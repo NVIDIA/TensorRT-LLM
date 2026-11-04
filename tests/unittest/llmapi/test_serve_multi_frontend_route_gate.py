@@ -28,6 +28,11 @@ from starlette.routing import Match
 from test_common.serve.routes import effective_routes
 
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve.api.anthropic.serving import (
+    AnthropicBatchesServing,
+    AnthropicCountTokensServing,
+    AnthropicMessagesServing,
+)
 from tensorrt_llm.serve.api.openai.completions import api_router as completions_router
 from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
@@ -104,7 +109,9 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     # As OpenAIServer.__init__ does: the serving objects the routers read go on
     # app.state, the role's own table is registered, then the routers of the role
     # (the system router with /health, /version and /v1/models, the tokenize
-    # router and the completions router) are attached.
+    # router, the completions router and the Anthropic router) are attached.
+    # The routes are enumerated, never called, so the serving objects get
+    # collaborators that are never used.
     server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
     setattr(
         server.app.state,
@@ -112,6 +119,11 @@ def _llm_server_routes() -> list[tuple[str, str]]:
         TokenizeServing(model="m", tokenizer=None),
     )
     setattr(server.app.state, completions_router.APP_STATE_KEY, _completion_serving())
+    server.app.state.anthropic_serving_messages = AnthropicMessagesServing(backend=None)
+    server.app.state.anthropic_serving_count_tokens = AnthropicCountTokensServing(
+        render_resources=lambda: None
+    )
+    server.app.state.anthropic_serving_batches = AnthropicBatchesServing(runner=None)
     server.register_routes()
     attach_routers(server.app, ServerCapabilities.for_role(None))
     # effective_routes walks included routers, which FastAPI 0.139 keeps as

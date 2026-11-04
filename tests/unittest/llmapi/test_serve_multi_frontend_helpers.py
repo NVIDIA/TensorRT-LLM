@@ -37,6 +37,11 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
+from tensorrt_llm.serve.api.anthropic.serving import (
+    AnthropicBatchesServing,
+    AnthropicCountTokensServing,
+    AnthropicMessagesServing,
+)
 from tensorrt_llm.serve.api.openai.completions import api_router as completions_router
 from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
@@ -120,8 +125,10 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server._launcher_forwarder = forwarder
     # The order OpenAIServer.__init__ registers them in: the launcher forwarding
     # routes, then the local table, then the routers of the role (the system
-    # router with /health, /version and /v1/models, the tokenize router and the
-    # completions router), which read their serving objects from app.state.
+    # router with /health, /version and /v1/models, the tokenize router, the
+    # completions router and the Anthropic router), which read their serving
+    # objects from app.state. The routes are enumerated and forwarded, never
+    # served locally, so the serving objects get placeholder collaborators.
     server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
     setattr(
         server.app.state,
@@ -149,6 +156,11 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
             postproc=select_postproc_strategy(postproc_worker_enabled=False),
         ),
     )
+    server.app.state.anthropic_serving_messages = AnthropicMessagesServing(backend=None)
+    server.app.state.anthropic_serving_count_tokens = AnthropicCountTokensServing(
+        render_resources=lambda: None
+    )
+    server.app.state.anthropic_serving_batches = AnthropicBatchesServing(runner=None)
     server._register_launcher_forwarding_routes()
     server.register_routes()
     attach_routers(server.app, ServerCapabilities.for_role(None))

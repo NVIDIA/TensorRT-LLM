@@ -682,11 +682,15 @@ def test_http_handlers_forward_hints(request_kind: str, with_hints: bool) -> Non
         )
         handler = server.chat_harmony if request_kind == "harmony" else server.openai_chat
 
+    # The request FastAPI would pass, reduced to what the handlers read before
+    # the engine boundary. The chat handler wraps it in a RequestContext, which
+    # needs an object to delegate to.
+    raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
     with patch(
         "tensorrt_llm.serve.openai_server.responses_api_request_preprocess",
         new=AsyncMock(return_value=([1, 2], SamplingParams(max_tokens=4))),
     ):
-        response = asyncio.run(handler(request, None))
+        response = asyncio.run(handler(request, raw_request))
     server.generator.generate_async.assert_called_once()
     assert server.generator.generate_async.call_args.kwargs["kv_hints"] == hints
     assert b"captured at engine boundary" in response.body

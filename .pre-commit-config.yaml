@@ -419,6 +419,8 @@ common-files: &common_files |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
         tensorrt_llm/serve/_base/serving.py |
+        tensorrt_llm/serve/_base/sse.py |
+        tensorrt_llm/serve/api/anthropic/serving.py |
         tensorrt_llm/serve/api/openai/completions/_merge.py |
         tensorrt_llm/serve/api/openai/completions/serving.py |
         tensorrt_llm/serve/api/openai/embeddings/serving.py |
@@ -1165,6 +1167,8 @@ legacy-files: &legacy_files |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
         tensorrt_llm/serve/_base/serving.py |
+        tensorrt_llm/serve/_base/sse.py |
+        tensorrt_llm/serve/api/anthropic/serving.py |
         tensorrt_llm/serve/api/openai/completions/_merge.py |
         tensorrt_llm/serve/api/openai/completions/serving.py |
         tensorrt_llm/serve/api/openai/embeddings/serving.py |

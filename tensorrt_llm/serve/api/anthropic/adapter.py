@@ -37,7 +37,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 from fastapi.responses import JSONResponse
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.anthropic_protocol import (
+from tensorrt_llm.serve.api.anthropic.protocol import (
     AnthropicContentBlockDeltaEvent,
     AnthropicContentBlockStartEvent,
     AnthropicContentBlockStopEvent,

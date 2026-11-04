@@ -22,14 +22,13 @@ import socket
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
@@ -41,15 +40,13 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._base.errors import EngineFatalError, ServingError
+from tensorrt_llm.serve._base.request_context import RequestContext
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
-from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
-                                                  AnthropicResponseError,
-                                                  anthropic_error_response,
-                                                  convert_anthropic_request,
-                                                  convert_chat_response,
-                                                  reframe_openai_stream)
-from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
-                                                   AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.anthropic.adapter import anthropic_error_response
+from tensorrt_llm.serve.api.anthropic.protocol import (
+    AnthropicCountTokensRequest, AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.anthropic.serving import AnthropicMessagesServing
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
@@ -62,14 +59,15 @@ from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ConversationParams, ErrorResponse, ResponsesRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    ChatCompletionRequest, CompletionRequest, ConversationParams, ErrorResponse,
+    ResponsesRequest, UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+                                                UCompletionResponseOrGenerator,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
                                                 stream_error_event)
@@ -213,7 +211,72 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
     return f"context worker rejected the request with status {error.status}"
 
 
+def _envelope_message(response: Response) -> str:
+    """The message of an error envelope, read the way the disaggregated /v1/messages did."""
+    try:
+        payload = json.loads(response.body)
+        message = (payload.get("message") or payload.get("detail")
+                   or payload.get("error") or json.dumps(payload))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        message = "Internal server error"
+    return str(message)
+
+
+def _disagg_serving_error(status: int, message: str) -> ServingError:
+    """A disaggregated pipeline failure as a ServingError; the message is final."""
+    code: Union[int, str] = status
+    if is_context_length_exceeded_message(message):
+        code = CONTEXT_LENGTH_EXCEEDED_CODE
+    return ServingError(status, ErrorResponse(
+        message=message,
+        type="BadRequestError" if 400 <= status < 500 else "InternalServerError",
+        code=code))
+
+
+class _DisaggChatBackend:
+    """ChatBackend over the prepare, run and finish steps (no serialize)."""
+
+    def __init__(self, server: "OpenAIDisaggServer") -> None:
+        self._server = server
+
+    async def create_chat_completion(self, request: ChatCompletionRequest,
+                                     ctx: RequestContext):
+        try:
+            # The service is read per request, so tests may replace it.
+            outcome = await self._server._call_entry_point(
+                self._server._service.openai_chat_completion, request,
+                ctx.http_request)
+        except HTTPException as e:
+            raise _disagg_serving_error(e.status_code, str(e.detail)) from e
+        if outcome is None:
+            # Engine failure: _handle_exception has sent SIGINT.
+            raise EngineFatalError()
+        if isinstance(outcome, Response):
+            # The envelope _handle_exception returns for a worker error that
+            # carries a machine-readable code (context_length_exceeded).
+            raise _disagg_serving_error(outcome.status_code,
+                                        _envelope_message(outcome))
+        return outcome
+
+    def stream_model(self, request: ChatCompletionRequest) -> str:
+        # The client's name, as the disaggregated route always announced it.
+        return request.model
+
+    def error_message(self, error: ServingError) -> str:
+        return error.body.message
+
+
 class OpenAIDisaggServer:
+    """OpenAI- and Anthropic-compatible frontend of disaggregated serving.
+
+    Extension surface used outside this repository (NeMo-RL subclasses this
+    class): the constructor (config, req_timeout_secs=...,
+    coordinator_url=None) with self.app built and every route registered when
+    it returns; __call__(host, port, sockets=None); _wrap_entry_point;
+    _handle_exception; and _perf_metrics_collector.http_exceptions. Agree a
+    change to any of them with the NeMo-RL owners first; the contract test is
+    tests/unittest/disaggregated/test_disagg_server_contract.py.
+    """
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
@@ -270,6 +333,11 @@ class OpenAIDisaggServer:
         self._service = OpenAIDisaggregatedService(
             self._config, self._coordinator, self._create_client,
             req_timeout_secs=self._req_timeout_secs)
+        # The Anthropic Messages orchestration is shared with the aggregated
+        # server; here it runs over the steps of _wrap_entry_point, without
+        # the serialization the OpenAI routes need.
+        self._anthropic_messages_serving = AnthropicMessagesServing(
+            _DisaggChatBackend(self))
 
         try:
             otlp_cfg = config.otlp_config
@@ -431,93 +499,115 @@ class OpenAIDisaggServer:
         # annotation with request_type (as openai_server.py does).
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
+            hooks: Optional[RawRequestResponseHooks] = None
             try:
-                self._perf_metrics_collector.total_requests.inc()
-                if req.stream:
-                    self._perf_metrics_collector.stream_requests.inc()
-                else:
-                    self._perf_metrics_collector.nonstream_requests.inc()
-                try:
-                    ensure_request_chat_template_allowed(
-                        req, self._allow_request_chat_template)
-                except ValueError as e:
-                    raise HTTPException(status_code=400, detail=str(e)) from e
-                self._extract_conversation_id(
-                    req, raw_req,
-                    self._config.conversation_affinity_header_for_subagents)
-                hooks = RawRequestResponseHooks(
-                    raw_req, self._perf_metrics_collector.queue_latency_seconds,
-                    self._collect_perf_metrics)
-                response_or_generator = await entry_point(req, hooks)
-                self._perf_metrics_collector.total_responses.inc()
-                if req.stream:
-                    stream = response_or_generator
-                    if isinstance(req, ResponsesRequest):
-                        # A relayed Responses stream that fails early ends with
-                        # an `error` event; other protocols end on a sentinel.
-                        stream = guard_responses_stream(stream,
-                                                        stream_error_event)
-                    return StreamingResponse(
-                        content=stream,
-                        media_type="text/event-stream")
-                # by_alias: e.g. text.format.schema goes out under its wire name.
-                return JSONResponse(
-                    content=response_or_generator.model_dump(by_alias=True))
+                hooks = self._prepare_request(req, raw_req)
+                response_or_generator = await self._run_entry_point(
+                    entry_point, req, hooks, raw_req)
+                self._finish_request(req, hooks)
+                return self._serialize_response(req, response_or_generator)
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
-                return self._handle_exception(e)
+                return self._finish_failed_request(e, req, hooks)
         return wrapper
+
+    @tracing.trace_span("disaggregated_request")
+    async def _call_entry_point(self, entry_point: Callable,
+                                req: UCompletionRequest, raw_req: Request):
+        """Prepare, run and finish one request without serializing it.
+
+        Returns the service's result (a typed response or the worker stream)
+        or, on failure, what _finish_failed_request returns (an error
+        envelope, or None after an engine failure); its HTTPException
+        propagates.
+        """
+        hooks: Optional[RawRequestResponseHooks] = None
+        try:
+            hooks = self._prepare_request(req, raw_req)
+            result = await self._run_entry_point(entry_point, req, hooks,
+                                                 raw_req)
+            self._finish_request(req, hooks)
+            return result
+        except Exception as e:
+            return self._finish_failed_request(e, req, hooks)
+
+    def _prepare_request(self, req: UCompletionRequest,
+                         raw_req: Request) -> RawRequestResponseHooks:
+        """Account for a request and check it before any worker is involved.
+
+        Counts the request, applies the chat-template permission (HTTPException
+        400), resolves the conversation identity from the headers and builds
+        the per-request hooks.
+        """
+        self._perf_metrics_collector.total_requests.inc()
+        if req.stream:
+            self._perf_metrics_collector.stream_requests.inc()
+        else:
+            self._perf_metrics_collector.nonstream_requests.inc()
+        try:
+            ensure_request_chat_template_allowed(
+                req, self._allow_request_chat_template)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        self._extract_conversation_id(
+            req, raw_req,
+            self._config.conversation_affinity_header_for_subagents)
+        return RawRequestResponseHooks(
+            raw_req, self._perf_metrics_collector.queue_latency_seconds,
+            self._collect_perf_metrics)
+
+    async def _run_entry_point(self, entry_point: Callable,
+                               req: UCompletionRequest,
+                               hooks: RawRequestResponseHooks,
+                               raw_req: Request) -> UCompletionResponseOrGenerator:
+        """Run the service entry point for one request.
+
+        A typed response for non-streaming requests, an async generator of the
+        worker's raw SSE bytes for streaming ones.
+        """
+        return await entry_point(req, hooks)
+
+    def _finish_request(self, req: UCompletionRequest,
+                        hooks: RawRequestResponseHooks) -> None:
+        """Account for a request the service answered."""
+        self._perf_metrics_collector.total_responses.inc()
+
+    def _finish_failed_request(
+            self, error: Exception, req: UCompletionRequest,
+            hooks: Optional[RawRequestResponseHooks]) -> Optional[Response]:
+        """Answer a failed request through _handle_exception.
+
+        Must be called while ``error`` is being handled: _handle_exception logs
+        with traceback.format_exc(). Raises HTTPException in most cases, returns
+        a JSONResponse for worker errors that carry a machine-readable code, and
+        returns None after an engine fatal error (SIGINT already sent).
+        """
+        return self._handle_exception(error)
+
+    def _serialize_response(
+            self, req: UCompletionRequest,
+            response_or_generator: UCompletionResponseOrGenerator) -> Response:
+        """The HTTP response of the OpenAI routes."""
+        if req.stream:
+            stream = response_or_generator
+            if isinstance(req, ResponsesRequest):
+                # A relayed Responses stream that fails early ends with
+                # an `error` event; other protocols end on a sentinel.
+                stream = guard_responses_stream(stream,
+                                                stream_error_event)
+            return StreamingResponse(
+                content=stream,
+                media_type="text/event-stream")
+        # by_alias: e.g. text.format.schema goes out under its wire name.
+        return JSONResponse(
+            content=response_or_generator.model_dump(by_alias=True))
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve Anthropic Messages through the disaggregated chat pipeline."""
-        try:
-            chat_request = convert_anthropic_request(request)
-        except (AnthropicRequestError, ValidationError) as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
-
-        try:
-            openai_response = await self._wrap_entry_point(
-                self._service.openai_chat_completion)(chat_request, raw_request)
-        except HTTPException as e:
-            error_type = ("invalid_request_error"
-                          if 400 <= e.status_code < 500 else "api_error")
-            return anthropic_error_response(str(e.detail), error_type,
-                                            e.status_code)
-
-        if isinstance(openai_response, StreamingResponse):
-            return StreamingResponse(
-                content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model),
-                media_type="text/event-stream",
-            )
-
-        status = getattr(openai_response, "status_code", 500)
-        if status != 200:
-            try:
-                payload = json.loads(openai_response.body)
-                message = (payload.get("message") or payload.get("detail")
-                           or payload.get("error") or json.dumps(payload))
-            except (json.JSONDecodeError, AttributeError, TypeError):
-                message = "Internal server error"
-            error_type = ("invalid_request_error"
-                          if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(str(message), error_type, status)
-
-        try:
-            chat_response = ChatCompletionResponse(
-                **json.loads(openai_response.body))
-            anthropic_response = convert_chat_response(chat_response)
-        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
-            logger.error(
-                "Invalid response from OpenAI chat pipeline:\n"
-                f"{traceback.format_exc()}")
-            return anthropic_error_response("Internal server error",
-                                            "api_error", 500)
-        return JSONResponse(content=anthropic_response.model_dump(
-            exclude_none=True))
+        return await self._anthropic_messages_serving.create_message(
+            request, RequestContext.from_http(raw_request))
 
     async def get_model(self) -> Response:
         """List the served model, as a context worker reports it."""

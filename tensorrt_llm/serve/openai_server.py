@@ -4,6 +4,7 @@
 
 import asyncio
 import base64
+import dataclasses
 import functools
 import json
 import os
@@ -21,11 +22,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator, Dict, List,
-                    Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Annotated, Any, AsyncIterator, Dict, List,
+                    Optional, Union)
 
 import uvicorn
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
@@ -62,24 +63,20 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._base.errors import (EngineFatalError, ServingError,
+                                             serving_error)
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
-from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve._base.request_context import RequestContext
+from tensorrt_llm.serve._base.routing import (RoleGroup, ServerCapabilities,
+                                              attach_routers, role_group_of)
 from tensorrt_llm.serve._base.serving import (BaseServing, GenerateBaseServing,
                                               _record_generator_termination)
+from tensorrt_llm.serve._base.sse import chat_stream_generator
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
-from tensorrt_llm.serve.anthropic_adapter import (
-    AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
-    convert_anthropic_count_tokens_request, convert_anthropic_request,
-    convert_chat_response, reframe_openai_stream)
-from tensorrt_llm.serve.anthropic_batches import (AnthropicBatchStore,
-                                                  BatchStoreFullError,
-                                                  results_to_jsonl)
-from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
-                                                   AnthropicBatchList,
-                                                   AnthropicCountTokensRequest,
-                                                   AnthropicCountTokensResponse,
-                                                   AnthropicCreateBatchRequest,
-                                                   AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.anthropic.adapter import anthropic_error_response
+from tensorrt_llm.serve.api.anthropic.serving import (
+    AnthropicBatchesServing, AnthropicCountTokensServing,
+    AnthropicMessagesServing)
 from tensorrt_llm.serve.api.openai.embeddings.batcher import EncodeBatcher
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.api.visual_gen.protocol import (ImageEditRequest,
@@ -116,11 +113,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_harmony_streaming_post_processor, chat_response_post_processor,
     chat_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor, select_postproc_strategy)
-from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
-                                       UnsupportedRenderError,
-                                       mount_render_endpoints,
-                                       prepare_chat_request, render_chat,
-                                       render_chat_for_length,
+from tensorrt_llm.serve.render import (RenderResources, mount_render_endpoints,
+                                       prepare_chat_request,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
@@ -145,7 +139,7 @@ from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import (AdjustedSteadyClock,
-                      get_global_steady_clock_now_in_seconds, nvtx_mark,
+                      get_global_steady_clock_now_in_seconds,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
@@ -510,6 +504,30 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     return getattr(spec_config, "max_draft_len", None)
 
 
+class _AggregatedChatBackend:
+    """ChatBackend over OpenAIServer's typed chat core.
+
+    Transitional: deleted when the chat core moves out of OpenAIServer into a
+    serving class that implements stream_model and error_message itself.
+    """
+
+    def __init__(self, server: "OpenAIServer") -> None:
+        self._server = server
+
+    async def create_chat_completion(self, request: ChatCompletionRequest,
+                                     ctx: RequestContext):
+        return await self._server.create_chat_completion(request, ctx)
+
+    def stream_model(self, request: ChatCompletionRequest) -> str:
+        # The served name, as the aggregated route always announced it.
+        return self._server.model
+
+    def error_message(self, error: ServingError) -> str:
+        # What the rejected chat route's body said: its message, else the
+        # whole body.
+        return error.body.message or json.dumps(error.body.model_dump())
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -854,6 +872,21 @@ class OpenAIServer(_VideoRoutesMixin):
         # health API exists.
         self.app.state.ops_serving_system = SystemServing(
             model=self.model, health_probe=self._health_probe)
+        if role_group_of(self.server_role) is RoleGroup.LLM:
+            # An attached frontend of a multi-frontend server forwards the
+            # launcher-owned routes, the Message Batches routes among them.
+            # They register before the routers so that they keep winning
+            # over the local handlers: FastAPI matches in registration order.
+            self._register_launcher_forwarding_routes()
+            messages_serving = AnthropicMessagesServing(
+                _AggregatedChatBackend(self))
+            self.app.state.anthropic_serving_messages = messages_serving
+            # Transitional: RenderResources per request until it is built once.
+            self.app.state.anthropic_serving_count_tokens = (
+                AnthropicCountTokensServing(
+                    render_resources=lambda: RenderResources.from_server(self)))
+            self.app.state.anthropic_serving_batches = AnthropicBatchesServing(
+                runner=messages_serving.run_batched_message)
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -907,12 +940,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 CompletionServing
             setattr(self.app.state, completions_router.APP_STATE_KEY,
                     CompletionServing(**self._generate_serving_kwargs()))
-            self._register_launcher_forwarding_routes()
             self.register_routes()
 
         # Attach routers after the role switch: every attach_router checks
         # that its serving objects are on app.state.
-        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
+        attach_routers(
+            self.app,
+            dataclasses.replace(ServerCapabilities.for_role(self.server_role),
+                                harmony_model=(not self._is_visual_gen)
+                                and self.use_harmony))
 
         if self._collect_perf_metrics:
             self.app.add_middleware(PerfMetricsMiddleware,
@@ -1221,38 +1257,6 @@ class OpenAIServer(_VideoRoutesMixin):
             "/v1/chat/completions",
             self.openai_chat if not self.use_harmony else self.chat_harmony,
             methods=["POST"])
-        # Anthropic Messages API adapter (e.g. Claude Code as a client).
-        # Not supported together with the harmony chat path (gpt-oss).
-        if not self.use_harmony:
-            self.app.add_api_route("/v1/messages",
-                                   self.anthropic_messages,
-                                   methods=["POST"])
-            # Claude Code calls this before most turns to decide whether to
-            # compact its context. Leaving it unregistered 404s every call,
-            # which the client cannot act on.
-            self.app.add_api_route("/v1/messages/count_tokens",
-                                   self.anthropic_count_tokens,
-                                   methods=["POST"])
-            # Message Batches. Registered before /v1/messages/{...} would be,
-            # so the literal paths win; FastAPI matches in registration order.
-            self.app.add_api_route("/v1/messages/batches",
-                                   self.anthropic_create_batch,
-                                   methods=["POST"])
-            self.app.add_api_route("/v1/messages/batches",
-                                   self.anthropic_list_batches,
-                                   methods=["GET"])
-            self.app.add_api_route("/v1/messages/batches/{batch_id}",
-                                   self.anthropic_get_batch,
-                                   methods=["GET"])
-            self.app.add_api_route("/v1/messages/batches/{batch_id}",
-                                   self.anthropic_delete_batch,
-                                   methods=["DELETE"])
-            self.app.add_api_route("/v1/messages/batches/{batch_id}/cancel",
-                                   self.anthropic_cancel_batch,
-                                   methods=["POST"])
-            self.app.add_api_route("/v1/messages/batches/{batch_id}/results",
-                                   self.anthropic_batch_results,
-                                   methods=["GET"])
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
@@ -1780,6 +1784,43 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        try:
+            result = await self.create_chat_completion(
+                request, RequestContext.from_http(raw_request))
+            if isinstance(result, ChatCompletionResponse):
+                return JSONResponse(content=result.model_dump())
+            return StreamingResponse(content=result,
+                                     media_type="text/event-stream")
+        except ServingError as e:
+            return JSONResponse(content=e.body.model_dump(),
+                                status_code=e.status)
+        except EngineFatalError:
+            # Answered as HTTP 200 with body null (FastAPI's rendering of
+            # None); the in-process callers map that to their own errors.
+            # Answering 5xx would be a behavior change of its own.
+            return None
+        except ValueError as e:
+            # JSONResponse encodes in its constructor (allow_nan=False), so a
+            # response that cannot be encoded fails here and keeps its 400.
+            return self.create_error_response(str(e))
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(str(e))
+
+    async def create_chat_completion(
+        self, request: ChatCompletionRequest, ctx: RequestContext
+    ) -> Union[ChatCompletionResponse, AsyncIterator[str]]:
+        """Run one chat completion and return a typed result.
+
+        Returns the ChatCompletionResponse for a non-streaming request, and
+        for a streaming one the SSE stream as strings, ending with
+        "data: [DONE]".
+
+        Raises:
+            ServingError: The request is rejected; the HTTP status travels
+                apart from the body.
+            EngineFatalError: The engine failed; SIGINT has been sent.
+        """
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -1787,33 +1828,6 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 role = request.messages[-1]["role"]
             return role
-
-        async def chat_stream_generator(
-                promise: RequestOutput,
-                postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            try:
-                first_response = await anext(promise)
-                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-                )
-                pp_results = self._postproc.apply(first_response,
-                                                  postproc_params)
-                for pp_res in pp_results:
-                    yield pp_res
-                # Making sure we can handle the situation where there is only one response
-                res = first_response
-                async for res in promise:
-                    pp_results = self._postproc.apply(res, postproc_params)
-                    for pp_res in pp_results:
-                        yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-                nvtx_mark("generation ends")
-            except Exception:
-                # Only failures are logged: a consumer that stops reading closes
-                # the stream with GeneratorExit, and a client that disconnects
-                # cancels it, and neither is an error of this stream.
-                logger.error(traceback.format_exc())
-                raise
 
         try:
             # Extension preprocessing, the required-tool check and tool dumping
@@ -1870,7 +1884,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if isinstance(request.tool_choice,
                           ChatCompletionNamedToolChoiceParam):
                 if not request.tools:
-                    return self.create_error_response(
+                    raise serving_error(
                         message=("tool_choice with a named function requires "
                                  "`tools` to be set."),
                         err_type="BadRequestError",
@@ -1888,7 +1902,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     # testing ``prompt_token_ids`` alone lets a base64 request
                     # through to the pre-tokenized branch, where the begin
                     # prefix is never appended.
-                    return self.create_error_response(
+                    raise serving_error(
                         message=("tool_choice with a named function is not "
                                  "supported alongside `prompt_token_ids`; pass "
                                  "`messages` instead."),
@@ -1903,7 +1917,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     # instead. Honouring only one of them silently would either
                     # ignore an explicit instruction or emit a tool call whose
                     # arguments are unconstrained text, so reject instead.
-                    return self.create_error_response(
+                    raise serving_error(
                         message=("tool_choice with a named function cannot be "
                                  "combined with `response_format` or other "
                                  "guided-decoding settings."),
@@ -1926,14 +1940,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     # ends up reported as ``function.arguments``. Fail loudly
                     # instead of returning a tool call whose arguments are
                     # unconstrained text.
-                    return self.create_error_response(
-                        message=(
-                            "tool_choice with a named function requires the "
-                            "server to be started with a guided decoding "
-                            "backend (set `guided_decoding_backend` to "
-                            "'xgrammar' or 'llguidance')."),
-                        err_type="BadRequestError",
-                        status_code=HTTPStatus.BAD_REQUEST)
+                    raise serving_error(message=(
+                        "tool_choice with a named function requires the "
+                        "server to be started with a guided decoding "
+                        "backend (set `guided_decoding_backend` to "
+                        "'xgrammar' or 'llguidance')."),
+                                        err_type="BadRequestError",
+                                        status_code=HTTPStatus.BAD_REQUEST)
                 forced_tool_name = request.tool_choice.function.name
 
             reasoning_parser_name = self.generator.args.reasoning_parser
@@ -1986,7 +1999,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                     request.tools, self.tool_parser,
                                     forced_tool_name))
                         except ValueError as e:
-                            return self.create_error_response(
+                            raise serving_error(
                                 message=str(e),
                                 err_type="BadRequestError",
                                 status_code=HTTPStatus.BAD_REQUEST)
@@ -2001,7 +2014,7 @@ class OpenAIServer(_VideoRoutesMixin):
                             sampling_params.guided_decoding = strict_guided
             elif forced_tool_name is not None:
                 # tools were provided but the server has no tool_parser configured.
-                return self.create_error_response(
+                raise serving_error(
                     message=("tool_choice with a named function requires the "
                              "server to be started with --tool_parser."),
                     err_type="BadRequestError",
@@ -2023,7 +2036,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # calls in the model output.
                 postproc_args.tools = (postproc_args.tools
                                        or []) + dynamic_tool_params
-            self._validate_internal_disagg_request(request, raw_request)
+            self._validate_internal_disagg_request(request, ctx)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
@@ -2055,7 +2068,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
-                raw_body = await raw_request.json()
+                raw_body = await ctx.json()
                 raw_messages = raw_body.get("messages", [])
                 conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     raw_messages,
@@ -2176,15 +2189,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args=postproc_args,
             )
 
-            trace_headers = (None if raw_request is None else
-                             tracing.extract_trace_headers(raw_request.headers))
+            trace_headers = (None if ctx is None else
+                             tracing.extract_trace_headers(ctx.headers))
 
             resolve_request_conversation_id(
-                request, None if raw_request is None else raw_request.headers)
+                request, None if ctx is None else ctx.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = self._get_scheduling_params(
-                request, raw_request)
+            scheduling_params = self._get_scheduling_params(request, ctx)
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -2211,19 +2223,19 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
+            asyncio.create_task(self.await_disconnected(ctx, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if request.stream:
-                response_generator = chat_stream_generator(
-                    promise, postproc_params)
-                return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                return chat_stream_generator(promise,
+                                             postproc_params,
+                                             server=self,
+                                             ctx=ctx)
             else:
                 response = await self._create_chat_response(
-                    promise, postproc_params, raw_request, disaggregated_params)
+                    promise, postproc_params, ctx, disaggregated_params)
                 # Context-only: optionally return prompt_token_ids as a base64
                 # int32 buffer (one string) so the disagg orchestrator relays it
                 # without materializing the int list on its event loop. The encode
@@ -2236,313 +2248,20 @@ class OpenAIServer(_VideoRoutesMixin):
                         np.asarray(response.prompt_token_ids,
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
-                return JSONResponse(content=response.model_dump())
-        except CppExecutorError:
+                return response
+        except ServingError:
+            raise
+        except CppExecutorError as e:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
+            raise EngineFatalError() from e
         except ValueError as e:
-            return self.create_error_response(str(e))
+            raise serving_error(str(e)) from e
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
-
-    async def anthropic_messages(self, request: AnthropicMessagesRequest,
-                                 raw_request: Request) -> Response:
-        """Serve the Anthropic Messages API on top of the openai_chat path.
-
-        The Anthropic request is translated into a ChatCompletionRequest,
-        handed to ``openai_chat`` unchanged (chat template, tool parser and
-        post-processing are reused verbatim), and the OpenAI-shaped result is
-        translated back: JSON body for non-streaming, SSE reframing for
-        streaming.
-        """
-        try:
-            chat_request = convert_anthropic_request(request)
-        except AnthropicRequestError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
-        except ValidationError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
-
-        response = await self.openai_chat(chat_request, raw_request)
-        if response is None:
-            return anthropic_error_response("Internal server error",
-                                            "api_error", 500)
-
-        if isinstance(response, StreamingResponse):
-            return StreamingResponse(
-                content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
-                media_type="text/event-stream",
-            )
-
-        status = getattr(response, "status_code", 500)
-        if status != 200:
-            try:
-                payload = json.loads(response.body)
-                message = payload.get("message") or json.dumps(payload)
-            except (json.JSONDecodeError, AttributeError):
-                message = "Internal server error"
-            err_type = ("invalid_request_error"
-                        if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
-
-        try:
-            chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
-        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
-            logger.error("Invalid response from OpenAI chat pipeline:\n"
-                         f"{traceback.format_exc()}")
-            return anthropic_error_response("Internal server error",
-                                            "api_error", 500)
-        return JSONResponse(content=anthropic_response.model_dump(
-            exclude_none=True))
-
-    async def anthropic_count_tokens(
-            self, request: AnthropicCountTokensRequest) -> Response:
-        """Report how many input tokens a Messages request would consume.
-
-        The count is taken over the rendered prompt rather than over the raw
-        messages, so system blocks, tool definitions and the thinking prefix
-        are all included - those are exactly what make a client's own estimate
-        drift from the server's.
-        """
-        try:
-            chat_request = convert_anthropic_count_tokens_request(request)
-        except AnthropicRequestError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
-        except ValidationError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
-
-        try:
-
-            # Both the render and the encode are synchronous and both scale
-            # with prompt size. Claude Code calls this before most turns with
-            # the whole conversation attached, so running them inline would
-            # block the event loop -- and therefore every other in-flight
-            # request on this server -- for a full template render plus a
-            # tokenizer pass. The chat path avoids this the same way.
-            def _count() -> int:
-                # The count is over the prompt tokens the chat route would
-                # execute: same pipeline, same template, same tokenization.
-                resources = RenderResources.from_server(self)
-                try:
-                    rendered = render_chat(chat_request,
-                                           resources,
-                                           tokenize=True)
-                except (UnsupportedRenderError, HarmonyConversionError):
-                    # Media, an own-processor model or an unconvertible Harmony
-                    # request: count the text, tools and template without the media.
-                    rendered = render_chat_for_length(chat_request, resources)
-                return len(rendered.token_ids)
-
-            input_tokens = await asyncio.to_thread(_count)
-        except Exception:
-            logger.error("count_tokens failed to render the prompt:\n"
-                         f"{traceback.format_exc()}")
-            return anthropic_error_response("Internal server error",
-                                            "api_error", 500)
-
-        return JSONResponse(content=AnthropicCountTokensResponse(
-            input_tokens=input_tokens).model_dump())
-
-    # -- Message Batches ---------------------------------------------------
-
-    @staticmethod
-    def _synthetic_request(body: Dict[str, Any]) -> Request:
-        """A Request for work with no client connection behind it.
-
-        The chat path reads ``raw_request.state`` and may re-read the body via
-        ``.json()``. A batched request has no live connection, so rather than
-        duck-type a stub that drifts as that path evolves, build a real Request
-        over a synthetic ASGI scope - anything the chat path can legitimately
-        do to a Request keeps working.
-        """
-        payload = json.dumps(body).encode()
-
-        async def receive() -> Dict[str, Any]:
-            return {"type": "http.request", "body": payload, "more_body": False}
-
-        return Request(
-            {
-                "type": "http",
-                "http_version": "1.1",
-                "method": "POST",
-                "scheme": "http",
-                "path": "/v1/messages",
-                "raw_path": b"/v1/messages",
-                "query_string": b"",
-                "root_path": "",
-                "headers": [(b"content-type", b"application/json")],
-                "client": None,
-                "server": None,
-                # PerfMetricsMiddleware seeds state["perf_metrics_records"] on a
-                # real connection (see perf_metrics.py). A batched request never
-                # passes through the middleware, so seed it here: with
-                # return_perf_metrics enabled, _extract_metrics appends to this
-                # list unconditionally and every batched request would otherwise
-                # die with AttributeError and come back "errored".
-                # No socket sits behind this request, so await_disconnected
-                # keys off no_client_connection to avoid polling forever on a
-                # connection that can never drop.
-                "state": {
-                    "perf_metrics_records": [],
-                    "no_client_connection": True
-                },
-            },
-            receive,
-        )
-
-    def _batch_store(self) -> AnthropicBatchStore:
-        """Created on first use so servers that never batch pay nothing."""
-        if getattr(self, "_anthropic_batch_store", None) is None:
-            self._anthropic_batch_store = AnthropicBatchStore(
-                runner=self._run_batched_message)
-        return self._anthropic_batch_store
-
-    async def _run_batched_message(
-            self,
-            request: AnthropicMessagesRequest) -> Tuple[str, Dict[str, Any]]:
-        """Run one batched Messages request through the ordinary chat path."""
-        # Streaming makes no sense for a batch: the result is collected, not
-        # watched. Forcing it off here means a client that sets stream=true in
-        # params gets a usable message instead of an SSE body in its .jsonl.
-        request = request.model_copy(update={"stream": False})
-        try:
-            chat_request = convert_anthropic_request(request)
-        except (AnthropicRequestError, ValidationError) as e:
-            return "errored", {
-                "type": "invalid_request_error",
-                "message": str(e)
-            }
-
-        raw_request = self._synthetic_request(
-            chat_request.model_dump(exclude_none=True))
-        response = await self.openai_chat(chat_request, raw_request)
-        if response is None:
-            return "errored", {
-                "type": "api_error",
-                "message": "Internal server error"
-            }
-
-        status = getattr(response, "status_code", 500)
-        if status != 200:
-            try:
-                payload = json.loads(response.body)
-                message = payload.get("message") or json.dumps(payload)
-            except (json.JSONDecodeError, AttributeError):
-                message = "Internal server error"
-            err_type = "invalid_request_error" if 400 <= status < 500 else "api_error"
-            return "errored", {"type": err_type, "message": message}
-
-        try:
-            chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
-        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
-            logger.error(
-                "Invalid response from OpenAI chat pipeline in batch:\n"
-                f"{traceback.format_exc()}")
-            return "errored", {
-                "type": "api_error",
-                "message": "Internal server error"
-            }
-        return "succeeded", anthropic_response.model_dump(exclude_none=True)
-
-    async def anthropic_create_batch(
-            self, request: AnthropicCreateBatchRequest) -> Response:
-        try:
-            batch = self._batch_store().create(request.requests)
-        except BatchStoreFullError as e:
-            # 429, not 400: the request is valid and an identical one will
-            # succeed later, so the client should back off rather than edit it.
-            return anthropic_error_response(str(e), "rate_limit_error", 429)
-        except ValueError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
-        return JSONResponse(content=batch.model_dump())
-
-    async def anthropic_list_batches(
-            self,
-            # Validated here rather than clamped in the store: clamping turned
-            # limit=0 into 1 instead of a 400, and bounded the page against the
-            # retention limit, which is an unrelated quantity.
-            limit: int = Query(20, ge=1, le=100),
-            after_id: Optional[str] = None,
-            before_id: Optional[str] = None) -> Response:
-        try:
-            batches, has_more = self._batch_store().list(limit=limit,
-                                                         after_id=after_id,
-                                                         before_id=before_id)
-        except LookupError as e:
-            # Saying so beats an empty page: an empty page is indistinguishable
-            # from a finished walk, so the client stops early having silently
-            # skipped every batch past the cursor.
-            return anthropic_error_response(
-                f"Unknown pagination cursor {e.args[0]!r}. The batch may have "
-                "been deleted or expired; restart the listing without a cursor.",
-                "invalid_request_error", 400)
-        listing = AnthropicBatchList(
-            data=batches,
-            # Reported honestly rather than hardcoded false: a client that
-            # asked for N and received N cannot otherwise tell a full page from
-            # the end of the list, and silently stops early. It pages on with
-            # ?after_id=<last_id>.
-            has_more=has_more,
-            first_id=batches[0].id if batches else None,
-            last_id=batches[-1].id if batches else None,
-        )
-        return JSONResponse(content=listing.model_dump())
-
-    async def anthropic_get_batch(self, batch_id: str) -> Response:
-        batch = self._batch_store().get(batch_id)
-        if batch is None:
-            return self._no_such_batch(batch_id)
-        return JSONResponse(content=batch.model_dump())
-
-    async def anthropic_cancel_batch(self, batch_id: str) -> Response:
-        batch = self._batch_store().cancel(batch_id)
-        if batch is None:
-            return self._no_such_batch(batch_id)
-        return JSONResponse(content=batch.model_dump())
-
-    async def anthropic_delete_batch(self, batch_id: str) -> Response:
-        try:
-            deleted = self._batch_store().delete(batch_id)
-        except ValueError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
-        if not deleted:
-            return self._no_such_batch(batch_id)
-        return JSONResponse(content=AnthropicBatchDeleteResponse(
-            id=batch_id).model_dump())
-
-    async def anthropic_batch_results(self, batch_id: str) -> Response:
-        store = self._batch_store()
-        results = store.results(batch_id)
-        if results is None:
-            if not store.has(batch_id):
-                return self._no_such_batch(batch_id)
-            # Known batch, but not finished. 404 would say "no such batch",
-            # which is wrong and would stop a client from polling.
-            return anthropic_error_response(
-                f"Message Batch {batch_id} is still processing; results are "
-                "available once processing_status is 'ended'",
-                "invalid_request_error", 400)
-        return Response(content=results_to_jsonl(results),
-                        media_type="application/x-ndjson")
-
-    @staticmethod
-    def _no_such_batch(batch_id: str) -> Response:
-        # Batches are held in memory only, so an id from before a restart lands
-        # here. Say so, rather than leaving the caller to wonder.
-        return anthropic_error_response(
-            f"Message Batch {batch_id} not found. Batches are stored in memory "
-            "and do not survive a server restart.", "not_found_error", 404)
+            raise serving_error(str(e)) from e
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:

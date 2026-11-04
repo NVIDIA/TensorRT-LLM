@@ -85,19 +85,8 @@ BASELINE = {
         "server_with_mock_generator OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_anthropic_routes.py": [
-        "_batch_client OpenAIServer",
         "_chat_stream OpenAIServer",
-        "_count_tokens_client OpenAIServer",
         "_handle OpenAIDisaggServer",
-        "_make_route_client OpenAIDisaggServer",
-        "_make_route_client OpenAIServer",
-        "test_await_disconnected_returns_immediately_for_a_synthetic_request OpenAIServer",
-        "test_batch_routes_are_registered_on_the_standard_server OpenAIServer",
-        "test_count_tokens_honours_the_server_chat_template OpenAIServer",
-        "test_create_batch_at_capacity_is_429_not_400 OpenAIServer",
-        "test_results_of_an_unfinished_batch_are_400_not_404.scenario OpenAIServer",
-        "test_standard_and_disagg_register_messages_route OpenAIDisaggServer",
-        "test_standard_and_disagg_register_messages_route OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_context_length_error.py": [
         "_disagg_server OpenAIDisaggServer",
@@ -106,7 +95,6 @@ BASELINE = {
         "_make_server OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_render_callers.py": [
-        "TestCountTokens._client OpenAIServer",
         "TestServerInfoFingerprint.test_the_first_call_hashes_off_the_event_loop OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_responses_store_replay.py": [

@@ -373,8 +373,8 @@ class TestServerInjectedControls:
 
     @staticmethod
     def _anthropic_chat_request():
-        from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
-        from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+        from tensorrt_llm.serve.api.anthropic.adapter import convert_anthropic_request
+        from tensorrt_llm.serve.api.anthropic.protocol import AnthropicMessagesRequest
 
         return convert_anthropic_request(
             AnthropicMessagesRequest(

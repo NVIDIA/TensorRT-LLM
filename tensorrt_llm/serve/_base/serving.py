@@ -5,21 +5,19 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor.postproc_worker import PostprocArgs
-from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         is_context_length_exceeded_message)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.serve._base.errors import error_body
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request)
-from tensorrt_llm.serve.openai_protocol import ErrorResponse
 from tensorrt_llm.serve.perf_metrics import build_request_metrics_record
 from tensorrt_llm.serve.postprocess_handlers import PostprocStrategy
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
@@ -38,15 +36,7 @@ class BaseServing:
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts are detected from the message text because they
-        # cross the executor IPC boundary as plain strings (RequestError), so
-        # no exception type survives to here.
-        code: Union[int, str] = status_code.value
-        if is_context_length_exceeded_message(message):
-            code = CONTEXT_LENGTH_EXCEEDED_CODE
-        error_response = ErrorResponse(message=message,
-                                       type=err_type,
-                                       code=code)
+        error_response = error_body(message, err_type, status_code)
         return JSONResponse(content=error_response.model_dump(),
                             status_code=status_code.value)
 
