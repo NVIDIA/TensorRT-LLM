@@ -30,6 +30,7 @@ import pytest
 
 from tensorrt_llm.executor.result import CompletionOutput
 from tensorrt_llm.inputs.tokenization import tokenize_prompt
+from tensorrt_llm.serve.api.anthropic.api_router import anthropic_messages
 from tensorrt_llm.serve.openai_disagg_service import _ctx_usage_info
 from tensorrt_llm.serve.openai_protocol import (
     PromptTokensDetails,
@@ -380,7 +381,10 @@ def _serve(
     server._extract_metrics = AsyncMock()
     app = FastAPI()
     app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
-    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+    # The Messages route function reads its serving object from app.state; the
+    # server's constructor built it over the same chat core the chat route runs.
+    app.state.anthropic_serving_messages = server.app.state.anthropic_serving_messages
+    app.add_api_route("/v1/messages", anthropic_messages, methods=["POST"])
     app.add_api_route("/v1/responses", server.openai_responses, methods=["POST"])
     return TestClient(app), prompts
 
