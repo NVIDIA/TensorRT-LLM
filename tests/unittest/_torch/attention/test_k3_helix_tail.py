@@ -10,6 +10,8 @@ halves and replayed in a CUDA graph. The optional MXFP8 o_proj operand is bitwis
 GEMM's quantization of ``bf16(out * gate)``.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -202,6 +204,12 @@ def _check_close(out, latent_ref, stats_ref, w_uv):
     scale = torch.where(finite, prod, 0.0).abs().amax(-1, keepdim=True)
     err = torch.where(finite, (got - prod).abs(), 0.0)
     assert bool((err <= scale * 2.0**-6 + 1e-6).all()), float(err.max())
+
+
+def test_log2_e():
+    from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_mufu16 import LOG2_E
+
+    assert math.isclose(LOG2_E, math.log2(math.e))
 
 
 CASES = [

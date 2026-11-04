@@ -1539,7 +1539,30 @@ class K3MlaLatentRowKernel:
 # Host side
 # ---------------------------------------------------------------------------
 
-_COMPILED: dict = {}
+
+def _stream():
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
+@functools.cache
+def _compiled(t_pad: int, use_pdl: bool, debug: bool, fuse_norm: bool):
+    kernel = K3MlaQFusedKernel(t_pad, use_pdl, debug=debug, fuse_norm=fuse_norm)
+    a, i = Int64(1 << 20), Int32(1)
+    gmem = cute.AddressSpace.gmem
+    return cute.compile(
+        kernel, a,
+        make_ptr(cutlass.Float8E4M3FN, 1 << 20, gmem, assumed_align=16), a,
+        make_ptr(cutlass.BFloat16, 1 << 20, gmem, assumed_align=16),
+        *(a,) * 8, Float32(1e-6), *(i,) * 4, _stream(),
+    )  # fmt: skip
+
+
+@functools.cache
+def _compiled_latent_row(use_pdl: bool):
+    a, i = Int64(1 << 20), Int32(1)
+    return cute.compile(
+        K3MlaLatentRowKernel(use_pdl), a, a, a, a, Float32(1e-6), *(i,) * 5, _stream()
+    )
 
 
 @functools.cache
@@ -1657,7 +1680,6 @@ def k3_mla_q_fused(
         and norm[0].data_ptr() % 16 == 0
     ):
         raise ValueError("the fused q_a RMSNorm needs FlashInfer and a contiguous BF16 weight")
-    key = (t_pad, use_pdl, debug is not None, norm is not None)
     args = (
         Int64(x.data_ptr()),
         make_ptr(cutlass.Float8E4M3FN, w_qb.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
@@ -1678,17 +1700,7 @@ def k3_mla_q_fused(
         Int32(rows_per_seq),
         cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
     )
-    compiled = _COMPILED.get(key)
-    if compiled is None:
-        kernel = K3MlaQFusedKernel(
-            t_pad,
-            use_pdl,
-            debug=debug is not None,
-            fuse_norm=norm is not None,
-        )
-        compiled = cute.compile(kernel, *args)
-        _COMPILED[key] = compiled
-    compiled(*args)
+    _compiled(t_pad, use_pdl, debug is not None, norm is not None)(*args)
 
 
 def latent_row_supported(c_kv: torch.Tensor, k_pe: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -1739,12 +1751,7 @@ def k3_mla_latent_row(
         Int32(_ceil_div(num_tokens, 4)),
         cuda.CUstream(torch.cuda.current_stream(c_kv.device).cuda_stream),
     )
-    key = ("latent", use_pdl)
-    compiled = _COMPILED.get(key)
-    if compiled is None:
-        compiled = cute.compile(K3MlaLatentRowKernel(use_pdl), *args)
-        _COMPILED[key] = compiled
-    compiled(*args)
+    _compiled_latent_row(use_pdl)(*args)
     return out
 
 

@@ -57,7 +57,6 @@ order than the cuBLAS BMM, so the result agrees with the four-kernel path to BF1
 from __future__ import annotations
 
 import functools
-import math
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -1347,16 +1346,34 @@ def _grid(num_heads: int, num_tokens: int, max_ctas: int) -> tuple[int, int]:
     return tiles_per_cta, n_ctas
 
 
+def _gmem(dtype, address: int, align: int):
+    return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=align)
+
+
+def _split_ptrs(address: int, fold: bool):
+    """The six split-state pointers (partials, maxima, sums, plan, Q / KV scales)."""
+    align = 32 if fold else 4
+    f32, i32 = cutlass.Float32, cutlass.Int32
+    return (
+        _gmem(f32, address, align),
+        _gmem(f32, address, align),
+        _gmem(f32, address, align),
+        _gmem(i32, address, 4),
+        _gmem(f32, address, 4),
+        _gmem(f32, address, 4),
+    )
+
+
 @functools.cache
-def _kernel(cp_size: int, num_heads: int, fold: bool, has_mask: bool, use_pdl: bool, mx_out: bool):
-    return K3HelixTailKernel(cp_size, num_heads, fold, has_mask, use_pdl, mx_out)
-
-
-_COMPILED: dict = {}
-
-
-def _gmem(dtype, tensor: torch.Tensor, align: int):
-    return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+def _compiled(
+    cp_size: int, num_heads: int, fold: bool, has_mask: bool, use_pdl: bool, mx_out: bool
+):
+    kernel = K3HelixTailKernel(cp_size, num_heads, fold, has_mask, use_pdl, mx_out)
+    a, f, i = Int64(1 << 20), Float32(1.0), Int32(1)
+    return cute.compile(
+        kernel, *_split_ptrs(1 << 20, fold), *(a,) * 12, f, f, *(i,) * 9,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )  # fmt: skip
 
 
 def k3_helix_tail(
@@ -1409,31 +1426,22 @@ def k3_helix_tail(
     if num_tokens * cp_size * record_bytes(num_heads // cp_size, V_HEAD_DIM) > half_bytes:
         raise ValueError("the Helix tail receive buffer is too small for this many tokens")
     has_mask = zero_kv_mask is not None
-    flags = (fold is not None, has_mask, use_pdl, mx_out is not None)
-    kernel = _kernel(cp_size, num_heads, *flags)
     tiles_per_cta, n_ctas = _grid(num_heads, num_tokens, max_ctas)
     if fold is not None:
         ptrs = (
-            _gmem(cutlass.Float32, fold.partial, 32),
-            _gmem(cutlass.Float32, fold.maxima, 32),
-            _gmem(cutlass.Float32, fold.sums, 32),
-            _gmem(cutlass.Int32, fold.plan, 4),
-            _gmem(cutlass.Float32, fold.q_scale, 4),
-            _gmem(cutlass.Float32, fold.kv_scale, 4),
+            _gmem(cutlass.Float32, fold.partial.data_ptr(), 32),
+            _gmem(cutlass.Float32, fold.maxima.data_ptr(), 32),
+            _gmem(cutlass.Float32, fold.sums.data_ptr(), 32),
+            _gmem(cutlass.Int32, fold.plan.data_ptr(), 4),
+            _gmem(cutlass.Float32, fold.q_scale.data_ptr(), 4),
+            _gmem(cutlass.Float32, fold.kv_scale.data_ptr(), 4),
         )
         query_len = fold.valid_m // num_heads
         dims = (fold.physical_m, fold.partial.shape[0], fold.plan.numel())
         scales = (Float32(fold.sm_scale * LOG2_E), Float32(fold.output_scale))
     else:
         # Never dereferenced without ``fold``; any valid pointers keep one signature.
-        ptrs = (
-            _gmem(cutlass.Float32, stats, 4),
-            _gmem(cutlass.Float32, stats, 4),
-            _gmem(cutlass.Float32, stats, 4),
-            _gmem(cutlass.Int32, stats, 4),
-            _gmem(cutlass.Float32, stats, 4),
-            _gmem(cutlass.Float32, stats, 4),
-        )
+        ptrs = _split_ptrs(stats.data_ptr(), False)
         query_len, dims = 1, (1, 1, 1)
         scales = (Float32(1.0), Float32(1.0))
     mx = (0, 0, 0) if mx_out is None else tuple(t.data_ptr() for t in mx_out)
@@ -1460,12 +1468,4 @@ def k3_helix_tail(
         Int32(n_ctas),
         cuda.CUstream(torch.cuda.current_stream(rows.device).cuda_stream),
     )
-    key = (cp_size, num_heads, *flags)
-    compiled = _COMPILED.get(key)
-    if compiled is None:
-        compiled = cute.compile(kernel, *args)
-        _COMPILED[key] = compiled
-    compiled(*args)
-
-
-assert math.isclose(LOG2_E, math.log2(math.e))
+    _compiled(cp_size, num_heads, fold is not None, has_mask, use_pdl, mx_out is not None)(*args)
