@@ -99,12 +99,22 @@ def test_missing_bytes_raise_instead_of_returning_a_partial_tensor(tmp_path):
     path = str(tmp_path / "shard.safetensors")
     ints = torch.arange(16, dtype=torch.int32)
     _write_shard(path, {"a": ("I32", ints), "b": ("I32", ints)})
-    with open(path, "r+b") as f:
-        f.truncate(os.path.getsize(path) - 1)  # last byte of "b" is gone
     with PinnedSafetensorsFile(path) as shard:
+        with open(path, "r+b") as f:
+            f.truncate(os.path.getsize(path) - 1)  # last byte of "b" is gone after open
         assert torch.equal(shard.get_tensor("a"), ints)
         with pytest.raises(OSError, match="short read"):
             shard.get_tensor("b")
+
+
+@pytest.mark.cpu_only
+def test_data_offsets_beyond_the_file_are_rejected_at_open(tmp_path):
+    path = str(tmp_path / "shard.safetensors")
+    _write_shard(path, {"a": ("I32", torch.arange(16, dtype=torch.int32))})
+    with open(path, "r+b") as f:
+        f.truncate(os.path.getsize(path) - 1)
+    with pytest.raises(ValueError, match="data_offsets outside the file"):
+        PinnedSafetensorsFile(path).__enter__()
 
 
 @pytest.mark.cpu_only
@@ -141,9 +151,8 @@ def test_oversized_header_length_is_rejected(tmp_path, header_len, file_size):
     path = tmp_path / "bad.safetensors"
     with open(path, "wb") as f:
         f.write(struct.pack("<Q", header_len) + b"{}")
-        f.truncate(
-            file_size
-        )  # shorter than the header, or sparse: fits in the file but exceeds the cap
+        # Shorter than the header, or sparse: fits in the file but exceeds the cap.
+        f.truncate(file_size)
     with pytest.raises(ValueError, match="invalid SafeTensors header length"):
         PinnedSafetensorsFile(str(path)).__enter__()
 

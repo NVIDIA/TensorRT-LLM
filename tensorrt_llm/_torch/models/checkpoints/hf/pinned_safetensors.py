@@ -59,7 +59,8 @@ class PinnedSafetensorsFile:
         self._fd = os.open(self._path, os.O_RDONLY)
         try:
             (header_len,) = struct.unpack("<Q", self._pread(8, 0))
-            if header_len > min(_MAX_HEADER_BYTES, os.fstat(self._fd).st_size - 8):
+            file_size = os.fstat(self._fd).st_size
+            if header_len > min(_MAX_HEADER_BYTES, file_size - 8):
                 raise ValueError(f"{self._path}: invalid SafeTensors header length {header_len}")
             header = json.loads(self._pread(header_len, 8))
             data_start = 8 + header_len
@@ -67,6 +68,8 @@ class PinnedSafetensorsFile:
                 if key == "__metadata__":
                     continue
                 begin, end = info["data_offsets"]
+                if not 0 <= begin <= end <= file_size - data_start:
+                    raise ValueError(f"{self._path}: {key!r} data_offsets outside the file")
                 self._entries[key] = (info["dtype"], info["shape"], data_start + begin, end - begin)
         except BaseException:  # KeyboardInterrupt included: always release the fd
             os.close(self._fd)
