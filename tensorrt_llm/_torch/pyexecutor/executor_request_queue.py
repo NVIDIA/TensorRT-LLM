@@ -330,11 +330,14 @@ class ExecutorRequestQueue:
 
     def get_from_request_queue(
             self,
-            timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
+            timeout: Optional[datetime.timedelta],
+            *,
+            wait_for_batch: bool = True) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
 
         Args:
             timeout: Optional timeout for waiting on queue.
+            wait_for_batch: Whether to wait for additional items to fill a batch.
 
         Returns:
             List of RequestQueueItem fetched from the queue.
@@ -355,7 +358,7 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
 
-        if self.batch_wait_timeout_ms == 0:
+        if not wait_for_batch or self.batch_wait_timeout_ms == 0:
             return items
 
         if len(items) >= self.max_batch_size:
