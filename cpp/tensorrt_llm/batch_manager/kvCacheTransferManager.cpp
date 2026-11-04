@@ -108,6 +108,8 @@ tk::KVCacheIndex::UnderlyingType KVCacheTransferManager::getPendingTransferIndex
     return block->isPrimary() ? blockOffset : blockOffset | tk::KVCacheIndex::kSecondaryPoolFlag;
 }
 
+//! Copy KV blocks through the selected memory or file transport, honoring supported partial-copy layouts.
+//! Direct DRAM host/device copies may emit submission metadata; device reuse and file transfers do not.
 void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
@@ -126,12 +128,14 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
 #if defined(TORCH_CUDA)
             common::RecordFunctionWithMetadata scope{common::ProfilerRegion::kKv};
+            //! Start the probe only for a nonempty host/device copy, without changing copy error handling.
             auto startTransfer = [&](std::size_t bytes, int copiedTokens) noexcept
             {
                 try
                 {
                     auto const srcType = (src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr)->getMemoryType();
                     auto const dstType = (dst->isPrimary() ? pool.primaryPtr : pool.secondaryPtr)->getMemoryType();
+                    //! Recognize ordinary and pinned host allocations for copy-direction metadata.
                     auto isHost = [](tr::MemoryType type) {
                         return type == tr::MemoryType::kCPU || type == tr::MemoryType::kPINNED
                             || type == tr::MemoryType::kPINNEDPOOL;

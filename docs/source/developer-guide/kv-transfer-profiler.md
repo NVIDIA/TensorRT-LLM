@@ -135,6 +135,10 @@ metadata also includes local source/destination block IDs and pool block indices
 pool index, requested/copied token counts, tokens per block, and layer count.
 These are local descriptors, not stable generation identities.
 
+V2 byte counts describe the device-backed hot-pool payload, excluding
+host-backed sparse pools. They do not measure a custom codec's encoded size or
+physical transfer volume.
+
 `kv.cuda_stream_id` is the numeric CUDA stream ID, never a raw handle or address.
 It is queried only when an active observer requests metadata and omitted when
 unavailable; it is not assumed to equal a Chrome/CUPTI stream index. Integer
