@@ -805,3 +805,22 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     # The worker thread first: it is the one still handing the connector work.
     executor.worker_thread.join.assert_called_once_with()
     assert order == ["connector", "kv pools"]
+
+
+def test_failed_connector_load_marks_request_for_local_recompute() -> None:
+    executor = object.__new__(PyExecutor)
+    request = SimpleNamespace(py_connector_load_failed=False)
+    calls: list[str] = []
+    executor.kv_connector_manager = SimpleNamespace(
+        forget_request=lambda req: calls.append("drop_saves")
+    )
+    executor.kv_cache_manager = SimpleNamespace(
+        drop_context_allocation=lambda req: calls.append("drop_allocation")
+    )
+    spec_manager = SimpleNamespace(free_resources=lambda req: calls.append("drop_spec"))
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda kind: spec_manager)
+
+    executor._restart_failed_connector_load(request)
+
+    assert request.py_connector_load_failed is True
+    assert calls == ["drop_saves", "drop_allocation", "drop_spec"]
