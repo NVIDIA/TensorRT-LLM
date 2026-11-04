@@ -10,7 +10,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import qsa_sparse_gqa_reference
 from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
-        prims_ts_available,
+    prims_ts_available,
     prims_ts_sparse_gqa,
     slice_request_boundaries,
 )
