@@ -630,6 +630,9 @@ class DFlashForCausalLM(nn.Module):
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
+        # The block's draft tokens sit in slots 0..K-1 (the DSpark shift_label
+        # convention, set by DSpark heads) instead of 1..K.
+        self.shift_label = False
         if dflash_attention_backend == "AUTO":
             dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend

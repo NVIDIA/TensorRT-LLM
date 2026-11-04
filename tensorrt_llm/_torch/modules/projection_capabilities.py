@@ -70,6 +70,11 @@ class PrequantizedInputProjection(nn.Module):
     of the rows themselves; there ``forward_prequantized`` equals ``self(rows)``.
     """
 
+    @property
+    def supports_prequantized_input(self) -> bool:
+        """Whether ``forward_prequantized`` serves every row count."""
+        raise NotImplementedError
+
     def takes_prequantized_input(self, num_rows: int) -> bool:
         raise NotImplementedError
 

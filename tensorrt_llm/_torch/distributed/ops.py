@@ -1710,6 +1710,10 @@ class AllReduce(nn.Module):
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
+        # Whether forward routes the call through torch.distributed (no fusions).
+        self._torch_distributed = self._disable_mpi and (
+            getattr(mapping, "_use_torch_distributed_allreduce", False)
+            or getattr(mapping, "_tp_group_pg", None) is not None)
         self._group_name = (mapping.tp_group_name
                             if self._disable_mpi and mapping.tp_size > 1
                             and torch.distributed.is_initialized() else None)
@@ -1881,11 +1885,8 @@ class AllReduce(nn.Module):
     def mnnvl_runs_fusion(self, fusion_op: AllReduceFusionOp) -> bool:
         """Whether ``forward`` runs ``fusion_op`` on the MNNVL kernels, the only strategy that
         offers the fusions without a residual (``RMS_NORM_QUANT_*``)."""
-        torch_distributed = self._disable_mpi and (
-            getattr(self.mapping, "_use_torch_distributed_allreduce", False)
-            or getattr(self.mapping, "_tp_group_pg", None) is not None)
         return (self.mapping.tp_size > 1 and self.mnnvl_allreduce is not None
-                and not torch_distributed
+                and not self._torch_distributed
                 and fusion_op in MNNVLAllReduce.SUPPORTED_FUSION_OPS)
 
     @staticmethod

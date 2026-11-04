@@ -454,7 +454,7 @@ needs_gpu = pytest.mark.skipif(
 def test_dspark_drafter_loads_head_weights_and_parses_config():
     weights = _tiny_weights()
     drafter = _build_drafter(True, weights)
-    assert drafter._dspark_shift_label and drafter._use_swa
+    assert drafter.shift_label and drafter._use_swa
     assert drafter._swa_window == SWA_WINDOW
     assert drafter._layer_windows == [(SWA_WINDOW - 1, SWA_WINDOW - 1)] * 2
     assert drafter.has_markov_head
@@ -633,7 +633,7 @@ def test_published_drafter_spelling_activates_the_heads():
     # Declared nowhere in the published config, so it rides on the DSpark
     # default. False would run slots 1..K on a block_size-K drafter and read
     # the next request's anchor slot.
-    assert drafter._dspark_shift_label
+    assert drafter.shift_label
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
     assert drafter.confidence_proj_bias is not None
 
@@ -718,8 +718,8 @@ def test_plain_dflash_drafter_keeps_old_gates():
     drafter = _build_drafter(False, _tiny_weights())
     assert not drafter._use_swa
     assert drafter._layer_windows == [(-1, -1)] * 2
+    assert drafter.shift_label is False
     for absent in (
-        "_dspark_shift_label",
         "has_markov_head",
         "markov_w1",
         "confidence_proj_weight",
@@ -1394,7 +1394,7 @@ def test_mla_dspark_loads_the_torchspec_spelling_and_keeps_its_embedding():
     weights = _tiny_mla_weights()
     drafter = _build_mla_drafter(weights)
 
-    assert drafter._dspark_shift_label
+    assert drafter.shift_label
     assert drafter.has_markov_head
     assert drafter._kv_factor == 1, "the MLA cache stores one latent, not K and V"
     assert (drafter._num_kv_heads, drafter._head_dim) == (1, MLA_LATENT)
@@ -2016,9 +2016,10 @@ def test_context_kv_only_is_rejected_for_a_drafter_that_drafts_elsewhere():
 
 def test_context_kv_only_requires_disaggregated_serving():
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 
     creator = object.__new__(KvCacheCreator)
-    creator._speculative_config = SimpleNamespace(context_kv_only=True)
+    creator._speculative_config = DSparkDecodingConfig(max_draft_len=4, context_kv_only=True)
     creator._is_disagg = True
     creator._validate_context_kv_only()
     creator._is_disagg = False
@@ -2033,6 +2034,7 @@ def test_context_server_takes_the_drafter_out_of_the_kv_budget_not_the_headroom(
     """The KV budget gives back (1 - fraction) of what the drafter keeps resident,
     so a context-KV-only drafter does not shrink PyTorch's headroom."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 
     head = torch.nn.Linear(16, 8, bias=False, device="cuda")
     draft = torch.nn.Module()
@@ -2048,7 +2050,7 @@ def test_context_server_takes_the_drafter_out_of_the_kv_budget_not_the_headroom(
 
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(model=model, spec_metadata=metadata)
-    creator._speculative_config = SimpleNamespace(context_kv_only=True)
+    creator._speculative_config = DSparkDecodingConfig(max_draft_len=4, context_kv_only=True)
     resident = draft.fc.weight.nbytes + draft.table.nbytes + metadata.captures.nbytes
     assert creator._get_context_server_spec_reserve(0.7) == int((1.0 - 0.7) * resident)
     creator._speculative_config.context_kv_only = False

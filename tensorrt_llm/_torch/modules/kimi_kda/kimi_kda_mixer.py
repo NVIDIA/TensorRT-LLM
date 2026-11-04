@@ -42,7 +42,7 @@ from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ..multi_stream_utils import maybe_execute_in_parallel
-from ..projection_capabilities import reduces_output
+from ..projection_capabilities import PrequantizedInputProjection, reduces_output
 from ._kda_kernels import KDAKernelDispatch, fused_kda_post_conv
 
 if TYPE_CHECKING:
@@ -674,7 +674,7 @@ class KimiKDALinearAttention(nn.Module):
 
         cores: List[torch.Tensor] = []
         if num_prefills > 0:
-            snapshot = getattr(mamba_metadata, "kda_inforward_snapshot", None)
+            snapshot = mamba_metadata.kda_inforward_snapshot
             inforward = None
             if snapshot is not None:
                 stage = attn_metadata.kv_cache_manager.inforward_snapshot_stage_views(
@@ -1637,8 +1637,8 @@ class KimiKDALinearAttention(nn.Module):
         prequantized_output_ok = (
             allow_prequantized_output
             and output is None
-            and bool(getattr(self.o_proj, "supports_prequantized_input", False))
-            and callable(getattr(self.o_proj, "forward_prequantized", None))
+            and isinstance(self.o_proj, PrequantizedInputProjection)
+            and self.o_proj.supports_prequantized_input
         )
         projections = self._project_verify_inputs(
             x,

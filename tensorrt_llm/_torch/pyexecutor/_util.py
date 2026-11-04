@@ -30,9 +30,10 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
-    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    DSparkDecodingConfig, KVEventsConfig, KvCacheCompressionConfig,
+    KvCacheConfig, MultimodalEncoderSchedulingPolicy, PeftCacheConfig,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
+    WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -1090,7 +1091,8 @@ class KvCacheCreator:
 
     def _validate_context_kv_only(self) -> None:
         """A drafter that never drafts belongs on a disaggregated context server."""
-        if (getattr(self._speculative_config, "context_kv_only", False)
+        if (isinstance(self._speculative_config, DSparkDecodingConfig)
+                and self._speculative_config.context_kv_only
                 and not self._is_disagg):
             raise ValueError(
                 "speculative_config.context_kv_only is for the context servers "
@@ -1461,7 +1463,8 @@ class KvCacheCreator:
             draft model (minus storage shared with the target) and the
             speculative metadata; 0 unless ``speculative_config.context_kv_only``.
         """
-        if not getattr(self._speculative_config, "context_kv_only", False):
+        if not (isinstance(self._speculative_config, DSparkDecodingConfig)
+                and self._speculative_config.context_kv_only):
             return 0
         model = self._model_engine.model
         draft_model = getattr(model, "draft_model", None)
@@ -2414,7 +2417,7 @@ class KvCacheCreator:
     def _unified_drafter_block_width(self) -> int:
         """Use the loaded checkpoint's slot convention for sizing and allocation."""
         draft_model = getattr(self._model_engine.model, "draft_model", None)
-        shift_label = getattr(draft_model, "_dspark_shift_label", False)
+        shift_label = draft_model is not None and draft_model.shift_label
         return get_draft_block_width(self._speculative_config,
                                      shift_label=shift_label)
 
@@ -2759,8 +2762,8 @@ class KvCacheCreator:
         spec_dec_mode = self._speculative_config.spec_dec_mode
         if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
-        if getattr(self._speculative_config, "context_kv_dtype",
-                   "auto") == "fp8":
+        if (isinstance(self._speculative_config, DSparkDecodingConfig)
+                and self._speculative_config.context_kv_dtype == "fp8"):
             # speculative_config.context_kv_dtype: FP8 E4M3 drafter latents.
             return self._get_unquantized_kv_model_config(
                 effective_draft_config, kv_cache_quant_algo=QuantAlgo.FP8)

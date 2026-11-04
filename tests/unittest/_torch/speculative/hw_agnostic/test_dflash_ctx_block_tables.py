@@ -193,7 +193,7 @@ def test_dspark_block_width_tracks_checkpoint_slot_convention(
     shift_label: bool, expected: int
 ) -> None:
     worker = _dspark_worker()
-    draft_model = SimpleNamespace(_dspark_shift_label=shift_label)
+    draft_model = SimpleNamespace(shift_label=shift_label)
 
     assert worker._draft_block_width(draft_model) == expected
     assert DSparkWorker.block_width_for(worker.spec_config, shift_label=shift_label) == expected
@@ -223,7 +223,7 @@ def _init_dspark_ctx_buffers(
 ) -> None:
     manager = SimpleNamespace(max_seq_len=64, _shared_draft_block_width=reserved_width)
     draft_model = SimpleNamespace(
-        _dspark_shift_label=shift_label,
+        shift_label=shift_label,
         block_size=block_size,
         dflash_attention_backend="TRTLLM",
     )

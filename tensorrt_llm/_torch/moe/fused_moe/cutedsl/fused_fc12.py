@@ -363,12 +363,14 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         """Die-major weights need the model's opt-in, two locality domains, halves of whole
         128-row blocks (the FC12 tactics then keep to N tiles that divide a half) and weights that
         stay where they are loaded (no EPLB, no DWDP)."""
+        from ....pyexecutor.dwdp import get_global_dwdp_manager
+
         return (
             self._die_major_allowed
             and (2 * self.intermediate_size_per_partition) % 256 == 0
             and self.hidden_size % 256 == 0
             and not self._using_load_balancer()
-            and getattr(self, "dwdp_handle_collector", None) is None
+            and get_global_dwdp_manager() is None
             and is_locality_domain_enabled()
         )
 

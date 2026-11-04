@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import msgpack
 import numpy as np
@@ -24,6 +25,7 @@ from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_mod
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 pytestmark = pytest.mark.cpu_only
 
@@ -222,7 +224,8 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
     monkeypatch, shares_draft_layers, draft_layer_ids, expected
 ) -> None:
     monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
-    manager = SimpleNamespace(
+    manager = Mock(
+        spec=KVCacheManagerV2,
         mapping=SimpleNamespace(
             rank=0,
             tp_size=1,
@@ -242,7 +245,7 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
         kv_factor=2,
         draft_layer_ids=draft_layer_ids,
     )
-    manager.get_draft_kv_cache_view = lambda: manager if shares_draft_layers else None
+    manager.get_draft_kv_cache_view.return_value = manager if shares_draft_layers else None
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
