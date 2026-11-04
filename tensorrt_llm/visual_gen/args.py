@@ -628,7 +628,8 @@ class SeaCacheConfig(BaseCacheConfig):
     Skips the generator transformer stack on steps whose spectrally filtered
     input latents changed little since the last computed step, and predicts the
     stack's residual by linear extrapolation from the last two computed steps.
-    The first and last denoising steps are always computed.
+    The first ``max(max_warmup_steps, 1)`` and the last denoising steps are always
+    computed.
     """
 
     cache_backend: Literal["seacache"] = Field(
@@ -643,11 +644,22 @@ class SeaCacheConfig(BaseCacheConfig):
             "reuses the cache; larger values skip more steps."
         ),
     )
-    max_consecutive_cached_steps: int = Field(
-        2,
+    max_warmup_steps: int = Field(
+        12,
         ge=0,
         status="prototype",
-        description="Maximum number of consecutive cached steps; 0 removes the limit.",
+        description=(
+            "Leading denoising steps that always run the full stack; the first step always does."
+        ),
+    )
+    max_continuous_cached_steps: int = Field(
+        2,
+        ge=-1,
+        status="prototype",
+        description=(
+            "Maximum number of consecutive cached steps before a full step is forced; "
+            "-1 removes the limit and 0 disables caching."
+        ),
     )
 
 

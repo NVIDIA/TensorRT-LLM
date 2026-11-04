@@ -98,11 +98,20 @@ class SeaCacheController:
 
     One instance serves one transformer stack. Call :meth:`reset` before each
     generation and :meth:`step` once per denoising step, in step order.
+
+    Args:
+        threshold: Accumulated indicator distance below which a step is cached.
+        max_continuous_cached_steps: Consecutive cached steps after which a step is
+            computed; -1 removes the limit and 0 disables caching.
+        max_warmup_steps: Leading steps that are always computed (at least one).
     """
 
-    def __init__(self, threshold: float, max_consecutive_cached_steps: int):
+    def __init__(
+        self, threshold: float, max_continuous_cached_steps: int, max_warmup_steps: int = 0
+    ):
         self.threshold = threshold
-        self.max_consecutive_cached_steps = max_consecutive_cached_steps
+        self.max_continuous_cached_steps = max_continuous_cached_steps
+        self.max_warmup_steps = max_warmup_steps
         self.num_inference_steps = 0
         self._state = _TrajectoryState()
         self.cached_steps: List[int] = []
@@ -134,11 +143,11 @@ class SeaCacheController:
         previous = state.previous_indicator
         state.previous_indicator = indicator
         forced = (
-            step < 1
+            step < max(self.max_warmup_steps, 1)
             or step >= self.num_inference_steps - 1
             or (
-                self.max_consecutive_cached_steps > 0
-                and state.consecutive_cached >= self.max_consecutive_cached_steps
+                self.max_continuous_cached_steps >= 0
+                and state.consecutive_cached >= self.max_continuous_cached_steps
             )
             or not state.history
             or previous is None

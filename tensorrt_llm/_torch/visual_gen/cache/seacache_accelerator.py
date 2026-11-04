@@ -34,7 +34,9 @@ class SeaCacheAccelerator(CacheAccelerator):
         self._pipeline = pipeline
         self._cfg = seacache_cfg
         self._controller = SeaCacheController(
-            seacache_cfg.threshold, seacache_cfg.max_consecutive_cached_steps
+            seacache_cfg.threshold,
+            seacache_cfg.max_continuous_cached_steps,
+            seacache_cfg.max_warmup_steps,
         )
         self._transformer: Optional[torch.nn.Module] = None
         self._hook_handles = []
@@ -82,7 +84,8 @@ class SeaCacheAccelerator(CacheAccelerator):
         logger.info(
             f"SeaCache: Enabling for {type(transformer).__name__} "
             f"(threshold={self._cfg.threshold}, "
-            f"max_consecutive_cached_steps={self._cfg.max_consecutive_cached_steps})"
+            f"max_warmup_steps={self._cfg.max_warmup_steps}, "
+            f"max_continuous_cached_steps={self._cfg.max_continuous_cached_steps})"
         )
         original_run_gen_stack = transformer._run_gen_stack
         original_set_step = transformer.set_denoising_step

@@ -45,17 +45,23 @@ HEIGHT = 720
 WIDTH = 1280
 NUM_FRAMES = 9
 GUIDANCE_SCALE = 6.0
-# A threshold no step reaches makes the skipped steps depend only on the cap, so
-# the pattern is fixed: steps 1, 2, 4, 5 cached; 0, 3, 6 and the last step computed.
-SEACACHE = SeaCacheConfig(threshold=1e6, max_consecutive_cached_steps=2)
+# A threshold no step reaches makes the skipped steps depend only on the cap and the
+# warm-up, so the pattern is fixed: steps 1, 2, 4, 5 cached; 0, 3, 6 and the last step
+# computed.
+SEACACHE = SeaCacheConfig(threshold=1e6, max_warmup_steps=0, max_continuous_cached_steps=2)
 EXPECTED_CACHED_STEPS = [1, 2, 4, 5]
+# With the default config the skipped steps depend on the SEA filter and the threshold on
+# real latents. Cached steps of the default-config request below, recorded on a B200.
+DEFAULT_CONFIG_STEPS = 35
+DEFAULT_CONFIG_CACHED_STEPS = 13
+DEFAULT_CONFIG_TOLERANCE = 1
 
 
 class _InjectedFailure(RuntimeError):
     pass
 
 
-def _load_pipeline(compile_enabled: bool) -> Generator:
+def _load_pipeline(compile_enabled: bool, cache_config: SeaCacheConfig = SEACACHE) -> Generator:
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     checkpoint = get_checkpoint("Cosmos3-Nano")
@@ -67,7 +73,7 @@ def _load_pipeline(compile_enabled: bool) -> Generator:
             compilation_config=CompilationConfig(
                 resolutions=[(HEIGHT, WIDTH)], num_frames=[NUM_FRAMES]
             ),
-            cache_config=SEACACHE,
+            cache_config=cache_config,
         )
         pipeline = PipelineLoader(args).load(skip_warmup=not compile_enabled)
         yield pipeline
@@ -87,14 +93,19 @@ def compiled_seacache_pipeline() -> Generator:
     yield from _load_pipeline(compile_enabled=True)
 
 
-def _generate(pipeline, *, image=None, num_frames=NUM_FRAMES):
+@pytest.fixture(scope="class")
+def default_seacache_pipeline() -> Generator:
+    yield from _load_pipeline(compile_enabled=False, cache_config=SeaCacheConfig())
+
+
+def _generate(pipeline, *, image=None, num_frames=NUM_FRAMES, num_inference_steps=NUM_STEPS):
     return pipeline.forward(
         prompt=PROMPT,
         image=image,
         height=HEIGHT,
         width=WIDTH,
         num_frames=num_frames,
-        num_inference_steps=NUM_STEPS,
+        num_inference_steps=num_inference_steps,
         guidance_scale=GUIDANCE_SCALE,
         seed=SEED,
         frame_rate=24.0,
@@ -193,3 +204,19 @@ class TestCompiled:
             "warm-up did not compile the generator blocks"
         )
         _check_failed_request_recovers(compiled_seacache_pipeline, monkeypatch)
+
+
+class TestDefaultConfig:
+    def test_cached_step_count_matches_the_recorded_value(self, default_seacache_pipeline) -> None:
+        """At the default config, the number of steps skipped on real latents stays within
+        a tolerance of the recorded value, so a change to the SEA filter, the threshold or
+        the warm-up shows up here."""
+        output = _generate(default_seacache_pipeline, num_inference_steps=DEFAULT_CONFIG_STEPS)
+        _assert_video(output.video)
+        stats = default_seacache_pipeline.cache_accelerator.get_stats()
+        warmup = max(SeaCacheConfig().max_warmup_steps, 1)
+        assert stats["total"] == DEFAULT_CONFIG_STEPS
+        assert all(
+            warmup <= step < DEFAULT_CONFIG_STEPS - 1 for step in stats["cached_step_indices"]
+        )
+        assert abs(stats["cached"] - DEFAULT_CONFIG_CACHED_STEPS) <= DEFAULT_CONFIG_TOLERANCE, stats

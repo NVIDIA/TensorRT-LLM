@@ -385,19 +385,21 @@ args = VisualGenArgs(
 
 #### SeaCache
 
-[SeaCache](https://arxiv.org/abs/2602.18993) decides per denoising step whether the generator transformer stack must run. It compares spectrally filtered input latents between steps: the filter keeps the content expected to survive denoising at the current noise level. While the accumulated relative change stays below `threshold`, the stack is skipped and its output residual is predicted by linear extrapolation from the last two computed steps (or reused from the only computed step so far). The first and last steps are always computed.
+[SeaCache](https://arxiv.org/abs/2602.18993) decides per denoising step whether the generator transformer stack must run. It compares spectrally filtered input latents between steps: the filter keeps the content expected to survive denoising at the current noise level. While the accumulated relative change stays below `threshold`, the stack is skipped and its output residual is predicted by linear extrapolation from the last two computed steps (or reused from the only computed step so far). The first `max_warmup_steps` steps (at least one) and the last step are always computed.
 
 ```yaml
 cache_config:
   cache_backend: seacache
   threshold: 0.25
-  max_consecutive_cached_steps: 2
+  max_warmup_steps: 12
+  max_continuous_cached_steps: 2
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `threshold` | float | `0.25` | Accumulated relative-L1 change of the filtered latents below which a step reuses the cache; larger values skip more steps (more speedup, possible quality loss). |
-| `max_consecutive_cached_steps` | int | `2` | Maximum number of consecutive cached steps before a full step is forced; `0` removes the limit. |
+| `max_warmup_steps` | int | `12` | Leading denoising steps that always run the full stack; the first step always does. Skipping early, high-noise steps can change the scene's composition. |
+| `max_continuous_cached_steps` | int | `2` | Maximum number of consecutive cached steps before a full step is forced; `-1` removes the limit and `0` disables caching. |
 
 SeaCache is currently available for Cosmos3 base checkpoints on a single GPU. Loading fails with an error when it is combined with multi-GPU parallelism, CUDA graphs, CPU offloading, a checkpoint's per-step precision policy, or a distilled few-step checkpoint. Text-to-image (single-frame) requests and requests with audio, action or transfer controls run uncached. The cached steps are logged after each denoising loop.
 

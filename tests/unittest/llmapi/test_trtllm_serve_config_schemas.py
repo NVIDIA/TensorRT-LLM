@@ -230,7 +230,8 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
                 "cache_config": {
                     "cache_backend": "seacache",
                     "threshold": 0.3,
-                    "max_consecutive_cached_steps": 0,
+                    "max_warmup_steps": 4,
+                    "max_continuous_cached_steps": -1,
                 }
             },
             True,
@@ -247,7 +248,17 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (
             generator.VISUAL_GEN_SCHEMA,
-            {"cache_config": {"cache_backend": "seacache", "max_consecutive_cached_steps": -1}},
+            {"cache_config": {"cache_backend": "seacache", "max_continuous_cached_steps": -2}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_warmup_steps": -1}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_consecutive_cached_steps": 2}},
             False,
         ),
         (

@@ -392,7 +392,7 @@ class TestVisualGenArgsCacheBackend:
         assert args.cache_backend == "seacache"
         assert isinstance(args.cache_config, SeaCacheConfig)
         assert args.seacache.threshold == 0.15
-        assert args.seacache.max_consecutive_cached_steps == 2
+        assert args.seacache.max_continuous_cached_steps == 2
         assert args.teacache is None and args.cache_dit is None
 
     @pytest.mark.parametrize(
@@ -400,27 +400,36 @@ class TestVisualGenArgsCacheBackend:
         [
             {"threshold": 0.0},
             {"threshold": -0.1},
-            {"max_consecutive_cached_steps": -1},
+            {"max_continuous_cached_steps": -2},
+            {"max_warmup_steps": -1},
             {"thresh": 0.2},
+            # The cap is named like Cache-DiT's; the earlier name is not an alias.
+            {"max_consecutive_cached_steps": 2},
         ],
     )
     def test_seacache_rejects_invalid_values(self, kwargs):
         with pytest.raises(ValidationError):
             SeaCacheConfig(**kwargs)
 
-    def test_seacache_zero_cap_means_unlimited(self):
-        assert SeaCacheConfig(max_consecutive_cached_steps=0).max_consecutive_cached_steps == 0
+    @pytest.mark.parametrize("cap", [-1, 0, 5])
+    def test_seacache_accepts_unlimited_disabled_and_positive_caps(self, cap):
+        assert SeaCacheConfig(max_continuous_cached_steps=cap).max_continuous_cached_steps == cap
 
     def test_seacache_config_round_trips(self):
         args = VisualGenArgs(
             model="/tmp/model",
-            cache_config={"cache_backend": "seacache", "max_consecutive_cached_steps": 0},
+            cache_config={
+                "cache_backend": "seacache",
+                "max_warmup_steps": 3,
+                "max_continuous_cached_steps": -1,
+            },
         )
         dumped = args.model_dump()["cache_config"]
         assert dumped == {
             "cache_backend": "seacache",
             "threshold": 0.25,
-            "max_consecutive_cached_steps": 0,
+            "max_warmup_steps": 3,
+            "max_continuous_cached_steps": -1,
         }
         restored = VisualGenArgs(model="/tmp/model", cache_config=dumped)
         assert restored.cache_config == args.cache_config

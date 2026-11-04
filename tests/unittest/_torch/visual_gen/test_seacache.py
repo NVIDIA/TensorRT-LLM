@@ -105,7 +105,7 @@ def _run_trajectory(controller, num_steps, latents_fn=_slow_latents, residual_fn
 
 
 def test_first_and_last_steps_always_compute_and_cap_limits_consecutive_skips():
-    controller = SeaCacheController(threshold=0.25, max_consecutive_cached_steps=2)
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=2)
     _, computed, _ = _run_trajectory(controller, num_steps=8)
     assert computed == [0, 3, 6, 7]
     stats = controller.get_stats()
@@ -114,14 +114,43 @@ def test_first_and_last_steps_always_compute_and_cap_limits_consecutive_skips():
     assert stats["hit_rate"] == pytest.approx(0.5)
 
 
-def test_zero_cap_means_unlimited_consecutive_skips():
-    controller = SeaCacheController(threshold=0.25, max_consecutive_cached_steps=0)
+def test_negative_cap_means_unlimited_consecutive_skips():
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=-1)
     _, computed, _ = _run_trajectory(controller, num_steps=8)
     assert computed == [0, 7]
 
 
+def test_zero_cap_disables_caching():
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=0)
+    _, computed, _ = _run_trajectory(controller, num_steps=8)
+    assert computed == list(range(8))
+    assert controller.get_stats()["cached"] == 0
+
+
+@pytest.mark.parametrize(
+    ("max_warmup_steps", "expected_computed"),
+    [
+        (0, [0, 3, 6, 7]),
+        (1, [0, 3, 6, 7]),
+        (4, [0, 1, 2, 3, 6, 7]),
+        (7, list(range(8))),
+        (12, list(range(8))),
+    ],
+)
+def test_warmup_steps_are_always_computed(max_warmup_steps, expected_computed):
+    controller = SeaCacheController(
+        threshold=0.25, max_continuous_cached_steps=2, max_warmup_steps=max_warmup_steps
+    )
+    outputs, computed, true_outputs = _run_trajectory(controller, num_steps=8)
+    assert computed == expected_computed
+    # A cached step with two computed steps before it extrapolates the linear residual exactly.
+    for step in sorted(set(range(8)) - set(computed)):
+        if sum(c < step for c in computed) >= 2:
+            torch.testing.assert_close(outputs[step], true_outputs[step])
+
+
 def test_large_indicator_change_computes_every_step():
-    controller = SeaCacheController(threshold=0.25, max_consecutive_cached_steps=2)
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=2)
     _, computed, _ = _run_trajectory(
         controller,
         num_steps=6,
@@ -135,7 +164,7 @@ def test_large_indicator_change_computes_every_step():
 def test_accumulated_distance_forces_compute():
     # Each step changes the latents by ~10% relative: the second skip candidate
     # pushes the accumulated distance past the threshold.
-    controller = SeaCacheController(threshold=0.15, max_consecutive_cached_steps=0)
+    controller = SeaCacheController(threshold=0.15, max_continuous_cached_steps=-1)
     base = torch.randn(LATENT_SHAPE, generator=torch.Generator().manual_seed(3))
     _, computed, _ = _run_trajectory(
         controller, num_steps=6, latents_fn=lambda step: base * (1.1**step)
@@ -144,7 +173,7 @@ def test_accumulated_distance_forces_compute():
 
 
 def test_skipped_steps_extrapolate_linear_residuals_exactly():
-    controller = SeaCacheController(threshold=0.25, max_consecutive_cached_steps=2)
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=2)
     outputs, computed, true_outputs = _run_trajectory(controller, num_steps=8)
     assert computed == [0, 3, 6, 7]
     # Steps 1-2 only have one computed residual (reused as is); from step 4 on the
@@ -159,7 +188,7 @@ def test_indicator_reference_advances_on_skipped_steps():
     # against the previous step (cached or not), so only the jump accumulates and
     # every middle step is cached. Measuring against the last computed step
     # instead would accumulate 0.1 per step and force a compute at step 3.
-    controller = SeaCacheController(threshold=0.25, max_consecutive_cached_steps=0)
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=-1)
     base = torch.randn(LATENT_SHAPE, generator=torch.Generator().manual_seed(4))
     _, computed, _ = _run_trajectory(
         controller, num_steps=6, latents_fn=lambda step: base if step == 0 else base * 1.1
@@ -168,7 +197,7 @@ def test_indicator_reference_advances_on_skipped_steps():
 
 
 def test_non_adjacent_step_restarts_trajectory():
-    controller = SeaCacheController(threshold=0.25, max_consecutive_cached_steps=2)
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=2)
     controller.reset(10)
     stack_input = torch.zeros(STACK_SHAPE)
     computed = []
@@ -185,7 +214,7 @@ def test_non_adjacent_step_restarts_trajectory():
 
 
 def test_reset_clears_state_between_generations():
-    controller = SeaCacheController(threshold=0.25, max_consecutive_cached_steps=2)
+    controller = SeaCacheController(threshold=0.25, max_continuous_cached_steps=2)
     _run_trajectory(controller, num_steps=8)
     _, computed, _ = _run_trajectory(controller, num_steps=4)
     assert computed == [0, 3]
@@ -227,6 +256,10 @@ class _FakeTransformer(nn.Module):
         )
 
 
+# The fake loops run a few steps; without a warm-up they can cache from step 1.
+ACCELERATOR_CONFIG = SeaCacheConfig(max_warmup_steps=0)
+
+
 def _fake_pipeline(num_steps=8, **overrides):
     pipeline = SimpleNamespace(
         transformer=_FakeTransformer(),
@@ -254,7 +287,7 @@ def _denoise(pipeline, accelerator, num_steps, latents_fn=_slow_latents, **forwa
 
 def test_accelerator_skips_generator_stack_on_cached_steps():
     pipeline = _fake_pipeline()
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
     assert accelerator.is_enabled()
     _denoise(pipeline, accelerator, 8)
@@ -273,7 +306,7 @@ def test_accelerator_reads_sigma_of_the_current_step(monkeypatch):
         return original(latents, sigma)
 
     monkeypatch.setattr(seacache, "build_indicator", recording_build_indicator)
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
     _denoise(pipeline, accelerator, 8)
     assert observed == pytest.approx(pipeline.scheduler.sigmas[:8].tolist())
@@ -283,7 +316,7 @@ def test_accelerator_reads_sigma_of_the_current_step(monkeypatch):
 def test_accelerator_releases_tensors_when_denoising_ends(fail_at_step):
     """The residual history is dropped when the loop ends, also on failure; stats survive."""
     pipeline = _fake_pipeline()
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
 
     def latents(step):
@@ -304,7 +337,7 @@ def test_accelerator_releases_tensors_when_denoising_ends(fail_at_step):
 
 def test_accelerator_forwards_step_hooks():
     pipeline = _fake_pipeline()
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
     pipeline.transformer.set_denoising_step(step_index=3, num_steps=8)
     assert vars(pipeline.transformer)["denoising_step"] == 3
@@ -316,7 +349,7 @@ def test_accelerator_runs_calls_outside_a_denoising_loop_uncached():
     # E.g. the Cosmos3 transfer loop: no refresh() and no set_denoising_step(),
     # even right after a cached request.
     pipeline = _fake_pipeline()
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
     _denoise(pipeline, accelerator, 8)
     calls_after_first_request = pipeline.transformer.stack_calls
@@ -327,7 +360,7 @@ def test_accelerator_runs_calls_outside_a_denoising_loop_uncached():
 
 def test_accelerator_runs_single_frame_latents_uncached():
     pipeline = _fake_pipeline()
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
     _denoise(pipeline, accelerator, 8, latents_fn=lambda step: _slow_latents(step)[:, :, :1])
     assert pipeline.transformer.stack_calls == 8
@@ -335,7 +368,7 @@ def test_accelerator_runs_single_frame_latents_uncached():
 
 def test_accelerator_runs_unsupported_streams_uncached():
     pipeline = _fake_pipeline()
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
     _denoise(pipeline, accelerator, 8, audio_latents=torch.zeros(1))
     assert pipeline.transformer.stack_calls == 8
@@ -344,7 +377,7 @@ def test_accelerator_runs_unsupported_streams_uncached():
 
 def test_accelerator_unwrap_restores_original_stack():
     pipeline = _fake_pipeline()
-    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG)
     accelerator.wrap()
     accelerator.unwrap()
     assert not accelerator.is_enabled()
@@ -369,7 +402,7 @@ def test_accelerator_unwrap_restores_original_stack():
     ],
 )
 def test_accelerator_rejects_unsupported_setups(overrides, match):
-    accelerator = SeaCacheAccelerator(_fake_pipeline(**overrides), SeaCacheConfig())
+    accelerator = SeaCacheAccelerator(_fake_pipeline(**overrides), ACCELERATOR_CONFIG)
     with pytest.raises(NotImplementedError, match=match):
         accelerator.wrap()
     assert not accelerator.is_enabled()
@@ -379,7 +412,7 @@ def test_accelerator_rejects_step_precision_policy():
     pipeline = _fake_pipeline()
     pipeline.transformer.step_precision_controller = object()
     with pytest.raises(NotImplementedError, match="precision policy"):
-        SeaCacheAccelerator(pipeline, SeaCacheConfig()).wrap()
+        SeaCacheAccelerator(pipeline, ACCELERATOR_CONFIG).wrap()
 
 
 def test_pipeline_setup_installs_seacache_accelerator():
