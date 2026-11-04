@@ -226,9 +226,10 @@ def generate_realistic_pre_data(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
+    seed: int = 123,
 ) -> dict[str, torch.Tensor | float]:
     """Generate real-scale mHC data to catch RMS denominator regressions."""
-    torch.random.manual_seed(123)
+    torch.random.manual_seed(seed)
 
     hc_mult2 = hc_mult * hc_mult
     hc_mult3 = hc_mult * 2 + hc_mult2
@@ -415,6 +416,80 @@ def test_mhc_pre_mapping_pro_hidden_size(n: int, hidden_size: int, hc_mult: int)
     torch.testing.assert_close(post_mix_ref, post_mix_cuda, rtol=1e-4, atol=1e-3)
     torch.testing.assert_close(comb_mix_ref, comb_mix_cuda, rtol=1e-3, atol=5e-3)
     torch.testing.assert_close(layer_input_ref, layer_input_cuda, rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.parametrize("fuse_norm", [False, True])
+@pytest.mark.parametrize("bigfuse_bs", [128, 256, 512])
+@pytest.mark.parametrize("n", [1, 32, 64, 128])
+@skip_pre_blackwell
+def test_mhc_pre_mapping_dg_splitk_matches_reference(
+    n: int, bigfuse_bs: int, fuse_norm: bool
+) -> None:
+    """The DeepGEMM split-K pre-mapping tactic (16 splits) matches its no-split form and torch.
+
+    At block size 512 and M <= 64 it runs the bulk-TMA big-fuse with the 16-split per-value sum,
+    the path DeepSeek-V4's first hyper-connection boundary takes at small decode batches. With
+    real-scale inputs a wrong split sum reaches the outputs; against ``dg_nosplit`` only the fp32
+    summation order differs, so the comparison there is tight.
+    """
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    if mhc_cuda._get_dg_fn() is None:
+        pytest.skip("DeepGEMM tf32_hc_prenorm_gemm is not available")
+    hidden_size, hc_mult = 7168, 4
+    data = generate_realistic_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size, seed=31 + n)
+    residual = data["residual"]
+    runner = mhc_cuda.MhcPreMappingRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=data["rms_eps"],
+        hc_pre_eps=data["hc_pre_eps"],
+        hc_sinkhorn_eps=data["hc_sinkhorn_eps"],
+        hc_post_mult_value=data["hc_post_mult_value"],
+        sinkhorn_repeat=data["sinkhorn_repeat"],
+    )
+    inputs = [
+        residual.view(n, hc_mult * hidden_size),
+        data["fn"].contiguous(),
+        residual,
+        data["hc_scale"],
+        data["hc_base"],
+    ]
+    kwargs = {}
+    if fuse_norm:
+        kwargs = {
+            "norm_weight": (1.0 + 0.1 * torch.randn((hidden_size,), device="cuda")).bfloat16(),
+            "norm_eps": 1e-6,
+        }
+    post_mix, comb_mix, layer_input = runner(
+        inputs=inputs, tactic=("dg_splitk", 0, 0, bigfuse_bs), **kwargs
+    )
+    post_one, comb_one, layer_input_one = runner(
+        inputs=inputs, tactic=("dg_nosplit", 0, 0, bigfuse_bs), **kwargs
+    )
+    torch.testing.assert_close(post_mix, post_one, rtol=0, atol=1e-4)
+    torch.testing.assert_close(comb_mix, comb_one, rtol=0, atol=1e-4)
+    torch.testing.assert_close(layer_input.float(), layer_input_one.float(), rtol=1e-2, atol=1e-2)
+
+    post_ref, comb_ref, layer_input_ref = vanilla_pre_mapping(
+        residual,
+        data["fn"],
+        data["hc_scale"],
+        data["hc_base"],
+        hc_mult,
+        data["rms_eps"],
+        data["hc_pre_eps"],
+        data["hc_sinkhorn_eps"],
+        data["hc_post_mult_value"],
+        data["sinkhorn_repeat"],
+    )
+    if fuse_norm:
+        li = layer_input_ref.float()
+        inv_rms = torch.rsqrt(li.square().mean(-1, keepdim=True) + kwargs["norm_eps"])
+        layer_input_ref = (li * inv_rms).bfloat16() * kwargs["norm_weight"]
+    torch.testing.assert_close(post_mix.view_as(post_ref), post_ref, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(comb_mix.view_as(comb_ref), comb_ref, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(layer_input, layer_input_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [64, 128, 4096, 8192])
@@ -699,80 +774,61 @@ def test_mhc_fused_hc_fused_norm(n: int, hidden_size: int, hc_mult: int):
         (384, 7168, ("fused_half_mma", 0, 0, 0, 1)),
     ],
 )
+@pytest.mark.parametrize("fuse_norm", [False, True])
 @skip_pre_blackwell
 def test_mhc_fused_hc_mma_split_k_deterministic(
-    n: int, hidden_size: int, tactic: tuple[str, int, int, int, int]
+    monkeypatch: pytest.MonkeyPatch,
+    n: int,
+    hidden_size: int,
+    tactic: tuple[str, int, int, int, int],
+    fuse_norm: bool,
 ) -> None:
-    """Split-K MMA fused_hc returns bit-identical outputs for identical inputs.
+    """Split-K MMA fused_hc writes every split and sums the splits in a fixed order.
 
-    The split partials are reduced in split order, so repeated calls must not
-    differ in any bit, and the result must still match the torch reference.
+    The inputs are at real scale, so the GEMM terms reach the outputs, and the split workspaces
+    come back NaN-filled, so a split slot the producer leaves unwritten reaches them too.
+    Repeated calls must agree bit for bit, and the outputs must match the same backend run with
+    one split, which differs only in fp32 summation order: a missing or misplaced split moves
+    post_mix / comb_mix far beyond that.
     """
     if not _mhc_fused_hc_mma_available():
         pytest.skip("TF32 MMA fused_hc backend not available")
-    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
 
-    hc_mult = 4
-    pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
-    torch.random.manual_seed(7)
-    device = "cuda"
-    x_prev = torch.randn((n, hidden_size), dtype=torch.bfloat16, device=device) / hidden_size
-    residual_prev = (
-        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device) / hidden_size
-    ).bfloat16()
-    post_mix_prev = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
-    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+    alloc_scratch = mhc_cuda._alloc_fused_hc_scratch
 
-    cur_module = mHC(
-        mult=hc_mult,
-        hidden_size=hidden_size,
-        sinkhorn_iters=pre_data["sinkhorn_repeat"],
-        dtype=None,
-        eps=pre_data["hc_pre_eps"],
-        norm_eps=pre_data["rms_eps"],
-        post_mult_value=pre_data["hc_post_mult_value"],
-    ).cuda()
-    cur_module.fn.copy_(pre_data["fn"])
-    cur_module.scale.copy_(pre_data["hc_scale"])
-    cur_module.base.copy_(pre_data["hc_base"])
-    residual_cur_ref = cur_module.post_mapping(
-        x_prev.clone(), residual_prev.clone(), post_mix_prev.clone(), comb_mix_prev.clone()
-    )
-    post_mix_ref, comb_mix_ref, layer_input_ref = cur_module.pre_mapping(residual_cur_ref.clone())
+    def nan_filled_scratch(*args: object, **kwargs: object) -> tuple[torch.Tensor, ...]:
+        y_acc, r_acc, done_counter = alloc_scratch(*args, **kwargs)
+        return y_acc.fill_(float("nan")), r_acc.fill_(float("nan")), done_counter
 
-    runner = MhcFusedHcRunner(
-        n=hc_mult,
-        hidden_size=hidden_size,
-        rms_eps=pre_data["rms_eps"],
-        hc_pre_eps=pre_data["hc_pre_eps"],
-        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
-        hc_post_mult_value=pre_data["hc_post_mult_value"],
-        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
-    )
-    inputs = [
-        x_prev,
-        residual_prev.contiguous(),
-        post_mix_prev.reshape(n, hc_mult).contiguous(),
-        comb_mix_prev.reshape(n, hc_mult, hc_mult).contiguous(),
-        cur_module.fn.detach().contiguous(),
-        cur_module.scale.detach(),
-        cur_module.base.detach(),
+    monkeypatch.setattr(mhc_cuda, "_alloc_fused_hc_scratch", nan_filled_scratch)
+    runner, inputs, norm = _make_real_scale_fused_hc_case(n, hidden_size, seed=7)
+    kwargs = norm if fuse_norm else {}
+
+    outputs = [
+        runner(inputs=[t.clone() for t in inputs], tactic=tactic, **kwargs) for _ in range(4)
     ]
-
-    outputs = [runner(inputs=[t.clone() for t in inputs], tactic=tactic) for _ in range(4)]
+    assert all(torch.isfinite(t.float()).all() for t in outputs[0]), (
+        f"tactic={tactic} n={n}: non-finite output (an unwritten split slot?)"
+    )
     for repeat in outputs[1:]:
         for first, other in zip(outputs[0], repeat):
             assert torch.equal(first, other), (
                 f"tactic={tactic} n={n}: outputs differ between identical calls"
             )
 
-    residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = outputs[0]
-    torch.testing.assert_close(residual_cur, residual_cur_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(post_mix_cur.view(n, hc_mult, 1), post_mix_ref, rtol=1e-3, atol=5e-3)
-    torch.testing.assert_close(
-        comb_mix_cur.view(n, hc_mult, hc_mult), comb_mix_ref, rtol=1e-3, atol=5e-3
+    backend, tile_n, _, bigfuse_bs, tile_m = tactic
+    one_split = runner(
+        inputs=[t.clone() for t in inputs],
+        tactic=(backend, tile_n, 1, bigfuse_bs, tile_m),
+        **kwargs,
     )
-    torch.testing.assert_close(layer_input_cur, layer_input_ref, rtol=1e-2, atol=1e-2)
+    residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = outputs[0]
+    # residual_cur comes from the post-mapping stage, which the split count does not touch.
+    torch.testing.assert_close(residual_cur, one_split[0], rtol=0, atol=0)
+    torch.testing.assert_close(post_mix_cur, one_split[1], rtol=0, atol=1e-4)
+    torch.testing.assert_close(comb_mix_cur, one_split[2], rtol=0, atol=1e-4)
+    torch.testing.assert_close(layer_input_cur.float(), one_split[3].float(), rtol=1e-2, atol=1e-2)
 
 
 def test_mhc_ops_reject_short_split_workspaces() -> None:
@@ -875,23 +931,24 @@ def _make_real_scale_fused_hc_case(
 ) -> tuple["MhcFusedHcRunner", list[torch.Tensor], dict[str, torch.Tensor | float]]:
     """Fused-HC inputs at real scale, with the fused next-layer RMSNorm the models use.
 
-    The GEMM terms are comparable to the logit bias here, so a change in summation order
-    reaches the outputs instead of being rounded away.
+    The previous residual and the mHC weights come from ``generate_realistic_pre_data``. The
+    GEMM terms are comparable to the logit bias here, so a change in summation order reaches
+    the outputs instead of being rounded away.
     """
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
 
     hc_mult = 4
-    mix = hc_mult * (2 + hc_mult)
-    torch.random.manual_seed(seed)
+    data = generate_realistic_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size, seed=seed)
+    torch.random.manual_seed(seed + 1)
     device = "cuda"
     inputs = [
         torch.randn((n, hidden_size), device=device).bfloat16(),
-        torch.randn((n, hc_mult, hidden_size), device=device).bfloat16(),
+        data["residual"],
         2.0 * torch.sigmoid(torch.randn((n, hc_mult), device=device)),
         torch.softmax(torch.randn((n, hc_mult, hc_mult), device=device), dim=-1),
-        torch.randn((mix, hc_mult * hidden_size), device=device) * 0.05,
-        torch.tensor([0.10, 0.10, 0.30], device=device),
-        torch.randn((mix,), device=device) * 2.0,
+        data["fn"].contiguous(),
+        data["hc_scale"],
+        data["hc_base"],
     ]
     norm = {
         "norm_weight": (1.0 + 0.1 * torch.randn((hidden_size,), device=device)).bfloat16(),
@@ -900,11 +957,11 @@ def _make_real_scale_fused_hc_case(
     runner = MhcFusedHcRunner(
         n=hc_mult,
         hidden_size=hidden_size,
-        rms_eps=1e-6,
-        hc_pre_eps=1e-6,
-        hc_sinkhorn_eps=1e-6,
-        hc_post_mult_value=1.0,
-        sinkhorn_repeat=20,
+        rms_eps=data["rms_eps"],
+        hc_pre_eps=data["hc_pre_eps"],
+        hc_sinkhorn_eps=data["hc_sinkhorn_eps"],
+        hc_post_mult_value=data["hc_post_mult_value"],
+        sinkhorn_repeat=data["sinkhorn_repeat"],
     )
     return runner, inputs, norm
 
@@ -918,7 +975,7 @@ def test_mhc_fused_hc_small_m_fma_candidates_agree(n: int, hidden_size: int) -> 
     the same backend, split count and BigFuse block size compute identical bits; in particular
     the pinned half-FMA candidates differ only in tile width, so whichever one wins the timing,
     the outputs are the same. Candidates that differ in one of those parameters may differ, and
-    the autotuner still chooses among them (see _FUSED_HC_SMALL_M_FMA_KS).
+    the autotuner still chooses among them (see the comment above _FUSED_HC_SMALL_M_HALF_FMA_BS).
     """
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_small_m_half_fma_tactics
 
@@ -942,6 +999,43 @@ def test_mhc_fused_hc_small_m_fma_candidates_agree(n: int, hidden_size: int) -> 
             assert all(torch.equal(a, b) for a, b in zip(outputs[members[0]], outputs[tactic])), (
                 f"{tactic} differs from {members[0]} although both sum in order {key}"
             )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", [(10, 3), (10, 0), (10, 7), (9, 0), (12, 0)])
+@pytest.mark.parametrize("n", [1, 8, 32])
+def test_mhc_fused_hc_small_m_half_fma_pin_is_sm103_only(
+    monkeypatch: pytest.MonkeyPatch, arch: tuple[int, int], n: int
+) -> None:
+    """At M <= 32 SM103 offers exactly the pinned half-FMA candidates; other GPUs offer more.
+
+    The device properties are faked, so the check runs on any machine for every architecture.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    props = SimpleNamespace(major=arch[0], minor=arch[1], multi_processor_count=148)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: props)
+    monkeypatch.setattr(mhc_cuda, "_fused_hc_mma_supported", lambda: arch[0] == 10)
+    runner = mhc_cuda.MhcFusedHcRunner(
+        n=4,
+        hidden_size=7168,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=20,
+    )
+    # get_valid_tactics reads only the token count and the device of the first input.
+    inputs = [torch.empty((n, 7168), dtype=torch.bfloat16)]
+    offered = {t for t in runner.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma"}
+    pinned = set(mhc_cuda._fused_hc_small_m_half_fma_tactics(n, 4, pinned=True))
+    assert pinned
+    if arch == (10, 3):
+        assert offered == pinned
+    else:
+        assert pinned < offered
 
 
 @pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))
@@ -2266,6 +2360,93 @@ def test_fused_hc_lagged_matches_eager_composition(num_tokens: int):
     torch.testing.assert_close(pre_cur, pre_ref, rtol=1e-3, atol=2e-3)
     torch.testing.assert_close(post_cur, post_ref, rtol=1e-3, atol=3e-3)
     torch.testing.assert_close(comb_cur, comb_ref, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(layer_input.float(), li_ref.float(), rtol=2e-2, atol=2e-2)
+
+
+@skip_pre_blackwell
+@requires_cuda
+@pytest.mark.parametrize(
+    "num_tokens,num_k_splits",
+    # Hidden 5120's ladder picks at 48 and 256 tokens; both run the runtime-split big-fuse.
+    [(48, 80), (256, 20)],
+)
+def test_fused_hc_lagged_half_mma_runtime_split_matches_eager(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int, num_k_splits: int
+) -> None:
+    """V4.1-Flash's lagged boundary on the half-MMA path at hidden 5120.
+
+    Forces the tactic, so the lagged pre-mix variant of the runtime-split big-fuse runs. The
+    split workspaces come back NaN-filled; the outputs must repeat bit for bit, match the same
+    tactic with one split up to fp32 summation order, and match the eager composition.
+    """
+    if not _mhc_fused_hc_mma_available():
+        pytest.skip("TF32 MMA fused_hc backend not available")
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    alloc_scratch = mhc_cuda._alloc_fused_hc_scratch
+
+    def nan_filled_scratch(*args: object, **kwargs: object) -> tuple[torch.Tensor, ...]:
+        y_acc, r_acc, done_counter = alloc_scratch(*args, **kwargs)
+        return y_acc.fill_(float("nan")), r_acc.fill_(float("nan")), done_counter
+
+    monkeypatch.setattr(mhc_cuda, "_alloc_fused_hc_scratch", nan_filled_scratch)
+    hidden_size = V41_REAL_HIDDEN_SIZE
+    module_prev = _build_mhc(hidden_size, seed=0)
+    module = _build_mhc(hidden_size, seed=2)
+    residual_prev = _residual(num_tokens, hidden_size, seed=1)
+    x_prev = (_residual(num_tokens, hidden_size, seed=4)[:, 0, :]).contiguous()
+    _, post_prev, comb_prev = module_prev.hc_coeffs(residual_prev)
+    pre_ext = module_prev.hc_coeffs(_residual(num_tokens, hidden_size, seed=3))[0]
+    torch.manual_seed(9)
+    norm_w = (torch.rand(hidden_size, device="cuda") + 0.5).bfloat16()
+    norm_eps = 1e-6
+
+    residual_ref = module_prev.post_mapping(x_prev, residual_prev, post_prev, comb_prev)
+    pre_ref, post_ref, comb_ref = module.hc_coeffs(residual_ref)
+    li = mHC.collapse(residual_ref, pre_ext).float()
+    li_ref = (
+        li * torch.rsqrt(li.square().mean(-1, keepdim=True) + norm_eps) * norm_w.float()
+    ).bfloat16()
+
+    runner = mhc_cuda.MhcFusedHcRunner(
+        n=V41_HC_MULT,
+        hidden_size=hidden_size,
+        rms_eps=module.norm_eps,
+        hc_pre_eps=module.eps,
+        hc_sinkhorn_eps=module.sinkhorn_eps,
+        hc_post_mult_value=module.post_mult_value,
+        sinkhorn_repeat=module.sinkhorn_iters,
+    )
+    inputs = [
+        x_prev,
+        residual_prev.contiguous(),
+        post_prev.reshape(num_tokens, V41_HC_MULT).contiguous(),
+        comb_prev.reshape(num_tokens, V41_HC_MULT, V41_HC_MULT).contiguous(),
+        module.fn.contiguous(),
+        module.scale,
+        module.base,
+    ]
+    kwargs = {"pre_mix_ext": pre_ext, "norm_weight": norm_w, "norm_eps": norm_eps}
+
+    def run(splits: int) -> tuple[torch.Tensor, ...]:
+        tactic = ("fused_half_mma", 0, splits, 512, 1)
+        return tuple(t.clone() for t in runner(inputs=inputs, tactic=tactic, **kwargs))
+
+    outputs = run(num_k_splits)
+    assert all(torch.isfinite(t.float()).all() for t in outputs), "non-finite output"
+    assert all(torch.equal(a, b) for a, b in zip(outputs, run(num_k_splits))), "not reproducible"
+    residual_cur, post_cur, comb_cur, layer_input, pre_cur = outputs
+    one_split = run(1)
+    torch.testing.assert_close(residual_cur, one_split[0], rtol=0, atol=0)
+    for name, index in (("post_mix", 1), ("comb_mix", 2), ("pre_mix", 4)):
+        torch.testing.assert_close(
+            outputs[index], one_split[index], rtol=0, atol=1e-4, msg=f"{name} vs one split"
+        )
+
+    _assert_bf16_within_one_ulp(residual_cur, residual_ref.reshape_as(residual_cur), "residual_cur")
+    torch.testing.assert_close(pre_cur.view_as(pre_ref), pre_ref, rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(post_cur.view_as(post_ref), post_ref, rtol=1e-3, atol=3e-3)
+    torch.testing.assert_close(comb_cur.view_as(comb_ref), comb_ref, rtol=1e-3, atol=5e-3)
     torch.testing.assert_close(layer_input.float(), li_ref.float(), rtol=2e-2, atol=2e-2)
 
 

@@ -165,20 +165,21 @@ class DecoderMetadata:
 
     @torch.inference_mode()
     def _warmup_dspark_ragged_compressor_metadata(self) -> None:
-        """Compile DSv4 ragged metadata for a non-CUDA-graph batch size.
+        """Compile the DSv4 compressor metadata helpers before the hang detector starts.
 
-        Whole-model CUDA-graph warmup exercises only configured graph batch
-        sizes. The first mixed attention-DP iteration can contain an
-        intermediate number of generation requests, which otherwise triggers
-        a long ``torch.compile`` specialization immediately before a TP
-        collective. Ranks without generation work reach the collective first
-        and can trip the executor hang detector while their peers compile.
+        ``_compute_gen_compressed_position_ids`` and ``_compute_compressed_mask``
+        read the batch composition from device tensors, so each compiles once and
+        that graph serves every batch mix. The one compile must not land on the
+        first mixed attention-DP iteration: it runs right before a TP collective,
+        and ranks without generation work reach the collective first and can trip
+        the executor hang detector while their peers compile.
 
-        One non-bucket probe forces the dynamic specialization during engine
-        warmup, before the hang detector starts. It uses the metadata's real
-        persistent buffers so the tensor shape and stride guards match serving.
-        Those buffers are created under inference mode, so all probe and
-        cleanup mutations must run under the same mode.
+        This probe calls both helpers once during engine warmup, with a number of
+        generation requests outside the CUDA-graph batch sizes. It uses the
+        metadata's real persistent buffers so the tensor shape and stride guards
+        match serving, and restores them afterwards. Those buffers are created
+        under inference mode, so all probe and cleanup mutations must run under
+        the same mode.
         """
         if not self._ragged_verification_enabled:
             return
@@ -259,8 +260,8 @@ class DecoderMetadata:
                 cu_new_comp[: num_generations + 1].mul_(compressed_tokens_per_generation)
 
             logger.info(
-                "DSpark ragged metadata warmup: compiling one non-graph "
-                f"shape with {num_generations} generation requests"
+                "DSpark ragged metadata warmup: compiling the compressor metadata "
+                f"helpers with {num_generations} generation requests"
             )
             gen_params = metadata.gen_position_params_cuda
             gen_params[0].fill_(0)

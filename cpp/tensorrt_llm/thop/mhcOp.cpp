@@ -177,16 +177,15 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
     // runs with. Path F (3) accumulates its at most two splits into one zeroed [M, ...] slot.
     if (backend != 3)
     {
-        if (backend != 1)
-        {
-            num_k_splits = tk::mhcFusedHcMmaKSplits(static_cast<int>(M), static_cast<int>(num_k_splits), backend == 2);
-        }
-        int64_t const numSplits = std::max<int64_t>(num_k_splits, 1);
+        // Only fused_half_mma resolves num_k_splits <= 0 with a heuristic; the other two run max(num_k_splits, 1).
+        int64_t const numSplits = backend == 0
+            ? tk::mhcFusedHcMmaKSplits(static_cast<int>(M), static_cast<int>(num_k_splits), /*allInOne=*/false)
+            : std::max<int64_t>(num_k_splits, 1);
         int64_t const shapeN = hc_mult * (2 + hc_mult);
         TORCH_CHECK(y_acc_workspace.numel() >= numSplits * M * shapeN && r_acc_workspace.numel() >= numSplits * M,
-            "mhc_fused_hc: backend ", backend, " with num_k_splits=", numSplits, " needs y_acc_workspace of ",
-            numSplits * M * shapeN, " and r_acc_workspace of ", numSplits * M, " fp32 elements, got ",
-            y_acc_workspace.numel(), " and ", r_acc_workspace.numel());
+            "mhc_fused_hc: backend ", backend, " with num_k_splits=", num_k_splits, " runs ", numSplits,
+            " splits and needs y_acc_workspace of ", numSplits * M * shapeN, " and r_acc_workspace of ", numSplits * M,
+            " fp32 elements, got ", y_acc_workspace.numel(), " and ", r_acc_workspace.numel());
     }
 
     // backend codes:

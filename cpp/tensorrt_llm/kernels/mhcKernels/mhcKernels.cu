@@ -135,12 +135,12 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     // of the splits and warp 0 adds the per-warp partials in warp order. NUM_SPLITS 8 and 16 are summed by warp 0
     // alone in split order. Either order is fixed, so the result is independent of how the producer's split CTAs
     // ran. Two and four splits are summed per lane in Phase 1a.
-    constexpr bool kLaneSplitSum = NUM_SPLITS == 0 || NUM_SPLITS >= 8;
+    constexpr bool kPerValueSplitSum = NUM_SPLITS == 0 || NUM_SPLITS >= 8;
     float rSplit = 0.0F;
     float yPreSplit = 0.0F;
     float yPostSplit = 0.0F;
     float cmSplit[HC_MULT] = {};
-    if constexpr (kLaneSplitSum)
+    if constexpr (kPerValueSplitSum)
     {
         float splitSum = 0.0F;
         if constexpr (NUM_SPLITS == 0)
@@ -241,7 +241,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             for (int k = 0; k < HC_MULT; k++)
                 cm[k] = y_row[2 * HC_MULT + lane * HC_MULT + k];
         }
-        else if constexpr (kLaneSplitSum)
+        else if constexpr (kPerValueSplitSum)
         {
             r_val = rSplit;
             y_pre = yPreSplit;
@@ -254,8 +254,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         }
         else
         {
-            // Compile-time split counts: this lane sums the seven values it consumes over the splits in split order,
-            // so the result is independent of how the producer's split CTAs ran.
+            // Two and four splits: this lane sums the seven values it consumes over the splits in split order, so
+            // the result is independent of how the producer's split CTAs ran.
             r_val = 0.0f;
 #pragma unroll
             for (int s = 0; s < NUM_SPLITS; s++)
@@ -1004,8 +1004,8 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
         // TMA wins only through M=64; its shared-memory footprint regresses
         // M>=128, where regular LDG has enough latency hiding. The residual
         // prefetch is independent of the split-K prologue; two and four splits
-        // (the half-FMA path's) measure faster without it once the next-layer
-        // norm is fused.
+        // (at M <= 64 only the half-FMA path runs them) measure faster without
+        // it once the next-layer norm is fused.
         if constexpr (NUM_SPLITS != 2 && NUM_SPLITS != 4)
         {
             if (M <= 64)

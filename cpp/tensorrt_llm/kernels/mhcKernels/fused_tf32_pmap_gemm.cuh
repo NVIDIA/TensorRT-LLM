@@ -218,7 +218,7 @@ __device__ __forceinline__ float2 mul_f32x2(float2 const& a, float2 const& b)
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
     uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kEarlyRelease = false>
-__global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf32_pmap_gemm_rout_atomic_impl(
+__global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf32_pmap_gemm_rout_impl(
     const uint32_t shape_m, const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
     const __grid_constant__ cute::TmaDescriptor tensor_map_x, const __grid_constant__ cute::TmaDescriptor tensor_map_b,
     const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out,
@@ -226,7 +226,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     const __grid_constant__ cute::TmaDescriptor tensor_map_comb, float const* __restrict__ post_mix,
     float const* __restrict__ comb_mix, float* __restrict__ D, float* __restrict__ sqr_sum)
 { // D [kNumSplits, M, SHAPE_N], sqr_sum [kNumSplits, M]: each split CTA stores its own partial (no atomics); the
-  // consumer (mhcBigFuseKernel) sums the splits in split order, so the result does not depend on CTA timing.
+  // consumer (mhcBigFuseKernel) sums the splits in a fixed order, so the result does not depend on CTA timing.
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -777,7 +777,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 // residual_cur @ W_T GEMM (instead of CUDA-core FMA).
 //
 // Pipelining, warp layout, and SMEM layout inherit from Path B
-// (fused_tf32_pmap_gemm_rout_atomic_impl): the pmap warp group computes
+// (fused_tf32_pmap_gemm_rout_impl): the pmap warp group computes
 // residual_cur, TMA-stores it to GMEM, and STSM-casts it into TMEM; the MMA
 // warp group consumes TMEM for the GEMM; the epilogue stores each split's
 // partial into its own y_acc / sqr_sum slot. Phase 3 is a per-m_block barrier

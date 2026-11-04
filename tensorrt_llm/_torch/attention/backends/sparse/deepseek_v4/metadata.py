@@ -1088,7 +1088,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         during postprocess, so their position IDs are irrelevant.
 
         Generation outputs of ratio ``r`` occupy slots
-        ``[cu_new_comp_kv[r][num_contexts], ... + num_generations * ceil(next_n / r))``;
+        ``[cu_new_comp_kv[r][num_contexts], ... + num_generations * ceil(num_gen_tokens_per_seq / r))``;
         slots outside that range (the context prefix and the tail) are left
         untouched.
 
@@ -1116,16 +1116,16 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             output_offset = cu.gather(0, num_contexts.long())
 
             # Stale entries past batch_size would break searchsorted's ordering.
-            seq_idx = torch.arange(cu.shape[0] - 1, dtype=torch.int32, device=device)
-            cu_valid = torch.where(seq_idx < batch_size, cu[1:], torch.iinfo(torch.int32).max)
+            req_idx = torch.arange(cu.shape[0] - 1, dtype=torch.int32, device=device)
+            cu_valid = torch.where(req_idx < batch_size, cu[1:], torch.iinfo(torch.int32).max)
 
             output_idx = torch.arange(position_ids.shape[0], dtype=torch.int32, device=device)
-            req_idx = torch.searchsorted(cu_valid, output_idx, right=True)
-            req_idx = torch.maximum(
-                torch.minimum(req_idx, last_seq.to(req_idx.dtype)), num_contexts.to(req_idx.dtype)
+            seq_idx = torch.searchsorted(cu_valid, output_idx, right=True)
+            seq_idx = torch.maximum(
+                torch.minimum(seq_idx, last_seq.to(seq_idx.dtype)), num_contexts.to(seq_idx.dtype)
             )
-            offset_in_req = output_idx - cu[req_idx]
-            result = ((past_kv_lens[req_idx] + offset_in_req) * compress_ratio).to(torch.int)
+            offset_in_seq = output_idx - cu[seq_idx]
+            result = ((past_kv_lens[seq_idx] + offset_in_seq) * compress_ratio).to(torch.int)
             in_gen_range = (output_idx >= output_offset) & (output_idx < output_offset + gen_comp)
             position_ids.copy_(torch.where(in_gen_range, result, position_ids))
 

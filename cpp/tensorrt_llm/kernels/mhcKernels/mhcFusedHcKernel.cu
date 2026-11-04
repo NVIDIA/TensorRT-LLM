@@ -17,7 +17,7 @@
 // Single-launch fused hyper-connection boundary op.
 //
 // This implementation wraps the SM100 tcgen05-based residual-out variant
-// (fused_tf32_pmap_gemm_rout_atomic_impl) to produce residual_cur, D, and
+// (fused_tf32_pmap_gemm_rout_impl) to produce residual_cur, D, and
 // sqr_sum in a single kernel launch; the big-fuse postlogue kernel then
 // consumes (D, sqr_sum, residual_cur) to emit (post_mix_cur, comb_mix_cur,
 // layer_input_cur). Semantically identical to
@@ -93,8 +93,18 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
         y_acc, y_elems, r_acc, r_elems, done_counter, done_elems);
 }
 
+// Zeroes only the done counters of the TF32 all-in-one path's Phase-3 barrier; its per-split workspaces need no
+// zeroing because each slot is written by exactly one CTA.
+inline void fhcZeroDoneCounters(int* done_counter, uint32_t done_elems, cudaStream_t stream)
+{
+    fhcZeroWorkspaces(
+        /*y_acc=*/nullptr, /*y_elems=*/0, /*r_acc=*/nullptr, /*r_elems=*/0, done_counter, done_elems, stream);
+}
+
 } // namespace
 
+// Mirrored by `_fused_hc_mma_k_splits` in tensorrt_llm/_torch/modules/mhc/mhc_cuda.py, which sizes the per-split
+// workspaces and passes the resolved count to the op; change both ladders together.
 int mhcFusedHcMmaKSplits(int M, int numKSplits, bool allInOne)
 {
     if (numKSplits > 0)
@@ -356,7 +366,7 @@ static FusedRoutFn fhcInstance()
 {
     static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
     static_assert(isSupportedFhcHalfMmaKS<Hidden, KS>(), "Unsupported fused-HC half-MMA kNumSplits for hidden size");
-    return &fused_mhc::fused_tf32_pmap_gemm_rout_atomic_impl<FHC_SHAPE_N, Hidden, FHC_HC_MULT, FHC_BLOCK_M, FHC_BLOCK_N,
+    return &fused_mhc::fused_tf32_pmap_gemm_rout_impl<FHC_SHAPE_N, Hidden, FHC_HC_MULT, FHC_BLOCK_M, FHC_BLOCK_N,
         FHC_BLOCK_K, FHC_SWIZZLE_CD, FHC_N_B_STAGES, FHC_N_INPUT_STG, FHC_NUM_MMA_TH, FHC_NUM_PMAP_TH, KS,
         /*kEarlyRelease=*/false>;
 }
@@ -436,7 +446,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     int device_id = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
     // Workspaces are per-split: y_acc [ks, M, SHAPE_N] and r_acc [ks, M]. Every slot is written by exactly
-    // one CTA (no atomics, no pre-zeroing), and the big-fuse step sums the splits in split order.
+    // one CTA (no atomics, no pre-zeroing), and the big-fuse step sums the splits in a fixed order (see
+    // mhcBigFuseKernel).
     uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*allInOne=*/false));
     int const bs = (bigfuse_block_size > 0) ? bigfuse_block_size : selectBigFuseBS(M);
 
@@ -719,8 +730,7 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     // so they need no zeroing. KS=1 skips the barrier (Phase 3 is just __threadfence_block + __syncthreads).
     if (ks > 1)
     {
-        fhcZeroWorkspaces(/*y_acc=*/nullptr, /*y_elems=*/0, /*r_acc=*/nullptr, /*r_elems=*/0, done_counter_workspace,
-            m_tiles, stream);
+        fhcZeroDoneCounters(done_counter_workspace, m_tiles, stream);
     }
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
@@ -855,6 +865,11 @@ using FmaAllInOneFn = void (*)(__nv_bfloat16 const*, __nv_bfloat16 const*, float
 template <int TN, int KS, int TM, bool kFuseNorm, bool kLaggedPre>
 static FmaAllInOneFn fhcFmaAllInOneInstance()
 {
+    // Path F adds its split partials onto one zeroed slot with atomicAdd. Two partials sum the same in either
+    // order; with more, the float sum would depend on the order the CTAs finish.
+    static_assert(KS == 1 || KS == 2,
+        "Path F accumulates with atomicAdd: more than two partials per slot is "
+        "order-dependent");
     return &fused_fma_kernels::fused_pmap_gemm_fma_allinone<TN, KS, TM, /*FULL_N=*/24, /*BF16_VEC_OVERRIDE=*/0,
         kFuseNorm, kLaggedPre>;
 }
@@ -924,15 +939,12 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     int const N = static_cast<int>(FHC_SHAPE_N);
     int const m_batches = (M + tile_m - 1) / tile_m;
 
-    // ---- Zero workspace buffers (atomic accumulators + done counter) ----
-    // NOTE: Path F's kernel epilogue always uses atomicAdd into y_acc/r_acc
-    // (no KS=1 direct-store fast path like the MMA Path D in
-    // mhcFusedHcAllInOneLaunchImpl), so we cannot skip the zero even at
-    // num_k_splits == 1. Adding the direct-store branch would require kernel
-    // changes in fused_pmap_gemm_fma_allinone; deferred since Path F is the
-    // small-M (M <= 32) winner where the workspace zero is ~1 µs anyway.
-    // Path F only instantiates num_k_splits <= 2: at most two partials are added onto the zeroed slot, and that
-    // sum is the same in either order, so the accumulation stays deterministic.
+    // ---- Zero workspace buffers (split accumulators + done counter) ----
+    // Path F's epilogue stores its partial at num_k_splits == 1 and atomicAdds the two partials of
+    // num_k_splits == 2 onto the zeroed slot; two partials sum the same in either order, so the result is
+    // deterministic (fhcFmaAllInOneInstance rejects more splits). One launch zeroes the accumulators and the
+    // done counters together; at num_k_splits == 1 only the counters need it, at about 1 µs for Path F's
+    // small-M (M <= 32) shapes.
     fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * static_cast<uint32_t>(N), r_acc_workspace,
         static_cast<uint32_t>(M), done_counter_workspace, static_cast<uint32_t>(m_batches), stream);
 
