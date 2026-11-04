@@ -22,9 +22,19 @@ from tensorrt_llm.grpc.smg.request_manager import GrpcRequestManager  # noqa: E4
 class _FakeLLM:
     """LLM double with exactly the public health surface health_check reads."""
 
-    def __init__(self, healthy=True, fatal_error=None, encode_only=False, check_raises=None):
+    def __init__(
+        self,
+        healthy=True,
+        fatal_error=None,
+        encode_only=False,
+        check_raises=None,
+        shutdown_started=False,
+        engine_dead=False,
+    ):
         self.args = SimpleNamespace(encode_only=encode_only)
         self.fatal_error = fatal_error
+        self.shutdown_started = shutdown_started
+        self.engine_dead = engine_dead
         self._healthy = healthy
         self._check_raises = check_raises
 
@@ -52,6 +62,23 @@ def test_encode_only_llm_answers_executor_not_available():
 
 def test_unhealthy_llm_without_fatal_error_answers_executor_unhealthy():
     assert _health_check(_FakeLLM(healthy=False)) == (False, "Executor is unhealthy")
+
+
+def test_llm_after_shutdown_answers_executor_not_available():
+    # The public health surface LLM.shutdown() leaves behind: no generation
+    # executor, so unhealthy, shutdown started, no fatal error, engine not dead.
+    llm = _FakeLLM(healthy=False, shutdown_started=True)
+    assert _health_check(llm) == (False, "Executor is not available")
+
+
+def test_dead_engine_during_shutdown_answers_executor_unhealthy():
+    llm = _FakeLLM(healthy=False, shutdown_started=True, engine_dead=True)
+    assert _health_check(llm) == (False, "Executor is unhealthy")
+
+
+def test_fatal_error_during_shutdown_answers_the_fatal_error():
+    llm = _FakeLLM(healthy=False, fatal_error=RuntimeError("CUDA OOM"), shutdown_started=True)
+    assert _health_check(llm) == (False, "RuntimeError: CUDA OOM")
 
 
 def test_fatal_error_message_names_the_exception_type():

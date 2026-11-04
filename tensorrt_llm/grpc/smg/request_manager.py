@@ -182,6 +182,10 @@ class GrpcRequestManager:
                     short = (lines[0] if lines else type(exc).__name__)[:200]
                     error_msg = f"{type(exc).__name__}: {short}"
                     logger.error(f"Health check fatal error: {repr(exc)}")
+                elif self.llm.shutdown_started and not self.llm.engine_dead:
+                    # No fatal error and no dead engine: shutdown() released
+                    # (or is releasing) the generation executor.
+                    error_msg = "Executor is not available"
                 return False, error_msg
 
             return True, "OK"
