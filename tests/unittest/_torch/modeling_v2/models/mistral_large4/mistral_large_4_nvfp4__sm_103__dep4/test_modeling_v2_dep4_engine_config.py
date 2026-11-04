@@ -999,7 +999,6 @@ def test_an_idle_rank_steps_with_a_one_token_generation_dummy(world, dep):
             request_ids=[ATTENTION_DP_DUMMY_REQUEST_ID],
             token_nums=None,
             is_gen=True,
-            prepare_resource=True,
             max_num_draft_tokens=0,
             draft_kv_cache_manager=None,
         )
