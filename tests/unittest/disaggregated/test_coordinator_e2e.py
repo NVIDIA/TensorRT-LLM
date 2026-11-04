@@ -54,11 +54,11 @@ from tensorrt_llm.llmapi.disagg_utils import (
     ServerRole,
 )
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._base.msgspec_route import _MsgspecRequest
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
-from tensorrt_llm.serve.openai_server import _MsgspecRequest
 
 GEN_TEXT = "HELLO_FROM_GEN"
 
