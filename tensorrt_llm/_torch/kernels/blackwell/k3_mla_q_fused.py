@@ -70,6 +70,8 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import cuda as cuda_tma
 
+from . import fp8_block_scale_low_m_gemm as low_m_gemm
+
 # The MXFP8 activation quantization uses the low-M GEMM's own helpers, so the
 # q_b operand is bitwise the one that GEMM quantizes.
 from .fp8_block_scale_low_m_gemm import (
@@ -142,8 +144,8 @@ _QPE_PITCH = ROPE_DIM * 2
 _OB_PITCH = _CTA_COLS * 2 + 16
 _KGROUPS = Q_LORA_RANK // 32
 #: q_b is summed as this many K slices added at the end, the association of the low-M GEMM's
-#: split-K partials at decode token counts (its SM107 tactic for this shape uses split 2 at
-#: M <= 16).
+#: split-K partials: its default tactic for q_b must use this split at every token count of the
+#: kernel (:func:`_qb_split_k`).
 _QB_SPLIT_K = 2
 _KBLOCKS = Q_LORA_RANK // 128
 #: W_UK reuses the shared memory of the first q_b chunks once every MMA warp is done with them;
@@ -226,6 +228,11 @@ def _shfl_bfly_b32(value, offset: int, *, loc=None, ip=None):
             ip=ip,
         )
     )
+
+
+def _qb_split_k(t_pad: int) -> int:
+    """Split-K of the low-M GEMM's default q_b tactic at ``t_pad`` tokens on this device."""
+    return low_m_gemm.default_tactic(t_pad, NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK).split_k
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -842,6 +849,11 @@ class K3MlaQFusedKernel:
     ):
         if t_pad % 8 or not 8 <= t_pad <= MAX_TOKENS:
             raise ValueError(f"t_pad={t_pad}")
+        if _qb_split_k(t_pad) != _QB_SPLIT_K:
+            raise ValueError(
+                f"the low-M GEMM sums q_b in {_qb_split_k(t_pad)} K slices at {t_pad} tokens; "
+                f"the fused query reproduces {_QB_SPLIT_K}"
+            )
         self.t_pad = t_pad
         self.nt = t_pad // 8
         self.use_pdl = use_pdl
@@ -1546,6 +1558,7 @@ def weights_supported(w_qb: torch.Tensor, w_uk: torch.Tensor) -> bool:
         and tuple(w_uk.shape) == (NUM_HEADS, KV_LORA_RANK, NOPE_DIM)
         and w_uk.is_contiguous()
         and w_uk.data_ptr() % 16 == 0
+        and all(_qb_split_k(t_pad) == _QB_SPLIT_K for t_pad in (8, MAX_TOKENS))
     )
 
 
