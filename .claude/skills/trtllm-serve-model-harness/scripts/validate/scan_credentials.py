@@ -31,6 +31,9 @@ Provenance still needs a human or a validator: a model can invent a Bearer-shape
 string or write ``sk-`` as shorthand. Report hits as suspicions until the value
 is shown to be a real credential.
 
+A file that cannot be read to its end gets the error in its row, next to the
+hits of the lines read before the damage; those hits count like any others.
+
 ``--restrict`` chmods files with hits to 0400. Only use it on CLOSED shards: a
 writer that re-opens a 0400 file it still owns fails with EACCES.
 
@@ -130,7 +133,7 @@ def main():
     files = expand(args.paths)
     report_files, new_digests, totals = [], {}, {}
     for path in files:
-        per = {}
+        per, error = {}, None
         try:
             for _, raw in iter_lines(path):
                 for name, value in matches(raw):
@@ -140,12 +143,16 @@ def main():
                     entry = per.setdefault(name, {})
                     slot = entry.setdefault(digest, {"count": 0, "chars": len(value)})
                     slot["count"] += 1
-        except FILE_ERRORS as error:
-            report_files.append({"file": path, "error": type(error).__name__})
-            continue
+        except FILE_ERRORS as exc:
+            # The lines before the damage were read: their hits count as any file's do.
+            error = type(exc).__name__
         if not per:
+            if error:
+                report_files.append({"file": path, "error": error})
             continue
         row = {"file": path, "patterns": {}}
+        if error:
+            row["error"] = error
         for name, values in per.items():
             row["patterns"][name] = [
                 {

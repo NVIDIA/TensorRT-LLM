@@ -549,6 +549,35 @@ def test_scan_credentials_reports_an_unreadable_shard_and_goes_on(tmp_path):
     assert "bearer" in rows["requests-2.jsonl"]["patterns"]
 
 
+def test_scan_credentials_keeps_the_hits_read_before_a_cut(tmp_path):
+    """A cut shard's lines before the damage are scanned: its row has the hits and the error."""
+    import gzip
+    import hashlib
+    import stat
+    import subprocess
+
+    fake = "Bearer " + "fake" * 8  # obviously not a credential, but Bearer-shaped
+    lines = [json.dumps({"k": fake})] + [
+        json.dumps({"n": hashlib.sha256(str(i).encode()).hexdigest()}) for i in range(400)
+    ]
+    packed = gzip.compress(("\n".join(lines) + "\n").encode())
+    shard = tmp_path / "requests-1.jsonl.gz"
+    shard.write_bytes(packed[: len(packed) // 2])
+    os.chmod(shard, 0o644)
+    known = tmp_path / "known.txt"
+    known.write_text("0" * 64 + "\n")
+    out = tmp_path / "scan.json"
+    result = subprocess.run([sys.executable, os.path.join(VALIDATE, "scan_credentials.py"),
+                             "--restrict", "--known", str(known), "--out", str(out), str(shard)],
+                            capture_output=True)  # fmt: skip
+    assert result.returncode == 0, result.stderr
+    report = json.loads(out.read_text())
+    (row,) = report["files"]
+    assert (row["error"], list(row["patterns"])) == ("ShardError", ["bearer"])
+    assert report["matches_by_pattern"] == {"bearer": 1} and len(report["new_digests"]) == 1
+    assert stat.S_IMODE(os.stat(shard).st_mode) == 0o400
+
+
 def _read_to_end(path):
     """``(lines, error)``: what ``iter_lines`` yielded, and what it raised (None if nothing)."""
     lines = []
