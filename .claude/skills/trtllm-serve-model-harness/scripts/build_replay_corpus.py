@@ -55,19 +55,22 @@ counts only.
 
 usage: build_replay_corpus.py --out corpus.jsonl --manifest manifest.json [--workers N] [options] PATH [PATH ...]
 PATH: request shards (requests-*.jsonl[.zst|.gz]) or directories holding them.
+A shard that cannot be read to its end stops the run with a message naming it.
 """
 
 import argparse
 import copy
-import gzip
 import hashlib
-import io
 import json
 import multiprocessing
 import os
 import random
 import re
+import sys
 from collections import Counter, defaultdict
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "validate"))
+from tracelib import ShardError, iter_lines  # noqa: E402
 
 PATTERNS = (  # strong credential signatures; kept in step with validate/scan_credentials.py
     re.compile(rb"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}"),
@@ -82,24 +85,6 @@ PATTERNS = (  # strong credential signatures; kept in step with validate/scan_cr
     re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b"),
 )
 SHARD = re.compile(r"(^|/)requests-[^/]*\.jsonl(\.zst|\.gz)?$")
-
-
-def iter_lines(path):
-    if path.endswith(".zst"):
-        import zstandard
-
-        with open(path, "rb") as fh:
-            reader = zstandard.ZstdDecompressor(max_window_size=2**31).stream_reader(fh)
-            for no, raw in enumerate(io.BufferedReader(reader, buffer_size=1 << 22), 1):
-                yield no, raw.rstrip(b"\n")
-    elif path.endswith(".gz"):
-        with gzip.open(path, "rb") as fh:
-            for no, raw in enumerate(fh, 1):
-                yield no, raw.rstrip(b"\n")
-    else:
-        with open(path, "rb") as fh:
-            for no, raw in enumerate(fh, 1):
-                yield no, raw.rstrip(b"\n")
 
 
 def expand(paths):
@@ -388,46 +373,57 @@ def main():
     # Pass 2: copy and transform only the selected lines.
     out_sha = hashlib.sha256()
     written = 0
-    # The corpus holds whole request bodies (user code, tool output): owner only.
-    fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # The corpus holds whole request bodies (user code, tool output): owner only. It is written
+    # under a temporary name and renamed once complete, so a run that stops leaves no corpus that
+    # a replay could take for a whole one.
+    partial = args.out + ".partial"
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w") as out:
-        for path in sorted(wanted):
-            lines = wanted[path]
-            for line_no, raw in iter_lines(path):
-                entry = lines.get(line_no)
-                if entry is None:
-                    continue
-                key, turn_index, turns_in_thread, (_, _, _, line_sha, trace_id) = entry
-                if hashlib.sha256(raw).hexdigest() != line_sha:
-                    counts["drop:source_changed"] += 1
-                    continue
-                rec = json.loads(raw)
-                body, transforms = transform(rec["body"], args)
-                written += 1
-                line = json.dumps(
-                    {
-                        "corpus_id": f"c{written:07d}",
-                        "route": args.route,
-                        "thread": key,
-                        "turn_index": turn_index,
-                        "turns_in_thread": turns_in_thread,
-                        "source": {
-                            "file": path,
-                            "line": line_no,
-                            "line_sha256": line_sha,
-                            "trace_id": trace_id,
+    try:
+        with os.fdopen(fd, "w") as out:
+            for path in sorted(wanted):
+                lines = wanted[path]
+                last = max(lines)
+                for line_no, raw in iter_lines(path):
+                    if line_no > last:  # what a live shard appended after pass 1 is not read
+                        break
+                    entry = lines.get(line_no)
+                    if entry is None:
+                        continue
+                    key, turn_index, turns_in_thread, (_, _, _, line_sha, trace_id) = entry
+                    if hashlib.sha256(raw).hexdigest() != line_sha:
+                        counts["drop:source_changed"] += 1
+                        continue
+                    rec = json.loads(raw)
+                    body, transforms = transform(rec["body"], args)
+                    written += 1
+                    line = json.dumps(
+                        {
+                            "corpus_id": f"c{written:07d}",
+                            "route": args.route,
+                            "thread": key,
+                            "turn_index": turn_index,
+                            "turns_in_thread": turns_in_thread,
+                            "source": {
+                                "file": path,
+                                "line": line_no,
+                                "line_sha256": line_sha,
+                                "trace_id": trace_id,
+                            },
+                            "original_body_sha256": hashlib.sha256(
+                                json.dumps(rec["body"], sort_keys=True, ensure_ascii=False).encode()
+                            ).hexdigest(),
+                            "transforms": transforms,
+                            "body": body,
                         },
-                        "original_body_sha256": hashlib.sha256(
-                            json.dumps(rec["body"], sort_keys=True, ensure_ascii=False).encode()
-                        ).hexdigest(),
-                        "transforms": transforms,
-                        "body": body,
-                    },
-                    ensure_ascii=False,
-                )
-                out.write(line + "\n")
-                out_sha.update((line + "\n").encode())
+                        ensure_ascii=False,
+                    )
+                    out.write(line + "\n")
+                    out_sha.update((line + "\n").encode())
+    except BaseException:
+        os.unlink(partial)
+        raise
+    os.replace(partial, args.out)
     counts["threads"] = len(by_thread)
     counts["selected"] = len(selected)
     counts["written"] = written
@@ -447,4 +443,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ShardError as error:  # a corpus from part of a shard would read as all of it
+        sys.exit(str(error))

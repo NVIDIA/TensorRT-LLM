@@ -36,35 +36,23 @@ after an error the harness did not understand), the response transport status
 
 usage: harness_signals.py --out signals.json PATH [PATH ...]
 PATH: request/response shards or directories (request-trace layout).
+A shard that cannot be read to its end stops the run with a message naming it.
 """
 
 import argparse
-import gzip
 import hashlib
-import io
 import json
 import os
 import re
+import sys
 from collections import Counter, defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tracelib import ShardError, iter_lines  # noqa: E402
 
 SHARD = re.compile(r"(^|/)(requests|responses)-[^/]*\.jsonl(\.zst|\.gz)?$")
 OUTPUT_TYPES = ("function_call_output", "custom_tool_call_output")
 UNAVAILABLE = re.compile(r"is unavailable in (\w+) mode", re.I)
-
-
-def iter_lines(path):
-    if path.endswith(".zst"):
-        import zstandard
-
-        with open(path, "rb") as fh:
-            reader = zstandard.ZstdDecompressor(max_window_size=2**31).stream_reader(fh)
-            yield from io.BufferedReader(reader, buffer_size=1 << 22)
-    elif path.endswith(".gz"):
-        with gzip.open(path, "rb") as fh:
-            yield from fh
-    else:
-        with open(path, "rb") as fh:
-            yield from fh
 
 
 def expand(paths):
@@ -134,7 +122,7 @@ def main():
     totals = Counter()
     for path in expand(args.paths):
         kind = SHARD.search(path).group(2)
-        for raw in iter_lines(path):
+        for _, raw in iter_lines(path):
             try:
                 rec = json.loads(raw)
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -219,4 +207,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ShardError as error:  # signals from part of a shard would read as all of them
+        sys.exit(str(error))

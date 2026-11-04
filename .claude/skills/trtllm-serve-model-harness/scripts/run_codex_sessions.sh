@@ -18,22 +18,35 @@
 #
 # usage: run_codex_sessions.sh <tasks.tsv> <out_dir>
 #   tasks.tsv: one task per line, "<source dir>\t<prompt>". The source dir is copied into a fresh
-#              per-session workspace; use "-" for an empty one.
+#              per-session workspace; use "-" for an empty one. Blank lines and lines starting
+#              with "#" are skipped.
 # env:
 #   BASE_URL     endpoint base, e.g. http://127.0.0.1:8000/v1   (required)
 #   MODEL        model name to send (default: served)
 #   CONCURRENCY  parallel sessions (default 4)
 #   TIMEOUT_S    per-session wall clock (default 3600)
 #   CODEX_BIN    codex executable (default: codex on PATH)
-#   SANDBOX      codex sandbox mode: read-only | workspace-write | danger-full-access (default workspace-write).
-#                danger-full-access only inside a disposable container or VM.
+#   SANDBOX      codex sandbox mode: read-only | workspace-write | danger-full-access (default
+#                workspace-write); danger-full-access only inside a disposable container or VM.
+#                Codex's own sandbox needs Linux namespaces: in a container that forbids them every
+#                command fails (exit 101, or "bwrap: No permissions to create a new namespace").
+#                Inside such an already isolated container, use SANDBOX=danger-full-access and let
+#                the container be the sandbox.
 #   CONTEXT_WINDOW  optional model_context_window to tell Codex (it compacts when its count reaches it)
 #   EFFORT       optional model_reasoning_effort
 #   EXTRA_ARGS   extra arguments for `codex exec`
+#   HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY, and http_proxy, https_proxy, no_proxy, all_proxy
+#                passed to the sessions only when set (curl reads only the lowercase http_proxy),
+#                e.g. a proxy at a closed port (http://127.0.0.1:9) with the endpoint's host in
+#                NO_PROXY and no_proxy, to cut other egress
+# Relative paths (arguments, CODEX_BIN, source dirs) are taken from where the runner is started.
 #
-# Every session gets its own CODEX_HOME, so the user's ~/.codex (config, auth, history) is never read
-# or written. The endpoint key is a dummy unless TRTLLM_API_KEY is set. Flags were checked against
-# codex-cli 0.155.1: re-check `codex exec --help` for other versions.
+# Every session runs under `env -i` and sees only PATH, its own HOME and CODEX_HOME, the endpoint
+# key TRTLLM_API_KEY, and TERM and the proxy variables above when they are set. So the user's
+# ~/.codex (config, auth, history) is never read or written, and nothing else from the calling
+# shell leaks in. PATH is the caller's: Codex's npm launcher runs `node` from it, and the commands
+# Codex runs find their tools on it. The endpoint key is a dummy unless TRTLLM_API_KEY is set.
+# Flags were checked against codex-cli 0.155.1: re-check `codex exec --help` for other versions.
 #
 # Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,last_message.txt,workspace/} and <out_dir>/sessions.tsv
 # (index, exit code, seconds). Harness-side signals come from the SERVER's request trace:
@@ -47,7 +60,17 @@ CONCURRENCY=${CONCURRENCY:-4}
 TIMEOUT_S=${TIMEOUT_S:-3600}
 CODEX_BIN=${CODEX_BIN:-codex}
 SANDBOX=${SANDBOX:-workspace-write}
-export TRTLLM_API_KEY=${TRTLLM_API_KEY:-dummy-local-key}
+TRTLLM_API_KEY=${TRTLLM_API_KEY:-dummy-local-key}
+# Codex works in the session's workspace: the paths it is given are made absolute here.
+abspath() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$PWD/$1" ;; esac; }
+TASKS=$(abspath "$TASKS")
+OUT=$(abspath "$OUT")
+case $CODEX_BIN in */*) CODEX_BIN=$(abspath "$CODEX_BIN") ;; esac
+# Of the caller's variables, these reach a session only when set.
+PASS_ENV=()
+for name in TERM HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
+  [ -n "${!name+set}" ] && PASS_ENV+=("$name=${!name}")
+done
 mkdir -p "$OUT"
 : > "$OUT/sessions.tsv"
 
@@ -62,7 +85,9 @@ run_one() {
   [ -n "${EFFORT:-}" ] && extra+=(-c "model_reasoning_effort=\"${EFFORT}\"")
   local start=$SECONDS
   # shellcheck disable=SC2086
-  CODEX_HOME="$dir/home" timeout "$TIMEOUT_S" "$CODEX_BIN" exec --json --skip-git-repo-check \
+  timeout "$TIMEOUT_S" env -i PATH="$PATH" HOME="$dir/home" CODEX_HOME="$dir/home" \
+    TRTLLM_API_KEY="$TRTLLM_API_KEY" "${PASS_ENV[@]}" \
+    "$CODEX_BIN" exec --json --skip-git-repo-check \
     -C "$dir/workspace" -s "$SANDBOX" -m "$MODEL" \
     -c 'model_provider="trtllm"' \
     -c "model_providers.trtllm={name=\"trtllm-serve\", base_url=\"${BASE_URL}\", wire_api=\"responses\", env_key=\"TRTLLM_API_KEY\"}" \
@@ -73,8 +98,9 @@ run_one() {
 }
 
 index=0
-while IFS=$'\t' read -r src prompt; do
-  [ -z "${src}${prompt}" ] && continue
+while IFS= read -r line || [ -n "$line" ]; do
+  case ${line#"${line%%[![:space:]]*}"} in "" | "#"*) continue ;; esac  # blank or comment
+  IFS=$'\t' read -r src prompt <<< "$line"
   index=$((index + 1))
   run_one "$index" "$src" "$prompt" &
   while [ "$(jobs -rp | wc -l)" -ge "$CONCURRENCY" ]; do sleep 1; done

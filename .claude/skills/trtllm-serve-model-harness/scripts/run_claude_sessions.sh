@@ -19,7 +19,8 @@
 #
 # usage: run_claude_sessions.sh <tasks.tsv> <out_dir>
 #   tasks.tsv: one task per line, "<source dir>\t<prompt>". The source dir is copied into a fresh
-#              per-session workspace; use "-" for an empty one.
+#              per-session workspace; use "-" for an empty one. Blank lines and lines starting
+#              with "#" are skipped.
 # env:
 #   BASE_URL     endpoint base WITHOUT /v1, e.g. http://127.0.0.1:8000   (required)
 #   MODEL        model name to send (default: served); also used for background tasks
@@ -31,13 +32,19 @@
 #                Allow write/exec tools only inside a disposable container or VM.
 #   ATTRIBUTION  CLAUDE_CODE_ATTRIBUTION_HEADER value (default: unset, i.e. Claude Code's default)
 #   EXTRA_ARGS   extra arguments for `claude -p`
+#   HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY, and http_proxy, https_proxy, no_proxy, all_proxy
+#                passed to the sessions only when set (curl reads only the lowercase http_proxy),
+#                e.g. a proxy at a closed port (http://127.0.0.1:9) with the endpoint's host in
+#                NO_PROXY and no_proxy, to cut other egress
+# Relative paths (arguments, CLAUDE_BIN, source dirs) are taken from where the runner is started.
 #
-# Every session runs under `env -i`: nothing from the calling shell leaks in (a Claude Code parent
-# session exports CLAUDE_CODE_* variables, including a messaging socket and token). Each session
-# gets its own HOME and CLAUDE_CONFIG_DIR, so the user's ~/.claude (credentials, settings, hooks,
-# plugins) is never read. The endpoint credential is a dummy unless ANTHROPIC_AUTH_TOKEN is set.
-# Gateway hint headers are on, so the trace carries request class, prompt id and compaction marks.
-# Flags were checked against Claude Code 2.1.289: re-check `claude --help` for other versions.
+# Every session runs under `env -i`: nothing from the calling shell leaks in but the proxy
+# variables above (a Claude Code parent session exports CLAUDE_CODE_* variables, including a
+# messaging socket and token). Each session gets its own HOME and CLAUDE_CONFIG_DIR, so the
+# user's ~/.claude (credentials, settings, hooks, plugins) is never read. The endpoint credential
+# is a dummy unless ANTHROPIC_AUTH_TOKEN is set. Gateway hint headers are on, so the trace carries
+# request class, prompt id and compaction marks. Flags were checked against Claude Code 2.1.289:
+# re-check `claude --help` for other versions.
 #
 # Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,workspace/} and <out_dir>/sessions.tsv
 # (index, exit code, seconds). Judge the run from the SERVER side trace (request trace or
@@ -53,6 +60,16 @@ CLAUDE_BIN=${CLAUDE_BIN:-$(readlink -f "$(command -v claude)")}
 ALLOWED=${ALLOWED:-Read Glob Grep}
 DISALLOWED=${DISALLOWED:-Bash Write Edit NotebookEdit WebFetch WebSearch}
 TOKEN=${ANTHROPIC_AUTH_TOKEN:-dummy-local-token}
+# A session runs in its own workspace: the paths it uses are made absolute here.
+abspath() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$PWD/$1" ;; esac; }
+TASKS=$(abspath "$TASKS")
+OUT=$(abspath "$OUT")
+case $CLAUDE_BIN in */*) CLAUDE_BIN=$(abspath "$CLAUDE_BIN") ;; esac
+# Of the caller's variables, these reach a session only when set.
+PROXY_ENV=()
+for name in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
+  [ -n "${!name+set}" ] && PROXY_ENV+=("$name=${!name}")
+done
 mkdir -p "$OUT"
 : > "$OUT/sessions.tsv"
 
@@ -71,7 +88,7 @@ run_one() {
     ANTHROPIC_BASE_URL="$BASE_URL" ANTHROPIC_AUTH_TOKEN="$TOKEN" \
     ANTHROPIC_MODEL="$MODEL" ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL" \
     CLAUDE_CODE_GATEWAY_HINT_HEADERS=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-    DISABLE_AUTOUPDATER=1 "${env_extra[@]}" \
+    DISABLE_AUTOUPDATER=1 "${env_extra[@]}" "${PROXY_ENV[@]}" \
     "$CLAUDE_BIN" -p "$prompt" --output-format stream-json --verbose \
     --allowedTools $ALLOWED --disallowedTools $DISALLOWED ${EXTRA_ARGS:-} \
     > "$dir/events.jsonl" 2> "$dir/stderr.log" < /dev/null)
@@ -80,8 +97,9 @@ run_one() {
 }
 
 index=0
-while IFS=$'\t' read -r src prompt; do
-  [ -z "${src}${prompt}" ] && continue
+while IFS= read -r line || [ -n "$line" ]; do
+  case ${line#"${line%%[![:space:]]*}"} in "" | "#"*) continue ;; esac  # blank or comment
+  IFS=$'\t' read -r src prompt <<< "$line"
   index=$((index + 1))
   run_one "$index" "$src" "$prompt" &
   while [ "$(jobs -rp | wc -l)" -ge "$CONCURRENCY" ]; do sleep 1; done

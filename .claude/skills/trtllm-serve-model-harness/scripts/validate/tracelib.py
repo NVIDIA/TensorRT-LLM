@@ -23,7 +23,8 @@ The checks read the request-trace layout that trtllm-serve writes when
 
 Shards may be plain, ``.zst`` or ``.gz``. The replay tool (``../replay_requests.py``)
 writes the same two shapes, so every check
-runs unchanged on recorded traffic and on replayed traffic.
+runs unchanged on recorded traffic and on replayed traffic. A shard that cannot
+be read to its end raises ``ShardError``: a damaged shard never reads as a short one.
 
 Nothing here prints record content. Locators are (file, 1-based line, trace_id).
 """
@@ -34,6 +35,7 @@ import io
 import json
 import os
 import re
+import zlib
 from typing import Iterator, List, Optional, Tuple
 
 TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
@@ -43,24 +45,98 @@ CALL_OUTPUT_TYPES = ("function_call_output", "custom_tool_call_output")
 
 _SHARD = re.compile(r"(^|/)(requests|responses|raw)-[^/]*\.jsonl(\.zst|\.gz)?$")
 
+# What reading a gzip stream raises when the file is cut short or corrupt.
+_GZIP_DAMAGE = (EOFError, gzip.BadGzipFile, zlib.error)
 
-def iter_lines(path: str) -> Iterator[Tuple[int, bytes]]:
-    """Yield ``(line_no, raw_bytes)`` of one shard, without the newline."""
-    if path.endswith(".zst"):
+
+class ShardError(ValueError):
+    """A shard that cannot be read to its end. The message names the file."""
+
+
+class _ZstdStream(io.RawIOBase):
+    """The decompressed bytes of a ``.zst`` shard, frame after frame.
+
+    Reading raises ShardError when the file ends inside a frame or holds bytes
+    that are not zstd.
+    """
+
+    def __init__(self, fh, path: str):
         import zstandard  # imported lazily: only compressed shards need it
 
-        with open(path, "rb") as fh:
-            reader = zstandard.ZstdDecompressor(max_window_size=2**31).stream_reader(fh)
-            for no, raw in enumerate(io.BufferedReader(reader, buffer_size=1 << 22), 1):
-                yield no, raw.rstrip(b"\n")
-    elif path.endswith(".gz"):
-        with gzip.open(path, "rb") as fh:
-            for no, raw in enumerate(fh, 1):
-                yield no, raw.rstrip(b"\n")
-    else:
-        with open(path, "rb") as fh:
-            for no, raw in enumerate(fh, 1):
-                yield no, raw.rstrip(b"\n")
+        self._fh, self._path = fh, path
+        self._dctx = zstandard.ZstdDecompressor(max_window_size=2**31)
+        self._zstd_error = zstandard.ZstdError
+        self._frame = None  # the decompressor of the frame being read, None between frames
+        self._input = b""
+        self._output = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        while not self._output:
+            if not self._input:
+                # Small reads bound memory: one decompress call returns all its input expands to.
+                self._input = self._fh.read(1 << 14)
+                if not self._input:
+                    if self._frame is not None:
+                        raise ShardError(f"{self._path}: zstd stream cut short inside a frame")
+                    return 0
+            if self._frame is None:
+                self._frame = self._dctx.decompressobj()
+            try:
+                self._output = memoryview(self._frame.decompress(self._input))
+            except self._zstd_error as error:
+                raise ShardError(f"{self._path}: corrupt zstd stream: {error}") from error
+            if self._frame.eof:  # the rest of the input starts the next frame
+                self._input, self._frame = self._frame.unused_data, None
+            else:
+                self._input = b""
+        size = min(len(buffer), len(self._output))
+        buffer[:size] = self._output[:size]
+        self._output = self._output[size:]
+        return size
+
+
+def iter_lines(path: str) -> Iterator[Tuple[int, bytes]]:
+    """Yield ``(line_no, raw_bytes)`` of one shard, without the newline.
+
+    A shard that cannot be read to its end raises ShardError, after the lines
+    before the damage: an empty, cut or corrupt ``.zst`` or ``.gz`` stream, or a
+    last line without its newline that is not JSON (a record cut short).
+    """
+    with open(path, "rb") as fh:
+        if path.endswith((".zst", ".gz")) and os.fstat(fh.fileno()).st_size == 0:
+            raise ShardError(f"{path}: empty file, no compressed stream")
+        if path.endswith(".zst"):
+            stream = io.BufferedReader(_ZstdStream(fh, path), buffer_size=1 << 22)
+        elif path.endswith(".gz"):
+            stream = gzip.GzipFile(fileobj=fh, mode="rb")
+        else:
+            stream = fh
+        with stream:
+            no = 0
+            while True:
+                try:
+                    raw = stream.readline()
+                except _GZIP_DAMAGE as error:
+                    raise ShardError(
+                        f"{path}: gzip stream cut short or corrupt: {error}"
+                    ) from error
+                if not raw:
+                    return
+                no += 1
+                if raw.endswith(b"\n"):
+                    yield no, raw[:-1]
+                    continue
+                # Only the last line can lack its newline: a record cut short is not JSON.
+                try:
+                    json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    raise ShardError(
+                        f"{path}: line {no} is cut short (no newline, not JSON)"
+                    ) from error
+                yield no, raw
 
 
 def expand_shards(paths: List[str], kind: Optional[str] = None) -> List[str]:

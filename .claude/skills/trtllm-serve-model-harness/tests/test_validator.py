@@ -40,7 +40,7 @@ import proto_chat  # noqa: E402
 import protocol_diff  # noqa: E402
 import sdk_diff  # noqa: E402
 import verdict  # noqa: E402
-from tracelib import sse_frames  # noqa: E402
+from tracelib import iter_lines, sse_frames  # noqa: E402
 from turnlib import Item, RequestView, Tool, classify_call, payload_digest  # noqa: E402
 
 
@@ -105,6 +105,42 @@ def test_check_stream_fails_an_unparsable_frame(tmp_path):
     verdicts = json.loads(out.read_text())["verdicts"]
     assert result.returncode == 1
     assert {c for c, v in verdicts.items() if v != "PASS"} == {"unparsable_event"}
+
+
+def test_check_stream_cannot_judge_a_cut_shard(tmp_path):
+    """A cut shard is no FAIL: exit 2 with the shard's name, no traceback and no report."""
+    import subprocess
+
+    import zstandard
+
+    done = {"type": "response.completed", "sequence_number": 0,
+            "response": {"id": "resp_1", "model": "m", "output": [], "status": "completed"}}  # fmt: skip
+    body = f"event: response.completed\ndata: {json.dumps(done)}\n\n"
+    data = "".join(json.dumps({"event": "response", "trace_id": f"t{i}",
+                               "response": {"kind": "sse_text", "body": body}}) + "\n"
+                   for i in range(20))  # fmt: skip
+    packed = zstandard.ZstdCompressor().compress(data.encode())
+    shard = tmp_path / "responses-1.jsonl.zst"
+    shard.write_bytes(packed[: len(packed) // 2])
+    out = tmp_path / "report.json"
+    result = subprocess.run([sys.executable, os.path.join(VALIDATE, "check_stream.py"), "--out",
+                             str(out), str(shard)], capture_output=True, text=True)  # fmt: skip
+    assert (result.returncode, out.exists()) == (2, False), result.stderr
+    assert str(shard) in result.stderr and "Traceback" not in result.stderr
+
+
+def test_check_stream_judges_nothing_in_a_trace_without_streams(tmp_path):
+    """A trace with no stream to read leaves every check BLOCKED: exit 2, not a pass."""
+    import subprocess
+
+    shard = tmp_path / "responses-1.jsonl"
+    shard.write_text("")
+    out = tmp_path / "report.json"
+    result = subprocess.run([sys.executable, os.path.join(VALIDATE, "check_stream.py"), "--out",
+                             str(out), str(shard)], capture_output=True, text=True)  # fmt: skip
+    verdicts = json.loads(out.read_text())["verdicts"]
+    assert set(verdicts.values()) == {"BLOCKED"}
+    assert result.returncode == 2, result.stderr
 
 
 def test_harness_signals_refuses_a_file_it_cannot_read(tmp_path):
@@ -389,8 +425,87 @@ def test_scan_credentials_reports_an_unreadable_shard_and_goes_on(tmp_path):
                              "--out", str(out), str(tmp_path)], capture_output=True)  # fmt: skip
     assert result.returncode == 0, result.stderr
     rows = {os.path.basename(r["file"]): r for r in json.loads(out.read_text())["files"]}
-    assert rows["requests-1.jsonl.zst"]["error"] == "ZstdError"
+    assert rows["requests-1.jsonl.zst"]["error"] == "ShardError"
     assert "bearer" in rows["requests-2.jsonl"]["patterns"]
+
+
+def _read_to_end(path):
+    """``(lines, error)``: what ``iter_lines`` yielded, and what it raised (None if nothing)."""
+    lines = []
+    try:
+        for _, raw in iter_lines(str(path)):
+            lines.append(raw)
+    except Exception as error:  # noqa: BLE001 - which error, if any, is what the tests check
+        return lines, error
+    return lines, None
+
+
+@pytest.mark.parametrize("suffix", [".zst", ".gz"])
+def test_a_damaged_compressed_shard_is_an_error_not_a_short_read(tmp_path, suffix):
+    """A cut, empty or corrupt stream raises, naming the file; an intact one reads every line."""
+    import gzip
+
+    import zstandard
+
+    lines = [json.dumps({"trace_id": f"t{i}", "body": "x" * 40}).encode() for i in range(2000)]
+    data = b"".join(line + b"\n" for line in lines)
+    half = len(data) // 2 + 7  # two frames (gzip: members), split inside a line
+    compress = zstandard.ZstdCompressor().compress if suffix == ".zst" else gzip.compress
+    whole = compress(data[:half]) + compress(data[half:])
+    shards = {"intact": whole, "cut": whole[: len(whole) * 3 // 4], "cut_last_byte": whole[:-1],
+              "empty": b"", "trailing_garbage": whole + b"not compressed\n"}  # fmt: skip
+    for name, content in shards.items():
+        path = tmp_path / f"requests-{name}.jsonl{suffix}"
+        path.write_bytes(content)
+        read, error = _read_to_end(path)
+        if name == "intact":
+            assert (read, error) == (lines, None)
+        else:
+            named = isinstance(error, ValueError) and str(path) in str(error)
+            assert named, (name, error, len(read))
+
+
+def test_a_last_line_cut_short_is_an_error_not_a_short_read(tmp_path):
+    """A last line without its newline reads when it is JSON; when it is not, it was cut short."""
+    whole = tmp_path / "requests-1.jsonl"
+    whole.write_bytes(b'{"a": 1}\nnot json\n{"b": 2}')
+    assert _read_to_end(whole) == ([b'{"a": 1}', b"not json", b'{"b": 2}'], None)
+    cut = tmp_path / "requests-2.jsonl"
+    cut.write_bytes(b'{"a": 1}\n{"b": ')
+    read, error = _read_to_end(cut)
+    assert read == [b'{"a": 1}'] and isinstance(error, ValueError), (read, error)
+    assert str(cut) in str(error) and "line 2" in str(error)
+
+
+def test_a_cut_shard_stops_the_verdict_and_is_named(tmp_path, capsys):
+    """Shards cut alike on both sides leave a population that still joins: no verdict (exit 3)."""
+    import zstandard
+
+    harness = controls.write_profile(
+        str(tmp_path / "h.yaml"), controls.CONTROL_PROFILES["anthropic"]
+    )
+    done = controls._anthropic_sse([{"type": "text", "text": "ok"}], "end_turn")
+    user = {"role": "user", "content": "go"}
+    trace = tmp_path / "t"
+    trace.mkdir()
+    for shard in (1, 2):  # two shards a side, so that several workers read them in parallel
+        ids = [f"t{shard}-{i}" for i in range(20)]
+        records = {"requests": [controls._anth_request(t, [user], "2026-01-01T00:00:01Z")
+                                for t in ids],
+                   "responses": [controls._sse_response(t, done) for t in ids]}  # fmt: skip
+        for kind, recs in records.items():
+            text = "".join(json.dumps(r) + "\n" for r in recs).encode()
+            if shard == 1:
+                (trace / f"{kind}-1.jsonl").write_bytes(text)
+            else:
+                packed = zstandard.ZstdCompressor().compress(text)
+                (trace / f"{kind}-2.jsonl.zst").write_bytes(packed[: len(packed) // 2])
+    for workers in ("1", "2"):
+        code = verdict.main(["--harness", harness, "--population", "window", "--claims",
+                             "inventory", "--workers", workers, "--out-dir",
+                             str(tmp_path / f"v{workers}"), str(trace)])  # fmt: skip
+        captured = capsys.readouterr()
+        assert code == 3 and "-2.jsonl.zst" in captured.err, (code, captured.out)
 
 
 def test_cross_cases(tmp_path):

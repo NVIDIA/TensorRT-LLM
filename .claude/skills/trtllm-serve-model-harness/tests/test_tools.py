@@ -12,7 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The replay, trial-build and pi kit tools (CPU only, no TensorRT-LLM import, no docker)."""
+"""The trace, replay, trial-build, session-runner and pi kit tools.
+
+CPU only: no TensorRT-LLM import, no docker.
+"""
 
 import asyncio
 import json
@@ -82,6 +85,57 @@ def test_the_corpus_is_readable_by_its_owner_only(tmp_path):
     assert result.returncode == 0, result.stderr
     assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
     assert len(out.read_text().splitlines()) == 1
+
+
+def test_a_corpus_cut_while_it_is_written_leaves_no_corpus(tmp_path, monkeypatch):
+    """A shard that fails during the second pass leaves neither a corpus nor a manifest."""
+    from tracelib import ShardError
+
+    shard = tmp_path / "requests-1.jsonl"
+    shard.write_text("".join(json.dumps({"event": "request", "trace_id": f"t{i}", "route": "/v1/responses",
+                                         "body": {"model": "m", "input": f"go {i}"}}) + "\n"
+                             for i in range(3)))  # fmt: skip
+    real, seen = build_replay_corpus.iter_lines, []
+
+    def cut_on_second_pass(path):
+        seen.append(path)
+        for number, (line_no, raw) in enumerate(real(path)):
+            if len(seen) > 1 and number == 1:
+                raise ShardError(f"{path}: cut")
+            yield line_no, raw
+
+    monkeypatch.setattr(build_replay_corpus, "iter_lines", cut_on_second_pass)
+    out, manifest = tmp_path / "corpus.jsonl", tmp_path / "manifest.json"
+    monkeypatch.setattr(sys, "argv", ["build_replay_corpus.py", "--out", str(out), "--manifest",
+                                      str(manifest), str(shard)])  # fmt: skip
+    with pytest.raises(ShardError):
+        build_replay_corpus.main()
+    assert len(seen) == 2
+    assert not out.exists() and not manifest.exists()
+    assert not os.path.exists(str(out) + ".partial")
+
+
+@pytest.mark.parametrize(
+    "script", ["build_replay_corpus.py", "summarize_capture.py", "validate/harness_signals.py"]
+)
+def test_a_cut_shard_stops_a_trace_tool_with_its_name(tmp_path, script):
+    """A truncated .zst shard ends the run with a message naming it, and nothing is written."""
+    import zstandard
+
+    record = {"event": "request", "route": "/v1/responses", "body": {"model": "m", "input": "go"}}
+    data = "".join(json.dumps(dict(record, trace_id=f"t{i}")) + "\n" for i in range(50))
+    packed = zstandard.ZstdCompressor().compress(data.encode())
+    shard = tmp_path / "requests-1.jsonl.zst"
+    shard.write_bytes(packed[: len(packed) // 2])
+    out = tmp_path / "out.json"
+    argv = [sys.executable, os.path.join(SCRIPTS, script), "--out", str(out), str(shard)]
+    if script == "build_replay_corpus.py":
+        argv[4:4] = ["--manifest", str(tmp_path / "manifest.json")]
+
+    result = subprocess.run(argv, capture_output=True, text=True)
+
+    assert result.returncode != 0 and str(shard) in result.stderr, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr and not out.exists()
 
 
 # --------------------------------------------------------------------------- replay
@@ -312,3 +366,131 @@ def test_a_case_without_a_final_message_is_summarized(tmp_path, monkeypatch):
 
     rows = (tmp_path / "RESULTS.md").read_text().splitlines()
     assert next(r for r in rows if r.startswith(f"| {case} |")).endswith("| - |")
+
+
+# --------------------------------------------------------------------------- session runners
+
+# A stand-in harness: it records its arguments, working directory and environment as exec passed
+# them (from /proc: Python adds variables of its own), then prints one event.
+STUB = """#!{python}
+import json, os, sys
+with open("/proc/self/environ", "rb") as fh:
+    env = dict(item.decode().split("=", 1) for item in fh.read().split(b"\\0") if item)
+with open(os.path.join({records!r}, "%d.json" % os.getpid()), "w") as fh:
+    json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "env": env}}, fh)
+print(json.dumps({{"type": "stub"}}))
+"""
+# runner: (script, the variable naming the harness executable, required settings)
+RUNNERS = {
+    "claude": ("run_claude_sessions.sh", "CLAUDE_BIN", {"BASE_URL": "http://127.0.0.1:9"}),
+    "codex": ("run_codex_sessions.sh", "CODEX_BIN", {"BASE_URL": "http://127.0.0.1:9/v1"}),
+    "pi": ("run_pi_sessions.sh", "NODE_BIN", {"BASE_URL": "http://127.0.0.1:9/v1", "MODEL": "m"}),
+}
+# What a session's environment holds besides the proxy variables.
+ALLOWED = {
+    "claude": {"PATH", "HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+               "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "DISABLE_AUTOUPDATER",
+               "CLAUDE_CODE_GATEWAY_HINT_HEADERS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"},
+    "codex": {"PATH", "HOME", "CODEX_HOME", "TRTLLM_API_KEY", "TERM"},
+    "pi": {"PATH", "HOME", "PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK",
+           "PI_TELEMETRY"},
+}  # fmt: skip
+PROXIES = {"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
+           "NO_PROXY": "127.0.0.1,localhost", "ALL_PROXY": "http://127.0.0.1:9"}  # fmt: skip
+PROXIES.update({name.lower(): value for name, value in PROXIES.items()})  # curl reads http_proxy
+needs_proc = pytest.mark.skipif(
+    not os.path.exists("/proc/self/environ") or shutil.which("timeout") is None,
+    reason="needs /proc and coreutils timeout",
+)
+
+
+def _run_sessions(cwd, runner, relative=False, tasks="src\tsay hi\n", environment=None):
+    """Run ``runner`` from ``cwd`` with the stub as its harness: ``(run, stub records)``.
+
+    ``relative`` passes the tasks file, the output directory and the executables relative to
+    ``cwd``; the source dir in ``tasks`` is relative in any case.
+    """
+    script, binary, settings = RUNNERS[runner]
+    records = cwd / "records"
+    for directory in (cwd / "bin", cwd / "src", records):
+        directory.mkdir(parents=True)
+    stub = cwd / "bin" / "harness"
+    stub.write_text(STUB.format(python=sys.executable, records=str(records)))
+    stub.chmod(0o755)
+    (cwd / "bin" / "pi.js").write_text("")
+    (cwd / "src" / "a.txt").write_text("a\n")
+    (cwd / "tasks.tsv").write_text(tasks)
+
+    def path(name):
+        return name if relative else str(cwd / name)
+
+    # The caller's environment, with a parent agent session's variables that no session may see.
+    env = {"PATH": os.environ["PATH"], "HOME": str(cwd), "TERM": "xterm",
+           "OPENAI_API_KEY": "sk-caller-only", "CLAUDE_CODE_SSE_PORT": "1",
+           binary: path("bin/harness"), **settings, **(environment or {})}  # fmt: skip
+    if runner == "pi":
+        env["PI_BIN"] = path("bin/pi.js")
+    result = subprocess.run(["bash", os.path.join(SCRIPTS, script), path("tasks.tsv"), path("out")],
+                            cwd=cwd, env=env, capture_output=True, text=True, timeout=120)  # fmt: skip
+    return result, [json.loads(p.read_text()) for p in sorted(records.iterdir())]
+
+
+def _prompt(runner, argv):
+    return argv[argv.index("-p") + 1] if runner == "claude" else argv[-1]
+
+
+@needs_proc
+@pytest.mark.parametrize("runner", sorted(RUNNERS))
+def test_a_runner_takes_relative_paths_from_where_it_started(tmp_path, runner):
+    """Relative paths: the outputs land in <out_dir>, and the harness is given absolute paths."""
+    result, records = _run_sessions(tmp_path, runner, relative=True)
+
+    session = tmp_path / "out" / "s0001"
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "out" / "sessions.tsv").read_text().split("\t")[:2] == ["1", "0"]
+    assert (session / "events.jsonl").read_text() == '{"type": "stub"}\n'
+    assert (session / "workspace" / "a.txt").read_text() == "a\n"
+    ((argv, cwd, env),) = [(r["argv"], r["cwd"], r["env"]) for r in records]
+    given = [("HOME", env.get("HOME"), session / "home")]
+    if runner == "claude":
+        given += [("CLAUDE_CONFIG_DIR", env.get("CLAUDE_CONFIG_DIR"), session / "home" / ".claude"),
+                  ("cwd", cwd, session / "workspace")]  # fmt: skip
+    elif runner == "codex":
+        given += [("CODEX_HOME", env.get("CODEX_HOME"), session / "home"),
+                  ("-C", argv[argv.index("-C") + 1], session / "workspace"),
+                  ("-o", argv[argv.index("-o") + 1], session / "last_message.txt")]  # fmt: skip
+    else:
+        given += [("PI_CODING_AGENT_DIR", env.get("PI_CODING_AGENT_DIR"), session / "agent"),
+                  ("--session-dir", argv[argv.index("--session-dir") + 1], session / "sessions"),
+                  ("PI_BIN", argv[0], tmp_path / "bin" / "pi.js"),
+                  ("cwd", cwd, session / "workspace")]  # fmt: skip
+    wrong = [(name, got) for name, got, want in given
+             if not (got and os.path.isabs(got) and os.path.realpath(got) == os.path.realpath(want))]  # fmt: skip
+    assert wrong == []
+
+
+@needs_proc
+@pytest.mark.parametrize("runner", sorted(RUNNERS))
+def test_a_session_sees_its_allowlist_and_the_proxies_set(tmp_path, runner):
+    """Of the caller's variables, only the proxy variables reach a session, and only when set."""
+    for case, environment in (("unset", {}), ("set", PROXIES)):
+        result, records = _run_sessions(tmp_path / case, runner, environment=environment)
+
+        assert result.returncode == 0 and len(records) == 1, result.stderr
+        env = records[0]["env"]
+        assert set(env) - set(PROXIES) == ALLOWED[runner], (case, sorted(env))
+        assert {k: v for k, v in env.items() if k in PROXIES} == environment, case
+
+
+@needs_proc
+@pytest.mark.parametrize("runner", sorted(RUNNERS))
+def test_a_tasks_file_starts_exactly_its_tasks(tmp_path, runner):
+    """A '#' header and blank lines start no session; a last task without a newline does."""
+    tasks = ("# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.\n"
+             "\nsrc\tfirst task\n  \n-\tsecond task")  # fmt: skip
+    result, records = _run_sessions(tmp_path, runner, tasks=tasks)
+
+    assert result.returncode == 0, result.stderr
+    rows = (tmp_path / "out" / "sessions.tsv").read_text().splitlines()
+    assert sorted(row.split("\t")[:2] for row in rows) == [["1", "0"], ["2", "0"]]
+    assert sorted(_prompt(runner, r["argv"]) for r in records) == ["first task", "second task"]

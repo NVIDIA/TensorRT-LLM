@@ -20,7 +20,8 @@
 #
 # usage: run_pi_sessions.sh <tasks.tsv> <out_dir>
 #   tasks.tsv: one task per line, "<source dir>\t<prompt>". The source dir is copied into a fresh
-#              per-session workspace; use "-" for an empty one.
+#              per-session workspace; use "-" for an empty one. Blank lines and lines starting
+#              with "#" are skipped.
 # env:
 #   BASE_URL       endpoint base WITH /v1, e.g. http://127.0.0.1:8000/v1   (required). pi appends
 #                  /chat/completions or /responses to it, but /v1/messages for anthropic-messages,
@@ -45,10 +46,17 @@
 #   TIMEOUT_S      per-session wall clock (default 1800)
 #   PI_BIN         pi entry point (default: pi on PATH); NODE_BIN the node to run it with
 #   EXTRA_ARGS     extra arguments for `pi -p`
+#   HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY, and http_proxy, https_proxy, no_proxy, all_proxy
+#                  passed to the sessions only when set (curl reads only the lowercase
+#                  http_proxy), e.g. a proxy at a closed port (http://127.0.0.1:9) with the
+#                  endpoint's host in NO_PROXY and no_proxy, to cut other egress
+# Relative paths (arguments, WORKSPACE, PI_BIN, NODE_BIN, source dirs) are taken from where the
+# runner is started.
 #
 # Every session runs under `env -i` with its own HOME and PI_CODING_AGENT_DIR, so ~/.pi is never
-# read; startup network activity, version checks and telemetry are off. Extensions, MCP, skills,
-# prompt templates and context files are disabled, so the request carries only pi's own prompt.
+# read, and of the caller's variables only the proxy variables above reach it. Startup network
+# activity, version checks and telemetry are off. Extensions, MCP, skills, prompt templates and
+# context files are disabled, so the request carries only pi's own prompt.
 # Flags were checked against @earendil-works/pi-coding-agent 1.4.0: re-check `pi --help`.
 #
 # Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,workspace/,agent/models.json} and
@@ -72,6 +80,18 @@ TIMEOUT_S=${TIMEOUT_S:-1800}
 PI_BIN=${PI_BIN:-$(readlink -f "$(command -v pi)")}
 NODE_BIN=${NODE_BIN:-$(readlink -f "$(command -v node)")}
 [ "$API" = anthropic-messages ] && BASE_URL=${BASE_URL%/v1}
+# A session runs in its own workspace: the paths it uses are made absolute here.
+abspath() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$PWD/$1" ;; esac; }
+TASKS=$(abspath "$TASKS")
+OUT=$(abspath "$OUT")
+[ -n "${WORKSPACE:-}" ] && WORKSPACE=$(abspath "$WORKSPACE")
+case $PI_BIN in */*) PI_BIN=$(abspath "$PI_BIN") ;; esac
+case $NODE_BIN in */*) NODE_BIN=$(abspath "$NODE_BIN") ;; esac
+# Of the caller's variables, these reach a session only when set.
+PROXY_ENV=()
+for name in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
+  [ -n "${!name+set}" ] && PROXY_ENV+=("$name=${!name}")
+done
 mkdir -p "$OUT"
 : > "$OUT/sessions.tsv"
 
@@ -96,6 +116,7 @@ JSON
   # shellcheck disable=SC2086
   (cd "$ws" && timeout "$TIMEOUT_S" env -i PATH=/usr/local/bin:/usr/bin:/bin \
     HOME="$dir/home" PI_CODING_AGENT_DIR="$dir/agent" PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 \
+    "${PROXY_ENV[@]}" \
     "$NODE_BIN" "$PI_BIN" -p --mode json --provider trtllm --model "$MODEL" "${thinking[@]}" \
     --tools "$TOOLS" --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files \
     --no-themes --offline --session-dir "$dir/sessions" ${EXTRA_ARGS:-} -- "$prompt" \
@@ -105,8 +126,9 @@ JSON
 }
 
 index=0
-while IFS=$'\t' read -r src prompt; do
-  [ -z "${src}${prompt}" ] && continue
+while IFS= read -r line || [ -n "$line" ]; do
+  case ${line#"${line%%[![:space:]]*}"} in "" | "#"*) continue ;; esac  # blank or comment
+  IFS=$'\t' read -r src prompt <<< "$line"
   index=$((index + 1))
   run_one "$index" "$src" "$prompt" &
   while [ "$(jobs -rp | wc -l)" -ge "$CONCURRENCY" ]; do sleep 1; done

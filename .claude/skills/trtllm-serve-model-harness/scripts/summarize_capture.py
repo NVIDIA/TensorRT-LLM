@@ -37,15 +37,18 @@ counts and types only. Output: JSON report plus a markdown skeleton to complete
 by hand (see contracts/TEMPLATE.md).
 
 usage: summarize_capture.py --out summary.json --markdown contract-skeleton.md PATH [PATH ...]
+A shard that cannot be read to its end stops the run with a message naming it.
 """
 
 import argparse
-import gzip
-import io
 import json
 import os
 import re
+import sys
 from collections import Counter, defaultdict
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "validate"))
+from tracelib import ShardError, iter_lines  # noqa: E402
 
 SHARD = re.compile(r"(^|/)(requests|responses)-[^/]*\.jsonl(\.zst|\.gz)?$")
 CATEGORICAL = (
@@ -72,21 +75,6 @@ SAFE_HEADERS = re.compile(
 )
 TERMINAL = ("response.completed", "response.incomplete", "response.failed")
 TOP_SEQUENCES = 10
-
-
-def iter_lines(path):
-    if path.endswith(".zst"):
-        import zstandard
-
-        with open(path, "rb") as fh:
-            reader = zstandard.ZstdDecompressor(max_window_size=2**31).stream_reader(fh)
-            yield from io.BufferedReader(reader, buffer_size=1 << 22)
-    elif path.endswith(".gz"):
-        with gzip.open(path, "rb") as fh:
-            yield from fh
-    else:
-        with open(path, "rb") as fh:
-            yield from fh
 
 
 def expand(paths):
@@ -225,7 +213,7 @@ def main():
     requests = responses = 0
     for path in expand(args.paths):
         is_request = "/requests-" in path or os.path.basename(path).startswith("requests-")
-        for raw in iter_lines(path):
+        for _, raw in iter_lines(path):
             try:
                 rec = json.loads(raw)
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -443,4 +431,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ShardError as error:  # a summary of part of a shard would read as all of it
+        sys.exit(str(error))

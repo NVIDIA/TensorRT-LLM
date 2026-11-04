@@ -433,6 +433,11 @@ RAW_IDS = st.one_of(st.none(), st.fixed_dictionaries({"run": st.sampled_from([0,
 
 @FEW
 @given(DELIVERED, ENDING, RAW_IDS)
+# The boundaries, every run: a stream cut before its terminal event is not an answer, one cut at
+# its budget is, and a run written into a stopped generation counts where it was written.
+@example([], "cut", {"run": 20, "ended": {}})
+@example([], "max_tokens", {"run": 20, "ended": {}})
+@example([], "error", {"run": 25, "ended": {"partial": True}})
 def test_a_degenerate_run_fails_r04_only_when_it_reached_the_client(delivered, ending, raw):
     blocks = [{"type": kind, "text": text} for kind, text in delivered]
     record = None

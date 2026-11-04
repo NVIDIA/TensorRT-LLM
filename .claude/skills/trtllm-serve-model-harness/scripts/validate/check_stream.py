@@ -49,6 +49,10 @@ difference, for synthetic or already-cleared data only.
 
 usage: check_stream.py --out report.json [--workers N] [--group-depth N] [--examples K] PATH [PATH ...]
 PATH: response shards or directories holding them (requests-* files are ignored).
+
+Exit code: 0 no check FAILs; 1 a check FAILs; 2 nothing could be judged, as a
+shard cannot be read to its end (cut short or corrupt: the message names it, and
+no report is written) or the arguments are wrong.
 """
 
 import argparse
@@ -62,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tracelib import (  # noqa: E402
     OPENING_EVENTS,
     TERMINAL_EVENTS,
+    ShardError,
     expand_shards,
     first_difference,
     group_of,
@@ -401,8 +406,15 @@ def main():
             }
         )
     )
-    sys.exit(1 if any(v == "FAIL" for v in verdicts.values()) else 0)
+    if any(v == "FAIL" for v in verdicts.values()):
+        sys.exit(1)
+    # Every check BLOCKED (e.g. no stream to read) judged nothing, which is not a pass.
+    sys.exit(2 if verdicts and all(v == "BLOCKED" for v in verdicts.values()) else 0)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ShardError as error:  # nothing is judged on a shard that cannot be read to its end
+        print(error, file=sys.stderr)
+        sys.exit(2)
