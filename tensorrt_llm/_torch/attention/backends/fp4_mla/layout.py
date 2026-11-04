@@ -265,25 +265,49 @@ def _shared_workspace_flat(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Flat view, at least ``numel`` elements long, of the process-wide block for ``attr_name``."""
+    """Flat view, at least ``numel`` elements long, of the process-wide block for ``attr_name``: the smallest block
+    that fits, or a new block of ``max(numel, capacity_numel)`` elements when none fits or every block is below the
+    capacity bound (a bounded caller upgrades a request-sized block once). Never allocates while capturing."""
     pool = _workspace_pool()
     key = _workspace_pool_key(attr_name, device)
-    nbytes = numel * dtype.itemsize
+    itemsize = dtype.itemsize
     blocks = pool.buffers.get(key, [])
-    if any(block.buffer.numel() >= nbytes for block in blocks):
+    largest = max((block.buffer.numel() for block in blocks), default=0)
+    want = max(numel, int(capacity_numel or 0))
+    capturing = torch.cuda.is_current_stream_capturing()
+    if largest >= numel * itemsize and (largest >= want * itemsize or capturing):
         return pool.get_buffer([numel], dtype, key, True)
-    if torch.cuda.is_current_stream_capturing():
+    if capturing:
         raise ValueError(
             f"Cannot allocate {attr_name} while capturing a CUDA graph. Run a warmup prepare/forward first."
         )
-    want = max(numel, int(capacity_numel or 0))
     if blocks:
-        held = max(block.buffer.numel() for block in blocks)
         logger.warning(
-            f"FP4 MLA decode scratch {attr_name} grows past its capacity bound ({held} B held, "
-            f"{want * dtype.itemsize} B requested); the old block stays reserved for the graphs that captured it."
+            f"FP4 MLA decode scratch {attr_name}: {largest} B held, {want * itemsize} B bound or requested now; "
+            "allocating the larger block (the old one stays reserved for the graphs that captured it)."
         )
+    # the pool allocates on the current device; blocks may be created on a side stream or inside a graph's memory
+    # pool, which is harmless for storage that is never freed
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            return pool.get_buffer([want], dtype, key, True)
     return pool.get_buffer([want], dtype, key, True)
+
+
+def _workspace_capacity_numel(
+    metadata: Any, attr_name: str, dtype: torch.dtype, device: torch.device
+) -> int:
+    """Elements ``_ensure_workspace_tensor`` can hand out for ``attr_name`` without allocating: the largest
+    process-wide block of that name, or the per-state entry of an unshared workspace. Capture-time probes use it."""
+    tensor = metadata.fp4_mla_state.workspaces.get(attr_name)
+    held = (
+        tensor.numel()
+        if tensor is not None and tensor.dtype == dtype and tensor.device == device
+        else 0
+    )
+    blocks = _workspace_pool().buffers.get(_workspace_pool_key(attr_name, device), [])
+    largest = max((block.buffer.numel() for block in blocks), default=0) // dtype.itemsize
+    return max(held, largest)
 
 
 def _ensure_workspace_tensor(
@@ -306,7 +330,8 @@ def _ensure_workspace_tensor(
     # capture of small MTP buckets.
     # ``shared`` workspaces (the default) are views of the process-wide block
     # described above, sized by ``capacity_numel`` on its first allocation;
-    # the per-state entry only caches the view.
+    # the per-state entry only caches the view of the latest request (the
+    # block itself is grow-only, see _workspace_capacity_numel).
     numel = 1
     for dim in shape:
         numel *= int(dim)
@@ -321,7 +346,8 @@ def _ensure_workspace_tensor(
     )
     if needs_alloc:
         if shared:
-            tensor = _shared_workspace_flat(attr_name, numel, capacity_numel, dtype, device)
+            flat = _shared_workspace_flat(attr_name, numel, capacity_numel, dtype, device)
+            tensor = flat.reshape(-1)[:numel].view(shape)
         else:
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError(

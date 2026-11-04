@@ -96,6 +96,24 @@ def packed_split_task_bound(max_requests: int, m_tiles: int, device: torch.devic
     return bound
 
 
+def packed_split_scratch_bound(
+    metadata: Any, num_heads: int, query_len: int, device: torch.device, *, max_requests: int
+) -> tuple[int, int]:
+    """(slot bound, slot x row bound) of the shared packed split scratch over every query width the engine can
+    decode (1 .. 1 + max_total_draft_tokens, ``query_len`` included). Narrow rows mean more wave tasks and more
+    splits, so neither bound is monotonic in the width: both are maxima over all of them."""
+    width = max(int(query_len), 1 + int(getattr(metadata, "max_total_draft_tokens", None) or 0))
+    slots_bound, slot_rows_bound = 32, 0
+    for q in range(1, width + 1):
+        rows = _fp4_mla_packed_rows_per_seq(num_heads, q)
+        if rows <= 0:
+            continue
+        slots = packed_split_task_bound(max_requests, rows // FP4_MLA_SCALE_ROW_GROUP, device)
+        slots_bound = max(slots_bound, slots)
+        slot_rows_bound = max(slot_rows_bound, slots * rows)
+    return slots_bound, slot_rows_bound
+
+
 class _PackedPlanGeometry(NamedTuple):
     """Per-step launch geometry of the packed split-KV decode."""
 
@@ -109,8 +127,9 @@ class _PackedPlanGeometry(NamedTuple):
     helix_kv_bounds: torch.Tensor | None
     plan: torch.Tensor | None
     key: tuple | None
-    # capacity of the shared split-KV scratch in task slots (0 = single task per request, no scratch)
+    # capacity of the shared split-KV scratch: task slots and slot x row products (0 = single task per request)
     task_bound: int = 0
+    slot_rows_bound: int = 0
 
 
 def _fp4_mla_packed_plan_geometry(
@@ -186,7 +205,11 @@ def _fp4_mla_packed_plan_geometry(
     # process-wide (layout._ensure_workspace_tensor), sized once for the largest batch any bucket can bring.
     task_capacity = tasks if is_cuda_graph else max(tasks, 32)
     max_requests = max(_max_sequences(metadata), num_requests)
-    task_bound = max(packed_split_task_bound(max_requests, m_tiles, device), task_capacity)
+    slots_bound, slot_rows_bound = packed_split_scratch_bound(
+        metadata, num_heads, query_len, device, max_requests=max_requests
+    )
+    task_bound = max(slots_bound, task_capacity)
+    slot_rows_bound = max(slot_rows_bound, task_capacity * rows_per_seq)
     plan = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_plan",
@@ -219,6 +242,7 @@ def _fp4_mla_packed_plan_geometry(
         plan,
         key,
         task_bound,
+        slot_rows_bound,
     )
 
 
