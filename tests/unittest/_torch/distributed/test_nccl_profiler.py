@@ -39,6 +39,7 @@ from mpi4py.futures import MPIPoolExecutor
 from profiler_test_utils import decode_profiler_metadata
 
 import tensorrt_llm
+from tensorrt_llm import _profiler as profiler
 from tensorrt_llm.bindings import BuildInfo
 
 if TYPE_CHECKING:
@@ -62,10 +63,7 @@ def _events(path: Path) -> list[dict[str, "MetadataValue"]]:
 
 def _enabled() -> bool:
     assert type(BuildInfo.ENABLE_NCCL_PROFILING) is bool
-    selection = os.environ.get("TLLM_PROFILE_CUSTOM_REGIONS")
-    return BuildInfo.ENABLE_NCCL_PROFILING and (
-        selection is None or "nccl" in {item.strip() for item in selection.split(",")}
-    )
+    return BuildInfo.ENABLE_NCCL_PROFILING and profiler.custom_region_enabled("nccl")
 
 
 def _profile(
@@ -73,7 +71,7 @@ def _profile(
     expected: list[torch.Tensor],
     graph: bool,
     dispatcher_name: str | None = None,
-    before_replay: Callable[[], None] | None = None,
+    before_run: Callable[[], None] | None = None,
 ) -> list[dict[str, "MetadataValue"]]:
     # Initialize communicators and allocator state outside capture and profiling.
     stream = torch.cuda.Stream()
@@ -98,10 +96,12 @@ def _profile(
                     with torch.cuda.graph(captured, stream=stream):
                         outputs = operation()
                 else:
+                    if before_run is not None:
+                        before_run()
                     outputs = operation()
             if graph:
-                if before_replay is not None:
-                    before_replay()
+                if before_run is not None:
+                    before_run()
                 captured.replay()
             torch.cuda.synchronize()
             for output, reference in zip(outputs, expected, strict=True):
@@ -130,8 +130,8 @@ def _profile(
                     execution_trace_observer=replay_observer,
                 ):
                     for _ in range(2):
-                        if before_replay is not None:
-                            before_replay()
+                        if before_run is not None:
+                            before_run()
                         captured.replay()
                         torch.cuda.synchronize()
                         for output, reference in zip(outputs, expected, strict=True):
@@ -250,12 +250,14 @@ def _run_point_to_point(graph: bool) -> bool:
             communicator.recv(local, 0)
         return [local]
 
-    def before_replay() -> None:
-        if rank == 1:
-            # A replay must receive fresh data rather than preserve warmup output.
+    def before_run() -> None:
+        # Warmup sends 17; every measured run must transfer the new payload.
+        if rank == 0:
+            local.fill_(31)
+        else:
             local.zero_()
 
-    fields = _profile(operation, [torch.full_like(local, 17)], graph, before_replay=before_replay)
+    fields = _profile(operation, [torch.full_like(local, 31)], graph, before_run=before_run)
     _assert_fields(fields, "send" if rank == 0 else "recv", 32, "pp", "nccl_send_recv", graph)
     if fields:
         assert fields[0]["nccl.src_rank"] == 0
@@ -290,6 +292,33 @@ def _run_process_group() -> bool:
 def test_nccl_profiling_build_info() -> None:
     """The build feature is a bool even when custom regions are compiled out."""
     assert type(BuildInfo.ENABLE_NCCL_PROFILING) is bool
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("selection", "selected"),
+    [
+        (None, True),
+        ("", True),
+        (" \t", True),
+        ("unknown", True),
+        ("nccl", True),
+        ("none", False),
+        ("mpi", False),
+    ],
+)
+def test_nccl_enabled_uses_cached_startup_selection(
+    monkeypatch: pytest.MonkeyPatch, selection: str | None, selected: bool
+) -> None:
+    """Use the product startup loader, including its default and invalid fallback."""
+    if selection is None:
+        monkeypatch.delenv("TLLM_PROFILE_CUSTOM_REGIONS", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_PROFILE_CUSTOM_REGIONS", selection)
+    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", profiler._load_custom_regions())
+    # The test expectation must follow the same immutable selection as the probes.
+    monkeypatch.setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none" if selected else "nccl")
+    assert _enabled() is (BuildInfo.ENABLE_NCCL_PROFILING and selected)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two real CUDA devices")
