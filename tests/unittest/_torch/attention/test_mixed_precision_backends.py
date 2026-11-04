@@ -1103,36 +1103,42 @@ def test_mixed_precision_high_restore_covers_fresh_window_pages():
     assert take_mixed_precision_high_restore(metadata, manager, [0, 14, 6, 40]) == []
 
 
+def _nvfp4_pool(num_pool_tokens, row_width):
+    """NVFP4 data and scale pools whose rows all decode differently."""
+    codes = torch.arange(1, num_pool_tokens + 1, dtype=torch.uint8, device="cuda")
+    data_pool = (codes | (codes << 4))[:, None].expand(-1, row_width // 2).contiguous()
+    scale_pool = torch.full(
+        (num_pool_tokens, row_width // 16), 2.0, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    return data_pool, scale_pool
+
+
+def _nvfp4_read(data_pool, scale_pool, pool_rows, head_dim, residual_dim, scale):
+    """The FP8 rows the NVFP4 MLA read returns for `pool_rows`."""
+    rows = torch.empty((len(pool_rows), 1, head_dim), dtype=torch.float8_e4m3fn, device="cuda")
+    indices = torch.tensor(pool_rows, dtype=torch.int32, device="cuda").view(-1, 1)
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        data_pool, scale_pool, indices, rows, scale, residual_dim, data_pool.shape[0]
+    )
+    return rows
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="NVFP4 MLA gather requires Blackwell",
 )
 def test_dsa_restore_fills_fresh_high_rows_from_the_pool():
-    """Restored high rows equal the pool rows decoded like the sparse read; other rows stay."""
+    """Restored high rows hold what the NVFP4 read returns for their pool rows; other rows stay."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
 
-    # Pool row r holds E2M1 code r + 1; the residual-quantized RoPE tail adds 0.25.
     tokens_per_block, num_pool_tokens, head_dim, residual_dim = 2, 10, 576, 64
-    residual_start = head_dim - residual_dim
-    codes = torch.arange(1, num_pool_tokens + 1, dtype=torch.uint8, device="cuda")
-    data_pool = (codes | (codes << 4))[:, None].expand(-1, (head_dim + residual_dim) // 2)
-    data_pool = data_pool.contiguous()
-    scale_pool = torch.full(
-        (num_pool_tokens, (head_dim + residual_dim) // 16),
-        2.0,
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
-    )
-    for group in range(residual_dim // 16):
-        group_offset = residual_start // 2 + group * 16
-        data_pool[:, group_offset + 8 : group_offset + 16] = 0x11
-        scale_pool[:, residual_start // 16 + group * 2 + 1] = 0.5
+    data_pool, scale_pool = _nvfp4_pool(num_pool_tokens, head_dim + residual_dim)
     host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
     host_pool_pointers[0, 0, 0] = data_pool.data_ptr()
     host_pool_pointers[0, 0, 1] = scale_pool.data_ptr()
 
-    # High pool [pages, kv, tokens, heads, width], every row a sentinel.
-    sentinel = 3.0
+    # High pool [pages, kv, tokens, heads, width]; no pool row decodes to the sentinel.
+    sentinel = 448.0
     high = torch.full(
         (4, 1, tokens_per_block, 1, head_dim), sentinel, dtype=torch.float8_e4m3fn, device="cuda"
     )
@@ -1162,28 +1168,15 @@ def test_dsa_restore_fills_fresh_high_rows_from_the_pool():
         host_kv_cache_pool_pointers=host_pool_pointers,
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
     )
-    owner = SimpleNamespace(
-        layer_idx=0,
-        _nvfp4_mla_kv_scale_quant_orig=torch.tensor([0.25], dtype=torch.float32, device="cuda"),
-    )
+    scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+    owner = SimpleNamespace(layer_idx=0, _nvfp4_mla_kv_scale_quant_orig=scale)
     DSATrtllmAttention._restore_mixed_precision_high_rows(owner, metadata, 0, 1, 0)
 
-    e2m1 = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        device="cuda",
-    )
-
-    def decoded(pool_row):
-        row = (e2m1[codes[pool_row].long()] * 2.0).expand(head_dim).clone()
-        if residual_dim:
-            row[-residual_dim:] += 0.25
-        return (row * 0.25).to(torch.float8_e4m3fn)
-
-    expected = torch.full_like(high, sentinel)
+    expected = torch.full_like(high, sentinel).view(torch.uint8)
     # Positions 2, 3 -> pool rows 0, 1 -> high page 2; position 4 -> pool row 6 -> high page 3.
-    for page, offset, pool_row in ((2, 0, 0), (2, 1, 1), (3, 0, 6)):
-        expected[page, 0, offset, 0] = decoded(pool_row)
-    assert torch.equal(high.view(torch.uint8), expected.view(torch.uint8))
+    read = _nvfp4_read(data_pool, scale_pool, [0, 1, 6], head_dim, residual_dim, scale)
+    expected[[2, 2, 3], 0, [0, 1, 0]] = read.view(torch.uint8)
+    assert torch.equal(high.view(torch.uint8), expected)
 
 
 @pytest.mark.skipif(
@@ -1192,29 +1185,16 @@ def test_dsa_restore_fills_fresh_high_rows_from_the_pool():
 )
 @pytest.mark.parametrize("residual_dim", [0, 64])
 def test_deepseek_v4_restore_fills_fresh_high_rows_from_the_pool(residual_dim):
-    """Restored compressed high rows equal the pool rows decoded like the sparse read."""
+    """Restored compressed high rows hold what the NVFP4 read returns for their pool rows."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
         DeepseekV4TrtllmAttention,
     )
 
     ratio, tokens_per_block, head_dim, num_pool_tokens = 4, 8, 512, 12
     rows_per_page, row_bytes = tokens_per_block // ratio, (head_dim + residual_dim) // 2
-    residual_start = head_dim - residual_dim
-    codes = torch.arange(1, num_pool_tokens + 1, dtype=torch.uint8, device="cuda")
-    data_pool = (codes | (codes << 4))[:, None].expand(-1, (head_dim + residual_dim) // 2)
-    data_pool = data_pool.contiguous()
-    scale_pool = torch.full(
-        (num_pool_tokens, (head_dim + residual_dim) // 16),
-        2.0,
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
-    )
-    for group in range(residual_dim // 16):
-        group_offset = residual_start // 2 + group * 16
-        data_pool[:, group_offset + 8 : group_offset + 16] = 0x11
-        scale_pool[:, residual_start // 16 + group * 2 + 1] = 0.5
+    data_pool, scale_pool = _nvfp4_pool(num_pool_tokens, head_dim + residual_dim)
 
-    sentinel = 3.0
+    sentinel = 448.0
     high = torch.full(
         (4, 1, rows_per_page, 1, head_dim), sentinel, dtype=torch.float8_e4m3fn, device="cuda"
     )
@@ -1237,11 +1217,9 @@ def test_deepseek_v4_restore_fills_fresh_high_rows_from_the_pool(residual_dim):
         torch.tensor([1, 1, 1], dtype=torch.int32, device="cuda"),
         torch.tensor([2, 3, 4], dtype=torch.int32, device="cuda"),
     )
+    scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
     owner = SimpleNamespace(
-        compress_ratio=ratio,
-        head_dim=head_dim,
-        layer_idx=0,
-        _nvfp4_compress_scale_quant_orig=torch.tensor([0.25], dtype=torch.float32, device="cuda"),
+        compress_ratio=ratio, head_dim=head_dim, layer_idx=0, _nvfp4_compress_scale_quant_orig=scale
     )
     block_table_compressed = torch.tensor(
         [[4, -1, -1], [2, 0, 3]], dtype=torch.int32, device="cuda"
@@ -1258,19 +1236,8 @@ def test_deepseek_v4_restore_fills_fresh_high_rows_from_the_pool(residual_dim):
         block_table_compressed,
     )
 
-    e2m1 = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        device="cuda",
-    )
-
-    def decoded(pool_row):
-        row = (e2m1[codes[pool_row].long()] * 2.0).expand(head_dim).clone()
-        if residual_dim:
-            row[-residual_dim:] += 0.25
-        return (row * 0.25).to(torch.float8_e4m3fn)
-
-    expected = torch.full_like(high, sentinel)
+    expected = torch.full_like(high, sentinel).view(torch.uint8)
     # Rows 2, 3 -> pool rows 2, 3 -> high page 2; row 4 -> pool row 2 + 3 * 2 = 8 -> high page 3.
-    for page, offset, pool_row in ((2, 0, 2), (2, 1, 3), (3, 0, 8)):
-        expected[page, 0, offset, 0] = decoded(pool_row)
-    assert torch.equal(high.view(torch.uint8), expected.view(torch.uint8))
+    read = _nvfp4_read(data_pool, scale_pool, [2, 3, 8], head_dim, residual_dim, scale)
+    expected[[2, 2, 3], 0, [0, 1, 0]] = read.view(torch.uint8)
+    assert torch.equal(high.view(torch.uint8), expected)
