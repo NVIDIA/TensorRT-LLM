@@ -116,12 +116,6 @@ def adapt_config_dict(
 ) -> PretrainedConfig:
     if _is_mistral_large4(config_dict):
         _require_mistral_common_for_mistral_large4()
-        if config_dict.get("quantization"):
-            raise ValueError(
-                "Mistral-Large-4 is served from the ModelOpt MIXED_PRECISION export, whose "
-                "params.json states quantization_config; found quantization="
-                f"{config_dict['quantization']!r}"
-            )
         config_dict = deepcopy(config_dict)
         config_dict = _remap_general_mistral_args(config_dict)
         config_dict = _remap_moe_args(config_dict)
