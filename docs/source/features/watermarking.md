@@ -8,15 +8,7 @@ The watermark uses a keyed Gumbel-max draw in place of the random draw of the fi
 Temperature, top-k, top-p and min-p are applied first, so the output distribution is unchanged on
 average over keys. Detection needs only the token ids, the tokenizer and the key.
 
-## Which requests are watermarked
-
-| Request | Watermarked? |
-|---------|--------------|
-| The engine has no `watermark_config` | No. |
-| `SamplingParams.watermarking=False` | No, unless the engine sets `allow_request_opt_out=False`. |
-| `watermarking=None` (the default) or `True` | Yes. The two behave the same: the field is only an opt-out. |
-| Greedy (`temperature=0`) or beam search | No. The request is generated normally and a warning is logged once. |
-| A sampled request | Yes, token by token. A token whose context repeats (`deduplicate_contexts`), the first `context_width` tokens with `"all"`, and the accepted drafts with `allow_target_only_watermarking` use ordinary sampling. |
+This feature is a prototype: the API and the detection recipe may change.
 
 ## Enable it
 
@@ -34,19 +26,31 @@ out = llm.generate(["Write a short note about GPUs."], SamplingParams(temperatur
 |-------|---------|---------|
 | `algorithm` | `"gumbel"` | `"gumbel"` or `"gumbel_dual_key"`. Dual-key additionally supports speculative decoding with rejection sampling (see below). |
 | `key` | required | Secret integer in `[0, 2**64)`. Detection needs the same value. Excluded from `repr`. |
-| `context_width` | 4 | Number of preceding tokens that seed each decision. Larger values are less robust to edits. |
+| `context_width` | 4 | Number of preceding tokens that seed each decision, 1 to 64. Larger values are less robust to edits; above 16 a warning is logged. |
 | `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this; `"single_turn"` searches the tokens the request generates; `"all"` also searches the prompt (for example earlier turns of a conversation) and leaves the first `context_width` generated tokens unwatermarked. |
 | `deduplicate_contexts_max_history` | 8192 | How many generated positions back the repeat search reaches. `None` means the whole generation. |
+| `allow_target_only_watermarking` | `False` | Only for speculative decoding with rejection sampling: leave accepted draft tokens unmarked (see below). |
 | `allow_request_opt_out` | `True` | Whether a request may set `SamplingParams.watermarking=False`. Set to `False` to enforce the watermark on every request that can carry one. |
 | `prf` | `"philox"` | Pseudo-random function. Fast but not cryptographic: it does not protect against key recovery or forgery. |
 
-Per request, `SamplingParams.watermarking` (and the `watermarking` field of the OpenAI-compatible
-completion and chat requests) is `None` or `True` to request a watermark and `False` to opt out.
+With `trtllm-serve`, put `watermark_config: {key: ...}` in the `--config` YAML. Per request,
+`SamplingParams.watermarking` (and the `watermarking` field of the OpenAI-compatible completion and chat
+requests) set to `False` opts out; see the next section.
+
+## Which requests are watermarked
+
+| Request | Watermarked? |
+|---------|--------------|
+| The engine has no `watermark_config` | No. |
+| `SamplingParams.watermarking=False` | No, unless the engine sets `allow_request_opt_out=False`. |
+| `watermarking=None` (the default) or `True` | Follows the engine: watermarked if it has a `watermark_config`. `True` does not force a watermark on an engine without one; only `False` changes the outcome. |
+| Greedy (`temperature=0`) or beam search | No. The request is generated normally and a warning is logged once. |
+| A sampled request | Yes, token by token. A token whose context repeats (`deduplicate_contexts`), the first `context_width` tokens with `"all"`, and the accepted drafts with `allow_target_only_watermarking` use ordinary sampling. |
 
 ## Speculative decoding
 
 Watermarking works with the one-model speculative modes (Eagle3, MTP, DraftTarget and the others that
-share their verification), with CUDA graphs, the overlap scheduler and chunked prefill.
+share their verification).
 
 - **Exact-match verification (the default).** A draft token is accepted only when it equals the token
   the target itself sampled at that position, so the output is exactly what plain decoding with the
@@ -60,7 +64,8 @@ share their verification), with CUDA graphs, the overlap scheduler and chunked p
   - `allow_target_only_watermarking=True` leaves accepted draft tokens unmarked and watermarks only the
     token that follows them. The signal weakens as the acceptance rate rises.
 
-  Without one of these, a watermarked request fails at admission.
+  Without one of these, a watermarked request fails at admission. `gumbel_dual_key` is also rejected at
+  admission with parallel-draft speculation.
 
 ## Detect it
 
@@ -85,19 +90,20 @@ before relying on a decision. Detection outputs can help an attacker imitate or 
 
 ## Compatibility
 
-Watermarking works with CUDA graphs, the overlap scheduler, chunked prefill, tensor, pipeline, expert and
-attention data parallelism, disaggregated serving (configure both workers identically), and the one-model
-speculative modes described above. A logits post-processor edits the logits before the watermark draw, so
-tokens it bans are never sampled and the mark steers among the rest (not combinable with speculative
-decoding, which the executor already rejects). With KV cache reuse, the first request matches an engine
-without reuse; a later request that hits the cache can differ in its sampled text through bf16 numerics, as
-it does without the watermark, and is still detected. Guided decoding, sliding window attention, LoRA and
-Helix parallelism are untested. See the
-[feature combination matrix](feature-combination-matrix.md).
+See the Text Watermarking row of the [feature combination matrix](feature-combination-matrix.md). Notes on
+specific combinations:
+
+- Disaggregated serving: configure the context and generation workers with the same `watermark_config`.
+- Logits post-processor: it edits the logits before the watermark draw, so tokens it bans are never sampled
+  and the mark steers among the rest. It cannot be combined with speculative decoding, which the executor
+  already rejects.
+- KV cache reuse: the first request matches an engine without reuse. A later request that hits the cache can
+  differ in its sampled text through bf16 numerics, as it does without the watermark, and is still detected.
+- Guided decoding: untested. The grammar mask is applied before the watermark draw, so the mark can only
+  steer among the tokens the grammar allows.
 
 ## Limitations
 
-- Greedy (`temperature=0`) and beam-search requests cannot carry a watermark and are generated normally.
 - Sampling becomes deterministic given the context. Requests with `n > 1` and the same prompt produce
   the same text until their contexts diverge, and repeated contexts are not watermarked.
 - Low-entropy output (code, short answers) and heavily edited text carry little signal.
@@ -106,8 +112,8 @@ Helix parallelism are untested. See the
   can move accuracy up or down by several points; the average over keys is unbiased.
   `deduplicate_contexts="all"` leaves the first `context_width` generated tokens unwatermarked and
   avoids this, at the price of no mark on very short outputs.
-- Guided decoding with the watermark is untested. The grammar mask is applied before the watermark draw, so
-  the mark can only steer among the tokens the grammar allows.
-- Not supported: NGram and user-provided drafts (verified in the sampler), tree (dynamic tree)
-  speculation, relaxed acceptance for thinking, and ragged verification. The engine rejects these
-  combinations: at startup for NGram and user-provided drafts, at admission for the others.
+- Not supported, and rejected by the engine:
+  - NGram and user-provided drafts: at startup.
+  - DSpark speculation (its verification windows are ragged): when the LLM arguments are validated.
+  - Tree (dynamic tree) speculation, relaxed acceptance for thinking, and rejection sampling without a
+    dual-key or target-only setting: at request admission.
