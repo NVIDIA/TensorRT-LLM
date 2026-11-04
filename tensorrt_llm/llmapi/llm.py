@@ -2148,7 +2148,7 @@ class _TorchLLM(BaseLLM):
             return  # Skip _executor creation
 
         # Hint: if this looks like an encoder model, suggest encode()
-        if self.args.encode_only is None and not self.args.mm_encoder_only:
+        if not self.args.encode_only and not self.args.mm_encoder_only:
             from tensorrt_llm._torch.model_config import ModelConfig
             architectures = getattr(self._hf_model_config, 'architectures',
                                     None) if self._hf_model_config else None

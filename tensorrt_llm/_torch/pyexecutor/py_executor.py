@@ -1560,6 +1560,11 @@ class PyExecutor:
             raise
 
     @property
+    def is_generation_model(self) -> bool:
+        """Whether requests generate tokens, rather than finish after one forward."""
+        return self.sampler.is_generation_model()
+
+    @property
     def metrics(self) -> dict[str, float | dict[str, float]]:
         """Return executor construction and model-engine startup metrics."""
         return self._metrics
