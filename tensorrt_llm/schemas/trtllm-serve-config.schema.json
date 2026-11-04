@@ -1044,6 +1044,22 @@
           "description": "Number of draft positions produced per block. If None, read from the draft model config (dspark_block_size). Should equal max_draft_len.",
           "title": "Block Size"
         },
+        "context_kv_dtype": {
+          "default": "auto",
+          "description": "Storage dtype of a standalone MLA DSpark drafter's context KV (one latent per token and drafter layer) in its paged draft KV cache. 'auto' keeps the drafter's weight dtype (BF16). 'fp8' stores FP8 E4M3 latents at a unit per-tensor scale, halving the draft cache bytes per token; the block decode then reads them with the FP8 CuTe DSL MLA decode, so a drafting server needs attention_backend CUTEDSL (the MLA drafter's AUTO choice). Lossy. The context and generation servers of disaggregated serving must set the same value.",
+          "enum": [
+            "auto",
+            "fp8"
+          ],
+          "title": "Context Kv Dtype",
+          "type": "string"
+        },
+        "context_kv_only": {
+          "default": false,
+          "description": "Set on the context servers of disaggregated serving with a standalone MLA DSpark drafter. A context server never drafts: it builds the drafter's context KV from the target hidden states during prefill. With this set it loads only what that needs (the context projection and each drafter layer's latent projection and norm) and emits placeholder draft tokens. Requires disaggregated serving.",
+          "title": "Context Kv Only",
+          "type": "boolean"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
