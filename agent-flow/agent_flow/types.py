@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -96,6 +99,14 @@ class SessionInitEvent:
     skills: list[str] = field(default_factory=list)
     plugins: list[str] = field(default_factory=list)
     agents: list[str] = field(default_factory=list)
+    backend: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    session_id: str | None = None
+    # What the session runs under, as the backend reports it: a site's policy
+    # can narrow what was asked for. ``None`` when the backend does not say.
+    sandbox: str | None = None
+    approval_policy: str | None = None
 
 
 @dataclass

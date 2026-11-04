@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deadline arbitration tests; no backend or GPU is needed to advance the clock."""
 
+import re
 import threading
 from functools import partial
 from types import SimpleNamespace
@@ -13,8 +14,11 @@ import pytest
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
-from tensorrt_llm._torch.disaggregation.native.bounce import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    PhysicalOperationState,
+    SendOperationOwner,
+)
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
@@ -591,7 +595,6 @@ def _receiver(watchdog: RetirementWatchdog) -> transfer_mod.Receiver:
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = Mock()
     return receiver
 
 
@@ -640,6 +643,165 @@ def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBa
     assert session._sender._begin_task_operation(task, 7)
     assert session._sender._submit_transfer(task, 7, object()) == (True, None)
     task.complete()
+
+
+def test_operation_snapshot_distinguishes_empty_and_retains_state_values() -> None:
+    """Snapshots contain immutable evidence, not live operation objects."""
+    owner = SendOperationOwner()
+    assert owner.try_snapshot_operation_states() == ()
+    assert owner.begin_physical_operation(1)
+    snapshot = owner.try_snapshot_operation_states()
+    assert snapshot == (PhysicalOperationState.ADMITTED,)
+
+    owner.retire_unsubmitted_physical_operation(1)
+
+    assert snapshot == (PhysicalOperationState.ADMITTED,)
+    assert owner.try_snapshot_operation_states() == (PhysicalOperationState.NOT_SUBMITTED,)
+
+
+def test_timeout_progress_reports_mixed_sender_phases_without_advancing_deadlines() -> None:
+    """An observation must neither query a backend nor arbitrate an overdue clock."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _tx_session(watchdog, need_aux=False)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    task = session.kv_tasks[0]
+    backend_status = Mock()
+    for peer in range(6):
+        assert task.begin_physical_operation(peer)
+    for peer in (1, 2, 3, 5):
+        task.begin_backend_submission(peer, object())
+    for peer in (2, 3, 5):
+        task.record_backend_submission(peer, backend_status)
+    task.retire_backend_done_physical_operation(3)
+    task.retire_unsubmitted_physical_operation(4)
+    task.mark_physical_operation_in_doubt(5)
+
+    def snapshot_state() -> tuple[object, ...]:
+        return (
+            session._deadline_monotonic_s,
+            session._retirement._request_deadline,
+            session._retirement._drain_started,
+            dict(session._retirement._claims),
+            session._logical_outcomes._terminal,
+            [operation.state for operation in task._physical_operations.values()],
+        )
+
+    before = snapshot_state()
+    clock.return_value = 100.0
+    clock.reset_mock()
+
+    description = session._timeout_progress_description()
+
+    for phase in (
+        "pre_submission",
+        "submitting",
+        "submitted",
+        "not_submitted",
+        "backend_done",
+        "in_doubt",
+    ):
+        assert re.search(rf"(?:\[|,){phase}=1(?:,|\])", description), description
+    assert "source_pieces=1" in description
+    assert "unavailable_tasks=0" in description
+    assert before == snapshot_state()
+    clock.assert_not_called()
+    assert backend_status.mock_calls == []
+
+
+def test_timeout_progress_reports_publication_not_remote_submission() -> None:
+    """GEN's local writer evidence must not be presented as CTX service progress."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _rx_session(_receiver(watchdog))
+    task = session.prepare_receive(Chunk([], [], TokenRange(0, 16), True))
+    assert task is not None
+    task.expected_transfers = 2
+    published: set[int] = set()
+    assert session.try_begin_transfer(
+        0,
+        {"sender"},
+        writer_cohort={1, 2},
+        publish=lambda: published.update((1, 2)),
+        published_writers=published,
+    )
+    owner = task._physical_owner
+    assert owner is not None
+    owner.record_writer_result(1, True)
+    owner.record_writer_in_doubt(2)
+
+    def snapshot_state() -> tuple[object, ...]:
+        return (
+            session._retirement._request_deadline,
+            dict(session._retirement._claims),
+            session._logical_outcomes._terminal,
+            dict(owner._writer_results),
+            set(owner._in_doubt_writers),
+        )
+
+    before = snapshot_state()
+    clock.return_value = 100.0
+    clock.reset_mock()
+
+    description = session._timeout_progress_description()
+
+    assert "ctx_submission=unknown" in description
+    assert "publication_may_have_escaped=True" in description
+    assert "expected_writer_results=4" in description  # KV and AUX each need two writers.
+    assert "received_writer_results=1" in description
+    assert "in_doubt_writers=1" in description
+    assert before == snapshot_state()
+    clock.assert_not_called()
+
+
+@pytest.mark.parametrize("side", ["tx", "rx"])
+@pytest.mark.parametrize("locked", ["session", "owner"])
+def test_timeout_progress_does_not_wait_for_busy_metadata(side: str, locked: str) -> None:
+    """A timeout report must not wait behind a worker or retirement arbiter."""
+    watchdog = RetirementWatchdog(Mock(), clock=lambda: 10.0)
+    if side == "tx":
+        session = _tx_session(watchdog, need_aux=False)
+        session.send(Chunk([], [], TokenRange(0, 16), True))
+    else:
+        session = _rx_session(_receiver(watchdog))
+        session.prepare_receive(Chunk([], [], TokenRange(0, 16), True))
+    results = []
+    lock = session.lock if locked == "session" else watchdog.lock
+    with lock:
+        thread = threading.Thread(
+            target=lambda: results.append(session._timeout_progress_description())
+        )
+        thread.start()
+        thread.join(timeout=1.0)
+        finished_without_unlock = not thread.is_alive()
+    thread.join(timeout=1.0)
+    assert finished_without_unlock
+    assert len(results) == 1
+    expected = (
+        "session_busy"
+        if locked == "session"
+        else ("unavailable_tasks=1" if side == "tx" else "unavailable_owners=2")
+    )
+    assert expected in results[0]
+    if side == "rx":
+        session.cancel_local()
+    assert session.close()
+    watchdog.stop()
+
+
+@pytest.mark.parametrize("side", ["tx", "rx"])
+def test_timeout_progress_keeps_legacy_resource_evidence_unavailable(side: str) -> None:
+    """Native sessions without physical ownership do not invent operation phases."""
+    peer = SimpleNamespace(
+        _enforce_physical_ownership=False, setup_session=Mock(), clear_session=Mock()
+    )
+    session_type = transfer_mod.TxSession if side == "tx" else transfer_mod.RxSession
+    session = session_type(4, DisaggregatedParams(disagg_request_id=4), peer)
+    description = session._timeout_progress_description()
+    assert "unavailable(ownership_disabled)" in description
+    assert "pre_submission=" not in description
+    assert "expected_writer_results=" not in description
+    assert session.close()
 
 
 @pytest.mark.parametrize("piece", ["kv", "aux"])
@@ -743,7 +905,6 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
     watchdog = RetirementWatchdog(Mock(), clock=clock)
     if final_piece == "receive_kv":
         receiver = _receiver(watchdog)
-        receiver._bounce = NoBounceTransport()
         receiver._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
         )
@@ -768,7 +929,6 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
             task = session.send_aux()
         sender = session._sender
         sender._instance_rank = sender._device_id = 0
-        sender._bounce = NoBounceTransport()
         sender._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="sender", instance_rank=0)
         )
@@ -854,7 +1014,6 @@ def test_finished_nonfinal_piece_does_not_complete_session(direction: str, block
         _submit_piece(session, session.kv_tasks[0])
     else:
         receiver = _receiver(watchdog)
-        receiver._bounce = NoBounceTransport()
         receiver._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
         )
@@ -929,7 +1088,6 @@ def test_expired_second_receive_preserves_existing_claims(need_aux: bool) -> Non
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
     receiver = _receiver(watchdog)
-    receiver._bounce = NoBounceTransport()
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
     )
@@ -969,7 +1127,6 @@ def _settled_rx_session(
 ) -> tuple[transfer_mod.RxSession, transfer_mod.KVRecvTask, Mock]:
     """Settle real KV and AUX result handlers before the executor closes the session."""
     receiver = _receiver(watchdog)
-    receiver._bounce = NoBounceTransport()
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
     )
@@ -1159,9 +1316,9 @@ def test_receive_reserves_kv_and_aux_atomically_against_cancellation(
     assert published == {7}
     assert session.status is SessionStatus.CANCELLED
     assert not session.resources_drained()
-    task.record_writer_result(7, False, wait_for_local_completion=False)
+    task.record_writer_result(7, False)
     assert not session.resources_drained()
-    session._aux_physical_owner.record_writer_result(7, False, wait_for_local_completion=False)
+    session._aux_physical_owner.record_writer_result(7, False)
     assert session.close()
     watchdog.stop()
 
@@ -1255,7 +1412,6 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
     worker._receiver = receiver
     worker._agent = Mock()
     worker._registered_mem = [object()]
-    worker._bounce = Mock()
     if trigger == "cancel":
         session.cancel_local()
     elif trigger == "failure":
@@ -1271,8 +1427,8 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
     clock.return_value = 20.0 if trigger == "timeout" else 15.0
     watchdog.progress()
     assert watchdog.fatal is not None
-    task.record_writer_result(7, False, wait_for_local_completion=False)
-    session._aux_physical_owner.record_writer_result(7, False, wait_for_local_completion=False)
+    task.record_writer_result(7, False)
+    session._aux_physical_owner.record_writer_result(7, False)
     assert not session.resources_drained()
     assert not session.close()
     assert receiver._sessions[4] is session
@@ -1280,7 +1436,6 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
         worker.shutdown()
     worker._agent.deregister_memory.assert_not_called()
     worker._agent.shutdown.assert_not_called()
-    worker._bounce.close.assert_not_called()
     assert len(worker._registered_mem) == 1
     with pytest.raises(RuntimeError, match="admission is closed"):
         _rx_session(receiver)
@@ -1411,7 +1566,7 @@ def test_receiver_timeout_during_blocking_wait_cannot_report_delivery() -> None:
         """Inject late backend evidence at the external wait boundary."""
         assert timeout == 5.0
         clock.return_value = 15.0
-        task.record_writer_result(7, True, wait_for_local_completion=False)
+        task.record_writer_result(7, True)
         task.complete()
         return True
 
