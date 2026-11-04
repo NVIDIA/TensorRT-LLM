@@ -15,25 +15,13 @@
 """Shared, observational PyTorch profiler scopes and literal metadata."""
 
 import logging
-
-
 import math
-
-
 import os
-
-
 from collections.abc import Callable, Generator, Mapping
-
-
 from contextlib import contextmanager
-
-
 from typing import Literal, TypeAlias, cast
 
-
 import torch
-
 
 ProfilerRegion: TypeAlias = Literal["workflow", "mpi", "nccl", "nanobind", "kv", "moe"]
 
