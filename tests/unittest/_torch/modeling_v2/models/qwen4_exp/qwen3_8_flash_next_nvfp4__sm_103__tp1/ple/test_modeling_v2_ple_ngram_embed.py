@@ -5,8 +5,8 @@
 Integer bookkeeping plus a one-rounding dequantize, so gated bitwise -- the
 embedding and the whole published pool -- against the entry's reference, which
 is the scalar references of `ngram_token_history` and `ngram_hash` and a
-float64 gather-and-scale. Beyond the cells: the `query_start_loc` length guard
-and graph capture.
+float64 gather-and-scale. Beyond the cells: the `query_start_loc` length guard,
+graph capture, and the host table's huge-page advice.
 """
 
 import zlib
@@ -178,3 +178,21 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert torch.equal(graph_out, want)
     assert torch.equal(args[1], want_pool)
     assert not torch.equal(args[1], pool_before)
+
+
+def test_host_table_is_advised_transparent_huge_pages() -> None:
+    # The host-resident table is a mapping of its own, advised MADV_HUGEPAGE
+    # before it is faulted in, whatever torch's CPU allocator does with huge pages.
+    table, host = _host_resident_empty(1 << 16, CKPT_HEAD_DIM, FP8, torch.device(DEV))
+    flags, inside = None, False
+    with open("/proc/self/smaps") as smaps:
+        for line in smaps:
+            fields = line.split()
+            if line[:1] in "0123456789abcdef" and "-" in fields[0]:
+                lo, hi = (int(x, 16) for x in fields[0].split("-"))
+                inside = lo <= host.pointer < hi
+            elif inside and line.startswith("VmFlags:"):
+                flags = fields[1:]
+                break
+    assert flags is not None and "hg" in flags, flags
+    assert table.shape == (1 << 16, CKPT_HEAD_DIM)
