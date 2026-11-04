@@ -32,6 +32,7 @@ __all__ = [
     "new_small_batch_moe_counters",
     "small_batch_moe_route_word",
     "small_batch_moe_supports",
+    "small_batch_moe_takes_published",
 ]
 
 #: Largest token count of the kernel (MMA N 32).
@@ -60,6 +61,14 @@ def small_batch_moe_supports(intermediate_size: int, hidden_size: int) -> bool:
     return intermediate_size % 256 == 0 and RubinSmallBatchFusedMoeKernel.supports(
         SMALL_BATCH_MOE_MAX_TOKENS, 2 * intermediate_size, hidden_size
     )
+
+
+def small_batch_moe_takes_published(num_local_experts: int) -> bool:
+    """Whether the kernel builds its tables from a published top-k (``published_routing``) of
+    ``num_local_experts`` local experts."""
+    from ..kernels.rubin.rubin_small_batch_fused_moe import MAX_PUBLISHED_LOCAL_EXPERTS
+
+    return num_local_experts <= MAX_PUBLISHED_LOCAL_EXPERTS
 
 
 def die_major_layout(t: torch.Tensor) -> torch.Tensor:
@@ -168,6 +177,8 @@ class _SmallBatchMoeRunner:
 
             if any(t is not None for t in tables):
                 raise ValueError("published routing takes no moe_sort tables")
+            if not small_batch_moe_takes_published(num_local):
+                raise ValueError(f"published routing serves no {num_local} local experts")
             m = sort_buffer_sizes(orig_m, num_local)[1]
             # the kernel reads none of the tables; any device address fills their slots
             tables = (counters,) * len(tables)

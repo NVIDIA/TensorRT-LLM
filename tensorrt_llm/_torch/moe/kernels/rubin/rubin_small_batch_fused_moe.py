@@ -71,7 +71,7 @@ tables, and writes every element of the routed output.
 * Output push (``output_push_world``, slice combine): the task that combines an m-tile also
   stores its BF16 rows into slot ``(token, rank)`` of every rank's current buffer of a one-shot
   MNNVL all-reduce (``mnnvl_pushed_allreduce.push_slot``, ``-0`` sent as ``+0``), for a consumer
-  that finishes that all-reduce (the Kimi-K3 one-kernel MoE tail).
+  that finishes that all-reduce.
 * PDL: barrier setup and TMEM allocation run before ``griddepcontrol.wait``; the dependents are
   released right after it (every consumer of the output waits for the whole grid).
 """
@@ -125,8 +125,10 @@ CTR_TILE_BASE = CTR_MTILE_BASE + MAX_MTILES
 _SLOT_BYTES = _MMA_M * _KBLK // 2
 #: Largest slice count (the partial workspace is sized for it).
 MAX_SLICES = 32
-#: Published routing: words of the shared-memory active-expert mask (local experts <= 896).
+#: Published routing: words of the shared-memory active-expert mask, one bit per local expert.
 _ROUTE_MASK_WORDS = 28
+#: Published routing: most local experts (bits of the active-expert mask).
+MAX_PUBLISHED_LOCAL_EXPERTS = 32 * _ROUTE_MASK_WORDS
 #: Slices whose partial loads the slice combine keeps in flight at once.
 _COMBINE_CHUNK = 4
 #: Red combine: slices of the output zeroed by the kernel (the CTAs that run units

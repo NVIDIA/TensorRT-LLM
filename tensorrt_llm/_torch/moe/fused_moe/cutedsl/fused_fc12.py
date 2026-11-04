@@ -54,6 +54,7 @@ from ...custom_ops.cute_dsl_small_batch_moe_custom_op import (
     new_small_batch_moe_counters,
     small_batch_moe_route_word,
     small_batch_moe_supports,
+    small_batch_moe_takes_published,
 )
 from ..activation import (
     DEFAULT_MOE_ACTIVATION,
@@ -256,6 +257,11 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             and small_batch_moe_supports(self.intermediate_size_per_partition, self.hidden_size)
             else 0
         )
+        # Whether a routing kernel may publish this rank's top-k for the small-batch kernel
+        # (published_routing_word).
+        self._small_batch_takes_published = bool(
+            self.small_batch_max_tokens
+        ) and small_batch_moe_takes_published(self.expert_size_per_partition)
         # Created by the first small-batch call (warmup runs before any graph capture); every
         # launch leaves it zero.
         self._small_batch_counters: torch.Tensor | None = None
@@ -340,6 +346,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         top-k."""
         if (
             not 1 <= num_tokens <= self.small_batch_max_tokens
+            or not self._small_batch_takes_published
             or self.tp_size <= 1
             or self._small_batch_counters is None
         ):
