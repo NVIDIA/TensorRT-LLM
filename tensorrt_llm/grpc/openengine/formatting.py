@@ -116,15 +116,15 @@ def _stop_texts(sampling_params: SamplingParams) -> list[str]:
 def _token_holdback(sampling_params: SamplingParams) -> int:
     """Number of trailing tokens to withhold so a stop token id is not streamed.
 
-    NOTE: this depends on the private ``SamplingParams._stop_word_ids``, which the
-    LLM engine populates with the tokenized stop words. It is read after
+    NOTE: this depends on ``SamplingParams.stop_word_ids``, which the LLM
+    engine populates with the tokenized stop words. It is read after
     ``generate_async`` returns, when it is expected to be set. If the engine ever
     stops populating it (or populates it later), this degrades to 0 (no holdback)
     rather than failing — ``test_token_holdback_*`` guards the current behavior.
     """
     if sampling_params.include_stop_str_in_output:
         return 0
-    stop_word_ids = getattr(sampling_params, "_stop_word_ids", None) or []
+    stop_word_ids = sampling_params.stop_word_ids or []
     if not stop_word_ids:
         return 0
     return max(1, max(len(token_ids) for token_ids in stop_word_ids) - 1)

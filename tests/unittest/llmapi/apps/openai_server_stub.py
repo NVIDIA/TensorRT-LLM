@@ -55,8 +55,8 @@ def make_stub_openai_server(
         tokenizer=tokenizer,
         input_processor=None,
         llm_id="stub",
-        _hf_model_dir=str(tmp_path),
-        _executor=SimpleNamespace(resource_governor_queue=None),
+        hf_model_dir=str(tmp_path),
+        resource_governor_queue=None,
         generate_async=generate_async,
     )
     previous_media_executor = BaseMediaIO._executor

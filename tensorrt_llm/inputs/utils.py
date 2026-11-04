@@ -380,6 +380,11 @@ class MultimodalDataTracker:
         self._request_media_io_kwargs = request_media_io_kwargs
 
     @property
+    def multimodal_server_config(self) -> MultimodalServerConfig:
+        """Server-wide media loading settings used for this request."""
+        return self._multimodal_server_config
+
+    @property
     def request_media_io_kwargs(self) -> Optional[Dict[str, Dict[str, Any]]]:
         """Per-request `media_io_kwargs` override, or `None` if not set."""
         return self._request_media_io_kwargs

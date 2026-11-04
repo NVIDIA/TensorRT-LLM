@@ -347,7 +347,7 @@ def sampling_params_from_request(
     # `_record_sampling_params_request_fields`). Without this, the materialized
     # defaults above would look client-provided and suppress a model's
     # generation_config.json sampling defaults under generation_config="auto".
-    sampling_params._set_request_provided_fields(provided_fields)
+    sampling_params.set_request_provided_fields(provided_fields)
     return sampling_params
 
 

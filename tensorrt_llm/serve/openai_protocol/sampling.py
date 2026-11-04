@@ -216,6 +216,6 @@ def _response_format_text_config_to_guided_decoding_params(
 def _record_sampling_params_request_fields(
         request: OpenAIBaseModel, sampling_params: SamplingParams) -> None:
     """Preserve explicitly supplied fields across protocol defaulting."""
-    sampling_params._set_request_provided_fields(
+    sampling_params.set_request_provided_fields(
         field_name for field_name in request.model_fields_set
         if getattr(request, field_name, None) is not None)

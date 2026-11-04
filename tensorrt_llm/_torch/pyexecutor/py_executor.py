@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, NoReturn, Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator,
+                    List, Literal, NoReturn, Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -2748,6 +2748,19 @@ class PyExecutor:
     def get_openengine_discovery(self) -> dict:
         """Return immutable-at-startup OpenEngine node and publisher discovery."""
         return self._openengine_discovery
+
+    def set_openengine_discovery(self, discovery: dict) -> None:
+        """Record OpenEngine node and KV-event publisher discovery metadata.
+
+        Called once at startup by the OpenEngine node-discovery hook
+        (tensorrt_llm/grpc/openengine/node.py); get_openengine_discovery()
+        returns it.
+        """
+        self._openengine_discovery = discovery
+
+    def set_openengine_node_server(self, server: Any) -> None:
+        """Adopt the OpenEngine node metadata server; shutdown closes it."""
+        self._openengine_node_server = server
 
     def get_kv_cache_load(self) -> dict:
         """Return the scheduler-owned KV load snapshot.

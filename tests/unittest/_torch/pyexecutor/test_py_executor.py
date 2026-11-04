@@ -1672,6 +1672,20 @@ def test_kv_pool_rebalance_refreshes_capacity_without_mixing_discovery_metadata(
     assert executor.get_openengine_discovery() == {"node": {"engine_id": "test"}}
 
 
+def test_openengine_setters_store_what_the_getter_and_shutdown_read():
+    """The OpenEngine node-discovery hook records through these two setters."""
+    executor = object.__new__(PyExecutor)
+
+    discovery = {"node": {"engine_id": "incarnation"}, "sources": []}
+    executor.set_openengine_discovery(discovery)
+    assert executor.get_openengine_discovery() is discovery
+
+    node_server = Mock()
+    executor.set_openengine_node_server(node_server)
+    # Shutdown closes the adopted server through this private field.
+    assert executor._openengine_node_server is node_server
+
+
 def test_adp_running_counts_update_without_a_new_block_sample():
     """The final request count must update even inside the sampling interval."""
     from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState

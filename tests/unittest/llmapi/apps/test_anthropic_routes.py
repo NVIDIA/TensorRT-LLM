@@ -477,7 +477,7 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
     standard.generator = SimpleNamespace(
-        _executor=SimpleNamespace(resource_governor_queue=None),
+        resource_governor_queue=None,
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False
@@ -570,7 +570,7 @@ def test_batch_routes_are_registered_on_the_standard_server():
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
     standard.generator = SimpleNamespace(
-        _executor=SimpleNamespace(resource_governor_queue=None),
+        resource_governor_queue=None,
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False

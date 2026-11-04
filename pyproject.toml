@@ -875,6 +875,7 @@ files = [
     "tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py",
+    "tensorrt_llm/llmapi/engine_client.py",
     "tensorrt_llm/serve/_base/routing.py",
     "tensorrt_llm/serve/api/ops/system/api_router.py",
     "tensorrt_llm/serve/api/ops/system/serving.py",

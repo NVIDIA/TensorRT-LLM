@@ -104,6 +104,19 @@ def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     return service
 
 
+def test_disagg_server_address_is_the_configured_listen_address(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The fleet launcher binds its SO_REUSEPORT socket to this address."""
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    config = DisaggServerConfig(server_configs=[], hostname="127.0.0.1", port=18000)
+
+    server = OpenAIDisaggServer(config=config)
+
+    assert server.address == (config.hostname, config.port)
+    assert server.address == ("127.0.0.1", 18000)
+
+
 @pytest.mark.asyncio
 async def test_conditional_disagg_uses_selected_server_match_length():
     service = _make_service("context_first")
@@ -1091,6 +1104,7 @@ def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():
                 stop_reason=None,
                 finish_reason="stop",
                 length=5,
+                spec_dec_counters=None,
             )
         ],
         context_logits=None,
@@ -1145,6 +1159,7 @@ def test_generation_chat_postprocessor_rewrites_usage_from_output_disaggregated_
                 ),
                 stop_reason=None,
                 finish_reason="stop",
+                spec_dec_counters=None,
             )
         ],
         cached_tokens=3,

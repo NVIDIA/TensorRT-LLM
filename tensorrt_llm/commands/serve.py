@@ -553,8 +553,8 @@ def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
     It lives in the multi-frontend ipc dir, which is private to the user and
     removed, socket file included, when the executor proxy shuts down.
     """
-    # Only the classic IPC proxy has the attribute.
-    ipc_dir = getattr(llm._executor, "_multi_frontend_ipc_dir", None)
+    # Only the classic IPC proxy in multi-frontend mode has one.
+    ipc_dir = llm.multi_frontend_ipc_dir
     if not ipc_dir:
         raise ValueError(
             "num_serve_frontends > 1 requires the classic IPC executor "
@@ -2659,7 +2659,7 @@ def _run_fleet_worker_impl():
     """Build and run one fleet worker inside its telemetry boundary."""
     _init_fleet_worker_process()
     server = _build_disagg_server_from_env()
-    host, port = server._config.hostname, server._config.port
+    host, port = server.address
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

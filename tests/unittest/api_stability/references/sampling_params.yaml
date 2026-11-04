@@ -32,4 +32,13 @@ methods:
         annotation: bool
         default: false
     return_annotation: None
-properties: {}
+  set_request_provided_fields:
+    parameters:
+      field_names:
+        annotation: Iterable[str]
+        default: inspect._empty
+    return_annotation: None
+properties:
+  stop_word_ids:
+    annotation: Optional[List[List[int]]]
+    default: inspect._empty

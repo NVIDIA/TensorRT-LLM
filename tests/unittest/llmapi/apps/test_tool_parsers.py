@@ -6392,6 +6392,7 @@ class TestForcedToolChoicePostprocessing:
                                  token_ids=[1, 2, 3],
                                  finish_reason=finish_reason,
                                  stop_reason=None,
+                                 spec_dec_counters=None,
                                  disaggregated_params=None)
         return SimpleNamespace(outputs=[output], cached_tokens=0)
 
@@ -6417,6 +6418,7 @@ class TestForcedToolChoicePostprocessing:
                 finish_reason=finish_reason if last else None,
                 stop_reason=None,
                 length=chunk_index + 1,
+                spec_dec_counters=None,
                 disaggregated_params=None,
             )
             rsp = SimpleNamespace(outputs=[output],

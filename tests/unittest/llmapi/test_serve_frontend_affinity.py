@@ -93,8 +93,8 @@ def test_launch_server_serves_the_affinity_port(monkeypatch, tmp_path):
     monkeypatch.setenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "1")
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
     llm = Mock()
-    # The launcher binds its forwarding socket in the executor's ipc dir.
-    llm._executor._multi_frontend_ipc_dir = str(tmp_path)
+    # The launcher binds its forwarding socket in the multi-frontend ipc dir.
+    llm.multi_frontend_ipc_dir = str(tmp_path)
     monkeypatch.setattr(serve, "PyTorchLLM", Mock(return_value=llm))
     handed_off = {}
 
