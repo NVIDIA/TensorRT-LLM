@@ -492,6 +492,20 @@ def _estimate_full_attn_size_per_token(
     )
 
 
+def _skips_auto_host_tier(has_cp_helix: bool, is_disagg: bool, spec_config) -> bool:
+    """Whether to leave out the automatic host tier.
+
+    Suspending a DSpark request under aggregated helix is not validated yet, so
+    that combination keeps a GPU-only pool, where recompute-pause reclaims
+    pages. An explicit ``host_cache_size`` still provisions a tier.
+    """
+    return (
+        has_cp_helix
+        and not is_disagg
+        and getattr(spec_config, "decoding_type", None) == "DSpark"
+    )
+
+
 def _compute_auto_host_tier_quota(
     quota: int,
     local_ranks: int,
@@ -2364,6 +2378,12 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         elif kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
+        elif _skips_auto_host_tier(self._has_cp_helix, is_disagg, spec_config):
+            host_quota = 0
+            logger.info(
+                "KV cache manager v2 automatic host tier disabled under aggregated "
+                "helix with DSpark; set kv_cache_config.host_cache_size to enable one."
+            )
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
             # evict and later restore KV cache pages. Without a secondary
