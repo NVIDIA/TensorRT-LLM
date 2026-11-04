@@ -3255,7 +3255,9 @@ def test_sm107_nvfp4_finalize_accepts_two_cta_n_tiling():
     not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="This test requires the public Rubin CuTe DSL package",
 )
-def test_sm107_nvfp4_gather_act_fusion_cache_key_ignores_inplace_output_rows(monkeypatch):
+def test_sm107_nvfp4_gather_act_fusion_cache_key_ignores_inplace_output_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
     runner = cute_dsl_custom_ops.Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
         num_experts=1, top_k=1, num_local_experts=1, local_expert_offset=0, tile_size=128
@@ -3281,7 +3283,7 @@ def test_sm107_nvfp4_gather_act_fusion_cache_key_ignores_inplace_output_rows(mon
             torch.Size((m * shard_n // 16,)),
         )
 
-    def cache_key(m: int) -> tuple:
+    def cache_key(m: int) -> tuple[tuple[int, ...], ...]:
         return AutoTuner._find_nearest_profile(
             input_shapes(m),
             tuning_config.dynamic_tensor_specs,
