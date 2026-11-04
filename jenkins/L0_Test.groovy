@@ -1859,6 +1859,7 @@ def getPytestBaseCommandLine(
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // GB200 stages run on multiple clusters; only gcp-iad needs the gIB NCCL network plugin over IB.
+    echo "The cluster is: ${clusterName}"
     if (stageName.startsWith("GB200") && clusterName == "gcp-iad") {
         extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
     }
