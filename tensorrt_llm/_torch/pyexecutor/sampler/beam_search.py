@@ -310,6 +310,32 @@ class BeamHistory:
     """[num_beams] float, cumulative log-prob per beam."""
 
 
+@dataclass(kw_only=True)
+class BeamSearchHandoff:
+    """Beam-search state of one step, for the pipeline-parallel ranks that do not sample.
+
+    Only the last pipeline-parallel rank samples, so only it holds the
+    beam-search store and can build the final beams. The other ranks still run
+    attention over every beam, and the first one returns the results, so the
+    last rank sends them this with the host state of each step.
+    """
+
+    request_ids: list[int]
+    """The step's requests, in the row order of ``cache_indirection``."""
+    cache_indirection: torch.Tensor
+    """[len(request_ids), max_beam_width, width] int, host copy of each
+    request's cache indirection after the step, for the positions the next
+    forward reads (``width`` covers the longest request)."""
+    cum_log_probs: torch.Tensor
+    """[len(request_ids), max_beam_width] float32, host copy of each request's
+    cumulative beam log-probs after the step, which a context-only request
+    returns with its first tokens."""
+    beam_histories: dict[int, BeamHistory] | None = None
+    """Final beams of the requests the step finishes, by request id. Filled in
+    on the last rank, once the step's copies have completed, right before the
+    hand-off."""
+
+
 def _gather_beam_path(
     *, current_path: torch.Tensor, cache_indirection: torch.Tensor
 ) -> torch.Tensor:

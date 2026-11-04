@@ -17,6 +17,7 @@ import functools
 import gc
 import os
 import pathlib as _pl
+import pickle
 import types
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
@@ -34,6 +35,7 @@ from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams, TorchLlmArgs
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
+                                                        LlmRequestType,
                                                         SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
@@ -44,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
     BeamSearchParams, BeamSearchStep, CBAGroupHost, CBAState,
     _assemble_final_beams, _gather_beam_path, _prepare_beam_history_cba,
     beam_search_sampling_batch_cba, finalize_beam)
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import \
     LlmRequest as CppLlmRequest
@@ -1803,6 +1806,190 @@ def test_beam_search_cba_reorders_stop_window():
     # both window rows must now hold beam 1's history
     assert stop_window[:, 0, 0].tolist() == [200, 200, 200]
     assert stop_window[:, 0, 1].tolist() == [200, 200, 200]
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_handoff_keeps_receiving_rank_in_step() -> None:
+    """A pipeline-parallel rank that does not sample keeps beam search in step.
+
+    Only the last pipeline-parallel rank samples; every other rank updates its
+    requests from the host state that rank hands it. Drive one sampler as the
+    sampling rank and another that only receives that host state, through the
+    context step, the generation steps and the finishing step, and check that
+    after every step the receiver holds the sampler's beams and the cache
+    indirection its next forward reads, and finishes with the same final beams.
+    """
+    beam_width = 3
+    max_tokens = 6
+    vocab_size = 32
+    prompts = [[1, 2, 3], [4, 5, 6, 7]]
+    sampling_params = SamplingParams(n=beam_width,
+                                     best_of=beam_width,
+                                     use_beam_search=True)
+
+    def make_sampler() -> TorchSampler:
+        return TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=32,
+                max_draft_len=0,
+                max_num_sequences=len(prompts),
+                max_beam_width=beam_width,
+                max_total_draft_tokens=0,
+                disable_overlap_scheduler=True,
+                share_beam_search_state=True,
+            ))
+
+    def make_requests() -> list[LlmRequest]:
+        return [
+            LlmRequest(
+                request_id=slot,
+                seq_slot=slot,
+                input_tokens=prompt,
+                max_new_tokens=max_tokens,
+                end_id=-1,
+                sampling_config=SamplingConfig(
+                    sampling_params._get_sampling_config()),
+                return_log_probs=True,
+                num_logprobs=0,
+                is_streaming=False,
+            ) for slot, prompt in enumerate(prompts)
+        ]
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    logits = [
+        torch.randn(
+            (len(prompts) * (1 if step == 0 else beam_width), vocab_size),
+            device="cuda",
+            generator=generator,
+        ) for step in range(max_tokens)
+    ]
+    sampling_rank, receiving_rank = make_sampler(), make_sampler()
+    sampled_requests, received_requests = make_requests(), make_requests()
+    sampled_store = sampling_rank.store.beam_search_store
+    received_store = receiving_rank.store.beam_search_store
+    assert sampled_store is not None and received_store is not None
+
+    for step, step_logits in enumerate(logits):
+        scheduled = ScheduledRequests()
+        if step == 0:
+            scheduled.context_requests_last_chunk = sampled_requests
+        else:
+            scheduled.generation_requests = sampled_requests
+        state = sampling_rank.sample_async(
+            scheduled,
+            model_outputs={"logits": step_logits},
+            num_context_logits_prefix_sum=(list(range(len(prompts) + 1))
+                                           if step == 0 else [0]),
+        )
+        assert state.sampler_event is not None
+        state.sampler_event.synchronize()
+        sampling_rank.prepare_handoff(state)
+        # The receiving rank gets only the host state, serialized between processes.
+        relayed = SampleStateTorch(requests=received_requests,
+                                   host=pickle.loads(pickle.dumps(state.host)))
+        sampling_rank.update_requests(state)
+        receiving_rank.update_requests(relayed)
+
+        for sampled, received in zip(sampled_requests, received_requests):
+            assert [
+                received.get_tokens(beam) for beam in range(beam_width)
+            ] == [sampled.get_tokens(beam) for beam in range(beam_width)]
+            assert received.is_finished == sampled.is_finished
+            # The next forward attends over every position the request holds.
+            num_positions = sampled.max_beam_num_tokens
+            slot = sampled.py_seq_slot
+            assert torch.equal(
+                received_store.cache_indirection[slot, :, :num_positions],
+                sampled_store.cache_indirection[slot, :, :num_positions])
+            for request in (sampled, received):
+                if not request.is_finished:
+                    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    request.decoding_iter = request.py_decoding_iter
+
+    for sampled, received in zip(sampled_requests, received_requests):
+        assert sampled.is_finished
+        assert received.py_result.log_probs == sampled.py_result.log_probs
+        assert received.py_result.cum_log_probs == sampled.py_result.cum_log_probs
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_handoff_returns_context_only_first_tokens() -> None:
+    """A pipeline-parallel rank that does not sample returns the sampled first tokens.
+
+    A context-only (disaggregated prefill) request ends with its context step
+    and returns each beam's first token with its cumulative log-prob, which
+    the generation server starts its beams from. The first pipeline-parallel
+    rank returns them, but only the last one samples: drive one sampler as the
+    sampling rank and another that only receives its host state, and check
+    that both return the same first tokens and log-probs.
+    """
+    beam_width = 3
+    vocab_size = 32
+    prompts = [[1, 2, 3], [4, 5, 6, 7]]
+    sampling_params = SamplingParams(n=beam_width,
+                                     best_of=beam_width,
+                                     use_beam_search=True)
+
+    def make_sampler() -> TorchSampler:
+        return TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=32,
+                max_draft_len=0,
+                max_num_sequences=len(prompts),
+                max_beam_width=beam_width,
+                max_total_draft_tokens=0,
+                disable_overlap_scheduler=True,
+                share_beam_search_state=True,
+            ))
+
+    def make_requests() -> list[LlmRequest]:
+        return [
+            LlmRequest(
+                request_id=slot,
+                seq_slot=slot,
+                input_tokens=prompt,
+                max_new_tokens=4,
+                end_id=-1,
+                sampling_config=SamplingConfig(
+                    sampling_params._get_sampling_config()),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+            ) for slot, prompt in enumerate(prompts)
+        ]
+
+    sampling_rank, receiving_rank = make_sampler(), make_sampler()
+    received_store = receiving_rank.store.beam_search_store
+    assert received_store is not None
+    # Nothing on a rank that does not sample writes them; make that visible.
+    received_store.cum_log_probs.fill_(float("nan"))
+    sampled_requests, received_requests = make_requests(), make_requests()
+
+    scheduled = ScheduledRequests()
+    scheduled.context_requests_last_chunk = sampled_requests
+    logits = torch.randn(
+        (len(prompts), vocab_size),
+        device="cuda",
+        generator=torch.Generator(device="cuda").manual_seed(0),
+    )
+    state = sampling_rank.sample_async(
+        scheduled,
+        model_outputs={"logits": logits},
+        num_context_logits_prefix_sum=list(range(len(prompts) + 1)),
+    )
+    assert state.sampler_event is not None
+    state.sampler_event.synchronize()
+    sampling_rank.prepare_handoff(state)
+    # The receiving rank gets only the host state, serialized between processes.
+    relayed = SampleStateTorch(requests=received_requests,
+                               host=pickle.loads(pickle.dumps(state.host)))
+    sampling_rank.update_requests(state)
+    receiving_rank.update_requests(relayed)
+
+    for sampled, received in zip(sampled_requests, received_requests):
+        first_gen_log_probs = sampled.py_result.first_gen_log_probs
+        assert first_gen_log_probs is not None
+        assert len(first_gen_log_probs) == beam_width
+        assert received.py_result.first_gen_log_probs == first_gen_log_probs
 
 
 def create_default_request(test_params: GeneralTestParams) -> LlmRequest:
