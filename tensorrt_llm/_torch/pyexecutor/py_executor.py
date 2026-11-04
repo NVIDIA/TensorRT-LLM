@@ -98,6 +98,7 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .idle_notification_runtime import (IdleNotificationRuntime,
+                                        can_park_idle_requests,
                                         prepare_idle_notification)
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
@@ -7267,9 +7268,17 @@ class PyExecutor:
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
+        notification_enabled = getattr(self, "_idle_notification_runtime",
+                                       None) is not None
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown
-                and not self._has_pending_connector_transfers())
+                and not self.is_shutdown)
+        if idle:
+            if notification_enabled:
+                # All ranks enter this vote, before any owner-local transfer
+                # predicate can make their collective/parking choices differ.
+                idle = can_park_idle_requests(self)
+            else:
+                idle = not self._has_pending_connector_transfers()
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -7279,8 +7288,6 @@ class PyExecutor:
             timeout = datetime.timedelta(0)
 
         idle_fetch = None
-        notification_enabled = getattr(self, "_idle_notification_runtime",
-                                       None) is not None
         # Fetch requests from rank 0
         new_requests = []
         if self.dist.rank == 0 and not control_pending:

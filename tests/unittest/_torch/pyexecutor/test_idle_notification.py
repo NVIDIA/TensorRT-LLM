@@ -6,6 +6,8 @@
 import copy
 import datetime
 import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.idle_notification import IdleRequestNotifica
 from tensorrt_llm._torch.pyexecutor.idle_notification_runtime import (
     IdleNotificationRuntime,
     _validate_progress_modes,
+    can_park_idle_requests,
 )
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
 
@@ -149,6 +152,11 @@ def _ordinary_executor() -> SimpleNamespace:
         is_benchmark_disagg=False,
         kv_cache_transceiver=None,
         kv_connector_manager=None,
+        async_transfer_manager=SimpleNamespace(has_any_inflight_requests=lambda: False),
+        _pending_response_terminations=[],
+        control_requests=[],
+        request_accumulated=[],
+        _has_pending_connector_transfers=lambda: False,
         drafter=None,
         draft_model_engine=None,
         model_engine=SimpleNamespace(
@@ -165,6 +173,98 @@ def _ordinary_executor() -> SimpleNamespace:
 
 def test_supported_progress_modes_are_admitted() -> None:
     _validate_progress_modes(_ordinary_executor())
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("transfer", ["transceiver", "connector", "both"])
+def test_disaggregation_and_attention_dp_are_not_topology_exclusions(
+    attention_dp, transfer
+) -> None:
+    executor = _ordinary_executor()
+    executor.enable_attention_dp = attention_dp
+    executor.is_benchmark_disagg = True
+    if transfer in ("transceiver", "both"):
+        executor.kv_cache_transceiver = object()
+    if transfer in ("connector", "both"):
+        executor.kv_connector_manager = object()
+    _validate_progress_modes(executor)
+
+
+@pytest.mark.parametrize("kind", ["vanilla", "eagle", "dynamic_tree"])
+@pytest.mark.parametrize("draft_len", [1, 7, 32])
+def test_builtin_mtp_worker_metadata_join_without_draft_length_cap(kind, draft_len) -> None:
+    from tensorrt_llm._torch.speculative.eagle3 import (
+        Eagle3OneModelSpecMetadata,
+        MTPEagleWorker,
+    )
+    from tensorrt_llm._torch.speculative.mtp import MTPSpecMetadata, MTPWorker
+    from tensorrt_llm._torch.speculative.mtp_dynamic_tree import MTPEagleDynamicTreeWorker
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    config = MTPDecodingConfig(
+        max_draft_len=draft_len,
+        num_nextn_predict_layers=1,
+        use_mtp_vanilla=kind == "vanilla",
+        use_dynamic_tree=kind == "dynamic_tree",
+        dynamic_tree_max_topK=2 if kind == "dynamic_tree" else None,
+    )
+    worker_type, metadata_type = {
+        "vanilla": (MTPWorker, MTPSpecMetadata),
+        "eagle": (MTPEagleWorker, Eagle3OneModelSpecMetadata),
+        "dynamic_tree": (MTPEagleDynamicTreeWorker, Eagle3OneModelSpecMetadata),
+    }[kind]
+    # Admission-only objects avoid allocating CUDA buffers in a CPU test.
+    # They do not establish model-forward or native MTP correctness.
+    worker = object.__new__(worker_type)
+    worker.spec_config = copy.deepcopy(config)
+    worker._auxiliary_state_handlers = []
+    metadata = object.__new__(metadata_type)
+    metadata.spec_dec_mode = config.spec_dec_mode
+    executor = _ordinary_executor()
+    executor.model_engine.spec_config = config
+    executor.model_engine._get_spec_worker = lambda: worker
+    executor.model_engine.spec_metadata = metadata
+    _validate_progress_modes(executor)
+
+    for field, value in (
+        ("spec_config", MTPDecodingConfig(max_draft_len=draft_len + 1)),
+        ("_auxiliary_state_handlers", [object()]),
+    ):
+        original = getattr(worker, field)
+        setattr(worker, field, value)
+        with pytest.raises(ValueError, match="built-in MTP worker/metadata"):
+            _validate_progress_modes(executor)
+        setattr(worker, field, original)
+    executor.model_engine.spec_metadata = None
+    with pytest.raises(ValueError, match="built-in MTP worker/metadata"):
+        _validate_progress_modes(executor)
+
+
+@pytest.mark.parametrize(
+    "pending", ["connector", "send", "receive", "response", "control", "queued"]
+)
+@pytest.mark.parametrize("peer_pending", [False, True])
+def test_idle_vote_covers_local_and_remote_progress_owners(pending, peer_pending) -> None:
+    executor = _ordinary_executor()
+    if pending == "connector":
+        executor._has_pending_connector_transfers = lambda: not peer_pending
+    elif pending == "send":
+        # Includes transceiver sends that outlive active_requests, even with
+        # no kv_connector_manager installed.
+        executor.async_transfer_manager.has_any_inflight_requests = lambda: not peer_pending
+    elif pending == "receive":
+        executor.kv_cache_transceiver = SimpleNamespace(
+            check_gen_transfer_complete=lambda: peer_pending
+        )
+    elif pending == "response":
+        executor._pending_response_terminations = [] if peer_pending else [object()]
+    elif pending == "control":
+        executor.control_requests = [] if peer_pending else [object()]
+    else:
+        executor.request_accumulated = [] if peer_pending else [object()]
+    executor.dist.allgather = Mock(return_value=[not peer_pending, peer_pending])
+    assert not can_park_idle_requests(executor)
+    executor.dist.allgather.assert_called_once_with(not peer_pending)
 
 
 @pytest.mark.parametrize("tp_size,cp_size", [(1, 2), (2, 2), (4, 2)])
@@ -420,6 +520,7 @@ def test_real_fetch_has_one_original_batch_deadline_and_parks_only_if_idle(
         pp_size=1,
         has_pp=False,
         supports_single_round_broadcast=False,
+        allgather=Mock(return_value=[False, False]),
     )
     requests = ExecutorRequestQueue(
         dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=100
@@ -500,14 +601,113 @@ def test_real_fetch_has_one_original_batch_deadline_and_parks_only_if_idle(
     assert underlying.get.call_count == (2 if live_requests == 0 and not already_queued else 1)
     waiting.add_requests.assert_called_once_with([item])
     broadcaster._broadcast_requests.assert_called_once_with([item], None)
+    assert dist.allgather.call_count == (1 if live_requests == 0 else 0)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("live_requests,shutdown", [(0, False), (1, False), (0, True)])
+def test_real_fetch_does_not_park_while_a_peer_has_pending_work(
+    enabled, live_requests, shutdown
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = _ordinary_executor()
+    executor.dist.rank = 0
+    executor.dist.allgather = Mock(return_value=[False, True])
+    executor.is_shutdown = shutdown
+    executor._idle_notification_runtime = object() if enabled else None
+    executor.hang_detector = SimpleNamespace(pause=nullcontext)
+    executor.executor_request_queue = SimpleNamespace(
+        get_from_request_queue=Mock(return_value=[])
+    )
+    executor.request_broadcaster = SimpleNamespace(broadcast=Mock(return_value=([], None)))
+    executor._handle_special_queue_items = lambda items: items
+    waiting = Mock()
+    waiting.__len__ = Mock(return_value=0)
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting, live_requests)
+
+    should_block = not enabled and not live_requests and not shutdown
+    expected_timeout = None if should_block else datetime.timedelta(0)
+    executor.executor_request_queue.get_from_request_queue.assert_called_once_with(expected_timeout)
+    should_vote = enabled and not live_requests and not shutdown
+    assert executor.dist.allgather.call_count == int(should_vote)
+    if enabled:
+        assert executor.request_broadcaster.broadcast.call_args.kwargs["idle_fetch"] is None
+
+
+@pytest.mark.parametrize("owner", [0, 1])
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("pending", ["none", "send", "receive", "connector", "response"])
+def test_two_rank_fetch_preserves_collective_order_and_progress(
+    owner, attention_dp, pending
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    # Exercise both real fetch/broadcast/protocol bodies concurrently. This
+    # CPU collective models rank ordering; it is not real-MPI validation.
+    barrier = threading.Barrier(2, timeout=5)
+    values = [None, None]
+    notices = queue.Queue()
+
+    def gather(rank, value):
+        values[rank] = value
+        barrier.wait()
+        result = list(values)
+        barrier.wait()
+        return result
+
+    def run(rank):
+        executor = _ordinary_executor()
+        executor.enable_attention_dp = attention_dp
+        executor.dist.rank = rank
+        executor.dist.has_pp = False
+        executor.dist.supports_single_round_broadcast = False
+        executor.dist.allgather = lambda value: gather(rank, value)
+        executor.dist.broadcast_int64 = lambda header, **kwargs: gather(rank, header)[0]
+        executor.is_shutdown = False
+        executor._idle_notification_runtime = object()
+        executor.hang_detector = SimpleNamespace(pause=nullcontext)
+        executor.executor_request_queue = SimpleNamespace(
+            get_from_request_queue=Mock(return_value=[])
+        )
+        executor._handle_special_queue_items = lambda items: items
+        if rank == owner:
+            if pending == "send":
+                executor.async_transfer_manager.has_any_inflight_requests = lambda: True
+            elif pending == "receive":
+                executor.kv_cache_transceiver = SimpleNamespace(
+                    check_gen_transfer_complete=lambda: False
+                )
+            elif pending == "connector":
+                executor._has_pending_connector_transfers = lambda: True
+            elif pending == "response":
+                executor._pending_response_terminations = [object()]
+        broadcaster = RequestBroadcaster(executor.dist, executor.hang_detector)
+        broadcaster.idle_notification = IdleRequestNotification(
+            notices.put, lambda: notices.get(timeout=5)
+        )
+        executor.request_broadcaster = broadcaster
+        waiting = Mock()
+        waiting.__len__ = Mock(return_value=0)
+        PyExecutor._fetch_and_enqueue_requests(executor, waiting, 0)
+        waiting.add_requests.assert_called_once_with([])
+        if rank == 0:
+            timeout = None if pending == "none" else datetime.timedelta(0)
+            executor.executor_request_queue.get_from_request_queue.assert_called_once_with(timeout)
+        else:
+            executor.executor_request_queue.get_from_request_queue.assert_not_called()
+        return broadcaster.idle_notification._epoch
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        epochs = list(workers.map(run, (0, 1)))
+    assert epochs == ([1, 1] if pending == "none" else [0, 0])
+    assert notices.empty()
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("enable_attention_dp", True),
         ("_resource_governor_enabled", True),
-        ("kv_connector_manager", object()),
         ("drafter", object()),
     ],
 )

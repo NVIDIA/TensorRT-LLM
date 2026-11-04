@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Worker-owned notification transport for non-pipelined MPI TP/CP."""
+"""Worker-owned notification transport for non-pipelined MPI executors."""
 
 from __future__ import annotations
 
@@ -29,7 +29,38 @@ def _validate_speculative_progress(executor: PyExecutor) -> None:
     if config is None and drafter is None and executor.draft_model_engine is None:
         return
 
-    from tensorrt_llm.llmapi import NGramDecodingConfig, SADecodingConfig
+    from tensorrt_llm.llmapi import MTPDecodingConfig, NGramDecodingConfig, SADecodingConfig
+
+    if type(config) is MTPDecodingConfig:
+        from ..speculative.eagle3 import Eagle3OneModelSpecMetadata, MTPEagleWorker
+        from ..speculative.mtp import MTPSpecMetadata, MTPWorker
+        from ..speculative.mtp_dynamic_tree import MTPEagleDynamicTreeWorker
+
+        worker = executor.model_engine._get_spec_worker()
+        metadata = executor.model_engine.spec_metadata
+        if config.spec_dec_mode.is_mtp_vanilla():
+            worker_type = MTPWorker
+            metadata_type = MTPSpecMetadata
+        else:
+            worker_type = MTPEagleDynamicTreeWorker if config.use_dynamic_tree else MTPEagleWorker
+            metadata_type = Eagle3OneModelSpecMetadata
+        # These built-in workers draft and commit state inside the selected
+        # model forward. Retained hidden states/SA caches are not independent
+        # completion jobs. Do not infer the same contract for custom workers.
+        if (
+            drafter is not None
+            or executor.draft_model_engine is not None
+            or type(worker) is not worker_type
+            or type(worker.spec_config) is not MTPDecodingConfig
+            or worker.spec_config != config
+            or worker._auxiliary_state_handlers
+            or type(metadata) is not metadata_type
+            or metadata.spec_dec_mode != config.spec_dec_mode
+        ):
+            raise ValueError(
+                "Idle notification requires the initialized built-in MTP worker/metadata"
+            )
+        return
 
     if type(config) is SADecodingConfig:
         from ..speculative.sa_worker import SASpecMetadata, SAWorker
@@ -80,8 +111,28 @@ def _validate_speculative_progress(executor: PyExecutor) -> None:
         or executor.draft_model_engine is not None
     ):
         raise ValueError(
-            "Idle notification currently supports only built-in NGram or SA speculation"
+            "Idle notification requires request-bound built-in NGram, SA or MTP speculation"
         )
+
+
+def can_park_idle_requests(executor: PyExecutor) -> bool:
+    """Agree on quiescence before the existing idle request fetch can block.
+
+    Call only at a group-uniform idle boundary (global live-request count and
+    replicated waiting queue both empty). A completed request can still own a
+    send/save, and an attention-DP peer can own work absent on rank zero. Keep
+    the ordinary executor loop progressing until every rank has drained it.
+    """
+    transceiver = executor.kv_cache_transceiver
+    pending = (
+        executor._has_pending_connector_transfers()
+        or executor.async_transfer_manager.has_any_inflight_requests()
+        or (transceiver is not None and not transceiver.check_gen_transfer_complete())
+        or bool(executor._pending_response_terminations)
+        or bool(executor.control_requests)
+        or bool(executor.request_accumulated)
+    )
+    return not any(executor.dist.allgather(pending))
 
 
 def _validate_progress_modes(executor: PyExecutor) -> None:
@@ -93,25 +144,23 @@ def _validate_progress_modes(executor: PyExecutor) -> None:
         dist.world_size < 2
         or dist.tp_size * dist.cp_size != dist.world_size
         or dist.pp_size != 1
-        or executor.enable_attention_dp
         or executor._disable_mpi
     ):
         raise ValueError("Idle notification requires non-pipelined MPI TP/CP")
     # Rebalance is deliberately not a gate: each ordinary executor loop checks
     # it before fetching requests, and the original idle leader already blocks
     # at that fetch. Parking followers does not remove a progress callback.
-    for name in ("_resource_governor_enabled", "is_benchmark_disagg"):
-        if getattr(executor, name, None) is not False:
-            raise ValueError(f"Idle notification does not support executor mode {name}")
+    if executor._resource_governor_enabled is not False:
+        raise ValueError(
+            "Idle notification does not support the independent resource-governor queue"
+        )
     if (
-        executor.kv_cache_transceiver is not None
-        or executor.kv_connector_manager is not None
-        or executor.llm_args.sleep_config is not None
+        executor.llm_args.sleep_config is not None
         or executor._gen_admission.enabled
         or executor.request_broadcaster.sync_clock
         or executor._first_token_timer is not None
     ):
-        raise ValueError("Idle notification requires no transfer, sleep or timed admission")
+        raise ValueError("Idle notification requires no sleep or timed admission")
     _validate_speculative_progress(executor)
     # Synchronous item scheduling has no independent wakeup source. Preserve
     # enabled model features, but reject inconsistent scheduler ownership.

@@ -1,11 +1,11 @@
 .. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 .. SPDX-License-Identifier: Apache-2.0
 
-Idle request notification for MPI tensor parallelism
-==================================================
+Idle request notification for MPI executors
+==========================================
 
 Idle request notification is an **opt-in** host-CPU wait policy for non-pipelined
-MPI tensor/context parallelism. When the leader's request queue is empty, followers
+MPI worker groups. When the leader's request queue is empty, followers
 wait on an authenticated notification instead of remaining inside the
 request-count MPI collective. New work resumes the existing count and payload
 broadcasts. Sampling and the model computation are unchanged.
@@ -73,6 +73,20 @@ two ranks, TP times CP equal to the MPI world, PP1 and ``MPI_THREAD_MULTIPLE``.
 Optional KV-pool rebalance retains its existing pre-fetch executor-loop check;
 it does not add an independent idle wake source or periodic notification timer.
 This expansion is source-reviewed preparation, not distributed validation.
+Attention-DP and expert parallelism inside that MPI world do not require a
+different opt-in. Separate DP replicas enable the policy in each applicable
+multi-rank executor; a one-rank executor has no followers to park. An external
+router or Dynamo does not by itself enable this policy in backend workers.
+
+Disaggregated prefill/decode and KV connectors are supported through a shared
+quiescence vote before blocking. Every rank must have no live/waiting requests,
+pending connector work, asynchronous sends/saves, receive sessions, deferred
+transfer responses or queued control/accumulated requests. One busy rank keeps
+all ranks on the ordinary nonblocking executor loop, including its existing
+transfer completion/error/timeout processing. Completed requests can still own
+transfers, so an empty active-request list alone never establishes quiescence.
+The vote is not added to the active-request path and adds no polling timer.
+
 The built-in NGram drafter and its built-in NGram pool are supported: draft
 preparation executes inline over scheduled generation requests. Standalone
 Suffix Automaton (SA) is supported when the initialized selected model exposes
@@ -86,7 +100,14 @@ SA with an additional drafter/draft engine, custom worker/pool, unreviewed
 auxiliary state handlers, or missing/mismatched initialized metadata is not
 admitted. Custom NGram subclasses/pools and other speculative implementations
 remain implementation limits of this candidate, not fundamental
-incompatibilities with notification.
+incompatibilities with notification. Built-in vanilla MTP, EAGLE-style MTP and
+dynamic-tree MTP are also admitted with their matching initialized worker and
+metadata. Their drafting/commit work runs inside model forward; retained hidden
+states and SA-enhancement caches do not independently advance an empty executor.
+There is no notification-specific limit on draft length or GPU count. Custom
+MTP workers, additional draft engines/drafters, mismatched metadata and unreviewed
+auxiliary state handlers remain rejected rather than assuming their progress
+contract. This admission coverage is not distributed MTP/transfer validation.
 
 The existing batching wait is also supported. On an idle fetch, the whole
 original queue operation is deferred until followers are parked, so it still
@@ -97,13 +118,12 @@ deadline or queue polling loop is introduced.
 It rejects explicit enablement with the following modes rather than silently
 disabling model features:
 
-* attention-DP, Ray or TorchDist;
-* pipeline parallelism;
-* connector or disaggregated KV transfer;
-* resource-governor activity;
-* speculative decoding other than the admitted built-in NGram/standalone SA paths;
-* executor sleep/wakeup;
-* Gen-admission timing/clock synchronization.
+* Ray or TorchDist, which do not use this MPI notification transport;
+* pipeline parallelism, whose stage progress is not this one request broadcast;
+* resource-governor activity, which has an independent control queue;
+* speculative decoding outside the admitted request-bound built-in paths;
+* executor sleep/wakeup, which has a separate wake/control lifecycle;
+* Gen-admission timing/clock synchronization, which requires executor-loop ticks.
 
 Synchronous multimodal item scheduling is retained only when the executor and
 model engine agree on its enabled state and scheduler ownership. Unsupported
