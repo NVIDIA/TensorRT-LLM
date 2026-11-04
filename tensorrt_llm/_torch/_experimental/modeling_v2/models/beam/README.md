@@ -115,9 +115,9 @@ diverge at near ties when GEMM/collective shapes change.
 The GO recipes (`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml` and
 `beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml`) differ from their eager counterparts only in
 `cuda_graph_config` (batch sizes 1, 2, 4, 8, 16, 32 and 64, with padding) and
-`disable_overlap_scheduler: false`. The executor captures one graph per batch size for
-generation-only steps: target verification of the eight rows per request, DFlash2 drafting
-and the TP all-reduces. A step that contains a context request, and a generation-only step
+`disable_overlap_scheduler: false`. The executor captures the generation-only steps for each
+listed batch size: target verification of the eight rows per request, DFlash2 drafting and
+the TP all-reduces. A step that contains a context request, and a generation-only step
 with more requests than the largest listed batch size, runs eagerly. Prefill and piecewise
 CUDA graphs are not used. Capture adds start-up time and about 1.6 GB per GPU.
 

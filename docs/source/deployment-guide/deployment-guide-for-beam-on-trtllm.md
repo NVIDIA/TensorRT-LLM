@@ -206,8 +206,8 @@ GPUs before starting another deployment there.
 
 To serve with decode CUDA graphs and the overlap scheduler, use
 `beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml` in the same command. During startup the server
-captures one graph per listed batch size for the generation-only steps (target verification of
-the eight rows per request, DFlash2 drafting and the TP all-reduces), so startup takes longer and
+captures the generation-only steps for each listed batch size (target verification of the eight
+rows per request, DFlash2 drafting and the TP all-reduces), so startup takes longer and
 each GPU holds about 1.6 GB more. Steps that contain a context (prefill) request always run
 eagerly, as does a generation-only step with more requests than the largest listed batch size
 (with the recipe's `max_batch_size` of 64, every generation-only step is captured). The eager
