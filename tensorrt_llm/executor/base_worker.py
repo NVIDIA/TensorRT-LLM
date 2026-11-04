@@ -432,7 +432,7 @@ class BaseWorker(GenerationExecutor):
                 # The prompt runs in one forward and nothing is generated, so
                 # it may fill max_seq_len; max_tokens=1 has the request
                 # complete with that forward in every executor loop.
-                if splited_prompt_len > max_seq_len:
+                if len(prompt_token_ids) > max_seq_len * cp_size:
                     raise ValueError(
                         context_length_exceeded_message(
                             max_context_length=max_seq_len * cp_size,

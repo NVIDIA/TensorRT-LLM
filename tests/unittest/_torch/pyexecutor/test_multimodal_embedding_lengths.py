@@ -245,6 +245,8 @@ def test_mm_encoder_sampler_exports_results_only_on_response_ranks(mapping, expo
         speculative_config=None,
         max_num_sequences=1,
     )
+    with pytest.raises(ValueError, match="maximum context length is 16 tokens"):
+        sampler.validate_request(SimpleNamespace(prompt_len=17))
     request = _FakeRequest(multimodal_lengths=[4])
     state = sampler.SampleState(
         requests=[request],
