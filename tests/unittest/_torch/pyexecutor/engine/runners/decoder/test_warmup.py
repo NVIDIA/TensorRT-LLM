@@ -861,6 +861,112 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
     owner.dist.tp_allgather.assert_called_once_with(1)
 
 
+def _decode_prewarm_owner(
+    modules: list[torch.nn.Module | Mock], tp_size: int, cp_size: int = 1, spec_config=None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=SimpleNamespace(modules=lambda: iter(modules)),
+        mapping=SimpleNamespace(tp_size=tp_size, cp_size=cp_size),
+        dist=Mock(),
+        _config=SimpleNamespace(max_num_tokens=96, spec_config=spec_config),
+    )
+
+
+def _kimi_linear_model(compiled: int = 7) -> Mock:
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearModel
+
+    # spec= keeps the test tied to the real class defining the hook.
+    model = Mock(spec=KimiLinearModel)
+    model.prewarm_decode_kernels.return_value = compiled
+    return model
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tp_size, cp_size, barrier", [(1, 1, None), (4, 1, "tp_allgather"), (4, 2, "tp_cp_allgather")]
+)
+@pytest.mark.parametrize("speculative", [False, True])
+def test_decode_prewarm_compiles_then_barriers(
+    tp_size: int, cp_size: int, barrier: str | None, speculative: bool
+) -> None:
+    """Every module with a ``prewarm_decode_kernels`` hook (here Kimi-K3's model) precompiles
+    for the runner's token budget (verify-batch kernels where speculative decoding runs), then the
+    TP (x CP) group meets once every compile on the rank has finished."""
+    model = _kimi_linear_model()
+    owner = _decode_prewarm_owner(
+        [torch.nn.Linear(2, 2), model], tp_size, cp_size, object() if speculative else None
+    )
+    events = []
+    model.prewarm_decode_kernels.side_effect = lambda *args: events.append("compile") or 7
+    for name in ("tp_allgather", "tp_cp_allgather"):
+        getattr(owner.dist, name).side_effect = lambda *args, name=name: events.append(name)
+
+    with patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("synchronize")):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+
+    model.prewarm_decode_kernels.assert_called_once_with(96, speculative)
+    assert events == ["compile", "synchronize"] + ([barrier] if barrier else [])
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_calls_any_module_with_the_hook() -> None:
+    """The hook is found by name, not by model class: every module defining it is called."""
+
+    class _OtherModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
+            self.calls.append((max_num_tokens, verify_batches))
+            return 2
+
+    other, kimi = _OtherModel(), _kimi_linear_model()
+    owner = _decode_prewarm_owner([other, torch.nn.Linear(2, 2), kimi], tp_size=1)
+    with patch.object(torch.cuda, "synchronize"):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+    assert other.calls == [(96, False)]
+    kimi.prewarm_decode_kernels.assert_called_once_with(96, False)
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_skips_verify_kernels_on_context_only_cache() -> None:
+    """A context-only worker never runs a verify batch, even with speculative decoding on."""
+    model = _kimi_linear_model()
+    owner = _decode_prewarm_owner([model], tp_size=1, spec_config=object())
+    with patch.object(torch.cuda, "synchronize"):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, SimpleNamespace(kda_context_only=True))
+    model.prewarm_decode_kernels.assert_called_once_with(96, False)
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_is_noop_without_hooks() -> None:
+    """For a model without the hook nothing is imported, compiled or synchronized."""
+    owner = _decode_prewarm_owner([torch.nn.Linear(2, 2)], tp_size=4)
+    with (
+        patch.dict(sys.modules, {"tensorrt_llm._torch.models.modeling_kimi_linear": None}),
+        patch.object(torch.cuda, "synchronize") as synchronize,
+    ):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+    synchronize.assert_not_called()
+    owner.dist.tp_allgather.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_failure_still_reaches_barrier() -> None:
+    """A failed compile only defers it to the first forward; the rank still meets its peers."""
+    model = _kimi_linear_model()
+    model.prewarm_decode_kernels.side_effect = RuntimeError("no compiler")
+    owner = _decode_prewarm_owner([model], tp_size=2)
+    with (
+        patch.object(torch.cuda, "synchronize"),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+    ):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+    warning.assert_called_once()
+    owner.dist.tp_allgather.assert_called_once_with(1)
+
+
 class TestWarmupCleanup(unittest.TestCase):
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
