@@ -57,7 +57,7 @@ from tensorrt_llm._torch.distributed import (
     AllReduceParams,
     AllReduceStrategy,
 )
-from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
+from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange, _PeerBuffers
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper import (
@@ -161,6 +161,7 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.speculative.vocab_parallel.VocabParallelHead",
     "tensorrt_llm._torch.speculative.vocab_parallel._PairExchange",
     "tensorrt_llm._torch.distributed.ll_exchange.TPKeyExchange",
+    "tensorrt_llm._torch.distributed.ll_exchange._PeerBuffers",
     # The A/B escape hatch's stock MTP-Eagle worker (TLLM_GLM5_NEXT_MTP_STOCK_WORKER=1).
     "tensorrt_llm._torch.speculative.utils.get_spec_worker",
     "tensorrt_llm._torch.distributed.ops.allgather",
@@ -749,9 +750,21 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
             input_ids = input_ids[: attn_metadata.num_tokens]
             position_ids = position_ids[..., : attn_metadata.num_tokens]
         vocab_head = None if self.mtp_step is None else self.mtp_step.vocab_head
+        verify_hidden = None
         if vocab_head is not None:
-            # This rank's vocab shard of the verify logits; the step selects the target tokens from it.
-            logits = vocab_head.local_logits(hidden_states[spec_metadata.gather_ids])
+            verify_hidden = hidden_states[spec_metadata.gather_ids]
+            if (
+                self.spec_worker is None
+                and spec_metadata.is_all_greedy_sample
+                and getattr(vocab_head, "fused_applies", None) is not None
+                and vocab_head.fused_applies(verify_hidden)
+            ):
+                # A greedy batch of few verify rows: the step takes the target tokens straight from the head's
+                # input (one fused launch) and the forward returns no logits.
+                logits = None
+            else:
+                # This rank's vocab shard of the verify logits; the step selects the target tokens from it.
+                logits = vocab_head.local_logits(verify_hidden)
         else:
             logits = self.logits_processor.forward(
                 hidden_states[spec_metadata.gather_ids], self.lm_head, attn_metadata, True
@@ -775,6 +788,7 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
             attn_metadata=attn_metadata,
             spec_metadata=spec_metadata,
             draft_model=self.draft_model,
+            verify_hidden=verify_hidden,
         )
 
     def set_guided_decoder(self, guided_decoder: Any) -> bool:
@@ -2752,6 +2766,86 @@ def _check_speculation(spec_config: Any) -> None:
         )
 
 
+class _FusedHeadArgmax:
+    """``trtllm::lm_head_argmax``: an LM head of few rows, its argmax and the TP group's maximum in one kernel.
+
+    Each rank streams its vocabulary shard through the tensor cores, keeps the best ``(logit, index)`` key per row
+    and exchanges it with the other ranks through its own peer-mapped buffers, so the logits are never stored.
+    """
+
+    #: Rows one call takes.
+    MAX_ROWS = 8
+    #: Ranks of the exchange.
+    MAX_RANKS = 8
+    #: Bytes of a rank's exchange buffer (three epochs of MAX_RANKS x MAX_ROWS keys).
+    EXCHANGE_BYTES = 3 * MAX_RANKS * MAX_ROWS * 8
+    #: int64 words of a rank's scratch (per-CTA partial keys, the CTA counter and the exchange state).
+    SCRATCH_WORDS = 256 * MAX_ROWS + 2
+    #: The hidden size must be a multiple of the kernel's k-chunk.
+    K_CHUNK = 1024
+
+    def __init__(self, peer_ptrs: list[int], rank: int, buffers: Any, device: torch.device) -> None:
+        self._peer_ptrs = peer_ptrs
+        self._rank = rank
+        self._buffers = buffers  # keeps the peer mappings alive
+        self._scratch = torch.zeros(self.SCRATCH_WORDS, dtype=torch.int64, device=device)
+
+    @classmethod
+    def create(cls, mapping: Mapping) -> "_FusedHeadArgmax | None":
+        """Collective over the TP group (every rank calls it in step); None without the op, SM90+ or peer memory."""
+        reason = None
+        if not hasattr(torch.ops.trtllm, "lm_head_argmax"):
+            reason = "the trtllm::lm_head_argmax op is not built"
+        elif torch.cuda.get_device_capability()[0] < 9:
+            reason = "it needs SM90+"
+        elif mapping.tp_size > cls.MAX_RANKS:
+            reason = f"TP {mapping.tp_size} > {cls.MAX_RANKS}"
+        device = torch.device("cuda", torch.cuda.current_device())
+        fused = None
+        if reason is None and mapping.tp_size == 1:
+            fused = cls([], 0, None, device)
+        elif reason is None:
+            buffers = _PeerBuffers.create(mapping, cls.EXCHANGE_BYTES)
+            if buffers is None:
+                reason = "no peer memory for the exchange"
+            else:
+                fused = cls([int(p) for p in buffers.peer_ptrs], mapping.tp_rank, buffers, device)
+        logger.info_once(
+            "glm5_next fused LM head + argmax: "
+            + ("on" if fused is not None else f"off ({reason})"),
+            key="glm5_next_fused_lm_head",
+        )
+        return fused
+
+    def supports(self, rows: int, shard_rows: int, hidden: int) -> bool:
+        return 1 <= rows <= self.MAX_ROWS and shard_rows > 0 and hidden % self.K_CHUNK == 0
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        vocab_offset: int,
+        out: torch.Tensor | None = None,
+        out_stride: int = 1,
+    ) -> torch.Tensor:
+        if out is None:
+            out = torch.empty(
+                hidden_states.shape[0], dtype=torch.int32, device=hidden_states.device
+            )
+            out_stride = 1
+        torch.ops.trtllm.lm_head_argmax(
+            hidden_states,
+            weight,
+            vocab_offset,
+            self._scratch,
+            self._peer_ptrs,
+            self._rank,
+            out,
+            out_stride,
+        )
+        return out
+
+
 class _NcclVocabParallelHead(VocabParallelHead):
     """Vocab-parallel token selection over the TP group's low-latency key exchange, else an NCCL pair exchange.
 
@@ -2774,8 +2868,34 @@ class _NcclVocabParallelHead(VocabParallelHead):
             mapping.tp_size,
             mapping.tp_rank,
         )
-        # Collective: every rank of the TP group builds its exchange here, at construction.
+        # Collective: every rank of the TP group builds its exchanges here, at construction.
         self._keys = TPKeyExchange.create(mapping, self.KEY_EXCHANGE_ROWS)
+        self._fused = _FusedHeadArgmax.create(mapping)
+
+    def fused_applies(self, hidden_states: torch.Tensor) -> bool:
+        """Whether :meth:`fused_tokens` takes ``hidden_states`` (host-side shapes and dtypes only)."""
+        fused = self._fused
+        weight = getattr(self.lm_head, "weight", None)
+        return (
+            fused is not None
+            and weight is not None
+            and weight.dtype == torch.bfloat16
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and fused.supports(hidden_states.shape[0], weight.shape[0], hidden_states.shape[1])
+        )
+
+    def fused_tokens(
+        self, hidden_states: torch.Tensor, out: torch.Tensor | None = None, out_stride: int = 1
+    ) -> torch.Tensor | None:
+        """The greedy tokens (int32) of ``hidden_states`` [rows, hidden] through the LM head in one launch (the GEMM
+        over this rank's vocabulary shard, its argmax and the group's maximum), or None where that kernel does not
+        apply (the caller takes the logits path)."""
+        if not self.fused_applies(hidden_states):
+            return None
+        if hidden_states.stride(-1) != 1:
+            hidden_states = hidden_states.contiguous()
+        return self._fused(hidden_states, self.lm_head.weight, self.col_base, out, out_stride)
 
     def argmax(self, local: torch.Tensor, out_dtype: torch.dtype = torch.int64) -> torch.Tensor:
         keys = self._keys
@@ -2833,18 +2953,21 @@ class Glm5NextMtpStep:
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
         attn_metadata: AttentionMetadata,
         spec_metadata: Any,
         draft_model: Glm5NextDraftModel,
+        verify_hidden: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Returns ``logits`` (the verify logits, as given), ``new_tokens [B, K+1]`` (accepted tokens; a context
         request defines column 0 only), ``new_tokens_lens [B]`` (1 + accepted drafts), ``next_draft_tokens [B, K]``
         and ``next_new_tokens [B, K+1]`` (each request's last accepted token, then its drafts: the next step's input
         under the overlap scheduler). With a vocab head, ``logits`` is this rank's vocab shard: a greedy batch returns
         it as is with ``logits_vocab_shard`` (the engine gathers it only for a logits post-processor), any other
-        batch gathers it first."""
-        if logits.dim() == 1:
+        batch gathers it first. ``logits`` None (a greedy batch of few verify rows): the target tokens come from
+        ``verify_hidden``, the verify head's input, through the fused head and argmax, and ``logits`` is returned as
+        None (the engine then runs no logits post-processing; the speculative sampler reads only the tokens)."""
+        if logits is not None and logits.dim() == 1:
             logits = logits.unsqueeze(0)
         if spec_metadata.is_ragged_verify:
             raise ValueError(
@@ -2855,20 +2978,27 @@ class Glm5NextMtpStep:
         num_gens = batch_size - num_contexts
         draft_len = spec_metadata.runtime_draft_len
         sharded = self.vocab_head is not None
-        if sharded and not spec_metadata.is_all_greedy_sample:
-            logits = self.vocab_head.gather_logits(logits)
+        if logits is None:
+            # The forward's greedy few-row case: the verify head fused with its argmax, no logits to return.
+            target_tokens = self.vocab_head.fused_tokens(verify_hidden)
             sharded = False
-        if sharded:
-            target_tokens = self.vocab_head.argmax(logits)
         else:
-            target_tokens = self._sample_target(logits, spec_metadata)
+            if sharded and not spec_metadata.is_all_greedy_sample:
+                logits = self.vocab_head.gather_logits(logits)
+                sharded = False
+            if sharded:
+                target_tokens = self.vocab_head.argmax(logits)
+            else:
+                target_tokens = self._sample_target(logits, spec_metadata)
         if draft_len == 0:
             return self._without_drafts(logits, target_tokens, batch_size, sharded)
 
         if num_gens > 0:
             draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, draft_len)
         else:
-            draft_tokens = torch.empty((0, draft_len), dtype=torch.int32, device=logits.device)
+            draft_tokens = torch.empty(
+                (0, draft_len), dtype=torch.int32, device=target_tokens.device
+            )
         accepted_tokens, num_accepted_tokens = strict_accept(
             target_tokens, draft_tokens, num_contexts, batch_size
         )
@@ -2942,16 +3072,18 @@ class Glm5NextMtpStep:
 
     @staticmethod
     def _without_drafts(
-        logits: torch.Tensor, target_tokens: torch.Tensor, batch_size: int, sharded: bool
+        logits: torch.Tensor | None, target_tokens: torch.Tensor, batch_size: int, sharded: bool
     ) -> dict[str, torch.Tensor]:
         """A step with no drafts (runtime draft length 0): the target token alone."""
         tokens = target_tokens[:batch_size].to(torch.int32).unsqueeze(1)
         outputs = {
             "logits": logits,
             "new_tokens": tokens,
-            "new_tokens_lens": torch.ones(batch_size, dtype=torch.int32, device=logits.device),
+            "new_tokens_lens": torch.ones(
+                batch_size, dtype=torch.int32, device=target_tokens.device
+            ),
             "next_draft_tokens": torch.zeros(
-                (batch_size, 0), dtype=torch.int32, device=logits.device
+                (batch_size, 0), dtype=torch.int32, device=target_tokens.device
             ),
             "next_new_tokens": tokens.clone(),
         }
@@ -3099,10 +3231,13 @@ class Glm5NextMtpStep:
                 spec_metadata=spec_metadata,
                 pick_rows=step0_rows if step == 0 else None,
             )
-            draft_logits = mtp_layer.shared_head(
-                request_hidden, draft_model.lm_head, attn_metadata, True
-            )
-            tokens = self._draft_argmax(draft_logits)
+            fused_tokens = getattr(self.vocab_head, "fused_tokens", None)
+            tokens = fused_tokens(request_hidden) if fused_tokens is not None else None
+            if tokens is None:
+                draft_logits = mtp_layer.shared_head(
+                    request_hidden, draft_model.lm_head, attn_metadata, True
+                )
+                tokens = self._draft_argmax(draft_logits)
             drafts.append(tokens)
             if step + 1 < draft_len:
                 step_ids = tokens
