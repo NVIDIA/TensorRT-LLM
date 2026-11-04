@@ -2081,6 +2081,10 @@ class KimiK3MoERuntime(nn.Module):
         self.layer_idx = layer_idx
         # Lossy decode kernels at <= 8 rows (``_prepare_min_latency_tail``).
         self._min_latency = model_config.enable_min_latency
+        # Row-independent conditions of the column-parallel tail and of latent_up's MXFP8 input;
+        # set in cache_derived_state.
+        self._column_parallel_tail_supported = False
+        self._latent_up_mxfp8_supported = False
         self.hidden_size = cfg.hidden_size
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
@@ -2334,38 +2338,44 @@ class KimiK3MoERuntime(nn.Module):
             return own
         return self.routed_experts.all_reduce
 
-    def runs_column_parallel_tail(self, num_tokens: int) -> bool:
-        """Whether a forward of ``num_tokens`` rows can run the column-parallel tail: latent_up
-        projects onto this rank's rows (``latent_up_rows``) with the whole projection's low-M
-        kernel, the routed latent all-reduce runs MNNVL one-shot (the C++ size rule, which also
-        bounds the tail's slot traffic) and the shared expert reduces with the MNNVL plain sum
-        on the same group."""
-        up = self.routed_expert_up_proj
+    def _supports_column_parallel_tail(self) -> bool:
+        """The row-independent part of :meth:`runs_column_parallel_tail`."""
         if (
             self.latent_up_rows is None
-            or torch.compiler.is_compiling()
-            or not isinstance(up, _Fp8BlockScaleWeightReadLinear)
-            or not up.serves_output_rows(num_tokens)
+            or not isinstance(self.routed_expert_up_proj, _Fp8BlockScaleWeightReadLinear)
             or self.moe_hidden_size % 256
         ):
             return False
         routed_ar = self.routed_experts.all_reduce
         down = self.shared_experts.down_proj
         shared_ar = down.all_reduce if isinstance(down, TrtllmLinear) else None
-        if (
-            shared_ar is None
-            or shared_ar.mnnvl_allreduce is None
-            or shared_ar.symm_mem_allreduce is not None
-            or shared_ar.mapping.tp_group != routed_ar.mapping.tp_group
-            or not routed_ar.mnnvl_runs_fusion(
+        return (
+            shared_ar is not None
+            and shared_ar.mnnvl_allreduce is not None
+            and shared_ar.symm_mem_allreduce is None
+            and shared_ar.mapping.tp_group == routed_ar.mapping.tp_group
+            and routed_ar.mnnvl_runs_fusion(
                 AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, self.moe_hidden_size
             )
-        ):
-            return False
-        one_shot, _ = mnnvl_allreduce_transport(
-            num_tokens, self.moe_hidden_size, routed_ar.mapping.tp_size, torch.bfloat16
         )
-        return one_shot
+
+    def runs_column_parallel_tail(self, num_tokens: int) -> bool:
+        """Whether a forward of ``num_tokens`` rows can run the column-parallel tail: latent_up
+        projects onto this rank's rows (``latent_up_rows``) with the whole projection's low-M
+        kernel, the routed latent all-reduce runs MNNVL one-shot (the C++ size rule, which also
+        bounds the tail's slot traffic) and the shared expert reduces with the MNNVL plain sum
+        on the same group (``_column_parallel_tail_supported``, set in cache_derived_state)."""
+        return (
+            self._column_parallel_tail_supported
+            and not torch.compiler.is_compiling()
+            and self.routed_expert_up_proj.serves_output_rows(num_tokens)
+            and mnnvl_allreduce_transport(
+                num_tokens,
+                self.moe_hidden_size,
+                self.routed_experts.all_reduce.mapping.tp_size,
+                torch.bfloat16,
+            )[0]
+        )
 
     def _column_parallel_tail(
         self, routed_latent: torch.Tensor, shared_partial: torch.Tensor, tail_targets=None
@@ -2435,24 +2445,27 @@ class KimiK3MoERuntime(nn.Module):
     def _latent_up_takes_mxfp8(self, routed_latent: torch.Tensor) -> bool:
         """Whether the routed latent all-reduce hands latent_up the MXFP8 form of the normalized
         latent: where latent_up's FP8 low-M GEMM serves the rows and the MNNVL kernels run the
-        all-reduce (``RMS_NORM_QUANT_MXFP8``, the GEMM's own quantization: the same bits)."""
-        up = self.routed_expert_up_proj
+        all-reduce (``RMS_NORM_QUANT_MXFP8``, the GEMM's own quantization: the same bits;
+        ``_latent_up_mxfp8_supported``, set in cache_derived_state)."""
         return (
-            isinstance(up, _Fp8BlockScaleWeightReadLinear)
+            self._latent_up_mxfp8_supported
             and routed_latent.dim() == 2
             and routed_latent.dtype == torch.bfloat16
-            and routed_latent.shape[-1] % 256 == 0
-            and self.routed_expert_norm.weight.dtype == torch.bfloat16
-            and up.takes_prequantized_input(routed_latent.shape[0])
-            and self.routed_experts.all_reduce.mnnvl_runs_fusion(
-                AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, routed_latent.shape[-1]
-            )
+            and self.routed_expert_up_proj.takes_prequantized_input(routed_latent.shape[0])
         )
 
     def post_load_weights(self) -> None:
         self.cache_derived_state()
 
     def cache_derived_state(self) -> None:
+        self._column_parallel_tail_supported = self._supports_column_parallel_tail()
+        self._latent_up_mxfp8_supported = (
+            isinstance(self.routed_expert_up_proj, _Fp8BlockScaleWeightReadLinear)
+            and self.routed_expert_norm.weight.dtype == torch.bfloat16
+            and self.routed_experts.all_reduce.mnnvl_runs_fusion(
+                AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, self.moe_hidden_size
+            )
+        )
         self._prepare_moe_front()
         self._prepare_min_latency_tail()
 
@@ -2462,14 +2475,14 @@ class KimiK3MoERuntime(nn.Module):
         shared expert one persistent kernel beside the routed experts
         (``kimi_k3_shared_expert``). Builds their operands on this rank."""
         self._moe_tail_wexp = self._shared_frags = self._shared_ws = None
-        if not self._min_latency or self.latent_up_rows is None:
+        if not self._min_latency or not self._column_parallel_tail_supported:
             return
         from ..kernels.blackwell import kimi_k3_moe_tail, kimi_k3_shared_expert
 
         up = self.routed_expert_up_proj
         world = self.routed_experts.all_reduce.mapping.tp_size
         if (
-            isinstance(up, _Fp8BlockScaleWeightReadLinear)
+            isinstance(self.routed_experts.backend, MoEImplBase)
             and tuple(up.weight.shape) == (kimi_k3_moe_tail.HIDDEN, kimi_k3_moe_tail.LATENT)
             and kimi_k3_moe_tail.can_run(1, world, self.latent_up_rows[1])
         ):
@@ -2501,12 +2514,8 @@ class KimiK3MoERuntime(nn.Module):
         """Whether this column-parallel tail forward runs the one-kernel MoE tail."""
         from ..kernels.blackwell import kimi_k3_moe_tail
 
-        return (
-            self._moe_tail_wexp is not None
-            and isinstance(self.routed_experts.backend, MoEImplBase)
-            and kimi_k3_moe_tail.can_run(
-                num_tokens, self.routed_experts.all_reduce.mapping.tp_size, self.latent_up_rows[1]
-            )
+        return self._moe_tail_wexp is not None and kimi_k3_moe_tail.can_run(
+            num_tokens, self.routed_experts.all_reduce.mapping.tp_size, self.latent_up_rows[1]
         )
 
     def _min_latency_tail_targets(self, num_tokens: int):

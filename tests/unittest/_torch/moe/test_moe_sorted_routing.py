@@ -287,6 +287,8 @@ def _runtime(moe, logits):
     from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoERuntime
 
     runtime = KimiK3MoERuntime.__new__(KimiK3MoERuntime)
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     torch.nn.Module.__init__(runtime)
     runtime.gate = type("Gate", (), {"compute_logits": staticmethod(lambda value: logits)})()
     runtime.routed_experts = moe

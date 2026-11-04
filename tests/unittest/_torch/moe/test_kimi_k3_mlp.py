@@ -382,6 +382,8 @@ def test_kimi_k3_min_latency_kernels_follow_enable_min_latency(monkeypatch, min_
         model_config, _runtime_config(), layer_idx=1, aux_stream_dict=_make_aux_stream_dict()
     )
     assert runtime.latent_up_rows is not None
+    # The column-parallel tail needs the MNNVL all-reduces this stand-in does not have.
+    runtime._column_parallel_tail_supported = True
 
     # Past the gate the preparation reads the shared expert's BF16 weights; stop it there.
     prepared = []
@@ -485,6 +487,8 @@ def test_kimi_k3_shared_allreduce_ordering(
             return self.down_proj.all_reduce(partial)
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
     runtime.routed_experts = routed_experts
@@ -609,6 +613,8 @@ def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
             return value
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
     runtime.routed_experts = _Routed()
@@ -723,6 +729,8 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
         return value
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=compute_logits)
     runtime.routed_experts = _RoutedExperts()
@@ -1043,6 +1051,8 @@ def test_kimi_k3_router_down_fusion_gate(
             self.bias = None
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(
         weight=torch.empty(num_experts, hidden_size, device=device, dtype=torch.bfloat16)
