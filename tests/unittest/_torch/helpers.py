@@ -306,3 +306,11 @@ def dspark_markov_chain_logits_reference(base_logits: torch.Tensor,
                                        next_token_fn=argmax_fn,
                                        cast_bias_to_logits=True)
     return corrected
+
+
+def triton_num_compiled(kernel) -> int:
+    """Specializations of a ``triton.jit`` kernel compiled in this process.
+
+    A launch that raises the count compiled a new variant of the kernel.
+    """
+    return sum(len(cache[0]) for cache in kernel.device_caches.values())

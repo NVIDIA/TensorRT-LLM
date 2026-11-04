@@ -39,7 +39,11 @@ import triton.language as tl
 _BLOCK_TABLE_BLOCK = 2048
 
 
-@triton.jit
+# The step kernels below do not specialize on arguments that follow the batch
+# composition (request counts, first rows and pointers sliced at them): a
+# specialization flips when a count becomes 1 or a multiple of 16 or a slice
+# loses 16-byte alignment, and would compile a kernel variant mid-serving.
+@triton.jit(do_not_specialize=["num_ctx", "num_gen"])
 def _strict_accept_kernel(
     target_ptr,
     draft_ptr,
@@ -214,7 +218,10 @@ class PagedLatentPrepare(NamedTuple):
     blk_kv_bounds: torch.Tensor  # [G * block] int32, blk_seq_lens per query token
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_gens", "first_row"],
+    do_not_specialize_on_alignment=["slots_ptr"],
+)
 def _paged_latent_prepare_kernel(
     num_accepted_ptr,
     accepted_ptr,
