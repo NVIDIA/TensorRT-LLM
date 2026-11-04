@@ -175,6 +175,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
+    # Mixed-precision high layers are appended like any attention layer group.
+    _supports_mixed_precision_kv = True
     # Set per instance when the MLA latent cache uses the FP4 MLA layout.
     _attention_cache_layout_policy = None
     # Set per instance once the FP4 MLA layout has logged a snapshot move.
@@ -717,8 +719,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         if local_layer_idx >= len(self.pp_layers):
-            # Virtual layers past the model's own (the FP4 MLA HP ring) are
-            # attention layers.
+            # Virtual layers past the model's own (the FP4 MLA HP ring and the mixed-precision
+            # high layers) are attention layers.
             return False
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
@@ -727,13 +729,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         buffers = self.impl.buffer_grouping[pool_id]
         layer_id = int(buffers[0].layer_id)
         if layer_id >= self.num_local_layers:
-            # Virtual layers past the model's own exist only for the FP4 MLA
-            # HP ring.
             if (
                 self._attention_cache_layout_policy is not None
                 and LayerId(layer_id) in self._hp_manager_layer_ids
             ):
                 return Role.MLA_HP_TAIL, None
+            if layer_id in self.mixed_precision_high_layers.values():
+                return super()._get_pool_roles(pool_id)
             raise ValueError(f"Unknown hybrid V2 virtual layer {layer_id}.")
         if not self._is_local_mamba_layer(layer_id):
             return super()._get_pool_roles(pool_id)
@@ -1424,11 +1426,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return 0
 
     @override
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_buffers(
+        self, layer_idx: int, kv_layout: str = "NHD", **kwargs
+    ) -> Optional[torch.Tensor]:
         local_layer_idx = self.layer_offsets[layer_idx]
         if self._is_local_mamba_layer(local_layer_idx):
             return None
-        return super().get_buffers(layer_idx, kv_layout)
+        return super().get_buffers(layer_idx, kv_layout, **kwargs)
 
     @override
     def _create_kv_cache(
