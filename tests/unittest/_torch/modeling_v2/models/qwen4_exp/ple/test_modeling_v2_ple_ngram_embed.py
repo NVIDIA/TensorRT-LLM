@@ -5,7 +5,8 @@
 Integer bookkeeping plus a one-rounding dequantize, so gated bitwise -- the
 embedding and the whole published pool -- against the entry's reference, which
 is the scalar references of `ngram_token_history` and `ngram_hash` and a
-float64 gather-and-scale.
+float64 gather-and-scale. Beyond the cells: the `query_start_loc` length guard
+and graph capture at the note's replay cells.
 """
 
 import zlib
@@ -29,6 +30,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_
     CKPT_HEAD_DIM,
     CKPT_SCALE,
     CKPT_TABLE_ROWS,
+    ENGINE_SLOTS,
+    TEP4_SLOTS,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import (  # noqa: E501
     ple_ngram_embed as op,
@@ -179,3 +182,38 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     _compare((out, args[1]), ref)
     if cell.spec.get("table") == "host":
         assert args[1].data_ptr() != 0 and not torch.equal(args[1], pool_before)
+
+
+def test_guard_refuses_short_query_start_loc() -> None:
+    args = _build(dict(lengths=(1, 1, 1)), seed=3)
+    args[4] = args[4][:-1]
+    with validating(op), pytest.raises(AssertionError):
+        op(*args)
+
+
+@pytest.mark.parametrize(
+    "lengths, pool_slots",
+    [((1,) * 16, ENGINE_SLOTS), ((1,) * 128, TEP4_SLOTS), ((8,) * 128, TEP4_SLOTS)],
+    ids=["16x1-461", "128x1-1874", "128x8-1874"],
+)
+def test_cuda_graph_capture_and_replay(lengths, pool_slots) -> None:
+    """The note's replay cells: a replay reads the ids and pool written since capture."""
+    spec = dict(lengths=lengths, pool_slots=pool_slots, eos_density=0.1)
+    args = _build(spec, seed=11)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        op(*args)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = op(*args)
+    fresh = _build(spec, seed=12)
+    args[0].copy_(fresh[0])
+    pool_before = args[1].clone()
+    want, want_pool = op.reference(*args)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(graph_out, want)
+    assert torch.equal(args[1], want_pool)
+    assert not torch.equal(args[1], pool_before)

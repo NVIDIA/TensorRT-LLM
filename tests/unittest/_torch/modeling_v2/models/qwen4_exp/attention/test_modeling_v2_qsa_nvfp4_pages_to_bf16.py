@@ -149,3 +149,13 @@ def test_listing_past_the_scratch_is_dropped() -> None:
     out = op(**args)
     for got, want in zip(out, ref):
         assert _bitwise(got, want)
+
+
+def test_guards() -> None:
+    args = _build(op.CELLS[0].spec, 3)
+    with validating(op), pytest.raises(AssertionError):
+        op(**{**args, "k_out": args["k_out"].float()})
+    with validating(op), pytest.raises(AssertionError):
+        op(**{**args, "block_table": args["block_table"].long()})
+    with validating(op), pytest.raises(AssertionError):
+        op(**{**args, "table": args["table"][:, :-1]})

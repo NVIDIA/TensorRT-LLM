@@ -103,3 +103,54 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
 #: histogram path); the replays move the bound, 128 rows down to the budget's
 #: copy-through shortcut.
 GRAPH_CASES = ((256, 2048, 1500), (1, 65536, 65535), (128, 65536, 511), (1024, 65536, 30000))
+
+
+def _layout_case():
+    torch.manual_seed(10)
+    rows, cols, top_k = 4, 128, 8
+    logits = torch.randn(rows, cols, device=DEV)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    row_ends = torch.full((rows,), cols, dtype=torch.int32, device=DEV)
+    return logits, row_starts, row_ends, top_k
+
+
+@pytest.mark.parametrize(
+    "rows, cols, window", GRAPH_CASES, ids=[f"{r}x{c}-to-{w}" for r, c, w in GRAPH_CASES]
+)
+def test_cuda_graph_capture_and_replay(rows, cols, window) -> None:
+    """Captured over full windows, then replayed against new scores and a new causal
+    bound through the captured addresses."""
+    gen = torch.Generator(device=DEV).manual_seed(8)
+    logits = _logits("relu", rows, cols, gen)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    row_ends = torch.full((rows,), cols, dtype=torch.int32, device=DEV)
+    indices = torch.empty(rows, BLOCK_TOPK, dtype=torch.int32, device=DEV)
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        op(logits, row_starts, row_ends, indices, BLOCK_TOPK)
+    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(logits, row_starts, row_ends, indices, BLOCK_TOPK)
+
+    logits.copy_(_logits("relu", rows, cols, gen))
+    row_ends.fill_(window)
+    indices.fill_(SENTINEL)
+    graph.replay()
+    torch.cuda.synchronize()
+    _compare(indices, op.reference(logits, row_starts, row_ends, indices, BLOCK_TOPK))
+
+
+def test_guard_refuses_the_token_budget_default() -> None:
+    """The default `index_topk` is 2048, the token budget; the target's buffer
+    is 512 wide. That is the wider-buffer fault the other way round, and the
+    guard catches it at the call that forgot to pass the block budget."""
+    logits, row_starts, row_ends, _ = _layout_case()
+    indices = torch.empty(logits.shape[0], BLOCK_TOPK, dtype=torch.int32, device=DEV)
+    with pytest.raises(AssertionError, match="index_topk=2048"):
+        with validating(op):
+            op(logits, row_starts, row_ends, indices)

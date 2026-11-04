@@ -3,7 +3,8 @@
 """GPU test for the qwen4 default target's qwen4_exp_hc_up_gate_mean_fp4__moe
 entry: `mixed` in the band `qwen4_exp_hc_up_gate_mean`'s test uses and bitwise
 that entry's own output, the NVFP4 outputs against the native-torch
-quantization of the returned `mixed` outside the reciprocal tie window."""
+quantization of the returned `mixed` outside the reciprocal tie window, the
+global-scale guard, graph capture."""
 
 import zlib
 
@@ -89,3 +90,31 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     # The same kernel and epilogue arithmetic as the bf16-only build the target runs elsewhere.
     assert torch.equal(mixed, qwen4_exp_hc_up_gate_mean(*args[:4]))
     _check_quant(mixed, xq, xsf, args[4])
+
+
+def test_guards() -> None:
+    """The kernel loads `global_scale[0]` only; a per-row scale is refused."""
+    low, up, normed, c, gs = _build(dict(rows=4), seed=4)
+    with validating(op), pytest.raises(AssertionError):
+        op(low, up, normed, c, torch.cat([gs, gs]))
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    low, up, normed, c, gs = _build(dict(rows=8), seed=5)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(low, up, normed, c, gs)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out = op(low, up, normed, c, gs)
+    fresh = _build(dict(rows=8), seed=6)
+    low.copy_(fresh[0])
+    normed.copy_(fresh[2])
+    gs.mul_(0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    want = op(fresh[0], up, fresh[2], c, gs)
+    for got, exp in zip(g_out, want):
+        assert torch.equal(got, exp)

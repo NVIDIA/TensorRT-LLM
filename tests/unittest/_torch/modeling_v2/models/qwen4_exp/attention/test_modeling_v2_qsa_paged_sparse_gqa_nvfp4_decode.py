@@ -227,7 +227,7 @@ def _replay_in_place(args, seed) -> None:
 
 
 def _marks(cell):
-    return (pytest.mark.large, pytest.mark.high_cuda_memory) if cell.spec.get("large") else ()
+    return (pytest.mark.high_cuda_memory,) if cell.spec.get("large") else ()
 
 
 @pytest.mark.parametrize(

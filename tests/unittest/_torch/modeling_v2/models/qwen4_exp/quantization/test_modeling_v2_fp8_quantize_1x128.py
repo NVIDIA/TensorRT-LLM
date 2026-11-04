@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the fp8_quantize_1x128 catalog entry.
 
-The entry owns the contract. This file turns a cell into an input and holds
-every code disagreement of a cell to a rounding tie.
+The entry owns the contract. This file turns a cell into an input, holds
+every code disagreement of a cell to a rounding tie, and adds what a cell
+cannot carry: CUDA-graph capture and replay, and the loud rejection of a
+strided input.
 """
 
 import zlib
@@ -128,3 +130,37 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
 
 
 # ── what a cell cannot carry ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("rows", [64, 128, 1024])
+def test_cuda_graph_capture_and_replay(rows):
+    """A replay reproduces a fresh eager call bitwise; so does a side stream."""
+    x = _input(rows, 2560, seed=17, magnitude=1.0)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            op(x)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_data, g_sf = op(x)
+    x.copy_(_input(rows, 2560, seed=18, magnitude=1.0))
+    e_data, e_sf = op(x)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(g_data.view(torch.uint8), e_data.view(torch.uint8))
+    assert torch.equal(g_sf.view(torch.int32), e_sf.view(torch.int32))
+    alt = torch.cuda.Stream()
+    with torch.cuda.stream(alt):
+        a_data, a_sf = op(x)
+    alt.synchronize()
+    assert torch.equal(a_data.view(torch.uint8), e_data.view(torch.uint8))
+    assert torch.equal(a_sf.view(torch.int32), e_sf.view(torch.int32))
+
+
+def test_rejects_a_strided_input():
+    """The op's own precondition, loud, which is why there is no guard."""
+    x = torch.randn(8, 5120, dtype=torch.bfloat16, device=DEV)[:, :2560]
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        op(x)

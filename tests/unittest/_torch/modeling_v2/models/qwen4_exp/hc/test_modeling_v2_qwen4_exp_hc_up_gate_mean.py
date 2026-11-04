@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_hc_up_gate_mean entry: cells in the band
-`qwen4_exp_gated_residual`'s test derives for `mixed`."""
+`qwen4_exp_gated_residual`'s test derives for `mixed`, the guard, graph
+capture."""
 
 import zlib
 
@@ -65,3 +66,27 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     # The answer came from the CuTe DSL kernel, JIT-compiled for this device.
     assert (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False) in _COMPILED
     _compare(mixed, op.reference(*args))
+
+
+def test_guard_refuses_a_contiguous_up() -> None:
+    low, up, normed, c = _build(dict(rows=4), seed=4)
+    with validating(op), pytest.raises(AssertionError):
+        op(low, up.contiguous(), normed, c)
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    low, up, normed, c = _build(dict(rows=8), seed=5)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(low, up, normed, c)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_mixed = op(low, up, normed, c)
+    fresh = _build(dict(rows=8), seed=6)
+    low.copy_(fresh[0])
+    normed.copy_(fresh[2])
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(g_mixed, op(fresh[0], up, fresh[2], c))

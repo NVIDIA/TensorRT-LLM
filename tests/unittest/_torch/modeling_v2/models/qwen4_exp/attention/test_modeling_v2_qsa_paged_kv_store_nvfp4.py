@@ -295,9 +295,10 @@ def _assert_straddles(spec, args) -> None:
         assert (spec["pages"] - 1) * args[name].stride(0) >= 2**31, (name, args[name].stride())
 
 
-# A pool sized to a member's measured page count does not fit a normal cell's 40 GiB.
+# A pool sized to a member's measured page count takes 47 GB of device memory.
 _CELL_PARAMS = [
-    pytest.param(c, marks=pytest.mark.large) if c.spec.get("large") else c for c in op.CELLS
+    pytest.param(c, marks=pytest.mark.high_cuda_memory) if c.spec.get("large") else c
+    for c in op.CELLS
 ]
 
 
@@ -323,3 +324,76 @@ def test_certified_cells(cell, certifying):  # noqa: F811
 
 def _decode_args(seed: int, **overrides):
     return _build({**op.CELLS[0].spec, **overrides}, seed=seed)
+
+
+def _reset(planes) -> None:
+    for plane, fill in zip(planes, (DATA_FILL, DATA_FILL, SCALE_FILL, SCALE_FILL)):
+        plane.fill_(fill)
+
+
+def _graph_replay(spec, seed: int, graph_batches) -> None:
+    """Each G: capture one step of the first G requests, replay the next step.
+
+    The next step lives in the captured buffers: new k/v rows, new pages in the
+    table, and every request's positions advanced by its rows, the way a decode
+    step moves. The replay must equal the reference and an eager call on the
+    same inputs, bit for bit. One pool serves the whole sweep, as the engine's does.
+    """
+    pool = _pool(spec)
+    steps = {n for _, n in spec["segments"]}
+    assert len(steps) == 1, "a graph cell's requests all carry the same row count"
+    step = steps.pop()
+    for g in graph_batches:
+        sub = {**spec, "segments": spec["segments"][:g]}
+        args, _, _ = _build(sub, seed=seed + g, pool=pool)
+        following, _, _ = _build(sub, seed=seed + 1000 + g, pool=pool)
+        planes = _planes(args)
+        positions = args["logical_positions"]
+        next_positions = positions.clone()
+        positions.sub_(step)
+        assert int(positions.min()) >= 0
+
+        def call():
+            op(**args)
+
+        for _ in range(3):  # compile the Triton kernel before capture
+            call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+
+        for name in ("k", "v", "block_table"):
+            args[name].copy_(following[name])
+        positions.copy_(next_positions)
+        _reset(planes)
+        op(**args)
+        eager = tuple(plane.clone() for plane in planes)
+        _reset(planes)
+        ref = op.reference(**args)
+        graph.replay()
+        torch.cuda.synchronize()
+        _compare(planes, ref)
+        assert all(torch.equal(p, e) for p, e in zip(planes, eager)), (
+            f"G={g} x {step} rows: replay differs from eager"
+        )
+        del graph
+    _assert_other_roles_untouched(spec, pool)
+
+
+def test_cuda_graph_replay_matches_eager() -> None:
+    """Decode MTP under a graph: 8 requests x 8 rows in the prefill cell's trunk layout,
+    captured once, replayed on the next step's rows, pages and positions."""
+    prefill = next(c.spec for c in op.CELLS if c.why.startswith("prefill:"))
+    spec = {**prefill, "segments": tuple((29 + 61 * i, 8) for i in range(8)), "pages": 256}
+    _graph_replay(spec, seed=8, graph_batches=(8,))
+
+
+def test_op_rejects_strided_request_indices() -> None:
+    """The callable's own loud error -- why the entry carries no `is_valid` -- for the
+    metadata a flat-pointer kernel would otherwise read at the wrong rows."""
+    args, _, _ = _decode_args(seed=5)
+    strided = torch.stack([args["request_indices"]] * 2, 1)[:, 0]
+    with pytest.raises(ValueError, match="request_indices must be contiguous"):
+        with validating(op):
+            op(**{**args, "request_indices": strided})

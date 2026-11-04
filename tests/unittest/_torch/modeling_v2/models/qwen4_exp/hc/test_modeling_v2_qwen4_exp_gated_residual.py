@@ -5,7 +5,8 @@
 The thing under test is a formula -- which operand is gated, which axis is
 reduced, where each division by `hc_count` sits, the factor on the injection
 -- and every mis-reading of it keeps the shapes; the cells' band sits 32x..192x
-inside the nearest wrong formula (measured).
+inside the nearest wrong formula (measured). Beyond the cells: graph replay and
+one loud misuse.
 """
 
 import zlib
@@ -124,3 +125,32 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         assert inject.shape == (*spec["leading"], hc_count)
     assert torch.equal(args[0], before), "the normed stream is read-only"
     _compare((mixed, inject), op.reference(*args))
+
+
+def test_malformed_operands_raise_rather_than_return() -> None:
+    """Why there is no `is_valid`: a width the weights do not take is loud on its own."""
+    _, (normed, down, up, inject_w, c) = _build((32,), seed=9)
+    with pytest.raises(RuntimeError):
+        op(normed[:, : WIDTH - 8], down, up, inject_w, c)
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    _, (static_in, down, up, inject_w, c) = _build((8,), seed=8)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            op(static_in, down, up, inject_w, c)
+    torch.cuda.current_stream().wait_stream(warmup)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_mixed, graph_inject = op(static_in, down, up, inject_w, c)
+
+    _, (fresh, *_) = _build((8,), seed=18)
+    static_in.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    eager_mixed, eager_inject = op(fresh, down, up, inject_w, c)
+    assert torch.equal(graph_mixed, eager_mixed)
+    assert torch.equal(graph_inject, eager_inject)

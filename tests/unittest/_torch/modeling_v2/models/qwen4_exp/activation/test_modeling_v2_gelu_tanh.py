@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp gelu_tanh entry.
 
-The entry's identity is *which* GELU it is: in bf16 the tanh and erf GELUs
-round to within about one ulp of each other, and only fp32 tells them apart.
+The entry's identity is *which* GELU it is, so the discrimination test is the
+point of this file: in bf16 the tanh and erf GELUs round to within about one
+ulp of each other, and only fp32 tells them apart.
 """
 
 import math
@@ -82,3 +83,51 @@ def _erf64(x):
     """The *other* GELU -- exact, erf-based; `torch.nn.GELU()` and `moe_gelu`."""
     x64 = x.double()
     return 0.5 * x64 * (1.0 + torch.erf(x64 / math.sqrt(2.0)))
+
+
+def test_identity_is_the_tanh_form_and_not_erf() -> None:
+    """Measured in fp32, where the question has an answer; and shown to have
+    none in bf16, so a bf16 match cannot quietly be read as confirmation."""
+    x32 = _uniform((512, INTERMEDIATE_SIZE), -4.0, 4.0, torch.float32, 24)
+    out = op(x32).double()
+    ref = _tanh64(x32)
+    correct = (out - ref).abs().max().item()
+    gate = _ATOL + _RTOL[torch.float32] * ref.abs().max().item()
+
+    # The entry's own gate refuses the erf form in fp32.
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(out.float(), _erf64(x32).float())
+
+    x64 = x32.double()
+    variants = {
+        "erf gelu (nn.GELU, and moe_gelu)": _erf64(x32),
+        "sigmoid approx x*sigmoid(1.702x)": x64 * torch.sigmoid(1.702 * x64),
+        "silu": x64 * torch.sigmoid(x64),
+        "relu": torch.clamp(x64, min=0.0),
+    }
+    print(f"\n  fp32: gate {gate:.3e}; correct-path deviation {correct:.3e}")
+    for name, wrong in variants.items():
+        dev = (out - wrong).abs().max().item()
+        print(
+            f"  {name:36s} dev {dev:.6e} ({dev / correct:9.1f}x correct, {dev / gate:7.1f}x gate)"
+        )
+        assert dev > 100.0 * correct, (name, dev, correct)
+        assert dev > 10.0 * gate, (name, dev, gate)
+
+    # A perturbation of this same formula: weak by construction (bounded by the
+    # coefficient change times the tanh derivative), so a lower multiple.
+    perturbed = 0.5 * x64 * (1.0 + torch.tanh(SQRT_2_OVER_PI * (x64 + 0.045 * x64**3)))
+    dev = (out - perturbed).abs().max().item()
+    print(f"  {'coefficient 0.044715 -> 0.045':36s} dev {dev:.6e} ({dev / gate:7.1f}x gate)")
+    assert dev > 100.0 * correct, (dev, correct)
+    assert dev > 5.0 * gate, (dev, gate)
+
+    # bf16 cannot see the difference: the erf variant's max deviation is within
+    # a small multiple of the correct path's own.
+    xb = x32.to(torch.bfloat16)
+    outb = op(xb).double()
+    correct_b = (outb - _tanh64(xb)).abs().max().item()
+    erf_b = (outb - _erf64(xb)).abs().max().item()
+    print(f"  bf16: correct {correct_b:.6e}; erf variant {erf_b:.6e} ({erf_b / correct_b:.3f}x)")
+    assert erf_b < 4.0 * correct_b, (erf_b, correct_b)
+    torch.testing.assert_close(outb.to(torch.bfloat16), op.reference(xb))

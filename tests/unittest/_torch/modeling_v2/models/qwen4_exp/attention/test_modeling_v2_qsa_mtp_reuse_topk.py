@@ -253,3 +253,18 @@ def _guard_case():
     whole[2] = kwargs["shared_visible_blocks"]
     kwargs["shared_visible_blocks"] = whole
     return intended, kwargs
+
+
+def test_guard_refuses_a_whole_multi_slot_count_buffer() -> None:
+    """Unguarded the op reads slot 0's counts and returns a plausible wrong answer;
+    `is_valid` refuses it."""
+    intended, kwargs = _guard_case()
+    out = op(**kwargs)
+    torch.cuda.synchronize()
+    assert not torch.equal(out, intended), "the op got it right after all"
+    _, kwargs = _guard_case()
+    with (
+        validating(op),
+        pytest.raises(ValueError, match="shared_visible_blocks must be one slot's"),
+    ):
+        op(**kwargs)

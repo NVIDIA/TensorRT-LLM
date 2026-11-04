@@ -298,3 +298,41 @@ def test_the_stock_managers_planes_are_the_cells_layout(member) -> None:
         for j, plane in enumerate(planes):
             if j != cell["layer"]:
                 assert bool((_bits(plane) == fill).all()), f"sparse layer {j}'s plane moved"
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    """Captured once at the 32 MTP7 verify blocks (256 rows), replayed against new
+    positions written into the same buffer."""
+    args = _small(seed=52, **_MTP7_BATCH)
+    positions = args["logical_positions"]
+    replayed = positions.clone()
+    positions.zero_()
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            op(**args)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(**args)
+
+    positions.copy_(replayed)
+    args["index_cache"].fill_(KEY_FILL)
+    args["position_cache"].fill_(POS_FILL)
+    ref = op.reference(**args)
+    graph.replay()
+    torch.cuda.synchronize()
+    _compare((args["index_cache"], args["position_cache"]), ref)
+
+
+def test_rejects_metadata_of_unequal_length() -> None:
+    """A shape the kernel would otherwise read past; the entry refuses it before
+    launching, so `is_valid` has nothing left to guard."""
+    args = _small(seed=61)
+    args["logical_positions"] = args["logical_positions"][:1]
+    before = (args["index_cache"].clone(), args["position_cache"].clone())
+    with pytest.raises(ValueError, match="equally long"):
+        op(**args)
+    assert torch.equal(_bits(args["index_cache"]), _bits(before[0]))
+    assert torch.equal(args["position_cache"], before[1])

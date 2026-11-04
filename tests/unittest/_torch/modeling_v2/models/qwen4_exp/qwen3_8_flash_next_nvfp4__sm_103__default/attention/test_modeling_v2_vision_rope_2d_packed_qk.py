@@ -172,3 +172,25 @@ def _small():
     qkv = _packed_qkv(96, torch.bfloat16, seed=17)
     cos, sin = _angle_table(grid_thw, MERGE, THETA, HEAD_DIM)
     return qkv, cos, sin
+
+
+#: The silent faults the op's note lists, each a table the kernel accepts: (cos, sin) -> table.
+_FAULTS = {
+    "bf16 table": lambda t: t.to(torch.bfloat16),
+    "short table": lambda t: t[:-8],
+    "narrow table": lambda t: t[:, : HALF - 4].contiguous(),
+    "non-contiguous table": lambda t: torch.cat((t, t), dim=-1)[:, :HALF],
+}
+
+
+@pytest.mark.parametrize("fault", list(_FAULTS))
+def test_is_valid_refuses_each_silent_table_fault(fault):
+    """Unguarded, the kernel returns a wrong rotation for each fault; `is_valid` refuses it."""
+    qkv, cos, sin = _small()
+    want = op.reference(_qk(qkv), cos, sin)
+    bad_cos, bad_sin = _FAULTS[fault](cos), _FAULTS[fault](sin)
+    got = op(_qk(qkv.clone()), bad_cos, bad_sin)
+    torch.cuda.synchronize()
+    assert not torch.equal(got, want), f"{fault}: the kernel got it right after all"
+    with validating(op), pytest.raises(AssertionError):
+        op(_qk(qkv.clone()), bad_cos, bad_sin)

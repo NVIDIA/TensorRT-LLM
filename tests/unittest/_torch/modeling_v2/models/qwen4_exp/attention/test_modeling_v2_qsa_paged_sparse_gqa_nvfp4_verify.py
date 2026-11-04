@@ -4,7 +4,8 @@
 `qsa_paged_sparse_gqa_nvfp4_decode` and against the per-row kernel, inside the NVFP4 op's band
 (4 ulp of each (row, head)'s max, 2 ulp relative RMS), over its cells; plus the routing to the
 per-row kernel, forced splits and other rows a request, the launch plan (a partial last wave's
-units split and merged), invalid request rows, and an unaligned row slice of the selection."""
+units split and merged), invalid request rows, an unaligned row slice of the selection, the
+selections `is_valid` refuses, determinism and graph replay against eager."""
 
 import math
 import zlib
@@ -266,3 +267,50 @@ def test_unaligned_row_slice_of_the_selection() -> None:
         aligned[name] = args[name].clone()
     assert args["selected_tokens"].data_ptr() % 16
     assert torch.equal(op(**args, rows_per_request=4), op(**aligned, rows_per_request=4))
+
+
+def test_is_valid_refuses_selections_that_are_not_expanded() -> None:
+    args = build(_segments(8, 4), seed=7)
+    op.is_valid(**args, rows_per_request=4)
+    good = args["selected_tokens"]
+    shifted = good.clone()
+    shifted[0, 0] += 1  # off its column's offset within the group
+    mixed = good.clone()
+    mixed[0, 1] = good[0, 5]  # two groups in one quad
+    repeated = good.clone()
+    repeated[0, 4:8] = good[0, 0:4]  # one group twice in a row
+    for bad in (shifted, mixed, repeated):
+        args["selected_tokens"] = bad
+        with pytest.raises(AssertionError):
+            op.is_valid(**args, rows_per_request=4)
+
+
+def test_calls_are_bitwise_deterministic() -> None:
+    args = build(_segments(8, 4), seed=8800)
+    assert torch.equal(op(**args, rows_per_request=4), op(**args, rows_per_request=4))
+
+
+@pytest.mark.parametrize("rows", [32])
+def test_replay_matches_eager(rows) -> None:
+    segments = tuple((100 + (499 * g) % 8000, 4) for g in range(rows // 4))
+    args = build(segments, seed=77)
+    fresh = build(segments, seed=127)
+    op(**args, rows_per_request=4)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(**args, rows_per_request=4)
+    for name in (
+        "q",
+        "k_cache",
+        "v_cache",
+        "k_scale_cache",
+        "v_scale_cache",
+        "block_table",
+        "selected_tokens",
+        "request_indices",
+    ):
+        args[name].copy_(fresh[name])
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, op(**fresh, rows_per_request=4))

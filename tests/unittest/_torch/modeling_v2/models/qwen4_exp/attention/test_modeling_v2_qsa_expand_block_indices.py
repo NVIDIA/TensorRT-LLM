@@ -132,3 +132,44 @@ def test_certified_cells(cell, certifying):  # noqa: F811
         assert bool((lengths.long() > positions.long() + 1).any()), (
             "a context cell must drive sequence_lengths past position + 1"
         )
+
+
+@pytest.mark.parametrize("rows", [1, 128, 256, 1024])
+def test_cuda_graph_capture_and_replay(rows) -> None:
+    """Capturable at decode and verify row counts (both launch shapes), and a replay
+    recomputes from whatever the buffers now hold."""
+    positions = torch.tensor([4096 + 7 * i for i in range(rows)], device=DEV)
+    lengths = (positions + 1).to(torch.int32)
+    blocks = _packed_selection(positions, CR, TOPK, seed=31)
+
+    def call():
+        return op(blocks, positions, lengths, compress_ratio=CR, token_topk=TOPK)
+
+    eager = call().clone()
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, eager)
+
+    blocks.copy_(_packed_selection(positions, CR, TOPK, seed=32))
+    graph.replay()
+    torch.cuda.synchronize()
+    _compare(captured, op.reference(blocks, positions, lengths, compress_ratio=CR, token_topk=TOPK))
+
+
+def test_op_rejects_a_width_that_does_not_match_the_geometry() -> None:
+    """A selection buffer whose width is not `token_topk // compress_ratio` is the
+    callable's own loud error, not a silent mis-expansion: why is_valid is empty."""
+    positions = torch.tensor([4096, 4097], device=DEV)
+    lengths = torch.tensor([4097, 4098], dtype=torch.int32, device=DEV)
+    blocks = _packed_selection(positions, CR, TOPK, seed=17)
+    with pytest.raises(ValueError, match="width does not match"):
+        op(blocks, positions, lengths, compress_ratio=CR, token_topk=1024)
