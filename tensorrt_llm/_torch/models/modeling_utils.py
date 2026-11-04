@@ -1425,12 +1425,20 @@ def register_config_loader(name: str):
 
 
 def get_checkpoint_weight_loader(name: str) -> Type["BaseWeightLoader"]:
+    from .checkpoints._registry import ensure_registered
+
+    ensure_registered(MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING,
+                      "register_checkpoint_weight_loader", name)
     if name not in MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default checkpoint weight loader {name} not found.")
     return MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name]
 
 
 def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
+    from .checkpoints._registry import ensure_registered
+
+    ensure_registered(MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING,
+                      "register_config_loader", name)
     if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default config loader {name} not found.")
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]

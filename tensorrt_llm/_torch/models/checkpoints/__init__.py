@@ -1,35 +1,45 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from .base_checkpoint_loader import BaseCheckpointLoader
-from .hf.afmoe_weight_mapper import AfmoeHfWeightMapper
-from .hf.checkpoint_loader import HfCheckpointLoader
-from .hf.config_loader import HfConfigLoader
-from .hf.cosmos3_edge_weight_mapper import Cosmos3EdgeHfWeightMapper
-from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
-from .hf.gemma3_weight_mapper import Gemma3HfWeightMapper
-from .hf.gemma4_weight_mapper import Gemma4HfWeightMapper
-from .hf.glm5_next_weight_mapper import Glm5NextHfWeightMapper
-from .hf.llama4_weight_mapper import Llama4HfWeightMapper
-from .hf.llava_next_weight_mapper import LlavaNextHfWeightMapper
-from .hf.mixtral_weight_mapper import MixtralHfWeightMapper
-from .hf.nemotron_h_weight_mapper import NemotronHHfWeightMapper
-from .hf.nemotron_nas_weight_mapper import NemotronNasHfWeightMapper
-from .hf.qwen2_moe_weight_mapper import Qwen2MoeHfWeightMapper
-from .hf.qwen2vl_weight_mapper import Qwen2VLHfWeightMapper
-from .hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
-from .hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
-from .hf.qwen3_next_weight_mapper import Qwen3NextHfWeightMapper
-from .hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
-from .hf.qwen4_exp_weight_mapper import Qwen4ExpHfWeightMapper
-from .hf.weight_loader import HfWeightLoader
-from .hf.weight_mapper import HfWeightMapper
-from .mistral.checkpoint_loader import (MistralCheckpointLoader,
-                                        MistralLarge3CheckpointLoader)
-from .mistral.config_loader import MistralConfigLoader
-from .mistral.weight_mapper import (MistralLarge3WeightMapper,
-                                    MistralWeightMapper)
-from .mx.checkpoint_loader import MXCheckpointLoader
+from tensorrt_llm._lazy_import import lazy_imports
+
+_CHECKPOINT_CLASS_TO_MODULE = {
+    "BaseCheckpointLoader": "base_checkpoint_loader",
+
+    # Huggingface
+    "HfCheckpointLoader": "hf.checkpoint_loader",
+    "HfConfigLoader": "hf.config_loader",
+    "HfWeightLoader": "hf.weight_loader",
+    "HfWeightMapper": "hf.weight_mapper",
+    "AfmoeHfWeightMapper": "hf.afmoe_weight_mapper",
+    "Cosmos3EdgeHfWeightMapper": "hf.cosmos3_edge_weight_mapper",
+    "Cosmos3HfWeightMapper": "hf.cosmos3_weight_mapper",
+    "Gemma3HfWeightMapper": "hf.gemma3_weight_mapper",
+    "Gemma4HfWeightMapper": "hf.gemma4_weight_mapper",
+    "Glm5NextHfWeightMapper": "hf.glm5_next_weight_mapper",
+    "Llama4HfWeightMapper": "hf.llama4_weight_mapper",
+    "LlavaNextHfWeightMapper": "hf.llava_next_weight_mapper",
+    "MixtralHfWeightMapper": "hf.mixtral_weight_mapper",
+    "NemotronHHfWeightMapper": "hf.nemotron_h_weight_mapper",
+    "NemotronNasHfWeightMapper": "hf.nemotron_nas_weight_mapper",
+    "Qwen2MoeHfWeightMapper": "hf.qwen2_moe_weight_mapper",
+    "Qwen2VLHfWeightMapper": "hf.qwen2vl_weight_mapper",
+    "Qwen3_5MoeHfWeightMapper": "hf.qwen3_5_weight_mapper",
+    "Qwen3MoeHfWeightMapper": "hf.qwen3_moe_weight_mapper",
+    "Qwen3NextHfWeightMapper": "hf.qwen3_next_weight_mapper",
+    "Qwen3VLHfWeightMapper": "hf.qwen3vl_weight_mapper",
+    "Qwen4ExpHfWeightMapper": "hf.qwen4_exp_weight_mapper",
+
+    # Mistral
+    "MistralCheckpointLoader": "mistral.checkpoint_loader",
+    "MistralLarge3CheckpointLoader": "mistral.checkpoint_loader",
+    "MistralConfigLoader": "mistral.config_loader",
+    "MistralLarge3WeightMapper": "mistral.weight_mapper",
+    "MistralWeightMapper": "mistral.weight_mapper",
+
+    # ModelExpress
+    "MXCheckpointLoader": "mx.checkpoint_loader",
+}
 
 __all__ = [
     "AfmoeHfWeightMapper", "HfConfigLoader", "HfWeightLoader", "HfWeightMapper",
@@ -45,3 +55,6 @@ __all__ = [
     "Cosmos3EdgeHfWeightMapper", "Qwen4ExpHfWeightMapper",
     "Glm5NextHfWeightMapper"
 ]
+
+__getattr__, __dir__ = lazy_imports(__name__, globals(),
+                                    _CHECKPOINT_CLASS_TO_MODULE)
