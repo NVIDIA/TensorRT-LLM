@@ -346,3 +346,11 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
     sampled = temperatures >= greedy_threshold
     return torch.where(sampled, scores.argmax(-1),
                        logits.float().argmax(-1)).to(torch.int32)
+
+
+def triton_num_compiled(kernel) -> int:
+    """Specializations of a ``triton.jit`` kernel compiled in this process.
+
+    A launch that raises the count compiled a new variant of the kernel.
+    """
+    return sum(len(cache[0]) for cache in kernel.device_caches.values())
