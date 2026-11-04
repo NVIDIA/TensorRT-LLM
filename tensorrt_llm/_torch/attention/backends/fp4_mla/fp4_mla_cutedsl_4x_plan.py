@@ -85,6 +85,25 @@ def plan_4x_task_capacity(
     return num_requests + more * (max_k - 1)
 
 
+_TASK_CAPACITY_BOUND_CACHE: dict[tuple[int, int, int, int], int] = {}
+
+
+def plan_4x_task_capacity_bound(
+    max_requests: int, pairs_per_request: int, lanes: int = LANES, max_k: int = MAX_K
+) -> int:
+    """Largest ``plan_4x_task_capacity`` of any batch up to ``max_requests``: the capacity of the shared split
+    workspace. Not monotonic in the batch (the tail wave drives ``more``), so it is the maximum over all sizes."""
+    key = (int(max_requests), int(pairs_per_request), int(lanes), int(max_k))
+    bound = _TASK_CAPACITY_BOUND_CACHE.get(key)
+    if bound is None:
+        bound = max(
+            plan_4x_task_capacity(requests, pairs_per_request, lanes, max_k)
+            for requests in range(1, max(1, int(max_requests)) + 1)
+        )
+        _TASK_CAPACITY_BOUND_CACHE[key] = bound
+    return bound
+
+
 def _warp_candidate(
     warp: int, split_tail: int, split_more: int, max_k: int
 ) -> tuple[bool, int, int]:
