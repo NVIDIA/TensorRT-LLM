@@ -3594,8 +3594,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 layer_idx,
                 model_config=model_config,
                 aux_stream_dict=aux_stream_dict,
-                # CP original stashed by _setup_helix_mappings; None outside helix.
-                mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
+                mapping_with_cp=model_config.mapping_with_cp,
                 reduce_output=not self.token_sliced,
             )
 
@@ -4430,9 +4429,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         self._repurposed_tp_mapping = repurposed
         model_config._frozen = False
         model_config.mapping = repurposed
-        # Side-channel for the MLA layers (avoids threading a kwarg through
-        # every intermediate signature).
-        model_config._helix_mapping_with_cp = self.mapping_with_cp
+        model_config.mapping_with_cp = self.mapping_with_cp
         model_config._frozen = True
 
     @classmethod

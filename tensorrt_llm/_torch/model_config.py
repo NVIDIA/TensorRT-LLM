@@ -255,6 +255,10 @@ def hf_remote_code_lock(timeout: int = 10) -> Iterator[None]:
 class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
     mapping: Mapping = field(default_factory=Mapping)
+    # Helix: the CP mapping of a model that builds its non-attention modules on
+    # ``mapping`` with the CP ranks repurposed as TP ranks; its attention layers
+    # and a drafter that shards like them read it. None outside Helix.
+    mapping_with_cp: Optional[Mapping] = None
 
     # Quantization configs
     quant_config: QuantConfig = field(default_factory=QuantConfig)

@@ -5099,8 +5099,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             dflash_attention_backend=model_config.spec_config.attention_backend,
             context_kv_only=context_kv_only,
             context_kv_dtype=context_kv_dtype,
-            # Set by a helix target that repurposed its mapping (Kimi K3).
-            helix_mapping=getattr(model_config, "_helix_mapping_with_cp", None),
+            helix_mapping=model_config.mapping_with_cp,
         )
     else:
         drafter_cls = GQADSparkForCausalLM
