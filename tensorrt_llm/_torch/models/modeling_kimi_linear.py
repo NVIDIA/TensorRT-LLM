@@ -1463,6 +1463,19 @@ class _Fp8BlockScaleWeightReadLinear(
         self.transform_weights()
         self._prepare_low_m_gemm()
 
+    @property
+    def is_fused_row_view(self) -> bool:
+        """Whether this projection is a row view of a fused KDA projection (no low-M GEMM of
+        its own)."""
+        return self._fused_projection is not None
+
+    def prepare_low_m_weight_scale(self) -> Optional[torch.Tensor]:
+        """The DeepGEMM-packed weight scale the low-M GEMM reads, or None where that GEMM does
+        not serve this weight. Runs this module's post-load first, for an owner whose own
+        post-load the walk reaches before this module's."""
+        self.post_load_weights()
+        return self._low_m_weight_scale
+
     def _prepare_low_m_gemm(self) -> None:
         """Select the low-M GEMM for this weight where it has a DeepGEMM-packed scale.
 
@@ -1787,9 +1800,7 @@ def _bf16_weight(linear: nn.Module) -> Optional[torch.Tensor]:
     if isinstance(linear, _Fp8BlockScaleWeightReadLinear):
         from ..kernels.blackwell import kimi_k3_moe_tail
 
-        linear.transform_weights()
-        linear._prepare_low_m_gemm()
-        packed = linear._low_m_weight_scale
+        packed = linear.prepare_low_m_weight_scale()
         n, k = linear.out_features, linear.in_features
         if packed is None or n % 128 or k % 128:
             return None
@@ -2486,11 +2497,10 @@ class KimiK3MoERuntime(nn.Module):
             and tuple(up.weight.shape) == (kimi_k3_moe_tail.HIDDEN, kimi_k3_moe_tail.LATENT)
             and kimi_k3_moe_tail.can_run(1, world, self.latent_up_rows[1])
         ):
-            up.transform_weights()
-            up._prepare_low_m_gemm()
-            if up._low_m_weight_scale is not None:
+            up_scale = up.prepare_low_m_weight_scale()
+            if up_scale is not None:
                 wexp = kimi_k3_moe_tail.block_exponents(
-                    up._low_m_weight_scale, kimi_k3_moe_tail.HIDDEN, kimi_k3_moe_tail.LATENT
+                    up_scale, kimi_k3_moe_tail.HIDDEN, kimi_k3_moe_tail.LATENT
                 )
                 if 1 <= int(wexp.min().item()) and int(wexp.max().item()) <= 254:
                     self._moe_tail_wexp = wexp
@@ -2586,10 +2596,7 @@ class KimiK3MoERuntime(nn.Module):
         ):
             return "not the Kimi-K3 geometry with a BF16 router"
         down = self.routed_expert_down_proj
-        if (
-            not isinstance(down, _Fp8BlockScaleWeightReadLinear)
-            or down._fused_projection is not None
-        ):
+        if not isinstance(down, _Fp8BlockScaleWeightReadLinear) or down.is_fused_row_view:
             return "latent_down is not an FP8 weight-read projection"
         return None
 
@@ -2599,10 +2606,10 @@ class KimiK3MoERuntime(nn.Module):
         self._moe_front_plan = None
         reason = self._moe_front_unsupported()
         down = self.routed_expert_down_proj
+        down_scale = None
         if reason is None:
-            down.transform_weights()
-            down._prepare_low_m_gemm()
-            if down._low_m_weight_scale is None:
+            down_scale = down.prepare_low_m_weight_scale()
+            if down_scale is None:
                 reason = "the low-M GEMM does not serve latent_down"
         if reason is not None:
             logger.info_once(
@@ -2620,7 +2627,7 @@ class KimiK3MoERuntime(nn.Module):
         with torch.no_grad():
             self._moe_front_plan = kimi_k3_moe_front.make_plan(
                 down.weight,
-                down._low_m_weight_scale,
+                down_scale,
                 self.gate.weight,
                 self.gate.e_score_correction_bias,
                 float(self.gate.routed_scaling_factor),

@@ -31,7 +31,7 @@ from ...attention.backends.interface import PositionalEmbeddingParams, RopeParam
 from ...attention.mla import MLA, _helix_gen_zero_kv_mask
 from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...distributed import AllReduceParams
-from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from ...flashinfer_utils import get_env_enable_pdl
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..helix_tail import HelixTail
@@ -145,6 +145,12 @@ class _ForwardStep:
     gate_behind_kv: bool = False
     # The MXFP8 form of the gated rows the tail stores for o_proj (PrequantizedInputProjection).
     operand: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+
+
+def _runs_flashinfer_cute_rmsnorm(norm: torch.nn.Module) -> bool:
+    """Whether ``norm`` of BF16 rows runs FlashInfer's CuTe DSL RMSNorm, the arithmetic the
+    fused K3 MLA kernels repeat bit for bit."""
+    return type(norm) is RMSNorm and norm.runs_flashinfer_cute_dsl()
 
 
 # ---------------------------------------------------------------------------
@@ -339,9 +345,9 @@ class KimiK3MLAAttention(MLA):
         self._fused_decode_query_norm = (
             self._fused_decode_query
             and self._resolve_qa_fused_scale() is None
-            and self._runs_flashinfer_cute_rmsnorm(self.q_a_layernorm)
+            and _runs_flashinfer_cute_rmsnorm(self.q_a_layernorm)
         )
-        self._fused_latent_row = self._fused_decode_query and self._runs_flashinfer_cute_rmsnorm(
+        self._fused_latent_row = self._fused_decode_query and _runs_flashinfer_cute_rmsnorm(
             self.kv_a_layernorm
         )
 
@@ -355,25 +361,6 @@ class KimiK3MLAAttention(MLA):
             self._helix_tail_max_tokens = HelixTail.max_tokens(
                 self.mapping, self.num_heads_tp, self.kv_lora_rank, self.v_head_dim
             )
-
-    @staticmethod
-    def _runs_flashinfer_cute_rmsnorm(norm: torch.nn.Module) -> bool:
-        """Whether ``norm`` of BF16 rows runs FlashInfer's CuTe DSL RMSNorm, the arithmetic
-        the fused K3 MLA kernels repeat bit for bit."""
-        if not (
-            IS_FLASHINFER_AVAILABLE
-            and type(norm) is RMSNorm
-            and not (norm.use_cuda_tile or norm.use_gemma or norm.is_nvfp4)
-            and not norm.return_hp_output
-            and norm.weight.dtype == torch.bfloat16
-            and norm.weight.is_contiguous()
-        ):
-            return False
-        try:
-            from flashinfer.norm import _use_cuda_norm
-        except ImportError:
-            return False
-        return not _use_cuda_norm(norm.weight.device)
 
     def _absorption_weight_bf16(self) -> Optional[torch.Tensor]:
         """The BF16 W_UK ``[H, kv_lora_rank, qk_nope_head_dim]`` the absorbed generation BMM

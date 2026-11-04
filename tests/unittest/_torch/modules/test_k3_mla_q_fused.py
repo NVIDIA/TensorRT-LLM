@@ -535,7 +535,10 @@ def _k3_mla(w, md):
 
     from tensorrt_llm._torch.kernels.blackwell import k3_mla_q_fused
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import KimiK3MLAAttention
+    from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import (
+        KimiK3MLAAttention,
+        _runs_flashinfer_cute_rmsnorm,
+    )
     from tensorrt_llm._torch.utils import AuxStreamType
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -575,8 +578,8 @@ def _k3_mla(w, md):
     # The q_b exponents cache_derived_state builds from that scale.
     mla._q_b_block_exponents = k3_mla_q_fused.block_exponents_from_fp32(w.s_qb_f32, *w.w_qb.shape)
     # The flags cache_derived_state sets from the loaded norms.
-    mla._fused_latent_row = mla._runs_flashinfer_cute_rmsnorm(mla.kv_a_layernorm)
-    mla._fused_decode_query_norm = mla._runs_flashinfer_cute_rmsnorm(mla.q_a_layernorm)
+    mla._fused_latent_row = _runs_flashinfer_cute_rmsnorm(mla.kv_a_layernorm)
+    mla._fused_decode_query_norm = _runs_flashinfer_cute_rmsnorm(mla.q_a_layernorm)
     # The decode of every head stands in for the attention and its Helix exchange.
     mla._attn_forward_gen = _DecodeAsAttention(md)
     return mla
