@@ -2071,6 +2071,7 @@ class KimiK3MoERuntime(nn.Module):
         # The routed latent all-reduce on its own MNNVL workspace (``_latent_all_reduce_workspace``)
         # for the sizes it runs one-shot (``_latent_all_reduce``); None: the routed experts'.
         self._own_latent_all_reduce: Optional[AllReduce] = None
+        self._own_latent_one_shot_max_bytes = 0
         # The sharded decode front (``kimi_k3_moe_front``): the routed all-reduce group's
         # workspace and this layer's operands on this rank, built after loading where it applies.
         self._moe_front_ws = None
@@ -2317,6 +2318,7 @@ class KimiK3MoERuntime(nn.Module):
             )
             if own.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM, self.moe_hidden_size):
                 self._own_latent_all_reduce = own
+                self._own_latent_one_shot_max_bytes = own.mnnvl_allreduce.one_shot_max_bytes
         # Stock fused RMSNorm (flashinfer kernel; the no-flashinfer
         # fallback is the same fp32-variance eager math as KimiK3RMSNorm).
         self.routed_expert_norm = RMSNorm(
@@ -2335,7 +2337,7 @@ class KimiK3MoERuntime(nn.Module):
                 self.moe_hidden_size,
                 own.mapping.tp_size,
                 torch.bfloat16,
-                own.one_shot_max_bytes,
+                self._own_latent_one_shot_max_bytes,
             )[0]
         ):
             return own

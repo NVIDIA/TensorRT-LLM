@@ -591,9 +591,6 @@ def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
         def __init__(self, name: str, tp_size: int = 8) -> None:
             self.name = name
             self.mapping = SimpleNamespace(tp_size=tp_size)
-            self.one_shot_max_bytes = modeling_kimi_linear._latent_all_reduce_workspace(
-                3584
-            ).one_shot_max_bytes
 
         def __call__(self, value: torch.Tensor, all_reduce_params=None) -> torch.Tensor:
             calls.append((self.name, current_stream))
@@ -646,6 +643,9 @@ def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
     runtime._reduce_routed_output = True
     runtime._defer_shared_allreduce = False
     runtime._own_latent_all_reduce = _AllReduce("own_ws_latent_ar")
+    runtime._own_latent_one_shot_max_bytes = modeling_kimi_linear._latent_all_reduce_workspace(
+        3584
+    ).one_shot_max_bytes
     runtime.shared_expert_stream = aux_stream
     runtime.moe_main_event = _Event("fork")
     runtime.moe_shared_event = _Event("shared_done")
