@@ -4733,6 +4733,7 @@ def _make_stream_executor(requests):
     executor.perf_manager = MagicMock()
     executor.iter_counter = 1
     executor.stream_interval = 20
+    executor.first_content_emit_iters = 1
     executor.disable_overlap_scheduler = False
     executor.dist = types.SimpleNamespace(rank=0, world_size=1)
     executor.kv_cache_transceiver = None
