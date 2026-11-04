@@ -64,6 +64,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
+from .warmup_overlap import warmup_overlap
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -1113,10 +1114,6 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
-        # The warmup steps that build kernels without a model forward depend on
-        # the configuration alone: run them while the weights load.
-        from tensorrt_llm._torch.pyexecutor import warmup_overlap
-        warmup_overlap.start(config, self.llm_args, self.mapping)
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked
@@ -1269,10 +1266,6 @@ class ModelLoader:
             # No-op if worked as expected
             if load_format != LoadFormat.GMS:
                 model.to("cuda")
-                # The Linear layers' GEMM kernels follow from their shapes:
-                # build them while the allocated weights load.
-                warmup_overlap.start_linear_prebuild(model, self.llm_args,
-                                                     self.mapping)
             memo.clear()
 
             rank_model_storage = get_rank_model_storage(model)
@@ -1316,13 +1309,14 @@ class ModelLoader:
 
                 weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
-                weights_preloaded = self._materialize_checkpoint_weights(
-                    checkpoint_loader, weights_checkpoint_dir, model, config,
-                    load_weights_kwargs)
+                with warmup_overlap(model, config, self.llm_args, self.mapping):
+                    weights_preloaded = self._materialize_checkpoint_weights(
+                        checkpoint_loader, weights_checkpoint_dir, model,
+                        config, load_weights_kwargs)
 
-                if loads_draft_weights:
-                    self._materialize_draft_checkpoint_weights(
-                        checkpoint_loader, model)
+                    if loads_draft_weights:
+                        self._materialize_draft_checkpoint_weights(
+                            checkpoint_loader, model)
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a

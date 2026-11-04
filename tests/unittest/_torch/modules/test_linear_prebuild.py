@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Linear GEMM prebuild next to weight loading (modules/linear_prebuild.py)."""
+"""Warmup kernel builds next to weight loading (pyexecutor/warmup_overlap.py,
+modules/linear_prebuild.py)."""
 
 from types import SimpleNamespace
 
@@ -9,8 +10,9 @@ import torch
 from torch import nn
 
 import tensorrt_llm._torch.modules.linear_prebuild as lp
-import tensorrt_llm._torch.pyexecutor.warmup_overlap as warmup_overlap
+import tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer as sampler_ops
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.pyexecutor.warmup_overlap import warmup_overlap
 from tensorrt_llm._torch.utils import deep_gemm_jit_warmup_buckets
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -34,6 +36,7 @@ def _llm_args(max_num_tokens, max_batch_size, max_seq_len=None, draft=0):
         max_num_tokens=max_num_tokens,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        max_beam_width=1,
         speculative_config=spec,
         cuda_graph_config=None,
     )
@@ -94,25 +97,33 @@ def test_collect_plans_the_swept_shapes():
 
 
 @pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
-def test_start_linear_prebuild_builds_the_sweep_before_wait(monkeypatch):
+def test_warmup_overlap_builds_before_the_with_ends(monkeypatch):
     monkeypatch.setenv("TLLM_OVERLAP_PREWARM", "1")
     monkeypatch.delenv("TLLM_OVERLAP_PREWARM_LINEAR", raising=False)
-    monkeypatch.setattr(warmup_overlap, "_linear_groups", [])
-    monkeypatch.setattr(warmup_overlap, "_linear_threads", [])
-    monkeypatch.setattr(warmup_overlap, "_released", False)
-    monkeypatch.setattr(warmup_overlap, "_thread", None)
+    sampled = []
+    monkeypatch.setattr(sampler_ops, "warmup_sampling_module", lambda: sampled.append(True))
     with torch.device("meta"):
         model = nn.Module()
         model.wide = Linear(
             NO_LOW_M[1], NO_LOW_M[0], bias=False, dtype=torch.bfloat16, quant_config=FP8
         )
+    model_config = SimpleNamespace(pretrained_config=None)
 
-    warmup_overlap.start_linear_prebuild(model, _llm_args(14, 2, draft=6), _Mapping(True))
-    warmup_overlap.wait()
+    with warmup_overlap(model, model_config, _llm_args(14, 2, draft=6), _Mapping(True)) as groups:
+        pass
 
-    groups = {group.name: group for group in warmup_overlap._linear_groups}
+    groups = {group.name: group for group in groups}
+    assert sampled == [True]
+    assert (groups["warmup_steps"].count, groups["warmup_steps"].failed) == (1, 0)
     deep_gemm = groups["deep_gemm"]
     assert (deep_gemm.count, deep_gemm.failed) == (1, 0)
     assert deep_gemm.launches == len(_sweep(14))
     assert groups["flashinfer_mxfp8"].count == 0
-    assert not any(thread.is_alive() for thread in warmup_overlap._linear_threads)
+    assert not any(t.is_alive() for group in groups.values() for t in group.threads)
+
+
+def test_warmup_overlap_is_a_no_op_when_disabled(monkeypatch):
+    monkeypatch.setenv("TLLM_OVERLAP_PREWARM", "0")
+    with warmup_overlap(nn.Module(), None, _llm_args(14, 2), _Mapping(True)) as groups:
+        pass
+    assert groups == []

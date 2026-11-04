@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Build the GEMM kernels of a model's Linear layers before its weights are loaded.
+"""Build the GEMM kernels of a model's Linear layers without a model forward.
 
 The decoder warmup builds them as a side effect of its forwards: DeepGEMM compiles a
 swap-AB kernel for every tile layout its heuristic picks for an FP8 block-scale weight

@@ -21,7 +21,6 @@ from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
-from tensorrt_llm._torch.pyexecutor import warmup_overlap
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
@@ -367,10 +366,6 @@ class DecoderWarmup:
         with self._warmup_timer.phase(
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
-            # The model loader may already be building these kernels next to the
-            # weight loading (warmup_overlap); let it finish, so the calls below
-            # find them built.
-            warmup_overlap.wait()
             warmup_sampling_module()
             if self._config.max_beam_width > 1:
                 warmup_topk_module()
