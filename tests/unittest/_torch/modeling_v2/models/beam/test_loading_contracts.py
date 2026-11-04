@@ -218,3 +218,97 @@ def test_builtin_loader_rejects_tp_before_copy(monkeypatch, tp_size):
     else:
         modeling_beam.BeamForCausalLM.load_weights(model, {})
         assert calls == [(model, {})]
+
+
+# ------------------------------------------------------------------ grouped-GEMM expert scales
+
+SCALE_EXPERTS = 4
+
+
+def _expert_scales(**changes) -> dict:
+    """[4]-expert scales in the checkpoint's form: one FC1 and one FC2 input scale per layer,
+    gate and up weight_scale_2 equal per expert. ``changes`` maps "kind.field" to an expert and
+    the value it takes there."""
+    w2 = torch.tensor([1.5e-3, 2.0e-3, 2.5e-3, 3.0e-3])
+    scales = {
+        "gate": {"input_scale": torch.full((4,), 0.0123), "weight_scale_2": w2.clone()},
+        "up": {"input_scale": torch.full((4,), 0.0123), "weight_scale_2": w2.clone()},
+        "down": {"input_scale": torch.full((4,), 0.0625), "weight_scale_2": w2 * 0.5},
+    }
+    for key, (expert, value) in changes.items():
+        kind, field = key.split(".")
+        scales[kind][field][expert] = value
+    return scales
+
+
+VIOLATIONS = [
+    ({"up.input_scale": (2, 0.0124)}, "gate and up input scales differ"),
+    (
+        {"gate.input_scale": (1, 0.0124), "up.input_scale": (1, 0.0124)},
+        "FC1 input scale differs between experts",
+    ),
+    ({"up.weight_scale_2": (3, 3.1e-3)}, "gate and up weight_scale_2 differ"),
+    ({"down.input_scale": (0, 0.0626)}, "FC2 input scale differs between experts"),
+]
+
+
+def test_expert_scales_fit_the_grouped_gemm():
+    nvfp4.check_expert_scales(3, _expert_scales())
+
+
+@pytest.mark.parametrize("changes,match", VIOLATIONS)
+def test_expert_scales_the_grouped_gemm_cannot_take_are_refused(changes, match):
+    with pytest.raises(nvfp4.CheckpointFormatError, match=f"sparse layer 3: .*{match}"):
+        nvfp4.check_expert_scales(3, _expert_scales(**changes))
+
+
+def _scalar_loader(monkeypatch, scales: dict):
+    """A component holding sparse layer 3 of four experts, reading ``scales`` as stored."""
+    specs = OrderedDict()
+    for e in range(SCALE_EXPERTS):
+        for proj, shape, split in (
+            ("gate_proj", (2560, 5120), 0),
+            ("up_proj", (2560, 5120), 0),
+            ("down_proj", (5120, 2560), 1),
+        ):
+            name = f"model.layers.3.mlp.experts.{e}.{proj}"
+            specs[name] = nvfp4.QuantSpec(name, shape, 3, e, proj, split)
+    values = {
+        f"model.layers.3.mlp.experts.{e}.{kind}_proj.{field}": float(scales[kind][field][e])
+        for kind in ("gate", "up", "down")
+        for field in ("input_scale", "weight_scale_2")
+        for e in range(SCALE_EXPERTS)
+    }
+    monkeypatch.setattr(nvfp4, "read_scalars", lambda catalog, reader, names: values)
+    banks = {}
+
+    def bank(name, field):
+        return banks.setdefault((name, field), torch.full((SCALE_EXPERTS,), float("nan")))
+
+    component = SimpleNamespace(
+        config={"num_experts": SCALE_EXPERTS}, specs=specs, bank=bank, _shared_fc1={}
+    )
+    return component, banks
+
+
+def test_load_scalars_writes_one_fc1_alpha_for_gate_and_up(monkeypatch):
+    component, banks = _scalar_loader(monkeypatch, _expert_scales())
+    record = nvfp4.BeamCheckpointLayoutNvfp4Sm103Tp4._load_scalars(component, None, None, 3)
+    assert record == {"scalars": 6 * SCALE_EXPERTS, "gate_up_input_scales_shared": SCALE_EXPERTS}
+    gate, up = "layers.3.experts.gate", "layers.3.experts.up"
+    for field in ("input_scale", "weight_scale_2", "g", "alpha"):
+        assert torch.equal(
+            banks[(gate, field)].view(torch.int32), banks[(up, field)].view(torch.int32)
+        )
+    s = torch.full((SCALE_EXPERTS,), 0.0123)
+    assert torch.equal(banks[(gate, "g")], torch.ones(SCALE_EXPERTS) / s)
+    assert torch.equal(banks[(gate, "alpha")], s * _expert_scales()["gate"]["weight_scale_2"])
+    assert component._shared_fc1[3] == [True] * SCALE_EXPERTS
+
+
+@pytest.mark.parametrize("changes,match", VIOLATIONS)
+def test_load_scalars_refuses_before_writing_any_bank(monkeypatch, changes, match):
+    component, banks = _scalar_loader(monkeypatch, _expert_scales(**changes))
+    with pytest.raises(nvfp4.CheckpointFormatError, match=match):
+        nvfp4.BeamCheckpointLayoutNvfp4Sm103Tp4._load_scalars(component, None, None, 3)
+    assert banks == {} and component._shared_fc1 == {}

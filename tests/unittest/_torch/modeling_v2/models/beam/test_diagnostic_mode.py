@@ -49,8 +49,8 @@ def _component(diagnostics: bool, agreements: list) -> SimpleNamespace:
     component.route = lambda layer, h: _routing()
     component.all_reduce = lambda t: t
     component._bank = lambda layer, which: torch.zeros(EXPERTS, HIDDEN, HIDDEN)
-    component.expert_bank = lambda layer: {}
-    component._shared_fc1 = {LAYER: [True] * EXPERTS}
+    component.expert_operands = lambda layer: None
+    component.max_tokens = 16
 
     def digests_agree(tensors):
         agreements.append(len(tensors))
@@ -68,11 +68,14 @@ def test_moe_router_agreement_runs_only_in_diagnostic_mode(monkeypatch, cls, dia
     component = _component(diagnostics, agreements)
 
     def dispatch(h, ids, weights, provider):
-        if cls is BF16_CLS:
-            provider(0, h[:1])  # one expert call, so a capture has rows to record
+        provider(0, h[:1])  # one expert call, so a capture has rows to record
+        return torch.ones_like(h)
+
+    def routed(h, ids, weights, operands, *, tune_max_rows, record=None):
         return torch.ones_like(h)
 
     monkeypatch.setattr(bf16.dispatch_combine, "beam_dispatch_combine", dispatch)
+    monkeypatch.setattr(nvfp4.routed_experts, "nvfp4_routed_experts", routed)
     monkeypatch.setattr(bf16, "cublas_mm", lambda a, b: a.float() @ b.float())
     monkeypatch.setattr(bf16, "swiglu_fp32", lambda g, u: {"silu": g, "product": g, "act": g})
     monkeypatch.setattr(bf16, "_rec", lambda capture, items: None)
