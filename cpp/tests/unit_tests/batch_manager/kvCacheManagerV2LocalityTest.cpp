@@ -218,9 +218,11 @@ protected:
         return config;
     }
 
-    static ReuseScope scopeFor(std::optional<int> localityDomainId)
+    static std::shared_ptr<KvCache> createOn(
+        KvCacheManager& manager, std::optional<int> localityDomainId, TokenSpan inputTokens = {})
     {
-        return ReuseScope{std::nullopt, std::nullopt, std::optional<LocalityDomainId>(localityDomainId)};
+        return manager.createKvCache({}, inputTokens, std::nullopt, {}, std::nullopt, std::nullopt, false, std::nullopt,
+            std::optional<LocalityDomainId>(localityDomainId));
     }
 
     std::vector<TokenIdExt> tokens(int count) const
@@ -266,7 +268,7 @@ TEST_F(KvCacheManagerV2MockLocalityTest, FreeSlotsAreTrackedPerDomain)
     EXPECT_GT(before[0], 0);
     EXPECT_EQ(before[0], before[1]);
 
-    auto cache = manager->createKvCache(scopeFor(1));
+    auto cache = createOn(*manager, 1);
     EXPECT_EQ(cache->localityDomainId(), std::optional<LocalityDomainId>{1});
     ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(mStream)));
     ASSERT_TRUE(cache->resize(64));
@@ -277,17 +279,17 @@ TEST_F(KvCacheManagerV2MockLocalityTest, FreeSlotsAreTrackedPerDomain)
     cache->close();
     EXPECT_EQ(freeSlotsPerDomain(manager->storage()), before);
 
-    EXPECT_THROW(manager->createKvCache(scopeFor(2)), tensorrt_llm::common::TllmException);
-    EXPECT_THROW(manager->createKvCache(scopeFor(std::nullopt)), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(createOn(*manager, 2), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(createOn(*manager, std::nullopt), tensorrt_llm::common::TllmException);
     auto plain = std::make_shared<KvCacheManager>(makeLocalizedConfig(false));
-    EXPECT_THROW(plain->createKvCache(scopeFor(0)), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(createOn(*plain, 0), tensorrt_llm::common::TllmException);
 }
 
 TEST_F(KvCacheManagerV2MockLocalityTest, PageIndexUpperBoundCoversBothDomains)
 {
     auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
-    auto cache0 = manager->createKvCache(scopeFor(0));
-    auto cache1 = manager->createKvCache(scopeFor(1));
+    auto cache0 = createOn(*manager, 0);
+    auto cache1 = createOn(*manager, 1);
     ASSERT_TRUE(cache0->resume(reinterpret_cast<CUstream>(mStream)));
     ASSERT_TRUE(cache1->resume(reinterpret_cast<CUstream>(mStream)));
     ASSERT_TRUE(cache0->resize(128));
@@ -318,55 +320,6 @@ TEST_F(KvCacheManagerV2MockLocalityTest, PageIndexUpperBoundCoversBothDomains)
     EXPECT_GT(mappedPages, 0U);
     cache0->close();
     cache1->close();
-}
-
-TEST_F(KvCacheManagerV2MockLocalityTest, PrefixReuseStaysWithinADomain)
-{
-    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
-    auto const all = tokens(64);
-    TokenSpan const prefix{all.data(), static_cast<int>(all.size()) - 1};
-
-    auto first = manager->createKvCache(scopeFor(0), prefix);
-    commitAndClose(*first, all, 128);
-
-    auto sameDomain = manager->createKvCache(scopeFor(0), prefix);
-    EXPECT_GT(sameDomain->numCommittedTokens(), 0);
-    commitAndClose(*sameDomain, all, 128);
-
-    auto otherDomain = manager->createKvCache(scopeFor(1), prefix);
-    EXPECT_EQ(otherDomain->numCommittedTokens(), 0);
-    commitAndClose(*otherDomain, all, 128);
-
-    auto otherDomainAgain = manager->createKvCache(scopeFor(1), prefix);
-    EXPECT_GT(otherDomainAgain->numCommittedTokens(), 0);
-    otherDomainAgain->close();
-}
-
-TEST_F(KvCacheManagerV2MockLocalityTest, ResizeKeepsDomainsIndependent)
-{
-    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
-    auto const all = tokens(64);
-    TokenSpan const prefix{all.data(), static_cast<int>(all.size()) - 1};
-    for (int domain : {0, 1})
-    {
-        auto cache = manager->createKvCache(scopeFor(domain), prefix);
-        commitAndClose(*cache, all, static_cast<int>(all.size()));
-    }
-
-    auto& storage = manager->storage();
-    PoolGroupIndex const pg{0};
-    SlotCount const before0 = storage.numSlots(pg);
-    storage.shrinkPoolGroup(kHotLevel, pg, SlotCount{1}, {}, LocalityDomainId{1});
-    EXPECT_EQ(storage.numSlots(pg), before0);
-    EXPECT_EQ(freeSlotsPerDomain(storage)[1], 0);
-
-    // Domain 0's cached prefix survived domain 1's shrink.
-    auto cache = manager->createKvCache(scopeFor(0), prefix);
-    EXPECT_GT(cache->numCommittedTokens(), 0);
-    cache->close();
-
-    storage.expandPoolGroup(kHotLevel, pg, before0, LocalityDomainId{1});
-    EXPECT_GT(freeSlotsPerDomain(storage)[1], 0);
 }
 
 // A slot's locality domain comes from the chunk its id falls in, so it stays right after one domain
@@ -535,7 +488,7 @@ TEST_F(KvCacheManagerV2MockLocalityTest, UtilizationIsReportedPerDomain)
     auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
     auto& storage = manager->storage();
     auto const capacity = storage.numSlots(PoolGroupIndex{0});
-    auto cache = manager->createKvCache(scopeFor(1));
+    auto cache = createOn(*manager, 1);
     ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(mStream)));
     ASSERT_TRUE(cache->resize(static_cast<int>(capacity) / 2 * 32));
 
@@ -545,15 +498,55 @@ TEST_F(KvCacheManagerV2MockLocalityTest, UtilizationIsReportedPerDomain)
     cache->close();
 }
 
-TEST_F(KvCacheManagerV2MockLocalityTest, NonLocalizedScopesHashAsBefore)
+TEST_F(KvCacheManagerV2MockLocalityTest, PrefixReuseCrossesDomains)
 {
-    // The third ReuseScope field must not change the key of scopes that do not set it.
-    ReuseScope const plain{7, "11"};
-    ReuseScope const explicitNone{7, "11", std::nullopt};
-    EXPECT_EQ(Hasher(plain).digest(), Hasher(explicitNone).digest());
-    EXPECT_NE(Hasher(plain).digest(), Hasher(ReuseScope{7, "11", LocalityDomainId{0}}).digest());
-    EXPECT_NE(Hasher(ReuseScope{7, "11", LocalityDomainId{0}}).digest(),
-        Hasher(ReuseScope{7, "11", LocalityDomainId{1}}).digest());
+    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
+    auto const all = tokens(64);
+    TokenSpan const prefix{all.data(), static_cast<int>(all.size()) - 1};
+    auto first = createOn(*manager, 0, prefix);
+    commitAndClose(*first, all, 128);
+
+    auto otherDomain = createOn(*manager, 1, prefix);
+    EXPECT_GT(otherDomain->numCommittedTokens(), 0);
+    EXPECT_EQ(manager->probeReuseDomains({}, prefix), (std::vector<int>{2, 0}));
+    otherDomain->close();
+}
+
+TEST_F(KvCacheManagerV2MockLocalityTest, AllocationFallsBackToTheOtherDomain)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
+    auto& storage = manager->storage();
+    PoolGroupIndex const pg{0};
+    storage.shrinkPoolGroup(kHotLevel, pg, SlotCount{1}, {}, LocalityDomainId{0});
+    auto const before = freeSlotsPerDomain(storage);
+    ASSERT_EQ(before[0], 1);
+
+    // Domain 0 has one free slot; the rest of the request lands on domain 1 instead of failing.
+    auto cache = createOn(*manager, 0);
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(mStream)));
+    ASSERT_TRUE(cache->resize(128));
+    auto const during = freeSlotsPerDomain(storage);
+    EXPECT_EQ(during[0], 0);
+    EXPECT_LT(during[1], before[1]);
+    cache->close();
+}
+
+TEST_F(KvCacheManagerV2MockLocalityTest, AllocationEvictsItsOwnDomainBeforeSpilling)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
+    auto& storage = manager->storage();
+    storage.shrinkPoolGroup(kHotLevel, PoolGroupIndex{0}, SlotCount{4}, {}, LocalityDomainId{0});
+    auto cached = createOn(*manager, 0);
+    commitAndClose(*cached, tokens(128), 128);
+    auto const before = freeSlotsPerDomain(storage);
+    ASSERT_EQ(before[0], 0);
+
+    // Domain 0 holds only cached pages while domain 1 is empty: the new pages replace domain 0's cache.
+    auto cache = createOn(*manager, 0);
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(mStream)));
+    ASSERT_TRUE(cache->resize(64));
+    EXPECT_EQ(freeSlotsPerDomain(storage), before);
+    cache->close();
 }
 
 } // namespace

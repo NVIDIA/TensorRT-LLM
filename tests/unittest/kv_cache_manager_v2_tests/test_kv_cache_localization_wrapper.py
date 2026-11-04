@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KVCacheManagerV2 wrapper paths that build a ReuseScope for a request.
+"""KVCacheManagerV2 wrapper paths that look up cached prefixes on a localized manager.
 
-Every probe, prefetch and mirror creation must carry the request's locality
-domain, or the native manager rejects the scope (localized) and the lookup
-misses the domain-keyed blocks. The wrapper is driven as a bare instance over a
-real native manager in mock localization mode, with no model.
+Prefixes are shared across locality domains, so a request on either domain sees a
+prefix cached on the other, and placement follows the domain holding the prefix's
+pages. The wrapper is driven as a bare instance over a real native manager in mock
+localization mode, with no model.
 """
 
 import gc
@@ -127,10 +127,11 @@ def _bare_wrapper(impl) -> KVCacheManagerV2:
     wrapper.tokens_per_block = impl.tokens_per_block
     wrapper._next_locality_domain = 0
     wrapper._locality_domain_load = [0, 0]
+    wrapper._locality_domain_pending = [0, 0]
     return wrapper
 
 
-class TestWrapperScopesCarryTheDomain(unittest.TestCase):
+class TestWrapperOnALocalizedManager(unittest.TestCase):
     def setUp(self) -> None:
         init_cuda_once()
         gc.collect()
@@ -143,7 +144,7 @@ class TestWrapperScopesCarryTheDomain(unittest.TestCase):
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
             native = self.impl._impl.create_kv_cache(
-                ReuseScope(locality_domain_id=0), self.tokens[:-1]
+                ReuseScope(), self.tokens[:-1], locality_domain_id=0
             )
             self.assertTrue(native.resume(stream))
             self.assertTrue(native.resize(128))
@@ -156,19 +157,16 @@ class TestWrapperScopesCarryTheDomain(unittest.TestCase):
         gc.enable()
         self.impl._impl.shutdown()
 
-    def test_probe_context_reuse_sees_only_its_domain(self) -> None:
-        self.assertGreater(self.wrapper.probe_context_reuse(_request(1, 0)), 0)
-        self.assertEqual(self.wrapper.probe_context_reuse(_request(2, 1)), 0)
-        self.assertEqual([s.locality_domain_id for s in self.impl.scopes], [0, 1])
+    def test_probe_context_reuse_sees_the_prefix_from_either_domain(self) -> None:
+        on_domain_0 = self.wrapper.probe_context_reuse(_request(1, 0))
+        self.assertGreater(on_domain_0, 0)
+        self.assertEqual(self.wrapper.probe_context_reuse(_request(2, 1)), on_domain_0)
 
-    def test_probe_prefix_match_length_takes_the_best_domain(self) -> None:
-        match = self.wrapper.probe_prefix_match_length(self.tokens[:-1])
-        self.assertGreater(match, 0)
-        self.assertEqual(sorted(s.locality_domain_id for s in self.impl.scopes), [0, 1])
-
-    def test_probe_first_new_block_key_uses_the_domain(self) -> None:
-        self.wrapper.probe_first_new_block_key(_request(3, 1))
-        self.assertEqual([s.locality_domain_id for s in self.impl.scopes], [1])
+    def test_probe_prefix_match_length_sees_the_whole_prefix(self) -> None:
+        self.assertEqual(
+            self.wrapper.probe_prefix_match_length(self.tokens[:-1]),
+            self.wrapper.probe_context_reuse(_request(3, 1)),
+        )
 
     def test_placement_sends_a_request_to_the_domain_holding_its_prefix(self) -> None:
         # Round-robin would start at domain 0, so place another request first to move it to 1.
@@ -176,9 +174,9 @@ class TestWrapperScopesCarryTheDomain(unittest.TestCase):
         self.assertEqual(self.wrapper.pick_locality_domain(self.tokens), 0)
         self.assertEqual(self.wrapper.pick_locality_domain([10**6 + t for t in self.tokens]), 1)
 
-    def test_prefetch_builds_a_domain_scope(self) -> None:
+    def test_prefetch_takes_requests_on_either_domain(self) -> None:
         self.wrapper.prefetch_for_context_tokens([_request(4, 1), _request(5, 0)])
-        self.assertEqual([s.locality_domain_id for s in self.impl.scopes], [1, 0])
+        self.assertEqual(self.impl.scopes, [ReuseScope(), ReuseScope()])
 
 
 if __name__ == "__main__":

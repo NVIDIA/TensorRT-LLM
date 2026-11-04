@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers,
     DecoderInputPreparer,
     HostInputs,
+    HostLists,
     _get_context_prompt_lookahead_token,
     _zero_fill_row_spans,
 )
@@ -125,6 +126,42 @@ def test_input_preparer_without_config_keeps_confidence_disabled() -> None:
     assert inputs._dspark_device_windows is False
     assert inputs.previous_verify_lens is None
     assert inputs.has_previous_device_draft is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("chunked_prefill", [False, True])
+def test_pack_context_requests_orders_by_locality_domain(chunked_prefill: bool) -> None:
+    inputs = DecoderInputPreparer(
+        buffers=None,
+        config=None,
+        mapping=Mapping(),
+        dist=None,
+        model=None,
+        get_runtime_tokens_per_gen_step=None,
+        iter_states={},
+        lora=None,
+        use_beam_search=False,
+        steady_gen_cache_supported=True,
+        attention_runtime_features=AttentionRuntimeFeatures(chunked_prefill=chunked_prefill),
+    )
+    requests = [SimpleNamespace(py_locality_domain_id=1), SimpleNamespace(py_locality_domain_id=0)]
+    scheduled = Mock(num_context_requests=0, context_requests=[] if chunked_prefill else requests)
+    scheduled.reset_context_requests.side_effect = lambda _: setattr(
+        scheduled, "context_requests", []
+    )
+    host = SimpleNamespace(
+        lists=HostLists(),
+        extra_inputs=None,
+        context_prompt_lookahead=None,
+        locality_domain_reorder=True,
+    )
+
+    inputs._pack_context_requests(host, scheduled)
+
+    if chunked_prefill:
+        scheduled.reset_context_requests.assert_not_called()
+    else:
+        scheduled.reset_context_requests.assert_called_once_with([requests[1], requests[0]])
 
 
 @contextlib.contextmanager
