@@ -349,7 +349,6 @@ class SamplingParams:
     guided_decoding: Optional[GuidedDecodingParams] = None
     thinking_token_budget: Optional[int] = None
 
-    # Text watermarking. Python-only: consumed by the sampler, not forwarded to the C++ runtime.
     watermarking: Optional[bool] = None
 
     # Tokenizer-related configs
