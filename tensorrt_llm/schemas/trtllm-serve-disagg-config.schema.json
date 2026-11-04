@@ -570,7 +570,8 @@
         "HF",
         "MX",
         "mistral",
-        "mistral_large_3"
+        "mistral_large_3",
+        "mistral_large_4"
       ],
       "title": "CheckpointFormat",
       "type": "string"
@@ -4607,13 +4608,6 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
-        },
-        "spec_dec_variant": {
-          "default": 3,
-          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
-          "exclusiveMinimum": 0,
-          "title": "Spec Dec Variant",
-          "type": "integer"
         },
         "spec_dec_variant": {
           "default": 3,
