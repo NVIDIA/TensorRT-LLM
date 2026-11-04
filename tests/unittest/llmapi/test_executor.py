@@ -14,6 +14,7 @@ from queue import Empty, Queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import zmq
@@ -21,7 +22,8 @@ import zmq
 from tensorrt_llm._utils import mpi_world_size, nvtx_range_debug
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
+from tensorrt_llm.executor import (CompletionOutput,
+                                   DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
@@ -30,7 +32,7 @@ from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
-from tensorrt_llm.metrics import MetricNames
+from tensorrt_llm.metrics import MetricNames, RequestEventTiming
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -495,6 +497,48 @@ def test_handle_response_postproc_adds_prompt_tokens():
             num_generated_tokens=1))
     assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == 300
     assert result.metrics_dict[MetricNames.PROMPT_CACHE_CACHED_TOKENS] == 256
+
+
+def _int32_prompt_result(prompt_len: int):
+    request = GenerationRequest(
+        prompt_token_ids=np.arange(prompt_len, dtype=np.int32),
+        sampling_params=SamplingParams(max_tokens=4)).set_id(1)
+    return request, GenerationResult(request)
+
+
+def test_record_stats_counts_an_int32_prompt_without_a_list():
+    """PROMPT_TOKENS comes from the request's int32 prompt buffer.
+
+    A finished request's prompt-token count must not materialize the prompt
+    as a Python list (O(ISL) per request) when only its length is needed.
+    """
+    request, result = _int32_prompt_result(4096)
+    output = CompletionOutput(index=0,
+                              token_ids=[1, 2, 3, 4],
+                              finish_reason="length")
+    result.record_stats(
+        output, {
+            RequestEventTiming.ARRIVAL_TIME: 1.0,
+            RequestEventTiming.FIRST_SCHEDULED_TIME: 1.1,
+            RequestEventTiming.FIRST_TOKEN_TIME: 1.5,
+            RequestEventTiming.LAST_TOKEN_TIME: 2.0,
+        })
+    assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == 4096
+    assert request.__dict__["_prompt_token_ids"] is None
+
+
+def test_handle_response_postproc_counts_an_int32_prompt_without_a_list():
+    request, result = _int32_prompt_result(300)
+    result._handle_response(
+        PostprocWorker.Output(
+            client_id=1,
+            res="mock_sse_data",
+            is_final=True,
+            metrics={MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256},
+            finish_reason="length",
+            num_generated_tokens=1))
+    assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == 300
+    assert request.__dict__["_prompt_token_ids"] is None
 
 
 def _ZeroMqQueue_sync_sync_task(addr: str):

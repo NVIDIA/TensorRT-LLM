@@ -250,6 +250,19 @@ class GenerationRequest:
         # `_prompt_token_ids_i32`; base_worker assumes both forms stay synced.
         return ptids
 
+    @property
+    def prompt_len(self) -> int:
+        """Number of prompt tokens, read without materializing the lazy list.
+
+        Equals ``len(self.prompt_token_ids)``, but an int32-buffered prompt is
+        counted from its buffer, so callers that only need the count do not
+        pay the O(ISL) ``.tolist()``.
+        """
+        ptids = self.__dict__.get("_prompt_token_ids")
+        if ptids is None:
+            ptids = self.__dict__.get("_prompt_token_ids_i32")
+        return len(ptids) if ptids is not None else 0
+
     @prompt_token_ids.setter
     def prompt_token_ids(self, value):
         self._prompt_token_ids = value
