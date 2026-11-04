@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import sys
 import threading
 from collections import OrderedDict
@@ -266,7 +267,16 @@ SMEM_P4_PAGE_ID_PLAN_BYTES = SMEM_P4_PAGE_ID_PLAN_INTS * ctm.Int32.bytes
 SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS = 4
 SMEM_P4_RUNTIME_MASK_BOUND_WORD = 2
 SMEM_P4_RUNTIME_SCALE_PAIR_BYTES = SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS * ctm.Float32.bytes
-SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = _initial_float_from_argv("--lazy-anchor-threshold-log2", 1.0)
+# Lazy-anchor rebase threshold (log2): a tile rescales the running O accumulator ("correction") only when the row
+# maximum grew by more than this since the current anchor. Every rebase drains the PV pipeline of all warps (and of
+# the whole 4-CTA cluster in the 4x kernel). Measured 2026-11-01 (hecate0340, DS-R1 shapes, logits scaled x1..x32): with
+# the default 1.0 realistic logits (x4) cost the 4x kernel 18-19 % and the 2x kernel 2-6 %; 4.0 removes the stalls up to
+# x8 logits and 6.0 up to ~x16 with FP32 cosine unchanged (the P scale saturates only above ~6.5 log2 at kv_gs 89.6; 8.0
+# breaks accuracy). Default 4.0; TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2 overrides it and the --lazy-anchor-threshold-log2
+# argv flag of the bench tools overrides both.
+SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = _initial_float_from_argv(
+    "--lazy-anchor-threshold-log2", float(os.environ.get("TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2", "4.0"))
+)
 if not 0.0 <= SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 <= 8.0:
     raise ValueError(
         f"--lazy-anchor-threshold-log2 must be in [0, 8], got {SMEM_P4_LAZY_ANCHOR_REBASE_LOG2}"
