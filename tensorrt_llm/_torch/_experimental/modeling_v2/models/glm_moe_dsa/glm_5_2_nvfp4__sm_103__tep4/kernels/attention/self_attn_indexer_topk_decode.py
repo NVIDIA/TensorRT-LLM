@@ -33,7 +33,10 @@ also get cluster launchers (4..16 CTAs per row, chosen per call by the row count
 actual length: up to ``_CLUSTER_SPLIT_MIN`` columns cluster rank 0 runs the one-CTA
 schedule (the other ranks exit), longer rows take a sampled-threshold single
 collect pass across the cluster (~13-18 us at 160K), with the histogram split as
-the exact fallback. Same selected set and tie rule as the one-CTA kernel.
+the exact fallback. Same selected set and tie rule as the one-CTA kernel. The two
+common paths (a short row's fp16 step, a long row's guess) lead the cluster kernel's
+code and the rare ones follow: with cold instruction caches, code deep into the
+~300 KB kernel stalls on instruction fetch (``select_topk_row_head``).
 
 Programmatic Dependent Launch (opt-in, ``pdl=True`` on
 ``compile_indexer_topk_decode``): the launch carries the programmatic stream
@@ -318,9 +321,10 @@ def _make_decode_cluster_topk_class():
     one-CTA kernel's: the same ordering, the same thresholds, the same tie rule.
 
     Rows no longer than ``split_min`` (and rows at most ``top_k``) are selected by
-    rank 0 alone with the one-CTA schedule; the other ranks exit at once. A row
-    whose fp32 steps all overflow (more than ``candidate_capacity`` bit-identical
-    scores at the cut) is also left to rank 0's one-CTA schedule.
+    rank 0 alone with the one-CTA schedule (``select_topk_row_head``, rerun whole
+    when its step 0 overflows); the other ranks exit at once. A row whose fp32 steps
+    all overflow (more than ``candidate_capacity`` bit-identical scores at the cut)
+    is also left to rank 0's one-CTA schedule.
     """
 
     prefill_cls = _histogram._make_prefill_histogram_topk_class()
@@ -331,6 +335,128 @@ def _make_decode_cluster_topk_class():
         pdl: bool = False
         cluster: int = 2
         split_min: int = _CLUSTER_SPLIT_MIN
+
+        # --------------------------------------------------------------
+        # Short rows: the one-CTA schedule's common case, laid out first
+        # --------------------------------------------------------------
+        @cute.jit
+        def select_topk_row_head(
+            self,
+            score,
+            length,
+            dst,
+            s_histogram,
+            s_output,
+            s_cand_vals,
+            s_cand_idx,
+            s_threshold_bin,
+            s_cand_count,
+            s_final_bin_size,
+            s_found_topk,
+            s_found_threshold,
+            s_pattern,
+            s_warp_sums,
+            s_sort_keys,
+            tidx,
+        ):
+            """Step 0 of ``select_topk_row`` (the common case of a short row): rows at most
+            ``top_k`` written whole, longer ones left as the fp16 bin's candidate list for
+            ``finish_candidates``.
+
+            Returns True (CTA-uniformly) when step 0 overflows the candidate capacity;
+            then nothing has been written and the caller reruns ``select_topk_row``. Kept
+            apart from the steps 1..3 / tied-scan code, the code both common paths run
+            (this, the guess path and their shared tail) leads the kernel: with cold
+            instruction caches (a served layer between calls) the one-CTA schedule placed
+            ~200 KB into the kernel stalled on instruction fetch, +3.7 us per call.
+            """
+
+            top_k = cutlass.const_expr(self.top_k)
+            num_threads = cutlass.const_expr(self.num_threads_per_cta)
+
+            overflow = cutlass.Boolean(False)
+            if length <= cutlass.Int32(top_k):
+                i = tidx
+                while i < length:
+                    dst[i] = i
+                    i = i + cutlass.Int32(num_threads)
+                i = length + tidx
+                while i < cutlass.Int32(top_k):
+                    dst[i] = cutlass.Int32(-1)
+                    i = i + cutlass.Int32(num_threads)
+            else:
+                if tidx == 0:
+                    s_pattern[0] = cutlass.Uint32(0)
+                    s_found_topk[0] = cutlass.Int32(0)
+                    s_cand_count[0] = cutlass.Int32(0)
+                cute.arch.barrier()
+                overflow = self.process_step(
+                    score,
+                    cutlass.Int32(0),
+                    length,
+                    s_histogram,
+                    s_output,
+                    s_cand_vals,
+                    s_cand_idx,
+                    s_threshold_bin,
+                    s_cand_count,
+                    s_final_bin_size,
+                    s_found_topk,
+                    s_found_threshold,
+                    s_pattern,
+                    s_warp_sums,
+                    tidx,
+                    STEP=0,
+                )
+            return overflow
+
+        @cute.jit
+        def finish_candidates(
+            self,
+            dst,
+            s_histogram,
+            s_output,
+            s_cand_vals,
+            s_cand_idx,
+            s_threshold_bin,
+            s_cand_count,
+            s_final_bin_size,
+            s_found_topk,
+            s_found_threshold,
+            s_warp_sums,
+            s_sort_keys,
+            tidx,
+        ):
+            """The tail both common paths share (one copy of its code): the exact top
+            ``top_k - found`` of the SMEM candidate list into ``s_output[found:]`` (rank
+            sort, or the radix refine above ``refine_cutoff`` candidates), then
+            ``s_output`` to ``dst``. The list is ``select_topk_row_head``'s fp16 bin or
+            ``select_topk_row_guess``'s narrowed one (rank 0)."""
+
+            top_k = cutlass.const_expr(self.top_k)
+            num_threads = cutlass.const_expr(self.num_threads_per_cta)
+            if s_cand_count[0] <= cutlass.Int32(self.refine_cutoff):
+                self.sort_final_candidates(
+                    s_output, s_cand_vals, s_cand_idx, s_cand_count, s_sort_keys, s_found_topk,
+                    tidx,
+                )  # fmt: skip
+            else:
+                # Poison the slots the refine still has to fill (a slot it never
+                # writes surfaces as -1); [0, found) holds emitted columns.
+                i = s_found_topk[0] + tidx
+                while i < cutlass.Int32(top_k):
+                    s_output[i] = cutlass.Int32(-1)
+                    i = i + cutlass.Int32(num_threads)
+                cute.arch.barrier()
+                self.refine_candidates(
+                    s_histogram, s_output, s_cand_vals, s_cand_idx, s_cand_count,
+                    s_threshold_bin, s_final_bin_size, s_found_topk, s_found_threshold,
+                    s_warp_sums, tidx, cutlass.Int32(0),
+                )  # fmt: skip
+            i = tidx
+            while i < cutlass.Int32(top_k):
+                dst[i] = s_output[i]
+                i = i + cutlass.Int32(num_threads)
 
         # --------------------------------------------------------------
         # One radix step over this CTA's chunk
@@ -616,16 +742,16 @@ def _make_decode_cluster_topk_class():
             s_sort_keys,
             tidx,
         ):
-            """Exact top-k of the SMEM candidate list (``s_cand_count[0]`` entries) into
-            ``s_output``.
+            """Narrow the SMEM candidate list (``s_cand_count[0]`` entries) toward its exact
+            top-k: winners into ``s_output``, the survivors left for ``finish_candidates``.
 
             Rounds of a 2048-bin equal-width histogram over a key window ``[lo, lo + 2048 <<
             shift)``: the first window is the list's own key range; each round emits the bins
             below the threshold bin for ``top_k - found``, compacts the threshold bin to the
             list front and, while it holds more than ``refine_cutoff`` entries, narrows the
             window to that bin (``shift`` drops by 11 bits, so at most three rounds reach
-            single keys). The survivors take the rank sort (ties to the lower column), or the
-            column-digit radix refine above ``refine_cutoff`` bit-identical keys. One window
+            single keys). The survivors then take the rank sort (ties to the lower column), or
+            the column-digit radix refine above ``refine_cutoff`` bit-identical keys. One window
             over [kmin, kmax] alone is too coarse on served logits: with the k-th score
             negative and positive outliers in the list, the ordered keys span the sign
             boundary and most of the list falls into one bin.
@@ -702,17 +828,6 @@ def _make_decode_cluster_topk_class():
                         shift = shift - cutlass.Uint32(11)
                     else:
                         shift = cutlass.Uint32(0)
-            if count <= cutlass.Int32(cutoff):
-                self.sort_final_candidates(
-                    s_output, s_cand_vals, s_cand_idx, s_cand_count, s_sort_keys, s_found_topk,
-                    tidx,
-                )  # fmt: skip
-            else:
-                self.refine_candidates(
-                    s_histogram, s_output, s_cand_vals, s_cand_idx, s_cand_count,
-                    s_threshold_bin, s_final_bin_size, s_found_topk, s_found_threshold,
-                    s_warp_sums, tidx, cutlass.Int32(0),
-                )  # fmt: skip
 
         @cute.jit
         def select_topk_row_guess(
@@ -744,9 +859,10 @@ def _make_decode_cluster_topk_class():
             ``<= tau`` into its own list; the peers then push theirs into rank 0's list
             (a range reserved with one DSMEM atomic each). If the cluster collected between
             ``top_k`` and ``candidate_capacity`` columns, they include the row's top-k
-            (every column left out scores below every collected one), and rank 0 resolves
-            the exact top-k of its list (``resolve_list``). Otherwise nothing has been
-            written and the caller runs the histogram split.
+            (every column left out scores below every collected one), and rank 0 narrows
+            its list (``resolve_list``); the caller finishes it on rank 0
+            (``finish_candidates``). Otherwise nothing has been written and the caller runs
+            the histogram split.
             """
 
             num_threads = cutlass.const_expr(self.num_threads_per_cta)
@@ -899,10 +1015,6 @@ def _make_decode_cluster_topk_class():
                     s_sort_keys,
                     tidx,
                 )
-                i = tidx
-                while i < cutlass.Int32(top_k):
-                    dst[i] = s_output[i]
-                    i = i + cutlass.Int32(num_threads)
             prims.barrier_cluster_wait()
             return not hit
 
@@ -1191,9 +1303,14 @@ def _make_decode_cluster_topk_class():
             if cutlass.const_expr(self.pdl):
                 cute.arch.griddepcontrol_wait()
 
-            # Cluster-uniform: every rank of the cluster sees the same row length.
+            # Cluster-uniform: every rank of the cluster sees the same row length. Code
+            # order is the point: the two common paths (long rows' guess, short rows'
+            # step 0) and their shared tail first, the rare ones (the split, a rerun of
+            # the whole one-CTA schedule) after; see ``select_topk_row_head``.
             solo = length <= cutlass.Int32(self.split_min)
             fallback = cutlass.Boolean(False)
+            rerun = cutlass.Boolean(False)
+            tail = cutlass.Boolean(False)
             if not solo:
                 fallback = self.select_topk_row_guess(
                     score,
@@ -1214,8 +1331,46 @@ def _make_decode_cluster_topk_class():
                     s_total,
                     tidx,
                 )
+                tail = (not fallback) & (rank == cutlass.Int32(0))
+            else:
+                if rank == cutlass.Int32(0):
+                    rerun = self.select_topk_row_head(
+                        score,
+                        length,
+                        dst,
+                        s_histogram,
+                        s_output,
+                        s_cand_vals,
+                        s_cand_idx,
+                        s_threshold_bin,
+                        s_cand_count,
+                        s_final_bin_size,
+                        s_found_topk,
+                        s_found_threshold,
+                        s_pattern,
+                        s_warp_sums,
+                        s_sort_keys,
+                        tidx,
+                    )
+                    tail = (not rerun) & (length > cutlass.Int32(self.top_k))
+            if tail:
+                self.finish_candidates(
+                    dst,
+                    s_histogram,
+                    s_output,
+                    s_cand_vals,
+                    s_cand_idx,
+                    s_threshold_bin,
+                    s_cand_count,
+                    s_final_bin_size,
+                    s_found_topk,
+                    s_found_threshold,
+                    s_warp_sums,
+                    s_sort_keys,
+                    tidx,
+                )
             if fallback:
-                solo = self.select_topk_row_cluster(
+                rerun = self.select_topk_row_cluster(
                     score,
                     length,
                     dst,
@@ -1235,7 +1390,7 @@ def _make_decode_cluster_topk_class():
                     s_sort_keys,
                     tidx,
                 )
-            if solo:
+            if rerun:
                 if rank == cutlass.Int32(0):
                     self.select_topk_row(
                         score,

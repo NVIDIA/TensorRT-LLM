@@ -94,6 +94,9 @@ CASES = [
     (1, [200000], "levels64"),
     # ~28000 tied at the cut (> the candidate capacity): every step overflows.
     (2, [200000, 40000], "levels7"),
+    # Short rows with ~5000 tied at the cut: rank 0's step 0 overflows, the whole one-CTA
+    # schedule reruns (down to its tied-column scan).
+    (2, [kernel._CLUSTER_SPLIT_MIN, 9000], "levels3"),
 ]
 
 
