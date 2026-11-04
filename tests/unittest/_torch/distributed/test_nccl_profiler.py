@@ -320,6 +320,7 @@ def test_nccl_enabled_uses_cached_startup_selection(
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", profiler._load_custom_regions())
     # The test expectation must follow the same immutable selection as the probes.
     monkeypatch.setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none" if selected else "nccl")
+    assert profiler.custom_region_enabled("nccl") is selected
     assert _enabled() is (BuildInfo.ENABLE_NCCL_PROFILING and selected)
 
 
