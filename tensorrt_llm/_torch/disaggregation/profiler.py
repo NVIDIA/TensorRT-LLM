@@ -359,7 +359,10 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         for req in result.cancelled_requests:
             record = self._records.get((id(req), "receive"))
             if record is not None:
-                self._finish(record, "cancelled")
+                self._finish(
+                    record,
+                    "failed" if req.state == LlmRequestState.DISAGG_TRANS_ERROR else "cancelled",
+                )
         for status_ids, outcome in (
             (result.completed_request_ids, "complete"),
             (result.error_request_ids, "failed"),
@@ -389,7 +392,13 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             for direction in directions:
                 record = self._records.get((id(req), direction))
                 if record is not None:
-                    self._finish(record, "cancelled")
+                    self._finish(
+                        record,
+                        "failed"
+                        if direction == "receive"
+                        and req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                        else "cancelled",
+                    )
         return cancelled
 
     def prepare_context_requests(self, requests: list[LlmRequest]) -> None:

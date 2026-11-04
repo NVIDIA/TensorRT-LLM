@@ -27,6 +27,7 @@ from profiler_test_utils import decode_profiler_metadata
 
 from tensorrt_llm import _profiler
 from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as factory
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     BindKvCacheTransceiver,
     CtxTransferStatus,
@@ -243,8 +244,9 @@ def test_cpp_void_receive_is_observed_from_request_mutation(
     assert not wrapper._records
 
 
+@pytest.mark.parametrize("failed", [False, True])
 def test_cancellation_false_keeps_observation_until_safe_true(
-    monkeypatch: pytest.MonkeyPatch, events: list
+    monkeypatch: pytest.MonkeyPatch, events: list, failed: bool
 ) -> None:
     backend = _ScriptedTransceiver()
     wrapper = _wrap(backend, monkeypatch)
@@ -253,9 +255,74 @@ def test_cancellation_false_keeps_observation_until_safe_true(
     assert wrapper.cancel_request(req) is False
     assert wrapper.cancel_request(req) is False
     assert len(events) == 1 and id(req) in backend.observed
+    if failed:
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
     assert wrapper.cancel_request(req) is True
     assert events[-1][0] == "trtllm::kv_transfer_cancelled"
     assert not wrapper._records and not backend.observed
+
+
+def test_v2_failed_receive_safe_cancellation_preserves_failure(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    owner = object.__new__(KvCacheTransceiverV2)
+    owner._fp4_mla_bridge_enabled = True
+    owner._wait_reqs = {}
+    owner._send_sessions = {}
+    owner._recv_sessions = {}
+    owner._recv_reqs = {}
+    monkeypatch.setattr(
+        owner,
+        "request_and_receive_async",
+        lambda request: setattr(
+            request, "state", LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        ),
+    )
+    wrapper = _wrap(owner, monkeypatch)
+    req = _request()
+    wrapper.request_and_receive_async(req)
+    session = Mock(status=SessionStatus.ERROR)
+    session.has_transferring_tasks.return_value = False
+    session.close.return_value = True
+    owner._recv_sessions[17] = session
+    owner._recv_reqs[17] = req
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert wrapper.has_inflight_transfer(req)
+
+    assert wrapper.cancel_request(req) is True
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert not wrapper.has_inflight_transfer(req)
+    assert wrapper.cancel_request(req) is True
+    session.cancel.assert_called_once_with()
+    session.close.assert_called_once_with()
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_failed",
+    ]
+    assert events[0][1] is events[1][1]
+    assert not wrapper._records
+
+
+def test_cancelled_receive_status_preserves_existing_failure_once(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    backend = FakeKvCacheTransceiver()
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    wrapper.request_and_receive_async(req)
+    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    backend.finish_recv(req, "cancel")
+
+    assert wrapper.check_gen_transfer_status(0) == GenTransferStatus([], [], [req])
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert wrapper.check_gen_transfer_status(0) == GenTransferStatus([], [], [])
+    assert wrapper.cancel_request(req) is True
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_failed",
+    ]
+    assert events[0][1] is events[1][1]
+    assert not wrapper._records
 
 
 def test_precise_owner_outcome_overrides_ambiguous_bridge_error(
