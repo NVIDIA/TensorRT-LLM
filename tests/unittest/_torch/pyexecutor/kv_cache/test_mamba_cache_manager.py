@@ -9543,3 +9543,49 @@ def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain():
         assert mgr.mixed_precision_high_layers == {1: 3}
     finally:
         mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_beside_private_mamba2_replay():
+    """Mixed-precision KV with MTP replay, whose PRIVATE buffers split each recurrent layer across two groups.
+
+    The mixed-precision page tables and the disaggregated layer ids resolve groups per buffer.
+    """
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import _compute_global_layer_ids
+
+    mgr = _build_v2_mamba2_replay_manager(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+    )
+    try:
+        replay_group = mgr.replay_layer_group_id
+        assert replay_group is not None and replay_group != mgr.ssm_layer_group_id
+        with pytest.raises(RuntimeError, match="layer groups"):
+            mgr.impl.get_layer_group_id(LayerId(0))
+        # Layers 0 and 1: recurrent state, layer 2: attention, layer 3: its mixed-precision high layer.
+        assert mgr.mixed_precision_high_layers == {2: 3}
+        low_group, high_group = (group for group, _ in mgr.mixed_precision_page_table_key(2))
+        assert len({low_group, high_group, mgr.ssm_layer_group_id, replay_group}) == 4
+
+        mgr.add_dummy_requests([123], token_nums=[128], is_gen=False)
+        low_pages, high_pages = mgr.get_mixed_precision_page_tables([123], 2)
+        # The MTP draft tokens extend the dummy request past its 128 tokens.
+        num_blocks = mgr.kv_cache_map[123].num_blocks
+        assert len(low_pages[0]) == len(high_pages[0]) == num_blocks >= 4
+        assert min(low_pages[0]) >= 0
+        assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
+        assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
+
+        # Model layer L -> 2L, the mixed-precision high layer of layer L -> 2L + 1. The PRIVATE
+        # group names the recurrent layers it splits once each.
+        assert sorted(_compute_global_layer_ids(mgr, replay_group)) == [0, 2]
+        ids = {}
+        for group, layer_ids in enumerate(mgr._layer_ids_by_group):
+            ids.update(zip(layer_ids, _compute_global_layer_ids(mgr, group)))
+        assert ids == {0: 0, 1: 2, 2: 4, 3: 5}
+    finally:
+        mgr.shutdown()

@@ -4206,7 +4206,7 @@ class KVCacheManagerV2(BaseResourceManager):
             int(high_layer): 2 * int(self.pp_layers[local]) + 1
             for local, high_layer in self.mixed_precision_high_layers.items()
         }
-        layer_ids = [int(layer_id) for layer_id in self.impl.layer_grouping[layer_group_id]]
+        layer_ids = self._layer_ids_by_group[layer_group_id]
         virtual = getattr(self, "_layer_attn_to_layer_id", None)
         if virtual:
             # The disaggregation extractor's encoding: model layer x attention types + attention type.
@@ -4261,7 +4261,7 @@ class KVCacheManagerV2(BaseResourceManager):
         local = self.layer_offsets[layer_idx]
         return tuple(
             (
-                int(self.impl.get_layer_group_id(layer)),
+                int(self.impl.get_buffer_group_id(layer, Role.KEY)),
                 int(self.impl.get_page_index_converter(layer, Role.KEY).scale),
             )
             for layer in (local, self.mixed_precision_high_layers[local])
