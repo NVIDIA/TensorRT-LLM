@@ -1910,12 +1910,12 @@ class SpecWorkerBase(nn.Module, ABC):
         A worker whose acceptance reads another layout overrides this. If its
         ``forward`` then returns this TP rank's vocabulary shard as
         ``"logits"``, it also returns ``"logits_vocab_shard": True``, and the
-        engine gathers the logits (on every TP rank together, so not under
-        attention DP) before any logits post-processor sees them; the
-        post-processors get a read-only view, since the acceptance already
-        ran inside ``forward``. Such a worker applies a guided decoder's
-        bitmask to its shard at the shard's column offset, or rejects guided
-        decoding.
+        engine gathers the logits over the LM head's TP group (whose ranks
+        must schedule the same requests) before any logits post-processor
+        sees them; the post-processors get a read-only view, since the
+        acceptance already ran inside ``forward``. Such a worker applies a
+        guided decoder's bitmask to its shard at the shard's column offset, or
+        rejects guided decoding.
         """
         return logits_processor.forward(hidden_states, lm_head, attn_metadata,
                                         True)
