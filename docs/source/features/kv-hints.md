@@ -90,7 +90,7 @@ or non-object action payload, discard the entire envelope and count reason
 `malformed`. Non-object hint values and non-JSON Python values follow the same
 policy. Admission does not salvage individual actions from an invalid envelope.
 Accepted envelopes must also fit the proxy's MessagePack transport. Admission
-discards an envelope if any integer in its payload or extra metadata is outside
+discards an envelope if any integer in its payload is outside
 the range `-2**63` through `2**64 - 1`, inclusive, and counts it as `malformed`.
 Admission checks the validated model and its MessagePack encoding without an
 extra JSON decoding pass. Nested metadata that fits the schema, byte budget
@@ -105,7 +105,7 @@ starting from the request's first block. With typical decimal `u64` hashes, a
 single-action envelope with short metadata holds about **3,100–3,200 hashes**,
 or roughly **100,000 tokens of represented prefix at 32 tokens per block**.
 This is an estimate, not a fixed token limit. Hash values, identifiers, endpoint
-length, extra metadata and additional actions affect the available capacity.
+length, provider payload data and additional actions affect the available capacity.
 
 The size limit bounds the represented cache prefix, not the total prompt length.
 A longer prompt can still carry a shorter reusable-prefix hint. If an envelope
@@ -127,11 +127,14 @@ preserve this representation across tensor/context and pipeline parallel ranks
 and on child requests; `LlmRequest.py_kv_hints` holds the admitted envelope.
 
 Public Python and HTTP inputs still use the existing JSON/Pydantic schema.
-Unknown action types/versions and optional JSON metadata remain intact. The
-runtime keeps optional envelope/action metadata separately from the protocol
-fields. `snapshot.envelope()` returns an independent public model with that
-metadata restored; `snapshot.wire_json` renders its JSON on demand. JSON bytes
-are not stored in the queued snapshot or decoded again by request transport.
+The envelope and each action carry only the defined protocol fields. Unknown
+envelope/action fields are ignored at admission; unknown action types/versions
+and all JSON data inside `payload` are preserved. Provider-specific metadata
+belongs inside `payload`. Direct JSON and MessagePack encoding of the snapshot
+uses the same field layout as the public envelope. `snapshot.envelope()` returns
+an independent public model; `snapshot.wire_json` renders its JSON on demand.
+JSON bytes are not stored in the queued snapshot or decoded again by request
+transport.
 
 HTTP request text representations omit `kv_hints`, including when a request is
 formatted in an error log. JSON serialization and proxy forwarding retain the
@@ -161,9 +164,9 @@ matching actions produce no candidates.
 
 Candidates share the immutable admitted envelope and retain their action
 positions. When a consumer needs one candidate, it can obtain an immutable
-one-action envelope. This preserves the envelope protocol, message identifier,
-extra metadata and complete action, including its identifier, version and opaque
-payload, without copying envelope metadata for every retained candidate.
+one-action envelope. This preserves the envelope protocol, message identifier
+and complete action, including its identifier, version and opaque payload,
+without copying envelope metadata for every retained candidate.
 
 The helper reports separate counts for unknown action types and fetch actions
 with no matching version. Each action is counted once, regardless of the number

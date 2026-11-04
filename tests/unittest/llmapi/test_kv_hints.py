@@ -102,8 +102,8 @@ def test_msgspec_request_transport_and_selection_need_no_json_conversion() -> No
     )
 
     wire = _wire()
-    wire["producer_metadata"] = {"trace": ["router"]}
-    wire["actions"][0]["action_metadata"] = {"trace": ["source"]}
+    wire["actions"][0]["payload"]["provider_metadata"] = {"trace": ["router"]}
+    wire["actions"][0]["payload"]["_extra"] = {"trace": ["source"]}
     request = _request(KvHintsEnvelope.model_validate(wire))
     with (
         patch.object(KvHintsEnvelope, "model_validate_json", side_effect=AssertionError("decoded")),
@@ -130,9 +130,9 @@ def test_msgspec_request_transport_and_selection_need_no_json_conversion() -> No
         with pytest.raises(TypeError, match="immutable"):
             selected.actions.clear()
         with pytest.raises(TypeError, match="immutable"):
-            selected._extra["producer_metadata"]["trace"].append("changed")
+            selected.actions[0].payload["provider_metadata"]["trace"].append("changed")
         with pytest.raises(TypeError, match="immutable"):
-            selected.actions[0]._extra["action_metadata"]["trace"].append("changed")
+            selected.actions[0].payload["_extra"]["trace"].append("changed")
     assert selected.envelope().model_dump(mode="json") == dict(wire, actions=wire["actions"][:1])
 
 
@@ -184,25 +184,40 @@ def test_wire_round_trip_preserves_unknown_actions_and_json() -> None:
     assert json.loads(envelope.model_dump_json()) == _wire()
 
 
-def test_optional_metadata_survives_admission_without_a_version_change() -> None:
-    """Unknown envelope and action metadata remain JSON-valid and immutable."""
-    wire = _wire()
+@pytest.mark.parametrize("typed", [False, True])
+def test_admission_keeps_only_protocol_fields(typed: bool) -> None:
+    """Public and admitted wire shapes match, with provider data kept in payload."""
+    expected = _wire()
+    expected["actions"][0]["payload"]["_extra"] = {"trace": ["provider"]}
+    wire = json.loads(json.dumps(expected))
     wire["producer_metadata"] = {"trace": ["router-a", 7]}
+    wire["_extra"] = {"legacy": True}
     wire["actions"][0]["optional_metadata"] = {"future": True}
-    hints = KvHintsEnvelope.model_validate(wire)
+    wire["actions"][0]["_extra"] = ["legacy"]
+    hints = KvHintsEnvelope.model_validate(wire) if typed else wire
+    public = KvHintsEnvelope.model_validate(hints)
+    assert public.model_dump(mode="json") == expected
     request = _request(hints)
-    assert request.kv_hints.envelope().model_dump() == wire
-    hints.__pydantic_extra__["producer_metadata"]["trace"].append("mutated")
-    assert request.kv_hints.envelope().model_dump() == wire
+    snapshot = request.kv_hints
+    assert snapshot.envelope().model_dump(mode="json") == expected
+    assert set(msgspec.to_builtins(snapshot)) == {"protocol_version", "message_id", "actions"}
+    assert set(msgspec.to_builtins(snapshot.actions[0])) == {
+        "action_id",
+        "action_type",
+        "action_version",
+        "payload",
+    }
+    for codec in (msgspec.json, msgspec.msgpack):
+        assert codec.decode(codec.encode(snapshot)) == public.model_dump(mode="json")
+    wire["actions"][0]["payload"]["_extra"]["trace"].append("mutated")
+    assert snapshot.envelope().model_dump(mode="json") == expected
 
 
-@pytest.mark.parametrize("action_level", [False, True])
 @pytest.mark.parametrize("invalid", [float("nan"), object()])
-def test_optional_metadata_must_remain_json(action_level: bool, invalid: object) -> None:
-    """Forward-compatible metadata cannot carry non-JSON Python objects."""
+def test_provider_payload_must_remain_json(invalid: object) -> None:
+    """Opaque provider payloads cannot carry non-JSON Python objects."""
     wire = _wire()
-    target = wire["actions"][0] if action_level else wire
-    target["optional_metadata"] = {"nested": invalid}
+    wire["actions"][0]["payload"]["provider_metadata"] = {"nested": invalid}
     with pytest.raises(ValidationError):
         KvHintsEnvelope.model_validate(wire)
     with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
@@ -269,7 +284,6 @@ def test_non_json_raw_hints_are_ignored_before_admission(invalid_json: str) -> N
 
 
 @pytest.mark.parametrize("typed", [False, True])
-@pytest.mark.parametrize("location", ["payload", "envelope_extra", "action_extra"])
 @pytest.mark.parametrize(
     ("value", "accepted"),
     [
@@ -281,19 +295,12 @@ def test_non_json_raw_hints_are_ignored_before_admission(invalid_json: str) -> N
         (2**64, False),
     ],
 )
-def test_admission_enforces_msgpack_integer_bounds(
-    typed: bool, location: str, value: int, accepted: bool
-) -> None:
+def test_admission_enforces_msgpack_integer_bounds(typed: bool, value: int, accepted: bool) -> None:
     """Admitted opaque JSON values must survive the proxy's MessagePack transport."""
     import msgspec
 
     wire = _wire()
-    targets = {
-        "payload": wire["actions"][0]["payload"],
-        "envelope_extra": wire,
-        "action_extra": wire["actions"][0],
-    }
-    targets[location]["nested"] = {"items": [value]}
+    wire["actions"][0]["payload"]["nested"] = {"items": [value]}
     hints = KvHintsEnvelope.model_validate(wire) if typed else wire
     with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
         request = _request(hints)
@@ -378,22 +385,16 @@ def test_http_request_repr_omits_hints_without_changing_transport(
 
 @pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize("container_kind", ["dict", "list"])
-@pytest.mark.parametrize("location", ["payload", "envelope_extra", "action_extra"])
 @pytest.mark.parametrize("depth", [32, 200])
 def test_admission_accepts_nested_metadata_supported_by_msgspec(
-    typed: bool, container_kind: str, location: str, depth: int
+    typed: bool, container_kind: str, depth: int
 ) -> None:
     """Valid metadata need not pass an unused JSON decoder before binary transport."""
     nested: JsonValue = "leaf"
     for _ in range(depth):
         nested = {"child": nested} if container_kind == "dict" else [nested]
     wire = _wire()
-    targets = {
-        "payload": wire["actions"][0]["payload"],
-        "envelope_extra": wire,
-        "action_extra": wire["actions"][0],
-    }
-    targets[location]["nested"] = nested
+    wire["actions"][0]["payload"]["nested"] = nested
     envelope = KvHintsEnvelope.model_validate(wire)
     wire_json = envelope.model_dump_json().encode("utf-8")
     assert len(wire_json) < MAX_KV_HINTS_BYTES

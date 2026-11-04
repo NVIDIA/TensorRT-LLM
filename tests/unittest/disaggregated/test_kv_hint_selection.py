@@ -44,9 +44,9 @@ def test_candidates_preserve_order_metadata_and_duplicate_action_ids() -> None:
     """Each supported action keeps its position and metadata, even when IDs repeat."""
     wire = _wire()
     first = wire["actions"][0]
-    first["optional_field"] = {"keep": [1, 2]}
+    first["payload"]["optional_field"] = {"keep": [1, 2]}
     later = dict(first, payload={"block_hashes": [33], "source_control_endpoint": "opaque"})
-    wire["producer_metadata"] = {"trace": ["router"]}
+    wire["actions"][0]["payload"]["provider_metadata"] = {"trace": ["router"]}
     wire["actions"] = [wire["actions"][1], first, later]
     snapshot = snapshot_kv_hints(wire)
     capabilities = {"store": frozenset({("kv.fetch", "1.0")})}
@@ -150,7 +150,7 @@ def test_absent_or_unknown_only_envelope_produces_no_candidates() -> None:
 def test_candidates_do_not_expose_mutable_input_or_result_state() -> None:
     """Caller changes and decoded-envelope changes cannot alter retained candidates."""
     wire = _wire()
-    wire["producer_metadata"] = {"trace": ["router"]}
+    wire["actions"][0]["payload"]["provider_metadata"] = {"trace": ["router"]}
     snapshot = snapshot_kv_hints(wire)
     capabilities = {"store": frozenset({("kv.fetch", "1.0")})}
     result = _collect_kv_fetch_candidates(snapshot, family_capabilities=capabilities)
@@ -158,11 +158,11 @@ def test_candidates_do_not_expose_mutable_input_or_result_state() -> None:
     expected = candidate.snapshot().envelope().model_dump()
 
     capabilities.clear()
-    wire["producer_metadata"]["trace"].clear()
+    wire["actions"][0]["payload"]["provider_metadata"]["trace"].clear()
     wire["actions"][0]["payload"].clear()
     decoded = candidate.snapshot().envelope()
+    decoded.actions[0].payload["provider_metadata"]["trace"].clear()
     decoded.actions[0].payload.clear()
-    decoded.__pydantic_extra__["producer_metadata"]["trace"].clear()
 
     assert candidate.families == frozenset({"store"})
     assert candidate.snapshot().envelope().model_dump() == expected
@@ -198,7 +198,7 @@ def test_collection_does_not_validate_payloads_or_choose_an_action() -> None:
 def test_collection_does_not_copy_large_envelope_metadata_per_candidate() -> None:
     """Retaining many candidates must not multiply the envelope's shared metadata."""
     wire = _wire()
-    wire["producer_metadata"] = {"padding": "x" * 32_000}
+    wire["message_id"] = "x" * 32_000
     fetch = dict(wire["actions"][0], payload={})
     wire["actions"] = [dict(fetch, action_id=str(index)) for index in range(200)]
     snapshot = snapshot_kv_hints(wire)
@@ -220,5 +220,5 @@ def test_collection_does_not_copy_large_envelope_metadata_per_candidate() -> Non
     # Eagerly copying 32 KB of metadata for 200 candidates retains over 6 MB.
     assert retained - before < 2 * 1024 * 1024
     selected = result.candidates[0].snapshot().envelope()
-    assert selected.__pydantic_extra__["producer_metadata"] == wire["producer_metadata"]
+    assert selected.message_id == wire["message_id"]
     assert len(selected.actions) == 1

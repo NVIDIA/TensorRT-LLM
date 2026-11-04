@@ -31,8 +31,7 @@ _SUPPORTED_PROTOCOL_VERSION = "0.1"
 class KvHintAction(BaseModel):
     """One producer-versioned action carried without interpreting its payload."""
 
-    model_config = ConfigDict(extra="allow", allow_inf_nan=False, revalidate_instances="always")
-    __pydantic_extra__: dict[str, JsonValue]
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False, revalidate_instances="always")
 
     action_id: str = Field(min_length=1, description="Producer's action identifier.")
     action_type: str = Field(min_length=1, description="Opaque action type, such as kv.fetch.")
@@ -45,12 +44,11 @@ class KvHintAction(BaseModel):
 class KvHintsEnvelope(BaseModel):
     """Versioned KV hints transported as prototype per-request metadata.
 
-    Unknown action types, action versions and optional JSON fields are preserved. Consumers must
-    negotiate and validate executable actions separately from this wire format.
+    Unknown envelope and action fields are ignored. Action types, versions and opaque
+    payloads are preserved; consumers negotiate and validate executable actions separately.
     """
 
-    model_config = ConfigDict(extra="allow", allow_inf_nan=False, revalidate_instances="always")
-    __pydantic_extra__: dict[str, JsonValue]
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False, revalidate_instances="always")
 
     protocol_version: str = Field(
         min_length=1,
@@ -97,34 +95,30 @@ def _freeze(value: object) -> object:
     return value
 
 
-class _KvHintActionSnapshot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+class _KvHintActionSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     action_id: str
     action_type: str
     action_version: str
     payload: dict[str, object]
-    _extra: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         msgspec.structs.force_setattr(self, "payload", _freeze(self.payload))
-        msgspec.structs.force_setattr(self, "_extra", _freeze(self._extra))
 
 
-class KvHintsSnapshot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+class KvHintsSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     """Admitted msgspec envelope with read-only nested request metadata.
 
     Consumers can pass this envelope directly to a compatible provider after
-    selection and authorization. Optional wire metadata remains in ``_extra``
-    for lossless request transport and reconstruction of the public envelope.
+    selection and authorization. Only defined protocol fields are carried; provider
+    metadata belongs inside the opaque action payload.
     """
 
     protocol_version: str
     message_id: str
     actions: list[_KvHintActionSnapshot]
-    _extra: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         msgspec.structs.force_setattr(self, "actions", _freeze(self.actions))
-        msgspec.structs.force_setattr(self, "_extra", _freeze(self._extra))
 
     @property
     def wire_json(self) -> bytes:
@@ -137,11 +131,7 @@ class KvHintsSnapshot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=T
         Returns:
             A validated envelope whose mutation cannot change this snapshot.
         """
-        fields = msgspec.to_builtins(self)
-        for action in fields["actions"]:
-            action.update(action.pop("_extra", None) or {})
-        fields.update(fields.pop("_extra", None) or {})
-        return KvHintsEnvelope.model_validate(fields)
+        return KvHintsEnvelope.model_validate(msgspec.to_builtins(self))
 
 
 def admit_kv_hints(hints: KvHintsInput | None) -> KvHintsEnvelope | None:
@@ -224,9 +214,7 @@ def snapshot_kv_hints(hints: KvHintsInput | None) -> KvHintsSnapshot | None:
                 action_type=action.action_type,
                 action_version=action.action_version,
                 payload=action.payload,
-                _extra=action.__pydantic_extra__ or None,
             )
             for action in envelope.actions
         ],
-        _extra=envelope.__pydantic_extra__ or None,
     )
