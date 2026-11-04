@@ -47,7 +47,11 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _request(
-    request_id: int, *, context: bool = False, num_return_sequences: int = 1
+    request_id: int,
+    *,
+    context: bool = False,
+    num_return_sequences: int = 1,
+    lora_task_id: int | None = None,
 ) -> LlmRequest:
     """Create a native request waiting for its generation-first peer.
 
@@ -55,6 +59,7 @@ def _request(
         request_id: Executor and transfer identity.
         context: Whether to create the context-side request.
         num_return_sequences: Number of sequences, including any native children.
+        lora_task_id: Adapter identity, if the request holds PEFT resources.
 
     Returns:
         A request that has not run a model batch.
@@ -66,6 +71,7 @@ def _request(
         sampling_config=SamplingConfig(1, num_return_sequences=num_return_sequences),
         is_streaming=False,
         draft_tokens=None,
+        lora_task_id=lora_task_id,
         llm_request_type=(
             LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
             if context
@@ -504,7 +510,7 @@ def test_model_request_cancels_between_batches_without_another_forward(
     executor: PyExecutor, context: bool, bridge_enabled: bool
 ) -> None:
     """A consumed abort needs no further model work to publish its result."""
-    request, healthy = _request(1, context=context), _request(2)
+    request, healthy = _request(1, context=context, lora_task_id=0), _request(2)
     request.state = (
         LlmRequestState.CONTEXT_INIT if context else LlmRequestState.GENERATION_IN_PROGRESS
     )
@@ -523,6 +529,7 @@ def test_model_request_cancels_between_batches_without_another_forward(
     assert not healthy.is_finished
     assert executor.canceled_req_ids == []
     assert executor.kv_cache_transceiver._wait_reqs == {}
+    assert executor._pending_response_terminations == [request]
     executor.resource_manager.free_resources.assert_not_called()
     _assert_released_once(executor, request)
     _abort(executor, request)
@@ -569,15 +576,23 @@ def test_scheduler_excludes_cancelled_model_work_without_releasing_its_roots(
 
 
 @pytest.mark.parametrize("completed", [False, True], ids=["cancelled", "already-complete"])
+@pytest.mark.parametrize("context", [False, True])
 def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary(
-    executor: PyExecutor, completed: bool
+    executor: PyExecutor, completed: bool, context: bool
 ) -> None:
     """Update physical model resources before finishing the retained request."""
-    request = _request(1)
-    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request = _request(1, context=context, lora_task_id=0)
+    request.state = (
+        LlmRequestState.CONTEXT_INIT if context else LlmRequestState.GENERATION_IN_PROGRESS
+    )
     executor.active_requests = [request]
     batch = ScheduledRequests()
-    batch.generation_requests = [request]
+    if context:
+        request.context_chunk_size = 4
+        request.move_to_next_context_chunk()
+        batch.context_requests_chunking = [request]
+    else:
+        batch.generation_requests = [request]
     executor.previous_batch = SimpleNamespace(scheduled_requests=batch)
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False

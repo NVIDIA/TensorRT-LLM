@@ -8105,6 +8105,18 @@ class PyExecutor:
             request for request in self.active_requests
             if request.py_request_id not in cancelled_model_ids
         ] if cancelled_model_ids else self.active_requests
+        if any(request.py_request_id in cancelled_model_ids
+               and request.lora_task_id is not None
+               for request in self.active_requests) or any(
+                   request.lora_task_id is not None for request in getattr(
+                       self, "_pending_response_terminations", ())):
+            # Filtered requests can still pin an adapter in the previous batch
+            # or until a queued terminal response is flushed. Keep LoRA admission
+            # closed until normal cleanup; non-PEFT work can still progress.
+            scheduling_requests = [
+                request for request in scheduling_requests
+                if request.lora_task_id is None
+            ]
         scheduler_output = self.scheduler.schedule_request(
             scheduling_requests, self.inflight_req_ids)
 
