@@ -47,6 +47,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaRole,
     MambaStateLayout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+    RECURRENT_STATE_REGION,
+    REPLAY_STATE_REGION,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import Plane
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -562,6 +567,13 @@ def test_ple_adds_buffers_without_overriding_snapshot_or_budget_solver():
     ple = manager._get_recurrent_buffer_configs(1)
     assert [buffer.role for buffer in core] == [MambaRole.SSM_STATE, MambaRole.CONV_STATE]
     assert [buffer.role for buffer in ple[2:]] == [PLE_NGRAM_CONTEXT, PLE_CONV_STATE]
+    # The PLE planes are recurrent state: snapshotted with it, in the same region.
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager._declare_regions()
+    assert manager.region_layout.region(RECURRENT_STATE_REGION).layers[1].planes[2:] == (
+        Plane(PLE_NGRAM_CONTEXT, 2 * 8),
+        Plane(PLE_CONV_STATE, 16 * 6 * 2),
+    )
     assert manager._mamba_state_bytes_per_slot() == 2 * (128 + 288) + 16 * 6 * 2 + 2 * 8
 
 
@@ -602,18 +614,17 @@ def test_warmup_cleanup_clears_registered_persistent_roles_only(
         2,
         torch.float32,
     )
-    manager._build_cache_config(
-        KVCacheManagerConfig(
-            tokens_per_block=32,
-            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
-            layers=[
-                AttentionLayerConfig(
-                    layer_id=LayerId(0), buffers=[BufferConfig(role=Role.KEY, size=256)]
-                )
-            ],
-            initial_pool_ratio=[1.0],
-        )
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0), buffers=[BufferConfig(role=Role.KEY, size=256)]
+            )
+        ],
+        initial_pool_ratio=[1.0],
     )
+    manager._build_cache_config(manager._lay_out_regions(base_config))
     raw_buffers = {}
 
     def wrap_buffer(role, dtype, shape):
@@ -761,18 +772,20 @@ def test_kda_pool_allocation_includes_replay_in_native_quota(
     manager._state_layout = layout
     manager.mamba_pp_layers = list(layout.mamba_pp_layers)
     manager.layer_offsets = {0: 0, 1: 1}
-    manager._kda_replay = KDAReplayState(2) if replay else None
+    manager._kda_replay = manager._speculative_state = KDAReplayState(2) if replay else None
     manager.ssm_bytes, manager.conv_bytes = 128, 288
     manager.max_batch_size = layout.max_batch_size
     manager.mapping = layout.mapping
     manager._num_reserved_dummy_slots = 1
     manager.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-    # What __init__ declares: PRIVATE replay buffers in a fixed pool of one slot per IndexMapper slot.
-    manager._replay_layouts = manager._private_replay_layouts = {
+    # What __init__ declares: a PRIVATE replay-state region in a fixed pool of one slot per IndexMapper slot.
+    manager._replay_layouts = {
         layer_id: replay_layout
         for layer_id in manager.mamba_pp_layers
         if (replay_layout := manager._get_replay_layout(layer_id))
     }
+    manager._declare_regions()
+    assert (REPLAY_STATE_REGION in manager.region_layout) == replay
     manager._index_mapper_capacity = 2 * layout.max_batch_size + 1
     persistent_bytes_per_slot = manager._mamba_state_bytes_per_slot()
     assert persistent_bytes_per_slot == 2 * (128 + 288)

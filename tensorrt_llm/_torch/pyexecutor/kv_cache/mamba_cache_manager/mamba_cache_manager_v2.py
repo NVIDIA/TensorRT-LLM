@@ -51,6 +51,16 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _compute_index_mapper_capacity,
     _read_guard_page_setting,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
+    AllocationUnit,
+    HandOff,
+    Plane,
+    Region,
+    RegionLayer,
+    RegionLifeCycle,
+    RegionProvider,
+    RegionTransfer,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -84,9 +94,11 @@ from .common import (
     MambaAcceptanceBatch,
     MambaHybridCacheManager,
     MambaLayerCache,
+    MambaReplayState,
     MambaRole,
     MambaState,
     MambaStateLayout,
+    ReplayLayout,
     _estimate_mamba_hybrid_cache_cost,
     _get_local_mamba_cache_layout,
     _get_num_cuda_graph_padding_dummy_slots,
@@ -125,8 +137,14 @@ class InforwardSnapshotEntry(NamedTuple):
     num_after: int  # chunk tokens from P to the prompt end
 
 
-# Per-slot shapes of one layer's replay buffers: {role: (dtype, slot shape)}.
-ReplayLayout = Dict[DataRole, Tuple[torch.dtype, List[int]]]
+# The regions a hybrid manager declares for its local recurrent layers (see
+# MambaHybridCacheManagerV2.declare_regions).
+RECURRENT_STATE_REGION = "recurrent_state"
+REPLAY_STATE_REGION = "replay_state"
+# The recurrent state is snapshotted into the prefix index at each request's
+# declared points; the replay state never leaves its request.
+_RECURRENT_STATE_LIFE_CYCLE = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.DECLARED_POINTS)
+_REPLAY_STATE_LIFE_CYCLE = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER)
 
 
 def _uses_fp4_mla_cache_layout(
@@ -184,10 +202,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Set per instance by the FP4 MLA layout on a disaggregated context
     # worker, which keeps no generation-only V scales or packed V.
     fp4_mla_context_only_cache = False
-    # Without PRIVATE replay buffers, replay slots are the recurrent-state slots.
+    # Without a replay-state region, replay slots are the recurrent-state slots.
     _disagg_context_only = False
     _replay_layouts = MappingProxyType({})
-    _private_replay_layouts = MappingProxyType({})
     replay_layer_group_id: Optional[int] = None
 
     # Construction and cache configuration
@@ -360,6 +377,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_state_layout=conv_state_layout,
         )
         self._speculative_state: MambaState | None = self._initialize_spec_state()
+        # Typed per-slot views of the replay buffers, keyed by global layer; the
+        # regions declare their bytes (declare_regions).
         self._replay_layouts: Dict[int, ReplayLayout] = (
             {}
             if self._disagg_context_only
@@ -368,10 +387,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 for layer_id in self.mamba_pp_layers
                 if (layout := self._get_replay_layout(layer_id))
             }
-        )
-        self._replay_reuse_policy_value = self._replay_reuse_policy()
-        self._private_replay_layouts: Dict[int, ReplayLayout] = (
-            self._replay_layouts if self._replay_reuse_policy_value == ReusePolicy.PRIVATE else {}
         )
 
         if isinstance(num_kv_heads, int):
@@ -603,18 +618,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        """Keep FP4 MLA V scales, packed V and replay history out of disaggregated transfers.
+        """Keep FP4 MLA V scales, packed V and the regions' rebuilt roles out of transfers.
 
         The generation worker rebuilds the FP4 MLA V scales and packed V from
-        the transferred K and K scales, and restarts replay history.
+        the transferred K and K scales, and restarts replay state.
         """
         roles = super().get_disagg_ignored_roles()
         layout_policy = self._attention_cache_layout_policy
         if layout_policy is not None:
             roles |= frozenset(layout_policy.DISAGG_IGNORED_ROLES)
-        return roles | frozenset(
-            role for layout in self._replay_layouts.values() for role in layout
-        )
+        return roles
 
     @override
     def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
@@ -623,7 +636,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         With the FP4 MLA cache layout, the policy's HP ring geometry joins
         them.
         """
-        layouts = {}
+        layouts = super().get_disagg_role_layouts()
         if self._attention_cache_layout_policy is not None:
             layouts.update(self._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
@@ -659,48 +672,125 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return ((pages + scale - 1) // scale) * bytes_per_slot
 
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        """Declare all buffers sharing one recurrent layer's slot lifecycle."""
+        """Declare the planes one recurrent layer stores in the recurrent-state region."""
         return [
             BufferConfig(role=MambaRole.SSM_STATE, size=self.ssm_bytes),
             BufferConfig(role=MambaRole.CONV_STATE, size=self.conv_bytes),
         ]
 
     def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
-        """Declare one local recurrent layer's per-request replay buffers.
+        """Typed per-slot views of one local recurrent layer's replay buffers.
 
-        The model state must then be a ``MambaReplayState``. The manager adds
-        the buffers to the layer with the policy from ``_replay_reuse_policy()``,
-        binds their views through the state's ``bind_replay_pool()``, excludes
-        them from disaggregated transfer and resets a request's replay slot the
-        first time the request gets one.
+        By default those the model state declares, when it is a
+        ``MambaReplayState``.
         """
+        state = self._speculative_state
+        if isinstance(state, MambaReplayState):
+            return state.replay_layout(self._state_layout, global_layer_id)
         return {}
 
     def _replay_reuse_policy(self) -> Optional[ReusePolicy]:
-        """Reuse policy of the declared replay buffers.
+        """Where the replay buffers live: PRIVATE in a region of their own, None in the state slot.
 
-        PRIVATE buffers are never committed for prefix reuse and live in a pool
-        group of fixed capacity bounded by ``max_live_kv_caches``; kernels
-        address them by the slots from ``get_replay_state_indices()``. With
-        ``None`` the buffers inherit the layer's policy and share the
-        recurrent-state slot and index, so snapshots carry them. Either way they
-        follow their request across suspend and resume.
+        By default the model state's ``replay_shares_state_slot`` decides.
         """
+        state = self._speculative_state
+        if isinstance(state, MambaReplayState) and state.replay_shares_state_slot:
+            return None
         return ReusePolicy.PRIVATE
 
-    def _replay_bytes_per_slot(self, layouts: Dict[int, ReplayLayout]) -> int:
+    @override
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        return (self,)
+
+    def declare_regions(self) -> List[Region]:
+        """Declare the state of the local recurrent layers as regions.
+
+        ``RECURRENT_STATE_REGION`` is the state that requests snapshot into the
+        prefix index at their declared points: SSM and convolution state, and
+        the planes a model adds through ``_get_recurrent_buffer_configs``. The
+        model's replay buffers form ``REPLAY_STATE_REGION``, which never leaves
+        its request and holds one slot per living cache, or, when the kernels
+        address them by the recurrent-state slot, are planes of the
+        recurrent-state region and share its life cycle. Replay buffers are
+        never transferred between disaggregated workers: the receiving worker
+        starts them afresh. A disaggregated context server declares none.
+        """
+        if not self.mamba_pp_layers:
+            return []
+        in_state_slot = bool(self._replay_layouts) and self._replay_reuse_policy() is None
+        recurrent_layers = []
+        replay_layers = []
+        for layer_id in self.mamba_pp_layers:
+            local_layer_id = self.layer_offsets[layer_id]
+            buffers = self._get_recurrent_buffer_configs(layer_id)
+            if any(buffer.reuse_policy is not None for buffer in buffers):
+                raise ValueError(
+                    "A recurrent-state buffer takes the region's life cycle; declare a buffer "
+                    "with its own reuse policy as a region of its own (declare_regions)"
+                )
+            planes = [
+                Plane(buffer.role, buffer.size, buffer.coalescing_group) for buffer in buffers
+            ]
+            replay_planes = [
+                Plane(role, dtype.itemsize * math.prod(shape))
+                for role, (dtype, shape) in self._replay_layouts.get(layer_id, {}).items()
+            ]
+            if in_state_slot:
+                planes += replay_planes
+            elif replay_planes:
+                replay_layers.append(RegionLayer(local_layer_id, tuple(replay_planes)))
+            recurrent_layers.append(RegionLayer(local_layer_id, tuple(planes)))
+        replay_roles = RegionTransfer(
+            rebuilt_roles=frozenset(
+                role for layout in self._replay_layouts.values() for role in layout
+            )
+        )
+        regions = [
+            Region(
+                RECURRENT_STATE_REGION,
+                _RECURRENT_STATE_LIFE_CYCLE,
+                tuple(recurrent_layers),
+                transfer=replay_roles if in_state_slot else RegionTransfer(),
+            )
+        ]
+        if replay_layers:
+            regions.append(
+                Region(
+                    REPLAY_STATE_REGION,
+                    _REPLAY_STATE_LIFE_CYCLE,
+                    tuple(replay_layers),
+                    transfer=replay_roles,
+                )
+            )
+        return regions
+
+    def _slot_region_bytes(self, reuse_policy: ReusePolicy) -> int:
+        """Bytes of one slot of the per-request regions with ``reuse_policy``, across layers."""
         return sum(
-            dtype.itemsize * math.prod(shape)
-            for layout in layouts.values()
-            for dtype, shape in layout.values()
+            plane.page_bytes
+            for region in self.region_layout.regions
+            if region.life_cycle.allocation == AllocationUnit.REQUEST
+            and region.life_cycle.reuse_policy == reuse_policy
+            for layer in region.layers
+            for plane in layer.planes
         )
 
     def _private_replay_bytes_per_slot(self) -> int:
-        return self._replay_bytes_per_slot(self._private_replay_layouts)
+        """Bytes of one slot of the request-private regions (the replay state)."""
+        return self._slot_region_bytes(ReusePolicy.PRIVATE)
 
     def _max_live_kv_caches(self) -> Optional[int]:
-        """Living caches the PRIVATE replay pool must hold, one slot each."""
-        return self._index_mapper_capacity if self._private_replay_layouts else None
+        """Living caches the request-private slot regions must hold, one slot each.
+
+        None without such a region, which leaves living caches unbounded.
+        """
+        has_private_slots = any(
+            region.life_cycle.allocation == AllocationUnit.REQUEST
+            and region.life_cycle.reuse_policy == ReusePolicy.PRIVATE
+            for region in self.region_layout.regions
+        )
+        return self._index_mapper_capacity if has_private_slots else None
 
     def _private_replay_quota(self) -> int:
         """GPU bytes of the fixed-capacity PRIVATE replay pool."""
@@ -714,7 +804,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _estimate_private_replay_bytes_per_slot(
         cls, model_config, mapping: Mapping, **kwargs
     ) -> int:
-        """Estimate the PRIVATE bytes ``_get_replay_layout`` declares per slot."""
+        """Estimate the per-slot bytes of the replay-state region this class declares."""
         return 0
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
@@ -755,15 +845,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return self.max_batch_size * self.mapping.pp_size
 
     def _mamba_state_bytes_per_slot(self) -> int:
-        """Return persistent bytes per recurrent-state slot allocated by the native pools."""
-        coupled_replay_bytes = (
-            0 if self._private_replay_layouts else self._replay_bytes_per_slot(self._replay_layouts)
-        )
-        return coupled_replay_bytes + sum(
-            buffer.size
-            for layer_id in self.mamba_pp_layers
-            for buffer in self._get_recurrent_buffer_configs(layer_id)
-        )
+        """Return persistent bytes per recurrent-state slot: the snapshotted per-request regions."""
+        return self._slot_region_bytes(ReusePolicy.REQUIRED)
 
     def _num_ssm_snapshots_for_capacity(
         self,
@@ -942,35 +1025,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"states and attention pages: got {gpu_quota} bytes, need at "
                 f"least {minimum_live_quota} bytes."
             )
-        # _build_base_config already constructed every attention layer,
-        # including dtype-specific scale and subclass-provided side buffers.
-        # Preserve those configs and replace only the local Mamba layers.
+        # The regions laid out the local recurrent layers (declare_regions);
+        # _build_base_config constructed every attention layer, including
+        # dtype-specific scale and subclass-provided side buffers.
         layers = list(config.layers)
-        # Register pool-owned roles here, then bind their typed views in
-        # _get_state_buffer. Model scratch must not participate in warmup cleanup.
-        self._recurrent_buffers: dict[tuple[int, DataRole], torch.Tensor | None] = {}
-        for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
-            if self._mamba_layer_mask[global_layer_idx]:
-                layer_id = LayerId(local_layer_idx)
-                buffers = [
-                    *self._get_recurrent_buffer_configs(global_layer_idx),
-                    *(
-                        BufferConfig(
-                            role=role,
-                            size=dtype.itemsize * math.prod(shape),
-                            reuse_policy=self._replay_reuse_policy_value,
-                        )
-                        for role, (dtype, shape) in self._replay_layouts.get(
-                            global_layer_idx, {}
-                        ).items()
-                    ),
-                ]
-                for buffer in buffers:
-                    self._recurrent_buffers[local_layer_idx, buffer.role] = None
-                layers[local_layer_idx] = SsmLayerConfig(
-                    layer_id=layer_id,
-                    buffers=buffers,
-                )
+        # Register the per-request region buffers here, then bind their typed
+        # views in _get_state_buffer. Model scratch must not participate in
+        # warmup cleanup.
+        region_layout = self.region_layout
+        self._recurrent_buffers: dict[tuple[int, DataRole], torch.Tensor | None] = {
+            buffer: None
+            for buffer, region in region_layout.owners.items()
+            if region_layout.region(region).life_cycle.allocation == AllocationUnit.REQUEST
+        }
 
         dummy_requests = [
             KVCacheDesc(capacity=0, history_length=0) for _ in range(self._num_reserved_dummy_slots)
@@ -1054,7 +1121,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
         self._replay_indices_buffer: DeviceCopyBuffer | None = None
         self._host_replay_indices: torch.Tensor | None = None
-        if self._private_replay_layouts:
+        if REPLAY_STATE_REGION in self.region_layout:
             self._replay_indices_buffer = DeviceCopyBuffer(
                 torch.zeros([state_index_capacity], dtype=torch.int32, device="cuda"),
                 pin_memory=prefer_pinned(),
@@ -1079,16 +1146,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.ssm_layer_group_id = self.impl.get_buffer_group_id(
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
             )
-            first_private_layout = self._private_replay_layouts.get(self.mamba_pp_layers[0])
-            self.replay_layer_group_id = (
-                int(
-                    self.impl.get_buffer_group_id(
-                        LayerId(first_mamba_local_layer), next(iter(first_private_layout))
-                    )
+            replay_groups = self.get_region_group_ids(REPLAY_STATE_REGION)
+            if len(replay_groups) > 1:
+                raise RuntimeError(
+                    f"The replay-state region spans layer groups {replay_groups}; its "
+                    "buffers must share one life cycle and one replay slot index"
                 )
-                if first_private_layout
-                else None
-            )
+            self.replay_layer_group_id = replay_groups[0] if replay_groups else None
             self._ssm_page_index_scale = self.impl.get_page_index_scale(
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
             )
@@ -2180,4 +2244,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         super().shutdown()
 
 
-__all__ = ["InforwardSnapshotEntry", "MambaHybridCacheManagerV2"]
+__all__ = [
+    "InforwardSnapshotEntry",
+    "MambaHybridCacheManagerV2",
+    "RECURRENT_STATE_REGION",
+    "REPLAY_STATE_REGION",
+    "ReplayLayout",
+]

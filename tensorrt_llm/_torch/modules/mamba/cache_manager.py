@@ -314,7 +314,12 @@ class ReplayHistory:
     def uses_replay(self) -> bool:
         return True
 
-    def pool_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+    @property
+    def replay_shares_state_slot(self) -> bool:
+        """The replay kernels address the history by its own replay slot."""
+        return False
+
+    def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
         """Per-slot shapes of one layer's replay history.
 
         The first local layer also holds the replay metadata row.
@@ -622,13 +627,6 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
             state.validate(self._state_layout)
         return state
 
-    @override
-    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
-        state = self._speculative_state
-        if not isinstance(state, ReplayHistory):
-            return {}
-        return state.pool_layout(self._state_layout, global_layer_id)
-
     @classmethod
     @override
     def _estimate_private_replay_bytes_per_slot(
@@ -677,7 +675,7 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         return sum(
             dtype.itemsize * math.prod(shape)
             for layer_id in layer_ids
-            for dtype, shape in state.pool_layout(context, layer_id).values()
+            for dtype, shape in state.replay_layout(context, layer_id).values()
         )
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
