@@ -126,6 +126,7 @@ attention_config:
 - On B200/GB200, it is recommended to use the `qk_dtype: "int8"` recipes.
 - On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200. INT8 SageAttention is unsupported and raises an error.
 - On Rubin (SM107), use `qk_dtype: "fp8"`, Q/V block size 1, and K block size 1, 4, or 16. INT8 SageAttention is unsupported and raises an error.
+- Recipe validation checks the backend, GPU architecture, formats, and block sizes. Execution also requires a compatible kernel for the model's head dimension and runtime shape. Head dimension 72 is unsupported by the native SageAttention path on SM100/SM103/SM107; unsupported shapes raise an error rather than falling back to unfused attention.
 - `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once. VisualGen currently enables `smooth_v` on B200/GB200 and B300/GB300 only; H100/H200/H800/H20 and Rubin reject it.
 
 **Configuration.**
