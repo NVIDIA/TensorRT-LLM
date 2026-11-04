@@ -237,6 +237,7 @@ def test_mm_encoder_sampler_exports_results_only_on_response_ranks(mapping, expo
             sampler_force_async_worker=False,
             disable_overlap_scheduler=True,
             enable_speculative_beam_history_d2h=False,
+            watermark_config=None,
         ),
         mapping,
         max_batch_size=1,
