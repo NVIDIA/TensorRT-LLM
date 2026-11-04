@@ -44,12 +44,21 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import prepare_multimo
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 
 
+@pytest.fixture(params=[103, 107], ids=["sm103", "sm107"])
+def target_sm(request):
+    return request.param
+
+
 @pytest.fixture(autouse=True, params=["tep4", "tp4", "dep4"])
-def target(request):
+def target(request, target_sm):
     global modeling, weights
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        if 10 * major + minor != target_sm:
+            pytest.skip(f"requires SM{target_sm}")
     module = (
         "tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4."
-        f"mistral_large_4_nvfp4__sm_103__{request.param}"
+        f"mistral_large_4_nvfp4__sm_{target_sm}__{request.param}"
     )
     modeling = importlib.import_module(module + ".modeling")
     weights = importlib.import_module(module + ".weights")
