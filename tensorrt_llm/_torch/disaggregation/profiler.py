@@ -49,6 +49,9 @@ class _KvTransferRecord:
     admission_uncertain: bool = False
 
     def get_request(self) -> LlmRequest | None:
+        """Resolve the retained request, returning None after a weak
+        reference expires.
+        """
         return self.request() if isinstance(self.request, weakref.ReferenceType) else self.request
 
 
@@ -123,6 +126,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return self._transceiver.has_poisoned_transfer_buffer()
 
     def _register(self, req: LlmRequest, direction: _Direction) -> _KvTransferRecord:
+        """Index one observation by request identity, direction, and native
+        status ID.
+        """
         request_id = req.request_id
         params = req.py_disaggregated_params
         transfer_id = request_id
@@ -165,6 +171,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return record
 
     def _metadata(self, record: _KvTransferRecord) -> str:
+        """Encode and cache request aliases and transport fields for this
+        observation.
+        """
         if record.metadata is None:
             req = record.get_request()
             if req is None:
@@ -189,6 +198,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return record.metadata
 
     def _discard(self, record: _KvTransferRecord) -> None:
+        """Remove observation indexes without changing transfer resource
+        ownership.
+        """
         if self._records.get(record.key) is not record:
             return
         self._records.pop(record.key)
@@ -209,6 +221,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
                 )
 
     def _observation_active(self) -> bool:
+        """Drop stale observations when the selected profiling window is
+        inactive.
+        """
         if _profiler.custom_region_active("kv"):
             return True
         # An emptied dict can retain deleted entries; avoid traversing that
@@ -219,6 +234,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return False
 
     def _finish(self, record: _KvTransferRecord, outcome: SendTerminalOutcome) -> None:
+        """Emit one terminal observation and remove its indexes even if
+        recording fails.
+        """
         if self._records.get(record.key) is not record:
             return
         try:
@@ -230,6 +248,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             self._discard(record)
 
     def _submission_failed(self, record: _KvTransferRecord) -> None:
+        """Retain observations according to resource ownership after
+        admission errors.
+        """
         req = record.get_request()
         if req is None:
             self._discard(record)
@@ -265,6 +286,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         *,
         synchronous: bool = False,
     ) -> None:
+        """Observe admission while preserving delegate results and original
+        exceptions.
+        """
         if not self._observation_active():
             return submit(req)
         existing = self._records.get((id(req), direction))
@@ -302,6 +326,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         )
 
     def _observe_request_terminal(self, record: _KvTransferRecord) -> None:
+        """Settle terminal request states unless the resource owner still
+        reports ownership.
+        """
         req = record.get_request()
         if req is None:
             self._discard(record)
@@ -332,6 +359,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         at_least_request_num: int | None,
         mark_complete: bool = False,
     ) -> CtxTransferStatus:
+        """Return native context status and settle matching send observations
+        once.
+        """
         result = self._transceiver.check_context_transfer_status(
             at_least_request_num, mark_complete
         )
@@ -353,13 +383,19 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return result
 
     def check_gen_transfer_status(self, at_least_request_num: int | None) -> GenTransferStatus:
+        """Return native generation status and preserve failed receive
+        outcomes.
+        """
         result = self._transceiver.check_gen_transfer_status(at_least_request_num)
         if not self._observation_active() or not self._records:
             return result
         for req in result.cancelled_requests:
             record = self._records.get((id(req), "receive"))
             if record is not None:
-                self._finish(record, "cancelled")
+                self._finish(
+                    record,
+                    "failed" if req.state == LlmRequestState.DISAGG_TRANS_ERROR else "cancelled",
+                )
         for status_ids, outcome in (
             (result.completed_request_ids, "complete"),
             (result.error_request_ids, "failed"),
@@ -378,6 +414,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return self._transceiver.check_gen_transfer_complete()
 
     def cancel_request(self, req: LlmRequest) -> bool:
+        """Delegate cancellation and settle only proven terminal
+        observations.
+        """
         cancelled = self._transceiver.cancel_request(req)
         terminal = not (
             isinstance(self._transceiver, BindKvCacheTransceiver)
@@ -389,7 +428,13 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             for direction in directions:
                 record = self._records.get((id(req), direction))
                 if record is not None:
-                    self._finish(record, "cancelled")
+                    self._finish(
+                        record,
+                        "failed"
+                        if direction == "receive"
+                        and req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                        else "cancelled",
+                    )
         return cancelled
 
     def prepare_context_requests(self, requests: list[LlmRequest]) -> None:
@@ -411,6 +456,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return self._transceiver.get_status_dump()
 
     def shutdown(self) -> None:
+        """Shut down the resource owner before cancelling its remaining
+        observations.
+        """
         result = self._transceiver.shutdown()
         for record in list(self._records.values()):
             self._finish(record, "cancelled")

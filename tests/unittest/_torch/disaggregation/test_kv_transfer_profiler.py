@@ -27,6 +27,7 @@ from profiler_test_utils import decode_profiler_metadata
 
 from tensorrt_llm import _profiler
 from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as factory
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     BindKvCacheTransceiver,
     CtxTransferStatus,
@@ -47,6 +48,9 @@ class _Request(SimpleNamespace):
 def _request(
     rid: int = 5, transfer_id: int | None = 17, ctx_id: int | None = None
 ) -> SimpleNamespace:
+    """Build a request with independent public, peer, and native status
+    aliases.
+    """
     return _Request(
         request_id=rid,
         py_request_id=transfer_id if transfer_id is not None else rid,
@@ -115,6 +119,9 @@ class _ScriptedTransceiver(FakeKvCacheTransceiver):
         return True
 
     def observe_send_terminal_outcome(self, req: SimpleNamespace, enabled: bool = True) -> None:
+        """Track request identities whose scripted send outcomes may be
+        observed.
+        """
         if enabled:
             self.observed.add(id(req))
             self.observed_status_ids[id(req)] = req.py_request_id
@@ -126,11 +133,15 @@ class _ScriptedTransceiver(FakeKvCacheTransceiver):
         return self.send_terminal
 
     def get_send_terminal_outcomes(self) -> dict[int, str]:
+        """Return scripted outcomes only for sends with active observation
+        claims.
+        """
         if self.send_terminal is None:
             return {}
         return {rid: self.send_terminal for rid in self.observed_status_ids.values()}
 
     def respond_and_send_async(self, req: SimpleNamespace) -> None:
+        """Record send submission, preserving a scripted admission failure."""
         self.call_log.append("send")
         if self.submit_error is not None:
             raise self.submit_error
@@ -152,6 +163,9 @@ class _ScriptedTransceiver(FakeKvCacheTransceiver):
         return "native-status"
 
     def shutdown(self) -> None:
+        """Record shutdown and propagate its scripted failure for retry
+        tests.
+        """
         self.call_log.append("shutdown")
         if self.shutdown_error is not None:
             raise self.shutdown_error
@@ -171,6 +185,7 @@ def test_disabled_wrapper_preserves_identity(
 def test_context_completion_is_correlated_once_and_metadata_cached(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify one send completion reuses its submission metadata and aliases."""
     backend = FakeKvCacheTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     req = _request()
@@ -204,6 +219,9 @@ def test_context_completion_is_correlated_once_and_metadata_cached(
 def test_python_receive_named_outcomes(
     monkeypatch: pytest.MonkeyPatch, events: list, outcome: str, event: str
 ) -> None:
+    """Verify native completion IDs produce the matching receive terminal
+    marker.
+    """
     backend = FakeKvCacheTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     req = _request()
@@ -243,9 +261,13 @@ def test_cpp_void_receive_is_observed_from_request_mutation(
     assert not wrapper._records
 
 
+@pytest.mark.parametrize("failed", [False, True])
 def test_cancellation_false_keeps_observation_until_safe_true(
-    monkeypatch: pytest.MonkeyPatch, events: list
+    monkeypatch: pytest.MonkeyPatch, events: list, failed: bool
 ) -> None:
+    """Verify refused cancellation keeps the observation until safe
+    cancellation.
+    """
     backend = _ScriptedTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     req = _request()
@@ -253,9 +275,78 @@ def test_cancellation_false_keeps_observation_until_safe_true(
     assert wrapper.cancel_request(req) is False
     assert wrapper.cancel_request(req) is False
     assert len(events) == 1 and id(req) in backend.observed
+    if failed:
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
     assert wrapper.cancel_request(req) is True
     assert events[-1][0] == "trtllm::kv_transfer_cancelled"
     assert not wrapper._records and not backend.observed
+
+
+def test_v2_failed_receive_safe_cancellation_preserves_failure(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """Verify real V2 cancellation preserves the failed receive outcome once."""
+    owner = object.__new__(KvCacheTransceiverV2)
+    owner._fp4_mla_bridge_enabled = True
+    owner._wait_reqs = {}
+    owner._send_sessions = {}
+    owner._recv_sessions = {}
+    owner._recv_reqs = {}
+    monkeypatch.setattr(
+        owner,
+        "request_and_receive_async",
+        lambda request: setattr(
+            request, "state", LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        ),
+    )
+    wrapper = _wrap(owner, monkeypatch)
+    req = _request()
+    wrapper.request_and_receive_async(req)
+    session = Mock(status=SessionStatus.ERROR)
+    session.has_transferring_tasks.return_value = False
+    session.close.return_value = True
+    owner._recv_sessions[17] = session
+    owner._recv_reqs[17] = req
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert wrapper.has_inflight_transfer(req)
+
+    assert wrapper.cancel_request(req) is True
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert not wrapper.has_inflight_transfer(req)
+    assert wrapper.cancel_request(req) is True
+    session.cancel.assert_called_once_with()
+    session.close.assert_called_once_with()
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_failed",
+    ]
+    assert events[0][1] is events[1][1]
+    assert not wrapper._records
+
+
+def test_cancelled_receive_status_preserves_existing_failure_once(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """Verify a safely cancelled receive with an error still emits failure
+    once.
+    """
+    backend = FakeKvCacheTransceiver()
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    wrapper.request_and_receive_async(req)
+    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    backend.finish_recv(req, "cancel")
+
+    assert wrapper.check_gen_transfer_status(0) == GenTransferStatus([], [], [req])
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert wrapper.check_gen_transfer_status(0) == GenTransferStatus([], [], [])
+    assert wrapper.cancel_request(req) is True
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_failed",
+    ]
+    assert events[0][1] is events[1][1]
+    assert not wrapper._records
 
 
 def test_precise_owner_outcome_overrides_ambiguous_bridge_error(
@@ -290,6 +381,9 @@ def test_retired_boolean_is_not_a_cancellation_oracle(
 def test_submission_failure_preserves_partial_or_unknown_admission(
     monkeypatch: pytest.MonkeyPatch, events: list, ownership: bool | None, pending: bool
 ) -> None:
+    """Verify failed admission retains observations while ownership is
+    unresolved.
+    """
     backend = _ScriptedTransceiver()
     backend.owned = ownership
     backend.submit_error = RuntimeError("admission failed")
@@ -310,6 +404,9 @@ def test_submission_failure_preserves_partial_or_unknown_admission(
 def test_shutdown_failure_preserves_observations_and_original_error_for_retry(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify failed shutdown retains observations and the original retryable
+    error.
+    """
     backend = _ScriptedTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     wrapper.respond_and_send_async(_request())
@@ -341,6 +438,9 @@ def test_duplicates_still_delegate_without_duplicate_submit(
 def test_backend_duplicate_rejection_preserves_original_pending_record(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify duplicate admission failure preserves the first pending
+    observation.
+    """
     wrapper = _wrap(FakeKvCacheTransceiver(), monkeypatch)
     req = _request()
     wrapper.respond_and_send_async(req)
@@ -352,6 +452,9 @@ def test_backend_duplicate_rejection_preserves_original_pending_record(
 def test_numeric_alias_domains_and_directions_do_not_overwrite(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify overlapping numeric aliases keep separate send and receive
+    records.
+    """
     backend = FakeKvCacheTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     first, second = _request(5, 17), _request(17, 23)
@@ -403,6 +506,7 @@ def test_poll_arguments_and_empty_record_calls_preserve_rank_symmetry(
 
 
 def test_all_resource_capabilities_are_delegated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify the wrapper preserves every resource-owner capability result."""
     backend = _ScriptedTransceiver()
     backend.owned = True
     wrapper = _wrap(backend, monkeypatch)
@@ -429,6 +533,9 @@ def test_all_resource_capabilities_are_delegated(monkeypatch: pytest.MonkeyPatch
 def test_wrapper_overrides_every_public_transceiver_method(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify the wrapper explicitly implements the public transceiver
+    contract.
+    """
     wrapper = _wrap(FakeKvCacheTransceiver(), monkeypatch)
     public_members = {
         name
@@ -487,6 +594,9 @@ def test_deferred_receive_and_idle_cancellation_errors_are_preserved(
 def test_sync_receive_settles_without_phantom_pending_record(
     monkeypatch: pytest.MonkeyPatch, events: list, outcome: str, event: str
 ) -> None:
+    """Verify synchronous receive settles immediately without a pending
+    record.
+    """
     backend = FakeKvCacheTransceiver()
     req = _request()
     backend.script_sync_recv(req, outcome)
@@ -520,6 +630,7 @@ def test_inactive_profiler_never_extracts_payload(monkeypatch: pytest.MonkeyPatc
 def test_native_accepted_inflight_cancel_waits_for_terminal_status(
     monkeypatch: pytest.MonkeyPatch, events: list, direction: str, outcome: str
 ) -> None:
+    """Verify accepted native cancellation waits for later terminal evidence."""
     monkeypatch.setattr(factory, "_disagg_inflight_cancel_enabled_cache", True)
     backend = object.__new__(BindKvCacheTransceiver)
     backend.impl = Mock()
@@ -599,6 +710,8 @@ def test_factory_profiled_bridge_rejection_releases_coordinator_claim(
 def test_profile_window_end_keeps_inactive_calls_constant_time(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify inactive calls avoid scanning the emptied observation table."""
+
     class NoEmptyScan(dict):
         def values(self) -> ValuesView[object]:
             assert self, "inactive empty-record traversal"
@@ -663,6 +776,10 @@ def test_profile_window_end_keeps_inactive_calls_constant_time(
 def test_pending_python_transfers_are_indexed_without_full_observation_scans(
     monkeypatch: pytest.MonkeyPatch, events: list, direction: str
 ) -> None:
+    """Verify Python status polling uses indexes instead of scanning all
+    records.
+    """
+
     class NoFullScan(dict):
         def values(self):
             raise AssertionError("full pending-record scan")
@@ -729,6 +846,9 @@ def test_send_outcome_observation_failure_warns_and_preserves_status(
 
 
 def test_real_cpu_profiler_captures_paired_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify the real CPU profiler records paired submit and completion
+    markers.
+    """
     backend = FakeKvCacheTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     req = _request()
@@ -745,6 +865,9 @@ def test_real_cpu_profiler_captures_paired_markers(monkeypatch: pytest.MonkeyPat
 def test_factory_wraps_after_unchanged_runtime_selection(
     monkeypatch: pytest.MonkeyPatch, enabled: bool, runtime: str
 ) -> None:
+    """Verify profiling wraps the resource owner after normal runtime
+    selection.
+    """
     backend = FakeKvCacheTransceiver()
     constructor = Mock(return_value=backend)
     monkeypatch.setattr(_profiler, "_CUSTOM_REGIONS", frozenset({"kv"}) if enabled else frozenset())
@@ -766,6 +889,9 @@ def test_factory_wraps_after_unchanged_runtime_selection(
 
 
 def test_v2_outcome_observation_requires_opt_in_and_safe_close() -> None:
+    """Verify V2 records terminal outcomes only after opt-in and safe
+    closure.
+    """
     owner = object.__new__(KvCacheTransceiverV2)
     req = _request()
     session = Mock()
@@ -791,6 +917,9 @@ def test_v2_outcome_observation_requires_opt_in_and_safe_close() -> None:
 
 
 def test_v2_failed_close_reports_failure_not_cancellation() -> None:
+    """Verify V2 failed-session closure produces the failure terminal
+    outcome.
+    """
     owner = object.__new__(KvCacheTransceiverV2)
     req = _request()
     getter = getattr(owner, "get_send_terminal_outcome", None)
@@ -817,6 +946,9 @@ def test_v2_pipeline_retirement_is_visible_before_final_request_registration() -
 def test_v2_actual_partial_send_admission_keeps_record_until_safe_retirement(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify partial real send admission stays observed until safe
+    retirement.
+    """
     owner = object.__new__(KvCacheTransceiverV2)
     req = _request()
     req.set_kv_cache_transfer_start = lambda value: None
@@ -858,6 +990,9 @@ def test_v2_actual_partial_send_admission_keeps_record_until_safe_retirement(
 def test_v2_rejected_receive_admission_cleans_observation(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify rejected receive admission removes its observation after safe
+    cleanup.
+    """
     owner = object.__new__(KvCacheTransceiverV2)
     req = _request()
     req.set_kv_cache_transfer_start = lambda value: None
@@ -894,6 +1029,7 @@ def test_v2_no_opt_in_does_not_retain_terminal_outcomes() -> None:
 def test_unknown_native_admission_does_not_strongly_retain_failed_requests(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify uncertain native admission does not keep failed requests alive."""
     backend = object.__new__(BindKvCacheTransceiver)
     backend.impl = Mock()
     error = RuntimeError("native admission is unknown")
@@ -920,6 +1056,9 @@ def test_unknown_native_admission_does_not_strongly_retain_failed_requests(
 def test_uncertain_native_generation_cannot_consume_reused_status_id(
     monkeypatch: pytest.MonkeyPatch, events: list, outcome: str, new_request_id: int
 ) -> None:
+    """Verify a reused native status ID cannot settle an uncertain older
+    generation.
+    """
     backend = object.__new__(BindKvCacheTransceiver)
     backend.impl = Mock()
     backend.kv_transfer_timeout_ms = None
@@ -960,6 +1099,9 @@ def test_uncertain_native_generation_cannot_consume_reused_status_id(
 def test_uncertain_native_send_does_not_shadow_reused_receive_domain(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify an uncertain send cannot hide a receive with the same numeric
+    alias.
+    """
     backend = object.__new__(BindKvCacheTransceiver)
     backend.impl = Mock()
     backend.kv_transfer_timeout_ms = None
@@ -987,6 +1129,9 @@ def test_uncertain_native_send_does_not_shadow_reused_receive_domain(
 def test_profile_metadata_failure_never_skips_transfer_or_replaces_error(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify metadata failure preserves admission and the original backend
+    error.
+    """
     backend = _ScriptedTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     req = _request()
@@ -1002,6 +1147,9 @@ def test_profile_metadata_failure_never_skips_transfer_or_replaces_error(
 def test_reused_request_after_terminal_gets_a_fresh_observation(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify a reused request receives a new observation after terminal
+    cleanup.
+    """
     backend = _ScriptedTransceiver()
     wrapper = _wrap(backend, monkeypatch)
     req = _request()
@@ -1025,6 +1173,9 @@ def test_reused_request_after_terminal_gets_a_fresh_observation(
 def test_receive_terminal_state_does_not_override_live_resource_owner(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify terminal request state cannot settle a still-owned receive
+    session.
+    """
     backend = _ScriptedTransceiver()
     backend.owned = True
     wrapper = _wrap(backend, monkeypatch)
@@ -1060,6 +1211,7 @@ def test_receive_status_arguments_and_result_identity_are_unchanged(
 def test_unknown_admission_cannot_reuse_a_stale_terminal_request_state(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
+    """Verify stale terminal state cannot settle uncertain new admission."""
     backend = object.__new__(BindKvCacheTransceiver)
     backend.impl = Mock()
     backend.impl.respond_and_send_async.side_effect = RuntimeError("unknown admission")
