@@ -19144,8 +19144,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         except ImportError:
             if not hasattr(cutlass, "tensor_utils"):
                 cutlass.tensor_utils = _cutlass_utils_compat
-        from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 import \
-            Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
+        from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 import (
+            DIE_COUNTER_STRIDE,
+            Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel)
 
         class Fc12FusedInputsHelper(GatherGroupedGemmInputsHelper):
             """Autotuning helper for the fused FC12 op.
@@ -19472,7 +19473,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # Three atomic counters zeroed by one fill (they sit on the
                 # routing chain); each scheduler counter on its own 128 B line,
                 # two lines per phase (one per locality domain).
-                ints_per_line = 32
+                ints_per_line = DIE_COUNTER_STRIDE
                 fc1_at = ((num_tiles + ints_per_line - 1) // ints_per_line *
                           ints_per_line)
                 fc2_at = fc1_at + 2 * ints_per_line

@@ -113,12 +113,13 @@ _EPI_BARRIER_BASE = 1
 #: domain 0 / 1 (own 128-byte lines); [CTR_MTILE_BASE + c] FC2 arrivals of m-tile c,
 #: [CTR_TILE_BASE + t] FC1 units stored / FC2 tasks started of tile t.
 CTR_DIE1 = 32
-#: Published routing: tokens whose top-k the routing kernel has published (release adds; the CTA
-#: that exits last resets it).
-CTR_ROUTE = 24
 CTR_FC2 = 48
 CTR_FC2_DIE1 = 56
-CTR_MTILE_BASE = 64
+#: Published routing: tokens whose top-k the routing kernel has published (release adds; the CTA
+#: that exits last resets it), on a 128-byte line of its own: the CTAs poll it while others claim
+#: work.
+CTR_ROUTE = 64
+CTR_MTILE_BASE = 96
 MAX_MTILES = 64
 CTR_TILE_BASE = CTR_MTILE_BASE + MAX_MTILES
 #: Bytes of the weight part of one ring stage (128 x 256 NVFP4).
