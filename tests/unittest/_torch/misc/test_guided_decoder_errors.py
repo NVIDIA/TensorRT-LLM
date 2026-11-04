@@ -330,3 +330,25 @@ def test_pp_executed_batch_fails_the_request_once_its_batch_is_synchronized(monk
 
     _between(log, ("fail", (7,), False), after=("synchronize", 1), before=("responses", 1))
     assert decoder.completed_batch_ids == [1]
+
+
+def test_overlap_loop_withholds_the_first_token_of_a_failed_request(monkeypatch):
+    """With early first-token responses, the failed request of the previous
+    batch gets no first-token response; its error follows, before the batch's
+    responses, once the batch is synchronized."""
+    log = []
+    decoder = _FakeCapturableDecoder({1: [(7, _ERROR)]})
+    executor = _loop_executor(monkeypatch, decoder, _three_batches()[:2], log)
+    executor.enable_early_first_token_response = True
+
+    def emit_first_token_responses(batch, skip_request_ids=frozenset()):
+        log.append(("first_tokens", batch.batch_no, frozenset(skip_request_ids)))
+
+    executor._emit_first_token_responses = emit_first_token_responses
+
+    PyExecutor._executor_loop_overlap(executor)
+
+    first_tokens = ("first_tokens", 1, frozenset({7}))
+    assert log.count(first_tokens) == 1, log
+    assert log.index(("synchronize", 1)) < log.index(first_tokens), log
+    _between(log, ("fail", (7,), False), after=first_tokens, before=("responses", 1))

@@ -333,7 +333,10 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
         executor.resource_manager.update_resources.side_effect = update_resources
         if state != "absent":
             executor.previous_batch = SimpleNamespace(
-                scheduled_requests=ScheduledRequests(), sample_state=Mock(), guided_batch_id=None
+                scheduled_requests=ScheduledRequests(),
+                sample_state=Mock(),
+                guided_batch_id=None,
+                guided_failures=None,
             )
         # A locally ready rank defers its previous batch while a peer cannot queue.
         executor._can_queue.return_value = (False, state == "deferred")

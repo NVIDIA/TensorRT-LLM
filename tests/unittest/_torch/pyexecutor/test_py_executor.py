@@ -4583,7 +4583,7 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
 
     if loop == "overlap":
         executor.previous_batch = types.SimpleNamespace(
-            scheduled_requests=batch, guided_batch_id=None
+            scheduled_requests=batch, guided_batch_id=None, guided_failures=None
         )
         executor.enable_early_first_token_response = False
         executor._process_previous_batch()
