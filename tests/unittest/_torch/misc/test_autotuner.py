@@ -2089,34 +2089,67 @@ def test_failed_profiling_capture_moves_to_a_fresh_graph_pool(monkeypatch):
     assert tuner._profile_graph_pool is None
 
 
-def test_parallel_split_deals_pairs_across_runners():
+def test_parallel_split_deals_pairs_across_runners(monkeypatch):
     """PARALLEL shares the (runner, tactic) pairs of all runners evenly.
 
+    Each rank of the group profiles only its share of a profile's pairs.
     Splitting each runner's tactics on its own would put the first tactic of
     every runner on group rank 0, so ranks with low indices would build and
     time most of the candidates while the others wait at the merge.
     """
+
+    class ListedTacticsRunner(TunableRunner):
+
+        def __init__(self, name: str, num_tactics: int):
+            self.name, self.num_tactics = name, num_tactics
+
+        def unique_id(self):
+            return (self.name, )
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return list(range(self.num_tactics))
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            return inputs[0]
+
+    timed = {}
+
+    def record_pair(self, runner, inputs, tactic, **kwargs):
+        timed.setdefault(self._tuning_group()[1], []).append(
+            (runner.name, tactic))
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
     group_size = 4
-    runner_tactics = [["cublas"], [f"direct{i}" for i in range(7)],
-                      [f"splitk{i}" for i in range(3)]]
-    shares = []
+    runners = [
+        ListedTacticsRunner("cublas", 1),
+        ListedTacticsRunner("direct", 7),
+        ListedTacticsRunner("splitk", 3)
+    ]
+    op = "autotuner_test::parallel_deal"
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    profile = OptimizationProfile([[StaticDim(8), StaticDim(64)]])
+    x = torch.zeros(8, 64)
     for rank in range(group_size):
         tuner = autotuner.AutoTuner()
         tuner.setup_distributed_state(Mapping(world_size=group_size,
                                               rank=rank,
                                               tp_size=group_size),
                                       dist=object())
-        share, offset = [], 0
-        for tactics in runner_tactics:
-            share += tuner._maybe_parallelize_tactics(
-                tactics, DistributedTuningStrategy.PARALLEL, offset=offset)
-            offset += len(tactics)
-        shares.append(share)
-    # Every pair is tuned on exactly one rank, and the shares differ by at most one.
-    assert sorted(t for share in shares
-                  for t in share) == sorted(t for tactics in runner_tactics
-                                            for t in tactics)
+        # choose_one sets these up before it profiles.
+        tuner.stats.tuned_op_profiled_configs[op] = 0
+        tuner.stats.failed_profiling_count[op] = set()
+        tuner._profile_runners_impl(op, runners, [x], profile, config)
+    shares = [timed.get(rank, []) for rank in range(group_size)]
+    # Every pair is timed on exactly one rank, and the shares differ by at most one.
+    assert sorted(pair for share in shares for pair in share) == sorted(
+        (r.name, t) for r in runners for t in range(r.num_tactics))
     assert max(map(len, shares)) - min(map(len, shares)) <= 1, shares
+    # The deal starts at the profile's start rank.
+    start = tuner._parallel_deal_start(op, profile,
+                                       DistributedTuningStrategy.PARALLEL)
+    assert shares[start][0] == ("cublas", 0), (start, shares)
 
 
 def test_parallel_search_cache_picks_fastest_runner():
