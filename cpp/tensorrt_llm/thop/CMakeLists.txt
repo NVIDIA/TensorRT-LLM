@@ -30,6 +30,7 @@ endif()
 
 add_library(th_utils STATIC thUtils.cpp)
 add_library(tllm::torch_utils ALIAS th_utils)
+# Torch headers require C++20 reversed operator== synthesis.
 target_compile_features(th_utils PUBLIC cxx_std_20)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_utils PUBLIC tllm::runtime_buffers ${TORCH_LIBRARIES}
