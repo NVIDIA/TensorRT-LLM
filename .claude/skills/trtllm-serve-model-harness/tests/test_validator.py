@@ -452,6 +452,55 @@ def test_protocol_diff_cannot_judge_a_cut_shard(tmp_path, capsys, damage):
     assert not out.exists() and str(cut) in capsys.readouterr().err
 
 
+def _diff_with_replies(tmp_path, side, edit):
+    """Exit code and row of an equal pair whose ``side`` replies are replaced by ``edit(record)``."""
+    chat, anth = controls.diff_runs(str(tmp_path / "d"))
+    shard = os.path.join(chat if side == "chat" else anth, "responses-x.jsonl")
+    with open(shard) as fh:
+        records = [json.loads(line) for line in fh]
+    with open(shard, "w") as fh:
+        fh.writelines(json.dumps(r) + "\n" for r in map(edit, records) if r is not None)
+    out = tmp_path / "report.json"
+    code = protocol_diff.main(["--out", str(out), f"chat={chat}", f"messages={anth}"])
+    return code, json.loads(out.read_text())["rows"][0]["messages"]
+
+
+def _cut_by_client(record):
+    first_frame = record["response"]["body"].split("\n\n")[0] + "\n\n"
+    return dict(record, status="client_disconnected",
+                response=dict(record["response"], body=first_frame))  # fmt: skip
+
+
+LOST = {"kind": "text", "body": "ServerDisconnectedError"}
+
+
+@pytest.mark.parametrize("side, edit, reason", [
+    ("anth", lambda r: None, "no_reply"),
+    ("chat", _cut_by_client, "client_cut"),
+    ("anth", lambda r: dict(r, status="upstream_error", http_status=502, response=LOST), "recorder_lost"),
+    ("anth", lambda r: dict(r, status="upstream_error", http_status=400), "recorder_lost"),
+    ("anth", lambda r: dict(r, status="recorder_shutdown", http_status=None,
+                            response={"kind": "none", "body": None}), "pending"),
+], ids=["no_reply", "client_cut", "unreachable", "lost_after_a_400", "pending"])  # fmt: skip
+def test_protocol_diff_does_not_judge_a_reply_the_server_did_not_end(tmp_path, side, edit, reason):
+    """A missing reply, or one cut by its client or the recorder, is not the server's: exit 2."""
+    code, row = _diff_with_replies(tmp_path, side, edit)
+    assert (code, row["attribution"]) == (2, "not_judged")
+    assert reason in row["not_judged"]
+
+
+@pytest.mark.parametrize("edit, code, attribution", [
+    (lambda r: dict(r, status="client_disconnected"), 0, "equal"),
+    (lambda r: dict(r, http_status=400, response={"kind": "json", "body": {
+        "type": "error", "error": {"type": "invalid_request_error", "message": "no"}}}),
+     1, "server_rejected"),
+], ids=["closed_after_the_end", "refused_by_the_server"])  # fmt: skip
+def test_protocol_diff_judges_a_reply_the_server_ended(tmp_path, edit, code, attribution):
+    """A client that closed after the terminal event cut nothing; a server's refusal is its own."""
+    got_code, row = _diff_with_replies(tmp_path, "anth", edit)
+    assert (got_code, row["attribution"], row["not_judged"]) == (code, attribution, [None, None])
+
+
 def test_verdict_names_the_matrix_bytes_it_read(tmp_path):
     """V-02: a verdict names its thresholds by the SHA-256 of the matrix file as read."""
     import hashlib

@@ -272,6 +272,7 @@ the server delivered.
   | `server_rejected` | One protocol path refused or broke off a request another path served |
   | `divergent_generation` | Same request and billed input, text that differs mid-way: two generations, not a conversion. Serve deterministically to settle it |
   | `after_divergence` | The history carries an earlier difference, a reasoning-only one included: replayed reasoning that differs makes the bill differ too |
+  | `not_judged` | A path has no reply, or one its client cut before the end, the recorder lost (R-06) or still had pending when it stopped: nothing of the server to compare. The row's `not_judged` names the reason |
 
 - **Exit codes:** 0 no server-side difference, 1 a server-side difference, 2 not conclusive.
 - **A `server_render` is settled offline.** Render both requests through the served build's own

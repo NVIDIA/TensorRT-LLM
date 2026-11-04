@@ -45,10 +45,15 @@ may legitimately replay it differently per API.
 attributed: serve the differential deterministically (no KV-cache block reuse,
 one request at a time) to settle it.
 
+`not_judged` (a turn whose reply on either path says nothing of the server, as the
+verdict reads it: no response record, a stream its client cut before the terminal
+event, a reply the recorder lost (R-06 counts it), or one pending when the recorder
+stopped) is not attributed either; the row's `not_judged` names the reason per path.
+
 Exit code: 0 no server-side difference; 1 a server-side difference; 2 not
-conclusive (no turns to compare, only divergent generations, or a shard that
-cannot be read to its end: the message names it, and no report is written);
-3 usage error.
+conclusive (no turns to compare, only divergent generations or turns not judged,
+or a shard that cannot be read to its end: the message names it, and no report is
+written); 3 usage error.
 Nothing in the report carries content: lengths and SHA-256 prefixes only.
 """
 
@@ -63,6 +68,7 @@ import proto_anthropic  # noqa: E402
 import proto_chat  # noqa: E402
 import proto_responses  # noqa: E402
 import usage as usage_mod  # noqa: E402
+from pipeline import CAPTURE_SIDE, CLIENT_SIDE, UPSTREAM_SIDE  # noqa: E402
 from tracelib import ShardError, expand_shards, iter_lines, load_json_line  # noqa: E402
 from turnlib import _canonical, content_text, sha256_text  # noqa: E402
 
@@ -235,9 +241,23 @@ def load_run(path: str) -> list:
                 "calls": [(i.name, _args(i.payload)) for i in delivered if i.kind == "call"],
                 "terminal": reply.terminal.get("kind") if reply else None,
                 "http_status": reply_rec.get("http_status") if reply_rec else None,
+                "not_judged": _unjudged(reply),
             },
         })  # fmt: skip
     return turns
+
+
+def _unjudged(reply):
+    """Why a reply says nothing of the server, as the verdict reads it; None when it does."""
+    if reply is None:
+        return "no_reply"  # no response record: a gap in the capture
+    if reply.status in CLIENT_SIDE and reply.terminal.get("kind") == "none":
+        return "client_cut"  # cut before its terminal event: incomplete by construction
+    if reply.status in UPSTREAM_SIDE:
+        return "recorder_lost"  # the recorder's own error, or the server's bytes up to the loss
+    if reply.status in CAPTURE_SIDE:
+        return "pending"  # the recorder stopped before the reply ended
+    return None
 
 
 def _semantic_schema(value):
@@ -289,7 +309,7 @@ def _reply_difference(a: dict, b: dict) -> str:
 
 def _failed(reply: dict) -> bool:
     status = reply.get("http_status")
-    return (isinstance(status, int) and status >= 400) or reply.get("terminal") in ("error", None)
+    return (isinstance(status, int) and status >= 400) or reply.get("terminal") == "error"
 
 
 def _lengths(reply: dict) -> list:
@@ -329,7 +349,11 @@ def compare(runs: dict) -> dict:
             same_meaning = _request_key(ref["conversation"], False, True) == \
                 _request_key(other["conversation"], False, True)  # fmt: skip
             failed = [_failed(ref["reply"]), _failed(other["reply"])]
-            if same_meaning and failed[0] != failed[1]:
+            unjudged = [ref["reply"].get("not_judged"), other["reply"].get("not_judged")]
+            if any(unjudged):
+                # A reply missing or cut on its way says nothing of either protocol path.
+                verdict = "not_judged"
+            elif same_meaning and failed[0] != failed[1]:
                 # One protocol path refused or broke off what another served.
                 verdict = "server_rejected"
             elif not same_request and label in diverged:
@@ -356,6 +380,7 @@ def compare(runs: dict) -> dict:
                 "billed_input": [ref["billed_input"], other["billed_input"]],
                 "reply_equal": reply_same,
                 "reply_lengths": [_lengths(ref["reply"]), _lengths(other["reply"])],
+                "not_judged": unjudged,
                 "attribution": verdict,
             }
         rows.append(row)
@@ -393,7 +418,8 @@ def main(argv=None) -> int:
     server = ("server_render", "server_output", "server_rejected")
     if any(report["attributions"].get(k) for k in server):
         return 1
-    return 2 if report["attributions"].get("divergent_generation") else 0
+    inconclusive = ("divergent_generation", "not_judged")
+    return 2 if any(report["attributions"].get(k) for k in inconclusive) else 0
 
 
 if __name__ == "__main__":
