@@ -66,6 +66,8 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(ENABLE_NANOBIND_PROFILING
+       "Emit PyTorch profiler regions around TensorRT-LLM nanobind calls" OFF)
 option(ENABLE_NCCL_PROFILING
        "Emit PyTorch profiler regions around NcclCommunicatorOp send/recv calls"
        OFF)
