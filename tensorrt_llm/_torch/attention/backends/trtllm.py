@@ -277,6 +277,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_owned_new_tokens_cpu: Optional[torch.Tensor] = None
     _helix_spec_tokens_valid: bool = False
 
+    @property
+    def helix_spec_tokens_valid(self) -> bool:
+        """Whether the per-token helix buffers above describe this step's verify groups."""
+        return self._helix_spec_tokens_valid
+
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None

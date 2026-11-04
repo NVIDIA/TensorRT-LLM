@@ -22,13 +22,16 @@ is a ``RuntimeHooks.decode_prologue`` that writes the same values with one
 kernel instead of one launch per buffer.
 """
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import triton
 import triton.language as tl
 
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
+
+if TYPE_CHECKING:
+    from ..pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 
 
 @triton.jit
@@ -195,7 +198,7 @@ class SpecDecodeHead:
 
     def __call__(
         self,
-        preparer: Any,
+        preparer: "DecoderInputPreparer",
         inputs: dict[str, Any],
         *,
         enable_spec_decode: bool,
@@ -210,7 +213,7 @@ class SpecDecodeHead:
             return False
         kv_lens = md.kv_lens_cuda
         overlap = preparer.overlap_scheduler_enabled
-        helix = preparer.mapping.has_cp_helix() and md._helix_spec_tokens_valid
+        helix = preparer.mapping.has_cp_helix() and md.helix_spec_tokens_valid
         position_ids = inputs["position_ids"]
         if (
             not (overlap or helix)
@@ -222,12 +225,7 @@ class SpecDecodeHead:
         num_ctx_tokens = md.num_ctx_tokens
         gen_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
         num_ctx_requests = md.num_contexts
-        num_chunked = md.num_chunked_ctx_requests
-        if num_ctx_requests >= num_chunked and num_chunked > 0:
-            # Generation requests with draft tokens run as chunked context requests.
-            kv_start, num_kv = num_ctx_requests - num_chunked, num_chunked
-        else:
-            kv_start, num_kv = num_ctx_requests, md.num_generations
+        kv_start, num_kv = preparer.spec_decode_kv_range(md)
         helix_kwargs = {}
         if helix:
             tokens_per_seq = preparer.get_runtime_tokens_per_gen_step(runtime_draft_len)
