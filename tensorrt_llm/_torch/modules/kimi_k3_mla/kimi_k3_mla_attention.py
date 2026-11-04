@@ -33,7 +33,7 @@ from ...distributed import AllReduceParams
 from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
-from ..linear import Linear, TensorParallelMode
+from ..linear import Linear, TensorParallelMode, _fp8_block_scales_uses_cute_dsl_sm107
 from ..multi_stream_utils import do_multi_stream
 from ..projection_capabilities import GatedEpilogueProjection, PrequantizedInputProjection
 from ..rms_norm import RMSNorm
@@ -379,9 +379,9 @@ class KimiK3MLAAttention(MLA):
         )
 
     def _q_b_exponents(self) -> Optional[torch.Tensor]:
-        """Block exponents of the q_b weight (``k3_mla_q_fused.block_exponents``), cached per
-        weight scale; None for a scale layout the kernel does not read, or while capturing a
-        CUDA graph before the first eager step built them."""
+        """Block exponents of the q_b weight from the scale layout its linear holds, cached per
+        weight scale; None for a scale the kernel does not read, or while capturing a CUDA graph
+        before the first eager step built them."""
         scale = self.q_b_proj.weight_scale
         cached = self._q_b_block_exponents
         if cached is not None and cached[0] is scale:
@@ -390,8 +390,12 @@ class KimiK3MLAAttention(MLA):
             return None
         from ...kernels.blackwell import k3_mla_q_fused
 
+        if _fp8_block_scales_uses_cute_dsl_sm107(self.q_b_proj):
+            from_scale = k3_mla_q_fused.block_exponents_from_r128c4
+        else:
+            from_scale = k3_mla_q_fused.block_exponents_from_fp32
         try:
-            exponents = k3_mla_q_fused.block_exponents(scale, *self.q_b_proj.weight.shape)
+            exponents = from_scale(scale, *self.q_b_proj.weight.shape)
         except ValueError:
             exponents = None
         self._q_b_block_exponents = (scale, exponents)

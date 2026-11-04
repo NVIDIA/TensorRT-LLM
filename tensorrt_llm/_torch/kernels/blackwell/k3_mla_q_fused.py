@@ -1527,22 +1527,27 @@ def _device_ok(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) == (10, 7)
 
 
-def block_exponents(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
+def block_exponents_from_fp32(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """UE8M0 exponents ``uint8 [ceil(n / 128), k / 128]`` of a 128x128 block-scaled FP8 weight
-    from its scale as the K3 FP8 projections hold it: power-of-two FP32 block scales, or the
-    Rubin MXFP8 GEMM's R128c4 UE8M0 layout (``transform_k128_scales_to_cutedsl_mxfp8_layout``,
-    whose 512-byte atoms start with the block exponent)."""
+    from its FP32 block scales (powers of two)."""
     nb, kb = _ceil_div(n, 128), k // 128
-    if weight_scale.dtype == torch.uint8 and weight_scale.numel() == nb * kb * 512:
-        return weight_scale.reshape(nb, kb, 512)[:, :, 0].contiguous()
-    if weight_scale.dtype == torch.float32 and weight_scale.numel() == nb * kb:
-        bits = weight_scale.reshape(nb, kb).contiguous().view(torch.int32)
-        if bool(((bits & 0x7FFFFF) != 0).any()):
-            raise ValueError("block scales must be powers of two")
-        return ((bits >> 23) & 0xFF).to(torch.uint8)
-    raise ValueError(
-        f"unsupported q_b weight scale {tuple(weight_scale.shape)} {weight_scale.dtype}"
-    )
+    if weight_scale.dtype != torch.float32 or weight_scale.numel() != nb * kb:
+        raise ValueError(f"expected FP32 [{nb}, {kb}] block scales")
+    bits = weight_scale.reshape(nb, kb).contiguous().view(torch.int32)
+    if bool(((bits & 0x7FFFFF) != 0).any()):
+        raise ValueError("block scales must be powers of two")
+    return ((bits >> 23) & 0xFF).to(torch.uint8)
+
+
+def block_exponents_from_r128c4(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """UE8M0 exponents ``uint8 [ceil(n / 128), k / 128]`` of a 128x128 block-scaled FP8 weight
+    from its scale in the Rubin MXFP8 GEMM's R128c4 UE8M0 layout
+    (``transform_k128_scales_to_cutedsl_mxfp8_layout``: every 512-byte atom starts with the
+    block exponent)."""
+    nb, kb = _ceil_div(n, 128), k // 128
+    if weight_scale.dtype != torch.uint8 or weight_scale.numel() != nb * kb * 512:
+        raise ValueError(f"expected uint8 R128c4 scales of {nb} x {kb} blocks")
+    return weight_scale.reshape(nb, kb, 512)[:, :, 0].contiguous()
 
 
 def weights_supported(w_qb: torch.Tensor, w_uk: torch.Tensor) -> bool:
@@ -1602,7 +1607,7 @@ def k3_mla_q_fused(
     Args:
         x: BF16 ``[T, 1536]`` normalized q_a latent (row stride a multiple of 8 elements).
         w_qb: q_b weight, FP8 ``[96 * 192, 1536]``; ``w_qb_exp``: its block exponents
-            (:func:`block_exponents`).
+            (:func:`block_exponents_from_fp32`, :func:`block_exponents_from_r128c4`).
         w_uk: BF16 absorption weight ``[96, 512, 128]``.
         q_global_scale: FP32 ``[1]`` global scale of the FP4 query.
         cos_sin: FP32 rotary table, 128 values ``(cos, sin)`` per position.
@@ -1715,7 +1720,8 @@ __all__ = [
     "weights_supported",
     "Q_ROW_BYTES",
     "Q_SF_COLS",
-    "block_exponents",
+    "block_exponents_from_fp32",
+    "block_exponents_from_r128c4",
     "can_run",
     "k3_mla_q_fused",
     "smem_bytes",
