@@ -834,7 +834,13 @@ def test_plain_dflash_block_decode_matches_full_attention_reference():
     assert diff < 0.02, f"plain DFlash parity failed: max abs diff {diff}"
 
 
-def _paged_block_decode_inputs(drafter, captured, noise_embed, cache_dtype, page_size=32):
+def _paged_block_decode_inputs(
+    drafter: DFlashForCausalLM,
+    captured: list[torch.Tensor],
+    noise_embed: list[torch.Tensor],
+    cache_dtype: torch.dtype,
+    page_size: int = 32,
+) -> dict[str, torch.Tensor | list[torch.Tensor] | None]:
     """Block decode through the TRTLLM paged cache, one request per history.
 
     Pages are shuffled across requests, so only the block tables decide which
@@ -877,14 +883,20 @@ def _paged_block_decode_inputs(drafter, captured, noise_embed, cache_dtype, page
     )
 
 
-def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_size=32):
+def _run_paged_block_decode(
+    drafter: DFlashForCausalLM,
+    captured: list[torch.Tensor],
+    noise_embed: list[torch.Tensor],
+    cache_dtype: torch.dtype,
+    page_size: int = 32,
+) -> torch.Tensor:
     inputs = _paged_block_decode_inputs(drafter, captured, noise_embed, cache_dtype, page_size)
     out = drafter.dflash_forward(**inputs)
     return out.float().cpu().view(len(captured), TINY["block_size"], -1)
 
 
 @needs_trtllm_gen
-def test_trtllm_paged_block_decode_matches_full_attention_reference():
+def test_trtllm_paged_block_decode_matches_full_attention_reference() -> None:
     """Folded BF16 block decode matches full attention over each request's pages."""
     weights = _tiny_weights()
     drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
@@ -909,7 +921,9 @@ def test_trtllm_paged_block_decode_matches_full_attention_reference():
 
 
 @needs_trtllm_gen
-def test_trtllm_paged_fp8_cache_is_rejected_before_mutation(monkeypatch):
+def test_trtllm_paged_fp8_cache_is_rejected_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dataclasses import replace
 
     weights = _tiny_weights()
@@ -921,7 +935,7 @@ def test_trtllm_paged_fp8_cache_is_rejected_before_mutation(monkeypatch):
     caches = inputs["ctx_kv_cache"]
     before = [cache.view(torch.uint8).clone() for cache in caches]
 
-    def unexpected_mutation(*args, **kwargs):
+    def unexpected_mutation(*args: object, **kwargs: object) -> None:
         pytest.fail("FP8 cache rejection must precede buffer preparation and paged append")
 
     monkeypatch.setattr(drafter, "_prepare_dflash_trtllm_gen_buffers", unexpected_mutation)

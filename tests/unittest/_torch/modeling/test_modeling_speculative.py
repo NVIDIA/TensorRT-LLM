@@ -748,7 +748,9 @@ def test_external_draft_inherits_block_scaling_backend(enabled: bool) -> None:
 @pytest.mark.parametrize(
     "block,heads,kv_heads,chunk", [(16, 12, 1, 10), (9, 32, 2, 8), (21, 6, 2, 21)]
 )
-def test_dflash_workspace_sizes_the_largest_folded_chunk(block, heads, kv_heads, chunk):
+def test_dflash_workspace_sizes_the_largest_folded_chunk(
+    block: int, heads: int, kv_heads: int, chunk: int
+) -> None:
     wrapper = _fake_dflash_buffer_wrapper()
     wrapper.validate_block_attention_windows.return_value = ["non-causal folded decode"]
     with (

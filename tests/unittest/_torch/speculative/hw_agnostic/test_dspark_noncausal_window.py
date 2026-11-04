@@ -573,7 +573,9 @@ def test_dflash_paged_cache_dtype_is_validated_before_allocation(
         (43, 6, 2, [252, 6]),
     ],
 )
-def test_folded_decode_chunks_preserve_full_attention(block, heads, kv_heads, expected_heads):
+def test_folded_decode_chunks_preserve_full_attention(
+    block: int, heads: int, kv_heads: int, expected_heads: list[int]
+) -> None:
     """Independent dense attention checks head grouping, query order and the tail chunk."""
     torch.manual_seed(302 + block)
     batch, dim = 2, 8
@@ -623,7 +625,9 @@ def test_folded_decode_chunks_preserve_full_attention(block, heads, kv_heads, ex
 @pytest.mark.parametrize(
     "block,heads,kv_heads", [(16, 12, 1), (16, 24, 2)] + [(b, 16, 1) for b in range(9, 16)]
 )
-def test_folded_runtime_accepts_large_blocks_by_chunking(block, heads, kv_heads):
+def test_folded_runtime_accepts_large_blocks_by_chunking(
+    block: int, heads: int, kv_heads: int
+) -> None:
     with patch("tensorrt_llm._torch.speculative.dflash_attention.get_dflash_trtllm_gen_ops"):
         validate_dflash_trtllm_gen_runtime(
             dtype=torch.bfloat16,
@@ -644,7 +648,9 @@ def test_folded_runtime_accepts_large_blocks_by_chunking(block, heads, kv_heads)
     "block,heads,kv_heads",
     [(0, 16, 1), (-1, 16, 1), (4, 0, 1), (4, 16, 0), (4, 7, 2), (4, 64, 1)],
 )
-def test_folded_chunk_plan_rejects_unsupported_base_shapes(block, heads, kv_heads):
+def test_folded_chunk_plan_rejects_unsupported_base_shapes(
+    block: int, heads: int, kv_heads: int
+) -> None:
     with pytest.raises(RuntimeError, match="positive|divisible|validated"):
         get_dflash_folded_decode_chunk_size(block, heads, kv_heads)
 
@@ -652,7 +658,7 @@ def test_folded_chunk_plan_rejects_unsupported_base_shapes(block, heads, kv_head
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["TRTLLM", "FA4"])
 @pytest.mark.parametrize("bad_layer", [0, 1])
-def test_paged_fp8_rejection_precedes_model_or_cache_mutation(backend, bad_layer):
+def test_paged_fp8_rejection_precedes_model_or_cache_mutation(backend: str, bad_layer: int) -> None:
     from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 
     wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
@@ -683,7 +689,9 @@ def test_paged_fp8_rejection_precedes_model_or_cache_mutation(backend, bad_layer
     [(1, 4, 2), (4, 8, 2), (4, 16, 1), (8, 16, 1), (16, 12, 1), (16, 24, 2)]
     + [(block, 16 * kv_heads, kv_heads) for block in range(9, 16) for kv_heads in (1, 2)],
 )
-def test_trtllm_folded_chunks_match_full_attention_and_graph(block, heads, kv_heads):
+def test_trtllm_folded_chunks_match_full_attention_and_graph(
+    block: int, heads: int, kv_heads: int
+) -> None:
     """Large effective ratios, multiple KV groups and partial final chunks."""
     ops = _trtllm_gen_ops_or_skip()
     torch.manual_seed(403 + block + heads)
