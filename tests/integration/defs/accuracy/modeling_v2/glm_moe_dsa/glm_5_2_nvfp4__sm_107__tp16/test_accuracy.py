@@ -14,10 +14,6 @@
 # limitations under the License.
 """Whole-model gate for the glm_moe_dsa modeling_v2 target glm_5_2_nvfp4__sm_107__tp16.
 
-One directory per target under accuracy/modeling_v2/, rather than inside
-test_glm52.py: these gate a parallel implementation, and reading them next to
-the built-in model's tests would invite treating one as a variant of the other.
-
 Every test here passes ``modeling_v2="require"`` to ``LLM``. Under ``"auto"`` a
 configuration that missed a target's criteria -- or fell outside its bounds --
 would quietly fall back to the built-in implementation, pass, and report the

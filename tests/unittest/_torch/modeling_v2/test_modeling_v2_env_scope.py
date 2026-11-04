@@ -112,7 +112,6 @@ def test_scope_restores_partial_setup_failure(monkeypatch) -> None:
 _ACCURACY_SOURCES = sorted(
     path for path in _ACCURACY_ROOT.rglob("*.py") if path.name != "__init__.py" and path != _SOURCE
 )
-_TARGET_DIRS = sorted({path.parent for path in _ACCURACY_ROOT.glob("*/*/test_*.py")})
 
 
 def _relative(path: Path) -> str:
@@ -130,16 +129,6 @@ def _llm_calls(tree: ast.AST) -> list[ast.Call]:
 def test_accuracy_scan_finds_sources() -> None:
     # An empty parametrize list would skip the scope check instead of failing it.
     assert _ACCURACY_SOURCES, f"no accuracy sources found under {_ACCURACY_ROOT}"
-    assert _TARGET_DIRS, f"no <family>/<target>/test_*.py found under {_ACCURACY_ROOT}"
-
-
-@pytest.mark.parametrize("target_dir", _TARGET_DIRS, ids=_relative)
-def test_accuracy_targets_construct_engines(target_dir: Path) -> None:
-    # A target's tests may build the engine in their family's shared modules.
-    sources = sorted(target_dir.glob("test_*.py")) + sorted(target_dir.parent.glob("_*.py"))
-    assert any(_llm_calls(ast.parse(source.read_text())) for source in sources), (
-        f"{_relative(target_dir)} contains no accuracy engine"
-    )
 
 
 @pytest.mark.parametrize("source", _ACCURACY_SOURCES, ids=_relative)

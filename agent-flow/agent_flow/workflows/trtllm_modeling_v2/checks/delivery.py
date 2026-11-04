@@ -656,10 +656,14 @@ def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
         )
     ]
     db = repo_root / TEST_DB_DIR
+    # Test-db entries name tests relative to the defs root, by file or by a directory above it.
+    wanted = f"{Path(ACCURACY_TESTS_DIR).name}/{accuracy_test}"
     listed: list[str] = []
     if db.is_dir():
         for yml in sorted(db.glob("*.yml")):
-            if accuracy_test in yml.read_text(encoding="utf-8"):
+            entries = re.findall(r"^\s*-\s+(\S+)", yml.read_text(encoding="utf-8"), re.MULTILINE)
+            paths = {entry.split("::")[0].rstrip("/") for entry in entries}
+            if any(wanted == path or wanted.startswith(f"{path}/") for path in paths):
                 listed.append(yml.name)
     checks.append(
         Check(

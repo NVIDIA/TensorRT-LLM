@@ -335,12 +335,19 @@ per model family, loaded only when routing picks one of the family's targets),
 plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
 native build module `cpp/cmake/modules/modeling_v2.cmake`.
 
-Scope — per target, per family, else all of modeling_v2. The test tree
-mirrors the code tree. A directory `models/<family>/<target>/` is a target
-when `accuracy/modeling_v2/<family>/<target>/` exists; its tests are
+Scope — per target, per family, else all of modeling_v2. Targets are
+defined by code, and the test tree mirrors the code tree. A directory
+`models/<family>/<target>/` is a target when a function in the family's
+`routing.py` decorated with `@routes(...)` returns a class that `routing.py`
+imports with `from .<target>... import <Class>`. Its tests are
 `unittest/_torch/modeling_v2/models/<family>/<target>` and
 `accuracy/modeling_v2/<family>/<target>`. Everything else under
-`models/<family>/` is family code.
+`models/<family>/` is family code. When `routing.py` is missing, does not
+parse, or returns anything else, every path of the family is family code and
+the whole family's tests stand in for those of its targets. The CPU check
+`tests/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py` requires
+every target to have an accuracy directory and every accuracy directory to
+name a target.
 
 | Changed file | Selects |
 |---|---|
@@ -353,7 +360,9 @@ when `accuracy/modeling_v2/<family>/<target>/` exists; its tests are
 
 The rule reads imports from the checkout, which in CI is the PR head: it
 parses every Python file of the subtree and of `tests/unittest/_torch/modeling_v2/`
-once per run. Relative imports, package `__init__` files, imports inside
+once per run. Imports and routing are read by `modeling_v2_source.py`, a
+standard-library-only module that the CPU check above loads by path, so the
+rule and the check read imports the same way. Relative imports, package `__init__` files, imports inside
 functions and constant `importlib.import_module` calls count, also when the
 file binds `import_module` to another name. A module depends on its own
 packages as well, since importing it runs their `__init__` files. A computed

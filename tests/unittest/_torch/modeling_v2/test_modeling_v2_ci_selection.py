@@ -5,29 +5,33 @@
 For a change under ``models/<family>/``, CI runs only the tests of what the change
 can reach (``jenkins/scripts/cbts/cbts/rules/modeling_v2.py``): one target, the
 targets that import a changed family-level module, or the whole family. A target
-is a directory ``models/<family>/<D>/`` with accuracy tests in
-``accuracy/modeling_v2/<family>/<D>/``. The rule maps paths, not names, so it is
-safe only while:
+is a directory ``models/<family>/<D>/`` that the family's ``routing.py`` returns a
+class from. The rule maps paths, not names, so it is safe only while:
 
 * no family reaches another family's code, and no stock code reaches modeling_v2;
 * no code reaches into a target except the target itself and the family's
   ``routing.py``;
-* test directories mirror source directories, and every target a ``route`` can
-  return has accuracy tests;
-* some test-db entry runs every modeling_v2 test;
+* test directories mirror source directories: every target has accuracy tests in
+  ``accuracy/modeling_v2/<family>/<D>/``, and every accuracy directory names a
+  target;
+* some test-db entry runs every modeling_v2 unit test, and some test-db or QA list
+  entry runs every target's accuracy tests;
 * every dynamic import names a module the rule's import analysis can read.
 
-This file sits directly under ``tests/unittest/_torch/modeling_v2/`` so CI keeps it
-for every modeling_v2 change. It reads files only. Each test takes the repository
-root as a default argument, so it can also run against a small fake tree.
+Imports and routing are read with the rule's own parser,
+``jenkins/scripts/cbts/cbts/rules/modeling_v2_source.py``, so the two cannot
+disagree on what a file imports. This file sits directly under
+``tests/unittest/_torch/modeling_v2/`` so CI keeps it for every modeling_v2 change.
+It reads files only. Each test takes the repository root as a default argument, so
+it can also run against a small fake tree.
 """
 
 from __future__ import annotations
 
 import ast
 import fnmatch
+import importlib.util
 import re
-from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
@@ -40,8 +44,20 @@ _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "tests/unittest/_torch/modeling_v2"
 _ACC = "tests/integration/defs/accuracy/modeling_v2"
 _TEST_DB = "tests/integration/test_lists/test-db"
+_QA_LISTS = "tests/integration/test_lists/qa"
 _REPO = Path(__file__).resolve().parents[4]
-_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
+
+
+def _load_source_parser():
+    path = _REPO / "jenkins/scripts/cbts/cbts/rules/modeling_v2_source.py"
+    spec = importlib.util.spec_from_file_location("_cbts_modeling_v2_source", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_source = _load_source_parser()
+_PACKAGE = _source.PACKAGE
 _MODELS_PACKAGE = f"{_PACKAGE}.models"
 _NATIVE_SUFFIXES = (".cu", ".cuh", ".h", ".hpp", ".inl", ".cpp")
 _INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
@@ -51,32 +67,27 @@ def _families(repo: Path = _REPO) -> list[Path]:
     return sorted(p.parent for p in (repo / _PY / "models").glob("*/__init__.py"))
 
 
-def _targets(family_dir: Path, repo: Path = _REPO) -> list[Path]:
-    """The family's directories that have accuracy tests, which is what makes them targets."""
-    accuracy = repo / _ACC / family_dir.name
-    return sorted(p for p in family_dir.iterdir() if p.is_dir() and (accuracy / p.name).is_dir())
+def _route_returns(family_dir: Path) -> list[tuple[ast.Return, str | None]]:
+    """Each return of the family's ``route`` functions, with the target directory it returns."""
+    routing = family_dir / "routing.py"
+    return _source.route_returns(ast.parse(routing.read_text())) if routing.is_file() else []
 
 
-def _imported_modules(node: ast.AST, package: str) -> list[str]:
-    """The absolute names an import statement in ``package`` reaches, one per imported name."""
-    if isinstance(node, ast.Import):
-        return [alias.name for alias in node.names]
-    if isinstance(node, ast.ImportFrom):
-        module = node.module or ""
-        if node.level:
-            module = resolve_name("." * node.level + module, package)
-        return [f"{module}.{alias.name}" for alias in node.names]
-    return []
+def _targets(family_dir: Path) -> list[Path]:
+    """The directories the family's ``routing.py`` returns classes from, which makes them targets."""
+    names = {target for _, target in _route_returns(family_dir) if target}
+    return sorted(family_dir / name for name in names if (family_dir / name).is_dir())
+
+
+def _package(path: Path, repo: Path) -> str:
+    """The package a Python file of the repository sits in."""
+    return ".".join(path.parent.relative_to(repo).parts)
 
 
 def _imports(path: Path, repo: Path) -> list[str]:
-    """Every absolute name a Python file of the package imports."""
-    package = ".".join((_PACKAGE, *path.parent.relative_to(repo / _PY).parts))
-    return [
-        module
-        for node in ast.walk(ast.parse(path.read_text()))
-        for module in _imported_modules(node, package)
-    ]
+    """Every absolute name a Python file imports, ``import_module`` literals included."""
+    names, _ = _source.imported_names(ast.parse(path.read_text()), _package(path, repo))
+    return sorted(names)
 
 
 def test_families_do_not_reach_each_other(repo: Path = _REPO):
@@ -113,12 +124,19 @@ def test_stock_code_does_not_reach_modeling_v2(repo: Path = _REPO):
     No family import, op call or fake registration in Python, and no modeling_v2
     header in C++.
     """
-    offenders = [
-        str(path.relative_to(repo))
-        for path in sorted((repo / "tensorrt_llm").rglob("*.py"))
-        if not path.is_relative_to(repo / _PY)
-        and _STOCK_PY_REFERENCE.search(path.read_text(errors="ignore"))
-    ]
+    offenders = []
+    for path in sorted((repo / "tensorrt_llm").rglob("*.py")):
+        if path.is_relative_to(repo / _PY):
+            continue
+        text = path.read_text(errors="ignore")
+        if _STOCK_PY_REFERENCE.search(text) or (
+            "modeling_v2" in text
+            and any(
+                module == _MODELS_PACKAGE or module.startswith(f"{_MODELS_PACKAGE}.")
+                for module in _imports(path, repo)
+            )
+        ):
+            offenders.append(str(path.relative_to(repo)))
     for root in ("cpp/tensorrt_llm", "cpp/include", "cpp/tests"):
         for path in sorted((repo / root).rglob("*")):
             # Generated cubin sources are large and include nothing of interest.
@@ -144,7 +162,7 @@ def test_only_routing_reaches_into_targets(repo: Path = _REPO):
     for family_dir in _families(repo):
         family = family_dir.name
         package = f"{_MODELS_PACKAGE}.{family}."
-        targets = {p.name for p in _targets(family_dir, repo)}
+        targets = {p.name for p in _targets(family_dir)}
         for path in sorted(family_dir.rglob("*")):
             relative = path.relative_to(family_dir)
             if relative == Path("routing.py"):
@@ -189,7 +207,7 @@ def test_unit_test_directories_mirror_source(repo: Path = _REPO):
     unmatched = []
     for family_dir in _families(repo):
         tests = repo / _UNIT / "models" / family_dir.name
-        targets = {p.name for p in _targets(family_dir, repo)}
+        targets = {p.name for p in _targets(family_dir)}
         for d in sorted(tests.rglob("*")):
             relative = d.relative_to(tests)
             if (
@@ -203,48 +221,31 @@ def test_unit_test_directories_mirror_source(repo: Path = _REPO):
 
 
 def test_accuracy_directories_are_targets(repo: Path = _REPO):
-    """``accuracy/modeling_v2/<family>/<D>/`` names a source directory and holds tests."""
+    """``accuracy/modeling_v2/<family>/<D>/`` names a target and holds tests."""
     problems = []
     for family_dir in _families(repo):
         accuracy = repo / _ACC / family_dir.name
+        targets = {p.name for p in _targets(family_dir)}
         for d in sorted(accuracy.iterdir()) if accuracy.is_dir() else []:
             if not d.is_dir() or d.name.startswith("_"):
                 continue
             where = d.relative_to(repo)
-            if not (family_dir / d.name).is_dir():
-                problems.append(f"{where}: no {family_dir.relative_to(repo)}/{d.name}/")
+            if d.name not in targets:
+                problems.append(
+                    f"{where}: {family_dir.relative_to(repo)}/routing.py returns no class "
+                    f"from {d.name}/"
+                )
             if not any(d.glob("test_*.py")):
                 problems.append(f"{where}: no test_*.py")
     assert not problems, "\n".join(problems)
 
 
-def _route_returns(routing: Path) -> list[ast.Return]:
-    """The ``return`` statements of the functions in ``routing`` decorated with ``@routes(...)``."""
-    returns = []
-    for function in ast.walk(ast.parse(routing.read_text())):
-        if isinstance(function, ast.FunctionDef) and any(
-            isinstance(d, ast.Call)
-            and getattr(d.func, "id", getattr(d.func, "attr", None)) == "routes"
-            for d in function.decorator_list
-        ):
-            # Only the function's own returns, not those of a function nested in it.
-            todo = list(function.body)
-            while todo:
-                node = todo.pop()
-                if isinstance(node, ast.Return):
-                    returns.append(node)
-                elif not isinstance(
-                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-                ):
-                    todo.extend(ast.iter_child_nodes(node))
-    return sorted(returns, key=lambda node: node.lineno)
-
-
 def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
-    """Every class a family's ``route`` returns lives in a directory with accuracy tests.
+    """Every class a family's ``route`` returns lives in a target with accuracy tests.
 
     ``routing.py`` imports each target class with ``from .<D>.<module> import <Class>``,
-    so the target directory ``<D>`` is read from that import.
+    so the target directory ``<D>`` is read from that import. CBTS reads targets the
+    same way, and tests a family whole while one of its returns is unknown.
     """
     problems = []
     for family_dir in _families(repo):
@@ -253,44 +254,21 @@ def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
         if not routing.is_file():
             problems.append(f"{where}: missing")
             continue
-        # Name -> the first package of the ``from .<package>... import <name>`` that binds it.
-        bound = {
-            alias.asname or alias.name: node.module.split(".")[0]
-            for node in ast.walk(ast.parse(routing.read_text()))
-            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module
-            for alias in node.names
-        }
-        returns = _route_returns(routing)
+        returns = _route_returns(family_dir)
         if not returns:
             problems.append(f"{where}: no return in a @routes(...) function")
-        for node in returns:
-            name = node.value.id if isinstance(node.value, ast.Name) else None
-            if name not in bound:
+        for node, target in returns:
+            if target is None:
                 problems.append(
-                    f"{where}:{node.lineno}: returns something other than a name bound by "
+                    f"{where}:{node.lineno}: returns something other than a name bound only by "
                     "`from .<D>.<module> import <Class>`, so its target is unknown"
                 )
-            elif not (repo / _ACC / family_dir.name / bound[name]).is_dir():
+            elif not (repo / _ACC / family_dir.name / target).is_dir():
                 problems.append(
-                    f"{where}:{node.lineno}: {name} from {bound[name]}/ has no "
-                    f"{_ACC}/{family_dir.name}/{bound[name]}/"
+                    f"{where}:{node.lineno}: {node.value.id} from {target}/ has no "
+                    f"{_ACC}/{family_dir.name}/{target}/"
                 )
     assert not problems, "\n".join(problems)
-
-
-# Test-db paths that no test-db entry runs, and why. An entry that becomes reached,
-# or names a path that no longer exists, fails the test, so the list stays current.
-_UNREACHED = {
-    "accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16": (
-        "no test-db entry yet (SM 10.7, TP16); run manually"
-    ),
-    "accuracy/modeling_v2/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4": (
-        "only in qa/llm_function_multinode.txt, not in CI"
-    ),
-    "accuracy/modeling_v2/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1": (
-        "only in qa/llm_function_multinode.txt, not in CI"
-    ),
-}
 
 
 def _test_db_entries(repo: Path) -> list[str]:
@@ -323,34 +301,51 @@ def _runs(entry: str, path: str) -> bool:
     return True
 
 
-def test_every_test_is_in_test_db(repo: Path = _REPO):
-    """Some test-db entry runs every unit test file and every target's accuracy tests.
+def _qa_entries(repo: Path) -> list[str]:
+    return [
+        line.strip()
+        for path in sorted((repo / _QA_LISTS).glob("*.txt"))
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
 
-    Paths are in test-db form: unit tests relative to ``tests/``, accuracy tests
-    relative to ``tests/integration/defs/``. Only paths are compared: the
-    ``-m cpu_only`` and ``-m "not cpu_only"`` split between stages is not checked.
+
+def test_every_test_is_in_a_test_list(repo: Path = _REPO):
+    """Every modeling_v2 test is in a list some job runs.
+
+    A test-db entry runs every unit test file. A test-db or QA list entry runs every
+    target's accuracy tests: targets on hardware CI does not have, such as 16-GPU
+    deployments, run from the QA lists. Paths are in test-db form: unit tests relative
+    to ``tests/``, accuracy tests relative to ``tests/integration/defs/``. Only paths
+    are compared: the ``-m cpu_only`` and ``-m "not cpu_only"`` split between stages is
+    not checked.
     """
     unit_root, accuracy_root = repo / "tests", repo / "tests/integration/defs"
-    # Test-db path -> the test files that stand for it.
+    test_db = _test_db_entries(repo)
+    any_list = test_db + _qa_entries(repo)
+    # Test-db path -> the test files that stand for it, and the entries that may run them.
     tests = {
-        str(p.relative_to(unit_root)): [str(p.relative_to(unit_root))]
+        str(p.relative_to(unit_root)): ([str(p.relative_to(unit_root))], test_db)
         for p in sorted((repo / _UNIT).rglob("test_*.py"))
     }
     for family_dir in _families(repo):
-        for d in _targets(family_dir, repo):
+        for d in _targets(family_dir):
             accuracy = repo / _ACC / family_dir.name / d.name
-            tests[str(accuracy.relative_to(accuracy_root))] = [
-                str(p.relative_to(accuracy_root)) for p in sorted(accuracy.rglob("test_*.py"))
-            ]
-    entries = _test_db_entries(repo)
-    run = {path: any(_runs(e, f) for e in entries for f in files) for path, files in tests.items()}
-    unreached = [path for path, hit in run.items() if not hit and path not in _UNREACHED]
-    stale = [path for path in _UNREACHED if run.get(path, True)]
-    assert not unreached, f"no test-db entry runs: {unreached}"
-    assert not stale, f"_UNREACHED entries that are run or no longer exist: {stale}"
+            if accuracy.is_dir():
+                files = [
+                    str(p.relative_to(accuracy_root)) for p in sorted(accuracy.rglob("test_*.py"))
+                ]
+                tests[str(accuracy.relative_to(accuracy_root))] = (files, any_list)
+    unreached = [
+        path
+        for path, (files, entries) in tests.items()
+        if not any(_runs(e, f) for e in entries for f in files)
+    ]
+    assert not unreached, f"no test list runs: {unreached}"
 
 
 _IMPORTERS = ("import_module", "__import__")
+_CATALOG_PACKAGE = f"{_PACKAGE}.catalog"
 
 
 def _is_str(node: ast.AST | None) -> bool:
@@ -364,36 +359,37 @@ def _starts_with_one_dot(node: ast.AST | None) -> bool:
     return _is_str(node) and node.value.startswith(".") and not node.value.startswith("..")
 
 
-def _dynamic_import_problem(call: ast.Call, aliases: set[str]) -> str | None:
-    """Why CBTS cannot read the import ``call`` makes, or None if it can.
+def _dynamic_import_problem(call: ast.Call, package: str, loaders: set[str]) -> str | None:
+    """Why CBTS cannot read the import ``call`` in ``package`` makes, or None if it can.
 
-    ``aliases`` are the other names the file binds to an importer function.
+    ``loaders`` are the names the file binds to ``importlib.import_module``.
     """
+    read = _source.dynamic_import(call, package, loaders)
+    if read is None:
+        return f"calls {ast.unparse(call.func)}, which CBTS does not read as an import"
+    if read:
+        if read == _CATALOG_PACKAGE or read.startswith(f"{_CATALOG_PACKAGE}."):
+            return "imports the catalog"
+        return None
+    # CBTS reads a computed name as an import of the caller's own directory.
     func = call.func
-    if isinstance(func, ast.Name) and func.id in aliases:
-        return f"calls {func.id}, an alias CBTS does not read"
-    if isinstance(func, ast.Attribute) and func.attr == "__import__":
-        return "calls __import__ as an attribute, which CBTS does not read"
-    is_import_module = getattr(func, "id", getattr(func, "attr", None)) == "import_module"
+    is_import_module = getattr(func, "attr", None) == "import_module" or (
+        getattr(func, "id", None) in loaders
+    )
     keywords = {k.arg: k.value for k in call.keywords}
-    name = call.args[0] if call.args else keywords.get("name")
-    package = call.args[1] if len(call.args) > 1 else keywords.get("package")
-    if _starts_with_one_dot(name):
-        if is_import_module and isinstance(package, ast.Name) and package.id == "__package__":
-            return None
-        return "imports a relative name without import_module(..., package=__package__)"
-    if not call.args:
-        return "passes the module name as a keyword, which CBTS reads as computed"
-    if not _is_str(name) or name.value.startswith("."):
-        return "imports a name that is neither a string literal nor a single-dot relative name"
-    if "catalog" in name.value:
-        return "imports the catalog"
     if not is_import_module and (len(call.args) > 4 or "level" in keywords):
         return "passes a level to __import__"
-    return None
+    if not call.args:
+        return "passes the module name as a keyword, which CBTS reads as computed"
+    anchor = call.args[1] if len(call.args) > 1 else keywords.get("package")
+    if not _starts_with_one_dot(call.args[0]):
+        return "imports a name that is neither a string literal nor a single-dot relative name"
+    if is_import_module and isinstance(anchor, ast.Name) and anchor.id == "__package__":
+        return None
+    return "imports a relative name without import_module(..., package=__package__)"
 
 
-# Calls the rule below cannot read but that load only the caller's own target, keyed by
+# Calls CBTS cannot read but that load only the caller's own target, keyed by
 # file and enclosing function. A change inside a target selects the whole target, so
 # these hide nothing from CBTS.
 _CONFINED_DYNAMIC_IMPORTS = {
@@ -406,13 +402,14 @@ _CONFINED_DYNAMIC_IMPORTS = {
 def test_models_import_dynamically_only_what_cbts_can_read(repo: Path = _REPO):
     """Every ``import_module`` and ``__import__`` call under ``models/`` names a module CBTS can read.
 
-    The CBTS import analysis reads a string-literal name as that module, and reads a
-    computed name as an import of the caller's own directory. So a computed name must
-    be a confined relative import: it starts with one dot and is resolved with
-    ``package=__package__``. A literal name must not name the catalog, which code
-    under ``models/`` imports only with import statements. A call through an alias,
-    or with a name held in a variable, could load a module whose changes then skip
-    the caller's tests.
+    The CBTS import analysis (``modeling_v2_source.dynamic_import``) reads a
+    string-literal name as that module, and reads a computed name as an import of the
+    caller's own directory. So a computed name must be a confined relative import: it
+    starts with one dot and is resolved with ``package=__package__``. A literal name
+    must not name the catalog, which code under ``models/`` imports only with import
+    statements. A call the analysis does not read as an import, such as
+    ``builtins.__import__``, or a name held in a variable, could load a module whose
+    changes then skip the caller's tests.
     """
     offenders = []
     confined = set()
@@ -424,6 +421,8 @@ def test_models_import_dynamically_only_what_cbts_can_read(repo: Path = _REPO):
             if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))
             for node in ast.walk(func)
         }
+        package = _package(path, repo)
+        loaders = _source.import_loaders(tree)
         # ``from importlib import import_module as x``: ``x`` calls an importer.
         aliases = {
             alias.asname
@@ -437,7 +436,7 @@ def test_models_import_dynamically_only_what_cbts_can_read(repo: Path = _REPO):
                 getattr(call.func, "id", None) in (*_IMPORTERS, *aliases)
                 or getattr(call.func, "attr", None) in _IMPORTERS
             ):
-                problem = _dynamic_import_problem(call, aliases)
+                problem = _dynamic_import_problem(call, package, loaders)
                 key = f"{path.relative_to(repo / _PY)}:{enclosing.get(id(call), '')}"
                 if problem and key in _CONFINED_DYNAMIC_IMPORTS:
                     confined.add(key)

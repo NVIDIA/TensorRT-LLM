@@ -82,7 +82,10 @@ def rule(tmp_path) -> ModelingV2Rule:
     ):
         (tmp_path / _PY / "models" / family / target).mkdir(parents=True)
         (tmp_path / _PY / "models" / family / target / "modeling.py").touch()
-        (tmp_path / _PY / "models" / family / "routing.py").touch()
+        (tmp_path / _PY / "models" / family / "routing.py").write_text(
+            f'@routes("Arch")\ndef route(config):\n    from .{target}.modeling import Model\n\n'
+            "    return Model\n"
+        )
         (tmp_path / "tests/integration/defs/accuracy/modeling_v2" / family / target).mkdir(
             parents=True
         )

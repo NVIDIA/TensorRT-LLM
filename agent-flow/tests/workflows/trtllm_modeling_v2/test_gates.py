@@ -431,6 +431,16 @@ def test_the_accuracy_test_path_follows_the_tree_layout(tmp_path):
     )
     checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
     assert checks == {"tests:accuracy-file": True, "tests:test-db": True}
+    # An entry may name the target's directory instead of the file; a sibling with a longer
+    # name does not count.
+    (db / "l0_x.yml").write_text(
+        "  - accuracy/modeling_v2/gpt_oss/t TIMEOUT (30)\n", encoding="utf-8"
+    )
+    checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
+    assert checks == {"tests:accuracy-file": True, "tests:test-db": True}
+    (db / "l0_x.yml").write_text("  - accuracy/modeling_v2/gpt_oss/t2\n", encoding="utf-8")
+    checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
+    assert checks == {"tests:accuracy-file": True, "tests:test-db": False}
 
 
 @pytest.mark.skipif(

@@ -245,10 +245,13 @@ CI selects tests by the scope of the change:
   every target that imports it. A change to code every model shares runs all
   Modeling V2 tests.
 
-A directory under `models/<family>/` counts as a target when it has an
-accuracy test directory, so give every target one. Make sure a test list under
-`tests/integration/test_lists/test-db/` reaches every new test, either by
-file or by directory. CI does not run unlisted tests.
+A target is a directory under `models/<family>/` whose class the family's
+`route` returns. Give each target a mirrored unit test directory and an
+accuracy test directory, `tests/integration/defs/accuracy/modeling_v2/<family>/<target>/`.
+Make sure a test list under `tests/integration/test_lists/test-db/` reaches
+every new test, either by file or by directory. CI does not run unlisted tests.
+A target's accuracy tests may instead be listed under
+`tests/integration/test_lists/qa/`, which runs on the QA schedule.
 `tests/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py` checks
 the layout and the test lists.
 

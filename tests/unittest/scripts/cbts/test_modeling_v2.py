@@ -17,13 +17,15 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.blocks import Block, YAMLIndex
-from cbts.rules import modeling_v2
+from cbts.rules import modeling_v2, modeling_v2_source
 from cbts.rules.base import PRInputs
 from cbts.rules.modeling_v2 import ModelingV2Rule
 
@@ -34,8 +36,22 @@ _ABS = "tensorrt_llm._torch._experimental.modeling_v2"
 _UNIT = "unittest/_torch/modeling_v2"
 _ACC = "accuracy/modeling_v2"
 
-# Family `fam` has targets a and b, family `other` has target c. A target is a
-# source directory with an accuracy directory of the same name.
+
+def _routing(*targets: str) -> str:
+    """A `routing.py` whose route returns a class from each of `targets`."""
+    returns = "".join(
+        f"    if config == {target!r}:\n"
+        f"        from .{target}.modeling import {target.upper()}\n\n"
+        f"        return {target.upper()}\n"
+        for target in targets
+    )
+    return (
+        f'from ..._router_index import routes\n\n\n@routes("Arch")\ndef route(config):\n{returns}'
+    )
+
+
+# Family `fam` has targets a and b, family `other` has target c: the
+# directories their routing.py returns classes from.
 _SOURCES = {
     "__init__.py": "from ._router_index import NoTarget\n",
     "_router_index.py": "def families():\n    from . import models\n",
@@ -52,9 +68,7 @@ _SOURCES = {
     "catalog/quant/fp4.py": "from .._op import OpWrapper\n",
     "models/__init__.py": "from .fam import routing\nfrom .other import routing\n",
     "models/fam/__init__.py": "",
-    "models/fam/routing.py": (
-        "def route():\n    from .a.modeling import A\n    from .b.modeling import B\n"
-    ),
+    "models/fam/routing.py": _routing("a", "b"),
     "models/fam/shapes.py": "",
     "models/fam/gemm_lib.py": "",
     # Family code no target imports; only a unit test outside the family does.
@@ -88,12 +102,12 @@ _SOURCES = {
     "models/fam/pkg/sub.py": "",
     "models/fam/tools/__init__.py": "",
     "models/fam/tools/dump.py": "",
-    # Holds a modeling file but has no accuracy directory, so it is family code.
+    # Holds a modeling file but no route returns from it, so it is family code.
     "models/fam/wip/modeling.py": "",
     "models/fam/csrc/k.cu": "",
     "models/fam/data.json": "",
     "models/other/__init__.py": "",
-    "models/other/routing.py": "def route():\n    from .c.modeling import C\n",
+    "models/other/routing.py": _routing("c"),
     "models/other/c/__init__.py": "",
     "models/other/c/modeling.py": f"from {_ABS}.catalog.gemm import mm\n",
 }
@@ -204,9 +218,7 @@ def _kept(rule: ModelingV2Rule, *changed: str) -> set[str]:
             _FAMILY | {_REFERENCE},
             id="family-code-runs-unit-tests-importing-it-through-a-helper",
         ),
-        pytest.param(
-            f"{_SRC}/models/fam/wip/modeling.py", _FAMILY, id="dir-without-accuracy-dir-is-family"
-        ),
+        pytest.param(f"{_SRC}/models/fam/wip/modeling.py", _FAMILY, id="unrouted-dir-is-family"),
         pytest.param(f"{_SRC}/models/fam/csrc/k.cu", _FAMILY, id="family-native-runs-the-family"),
         pytest.param(f"{_SRC}/models/fam/data.json", _FAMILY, id="family-data-runs-the-family"),
         pytest.param(
@@ -291,6 +303,7 @@ def test_target_depends_on_its_family_init(tmp_path: Path) -> None:
     """Target c imports only the catalog, yet importing it runs models/other/__init__.py."""
     rule = _rule(tmp_path)
     for path, text in (
+        ("models/other/routing.py", _routing("c", "e")),
         ("models/other/shared.py", ""),
         ("models/other/e/__init__.py", ""),
         ("models/other/e/modeling.py", "from ..shared import X\n"),
@@ -318,6 +331,103 @@ def test_aliased_import_module_counts_as_an_import(tmp_path: Path) -> None:
         (tmp_path / _SRC / path).write_text(text)
     for kernel in ("kern_a", "kern_b"):
         assert _kept(rule, f"{_SRC}/models/fam/{kernel}.py") == _FAMILY_LEVEL | _B | {_TREE}
+
+
+def test_targets_come_from_routing(tmp_path: Path) -> None:
+    """An accuracy directory neither makes nor is needed for a target."""
+    rule = _rule(tmp_path)
+    accuracy = tmp_path / "tests/integration/defs" / _ACC
+    (accuracy / "fam/wip").mkdir()
+    (accuracy / "fam/a/__init__.py").unlink()
+    (accuracy / "fam/a").rmdir()
+    assert _kept(rule, f"{_SRC}/models/fam/wip/modeling.py") == _FAMILY | {_TREE}
+    assert _kept(rule, f"{_SRC}/models/fam/a/modeling.py") == _A | {_TREE}
+
+
+@pytest.mark.parametrize(
+    ("routing", "catalog"),
+    (
+        (None, {_NORM} | _FAMILY),
+        ("def route(:\n", _EVERYTHING),
+        (_routing("a", "b") + "    return make()\n", {_NORM} | _FAMILY),
+        ("def route(config):\n    from .a.modeling import A\n\n    return A\n", {_NORM} | _FAMILY),
+    ),
+    ids=("missing", "unparsable", "unknown-return", "no-routes-function"),
+)
+def test_unreadable_routing_widens_to_the_family(
+    tmp_path: Path, routing: str | None, catalog: set[str]
+) -> None:
+    """A family whose targets are unknown is tested whole, also through its importers."""
+    rule = _rule(tmp_path)
+    path = tmp_path / _SRC / "models/fam/routing.py"
+    if routing is None:
+        path.unlink()
+    else:
+        path.write_text(routing)
+    assert _kept(rule, f"{_SRC}/models/fam/a/modeling.py") == _FAMILY | {_TREE}
+    assert _kept(rule, f"{_SRC}/catalog/norm/rmsnorm.py") == catalog | {_TREE}
+    assert _kept(rule, f"{_SRC}/models/other/c/modeling.py") == _C | {_TREE}
+
+
+@pytest.mark.parametrize(
+    ("routing", "targets"),
+    (
+        (
+            """
+            from ..._router_index import routes
+            from .b import modeling as b
+
+            @routes("Arch")
+            def route(config):
+                def fallback():
+                    return config
+
+                if config:
+                    from .a.modeling import A as Picked
+
+                    return Picked
+                from .b.sub.modeling import B
+                return B
+            """,
+            {"a", "b"},
+        ),
+        ('@router.routes("Arch")\ndef route(config):\n    from .a import A\n    return A\n', {"a"}),
+        ("@routes('Arch')\ndef route(config):\n    return make(config)\n", None),
+        ("@routes('Arch')\ndef route(config):\n    return\n", None),
+        (
+            "from ..a.m import A\n@routes('Arch')\ndef route(c):\n    from .a.m import A\n    return A\n",
+            None,
+        ),
+        (
+            "from .b.m import A\n@routes('Arch')\ndef route(c):\n    from .a.m import A\n    return A\n",
+            None,
+        ),
+        ("def route(config):\n    from .a.modeling import A\n    return A\n", None),
+    ),
+    ids=(
+        "nested-and-aliased",
+        "attribute-decorator",
+        "call",
+        "bare-return",
+        "name-also-bound-elsewhere",
+        "name-bound-to-two-directories",
+        "no-routes-function",
+    ),
+)
+def test_routed_targets(routing: str, targets: set[str] | None) -> None:
+    assert modeling_v2_source.routed_targets(ast.parse(dedent(routing))) == targets
+
+
+def test_ci_selection_check_reads_imports_with_the_rule_parser() -> None:
+    """The CPU check of the tree and the rule share one reading of imports and routing."""
+    repo = Path(__file__).resolve().parents[4]
+    path = repo / "tests/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py"
+    spec = importlib.util.spec_from_file_location("modeling_v2_ci_selection", path)
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+    assert Path(check._source.__file__).resolve() == Path(modeling_v2_source.__file__).resolve()
+    assert modeling_v2.imported_names is modeling_v2_source.imported_names
+    assert modeling_v2.routed_targets is modeling_v2_source.routed_targets
 
 
 def test_docs_are_not_claimed(tmp_path: Path) -> None:
@@ -349,8 +459,9 @@ def test_tree_is_parsed_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(
         modeling_v2.ast, "parse", lambda *a, **k: parsed.append(1) or parse(*a, **k)
     )
+    # The catalog entry builds the import graph before the targets of `other` are read.
     _kept(rule, f"{_SRC}/models/fam/shapes.py", f"{_SRC}/catalog/norm/rmsnorm.py")
-    _kept(rule, f"{_SRC}/models/fam/gemm_lib.py")
+    _kept(rule, f"{_SRC}/models/fam/gemm_lib.py", f"{_SRC}/models/other/c/modeling.py")
     unit_tests = [path for path in _TEST_FILES if path.startswith(_UNIT)]
     assert len(parsed) == sum(path.endswith(".py") for path in _SOURCES) + len(unit_tests)
 

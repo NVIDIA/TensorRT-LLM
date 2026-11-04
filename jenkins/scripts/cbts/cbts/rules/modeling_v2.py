@@ -27,12 +27,19 @@ by construction rather than by luck: the unit tests live in their own
 `accuracy/modeling_v2/` directory.
 
 Entry selection: the test tree mirrors the code tree, so each changed file
-maps to test paths. A directory `models/<family>/<target>/` is a target iff
-`accuracy/modeling_v2/<family>/<target>/` exists; everything else under
-`models/<family>/` is family code. A target's tests are its unit tests
+maps to test paths. The targets are defined by code: a directory
+`models/<family>/<target>/` is a target iff a function in the family's
+`routing.py` decorated with `@routes(...)` returns a class that `routing.py`
+binds with `from .<target>... import <Class>`. Everything else under
+`models/<family>/` is family code. If `routing.py` is missing, does not parse,
+or has a return whose directory it does not name, every path of the family is
+family code, and the whole family's tests stand in for those of its targets.
+A target's tests are its unit tests
 (`unittest/_torch/modeling_v2/models/<family>/<target>`) and its accuracy
 tests (`accuracy/modeling_v2/<family>/<target>`); a family's tests are the
-same two paths one level up.
+same two paths one level up. The CPU check
+`unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py` requires every
+target to have accuracy tests, and every accuracy directory to name a target.
 
 - Any file in a target, native code included, selects only that target's
   tests.
@@ -54,7 +61,8 @@ same two paths one level up.
   modeling_v2 entry.
 
 "Imports" is read from the tree on disk, which in CI is the PR head: every
-Python file of the subtree and of the unit test directory is parsed once. A
+Python file of the subtree and of the unit test directory is parsed once,
+with the readings in `modeling_v2_source.py` that the CPU check shares. A
 target or test imports a module when one of its files reaches it through
 imports anywhere in the files, relative ones, package `__init__` files and
 constant `importlib.import_module` calls included, under any name the file
@@ -111,13 +119,14 @@ import ast
 import re
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Callable, Optional
 
 from cbts.blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree
 
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
+from .modeling_v2_source import PACKAGE, imported_names, package_names, routed_targets
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
@@ -130,9 +139,7 @@ _IGNORE = re.compile(r"--ignore=(\S+)")
 
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
-# Where the accuracy root sits in the repository; its directories name the targets.
-_ACCURACY_DIR = f"tests/integration/defs/{_ACCURACY_ROOT}"
-_PKG_MODULE = "tensorrt_llm._torch._experimental.modeling_v2"
+_PKG_MODULE = PACKAGE
 
 # Substrings that mark a test entry as modeling_v2. All are unambiguous:
 #   - "unittest/_torch/modeling_v2/" → the op and target unit tests
@@ -190,114 +197,10 @@ def _module_name(rel: PurePosixPath) -> str:
     return ".".join((_PKG_MODULE, *parts))
 
 
-def _resolve(name: str, level: int, package: str) -> Optional[str]:
-    """The absolute name of `name` imported with `level` leading dots from `package`."""
-    if level == 0:
-        return name
-    parts = package.split(".")
-    if level - 1 >= len(parts):
-        return None
-    base = parts[: len(parts) - (level - 1)]
-    return ".".join([*base, name] if name else base)
-
-
-def _is_str(node: Optional[ast.AST]) -> bool:
-    return isinstance(node, ast.Constant) and isinstance(node.value, str)
-
-
-def _dynamic_import(call: ast.Call, package: str, loaders: set[str]) -> Optional[str]:
-    """The module an `import_module(...)` / `__import__(...)` call names; "" if computed.
-
-    None if the call is not an import. `loaders` are the bare names bound to
-    `importlib.import_module`; any `<x>.import_module(...)` counts, which
-    covers `importlib` imported under another name.
-    """
-    func = call.func
-    if (isinstance(func, ast.Attribute) and func.attr == "import_module") or (
-        isinstance(func, ast.Name) and func.id in loaders
-    ):
-        anchor = call.args[1] if len(call.args) > 1 else None
-        anchor = next((k.value for k in call.keywords if k.arg == "package"), anchor)
-    elif isinstance(func, ast.Name) and func.id == "__import__":
-        # A `level` argument makes the name relative; read it as computed.
-        if len(call.args) > 4 or any(k.arg == "level" for k in call.keywords):
-            return ""
-        anchor = None
-    else:
-        return None
-    if not call.args or not _is_str(call.args[0]):
-        return ""
-    name = call.args[0].value
-    level = len(name) - len(name.lstrip("."))
-    if level == 0:
-        return name
-    if _is_str(anchor):
-        anchor_package = anchor.value
-    elif isinstance(anchor, ast.Name) and anchor.id == "__package__":
-        anchor_package = package
-    else:
-        return ""
-    return _resolve(name[level:], level, anchor_package) or ""
-
-
-def _imported_names(tree: ast.AST, package: str) -> tuple[set[str], bool]:
-    """Absolute names a module imports anywhere, and whether it computes one at run time.
-
-    `from X import Y` names both X and X.Y, as Y may be a submodule.
-    """
-    names: set[str] = set()
-    calls: list[ast.Call] = []
-    # Names bound to importlib.import_module, such as `from importlib import import_module as im`.
-    loaders = {"import_module"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            base = _resolve(node.module or "", node.level, package)
-            if base:
-                names.add(base)
-                names.update(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
-            if base == "importlib":
-                loaders.update(
-                    alias.asname or alias.name
-                    for alias in node.names
-                    if alias.name == "import_module"
-                )
-        elif isinstance(node, ast.Call):
-            calls.append(node)
-    computed = False
-    for call in calls:
-        name = _dynamic_import(call, package, loaders)
-        if name == "":
-            computed = True
-        elif name:
-            names.add(name)
-    return names, computed
-
-
-def _in_package(name: str) -> bool:
-    return name == _PKG_MODULE or name.startswith(f"{_PKG_MODULE}.")
-
-
-def _package_names(names: set[str]) -> set[str]:
-    """The names under the subtree among `names`, with the packages that hold them.
-
-    Importing a.b.c runs a/__init__.py and a/b/__init__.py too. A name counts
-    whether or not its file exists, so the importers of a deleted or moved
-    module are still found: CI reads the PR head, where the file is gone.
-    """
-    depth = _PKG_MODULE.count(".") + 1
-    found = set()
-    for name in filter(_in_package, names):
-        parts = name.split(".")
-        found.update(".".join(parts[:i]) for i in range(depth, len(parts) + 1))
-    return found
-
-
 def _parse(path: Path) -> Optional[ast.AST]:
     try:
         return ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError, ValueError):
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
         return None
 
 
@@ -308,7 +211,9 @@ class _ImportGraph:
     the subtree by module name and their helpers by bare name.
     """
 
-    def __init__(self, src_root: Path, test_root: Path) -> None:
+    def __init__(
+        self, src_root: Path, test_root: Path, parse: Callable[[Path], Optional[ast.AST]]
+    ) -> None:
         # Module name -> file path relative to the subtree.
         self.files = {
             _module_name(rel): rel
@@ -331,16 +236,16 @@ class _ImportGraph:
         # Package -> modules that import a computed name, which may be any module under it.
         self._computed: dict[str, set[str]] = defaultdict(set)
         for module, rel in self.files.items():
-            tree = _parse(src_root / rel)
+            tree = parse(src_root / rel)
             if tree is None:
                 self.complete = False
                 continue
             package = module if rel.name == "__init__.py" else module.rpartition(".")[0]
-            names, computed = _imported_names(tree, package)
+            names, computed = imported_names(tree, package)
             if computed:
                 self._computed[package].add(module)
             # A module depends on its own packages too: importing it runs their __init__.
-            for dep in _package_names(names | {module}) - {module}:
+            for dep in package_names(names | {module}) - {module}:
                 self._importers[dep].add(module)
         # A bare name finds every helper of that name: tests put different
         # directories on sys.path, and a wider match only over-selects.
@@ -348,14 +253,14 @@ class _ImportGraph:
         for key, rel in self.tests.items():
             helpers[rel.stem].add(key)
         for key, rel in self.tests.items():
-            tree = _parse(test_root / rel)
+            tree = parse(test_root / rel)
             if tree is None:
                 self.complete = False
                 continue
             # Tests are not a package of the subtree: only absolute names and
             # bare helper names count, and a computed name reaches no helper.
-            names, _ = _imported_names(tree, "")
-            deps = _package_names(names)
+            names, _ = imported_names(tree, "")
+            deps = package_names(names)
             for name in names:
                 deps |= helpers.get(name.split(".")[0], set())
             for dep in deps - {key}:
@@ -433,23 +338,52 @@ class ModelingV2Rule(Rule):
         self.yaml_index = yaml_index
         self._stages_by_yaml = stages_by_yaml_stem(stages)
         self._repo_root = Path(repo_root)
+        self._src_root = self._repo_root / _MV2_SRC_PREFIXES[0]
         self._graph: Optional[_ImportGraph] = None
+        # routing.py trees, which both the targets and the import graph read.
+        self._routing_trees: dict[Path, Optional[ast.AST]] = {}
+        self._routed: dict[str, Optional[set[str]]] = {}
+
+    def _parse(self, path: Path) -> Optional[ast.AST]:
+        if path.name != "routing.py" or path.parent.parent != self._src_root / "models":
+            return _parse(path)
+        if path not in self._routing_trees:
+            self._routing_trees[path] = _parse(path)
+        return self._routing_trees[path]
+
+    def _targets(self, family: str) -> Optional[set[str]]:
+        """The directories the family's `routing.py` returns target classes from.
+
+        None when `routing.py` is missing, does not parse, or returns something
+        whose directory it does not name: every path of the family is then
+        family code.
+        """
+        if family not in self._routed:
+            tree = self._parse(self._src_root / "models" / family / "routing.py")
+            self._routed[family] = None if tree is None else routed_targets(tree)
+        return self._routed[family]
 
     def _is_target(self, family: str, name: str) -> bool:
-        return (self._repo_root / _ACCURACY_DIR / family / name).is_dir()
+        targets = self._targets(family)
+        return targets is not None and name in targets
 
     @staticmethod
     def _target_tests(family: str, target: str) -> set[str]:
         return {f"{_UNIT_ROOT}/models/{family}/{target}", f"{_ACCURACY_ROOT}/{family}/{target}"}
 
+    @staticmethod
+    def _family_tests(family: str) -> set[str]:
+        return {f"{_UNIT_ROOT}/models/{family}", f"{_ACCURACY_ROOT}/{family}"}
+
     def _importers(self, rel: PurePosixPath) -> Optional[tuple[set[str], set[str]]]:
         """Test prefixes of every target that imports `rel`, and every unit test file that does.
 
-        None if a file did not parse.
+        An importer in a family whose targets are unknown stands for the whole
+        family. None if a file did not parse.
         """
         if self._graph is None:
             self._graph = _ImportGraph(
-                self._repo_root / _MV2_SRC_PREFIXES[0], self._repo_root / "tests" / _UNIT_ROOT
+                self._src_root, self._repo_root / "tests" / _UNIT_ROOT, self._parse
             )
         if not self._graph.complete:
             return None
@@ -457,7 +391,11 @@ class ModelingV2Rule(Rule):
         targets = set()
         for importer in sources:
             parts = importer.parts
-            if parts[0] == "models" and len(parts) > 3 and self._is_target(parts[1], parts[2]):
+            if parts[0] != "models":
+                continue
+            if self._targets(parts[1]) is None:
+                targets |= self._family_tests(parts[1])
+            elif len(parts) > 3 and self._is_target(parts[1], parts[2]):
                 targets |= self._target_tests(parts[1], parts[2])
         return targets, {f"{_UNIT_ROOT}/{test}" for test in tests}
 
@@ -501,14 +439,14 @@ class ModelingV2Rule(Rule):
         family = parts[1]
         if len(parts) > 3 and self._is_target(family, parts[2]):
             return self._target_tests(family, parts[2])
-        whole_family = {f"{_UNIT_ROOT}/models/{family}", f"{_ACCURACY_ROOT}/{family}"}
+        whole_family = self._family_tests(family)
         if rel.suffix != ".py":
             return whole_family
         importers = self._importers(rel)
         if importers is None:
             return whole_family
         targets, tests = importers
-        if not targets:
+        if not targets or self._targets(family) is None:
             return _outermost(whole_family | tests)
         return _outermost(
             self._family_unit_tests(family, PurePosixPath(*parts[2:-1])) | targets | tests

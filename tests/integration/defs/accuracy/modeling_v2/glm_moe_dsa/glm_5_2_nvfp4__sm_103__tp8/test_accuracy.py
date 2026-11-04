@@ -14,10 +14,6 @@
 # limitations under the License.
 """Whole-model gate for the glm_moe_dsa modeling_v2 target glm_5_2_nvfp4__sm_103__tp8.
 
-One directory per target under accuracy/modeling_v2/, rather than inside
-test_glm52.py: these gate a parallel implementation, and reading them next to
-the built-in model's tests would invite treating one as a variant of the other.
-
 ``TestModelingV2Glm52Nvfp4Sm103Tp8``: GSM8K end to end for the SM103 tp8
 low-latency target, at the deployment its ``route()`` admits: the GLM-5.2
 modelopt NVFP4 checkpoint (bf16 MTP layer), attention and experts
