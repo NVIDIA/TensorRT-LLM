@@ -2032,7 +2032,11 @@ def test_send_session_publishes_peer_ready_time_before_receiver_ready(
         get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[0])),
     )
     session = _ReadinessOrderSession(
-        disagg_request_id=rid, lock=threading.Lock(), receiver_ready=False, peer_ready_time=None
+        disagg_request_id=rid,
+        lock=threading.Lock(),
+        receiver_ready=False,
+        peer_ready_time=None,
+        _enforce_physical_ownership=None,
     )
     info = transfer_mod.RecvReqInfo(
         sender_req_id=rid,
