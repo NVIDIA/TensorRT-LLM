@@ -890,6 +890,7 @@ def _create_py_executor(
     _check_no_kv_execution(llm_args, mapping, is_generation)
     if not is_generation:
         enable_chunked_context = False
+        model_engine.attn_runtime_features.chunked_prefill = False
 
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (

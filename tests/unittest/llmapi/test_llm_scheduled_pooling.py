@@ -44,7 +44,15 @@ def _pooled(llm: LLM, prompt: list[int], max_tokens: int = 1) -> torch.Tensor:
 
 
 def test_over_long_request_fails_alone_with_chunked_prefill():
-    prompts = [_prompt(16, seed=1), _prompt(80), _prompt(24, seed=2)]
+    # The prompts that fit max_num_tokens add up to more than it, so they span batches unsplit.
+    prompts = [
+        _prompt(16, seed=1),
+        _prompt(80),
+        _prompt(24, seed=2),
+        _prompt(40, seed=3),
+        _prompt(40, seed=4),
+    ]
+    fitting = (0, 2, 3, 4)
     params = SamplingParams(max_tokens=1, return_context_logits=True)
 
     with _llm(
@@ -54,8 +62,8 @@ def test_over_long_request_fails_alone_with_chunked_prefill():
         with pytest.raises(RequestError) as error:
             futures[1].result()
         assert is_context_length_exceeded_message(str(error.value))
-        batched = [futures[i].result().context_logits.float().cpu() for i in (0, 2)]
-        alone = [_pooled(llm, prompts[i]) for i in (0, 2)]
+        batched = [futures[i].result().context_logits.float().cpu() for i in fitting]
+        alone = [_pooled(llm, prompts[i]) for i in fitting]
 
     for got, expected in zip(batched, alone):
         torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)

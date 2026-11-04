@@ -298,6 +298,10 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
     """
     Use for skipping decoding step for non generation model,
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
+
+    Args:
+        max_num_tokens: The engine's token budget. A request runs whole in one
+            forward, so a prompt longer than this is rejected; None skips the check.
     """
 
     SampleState: TypeAlias = SampleState[SampleStateTensors, SampleStateTensors]
@@ -420,6 +424,8 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             the frontend: the results are exported as CUDA IPC handles, and
             PyTorch keeps an exported allocation alive until a consumer opens
             and releases its handle.
+        max_num_tokens: The engine's token budget. A request runs whole in one
+            forward, so a prompt longer than this is rejected; None skips the check.
     """
 
     SampleState: TypeAlias = SampleStateWithMMResult
