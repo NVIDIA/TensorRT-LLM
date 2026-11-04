@@ -34,7 +34,7 @@ from typing import Optional
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequestState
-from .gen_admission_queue import STATS_LOG_PERIOD_S, GenAdmissionWaitingQueue
+from .gen_admission_queue import STATS_LOG_PERIOD_S, GenAdmissionConfig, GenAdmissionWaitingQueue
 
 
 @dataclass(frozen=True)
@@ -72,6 +72,50 @@ def resident_headroom(max_batch_size: int, settings: Optional[GenPreemptionSetti
     """Entries a pool with one per resident request adds for paused requests."""
     settings = settings or _active_settings
     return paused_cap(max_batch_size) if settings.enabled else 0
+
+
+def unsupported_headroom_reason(config, llm_args) -> Optional[str]:
+    """Why pool sizing must not reserve the resident headroom, else ``None``.
+
+    The creator reserves the paused cap in every pool before the model is
+    loaded; when ``create_gen_preemption`` would then disable the feature
+    anyway, the worker keeps a smaller cache pool for headroom it never
+    uses. This resolves the same prerequisites from the LLM args alone (the
+    message strings are ``_unsupported``'s):
+
+    * pipeline parallelism and attention DP disable it outright;
+    * the auto GEN admission policy is read from the same environment;
+    * ``use_kv_cache_manager_v2=True`` is demotable only by the runtime
+      features ``resolved_kv_cache_manager_is_v2`` checks. An explicit
+      ``False`` keeps the headroom out, which only mispredicts a
+      variable-KV-geometry model that forces V2 despite it; an unresolved
+      ``"auto"`` keeps the headroom in, and ``create_gen_preemption``
+      decides with the real scheduler.
+    """
+    if config is None or not GenPreemptionSettings.from_config(config).enabled:
+        return None
+    if llm_args is None:
+        return None
+    if getattr(llm_args, "pipeline_parallel_size", 1) > 1:
+        return "not supported with pipeline parallelism"
+    if getattr(llm_args, "enable_attention_dp", False):
+        return "not supported with attention DP"
+    if not GenAdmissionConfig.from_env().needs_clock:
+        return "needs the auto GEN admission policy (0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99)"
+    kv_cache_config = getattr(llm_args, "kv_cache_config", None)
+    use_v2 = getattr(kv_cache_config, "use_kv_cache_manager_v2", None)
+    if use_v2 is False:
+        return "needs the KV cache manager V2 scheduler"
+    if use_v2 is True:
+        from .._util import resolved_kv_cache_manager_is_v2
+
+        if not resolved_kv_cache_manager_is_v2(
+            kv_cache_config,
+            getattr(llm_args, "max_beam_width", None),
+            enable_sleep=getattr(llm_args, "sleep_config", None) is not None,
+        ):
+            return "needs the KV cache manager V2 scheduler"
+    return None
 
 
 def generated_tokens(req) -> int:

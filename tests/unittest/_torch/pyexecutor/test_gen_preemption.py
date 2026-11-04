@@ -509,6 +509,79 @@ class TestCreate:
             create_gen_preemption(ex, SLO)
 
 
+class TestUnsupportedHeadroomReason:
+    """The creator-time mirror of create_gen_preemption's checks, deciding
+    whether pools reserve the paused cap at all."""
+
+    def _llm_args(self, **overrides):
+        args = SimpleNamespace(
+            pipeline_parallel_size=1,
+            enable_attention_dp=False,
+            kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True),
+            max_beam_width=1,
+            sleep_config=None,
+        )
+        args.__dict__.update(overrides)
+        return args
+
+    def _reason(self, **overrides):
+        return gen_preemption.unsupported_headroom_reason(
+            GenPreemptionConfig(tpot_budget=0.25), self._llm_args(**overrides)
+        )
+
+    @pytest.mark.parametrize(
+        "overrides, needle",
+        [
+            ({}, None),
+            ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
+            ({"enable_attention_dp": True}, "attention DP"),
+            (
+                {"kv_cache_config": SimpleNamespace(use_kv_cache_manager_v2=True)},
+                None,
+            ),
+            (
+                {"kv_cache_config": SimpleNamespace(use_kv_cache_manager_v2=False)},
+                "V2 scheduler",
+            ),
+            # "auto" is only resolved when the model is loaded: keep sizing
+            # the pools; the executor decides with the real scheduler.
+            (
+                {"kv_cache_config": SimpleNamespace(use_kv_cache_manager_v2="auto")},
+                None,
+            ),
+            # Sleep demotes a requested V2 manager to V1.
+            ({"sleep_config": SimpleNamespace()}, "V2 scheduler"),
+        ],
+    )
+    def test_reason(self, overrides, needle, monkeypatch):
+        monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", "90")
+        assert self._reason(**overrides) == needle
+
+    def test_missing_auto_admission_policy_is_a_reason(self, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import GEN_ADMISSION_ENV
+
+        monkeypatch.delenv(GEN_ADMISSION_ENV, raising=False)
+        assert self._reason() == (
+            "needs the auto GEN admission policy (0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99)"
+        )
+
+    def test_off_feature_never_gives_a_reason(self, monkeypatch):
+        monkeypatch.delenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", raising=False)
+        assert (
+            gen_preemption.unsupported_headroom_reason(
+                None, self._llm_args(pipeline_parallel_size=2)
+            )
+            is None
+        )
+        assert (
+            gen_preemption.unsupported_headroom_reason(
+                GenPreemptionConfig(),
+                self._llm_args(pipeline_parallel_size=2, enable_attention_dp=True),
+            )
+            is None
+        )
+
+
 def _drafter(kind, num_slots=4):
     """A DFlash or DSpark drafter worker and its metadata with ``num_slots``
     request slots plus a scratch slot (CPU stand-ins for device buffers)."""

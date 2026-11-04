@@ -89,6 +89,7 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .scheduler.gen_preemption import GenPreemptionSettings
 from .scheduler.gen_preemption import \
     resident_headroom as gen_preempt_resident_headroom
+from .scheduler.gen_preemption import unsupported_headroom_reason
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -4583,6 +4584,11 @@ def create_py_executor_instance(
         dwdp_manager=dwdp_manager,
         max_num_sequences=max_num_sequences,
     )
+    # Mirror the creator's gen_preemption gate (the pools were sized against
+    # the same reason): an executor that cannot pause keeps the feature off
+    # here instead of re-deriving a short-pool warning from its own check.
+    headroom_reason = unsupported_headroom_reason(
+        llm_args.scheduler_config.gen_preemption, llm_args)
     spec_config = model_engine.spec_config
     config = model_engine.model.model_config.pretrained_config
     return PyExecutor(
@@ -4627,7 +4633,8 @@ def create_py_executor_instance(
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler)),
         gen_preemption=GenPreemptionSettings.from_config(
-            llm_args.scheduler_config.gen_preemption),
+            llm_args.scheduler_config.gen_preemption)
+        if headroom_reason is None else None,
     )
 
 
