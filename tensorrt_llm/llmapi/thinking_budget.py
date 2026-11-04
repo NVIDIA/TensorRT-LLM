@@ -165,6 +165,10 @@ def add_thinking_budget_logits_processor(
     from .reasoning_parser import ReasoningParserFactory
 
     parser = ReasoningParserFactory.create_reasoning_parser(reasoning_parser, chat_template_kwargs)
+    if not getattr(parser, "supports_thinking_budget", True):
+        raise ValueError(
+            f"thinking_token_budget is not supported with the {reasoning_parser} reasoning parser"
+        )
     reasoning_start = _get_reasoning_boundary(parser, "start")
     reasoning_end = _get_reasoning_boundary(parser, "end")
     processor = ThinkingBudgetLogitsProcessor(

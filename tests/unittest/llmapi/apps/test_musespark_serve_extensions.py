@@ -143,6 +143,19 @@ class TestMuseSparkEffortRouting:
     def test_client_chat_template_kwargs_win(self) -> None:
         req = self.apply(reasoning_effort="xhigh", chat_template_kwargs={"reasoning_effort": "low"})
         assert self.kwargs_of(req)["reasoning_effort"] == "low"
+        assert "reasoning_effort" not in (req.injected_chat_template_kwargs or [])
+
+    def test_derived_effort_is_injected(self) -> None:
+        # The client sent only the top-level field, so a template that does
+        # not read `reasoning_effort` (a custom --chat_template) drops the
+        # derived kwarg instead of rejecting the request.
+        req = self.apply(reasoning_effort="high")
+        assert req.injected_chat_template_kwargs == ["reasoning_effort"]
+        validate_chat_template_kwargs(
+            TEMPLATE_PLAIN,
+            req.chat_template_kwargs,
+            injected_keys=req.injected_chat_template_kwargs,
+        )
 
     def test_other_client_kwargs_preserved(self) -> None:
         req = self.apply(reasoning_effort="xhigh", chat_template_kwargs={"foo": "bar"})
@@ -217,6 +230,33 @@ class TestAnthropicEffortReachesMuseSparkTemplate:
 
     def test_other_models_get_the_verbatim_value(self) -> None:
         assert self.convert("max", model_type="llama")["reasoning_effort"] == "max"
+
+    def convert_thinking(self, thinking: dict, **fields) -> dict:
+        request = AnthropicMessagesRequest(
+            model="musespark_open",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=thinking,
+            **fields,
+        )
+        chat = convert_anthropic_request(request)
+        apply_model_chat_extensions(chat, "muse_spark")
+        return chat.chat_template_kwargs or {}
+
+    def test_thinking_disabled_gets_the_lowest_effort(self) -> None:
+        # The template reads no `enable_thinking` and cannot turn reasoning
+        # off, so disabled thinking gets `low`, as `none` does on the other
+        # routes, rather than the template default `xhigh`.
+        kwargs = self.convert_thinking({"type": "disabled"})
+        assert kwargs["reasoning_effort"] == "low"
+
+    def test_thinking_disabled_keeps_an_explicit_effort(self) -> None:
+        kwargs = self.convert_thinking({"type": "disabled"}, output_config={"effort": "high"})
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_thinking_enabled_keeps_the_template_default(self) -> None:
+        kwargs = self.convert_thinking({"type": "enabled", "budget_tokens": 1024})
+        assert "reasoning_effort" not in kwargs
 
 
 # A template in the MuseSpark style: it reads the effort level from its

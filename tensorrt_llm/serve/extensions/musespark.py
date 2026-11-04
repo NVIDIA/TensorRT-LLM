@@ -85,9 +85,16 @@ class MuseSparkServingExtension(ServingExtension):
         adapter forwards `output_config.effort` this way and lists it in
         `injected_chat_template_kwargs`) is normalized in place; a kwarg
         the client wrote is forwarded untouched.
+
+        With no effort at all, an injected `enable_thinking=False` (the
+        Anthropic adapter's `thinking: {type: "disabled"}`) selects `low`,
+        as `none` does: the template cannot turn reasoning off and reads no
+        `enable_thinking`. A derived effort is listed as injected too, so a
+        template that does not read it drops it instead of rejecting the
+        request.
         """
         kwargs = request.chat_template_kwargs
-        injected = request.injected_chat_template_kwargs or ()
+        injected = list(request.injected_chat_template_kwargs or ())
         if kwargs and "reasoning_effort" in kwargs and "reasoning_effort" in injected:
             kwargs = dict(kwargs)
             normalized = normalize_musespark_effort(kwargs["reasoning_effort"])
@@ -97,12 +104,17 @@ class MuseSparkServingExtension(ServingExtension):
                 kwargs["reasoning_effort"] = normalized
             request.chat_template_kwargs = kwargs
 
-        if "reasoning_effort" not in request.model_fields_set or request.reasoning_effort is None:
+        kwargs = request.chat_template_kwargs or {}
+        if "reasoning_effort" in kwargs:
+            # The client's own kwarg, or one injected and normalized above.
             return
-        effort = normalize_musespark_effort(request.reasoning_effort)
+        if "reasoning_effort" in request.model_fields_set and request.reasoning_effort is not None:
+            effort = normalize_musespark_effort(request.reasoning_effort)
+        elif kwargs.get("enable_thinking") is False and "enable_thinking" in injected:
+            effort = normalize_musespark_effort("none")
+        else:
+            return
         if effort is None:
             return
-        request.chat_template_kwargs = {
-            "reasoning_effort": effort,
-            **(request.chat_template_kwargs or {}),
-        }
+        request.chat_template_kwargs = {**kwargs, "reasoning_effort": effort}
+        request.injected_chat_template_kwargs = [*injected, "reasoning_effort"]

@@ -46,16 +46,20 @@ def _parse_param_value(raw: str, declared: Optional[str]) -> Any:
 
     `json.loads` on the raw text, else keep the raw string (no trimming).
 
-    One addition: a parameter the tool schema declares as `string` is kept
+    Two additions: a parameter the tool schema declares as `string` is kept
     raw even when its text happens to be valid JSON (`"quoted"`, `1e3`,
-    `true`), so the model's string is not re-typed.
+    `true`), so the model's string is not re-typed; and a value holding
+    `NaN`, `Infinity` or an overflowing number such as `1e999` stays text,
+    because the arguments must be valid JSON and those are not.
     """
     if declared == "string":
         return raw
     try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+        value = json.loads(raw)
+        json.dumps(value, allow_nan=False)
+    except ValueError:
         return raw
+    return value
 
 
 class MuseSparkToolParser(BaseToolParser):
@@ -105,8 +109,11 @@ class MuseSparkToolParser(BaseToolParser):
     # Both paths anchor on the opening tag; the closer is found by search, so a
     # truncated invoke is still seen. See _iter_invokes.
     _INVOKE_START_RE = re.compile(r"<atem:invoke\s+name=(?:\"|')?(" + _NAME + r")(?:\"|')?[^>]*>")
+    # A parameter name is a JSON-schema property key, which may hold any
+    # character: a quoted name runs to its closing quote.
     _PARAM_RE = re.compile(
-        r"<atem:parameter\s+name=(?:\"|')?(" + _NAME + r")(?:\"|')?[^>]*>(.*?)</atem:parameter>",
+        r"<atem:parameter\s+name=(?:\"([^\"]*)\"|'([^']*)'|(" + _NAME + r"))[^>]*>"
+        r"(.*?)</atem:parameter>",
         re.DOTALL,
     )
     _NON_TOOL_RECIPIENTS = frozenset({"self", "user", "commentary"})
@@ -116,6 +123,7 @@ class MuseSparkToolParser(BaseToolParser):
         self.bot_token = "<atem:function_calls>"  # nosec B105
         self.eot_token = "</atem:function_calls>"  # nosec B105
         self.invoke_end_token = "</atem:invoke>"  # nosec B105
+        self.param_end_token = "</atem:parameter>"  # nosec B105
         self._block_re = re.compile(
             re.escape(self.bot_token)
             + r"(.*?)"
@@ -134,6 +142,10 @@ class MuseSparkToolParser(BaseToolParser):
         self._block_text = ""
         self._block_base_index = 0
         self._block_invoke_count = 0
+        # Per tool index: the end of the last closed parameter that was parsed
+        # in a still-open invoke, and the invokes whose arguments are final.
+        self._parsed_params_end: Dict[int, int] = {}
+        self._finished_tools: set = set()
         self.prev_tool_call_arr = []
         self.streamed_args_for_tool = []
         self.current_tool_id = -1
@@ -167,8 +179,12 @@ class MuseSparkToolParser(BaseToolParser):
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
         for m in self._PARAM_RE.finditer(invoke_content):
-            name, raw = m.group(1), m.group(2)
-            params[name] = _parse_param_value(raw, _declared_type(name, func_name, tools))
+            name = next(group for group in m.group(1, 2, 3) if group is not None)
+            if name in params:
+                # The first value wins: streamed arguments only ever extend, so a
+                # repeated name cannot replace a value a client already has.
+                continue
+            params[name] = _parse_param_value(m.group(4), _declared_type(name, func_name, tools))
         return params
 
     def _parse_invoke_content(
@@ -274,6 +290,8 @@ class MuseSparkToolParser(BaseToolParser):
         Both parse paths skip these spans before they look for a tool block.
         """
         spans: List[Tuple[re.Match, int, bool]] = []
+        if not self._may_hold_header(text):
+            return spans
         pos = 0
         while True:
             m = self._HEADER_RE.search(text, pos)
@@ -297,7 +315,21 @@ class MuseSparkToolParser(BaseToolParser):
 
     def _strip_headers_and_reasoning(self, text: str) -> str:
         """Non-streaming cleanup of text outside tool blocks."""
-        return self._clean(self._HEADER_RE.sub("", self._drop_self_spans(text)))
+        text = self._drop_self_spans(text)
+        if self._may_hold_header(text):
+            text = self._HEADER_RE.sub("", text)
+        return self._clean(text)
+
+    @staticmethod
+    def _may_hold_header(text: str) -> bool:
+        """Whether `text` can contain a routing header (or the start of one).
+
+        Every header holds `to=`. Checking for it first keeps the header
+        patterns off text that has none: their leading whitespace match
+        backtracks across a long whitespace run, and a streamed run is held
+        and rescanned on every delta.
+        """
+        return "to=" in text
 
     # ------------------------------------------------------------- streaming
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -334,7 +366,11 @@ class MuseSparkToolParser(BaseToolParser):
                             self._buffer = self._buffer[header.end() :]
                             self._in_reasoning_block = True
                             continue
-                        tail = self._HEADER_TAIL_RE.search(leading)
+                        tail = (
+                            self._HEADER_TAIL_RE.search(leading)
+                            if self._may_hold_header(leading)
+                            else None
+                        )
                         if tail is not None:
                             leading = leading[: tail.start()]
                         leading = self._strip_headers_and_reasoning(leading)
@@ -395,7 +431,8 @@ class MuseSparkToolParser(BaseToolParser):
         """
         parts: List[str] = []
         start_pos = safe.find(self.START)
-        m = self._HEADER_RE.search(safe)
+        may_hold_header = self._may_hold_header(safe)
+        m = self._HEADER_RE.search(safe) if may_hold_header else None
         if m is not None and (start_pos < 0 or m.start() <= start_pos):
             # The first message after the generation prompt has no <|start|>
             # (` to=X<|message|>`); a later one includes it in the match.
@@ -412,7 +449,7 @@ class MuseSparkToolParser(BaseToolParser):
                 return parts, start_pos, False
             return parts, msg_pos + len(self.MESSAGE), False
 
-        tail = self._HEADER_TAIL_RE.search(safe)
+        tail = self._HEADER_TAIL_RE.search(safe) if may_hold_header else None
         if tail is not None:
             if tail.start() > 0:
                 parts.append(safe[: tail.start()])
@@ -464,6 +501,8 @@ class MuseSparkToolParser(BaseToolParser):
 
         for local, inv in enumerate(invokes[: self._block_invoke_count]):
             idx = self._block_base_index + local
+            if idx in self._finished_tools:
+                continue
             func_name = inv.group(1)
             content_start = inv.end()
             content_end = (
@@ -474,11 +513,22 @@ class MuseSparkToolParser(BaseToolParser):
             closed = close_pos >= 0
             parsable = invoke_content[:close_pos] if closed else invoke_content
 
-            params = (
-                self._parse_invoke_content(parsable, func_name, tools)
-                if (closed or block_complete)
-                else self._parse_params(parsable, func_name, tools)
-            )
+            if closed or block_complete:
+                params = self._parse_invoke_content(parsable, func_name, tools)
+                self._finished_tools.add(idx)
+            else:
+                # Only closed parameters stream, and they change only when
+                # another one closes: parse up to the last closing tag, and
+                # skip the parse while that has not moved. A long open value
+                # then costs one `rfind` per delta, not a regex pass and a
+                # re-serialization of every argument.
+                params_end = parsable.rfind(self.param_end_token)
+                if params_end < 0 or params_end == self._parsed_params_end.get(idx):
+                    continue
+                self._parsed_params_end[idx] = params_end
+                params = self._parse_params(
+                    parsable[: params_end + len(self.param_end_token)], func_name, tools
+                )
             if idx < len(self.prev_tool_call_arr):
                 self.prev_tool_call_arr[idx]["arguments"] = params
 
@@ -510,7 +560,9 @@ class MuseSparkToolParser(BaseToolParser):
         elif not self._in_reasoning_block and self._buffer:
             leftover = self._buffer
             self._buffer = ""
-            tail = self._HEADER_TAIL_RE.search(leftover)
+            tail = (
+                self._HEADER_TAIL_RE.search(leftover) if self._may_hold_header(leftover) else None
+            )
             if tail is not None:
                 leftover = leftover[: tail.start()]
             normal_text = self._clean(leftover)

@@ -454,6 +454,24 @@ def test_musespark_always_consumes(seed):
     streamed.finish()
 
 
+def test_thinking_budget_rejected_for_musespark():
+    """The budget processor counts one span; Muse reasoning is not one.
+
+    Each private message would restart the count, and a tool call after the
+    reasoning would be counted and get the forced answer header in its
+    arguments, so the request is rejected instead.
+    """
+    from tensorrt_llm.llmapi.thinking_budget import add_thinking_budget_logits_processor
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    params = SamplingParams(thinking_token_budget=64)
+    with pytest.raises(ValueError, match="musespark reasoning parser"):
+        add_thinking_budget_logits_processor(
+            params, reasoning_parser="musespark", tokenizer=object()
+        )
+    assert params.logits_processor is None
+
+
 def test_musespark_registry_and_flag():
     assert "musespark" in ReasoningParserFactory.keys()
     assert ReasoningParserFactory.needs_raw_special_tokens("musespark")

@@ -460,6 +460,121 @@ def test_musespark_finish_releases_held_text(musespark_parser, musespark_sample_
     assert musespark_parser.finish(musespark_sample_tools).normal_text == " <atem"
 
 
+# ------------------------------------------------- parameter names and values
+@pytest.mark.parametrize("name", ["user:id", "first name", "$filter", "城市", "a>b"])
+def test_musespark_parameter_name_runs_to_its_closing_quote(musespark_parser, name):
+    """A parameter name is a JSON-schema property key and may hold any character."""
+    text = musespark_block(
+        f'<atem:invoke name="lookup"><atem:parameter name="{name}">7</atem:parameter></atem:invoke>'
+    )
+    expected = [(0, "lookup", {name: 7})]
+    assert musespark_calls_as_dicts(musespark_parser.detect_and_parse(text, []).calls) == expected
+    _, calls = musespark_stream_chunks(MuseSparkToolParser(), [], text, [3] * (len(text) // 3))
+    assert [(i, n, json.loads(a)) for i, n, a in calls] == expected
+
+
+def test_musespark_repeated_parameter_keeps_its_first_value(musespark_sample_tools):
+    """A repeated parameter name keeps its first value in both paths.
+
+    Streamed arguments only ever extend, so the stream stays a prefix of the
+    final arguments and still closes as valid JSON.
+    """
+    text = musespark_block(
+        '<atem:invoke name="get_weather">\n'
+        '<atem:parameter name="city">Paris</atem:parameter>\n'
+        '<atem:parameter name="days">3</atem:parameter>\n'
+        '<atem:parameter name="city">Lyon</atem:parameter>\n'
+        "</atem:invoke>\n"
+    )
+    expected = [(0, "get_weather", {"city": "Paris", "days": 3})]
+    parsed = MuseSparkToolParser().detect_and_parse(text, musespark_sample_tools)
+    assert musespark_calls_as_dicts(parsed.calls) == expected
+    _, calls = musespark_stream_chunks(
+        MuseSparkToolParser(), musespark_sample_tools, text, [1] * len(text)
+    )
+    assert [(i, n, json.loads(a)) for i, n, a in calls] == expected
+
+
+def _reject_non_finite(constant):
+    raise ValueError(f"{constant} is not JSON")
+
+
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "1e999", "[1, NaN]"])
+def test_musespark_non_finite_values_stay_text(musespark_parser, raw):
+    """`json.loads` accepts these, but strict JSON clients reject them."""
+    text = musespark_block(musespark_invoke("bounds", lower="0", upper=raw))
+    expected = {"lower": 0, "upper": raw}
+    for parameters in (
+        musespark_parser.detect_and_parse(text, []).calls[0].parameters,
+        musespark_stream_chunks(MuseSparkToolParser(), [], text, [5] * (len(text) // 5))[1][0][2],
+    ):
+        assert json.loads(parameters, parse_constant=_reject_non_finite) == expected
+
+
+# ----------------------------------------------------------- streaming cost
+class _ScanRecorder:
+    """Wraps a compiled pattern and records the length of every text it scans."""
+
+    def __init__(self, pattern, scanned):
+        self._pattern, self._scanned = pattern, scanned
+
+    def search(self, text, *args):
+        self._scanned.append(len(text))
+        return self._pattern.search(text, *args)
+
+    def sub(self, repl, text, *args):
+        self._scanned.append(len(text))
+        return self._pattern.sub(repl, text, *args)
+
+
+def test_musespark_held_whitespace_is_not_rescanned_per_delta(monkeypatch, musespark_sample_tools):
+    """The header patterns do not rescan a held whitespace run on every delta.
+
+    The run is held because it could still start a header, but without `to=`
+    the patterns cannot match, and their backtracking over a long run made the
+    stream cubic.
+    """
+    parser = MuseSparkToolParser()
+    scanned = []
+    for name in ("_HEADER_RE", "_HEADER_TAIL_RE"):
+        monkeypatch.setattr(
+            parser, name, _ScanRecorder(getattr(MuseSparkToolParser, name), scanned)
+        )
+    text = "\n\n\n\n" * 500 + f" to=user{MS_M}Hi{MS_EOT}"
+    normal, calls = musespark_stream_chunks(
+        parser, musespark_sample_tools, text, [4] * 500 + [len(text) - 2000]
+    )
+    assert normal.strip() == "Hi" and not calls
+    # Once the header arrives, not once per delta of the run.
+    assert len(scanned) <= 4
+
+
+def test_musespark_long_open_argument_is_parsed_once_per_closed_parameter(
+    monkeypatch, musespark_sample_tools
+):
+    """The parameters are parsed only when one of them closes.
+
+    While a value streams, nothing new can be emitted for it.
+    """
+    parser = MuseSparkToolParser()
+    parsed_lengths = []
+    parse_params = parser._parse_params
+
+    def recording_parse_params(content, *args):
+        parsed_lengths.append(len(content))
+        return parse_params(content, *args)
+
+    monkeypatch.setattr(parser, "_parse_params", recording_parse_params)
+    code = "if a > b:\n    x = 1\n" * 1500
+    text = musespark_block(musespark_invoke("get_weather", city="Paris", code=code, days="3"))
+    _, calls = musespark_stream_chunks(parser, musespark_sample_tools, text, [4] * (len(text) // 4))
+    assert [(i, n, json.loads(a)) for i, n, a in calls] == [
+        (0, "get_weather", {"city": "Paris", "code": code, "days": 3})
+    ]
+    # Three parameters close, then the invoke: four parses, not one per delta.
+    assert len(parsed_lengths) == 4
+
+
 EQUIV_TEXTS = [
     f" to=get_weather{MS_M}{MS_WEATHER}{MS_EOT}",
     f" to=self{MS_M}think{MS_EOM}{MS_S}assistant to=get_weather{MS_M}{MS_WEATHER}{MS_EOM}"

@@ -90,6 +90,14 @@ class MuseSparkReasoningParser(BaseReasoningParser):
     reasoning_start = " to=self<|message|>"
     reasoning_end = "<|eom|><|start|>assistant" + answer_start
 
+    # `ThinkingBudgetLogitsProcessor` budgets one span, from the last
+    # `reasoning_start` to `reasoning_end`. Here reasoning can be several
+    # private messages, each of which would restart the count, and a tool call
+    # can follow it without the answer header, so the call's tokens would count
+    # and the forced header would land inside its arguments. A thinking budget
+    # is rejected instead.
+    supports_thinking_budget = False
+
     START = "<|start|>"
     MESSAGE = "<|message|>"
     EOM = "<|eom|>"
