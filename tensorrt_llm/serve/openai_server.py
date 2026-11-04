@@ -2195,12 +2195,15 @@ class OpenAIServer(_VideoRoutesMixin):
             # A model whose own grammar forces a required or named call takes
             # it here, in place of the begin prefix and the required-tool modes
             # below.
-            forced_tool_decoding = extension.forced_tool_call_decoding(
-                request,
-                self.tokenizer,
-                tool_parser=self.tool_parser,
-                guided_decoding_backend=self.generator.args.
-                guided_decoding_backend)
+            forced_tool_decoding = None
+            if request.tool_choice == "required" or isinstance(
+                    request.tool_choice, ChatCompletionNamedToolChoiceParam):
+                forced_tool_decoding = extension.forced_tool_call_decoding(
+                    request,
+                    self.tokenizer,
+                    tool_parser=self.tool_parser,
+                    guided_decoding_backend=self.generator.args.
+                    guided_decoding_backend)
             if forced_tool_decoding is not None:
                 if sampling_params.guided_decoding is not None:
                     raise ValueError(
