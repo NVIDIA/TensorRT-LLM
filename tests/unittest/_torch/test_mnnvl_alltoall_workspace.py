@@ -15,7 +15,7 @@
 
 import gc
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 from weakref import WeakSet
 
 import pytest
@@ -663,7 +663,6 @@ def test_two_sided_checkpoint_restore_noop_preserves_shared_owner_state(
 
 def test_frontend_checkpoint_delegates_to_shared_lifecycle() -> None:
     wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
-    wrapper.can_use_cft_counted_writes = False
     wrapper._workspace_lifecycle = Mock()
     comm = Mock()
 
@@ -697,7 +696,6 @@ def test_one_sided_checkpoint_rejects_destroyed_workspace(
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
     wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper._destroyed = False
-    wrapper.can_use_cft_counted_writes = False
     wrapper._workspace_lifecycle = Mock()
     wrapper._workspace_key = ("test",)
     wrapper._workspace_registered = True
@@ -799,7 +797,6 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
-    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
     monkeypatch.setattr(
         _MnnvlAlltoAllWorkspaceLifecycle,
         "get_or_create",
@@ -831,101 +828,16 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     lifecycle.unregister.assert_not_called()
 
 
-def test_second_cft_layout_falls_back_to_fence(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A workspace that cannot own the endpoints builds in fence mode instead of aborting.
-
-    CFT binds logical endpoints to one workspace per process. Models whose layers
-    differ in top-k allocate distinct workspaces, so every later layout must fall
-    back rather than fail construction.
-    """
-
-    class _Memory:
-        mapped = True
-
-        @staticmethod
-        def initialize() -> None:
-            pass
-
-        def __init__(self, mapping: object, size: int) -> None:
-            self.comm = _FakeComm()
-            self.local_mem_handle = 0
-
-        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
-            return torch.zeros(2, 64, dtype=torch.uint8)
-
-    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
-    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
-    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
-    monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
-    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
-    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
-    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
-    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
-    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
-    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
-    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
-    monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=True))
-    monkeypatch.setattr(
-        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
-    )
-    monkeypatch.setattr(
-        torch.ops.trtllm, "moe_a2a_initialize", Mock(return_value=torch.tensor([1]))
-    )
-    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_initialize", Mock())
-
-    def build(top_k: int) -> NVLinkOneSided:
-        mapping = SimpleNamespace(
-            world_size=2,
-            moe_ep_size=2,
-            moe_ep_rank=0,
-            has_cp_helix=Mock(return_value=False),
-        )
-        return NVLinkOneSided(mapping=mapping, num_slots=8, top_k=top_k, max_num_tokens_per_rank=1)
-
-    first = build(top_k=2)
-    assert first.can_use_cft_counted_writes, "the first workspace should own the endpoints"
-
-    # Same layout: reuses the bound workspace, so CFT must not be given up.
-    assert build(top_k=2).can_use_cft_counted_writes
-
-    # Distinct layouts: a different workspace cannot own the endpoints.
-    for top_k in (4, 6):
-        other = build(top_k=top_k)
-        assert not other.can_use_cft_counted_writes, (
-            f"top_k={top_k} allocates its own workspace and must fall back to fence"
-        )
-        assert other._workspace_key != first._workspace_key
-
-
-# Ported from tests/unittest/_torch/moe/test_moe_a2a_cft.py, added upstream in
-# NVIDIA/TensorRT-LLM#19183. That file was retired here by bafb66d154; these two
-# cover _release_workspace teardown, which nothing else on this branch asserts.
-def test_destroy_releases_cft_manager_before_workspace_allocation(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    workspace_key = ("cft-workspace",)
+def test_destroy_drops_workspace_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The last destroy drops the shared workspace; a second destroy is inert."""
+    workspace_key = ("workspace",)
     workspace = object()
     mnnvl_mem = object()
-    workspace_state = {
-        "cft_initialized": True,
-        "workspace": workspace,
-        "ep_rank": 3,
-        "mnnvl_mem": mnnvl_mem,
-    }
+    workspace_state = {"workspace": workspace, "ep_rank": 3, "mnnvl_mem": mnnvl_mem}
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {workspace_key: workspace_state})
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {workspace_key: 1})
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    release_cft_manager = MagicMock()
-
-    def verify_workspace_is_alive(workspace_arg: object, ep_rank: int) -> None:
-        assert workspace_arg is workspace
-        assert ep_rank == 3
-        assert NVLinkOneSided._WORKSPACES[workspace_key]["mnnvl_mem"] is mnnvl_mem
-
-    release_cft_manager.side_effect = verify_workspace_is_alive
-    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_release", release_cft_manager, raising=False)
 
     comm = NVLinkOneSided.__new__(NVLinkOneSided)
     comm._destroyed = False
@@ -938,13 +850,8 @@ def test_destroy_releases_cft_manager_before_workspace_allocation(
     comm._dispatch_state = {"phase": "idle"}
 
     comm.destroy()
-    # Teardown is rank-coordinated and may be reached twice (explicit destroy
-    # plus a later sweep). The second call must be inert: releasing the CFT
-    # endpoint twice would destroy an endpoint this communicator no longer
-    # owns, and the workspace state has already been cleared.
     comm.destroy()
 
-    release_cft_manager.assert_called_once_with(workspace, 3)
     assert workspace_key not in NVLinkOneSided._WORKSPACES
     assert workspace_key not in NVLinkOneSided._WORKSPACE_REFCOUNTS
     assert NVLinkOneSided._WORKSPACE is None
@@ -953,77 +860,11 @@ def test_destroy_releases_cft_manager_before_workspace_allocation(
     assert comm.workspace is None
 
 
-def test_destroy_drops_workspace_when_cft_release_fails(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """A failed CFT release must not leave a reusable workspace behind.
-
-    ``destroy`` decrements the refcount and unregisters the lifecycle before
-    calling ``_release_workspace``, so nothing retries. If the release raised
-    and the entry survived in ``_WORKSPACES``, the next communicator built on
-    the same key would adopt an allocation whose endpoint state is unknown.
-    """
-    workspace_key = ("cft-workspace-failing",)
-    workspace = object()
-    mnnvl_mem = object()
-    workspace_state = {
-        "cft_initialized": True,
-        "workspace": workspace,
-        "ep_rank": 3,
-        "mnnvl_mem": mnnvl_mem,
-    }
-    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {workspace_key: workspace_state})
-    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {workspace_key: 1})
-    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    release_cft_manager = MagicMock(side_effect=RuntimeError("cft release failed"))
-    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_release", release_cft_manager, raising=False)
-
-    comm = NVLinkOneSided.__new__(NVLinkOneSided)
-    comm._destroyed = False
-    comm._workspace_key = workspace_key
-    comm._workspace_state = workspace_state
-    comm._workspace_lifecycle = None
-    comm._workspace_registered = True
-    comm.mnnvl_mem = mnnvl_mem
-    comm.workspace = workspace
-    comm._dispatch_state = {"phase": "idle"}
-
-    # The failure is reported rather than swallowed.
-    with pytest.raises(RuntimeError, match="cft release failed"):
-        comm.destroy()
-
-    release_cft_manager.assert_called_once_with(workspace, 3)
-    # ...but the workspace is gone either way, so nothing can adopt it.
-    assert workspace_key not in NVLinkOneSided._WORKSPACES
-    assert NVLinkOneSided._WORKSPACE is None
-    assert workspace_state == {}
-
-
-def test_destroy_releases_only_its_own_cft_workspace(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Each workspace owns its own CFT manager, so teardown is per workspace.
-
-    Releasing one workspace must pass exactly that workspace to
-    ``moe_a2a_cft_release`` (which erases only its manager) and leave another
-    CFT workspace, and its endpoint, untouched.
-    """
-    released_key, kept_key = ("cft-workspace-a",), ("cft-workspace-b",)
-    released_workspace, kept_workspace = object(), object()
-    released_state = {
-        "cft_initialized": True,
-        "workspace": released_workspace,
-        "ep_rank": 1,
-        "mnnvl_mem": object(),
-    }
-    kept_state = {
-        "cft_initialized": True,
-        "workspace": kept_workspace,
-        "ep_rank": 1,
-        "mnnvl_mem": object(),
-    }
+def test_destroy_releases_only_its_own_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Releasing one workspace leaves another workspace and its refcount untouched."""
+    released_key, kept_key = ("workspace-a",), ("workspace-b",)
+    released_state = {"workspace": object(), "ep_rank": 1, "mnnvl_mem": object()}
+    kept_state = {"workspace": object(), "ep_rank": 1, "mnnvl_mem": object()}
     monkeypatch.setattr(
         NVLinkOneSided,
         "_WORKSPACES",
@@ -1031,10 +872,7 @@ def test_destroy_releases_only_its_own_cft_workspace(
     )
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {released_key: 1, kept_key: 1})
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", kept_state)
-    monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    release_cft_manager = MagicMock()
-    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_release", release_cft_manager, raising=False)
 
     comm = NVLinkOneSided.__new__(NVLinkOneSided)
     comm._destroyed = False
@@ -1043,14 +881,12 @@ def test_destroy_releases_only_its_own_cft_workspace(
     comm._workspace_lifecycle = None
     comm._workspace_registered = True
     comm.mnnvl_mem = released_state["mnnvl_mem"]
-    comm.workspace = released_workspace
+    comm.workspace = released_state["workspace"]
     comm._dispatch_state = {"phase": "idle"}
 
     comm.destroy()
 
-    release_cft_manager.assert_called_once_with(released_workspace, 1)
     assert released_key not in NVLinkOneSided._WORKSPACES
     assert NVLinkOneSided._WORKSPACES[kept_key] is kept_state
-    assert kept_state["cft_initialized"] is True
     assert NVLinkOneSided._WORKSPACE is kept_state
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {kept_key: 1}
