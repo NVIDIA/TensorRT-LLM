@@ -209,11 +209,6 @@ def test_null_strict_is_dropped_from_tools():
     assert tools == original
 
 
-def test_a_chat_template_is_rejected():
-    with pytest.raises(ValueError, match="native Tekken chat template"):
-        _render(_RecordingTokenizer(), [{"role": "user", "content": "Hi."}], chat_template="{{x}}")
-
-
 @pytest.mark.parametrize("effort", ["low", "high"])
 def test_top_level_reasoning_effort_reaches_the_renderer(effort):
     request = _request(reasoning_effort=effort, chat_template_kwargs={"x": 1})
@@ -244,12 +239,11 @@ def test_reasoning_effort_in_kwargs_is_kept_and_must_agree():
         )
 
 
-def test_an_unknown_reasoning_effort_is_rejected():
-    """mistral-common's own efforts pass; whether the checkpoint declares one is the renderer's."""
-    with pytest.raises(ValueError, match="is not a reasoning effort"):
-        apply_model_chat_extensions(
-            _request(chat_template_kwargs={"reasoning_effort": "turbo"}), "mistral_large_4"
-        )
+def test_the_renderer_judges_the_reasoning_effort_name():
+    """The extension passes an effort on unchecked; mistral-common rejects it at rendering."""
+    request = _request(chat_template_kwargs={"reasoning_effort": "turbo"})
+    apply_model_chat_extensions(request, "mistral_large_4")
+    assert request.chat_template_kwargs == {"reasoning_effort": "turbo"}
 
 
 def test_a_request_chat_template_is_rejected():
@@ -443,11 +437,21 @@ def test_top_level_reasoning_effort_renders(tokenizer):
     assert _server_ids(tokenizer, messages=messages) == _raw_ids(tokenizer, messages)
 
 
-def test_a_reasoning_effort_the_checkpoint_does_not_declare_is_an_invalid_request(tokenizer):
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"reasoning_effort": "max"},
+        {"chat_template_kwargs": {"reasoning_effort": "minimal"}},
+        {"chat_template_kwargs": {"reasoning_effort": "turbo"}},
+    ],
+    ids=["undeclared", "undeclared_in_kwargs", "unknown_in_kwargs"],
+)
+def test_a_reasoning_effort_the_checkpoint_does_not_declare_is_an_invalid_request(
+    tokenizer, fields
+):
+    # openai_chat returns HTTP 400 for a ValueError raised while rendering.
     with pytest.raises(ValueError, match="reasoning_effort"):
-        _server_ids(
-            tokenizer, messages=[{"role": "user", "content": "Think."}], reasoning_effort="max"
-        )
+        _server_ids(tokenizer, messages=[{"role": "user", "content": "Think."}], **fields)
 
 
 def test_ignored_fields_leave_the_tokens_unchanged(tokenizer):

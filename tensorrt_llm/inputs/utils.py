@@ -904,9 +904,6 @@ def apply_chat_template(
     """
 
     if model_type == "mistral_large_4":
-        if chat_template is not None:
-            raise ValueError(
-                "Mistral Large 4 uses its native Tekken chat template")
         from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
             MistralTokenizer
         if isinstance(tokenizer, TransformersTokenizer) and not isinstance(
