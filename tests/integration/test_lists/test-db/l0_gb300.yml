@@ -18,7 +18,32 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_prebuild.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_rank_agreement.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_prebuild.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_rank_agreement.py
   # ------------- PyTorch tests ---------------
+  # MLA context head slices, including FP8 scale-block boundaries.
+  - unittest/_torch/modules/test_linear_output_slice.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
@@ -56,6 +81,21 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/visual_gen/kernels/parallel
+  # Qwen3.5 decode kernels: low-M warp-MMA GEMM, TRTLLM-gen NVFP4 MoE decode / route fronts, draft experts,
+  # GDN fused target verify.
+  - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/modules/mamba/test_gdn_kernel_optimizations.py
+  - unittest/_torch/moe/test_moe_decode_front.py
+  - unittest/_torch/moe/test_draft_experts_nvfp4.py
+  - unittest/_torch/modules/test_embedding_lookup.py
+  # GQA decode FMHA libraries (SM100 runs them with unittest/_torch/attention in l0_b200).
+  - unittest/_torch/attention/test_gqa_decode_fmha.py
+  # One-model speculative decoding: step copies, MXFP8 draft head, MTP fc input, steady prepare.
+  - unittest/_torch/kernels/test_spec_step_copies.py
+  - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/modules/test_mxfp8_draft_head.py
+  - unittest/_torch/modules/test_q35_mtp_glue.py
+  - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
 - condition:
     ranges:
       system_gpu_count:
@@ -81,3 +121,37 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
+
+# K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_latent_reduce.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_markov.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mnnvl_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_front.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_push.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sandwich.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_spec_accept_sharded.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_latent_reduce_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe_front_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_sandwich_plain_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_sandwich_tail_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_comm_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_allgather_split_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py

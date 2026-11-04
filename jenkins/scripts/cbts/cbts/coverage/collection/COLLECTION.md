@@ -42,14 +42,27 @@ def _on_py_start(self, code, offset):
     fn = code.co_filename
     if self._in_source(fn):
         qual = code.co_qualname
-        if "<locals>" not in qual and qual not in _SKIP_QUALNAMES:
+        if qual.rpartition(".")[2] not in _SKIP_QUALNAMES:
             self._data[self._ctx].add((fn, qual))
     return _MON.DISABLE
 ```
 
 - Each code object fires once on **first entry**, then `DISABLE`s itself: zero cost afterwards.
+    - Note: for generator or coroutine, that's the first resume, not the function invocation.
 - Each test re-arms with `restart_events()`, so every test gets its own complete function set.
 - Cost scales with how many **distinct** functions were entered, not with how often.
+
+The reported qualname is inherently non-unique: Python doesn't enforce every function definition
+to have distinct name, and the `@property` idiom even recommends sharing name for getter and setter.
+Since we are handling *change*, the line number and code itself are also not reliable identity to
+distinguish same-name functions.
+
+### 2.1 Closures
+
+A closure created by a function / class definition, like a decorator's `wrapper`, a registered callback or
+the inner function of a cached factory, is recorded normally under its full dotted `co_qualname`
+(e.g. `my_decorator.<locals>.wrapper`). Closures created by lambda and generator expression are excluded
+because a difficulty in the static analysis when selection tests.
 
 ## 3. Crossing processes
 
@@ -59,11 +72,11 @@ tracker in every Python process in the tree. No product code is modified.
 A process learns what it is from `CBTS_PROCESS_ROLE`, set by whoever launches it and popped by
 `sitecustomize.py` so it describes exactly one process:
 
-| Role | Set by | Context source | Activation |
-|---|---|---|---|
-| `outer_pytest` | `jenkins/L0_Test.groovy` | `cbts_plugin`'s `pytest_runtest_protocol` switches it directly | at interpreter startup |
-| `inner_pytest` | `tests/integration/defs/test_unittests.py` | inherited `CBTS_TEST_ID`, held for the whole batch | at interpreter startup |
-| *(unset)* — pool workers, `trtllm-serve`, helper subprocesses | — | inherited `CBTS_TEST_ID` until it subscribes to the context channel, then every announcement | immediate, at interpreter startup — except an `mpi4py.futures` pool worker, deferred to its `_sync_set_data` sync-handshake hook (see `README.md`) |
+| Role                                                          | Set by                                     | Context source                                                                               | Activation                                                                                                                                         |
+|---------------------------------------------------------------|--------------------------------------------|----------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| `outer_pytest`                                                | `jenkins/L0_Test.groovy`                   | `cbts_plugin`'s `pytest_runtest_protocol` switches it directly                               | at interpreter startup                                                                                                                             |
+| `inner_pytest`                                                | `tests/integration/defs/test_unittests.py` | inherited `CBTS_TEST_ID`, held for the whole batch                                           | at interpreter startup                                                                                                                             |
+| *(unset)* - pool workers, `trtllm-serve`, helper subprocesses | -                                          | inherited `CBTS_TEST_ID` until it subscribes to the context channel, then every announcement | immediate, at interpreter startup - except an `mpi4py.futures` pool worker, deferred to its `_sync_set_data` sync-handshake hook (see `README.md`) |
 
 A subscriber finds the channel through `CBTS_CONTEXT_SOCKET`. Ordinary children inherit it at exec;
 MPI pool workers are spawned from an environment the MPI runtime captured before `pytest_configure`
@@ -84,15 +97,19 @@ channel subscriber additionally flushes synchronously on every context switch, b
 what a confirmed-dead subscriber's already-superseded tests rely on. Leaf, platform-level and final
 databases share schema version 5, so one reducer merges every level:
 
-| Table | Contents |
-|---|---|
-| `stage`, `case_stage` | interned stage names and bare test contexts |
-| `file`, `symbol` | interned product paths and qualnames |
-| `touch(case_stage_id, symbol_id)` | which test context entered each symbol |
-| `process` | stable process identity |
-| `test_result` | coordinator outcome observations |
-| `taint(process_id, case_stage_id, kind, reason)` | coverage the context channel could not vouch for |
-| `process_diagnostic(process_id, key, value)` | diagnostic only: arbitrary facts recorded about a process, open-ended by design — a new fact is a new row, never a schema change. Currently sourced from `ContextServer.diagnostics` (a subscriber's own cmdline and inherited pytest case, kept if it is later dropped confirmed dead or on an ordinary voluntary leave), but the table itself carries whatever is sent |
+| Table                                            | Contents                                                  |
+|--------------------------------------------------|-----------------------------------------------------------|
+| `stage`, `case_stage`                            | interned stage names and bare test contexts               |
+| `file`, `symbol`                                 | interned product paths and qualnames                      |
+| `touch(case_stage_id, symbol_id)`                | which test context entered each symbol                    |
+| `process`                                        | stable process identity                                   |
+| `test_result`                                    | coordinator outcome observations                          |
+| `taint(process_id, case_stage_id, kind, reason)` | coverage the context channel could not vouch for          |
+| `process_diagnostic(process_id, key, value)`     | diagnostic only: arbitrary facts recorded about a process |
+
+Currently, the `process_diagnostic` table contains the subscribers' cmdline and inherited pytest case.
+They can be used to understand when and why they dropped unexpectedly, is that happens later.
+If other requirements arise in the future, other facts can be recorded using their own keys.
 
 The merge (`pystart_report.py`) resolves each input's local IDs by its natural keys and unions the
 relations. The final artifact is `cbts_touchmap.sqlite`; the `touch_rows`, `taint_rows`,
@@ -106,45 +123,31 @@ process has — a process with none known simply has no matching rows.
 
 This section is what forces the concessions on the consumer side.
 
-### 5.1 Closures — not recorded at all, **still unresolved**
+### 5.1 Anonymous constructs
 
-```python
-if "<locals>" not in qual and ...
-```
+`_on_py_start` drops `<lambda>` and `<genexpr>` frames (`_SKIP_QUALNAMES`): selection has no
+static-analysis path to resolve a changed line to either, so a recorded row would have no consumer; see
+`../selection/SELECTION.md` §4.1 for why. This is conservative, not a hard limit.
 
-Any frame whose qualname contains `<locals>` is dropped outright. A decorator's `wrapper`, a
-registered callback, the inner function of a cached factory — none leave a trace however often they
-run.
+Note: list/set/dict comprehensions need no entry here either, for an unrelated reason - PEP 709 inlines
+them into the enclosing frame on Python 3.12+, so no code object exists for either side to see.
 
-Measured scale: `tensorrt_llm` is 646410 lines, of which **14191 (2.2%)** are closure bodies; 7513 of
-those sit under an enclosing function whose row set trails the whole file's by more than 300 tests.
+### 5.2 PEP 695 Generics
 
-The consumer side widens a closure change to file level when that is wider, and otherwise runs in
-full (`../selection/SELECTION.md` §4.1); **the collection side itself is unfixed.** A fix
-means having the producer record closure frames (the `<locals>` segments in `co_qualname` can be kept
-or folded), which is follow-up work.
+PEP 695 generic syntax (`def f[T](...)`, `class C[T]:`, `type X[T] = ...`, Python 3.12+) compiles an
+implicit type-parameter scope whose qualname is `<generic parameters of f>`. We don't use it in product code
+and don't handle it yet.
 
-### 5.2 The outer pytest's own import is unattributed
+### 5.3 The outer pytest's own import
 
 Every product process activates `PY_START` and records its own import — immediately for most, or at
 its mpi4py sync handshake for an `mpi4py.futures` pool worker specifically, which still precedes any
 product code — see `README.md`'s "Process roles" and "The context channel" sections.
 
 The outer pytest's import happens before any test, under the empty context, and the merge filters it
-out with `WHERE test != ''`. So the outer pytest's own module-level and class-level import-time code
-(as opposed to a subprocess's) earns no rows from any test, by construction — nothing to fix here,
+out with `WHERE test != ''`. So the outer pytest's own module-level and class-level import-time code (as opposed to a
+subprocess's) earns no rows from any test, by construction — nothing to fix here,
 since nothing could ever attribute it to one test over another.
-
-### 5.3 Other blind spots
-
-| Blind spot | Reason |
-|---|---|
-| C++ / nanobind implementations | PY_START only sees Python frames; the C++ side of KV cache manager, scheduler and decoder is invisible |
-| Comprehensions / genexprs / lambdas | skipped explicitly by `_SKIP_QUALNAMES` |
-| Other test bodies and helpers | Under `tests/`, the default include patterns select only `test_common/` and `conftest.py` |
-| A Ray stage's GPU worker | `RayGPUWorker` lives in the opted-out `default_worker.py` |
-| Multi-GPU / multi-node stages | phase 1 collects on single-GPU stages only; the channel design is single-producer, so a multi-node stage would need its address published somewhere shared |
-| A channel failure inside an inner-pytest batch | `test_unittests_v2` has no `cbts_plugin` (§3's `inner_pytest` row), so nothing records a taint if a subscriber it spawns falls behind |
 
 ### 5.4 Pytest fixtures and hooks
 
@@ -154,6 +157,16 @@ empty context and do not count as per-test coverage. A shared fixture's setup is
 first consumer and teardown under its last; cached reuse by another test enters no Python frame.
 These rows describe execution, not every test that depends on a shared fixture. Selecting tests for
 `conftest.py` changes requires additional dependency and scope handling.
+
+### 5.5 Other blind spots
+
+| Blind spot                                     | Reason                                                                                                                                                     |
+|------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| C++ / nanobind implementations                 | PY_START only sees Python frames; the C++ side of KV cache manager, scheduler and decoder is invisible                                                     |
+| Other test bodies and helpers                  | Under `tests/`, the default include patterns select only `test_common/` and `conftest.py`                                                                  |
+| A Ray stage's GPU worker                       | `RayGPUWorker` lives in the opted-out `default_worker.py`                                                                                                  |
+| Multi-GPU / multi-node stages                  | phase 1 collects on single-GPU stages only; the channel design is single-producer, so a multi-node stage would need its address published somewhere shared |
+| A channel failure inside an inner-pytest batch | `test_unittests_v2` has no `cbts_plugin` (§3's `inner_pytest` row), so nothing records a taint if a subscriber it spawns falls behind                      |
 
 ---
 

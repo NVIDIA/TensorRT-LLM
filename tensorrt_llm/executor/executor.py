@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
@@ -132,9 +133,13 @@ class GenerationExecutor(ABC):
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
+
+        ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
+        omit this argument or pass None.
         """
         assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
             prompt_token_ids[0], int)
@@ -161,7 +166,8 @@ class GenerationExecutor(ABC):
             cache_salt=cache_salt,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
-            priority=priority)
+            priority=priority,
+            kv_hints=kv_hints)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
@@ -181,6 +187,9 @@ class GenerationExecutor(ABC):
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
+
+        ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
+        omit this argument or pass None.
         """
         unbatched = isinstance(prompt_token_ids[0], int)
 

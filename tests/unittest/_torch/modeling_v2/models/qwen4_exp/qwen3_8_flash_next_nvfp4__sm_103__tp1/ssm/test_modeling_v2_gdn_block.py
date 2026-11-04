@@ -4,12 +4,12 @@
 
 Drives `DecodeTarget._gdn_block` and `PrefillTarget._gdn_block` at the
 checkpoint's geometry (hidden 2560, 16 k-heads, 48 v-heads, head dim 128,
-fp32 recurrent pool of 461 slots) on a decode and a mixed (context + one-token
+fp32 or bf16 recurrent pool of 461 slots) on a decode and a mixed (context + one-token
 generation rows) batch, and compares the block output
 and both state pools with a reference that composes the Triton recurrences
-(`fused_sigmoid_gating_delta_rule_update` for decode,
-`chunk_gated_delta_rule` over every row of a prefill step) around the same
-projections, convolutions and epilogue.
+(`fused_sigmoid_gating_delta_rule_update`'s rows form for decode, bitwise its
+packed call at either pool dtype; `chunk_gated_delta_rule` over every row of a
+prefill step) around the same projections, convolutions and epilogue.
 
 The reference's context rows run the unfused `extract_transpose_prefill_slice`
 -> `causal_conv1d_fwd` -> `fused_gdn_post_conv` chain the target's
@@ -45,6 +45,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.fused_sigmoid_gating_delta_rule_update import (  # noqa: E501
     fused_sigmoid_gating_delta_rule_update as triton_decode,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
+    reset_recurrent_state_rows,
+)
 
 assert torch.cuda.is_available(), "the Gated-DeltaNet block requires a CUDA device"
 
@@ -65,11 +68,12 @@ def _slots(n: int) -> list[int]:
     return ([SLOTS - 1, 0] + rest)[:n]
 
 
-def _core(seed: int) -> types.SimpleNamespace:
-    """The attributes `_gdn_block` reads off the core, with layer 0's pools."""
+def _core(seed: int, state: torch.dtype = torch.float32) -> types.SimpleNamespace:
+    """The attributes `_gdn_block` reads off the core, with layer 0's pools (the recurrent
+    one in `state`)."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     conv = torch.randn(SLOTS, CONV, WIDTH - 1, generator=g, device=DEV, dtype=BF16)
-    ssm = torch.randn(SLOTS, HV, V, K, generator=g, device=DEV) * 0.05
+    ssm = (torch.randn(SLOTS, HV, V, K, generator=g, device=DEV) * 0.05).to(state)
     return types.SimpleNamespace(
         conv_dim=CONV,
         key_dim=KD,
@@ -110,6 +114,14 @@ def _layer(seed: int) -> types.SimpleNamespace:
         a_log=torch.empty(HV, device=DEV).uniform_(-5.5, 3.5, generator=g),
         dt_bias=torch.empty(HV, device=DEV).uniform_(-8.9, 19.2, generator=g),
         gnorm=(1.0 + 0.1 * torch.randn(VD // HV, generator=g, device=DEV)).to(BF16),
+        # No FP8 copies: the projections stay on the bf16 entries (dense FP8 mode off).
+        in_proj8=None,
+        out8=None,
+        in_proj_g=None,
+        out_g=None,
+        in_proj_m=None,
+        out_m=None,
+        in_proj_nv=None,
     )
 
 
@@ -142,9 +154,7 @@ def _decode_state(m: int):
     slot vector is the head of an engine-sized buffer."""
     buf = torch.zeros(MAX_BATCH, dtype=torch.int32, device=DEV)
     buf[:m] = torch.tensor(_slots(m), dtype=torch.int32, device=DEV)
-    si_all = buf[:m]
-    qsl_long = torch.arange(m + 1, dtype=torch.int64, device=DEV)
-    return (si_all, False, m, 1, None, None), qsl_long
+    return (buf[:m], False, m, 1, None, None)
 
 
 def _prefill_state(ctx_lens: tuple, n_dec: int, has_init: tuple):
@@ -210,8 +220,10 @@ def _post_conv(prefill, decode, a, b, L):
     )
 
 
-def _triton_decode_block(core, x, L, si_all, qsl_long):
-    """The decode block with the Triton single-token recurrence."""
+def _triton_decode_block(core, x, L, si_all):
+    """The decode block with the Triton single-token recurrence in its rows form (q/k/v
+    `[m, 1, heads, 128]` from a contiguous copy, `cu_seqlens` None), which stays on the
+    Triton kernel at either pool dtype."""
     m = x.shape[0]
     mixed, z, a, b = torch.split(M.cublas_mm(x, L.in_proj), [CONV, VD, HV, HV], 1)
     M.causal_conv1d_update(
@@ -224,22 +236,22 @@ def _triton_decode_block(core, x, L, si_all, qsl_long):
         conv_state_indices=si_all,
         pad_slot_id=M._PAD_SLOT_ID,
     )
-    qv, kv, vv = torch.split(mixed, [KD, KD, VD], 1)
+    qv, kv, vv = torch.split(torch.reshape(mixed.contiguous(), [m, 1, -1, K]), [H, H, HV], 2)
     out = triton_decode(
         A_log=L.a_log,
-        a=a,
+        a=torch.reshape(a.contiguous(), [m, 1, HV]),
         dt_bias=L.dt_bias,
         softplus_beta=M._SOFTPLUS_BETA,
         softplus_threshold=M._SOFTPLUS_THRESHOLD,
-        q=torch.reshape(qv, [1, m, H, K]),
-        k=torch.reshape(kv, [1, m, H, K]),
-        v=torch.reshape(vv, [1, m, HV, V]),
-        b=b,
+        q=qv,
+        k=kv,
+        v=vv,
+        b=torch.reshape(b.contiguous(), [m, 1, HV]),
         initial_state_source=core._bound.ssm[0],
         initial_state_indices=si_all,
         scale=None,
         use_qk_l2norm_in_kernel=True,
-        cu_seqlens=qsl_long,
+        cu_seqlens=None,
         output=None,
     )
     return M.DecodeTarget._gdn_epilogue(_target(M.DecodeTarget, core), out, z, L, m)
@@ -252,7 +264,7 @@ def _triton_prefill_block(core, x, L, st):
     T = x.shape[0]
     conv, ssm = core._bound.conv[0], core._bound.ssm[0]
     mixed, z, a, b = torch.split(M.cublas_mm(x, L.in_proj), [CONV, VD, HV, HV], 1)
-    M.reset_recurrent_state_rows(ssm, si_p, hi_p, conv)
+    reset_recurrent_state_rows(ssm, si_p, hi_p, conv)
     conv_args = dict(
         weight=L.conv_w,
         bias=None,
@@ -337,43 +349,50 @@ def warm_triton_chunk():
     torch.cuda.synchronize()
 
 
-def test_decode_block() -> None:
+#: The recurrent pool dtypes the target serves (`mamba_ssm_cache_dtype`).
+STATES = {"fp32": torch.float32, "bf16": torch.bfloat16}
+
+
+@pytest.mark.parametrize("state", STATES)
+def test_decode_block(state) -> None:
     """A con-128 decode step; the graph-replay test below runs 32 rows."""
     m = 128
-    core, L, x = _core(100 + m), _layer(200 + m), _x(m, 300 + m)
+    core, L, x = _core(100 + m, STATES[state]), _layer(200 + m), _x(m, 300 + m)
     core_ref = _clone_core(core)
-    st, qsl_long = _decode_state(m)
+    st = _decode_state(m)
     y = _target(M.DecodeTarget, core)._gdn_block(x, 0, L, st)
-    y_ref = _triton_decode_block(core_ref, x, L, st[0], qsl_long)
-    _check(y, y_ref, core, core_ref, f"decode m={m}")
+    y_ref = _triton_decode_block(core_ref, x, L, st[0])
+    _check(y, y_ref, core, core_ref, f"decode m={m}, {state} pool")
     named = set(_slots(m))
     unnamed = [s for s in range(SLOTS) if s not in named]
-    original = _core(100 + m)
+    original = _core(100 + m, STATES[state])
     assert torch.equal(core._bound.ssm[0][unnamed], original._bound.ssm[0][unnamed]), (
         "unnamed slots written"
     )
 
 
-def test_prefill_block(warm_triton_chunk) -> None:  # noqa: F811 — fixture by name
+@pytest.mark.parametrize("state", STATES)
+def test_prefill_block(state, warm_triton_chunk) -> None:  # noqa: F811 — fixture by name
     """A mixed step: three variable-length contexts (two carrying state) plus five
     one-token generation rows."""
     ctx_lens, n_dec, has_init = (200, 37, 91), 5, (True, False, True)
     tokens = sum(ctx_lens) + n_dec
-    core, L, x = _core(400 + tokens), _layer(500 + tokens), _x(tokens, 600 + tokens)
+    core, L, x = _core(400 + tokens, STATES[state]), _layer(500 + tokens), _x(tokens, 600 + tokens)
     core_ref = _clone_core(core)
     st = _prefill_state(ctx_lens, n_dec, has_init)
     y = _prefill_block(core, x, L, st)
     y_ref = _triton_prefill_block(core_ref, x, L, st)
-    _check(y, y_ref, core, core_ref, f"prefill {ctx_lens}+{n_dec}x1")
+    _check(y, y_ref, core, core_ref, f"prefill {ctx_lens}+{n_dec}x1, {state} pool")
 
 
-def test_decode_block_replays_under_cuda_graph() -> None:
+@pytest.mark.parametrize("state", STATES)
+def test_decode_block_replays_under_cuda_graph(state) -> None:
     """The decode block captured into a CUDA graph after one eager call (the
     eager call compiles the decode kernel and sizes its per-batch scratch, as
     the engine's warmup does) replays to exactly the eager result."""
     m = 32
-    core0, L, x = _core(700), _layer(701), _x(m, 702)
-    st, _ = _decode_state(m)
+    core0, L, x = _core(700, STATES[state]), _layer(701), _x(m, 702)
+    st = _decode_state(m)
     eager_core = _clone_core(core0)
     y_eager = _target(M.DecodeTarget, eager_core)._gdn_block(x, 0, L, st).clone()
     graph_core = _clone_core(core0)

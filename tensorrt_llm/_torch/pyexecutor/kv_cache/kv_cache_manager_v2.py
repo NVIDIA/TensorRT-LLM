@@ -72,7 +72,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
     GPU_LEVEL,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     AttnLifeCycle,
     Batch,
     BatchDesc,
@@ -94,6 +93,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     PoolRebalanceConfig,
+    ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
     SwaScratchReuseConfig,
@@ -141,6 +141,7 @@ from ..scheduler import ScheduledRequests
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
@@ -192,13 +193,6 @@ _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 
 # Storage dtypes accepted as the history half of a mixed-precision KV cache.
 _MIXED_PRECISION_LOW_DTYPES = {"nvfp4": DataType.NVFP4}
-
-
-class _MixedPrecisionLayerKind(IntEnum):
-    """Which of a mixed-precision layer's two pools a runtime layer id refers to."""
-
-    PRIMARY = 0
-    HIGH_PRECISION = 1
 
 
 def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
@@ -309,7 +303,7 @@ class KVCacheLayerSpec:
     buffer_roles: tuple[DataRole, ...]
     sliding_window_size: Optional[int] = None
     num_sink_tokens: Optional[int] = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
     def __post_init__(self) -> None:
         if self.global_layer_id < 0:
@@ -1075,6 +1069,7 @@ def _augment_tokens_with_mm_run_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     metadata: _MmRunMetadata,
     chunk_start: int,
     chunk_end: int,
@@ -1109,6 +1104,7 @@ def _augment_tokens_with_mm_run_metadata(
 
     current_item_idx: Optional[int] = None
     digest = b""
+    uuid: str | None = None
     for item_idx, chunk_result_offset, item_token_offset, length in zip(
         overlap_run_item_indices.tolist(),
         chunk_result_offsets.tolist(),
@@ -1119,13 +1115,22 @@ def _augment_tokens_with_mm_run_metadata(
         if item_idx != current_item_idx:
             current_item_idx = item_idx
             digest = _hash_to_digest(multimodal_hashes[item_idx])
+            uuid = (
+                multimodal_uuids[item_idx]
+                if multimodal_uuids is not None and item_idx < len(multimodal_uuids)
+                else None
+            )
         # Feed the coarse item property (content digest) and granular run
         # properties (item-local offset and span length) into the key
         # generator, so cache keys reflect the actual multimodal tokens being
         # rewritten.
         result[chunk_result_offset : chunk_result_offset + length] = (
             gen_multimodal_cache_key_tokens(
-                vocab_size, digest, length, token_offset=item_token_offset
+                vocab_size,
+                digest,
+                length,
+                token_offset=item_token_offset,
+                uuid=uuid,
             )
         )
 
@@ -1136,6 +1141,7 @@ def _augment_tokens_with_contiguous_mm_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     multimodal_positions: Sequence[int] | torch.Tensor,
     multimodal_lengths: Sequence[int] | torch.Tensor,
     chunk_start: int,
@@ -1163,6 +1169,11 @@ def _augment_tokens_with_contiguous_mm_metadata(
             _hash_to_digest(multimodal_hashes[item_idx]),
             overlap_length,
             token_offset=source_offset,
+            uuid=(
+                multimodal_uuids[item_idx]
+                if multimodal_uuids is not None and item_idx < len(multimodal_uuids)
+                else None
+            ),
         )
 
     return result
@@ -1768,10 +1779,18 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # Staging rows per batch for recurrent-state snapshots taken inside the
+    # forward (MambaHybridCacheManagerV2); 0 = none.
+    inforward_snapshot_rows: int = 0
     # Mixed-precision state as seen by instances built without __init__;
     # _init_mixed_precision assigns fresh per-instance values.
-    low_precision_dtype: Optional[DataType] = None
-    high_layers: dict[int, int] = {}
+    mixed_precision_low_dtype: DataType | None = None
+    mixed_precision_high_layers: dict[int, int] = {}
+    mixed_precision_high_dtype: DataType | None = None
+    # A subclass opts in, and its own subclasses inherit that; the base class always supports it.
+    _supports_mixed_precision_kv = False
+    # True when the manager's own pool already holds the history in the mixed-precision low format.
+    _own_pool_is_mixed_precision_low = False
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1795,6 +1814,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # the class for instances built without running __init__.
     _commit_branch_snapshots = False
     _record_branch_snapshots = False
+    # Request id -> points of its prompt that requests waiting for its prefix
+    # need snapshotted (request_prefix_snapshot); kept apart from the request's
+    # own expect_snapshot_points, which other code rewrites. Created on first use.
+    _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
 
     def __init__(
         self,
@@ -1877,16 +1900,33 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise ValueError(f"layer-spec global layer ids must be unique: {self.pp_layers}")
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
         self.is_draft = is_draft
+        # Draft layers follow the model's own layers; under a layer_mask only the model config tells
+        # where they start.
+        first_draft_layer = (
+            self._declared_target_layer_count
+            if layer_mask is None
+            else getattr(kwargs.get("pretrained_config"), "num_hidden_layers", None)
+        )
         self._legacy_draft_layer_ids = {
             global_layer_id
             for global_layer_id in self.pp_layers
             if is_draft
             or (
                 spec_config is not None
-                and layer_mask is None
-                and global_layer_id >= self._declared_target_layer_count
+                and first_draft_layer is not None
+                and global_layer_id >= first_draft_layer
             )
         }
+        # MTP layers use mixed-precision KV like the model's own layers; the layers that another
+        # drafter (Eagle3, ...) adds to this manager keep a plain cache.
+        self._plain_draft_layers = set()
+        if (
+            self.mixed_precision_low_dtype is not None
+            and spec_config is not None
+            and not is_draft
+            and not spec_config.spec_dec_mode.is_mtp_one_model()
+        ):
+            self._plain_draft_layers = self._legacy_draft_layer_ids
         if self.layer_specs is not None:
             if is_draft and any(
                 layer.owner is not KVCacheLayerOwner.DRAFT for layer in self.layer_specs
@@ -1992,6 +2032,34 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"(got pp_size={mapping.pp_size}). Set "
                     "pipeline_parallel_size=1 or enable_attention_dp=False."
                 )
+            if kv_cache_config.enable_kv_pool_rebalance:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support KV pool rebalance with "
+                    "helix context parallelism: a rebalance changes pool sizes "
+                    "on each rank independently of the cross-rank quota agreed "
+                    "at construction. Set "
+                    "kv_cache_config.enable_kv_pool_rebalance=False."
+                )
+            if not is_disagg:
+                if (kv_cache_config.host_cache_size or 0) > 0 or (
+                    kv_cache_config.disk_cache_size or 0
+                ) > 0:
+                    raise ValueError(
+                        "KVCacheManagerV2 does not support cache tiers below "
+                        "GPU with aggregated helix context parallelism: "
+                        "suspending to a lower tier is not validated to make "
+                        "the same decisions on every CP rank. Set "
+                        "kv_cache_config.host_cache_size=0 and "
+                        "kv_cache_config.disk_cache_size=0."
+                    )
+                if kv_connector_manager is not None:
+                    raise ValueError(
+                        "KVCacheManagerV2 does not support a KV cache "
+                        "connector with aggregated helix context parallelism: "
+                        "its loads, saves and deferred preemptions are not "
+                        "validated to make the same decisions on every CP "
+                        "rank. Unset kv_connector_config."
+                    )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_cuda_graph_batch_size = max_cuda_graph_batch_size
@@ -2235,7 +2303,16 @@ class KVCacheManagerV2(BaseResourceManager):
         connector_registers_pages = (
             kv_connector_manager is not None and not kv_connector_manager.capacity_only
         )
-        if connector_registers_pages and kv_cache_config.host_cache_size is None:
+        if self._has_cp_helix and not is_disagg:
+            # Aggregated helix runs GPU-only (lower tiers are rejected above),
+            # so pool pressure is relieved by preemption, as in the connector
+            # case.
+            host_quota = 0
+            logger.info(
+                "KV cache manager v2 host tier disabled: aggregated helix runs "
+                "GPU-only and relieves KV pressure by recompute pause."
+            )
+        elif connector_registers_pages and kv_cache_config.host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
@@ -2348,7 +2425,11 @@ class KVCacheManagerV2(BaseResourceManager):
             if isinstance(self.event_manager, StreamingKVCacheEventManager)
             else self.event_manager
         )
-        if not has_host_cache_tier:
+        # Aggregated helix runs GPU-only but its CP ranks still need a common
+        # verdict: a rank that fails to allocate would otherwise leave its peers
+        # waiting in the first collective.
+        sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
+        if not sync_init_status:
             candidate = self._allocate_cache_pools(
                 config,
                 event_manager=event_sink,
@@ -2513,6 +2594,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self.enable_joint_kv_cache_reuse
             and not self._has_cp_helix
         )
+        self.can_share_inflight_prefix = self._can_share_inflight_prefix()
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -2583,10 +2665,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 }
             )
         )
-        if self._sparse_layer_group_ids:
-            self.sparse_metadata_batch = Batch(
-                self.impl, index_mapper_capacity, self.max_blocks_per_seq, self.max_beam_width
-            )
+        # Metadata publication belongs to the sparse fetch path, which builds the Batch
+        # it publishes through; this manager does not. Every use of
+        # `sparse_metadata_batch` is guarded on it being set, so leaving it unset keeps
+        # those paths inert. Restore this with the full sparse attention support, which
+        # brings that fetch path with it -- it is dropped here only so the KVCM2 core
+        # change stands alone.
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
@@ -2912,6 +2996,9 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_block_scale_role(self, role_a: DataRole, layer_id: int) -> Optional[DataRole]:
         """Select block scales for a role and local layer in the pool mapping."""
         if self._get_layer_dtype_by_local_id(layer_id) != DataType.NVFP4 or role_a != Role.KEY:
+            return None
+        # Mixed-precision high layers hold plain rows without block scales.
+        if int(layer_id) in self.mixed_precision_high_layers.values():
             return None
         return Role.KEY_BLOCK_SCALE
 
@@ -3899,7 +3986,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
                 else:
-                    layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
+                    layers.append(
+                        SsmLayerConfig(
+                            layer_id=layer_id, buffers=buffers, reuse_policy=layer.reuse_policy
+                        )
+                    )
 
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
@@ -3917,17 +4008,17 @@ class KVCacheManagerV2(BaseResourceManager):
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         return replace(config, layers=layers)
 
-    # Mixed-precision KV: each full-attention layer keeps its history in a low-precision pool
-    # and a native SWA+sink layer group keeps every sequence's first_n/last_n tokens at the
-    # attention dtype. Attention reads a staging copy prepared by the attention metadata.
+    # Mixed-precision KV: full-attention layers keep their history in a low pool and each sequence's
+    # first_n/last_n tokens in a high pool, built as a native SWA+sink layer group.
 
     def _init_mixed_precision(
         self, kv_cache_config: KvCacheConfig, pretrained_config, max_seq_len: int, dtype: DataType
     ) -> None:
         """Record the mixed-precision layout requested through kv_cache_config.dtype."""
-        # Local layer id -> layer id of its retained-token (high-precision) twin.
-        self.high_layers: dict[int, int] = {}
-        self.low_precision_dtype: Optional[DataType] = None
+        # Local layer id -> layer id of its mixed-precision high layer.
+        self.mixed_precision_high_layers: dict[int, int] = {}
+        self.mixed_precision_low_dtype: DataType | None = None
+        self.mixed_precision_high_dtype: DataType | None = None
         self.first_n = self.last_n = 0
         # The engine's sequence capacity. KV estimation lowers self.max_seq_len
         # to fit the temporary cache; the attention staging copy is sized from
@@ -3938,20 +4029,21 @@ class KVCacheManagerV2(BaseResourceManager):
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         if mixed is None:
             return
-        # Managers with their own pools (hybrid, sparse) are not wired up yet.
-        if type(self) is not KVCacheManagerV2:
+        if type(self) is not KVCacheManagerV2 and not self._supports_mixed_precision_kv:
             raise NotImplementedError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is only supported by the "
-                f"standard KV cache manager, not {type(self).__name__}"
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is not supported by "
+                f"{type(self).__name__}"
             )
         self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
-        self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
-        retained_dtype = str_dtype_to_binding(mixed.high)
-        if dtype != retained_dtype:
+        self.mixed_precision_low_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
+        self.mixed_precision_high_dtype = str_dtype_to_binding(mixed.high)
+        # The model's KV dtype must be the mixed-precision high dtype, except on a manager whose
+        # own pool already holds the mixed-precision low format.
+        if not self._own_pool_is_mixed_precision_low and dtype != self.mixed_precision_high_dtype:
             raise ValueError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the first/last tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
             )
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
@@ -3967,16 +4059,18 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
-        """Whether this local layer stores its history in the low-precision pool."""
+        """Whether this local layer stores its history in the mixed-precision low pool."""
+        layer_id = self.pp_layers[local_layer_idx]
         return (
-            self.low_precision_dtype is not None
+            self.mixed_precision_low_dtype is not None
             and self.num_kv_heads_per_layer[local_layer_idx] > 0
             and self.max_attention_window_vec[local_layer_idx] is None
-            and self.pp_layers[local_layer_idx] not in self._shared_kv_layers
+            and layer_id not in self._shared_kv_layers
+            and layer_id not in self._plain_draft_layers
         )
 
     def _mixed_precision_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
-        """Bytes per token of the low-precision pool, scales included."""
+        """Bytes per token of the mixed-precision low pool, scales included."""
         from ...attention.kernels.blackwell.mixed_precision_kv import (
             get_mixed_precision_kv_row_bytes,
         )
@@ -3984,74 +4078,86 @@ class KVCacheManagerV2(BaseResourceManager):
         return (
             self.num_kv_heads_per_layer[local_layer_idx]
             * get_mixed_precision_kv_row_bytes(
-                self.low_precision_dtype, self.head_dim_per_layer[local_layer_idx]
+                self.mixed_precision_low_dtype, self.head_dim_per_layer[local_layer_idx]
             )
             * (self.kv_factor if data_role == Role.ALL else 1)
         )
 
+    def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
+        """Rows per mixed-precision high layer page; a page covers tokens_per_block tokens."""
+        return self.tokens_per_block
+
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Append the retained-token layer group for every mixed-precision layer."""
-        if self.low_precision_dtype is None:
+        """Append the mixed-precision high layer group for every mixed-precision layer."""
+        if self.mixed_precision_low_dtype is None:
             return config
+        # Disaggregated transfer and KV cache sharing name every layer through this hook, also on a
+        # pipeline rank that holds no mixed-precision layer.
+        self.get_disagg_global_layer_ids = self._mixed_precision_global_layer_ids
         if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
             raise NotImplementedError(
                 "Mixed precision currently supports dense self Attention only"
             )
         if self.mapping.cp_size != 1:
             raise NotImplementedError("Mixed precision requires CP=1")
-        if self.dtype not in (DataType.HALF, DataType.BF16, DataType.FP8):
+        if self.mixed_precision_high_dtype not in (DataType.HALF, DataType.BF16, DataType.FP8):
             raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
         layers = list(config.layers)
-        # Disaggregated transfer derives collision-free layer ids for the
-        # retained-token twins from this (model layer, kind) mapping.
-        layer_attn_to_layer_id = {
-            (model, _MixedPrecisionLayerKind.PRIMARY): LayerId(local)
-            for local, model in enumerate(self.pp_layers)
-        }
-        for layer in config.layers:
-            # Preserve native SWA and recurrent-state pools.
-            if not isinstance(layer, AttentionLayerConfig) or not self._is_mixed_precision_layer(
-                int(layer.layer_id)
-            ):
+        roles = (Role.KEY,) if self.kv_factor == 1 else (Role.KEY, Role.VALUE)
+        for local in range(self.num_local_layers):
+            if not self._is_mixed_precision_layer(local):
                 continue
-            layer_id = int(layer.layer_id)
-            layer_attn_to_layer_id[
-                self.pp_layers[layer_id], _MixedPrecisionLayerKind.HIGH_PRECISION
-            ] = LayerId(len(layers))
             page_bytes = get_size_in_bytes(
-                self.tokens_per_block
-                * self.num_kv_heads_per_layer[layer_id]
-                * self.head_dim_per_layer[layer_id],
-                self.dtype,
+                self._mixed_precision_rows_per_page(local)
+                * self.num_kv_heads_per_layer[local]
+                * self.head_dim_per_layer[local],
+                self.mixed_precision_high_dtype,
             )
-            buffers = [
-                BufferConfig(role=buffer.role, size=page_bytes)
-                for buffer in layer.buffers
-                if buffer.role in (Role.KEY, Role.VALUE)
-            ]
-            self.high_layers[layer_id] = len(layers)
+            self.mixed_precision_high_layers[local] = len(layers)
             layers.append(
                 AttentionLayerConfig(
-                    layer_id=len(layers),
-                    buffers=buffers,
+                    layer_id=LayerId(len(layers)),
+                    buffers=[BufferConfig(role=role, size=page_bytes) for role in roles],
                     # Native SWA includes the next query's write position.
                     sliding_window_size=self.last_n + 1,
                     num_sink_tokens=self.first_n,
-                    reuse_policy=AttentionReusePolicy.REQUIRED,
+                    reuse_policy=ReusePolicy.REQUIRED,
                 )
             )
 
-        if not self.high_layers:
-            return config
-        self._layer_attn_to_layer_id = layer_attn_to_layer_id
-        # A configured pool_ratio must now cover the appended retained-token
+        # A configured pool_ratio must now cover the appended mixed-precision high
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
+
+    def _mixed_precision_global_layer_ids(self, layer_group_id: int) -> List[int]:
+        """Return the global layer ids of a layer group under mixed-precision KV.
+
+        A mixed-precision high layer of global model layer L gets 2L + 1 and every other layer
+        gets twice the id it has without mixed-precision KV, so the ids are collision-free and the
+        same on every pipeline rank. Disaggregated transfer and KV cache sharing read these ids.
+        """
+        high = {
+            int(high_layer): 2 * int(self.pp_layers[local]) + 1
+            for local, high_layer in self.mixed_precision_high_layers.items()
+        }
+        layer_ids = [int(layer_id) for layer_id in self.impl.layer_grouping[layer_group_id]]
+        virtual = getattr(self, "_layer_attn_to_layer_id", None)
+        if virtual:
+            # The disaggregation extractor's encoding: model layer x attention types + attention type.
+            num_types = max(member.value for member in type(next(iter(virtual))[1])) + 1
+            own = {}
+            for (model_layer, attn_type), layer_id in virtual.items():
+                own.setdefault(int(layer_id), model_layer * num_types + attn_type.value)
+        else:
+            # By model layer, as the hybrid manager names them too (it has no FP4 MLA layout here).
+            own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
+        return [high[layer_id] if layer_id in high else 2 * own[layer_id] for layer_id in layer_ids]
 
     def _get_mixed_precision_buffers(
         self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
     ) -> torch.Tensor:
         """Return a zero-copy view of the low or high pool of a mixed-precision layer."""
+        rows = self.tokens_per_block
         if mixed_precision_pool == "low":
             layer, dtype = layer_offset, torch.uint8
             width = (
@@ -4059,13 +4165,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 // self.num_kv_heads_per_layer[layer_offset]
             )
         else:
-            layer, dtype = self.high_layers[layer_offset], self.dtype
+            layer = self.mixed_precision_high_layers[layer_offset]
+            dtype = self.mixed_precision_high_dtype
+            rows = self._mixed_precision_rows_per_page(layer_offset)
             width = self.head_dim_per_layer[layer_offset]
         address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
         shape = [
             self.impl.get_page_index_upper_bound(layer, Role.KEY) // self.kv_factor,
             self.kv_factor,
-            self.tokens_per_block,
+            rows,
             self.num_kv_heads_per_layer[layer_offset],
             width,
         ]
@@ -4073,29 +4181,51 @@ class KVCacheManagerV2(BaseResourceManager):
             shape[2], shape[3] = shape[3], shape[2]
         return convert_to_torch_tensor(TensorWrapper(address, dtype, shape))
 
+    def mixed_precision_page_table_key(self, layer_idx: int) -> tuple[tuple[int, int], ...]:
+        """Return the page-table key of a mixed-precision layer.
+
+        Args:
+            layer_idx: Model layer id of a mixed-precision layer.
+
+        Returns:
+            The (layer group id, page-index scale) pair of the layer's mixed-precision low pool,
+            then of its mixed-precision high pool. Layers with equal keys have identical page
+            tables.
+        """
+        local = self.layer_offsets[layer_idx]
+        return tuple(
+            (
+                int(self.impl.get_layer_group_id(layer)),
+                int(self.impl.get_page_index_converter(layer, Role.KEY).scale),
+            )
+            for layer in (local, self.mixed_precision_high_layers[local])
+        )
+
     def fill_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int, out: np.ndarray
     ) -> None:
         """Write the low (``out[0]``) and high (``out[1]``) page tables of a mixed-precision layer.
 
         ``out`` is ``(2, batch, pages)`` int32; entries past a request's blocks are left as they
-        are. The page indices are read as whole arrays from the cache's zero-copy buffers, so
-        this costs a few vector operations per request instead of one Python operation per page.
+        are. Each table is one gather from the zero-copy host page-index table.
         """
         local = self.layer_offsets[layer_idx]
-        for role, layer in enumerate((local, self.high_layers[local])):
-            pool_id = int(self.impl.get_layer_group_id(layer))
-            scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
-            for row, req_id in enumerate(request_ids):
-                kv_cache = self.kv_cache_map[req_id]
-                count = min(kv_cache.num_blocks, out.shape[2])
-                base = kv_cache.get_base_page_indices(pool_id)[:count]
-                np.copyto(
-                    out[role, row, :count],
-                    np.where(
-                        base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor
-                    ),
-                )
+        for role, layer in enumerate((local, self.mixed_precision_high_layers[local])):
+            self._fill_page_table(layer, request_ids, out[role])
+
+    def _fill_page_table(self, layer: int, request_ids: list[int], out: np.ndarray) -> None:
+        """Write the `(batch, pages)` page table of one manager layer into `out`."""
+        pool_id = int(self.impl.get_layer_group_id(layer))
+        scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
+        # Gather the batch's rows from the core's zero-copy host table (not get_copy_index: its
+        # buffer is shared with in-flight block-offset copies).
+        rows = [self.index_mapper.get_index(req_id) * self.max_beam_width for req_id in request_ids]
+        width = min(out.shape[1], self.host_kv_cache_block_offsets.shape[-1])
+        base = self.host_kv_cache_block_offsets[pool_id, :, 0, :width].numpy()[rows]
+        counts = np.array([self.kv_cache_map[req_id].num_blocks for req_id in request_ids])
+        pages = np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor)
+        # Entries past a request's blocks are left as they are.
+        np.copyto(out[:, :width], pages, where=np.arange(width) < counts[:, None])
 
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
@@ -4108,10 +4238,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the typical sequence length that sizes the pools when no ratio is given."""
-        if kv_cache_config.avg_seq_len is not None or self.low_precision_dtype is None:
+        if kv_cache_config.avg_seq_len is not None or self.mixed_precision_low_dtype is None:
             return kv_cache_config.avg_seq_len
         # Without a typical step the backend sizes the pools for one 2048-token
-        # request, which hands the retained-token group a share it never uses.
+        # request, which hands the mixed-precision high group a share it never uses.
         typical_seq_len = max(1, self.max_seq_len // 2)
         logger.warning_once(
             "kv_cache_config.avg_seq_len is not set; sizing the mixed-precision KV pools for "
@@ -4191,6 +4321,26 @@ class KVCacheManagerV2(BaseResourceManager):
         between disaggregated workers.
         """
         return frozenset()
+
+    def get_disagg_pool_view_partition(
+        self, layer_id: LayerId, role: DataRole
+    ) -> tuple[str, int] | None:
+        """Keep different owners and KV-head counts in separate transfer views.
+
+        Layers may share a physical pool when their buffers have equal byte
+        sizes, even if their head counts differ within the same model.
+        """
+        layer_specs = getattr(self, "layer_specs", None)
+        if layer_specs is None:
+            # Virtual storage IDs may not index the model-layer head list.
+            local_layer_id = int(layer_id)
+            if hasattr(self, "_layer_attn_to_layer_id") or not (
+                0 <= local_layer_id < len(self.num_kv_heads_per_layer)
+            ):
+                return None
+            return KVCacheLayerOwner.TARGET.value, self.num_kv_heads_per_layer[local_layer_id]
+        layer = layer_specs[int(layer_id)]
+        return layer.owner.value, layer.num_kv_heads
 
     def get_layer_cache_spec(self, global_layer_id: int) -> KVCacheLayerSpec:
         """Return an explicitly supplied rank-local layer specification."""
@@ -4352,7 +4502,7 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> Optional[torch.Tensor]:
         """Return a zero-copy KV view; its slot dimension may be strided."""
         layer_offset = self.layer_offsets[layer_idx]
-        if layer_offset in self.high_layers:
+        if layer_offset in self.mixed_precision_high_layers:
             return self._get_mixed_precision_buffers(layer_offset, kv_layout, mixed_precision_pool)
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
         layer_kv_factor = self._get_layer_kv_factor_by_local_id(layer_offset)
@@ -4648,8 +4798,11 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
-            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
-                draft_len = self.max_total_draft_tokens
+            if not self.is_draft and not req.py_disable_speculative_decoding:
+                # The GEN pads a CTX draft shorter than its own width (no draft,
+                # or a CTX with a smaller max_draft_len) up to
+                # max_total_draft_tokens, so reserve for the padded width.
+                draft_len = max(draft_len, self.max_total_draft_tokens)
         return draft_len
 
     def _helix_local_len(self, global_len: int) -> int:
@@ -4942,17 +5095,96 @@ class KVCacheManagerV2(BaseResourceManager):
         point = _swa_branch_snapshot_point(
             divergence, num_lookup_tokens, reused, req.prompt_len, self.tokens_per_block
         )
-        if point is None:
-            # Drop a point left by an earlier lookup of this request.
-            req.expect_snapshot_points = []
-            return
-        # Only recurrent-state managers rewrite this list each scheduler pass, so
-        # the point persists here until the request finishes.
-        req.expect_snapshot_points = [point]
-        logger.debug(
-            f"[KVCacheManagerV2] request {req.py_request_id} branch snapshot at {point} "
-            f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
+        # A fresh lookup replaces the point of an earlier lookup of this request.
+        # Points requested by waiting requests (request_prefix_snapshot) may
+        # already be in the list, so they are merged back in.
+        req.expect_snapshot_points = [] if point is None else [point]
+        self._merge_waiter_snapshot_points(req)
+        if point is not None:
+            logger.debug(
+                f"[KVCacheManagerV2] request {req.py_request_id} branch snapshot at {point} "
+                f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
+            )
+
+    def _can_share_inflight_prefix(self) -> bool:
+        """Whether a request can wait for another to make a shared prefix reusable.
+
+        Without SWA layers whose window reaches the radix tree only at a context
+        chunk end, every block a request computes is committed, at the latest
+        when its context ends. Otherwise the request computing the prefix must
+        end a chunk at the shared depth, which needs SWA branch snapshots.
+        Decided at construction; see :meth:`request_prefix_snapshot`.
+        """
+        if not (self.enable_block_reuse and self._can_publish_block_reuse):
+            return False
+        if self._record_branch_snapshots:
+            return True
+        # Only the SWA window at a context chunk end reaches the radix tree: SWA
+        # scratch reuse gives no other window real pages, and a policy other
+        # than all_reusable commits the window at a prompt end only.
+        swa_window_only_at_chunk_end = (
+            self.enable_swa_scratch_reuse
+            or self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
         )
+        return not (
+            swa_window_only_at_chunk_end
+            and any(
+                getattr(layer, "sliding_window_size", None)
+                for layer in self.impl.init_config.layers
+            )
+        )
+
+    def request_prefix_snapshot(self, owner: LlmRequest, num_tokens: int) -> bool:
+        """Make the first ``num_tokens`` of ``owner``'s prompt reusable once computed.
+
+        ``owner`` is a context request that has not finished its context; a
+        request sharing that prefix waits for it (``PrefixWaitPlanner``). Only
+        called when :attr:`can_share_inflight_prefix`. Where only the SWA window
+        at a context chunk end reaches the radix tree (SWA branch snapshots, see
+        :meth:`_record_branch_snapshot_point`), ``owner`` ends a chunk at the
+        block-aligned depth. Returns False when that is no longer possible.
+        """
+        if not self._record_branch_snapshots:
+            return True
+        return self._add_waiter_snapshot_point(owner, num_tokens)
+
+    def _add_waiter_snapshot_point(self, owner: LlmRequest, point: int) -> bool:
+        """Add the block-aligned ``point`` to ``owner``'s snapshot points.
+
+        The point is also kept apart from the request, so that whatever rewrites
+        ``expect_snapshot_points`` later (a fresh lookup's branch point, or a
+        recurrent-state manager's per-pass placement) merges it back in with
+        :meth:`_merge_waiter_snapshot_points`. Returns False when the point is
+        not inside ``owner``'s prompt or not past the context ``owner`` has
+        computed or holds pages for: a chunk already allocated (an in-flight
+        chunk, or one grown under SWA scratch reuse whose forward was skipped)
+        cannot end at the point any more.
+        """
+        point = point // self.tokens_per_block * self.tokens_per_block
+        allocated_end = owner.context_current_position
+        kv_cache = self.kv_cache_map.get(owner.py_request_id)
+        if kv_cache is not None:
+            allocated_end = max(allocated_end, kv_cache.capacity - self.num_extra_kv_tokens)
+        if not allocated_end < point < owner.prompt_len:
+            return False
+        if self._waiter_snapshot_points is None:
+            self._waiter_snapshot_points = {}
+        self._waiter_snapshot_points.setdefault(owner.py_request_id, set()).add(point)
+        self._merge_waiter_snapshot_points(owner)
+        return True
+
+    def _merge_waiter_snapshot_points(self, request: LlmRequest) -> None:
+        """Merge into ``request``'s snapshot points the waiters' points it has not passed yet."""
+        points_by_id = self._waiter_snapshot_points
+        points = points_by_id.get(request.py_request_id) if points_by_id else None
+        if not points:
+            return
+        start = request.context_current_position
+        points.difference_update([point for point in points if point <= start])
+        if not points:
+            del points_by_id[request.py_request_id]
+            return
+        request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
 
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
@@ -6050,13 +6282,20 @@ class KVCacheManagerV2(BaseResourceManager):
         run_metadata = _resolve_multimodal_run_metadata(req)
         if run_metadata is not None:
             return _augment_tokens_with_mm_run_metadata(
-                self.vocab_size, result, req.multimodal_hashes, run_metadata, chunk_start, chunk_end
+                self.vocab_size,
+                result,
+                req.multimodal_hashes,
+                req.multimodal_uuids,
+                run_metadata,
+                chunk_start,
+                chunk_end,
             )
 
         return _augment_tokens_with_contiguous_mm_metadata(
             self.vocab_size,
             result,
             req.multimodal_hashes,
+            req.multimodal_uuids,
             req.multimodal_positions,
             req.multimodal_lengths,
             chunk_start,
@@ -7004,6 +7243,24 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
+    def _remove_kv_cache(self, request_id: int) -> None:
+        """Forget a sequence made by `_create_kv_cache`: drop it from the map,
+        close it, clear its stats exclusion and free its index slot. Calling
+        this again for the same id does nothing."""
+        kv_cache = self.kv_cache_map.pop(request_id, None)
+        if kv_cache is None:
+            self.impl.clear_stats_excluded(request_id)
+            return
+        kv_cache.discard_pending_stats()
+        if self._sharing is not None:
+            self._sharing._on_free(request_id, kv_cache)
+        kv_cache.close()
+        self.impl.clear_stats_excluded(request_id)
+        if request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request_id)
+        else:
+            self.index_mapper.remove_sequence(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
         # its saves drain, and a dead entry here would block every later
@@ -7029,6 +7286,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.reset_request_state(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
+        if self._waiter_snapshot_points is not None:
+            self._waiter_snapshot_points.pop(request.py_request_id, None)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         self._inflight_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
@@ -7038,19 +7297,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
-        kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
-        if kv_cache is None:
-            self.impl.clear_stats_excluded(request.py_request_id)
-            return
-        kv_cache.discard_pending_stats()
-        if self._sharing is not None:
-            self._sharing._on_free(request.py_request_id, kv_cache)
-        kv_cache.close()
-        self.impl.clear_stats_excluded(request.py_request_id)
-        if request.py_request_id in self._early_freed_index_requests:
-            self._early_freed_index_requests.discard(request.py_request_id)
-        else:
-            self.index_mapper.remove_sequence(request.py_request_id)
+        self._remove_kv_cache(request.py_request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
         """Tell the lender, if one is attached, that ``kv_cache`` may have shrunk in place: blocks
@@ -7230,7 +7477,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 return layer.bytes_per_token()
             return layer.bytes_per_token(data_role)
 
-        if self._is_mixed_precision_layer(local_layer_idx):
+        # Size a mixed-precision layer's pool for the mixed-precision low format, unless the
+        # manager's own pool already holds that format.
+        if (
+            self._is_mixed_precision_layer(local_layer_idx)
+            and not self._own_pool_is_mixed_precision_low
+        ):
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
         if self.dtype not in (
             DataType.FP8,
@@ -7371,6 +7623,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # its plan, which mutates manager state.
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
+        if self._waiter_snapshot_points is not None:
+            self._waiter_snapshot_points.clear()
         self.impl.shutdown()
         if self._sharing is not None:
             # After the runtime's shutdown, which raises while any cache is open, in the map or not;
@@ -8026,6 +8280,41 @@ class KVCacheManagerV2(BaseResourceManager):
             stream=stream,
         )
 
+    # Trailing blocks of a request that a decode step can change at an unchanged block count: a step appends at
+    # most one block and the rewind of its rejected drafts frees at most one, so only the last block can come back
+    # on another page; two cover any step of fewer than two blocks' tokens.
+    _BLOCK_TABLE_KEY_TAIL_BLOCKS = 2
+
+    def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
+        """Key of the rows ``copy_batch_block_offsets`` writes for ``request_ids``: equal keys mean an identical
+        copy for a batch of fewer than two blocks' tokens per request and step. Per request: its block count and
+        the page indices of its last blocks (beam 0). None where the device table is not a plain copy of the host
+        table (per-layer page tables, sparse metadata) or blocks can change otherwise (block or scratch reuse, a
+        finite attention window freeing earlier blocks, other beams)."""
+        if (
+            self.enable_swa_scratch_reuse
+            or self.enable_block_reuse
+            or self.max_beam_width > 1
+            or any(
+                window is not None and window < self.max_seq_len
+                for window in self.max_attention_window_vec
+            )
+            or self._use_per_layer_page_tables
+            or self.sparse_metadata_batch is not None
+        ):
+            return None
+        host = self.host_kv_cache_block_offsets.numpy()
+        keys = []
+        for request_id in request_ids:
+            kv_cache = self.kv_cache_map.get(request_id)
+            if kv_cache is None:
+                return None
+            num_blocks = int(kv_cache.num_blocks)
+            row = self.index_mapper.get_index(request_id) * self.max_beam_width
+            first = max(0, num_blocks - self._BLOCK_TABLE_KEY_TAIL_BLOCKS)
+            keys.append((num_blocks, host[:, row, 0, first:num_blocks].tobytes()))
+        return tuple(keys)
+
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> str | None:
         """Return the string namespace shared by creation, prefetch and probes."""
@@ -8187,9 +8476,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 success = False
         return success
 
-    def reset_reuse_state(self):
-        self.impl.clear_reusable_blocks()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
-        if self._sharing is not None:
-            self._sharing._on_reset()
+    def reset_reuse_state(
+        self,
+        *,
+        on_cleared: Optional[Callable[[], None]] = None,
+    ):
+        try:
+            self.impl.clear_reusable_blocks()
+            if on_cleared is not None:
+                on_cleared()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+            if self._sharing is not None:
+                self._sharing._on_reset()
+        finally:
+            # The sidecar consumes the per-rank streaming publisher. Flush it
+            # even while inference is paused, without starting a buffered ADP gather.
+            if isinstance(self.event_manager, StreamingKVCacheEventManager):
+                self.flush_iteration_events()
