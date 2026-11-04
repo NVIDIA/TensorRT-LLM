@@ -12,7 +12,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # isort: off
@@ -23,7 +26,7 @@ from utils.util import skip_single_gpu
 from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
-from tensorrt_llm.executor.result import LogProbsResult
+from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -106,6 +109,112 @@ def test_generation_logprobs_do_not_recompute_logits(monkeypatch):
                                result=SimpleNamespace(is_final=True))
     assert base_worker._get_logprobs(worker, response) is None
     assert not hasattr(generation_result, "_logprob_params")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("num_sequences", [1, 2])
+def test_queued_context_cancellation_without_prompt_logits(
+        monkeypatch: pytest.MonkeyPatch, streaming: bool,
+        num_sequences: int) -> None:
+    """Deliver native cancellation results without computing nonexistent logits."""
+    params = SamplingParams(max_tokens=4,
+                            n=num_sequences,
+                            temperature=1.0,
+                            prompt_logprobs=0)
+    generation_request = GenerationRequest(prompt_token_ids=[10, 11, 12],
+                                           sampling_params=params,
+                                           streaming=streaming)
+    generation_request.set_id(7)
+    generation_result = GenerationResult(
+        generation_request, logprob_params=LogprobParams(prompt_logprobs=0))
+    worker = SimpleNamespace(_results={7: generation_result})
+    request = LlmRequest(
+        request_id=1,
+        client_id=7,
+        max_new_tokens=4,
+        input_tokens=[10, 11, 12],
+        sampling_config=params._get_sampling_config(),
+        is_streaming=streaming,
+        exclude_input_from_output=True,
+        return_context_logits=True,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    for child_id in range(2, num_sequences + 1):
+        request.create_child_request(child_id)
+
+    def unexpected_compute(*args, **kwargs):
+        pytest.fail("A queued cancellation cannot have prompt logits")
+
+    monkeypatch.setattr(base_worker, "compute_prompt_logprobs",
+                        unexpected_compute)
+    for index, sequence in enumerate([request, *request.child_requests]):
+        sequence.finish_by_reason(FinishReason.CANCELLED)
+        response = sequence.create_response()
+        assert response is not None
+        assert response.result.context_logits is None
+        wrapped = base_worker._maybe_wrap_response(worker, response)
+        generation_result._handle_response(wrapped)
+        is_last = index == num_sequences - 1
+        assert generation_result.finished == is_last
+        assert hasattr(generation_result, "_logprob_params") != is_last
+
+    assert all(output.finish_reason == "cancelled"
+               for output in generation_result.outputs)
+    assert all(output.prompt_logprobs == []
+               for output in generation_result.outputs)
+    assert all(output.token_ids == [] for output in generation_result.outputs)
+
+
+@pytest.mark.cpu_only
+def test_cancelled_stream_keeps_cached_prompt_logprobs() -> None:
+    """A later cancellation must preserve prompt data produced before it."""
+    params = SamplingParams(max_tokens=4, prompt_logprobs=0)
+    generation_request = GenerationRequest(prompt_token_ids=[10, 11, 12],
+                                           sampling_params=params,
+                                           streaming=True)
+    generation_request.set_id(7)
+    generation_result = GenerationResult(
+        generation_request, logprob_params=LogprobParams(prompt_logprobs=0))
+    cached = [{11: "cached prompt logprob"}]
+    generation_result._cached_prompt_logprobs = cached
+    worker = SimpleNamespace(_results={7: generation_result})
+    request = LlmRequest(request_id=1,
+                         client_id=7,
+                         max_new_tokens=4,
+                         input_tokens=[10, 11, 12],
+                         sampling_config=params._get_sampling_config(),
+                         is_streaming=True,
+                         exclude_input_from_output=True,
+                         return_context_logits=True)
+    request.finish_by_reason(FinishReason.CANCELLED)
+    response = request.create_response()
+    assert response is not None
+    wrapped = base_worker._maybe_wrap_response(worker, response)
+    generation_result._handle_response(wrapped)
+    assert generation_result.finished
+    assert generation_result.outputs[0].prompt_logprobs is cached
+    assert not hasattr(generation_result, "_logprob_params")
+
+
+@pytest.mark.cpu_only
+def test_successful_terminal_response_still_requires_prompt_logits() -> None:
+    """Missing requested logits are tolerated only for cancelled sequences."""
+    generation_result = SimpleNamespace(
+        _logprob_params=LogprobParams(prompt_logprobs=0), _streaming=False)
+    worker = SimpleNamespace(_results={7: generation_result})
+    request = LlmRequest(
+        request_id=1,
+        client_id=7,
+        max_new_tokens=4,
+        input_tokens=[10, 11, 12],
+        sampling_config=SamplingParams()._get_sampling_config(),
+        is_streaming=False,
+        return_context_logits=True)
+    request.finish_by_reason(FinishReason.LENGTH)
+    response = request.create_response()
+    assert response is not None
+    with pytest.raises(AssertionError, match="context_logits must not be None"):
+        base_worker._maybe_wrap_response(worker, response)
 
 
 @pytest.mark.cpu_only

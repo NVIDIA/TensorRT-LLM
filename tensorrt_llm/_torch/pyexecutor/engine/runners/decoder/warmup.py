@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import os
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -411,6 +412,10 @@ class DecoderWarmup:
         with self._warmup_timer.phase("cute_dsl_indexer_q"):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
+        # Same for the decode kernels a model JIT-compiles on first use and no warmup forward
+        # reaches with every variant (e.g. Kimi-K3's attention-residual kernels).
+        with self._warmup_timer.phase("model_decode_kernels"):
+            self._prewarm_model_decode_kernels(kv_cache_manager)
         if self._context_warmups_supported:
             with (
                 self._warmup_timer.phase(
@@ -744,6 +749,53 @@ class DecoderWarmup:
             self.dist.tp_allgather(1)
         if compiled:
             logger.info(f"indexer-Q CuTe DSL prewarm complete ({compiled}/3 token counts)")
+
+    def _prewarm_model_decode_kernels(self, kv_cache_manager) -> None:
+        """Call ``prewarm_decode_kernels`` on every module of the model that defines it, then
+        barrier.
+
+        The hook is ``prewarm_decode_kernels(max_num_tokens: int, verify_batches: bool) -> int``:
+        JIT-compile the kernels the module's forwards of up to ``max_num_tokens`` tokens launch,
+        and return how many it compiled. ``verify_batches`` is True when this worker runs
+        speculative-decoding verify batches (a spec config and a cache that is not
+        context-only). Served without CUDA graphs, the first decode steps would otherwise compile
+        these inline while the peers wait in the first collective. A failed hook only logs: its
+        compiles move to the first forward that needs them. Whether a rank enters depends only
+        on the model's module classes, so every rank of the group reaches the barrier.
+        """
+        hooks = [
+            (type(m).__name__, m.prewarm_decode_kernels)
+            for m in self.model.modules()
+            if callable(getattr(m, "prewarm_decode_kernels", None))
+        ]
+        if not hooks:
+            return
+        verify_batches = self._config.spec_config is not None and not is_context_only_kv_cache(
+            kv_cache_manager
+        )
+        compiled = 0
+        start = time.perf_counter()
+        with torch.inference_mode():
+            for name, hook in hooks:
+                try:
+                    compiled += hook(self._config.max_num_tokens, verify_batches)
+                except Exception as e:
+                    # A prewarm miss only defers these compiles to the first forward that
+                    # needs them, so it must not fail startup.
+                    logger.warning(f"{name} decode kernel prewarm skipped. {type(e).__name__}: {e}")
+        torch.cuda.synchronize()
+        # Hold the TP (x CP) group, as the indexer-Q prewarm does, so these compiles add no skew
+        # between the peers of the first collective.
+        if self.dist is not None:
+            if self.mapping.cp_size > 1:
+                self.dist.tp_cp_allgather(1)
+            elif self.mapping.tp_size > 1:
+                self.dist.tp_allgather(1)
+        if compiled:
+            logger.info(
+                f"Decode kernel prewarm complete ({compiled} kernels, "
+                f"{time.perf_counter() - start:.1f} s)"
+            )
 
     def _ensure_dsa_attn_metadata_for_warmup(self, resource_manager: ResourceManager) -> None:
         """Build the DSA attention metadata if no warmup forward created it, so
