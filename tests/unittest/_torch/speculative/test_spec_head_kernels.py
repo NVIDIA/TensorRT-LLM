@@ -15,11 +15,13 @@
 """The one-kernel speculative decode step head writes what the native head writes."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.speculative.spec_head_kernels import fused_spec_head_prep, spec_decode_head
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
@@ -160,6 +162,102 @@ def test_fused_head_overlap_only_chunked_range(num_gen_tokens):
     torch.cuda.synchronize()
     assert torch.equal(position_ids, ref_pos)
     assert torch.equal(kv_lens, ref_kv)
+
+
+def _step_metadata(num_ctx, num_ctx_tokens, num_gen, num_chunked, helix, gen_positions, gen):
+    """TRT-LLM attention metadata of a mixed step: ``num_ctx`` context rows (the last
+    ``num_chunked`` of them extend a context) and ``num_gen`` verify groups."""
+    max_tokens = 256
+    md = Mock(spec=TrtllmAttentionMetadata)
+    md.num_contexts, md.num_generations = num_ctx, num_gen
+    md.num_ctx_tokens, md.num_chunked_ctx_requests = num_ctx_tokens, num_chunked
+    md.kv_lens_cuda = torch.randint(0, 1 << 12, (num_ctx + num_gen,), device="cuda", generator=gen)
+    md.kv_lens_cuda = md.kv_lens_cuda.to(torch.int32)
+    md.kv_cache_manager = SimpleNamespace(tokens_per_block=32)
+    md.mapping = SimpleNamespace(cp_size=4, cp_rank=1)
+    md.helix_spec_tokens_valid = md._helix_spec_tokens_valid = helix
+    md.helix_position_offsets = torch.zeros(max_tokens, dtype=torch.int32, device="cuda")
+    md.helix_position_offsets[: gen_positions.numel()] = gen_positions
+    md.helix_local_slots = torch.full((max_tokens,), -7, dtype=torch.int32, device="cuda")
+    md.helix_kv_bounds = torch.full((max_tokens,), -7, dtype=torch.int32, device="cuda")
+    md.helix_zero_kv_tokens = torch.ones(max_tokens, dtype=torch.bool, device="cuda")
+    md.recompute_helix_spec_buffers = (
+        lambda num_tokens, width: TrtllmAttentionMetadata.recompute_helix_spec_buffers(
+            md, num_tokens, width
+        )
+    )
+    return md
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "num_ctx, num_gen, num_chunked, helix",
+    [(2, 3, 0, False), (2, 3, 0, True), (3, 0, 2, False), (0, 4, 0, True)],
+    ids=["mixed", "mixed_helix", "chunked", "gen_helix"],
+)
+def test_head_matches_native_preprocess_inputs(num_ctx, num_gen, num_chunked, helix):
+    """SpecDecodeHead through its RuntimeHooks entry writes what
+    DecoderInputPreparer.preprocess_inputs writes: the KV-length range of mixed and
+    extend-context batches, and the helix buffers past the context rows."""
+    draft_len = 3
+    width = draft_len + 1
+    num_ctx_tokens = 37 * num_ctx
+    gen_tokens = num_gen * width if num_gen else num_chunked * width
+    gen = torch.Generator(device="cuda").manual_seed(num_ctx * 7 + num_gen + num_chunked + helix)
+    base = torch.randint(0, 1 << 12, (max(num_gen, 1),), device="cuda", generator=gen)
+    gen_positions = (base.view(-1, 1) * 32 + 30 + torch.arange(width, device="cuda")).view(-1)
+    gen_positions = gen_positions[: num_gen * width].to(torch.int32)
+    pos_offsets = torch.randint(-2, 1, (256,), device="cuda", generator=gen).to(torch.int32)
+    kv_offsets = torch.randint(-2, 1, (16,), device="cuda", generator=gen).to(torch.int32)
+    position_ids = torch.randint(
+        0, 1 << 16, (1, num_ctx_tokens + gen_tokens), device="cuda", generator=gen
+    ).to(torch.int32)
+    mapping = SimpleNamespace(has_cp_helix=lambda: helix)
+
+    def step(seed):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        md = _step_metadata(num_ctx, num_ctx_tokens, num_gen, num_chunked, helix, gen_positions, g)
+        return {
+            "attn_metadata": md,
+            "position_ids": position_ids.clone(),
+            "input_ids": torch.zeros(num_ctx_tokens + gen_tokens, device="cuda"),
+        }
+
+    native = SimpleNamespace(
+        decode_prologue=None,
+        guided_decoder=None,
+        _config=SimpleNamespace(disable_overlap_scheduler=False),
+        _buffers=SimpleNamespace(
+            previous_pos_id_offsets_cuda=pos_offsets, previous_kv_lens_offsets_cuda=kv_offsets
+        ),
+        mapping=mapping,
+        get_runtime_tokens_per_gen_step=lambda d: d + 1,
+    )
+    ref = DecoderInputPreparer.preprocess_inputs(
+        native, step(11), enable_spec_decode=True, runtime_draft_len=draft_len
+    )
+    fused = SimpleNamespace(
+        overlap_scheduler_enabled=True,
+        mapping=mapping,
+        spec_decode_offsets=(pos_offsets, kv_offsets),
+        get_runtime_tokens_per_gen_step=lambda d: d + 1,
+        spec_decode_kv_range=DecoderInputPreparer.spec_decode_kv_range,
+    )
+    out = step(11)
+    assert spec_decode_head(fused, out, enable_spec_decode=True, runtime_draft_len=draft_len)
+    torch.cuda.synchronize()
+    assert torch.equal(out["position_ids"], ref["position_ids"])
+    out_md, ref_md = out["attn_metadata"], ref["attn_metadata"]
+    assert torch.equal(out_md.kv_lens_cuda, ref_md.kv_lens_cuda)
+    if helix:
+        n = gen_tokens
+        for name in (
+            "helix_position_offsets",
+            "helix_local_slots",
+            "helix_kv_bounds",
+            "helix_zero_kv_tokens",
+        ):
+            assert torch.equal(getattr(out_md, name)[:n], getattr(ref_md, name)[:n]), name
 
 
 def test_head_keeps_the_native_prologue_outside_its_cases():
