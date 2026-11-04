@@ -73,6 +73,7 @@ l0_cpu:
   # splice and admission check on a stub tower, the KV pool contract, its KV storage
   # derivation and attention-call arguments, its routed-expert scalars and its weight table.
   # The rest of unittest/_torch/modeling_v2 needs a GPU.
+  - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py

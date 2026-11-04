@@ -268,7 +268,7 @@ class _Prefetch(threading.Thread):
     def run(self):
         try:
             self.reader._read(*self.args)
-        except OSError as exc:  # surfaced to the consumer by tiles()
+        except BaseException as exc:  # Worker boundary: tiles() re-raises on the consumer.
             self.error = exc
 
 
