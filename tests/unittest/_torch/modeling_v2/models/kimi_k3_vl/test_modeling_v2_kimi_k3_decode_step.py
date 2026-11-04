@@ -10,13 +10,13 @@ from importlib import import_module
 import pytest
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateLayerCache,
     KDAReplayLayerCache,
 )
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 
 try:
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
@@ -305,7 +305,9 @@ def test_kda_verify_keeps_builtin_fallback_dense(
 def _slot_worker(target):
     worker = object.__new__(target.KimiK3DSparkWorker)
     torch.nn.Module.__init__(worker)
-    worker._batch_to_slot_buffer = DeviceCopyBuffer(torch.zeros(3, dtype=torch.long))
+    worker._batch_to_slot_buffer = DeviceCopyBuffer(
+        torch.zeros(3, dtype=torch.long), site=CopySite.DFLASH_BATCH_TO_SLOT
+    )
     worker._req_to_slot = {100: 2, 101: 0, 102: 1}
     worker._dummy_slot = 3
     worker._ctx_len = torch.tensor([10, 20, 30, 0])

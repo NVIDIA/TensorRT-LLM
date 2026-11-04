@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 
 pytestmark = pytest.mark.cpu_only
@@ -22,7 +22,9 @@ def _worker(req_to_slot):
         _free_slots=[],
         _graph_dummy_id_floor=1 << 30,
         _dummy_slot=DUMMY_SLOT,
-        _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long)),
+        _batch_to_slot_buffer=DeviceCopyBuffer(
+            torch.zeros(8, dtype=torch.long), site=CopySite.DFLASH_BATCH_TO_SLOT
+        ),
         _write_ctx_len=lambda updates, base_updates=None: None,
     )
     # Generation requests are already assigned in these tests; prepare assigns nothing.
@@ -37,7 +39,9 @@ def _metadata(worker, request_ids, num_generations):
         batch_indices_cuda=torch.full((8,), -1, dtype=torch.int),
         _dflash_worker=worker,
     )
-    metadata._batch_indices_buffer = DeviceCopyBuffer(metadata.batch_indices_cuda)
+    metadata._batch_indices_buffer = DeviceCopyBuffer(
+        metadata.batch_indices_cuda, site=CopySite.DFLASH_BATCH_INDICES
+    )
     return metadata
 
 

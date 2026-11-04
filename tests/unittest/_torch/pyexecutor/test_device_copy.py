@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """A step's copies routed by a copy plan: merged into one upload and one scatter launch per barrier. Whether a copy is
-needed is the buffer owner's call (``unchanged``, ``UploadRecords``)."""
+needed is the buffer owner's call (``unchanged``, ``DeviceCopyBuffer``)."""
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.device_copy import (
     CHECK_ENV,
@@ -52,14 +54,40 @@ class _Site(CopySiteEnum):
 
 _PLAN = CopyPlan(merge={_Site.H2D, _Site.D2D, _Site.SKIP})
 
+
+class _Owner:
+    """A buffer owner keeping a DeviceCopyBuffer per destination storage, through the attention metadata's own
+    ``_upload_buffer`` (the owner pattern of a metadata class that skips unchanged uploads)."""
+
+    def __init__(self) -> None:
+        self._state = SimpleNamespace(_upload_buffers={})
+
+    def buffer(self, site, t: torch.Tensor) -> device_copy.DeviceCopyBuffer:
+        return TrtllmAttentionMetadata._upload_buffer(self._state, site, t)
+
+    def copy(self, site, dst: torch.Tensor, src: torch.Tensor) -> bool:
+        return self.buffer(site, dst).update(src, view=dst)
+
+    def fill_tail(self, site, buf: torch.Tensor, start: int, value: int) -> None:
+        self.buffer(None, buf).fill_tail(site, start, value)
+
+    def forget(self, t: torch.Tensor) -> None:
+        """Another writer wrote ``t``: drop its record."""
+        buffer = self._state._upload_buffers.get(t.untyped_storage().data_ptr())
+        if buffer is not None:
+            buffer.invalidate()
+
+
 # The test's buffer owner: what its skippable uploads last wrote (fresh for every test).
-_REC = device_copy.UploadRecords()
+_REC = _Owner()
 
 
 @pytest.fixture(autouse=True)
-def _fresh_records():
+def _fresh_records(monkeypatch):
     global _REC
-    _REC = device_copy.UploadRecords()
+    _REC = _Owner()
+    # The tests here turn check mode on where they test it (the unit-test conftest turns it on everywhere).
+    monkeypatch.setattr(device_copy, "CHECK_MODE", False)
     yield
 
 
@@ -886,7 +914,7 @@ def test_active_none_disables_the_copier_inside_an_outer_one(copier):
 def test_two_owners_keep_their_own_records(copier):
     dst = _zeros(3)
     values = _host([7, 8, 9])
-    other = device_copy.UploadRecords()
+    other = _Owner()
 
     assert _skip_copy(dst, values) is True
     # The other owner has never uploaded into dst.
