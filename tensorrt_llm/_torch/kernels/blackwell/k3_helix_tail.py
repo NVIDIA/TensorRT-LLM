@@ -1334,6 +1334,19 @@ def record_bytes(num_heads: int, head_dim: int) -> int:
     return num_heads * head_dim * 2 + num_heads * 8
 
 
+def _grid(num_heads: int, num_tokens: int, max_ctas: int) -> tuple[int, int]:
+    """(tiles_per_cta, n_ctas): every head gets the same number of CTAs, at most max_ctas
+    in all, each with the fewest tiles that cover the tokens."""
+    groups = max_ctas // num_heads
+    if groups == 0:
+        raise ValueError(f"the Helix tail needs one CTA per head: {num_heads} heads > {max_ctas}")
+    n_tiles = _ceil_div(num_tokens, ROWS)
+    tiles_per_cta = _ceil_div(n_tiles, groups)
+    n_ctas = num_heads * _ceil_div(n_tiles, tiles_per_cta)
+    assert n_ctas <= max_ctas
+    return tiles_per_cta, n_ctas
+
+
 @functools.cache
 def _kernel(cp_size: int, num_heads: int, fold: bool, has_mask: bool, use_pdl: bool, mx_out: bool):
     return K3HelixTailKernel(cp_size, num_heads, fold, has_mask, use_pdl, mx_out)
@@ -1398,9 +1411,7 @@ def k3_helix_tail(
     has_mask = zero_kv_mask is not None
     flags = (fold is not None, has_mask, use_pdl, mx_out is not None)
     kernel = _kernel(cp_size, num_heads, *flags)
-    n_tiles = _ceil_div(num_tokens, ROWS)
-    tiles_per_cta = _ceil_div(num_heads * n_tiles, max(max_ctas, num_heads))
-    n_ctas = num_heads * _ceil_div(n_tiles, tiles_per_cta)
+    tiles_per_cta, n_ctas = _grid(num_heads, num_tokens, max_ctas)
     if fold is not None:
         ptrs = (
             _gmem(cutlass.Float32, fold.partial, 32),

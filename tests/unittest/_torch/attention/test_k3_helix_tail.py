@@ -293,6 +293,34 @@ def test_helix_tail_direct_rows_and_graph_replay():
     assert bool((ws.buffer == -1).all())
 
 
+def _direct_inputs(num_tokens, seed):
+    g = torch.Generator(device="cuda")
+    g.manual_seed(seed)
+    rows = torch.randn((num_tokens * NUM_HEADS, 512), device="cuda", generator=g)
+    stats = torch.empty((num_tokens * NUM_HEADS, 2), device="cuda")
+    stats[:, 0] = torch.randn(num_tokens * NUM_HEADS, device="cuda", generator=g) * 3
+    stats[:, 1] = torch.rand(num_tokens * NUM_HEADS, device="cuda", generator=g) * 50 + 1
+    return rows.to(torch.bfloat16), stats
+
+
+@pytest.mark.parametrize("extra_tokens", [0, 183])
+def test_helix_tail_tokens_beyond_sm_count(extra_tokens):
+    """At least as many tokens as SMs: the grid stays within one CTA per SM (every CTA polls
+    after its pushes, so a non-resident sender would hang the launch)."""
+    _, tail_mod = _modules()
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    num_tokens = sm_count + extra_tokens
+    for tokens in range(1, num_tokens + 1):
+        assert tail_mod._grid(NUM_HEADS, tokens, sm_count)[1] <= sm_count
+    rows, stats = _direct_inputs(num_tokens, num_tokens)
+    ws = _Workspace(half_bytes=num_tokens * tail_mod.record_bytes(NUM_HEADS, 128) + 4096)
+    out = torch.full((num_tokens, NUM_HEADS * 128), torch.nan, dtype=torch.bfloat16, device="cuda")
+    ws.launch(tail_mod, rows, stats, _selector(128), out, None)
+    torch.cuda.synchronize()
+    _check_bitwise(out, rows, stats, 128)
+    assert bool((ws.buffer == -1).all())
+
+
 @pytest.mark.parametrize("num_tokens", [8, 37, 64, 130])
 def test_helix_tail_mxfp8_operand(num_tokens):
     """The receivers' MXFP8 form of ``bf16(out * gate)`` (R128c4 scales) is bitwise the low-M
