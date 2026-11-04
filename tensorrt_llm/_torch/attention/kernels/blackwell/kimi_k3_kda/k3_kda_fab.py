@@ -41,8 +41,11 @@ Design:
   ``f_a`` to BF16 into shared memory (worker ``rb == 0`` also writes ``beta``) and computes its
   forget-gate rows with ``mma.sync``. A worker only waits for CTAs with higher ranks or that
   already run, so progress needs ``T + 1`` co-resident CTAs, not grid-wide co-residency.
-* Launches sharing a device's counter and workspace must not overlap (stream order; with PDL the
-  ticket and the refill happen after ``griddepcontrol.wait``).
+* One counter and workspace per device serve every launch on it, so launches must not overlap:
+  the caller orders them (one stream, or forks joined before the next launch, as the KDA mixer's
+  layers are; with PDL the ticket and the refill happen after ``griddepcontrol.wait``).
+* Co-residency: the host takes a tiling only if its grid has at most one CTA per SM of the
+  device (:func:`_fits_device`), so every CTA becomes resident once concurrent kernels retire.
 
 ``f_a`` mode (:func:`k3_kda_fab_fa`) runs the same GEMM 1 and hand-off but stops at
 ``bfa = bf16([f_a | b])``: every CTA becomes a worker that sums an equal share of the
@@ -1680,6 +1683,12 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _fits_device(cfg: FabConfig, n_tiles: int, n2: int, k: int, device: torch.device) -> bool:
+    """Whether every CTA of the tiling can be resident at once (one per SM): the tail polls
+    producers, and in f_a mode every CTA polls every other."""
+    return _geometry(cfg, n_tiles, n2, k)["num_ctas"] <= _num_sms(_device_index(device))
+
+
 @functools.cache
 def _is_supported_device(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3), (10, 7))
@@ -1727,6 +1736,8 @@ def run_k3_kda_fab(
     m, k = x.shape
     n_tiles = _ceil_div(m, _N_TILE)
     cfg = config if config is not None else default_config(n_tiles, w_fb.shape[0], k)
+    if not _fits_device(cfg, n_tiles, w_fb.shape[0], k, x.device):
+        raise ValueError(f"{cfg}: more CTAs than SMs")
     compiled = _compiled(cfg, n_tiles, w_bfa.shape[0], w_fb.shape[0], k, num_heads, use_pdl)
     words, ws = _device_state(x.device)
     compiled(
@@ -1761,6 +1772,8 @@ def run_k3_kda_fab_fa(
     n_tiles = _ceil_div(m, _N_TILE)
     n2 = w_fb.shape[0] if w_fb is not None else 768
     cfg = config if config is not None else default_config(n_tiles, n2, k)
+    if not _fits_device(cfg, n_tiles, n2, k, x.device):
+        raise ValueError(f"{cfg}: more CTAs than SMs")
     compiled = _compiled(
         cfg, n_tiles, w_bfa.shape[0], n2, k, num_heads, use_pdl, True, w_fb is not None
     )
@@ -1837,10 +1850,11 @@ def can_use_k3_kda_fab_fa(
         n_tiles = _ceil_div(x.shape[0], _N_TILE)
         k = x.shape[1]
         n2 = w_fb.shape[0] if w_fb is not None else 768
-        validate_config(default_config(n_tiles, n2, k), n_tiles, w_bfa.shape[0], n2, k, num_heads)
+        cfg = default_config(n_tiles, n2, k)
+        validate_config(cfg, n_tiles, w_bfa.shape[0], n2, k, num_heads)
     except ValueError:
         return False
-    return True
+    return _fits_device(cfg, n_tiles, n2, k, x.device)
 
 
 @torch.library.custom_op("trtllm::k3_kda_fab_proj", mutates_args=())
@@ -1890,10 +1904,11 @@ def can_use_k3_kda_fab(
         _check_inputs(x, w_bfa, w_fb, num_heads)
         n_tiles = _ceil_div(x.shape[0], _N_TILE)
         n2, k = w_fb.shape[0], x.shape[1]
-        validate_config(default_config(n_tiles, n2, k), n_tiles, w_bfa.shape[0], n2, k, num_heads)
+        cfg = default_config(n_tiles, n2, k)
+        validate_config(cfg, n_tiles, w_bfa.shape[0], n2, k, num_heads)
     except ValueError:
         return False
-    return True
+    return _fits_device(cfg, n_tiles, n2, k, x.device)
 
 
 __all__ = [
