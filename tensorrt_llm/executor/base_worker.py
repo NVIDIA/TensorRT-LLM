@@ -428,6 +428,16 @@ class BaseWorker(GenerationExecutor):
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
+            if not self.engine.is_generation_model:
+                # The prompt runs in one forward and nothing is generated, so
+                # it may fill max_seq_len; max_tokens=1 has the request
+                # complete with that forward in every executor loop.
+                if splited_prompt_len > max_seq_len:
+                    raise ValueError(
+                        context_length_exceeded_message(
+                            max_context_length=max_seq_len * cp_size,
+                            num_prompt_tokens=len(prompt_token_ids)))
+                return 1
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
                 # Reject (never truncate): the prompt leaves no room for even
