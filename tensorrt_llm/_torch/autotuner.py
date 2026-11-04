@@ -756,15 +756,7 @@ class AutoTunerProfilingCache:
             self._deserialize_metadata(
                 current_cache_contents.get("metadata", {}))
 
-            # Start with empty cache and independent ops set. Entries of ops
-            # excluded from the file are never on disk, so keep the ones this
-            # process recorded: dropping them makes the next tuning call of
-            # such an op redo its whole sweep.
-            excluded_entries = {
-                key: value
-                for key, value in self.cache.items()
-                if key[0] in self.excluded_op
-            }
+            # Start with empty cache and independent ops set
             self.cache = {}
             self.independent_op = set()
 
@@ -789,7 +781,6 @@ class AutoTunerProfilingCache:
                 logger.debug(
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
-            self.cache.update(excluded_entries)
 
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
@@ -966,9 +957,6 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
-        # Sweep keys (_excluded_sweep_key) of the cache-excluded ops this
-        # process has swept in tuning mode; see choose_one.
-        self._swept_excluded: set[tuple] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1181,21 +1169,11 @@ class AutoTuner:
         # mark them in the cache so save_cache filters them out, and
         # — in tuning mode — force the full profile path so the JIT
         # warmup actually runs even if a stale on-disk entry was loaded.
-        # The forced path runs once per sweep key in this process (see
-        # _excluded_sweep_key): a clean sweep records every bucket in the
-        # in-process cache, so later calls with the same key (every layer,
-        # every later warmup forward) look it up instead of walking the same
-        # buckets again. A sweep with a failed profile is not recorded, so
-        # the next call walks again.
         # In inference mode we still consult the in-process cache, which
         # was populated by this process's own warmup.
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
-        sweep_key = None
         if tuning_config.exclude_from_cache and self.is_tuning_mode:
-            sweep_key = self._excluded_sweep_key(custom_op, runners,
-                                                 tuning_config, input_shapes)
-        if sweep_key is not None and sweep_key not in self._swept_excluded:
             is_cache_hit = False
             best_runner_id, best_tactic, min_time = (
                 self.profiling_cache.fallback_entry())
@@ -1296,45 +1274,12 @@ class AutoTuner:
         # If no valid tactic is found, the fallback runner and tactic will be used
         _, runner_id, tactic, _ = self.profiling_cache.search_cache(
             custom_op, runners, input_shapes, tuning_config)
-        if sweep_key is not None and not new_tuning_failure_occurred:
-            self._swept_excluded.add(sweep_key)
 
         tuning_end_time = time.perf_counter()
         self.stats.tuned_op_time_cost[
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
-
-    def _excluded_sweep_key(self, custom_op: str, runners: List[TunableRunner],
-                            tuning_config: TuningConfig,
-                            input_shapes: Tuple) -> tuple:
-        """What decides the forced sweep of a cache-excluded op.
-
-        The buckets it visits come from the input shapes, the tuning config's
-        dynamic specs and token limit, and whether this tuning pass sweeps
-        every bucket or only the input's own (skip_dynamic_tuning_buckets);
-        the kernels each bucket builds come from the runners, whose unique
-        ids carry their variant. A call that matches all of them would only
-        revisit what an earlier sweep with this key built. Constraint specs
-        are not in the key: the cache key does not hold the dimensions they
-        set (see _find_nearest_profile), so a sweep under other constraint
-        specs finds the same buckets cached.
-        """
-
-        def buckets_key(b):
-            if isinstance(b, (list, tuple)):
-                return tuple(b)
-            return (getattr(b, "__module__", None),
-                    getattr(b, "__qualname__", None)) if callable(b) else b
-
-        specs = tuple(
-            (spec.input_idx, spec.dim_idx, buckets_key(spec.gen_tuning_buckets),
-             buckets_key(spec.map_to_tuning_buckets))
-            for spec in tuning_config.dynamic_tensor_specs)
-        return (custom_op,
-                tuple((type(r).__name__, str(r.unique_id())) for r in runners),
-                input_shapes, specs, tuning_config.tune_max_num_tokens,
-                self.skip_dynamic_tuning_buckets)
 
     def _prime_cached_tactics(
         self,
@@ -2070,7 +2015,6 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
-        self._swept_excluded.clear()
         if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
             torch.ops.trtllm.clear_allreduce_tactic_cache()
 
