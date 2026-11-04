@@ -244,6 +244,10 @@ def test_a_resolved_record_fits_the_reply(readings, window, reported):
 
 @SETTINGS
 @given(st.lists(READING, min_size=2, max_size=4), WINDOW, COUNT)
+# The boundary, every run: two records fit, the first with both times known; neither is joined.
+@example([{"started_at": (10.0, 10.0), "finished_at": (11.0, 11.0), "output_tokens": None},
+          {"started_at": (10.5, 10.5), "finished_at": (11.5, 11.5), "output_tokens": None}],
+         (10.0, 12.0), None)  # fmt: skip
 def test_a_resolved_record_is_the_only_one_not_ruled_out(readings, window, reported):
     joined = pipeline.fitting_raw(readings, window, reported)
     if joined is not None:
