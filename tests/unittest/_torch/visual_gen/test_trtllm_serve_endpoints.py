@@ -37,7 +37,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.serve.openai_protocol import VideoJob
+from tensorrt_llm.serve.api.visual_gen.protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE

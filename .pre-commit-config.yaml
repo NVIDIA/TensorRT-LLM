@@ -417,6 +417,8 @@ common-files: &common_files |
         tensorrt_llm/scaffolding/worker.py |
         tensorrt_llm/scheduling_params.py |
         tensorrt_llm/serve/__init__.py |
+        tensorrt_llm/serve/_base/msgspec_route.py |
+        tensorrt_llm/serve/api/visual_gen/protocol.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
         tensorrt_llm/serve/disagg_auto_scaling.py |
@@ -1144,6 +1146,8 @@ legacy-files: &legacy_files |
         tensorrt_llm/scaffolding/worker.py |
         tensorrt_llm/scheduling_params.py |
         tensorrt_llm/serve/__init__.py |
+        tensorrt_llm/serve/_base/msgspec_route.py |
+        tensorrt_llm/serve/api/visual_gen/protocol.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
         tensorrt_llm/serve/disagg_auto_scaling.py |
@@ -1620,6 +1624,7 @@ repos:
         # Run mypy with no explicit paths so it type-checks the set declared in
         # pyproject.toml [tool.mypy] `files` (single source of truth). This
         # `files:` pattern only decides when the hook triggers — any change under
-        # the sampler source/test dirs.
+        # the sampler source/test dirs or the serving frontends. A PR that adds
+        # a typed module elsewhere extends this pattern in the same PR.
         pass_filenames: false
-        files: ^(tensorrt_llm/_torch/pyexecutor/sampler/|tests/unittest/_torch/sampler/)
+        files: ^(tensorrt_llm/_torch/pyexecutor/sampler/|tests/unittest/_torch/sampler/|tensorrt_llm/serve/|tensorrt_llm/commands/serve_cli/)
