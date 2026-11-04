@@ -14,9 +14,6 @@
 # limitations under the License.
 """The per-dialect error registry (``tensorrt_llm/serve/exception_handling/register.py``)."""
 
-import ast
-from pathlib import Path
-
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -38,8 +35,6 @@ from tensorrt_llm.serve.exception_handling.register import (
 )
 
 pytestmark = pytest.mark.cpu_only
-
-REPO_ROOT = Path(__file__).resolve().parents[4]
 
 MARKER_RULE = (
     "dialect_of must read the endpoint marker (scope['endpoint'] or scope['route'].endpoint)"
@@ -297,39 +292,3 @@ def test_renderer_may_return_a_stream():
         "error renderers must be allowed to return a stream (an error found after a Responses "
         "stream has opened is answered inside the stream)"
     )
-
-
-# ---------------------------------------------------------------------------
-# Import isolation
-# ---------------------------------------------------------------------------
-
-_SHARED_MODULES = (
-    "tensorrt_llm/serve/exception_handling/register.py",
-    "tensorrt_llm/serve/_base/errors.py",
-)
-_VISUAL_GEN_MODULES = (
-    "tensorrt_llm.serve.api.visual_gen",
-    "tensorrt_llm.serve._visual_gen_errors",
-    "tensorrt_llm.serve.openai_video_routes",
-)
-
-
-def _imported_modules(path: Path):
-    for node in ast.walk(ast.parse(path.read_text())):
-        if isinstance(node, ast.Import):
-            yield from (alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            yield node.module
-
-
-def test_registry_modules_import_no_visual_gen():
-    for module in _SHARED_MODULES:
-        for imported in _imported_modules(REPO_ROOT / module):
-            assert not any(
-                imported == forbidden or imported.startswith(forbidden + ".")
-                for forbidden in _VISUAL_GEN_MODULES
-            ), (
-                f"{module} imports {imported}: serve/exception_handling and serve/_base must not "
-                "import VisualGen code, which only the VisualGen role may load; VisualGen registers "
-                "its renderer from its own route registration"
-            )

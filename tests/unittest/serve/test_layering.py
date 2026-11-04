@@ -136,6 +136,21 @@ CONTRACTS = (
             "VisualGen role runs."
         ),
     ),
+    Contract(
+        name="serve/exception_handling/ and serve/_base/errors.py import no VisualGen module",
+        importers=("tensorrt_llm.serve.exception_handling", "tensorrt_llm.serve._base.errors"),
+        forbidden=(
+            "tensorrt_llm.serve.api.visual_gen",
+            "tensorrt_llm.serve._visual_gen_errors",
+            "tensorrt_llm.serve.openai_video_routes",
+        ),
+        include_type_checking=True,
+        fix=(
+            "The error registry and serve/_base/errors.py serve every role, and only the "
+            "VisualGen role may load VisualGen code, not even for type checking: VisualGen "
+            "code registers its renderer from its own route registration."
+        ),
+    ),
 )
 
 
