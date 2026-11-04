@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ast
+import concurrent.futures
 import contextlib
 import copy
 import enum
@@ -147,6 +148,14 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
+        parallel_jit_warmup (int): Before profiling, run every not-yet-tuned profile once
+            on this many threads. For runners whose first call per shape JIT-compiles a
+            kernel and releases the GIL while compiling (DeepGEMM), those compiles then
+            overlap, and the profiling loop that follows finds them built. Opted-in
+            runners must be thread-safe and must not use NCCL windows. 0 disables; -1 uses
+            this rank's share of the host's cores (up to 32): neighbouring sweep points
+            often select the same kernel and compile it twice, so more threads keep
+            paying off. TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -156,6 +165,7 @@ class TuningConfig:
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
+    parallel_jit_warmup: int = 0
 
 
 @dataclass(unsafe_hash=True)
@@ -1245,6 +1255,8 @@ class AutoTuner:
         # Synchronize ranks before profiling
         if self._should_current_rank_tune(
                 tuning_config.distributed_tuning_strategy):
+            self._parallel_jit_warmup(custom_op, runners, profiles, inputs,
+                                      tuning_config, **kwargs)
             with self._shared_profile_graph_pool():
                 for p in profiles:
                     is_cache_hit, *_ = self.profiling_cache.search_cache(
@@ -1587,6 +1599,75 @@ class AutoTuner:
             )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
+
+    def _parallel_jit_warmup(self, custom_op: str, runners: List[TunableRunner],
+                             profiles: List[OptimizationProfile],
+                             inputs: List[torch.Tensor],
+                             tuning_config: TuningConfig, **kwargs) -> None:
+        """Run each not-yet-tuned profile once on a thread pool to drive its JIT.
+
+        See ``TuningConfig.parallel_jit_warmup``. Purely a warmup: results are
+        discarded, and a failure here is left to the profiling loop, which
+        runs every profile again and handles errors as usual.
+        """
+        num_threads = int(
+            os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
+                           tuning_config.parallel_jit_warmup))
+        if num_threads < 0:
+            num_threads = min(32, (os.cpu_count() or 1) //
+                              max(1, torch.cuda.device_count()))
+        if num_threads < 2:
+            return
+        pending = [
+            p for p in profiles if not self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                p.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )[0]
+        ]
+        num_threads = min(num_threads, len(pending))
+        if num_threads < 2:
+            return
+        # Interleave contiguous blocks of the sweep, so the calls in flight
+        # come from far-apart shapes and mostly select different kernels
+        # rather than several threads compiling the same one.
+        size = -(-len(pending) // num_threads)
+        blocks = [pending[i * size:(i + 1) * size] for i in range(num_threads)]
+        order = [b[j] for j in range(size) for b in blocks if j < len(b)]
+        device = torch.cuda.current_device()
+        # One stream for all workers: the allocator caches their blocks where
+        # the profiling loop below allocates, and GPU time is not the cost here.
+        stream = torch.cuda.current_stream()
+        failures = []
+
+        def warm(profile: OptimizationProfile) -> None:
+            torch.cuda.set_device(device)
+            try:
+                with torch.cuda.stream(stream):
+                    tensors = self._prepare_input_tensors(profile, inputs)
+                    if tuning_config.inputs_pre_hook is not None:
+                        tensors = tuning_config.inputs_pre_hook(tensors)
+                    for runner in runners:
+                        for tactic in runner.get_valid_tactics(
+                                tensors, profile, **kwargs):
+                            runner(tensors, tactic=tactic, **kwargs)
+                    stream.synchronize()
+            except Exception as e:  # noqa: BLE001 - the profiling loop reports it
+                failures.append(e)
+
+        start = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_threads,
+                thread_name_prefix="autotuner_jit_warmup") as pool:
+            list(pool.map(warm, order))
+        logger.info(f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
+                    f"{num_threads} threads to drive their JIT in "
+                    f"{time.perf_counter() - start:.1f}s" +
+                    (f"; {len(failures)} failed and are left to profiling "
+                     f"({type(failures[0]).__name__}: {failures[0]})"
+                     if failures else ""))
 
     @staticmethod
     def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
