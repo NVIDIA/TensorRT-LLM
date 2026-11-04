@@ -262,6 +262,8 @@ def _run_point_to_point(graph: bool) -> bool:
     if fields:
         assert fields[0]["nccl.src_rank"] == 0
         assert fields[0]["nccl.dst_rank"] == 1
+        assert fields[0]["nccl.input_shape" if rank == 0 else "nccl.output_shape"] == [2, 4]
+        assert fields[0]["nccl.dtype"] == "Float"
     return True
 
 
