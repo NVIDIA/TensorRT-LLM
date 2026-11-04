@@ -226,8 +226,10 @@ a running total). `scripts/validate/usage.py`.
   out on Chat, and on Messages, which runs through the Chat handler, while the Responses route
   bills the whole prompt: `prompt_offset: {chat-completions: 3, anthropic-messages: 3,
   responses: 0}`.
-  `count_tokens` on main counts the whole rendered prompt, so with an offset on Messages it is
-  expected to answer that much more than the turn billed (USG-05).
+  The offset applies to the prompt count (USG-07) only. `count_tokens` on main counts the whole
+  rendered prompt, so with an offset on Messages it answers that much more than the turn billed,
+  and USG-05, which holds the two equal, reports it: a client that budgets by `count_tokens` is
+  then told another number than it is billed.
 - **`count_tokens` is paired by content, not by id.** A smoke run can probe it: replay the
   recorded `/v1/messages` bodies' prompt-shaping fields to `/v1/messages/count_tokens` into the
   same trace, and C-14 pairs them.
