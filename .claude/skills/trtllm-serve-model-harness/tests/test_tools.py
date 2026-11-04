@@ -138,6 +138,36 @@ def test_a_cut_shard_stops_a_trace_tool_with_its_name(tmp_path, script):
     assert "Traceback" not in result.stderr and not out.exists()
 
 
+def test_a_count_tokens_corpus_cut_while_it_is_written_is_not_left(tmp_path):
+    """Entries written before a shard's damage leave no corpus; a whole run's is owner-only."""
+    import gzip
+
+    def request(i):
+        body = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": f"go {i}"}]}
+        return {"event": "request", "trace_id": f"t{i}", "route": "/v1/messages", "body": body}
+
+    packed = gzip.compress("".join(json.dumps(request(i)) + "\n" for i in range(200)).encode())
+    whole = tmp_path / "whole" / "requests-1.jsonl.gz"
+    cut = tmp_path / "cut" / "requests-1.jsonl.gz"
+    for shard, data in ((whole, packed), (cut, packed[: len(packed) // 2])):
+        shard.parent.mkdir()
+        shard.write_bytes(data)
+    script = os.path.join(SCRIPTS, "count_tokens_corpus.py")
+    out = tmp_path / "corpus.jsonl"
+
+    result = subprocess.run([sys.executable, script, "--out", str(out), str(cut)],
+                            capture_output=True, text=True)  # fmt: skip
+    assert result.returncode != 0 and str(cut) in result.stderr, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    assert not out.exists() and not os.path.exists(str(out) + ".partial")
+
+    result = subprocess.run([sys.executable, script, "--out", str(out), str(whole)],
+                            capture_output=True, text=True)  # fmt: skip
+    assert result.returncode == 0, result.stderr
+    assert len(out.read_text().splitlines()) == 200
+    assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+
+
 # --------------------------------------------------------------------------- replay
 
 EVENT = b'event: response.created\ndata: {"type": "response.created"}\n\n'
