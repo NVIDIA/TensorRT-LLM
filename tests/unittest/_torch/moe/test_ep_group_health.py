@@ -19,9 +19,7 @@ Covers single-threaded correctness of the public API and concurrent update
 races as required by the WideEP FT implementation plan section 8.
 """
 
-import os
 import threading
-import time
 
 import pytest
 
@@ -92,23 +90,8 @@ def test_methods_reject_out_of_range_rank(bad_rank: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _hang_in_ci() -> None:
-    """Hang this process when it runs in a CI stage.
-
-    TEMPORARY, DO NOT MERGE: makes the test hang so that both the sub-test and
-    the test_unittests_v2 wrapper that runs it time out. Local runs are
-    unaffected.
-    """
-    if os.environ.get("BUILD_TAG") and os.environ.get("stageName"):
-        time.sleep(1800)
-
-
-# The inner pytest's own --timeout is disabled so the wrapper's timeout, set in
-# the CI test list, is the one that fires.
-@pytest.mark.timeout(0)
 def test_mark_failed_basic() -> None:
     """Marking an active rank failed updates mask, count, set, and generation."""
-    _hang_in_ci()
     h = EPGroupHealth(8)
     assert h.mark_failed(3) is True
     assert h.is_active(3) is False
