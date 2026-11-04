@@ -129,7 +129,7 @@ class LamportWorkspaceView:
     """Device addresses of one MNNVL all-reduce workspace for pushed calls
     (``kernels/blackwell/mnnvl_pushed_allreduce.py``).
 
-    ``uc_local``: this rank's unicast mapping of the workspace; ``mc_base``: its multicast
+    ``buffer``: this rank's unicast mapping of the workspace; ``mc_base``: its multicast
     mapping; ``peer_ptrs``: int64 CUDA tensor with every rank's unicast mapping (this rank's own
     at index ``rank``); ``flags``: the uint32 rotation state shared with the C++ kernels;
     ``bytes_per_buffer``: size of one of the three Lamport buffers.
@@ -137,11 +137,16 @@ class LamportWorkspaceView:
 
     world: int
     rank: int
-    uc_local: int
+    buffer: torch.Tensor
     mc_base: int
     peer_ptrs: torch.Tensor
     flags: torch.Tensor
     bytes_per_buffer: int
+
+    @property
+    def uc_local(self) -> int:
+        """Device address of ``buffer``."""
+        return self.buffer.data_ptr()
 
 
 def _lamport_workspace_view(handle: McastGPUBuffer, uc_buffer: torch.Tensor,
@@ -157,7 +162,7 @@ def _lamport_workspace_view(handle: McastGPUBuffer, uc_buffer: torch.Tensor,
     return LamportWorkspaceView(
         world=mapping.tp_size,
         rank=mapping.tp_rank,
-        uc_local=uc_buffer.data_ptr(),
+        buffer=uc_buffer,
         mc_base=handle.get_mc_buffer((1, ), torch.uint8, 0).data_ptr(),
         peer_ptrs=torch.tensor(peers,
                                dtype=torch.int64,

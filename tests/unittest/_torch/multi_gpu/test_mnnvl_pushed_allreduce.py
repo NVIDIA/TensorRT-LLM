@@ -780,7 +780,7 @@ def test_one_shot_finish_sums_rank_chunks(world):
     view = LamportWorkspaceView(
         world=world,
         rank=0,
-        uc_local=workspace.data_ptr(),
+        buffer=workspace,
         mc_base=0,
         peer_ptrs=torch.tensor([workspace.data_ptr()], dtype=torch.int64, device="cuda"),
         flags=flags,
@@ -836,7 +836,7 @@ def test_all_gather_call_finish_on_one_gpu(world, m, cpp_one_shot):
         view = LamportWorkspaceView(
             world=world,
             rank=0,
-            uc_local=ws.data_ptr(),
+            buffer=ws,
             mc_base=0,
             peer_ptrs=torch.tensor([ws.data_ptr()], dtype=torch.int64, device="cuda"),
             flags=flags,

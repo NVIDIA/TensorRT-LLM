@@ -5849,13 +5849,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         mutates_args=(),
         device_types="cuda")
     def kimi_k3_attn_res_add_rmsnorm_in_place_addend(
-            prefix: torch.Tensor, uc_local: int, flags: torch.Tensor,
+            prefix: torch.Tensor, workspace: torch.Tensor, flags: torch.Tensor,
             block: torch.Tensor, res_weight: torch.Tensor,
             rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
             out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """``kimi_k3_attn_res_add_rmsnorm`` whose addend is the result of the
         pushed MNNVL all-reduce finished in place last on the workspace with
-        local buffer address ``uc_local`` and state ``flags``
+        local buffer ``workspace`` and state ``flags``
         (``MnnvlInPlaceResult``)."""
         output = torch.empty_like(prefix)
         updated = torch.empty_like(prefix)
@@ -5868,23 +5868,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       out_eps,
                                       output,
                                       updated,
-                                      in_place_addend=(uc_local,
+                                      in_place_addend=(workspace.data_ptr(),
                                                        flags.data_ptr()))
         return updated, output
 
     @torch.library.register_fake(
         "trtllm::kimi_k3_attn_res_add_rmsnorm_in_place_addend")
-    def _(prefix, uc_local, flags, block, res_weight, rms_weight, out_weight,
+    def _(prefix, workspace, flags, block, res_weight, rms_weight, out_weight,
           rms_eps, out_eps):
         return torch.empty_like(prefix), torch.empty_like(prefix)
 
     @torch.library.custom_op(
         "trtllm::kimi_k3_attn_res_add_rmsnorm_finish_addend",
-        mutates_args=(),
+        mutates_args=("workspace", "flags"),
         device_types="cuda")
     def kimi_k3_attn_res_add_rmsnorm_finish_addend(
             prefix: torch.Tensor,
-            uc_local: int,
+            workspace: torch.Tensor,
             mc_base: int,
             flags: torch.Tensor,
             world: int,
@@ -5899,9 +5899,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             out_eps: float,
             entry_trigger: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """``kimi_k3_attn_res_add_rmsnorm`` whose addend is the pushed MNNVL
-        all-reduce over ``world`` ranks on the workspace (``uc_local``,
+        all-reduce over ``world`` ranks on the workspace (``workspace``,
         ``mc_base``, ``flags``) whose finish was left to this kernel
-        (``MnnvlPendingResult``): the kernel finishes it (``two_shot``
+        (``MnnvlPendingResult``): the kernel finishes it, writing the
+        workspace and advancing ``flags`` (``two_shot``
         transport; ``early_poll``: before its grid wait, one-shot only).
         ``entry_trigger``: release the dependent at kernel entry
         (``kimi_k3_attn_res``; the caller checked that the dependent is the
@@ -5918,7 +5919,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             out_eps,
             output,
             updated,
-            in_place_addend=(uc_local, flags.data_ptr()),
+            in_place_addend=(workspace.data_ptr(), flags.data_ptr()),
             finish=kimi_k3_attn_res.AllReduceFinish(world, rank, mc_base,
                                                     two_shot, early_poll),
             entry_trigger=entry_trigger)
@@ -5927,7 +5928,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     @torch.library.register_fake(
         "trtllm::kimi_k3_attn_res_add_rmsnorm_finish_addend")
     def _(prefix,
-          uc_local,
+          workspace,
           mc_base,
           flags,
           world,
@@ -6032,7 +6033,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 *_kimi_k3_attn_res_mxfp8_outputs(residual))
 
     def _kimi_k3_attn_res_moe_finish(residual,
-                                     uc_local,
+                                     workspace,
                                      mc_base,
                                      flags,
                                      world,
@@ -6057,7 +6058,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output,
             prefix,
             mxfp8_out=mxfp8_out,
-            in_place_addend=(uc_local, flags.data_ptr()),
+            in_place_addend=(workspace.data_ptr(), flags.data_ptr()),
             finish=kimi_k3_attn_res.AllReduceFinish(world,
                                                     rank,
                                                     mc_base,
@@ -6070,37 +6071,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return (prefix, output) + (tuple(mxfp8_out) if mxfp8 else ())
 
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_finish_rmsnorm",
-                             mutates_args=(),
+                             mutates_args=("workspace", "flags"),
                              device_types="cuda")
     def kimi_k3_attn_res_moe_finish_rmsnorm(
-            residual: torch.Tensor, uc_local: int, mc_base: int,
+            residual: torch.Tensor, workspace: torch.Tensor, mc_base: int,
             flags: torch.Tensor, world: int, rank: int, chunk: int,
             sanitize: bool, block: torch.Tensor, res_weight: torch.Tensor,
             rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
             out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """``kimi_k3_attn_res_moe_add_rmsnorm`` whose ``(routed, shared)``
         are a pending all-gather call over ``world`` ranks on the workspace
-        (``uc_local``, ``mc_base``, ``flags``; ``MnnvlPendingResult`` with
+        (``workspace``, ``mc_base``, ``flags``; ``MnnvlPendingResult`` with
         ``all_gather``): ``routed`` its all-gather rows, ``shared`` its slot
         sum (``chunk`` ranks at a time, ``sanitize``: ``-0`` as ``+0``). The
-        kernel finishes the call before its grid wait."""
+        kernel finishes the call before its grid wait, writing the workspace
+        and advancing ``flags``."""
         return _kimi_k3_attn_res_moe_finish(
-            residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
+            residual, workspace, mc_base, flags, world, rank, chunk, sanitize,
             block, (res_weight, rms_weight, out_weight), rms_eps, out_eps,
             False)
 
     @torch.library.register_fake("trtllm::kimi_k3_attn_res_moe_finish_rmsnorm")
-    def _(residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
+    def _(residual, workspace, mc_base, flags, world, rank, chunk, sanitize,
           block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
         return torch.empty_like(residual), torch.empty_like(residual)
 
     @torch.library.custom_op(
         "trtllm::kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8",
-        mutates_args=(),
+        mutates_args=("workspace", "flags"),
         device_types="cuda")
     def kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8(
         residual: torch.Tensor,
-        uc_local: int,
+        workspace: torch.Tensor,
         mc_base: int,
         flags: torch.Tensor,
         world: int,
@@ -6119,14 +6121,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         xs)`` of its output (as ``kimi_k3_attn_res_moe_add_rmsnorm_mxfp8``,
         also its ``entry_trigger``)."""
         return _kimi_k3_attn_res_moe_finish(
-            residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
+            residual, workspace, mc_base, flags, world, rank, chunk, sanitize,
             block, (res_weight, rms_weight, out_weight), rms_eps, out_eps, True,
             entry_trigger)
 
     @torch.library.register_fake(
         "trtllm::kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8")
     def _(residual,
-          uc_local,
+          workspace,
           mc_base,
           flags,
           world,

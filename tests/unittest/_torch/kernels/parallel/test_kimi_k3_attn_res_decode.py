@@ -268,7 +268,7 @@ def test_in_place_all_reduce_addend(m: int, n: int):
         torch.cuda._sleep(1_000_000)
         rows.copy_(t["addend"])
     updated, out = torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_in_place_addend(
-        t["layer"], workspace.data_ptr(), flags, t["block"], *w
+        t["layer"], workspace, flags, t["block"], *w
     )
     torch.cuda.synchronize()
     assert _mismatches(updated, ref_updated) == 0 and _mismatches(out, ref_out) == 0

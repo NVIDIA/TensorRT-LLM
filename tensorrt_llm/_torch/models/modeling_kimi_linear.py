@@ -810,7 +810,7 @@ def _attn_res_decode_kernel(
         world, rank, mc_base, two_shot, *_ = pending.finish_args
         return torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_finish_addend(
             layer,
-            pending.view.uc_local,
+            pending.view.buffer,
             mc_base,
             pending.view.flags,
             world,
@@ -827,7 +827,7 @@ def _attn_res_decode_kernel(
     if in_place:
         view = addends[0].view
         return torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_in_place_addend(
-            layer, view.uc_local, view.flags, block_residual, *weights, eps, out_eps
+            layer, view.buffer, view.flags, block_residual, *weights, eps, out_eps
         )
     if not addends:
         normed = torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(
@@ -1060,7 +1060,7 @@ def _attn_res_decode_finish_all_gather(
     _note_attn_res_fusion("attn_res+norm/decode/cp_tail", True, M, H, block_residual.shape[0] + 1)
     args = (
         layer.contiguous(),
-        pending.view.uc_local,
+        pending.view.buffer,
         mc_base,
         pending.view.flags,
         world,
