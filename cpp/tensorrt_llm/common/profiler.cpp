@@ -38,6 +38,7 @@ std::atomic<int>& initializedRegions() noexcept
     return regions;
 }
 
+//! Return a selector-token view without surrounding spaces, tabs, or line endings.
 std::string_view trim(std::string_view region)
 {
     auto const first = region.find_first_not_of(" \t\r\n");
@@ -45,6 +46,7 @@ std::string_view trim(std::string_view region)
                                            : region.substr(first, region.find_last_not_of(" \t\r\n") - first + 1);
 }
 
+//! Parse startup regions, rejecting unknown names, duplicate names, and invalid none mixtures.
 std::uint8_t parseRegions()
 {
     char const* value = std::getenv("TLLM_PROFILE_CUSTOM_REGIONS");
@@ -96,6 +98,7 @@ struct Selection
 
 } // namespace
 
+//! Cache startup selection once, retaining a diagnostic and default regions after malformed input.
 std::optional<std::string> initializeProfiler()
 {
     static Selection const selection = []
@@ -116,6 +119,7 @@ std::optional<std::string> initializeProfiler()
     return selection.error.empty() ? std::nullopt : std::make_optional(selection.error);
 }
 
+//! Read a valid region's cached selection without parsing or consulting the environment.
 bool customRegionEnabled(ProfilerRegion region) noexcept
 {
     auto const index = static_cast<std::uint8_t>(region);
@@ -123,6 +127,7 @@ bool customRegionEnabled(ProfilerRegion region) noexcept
     return enabled >= 0 && index < std::size(kRegionNames) && (enabled & (1U << index)) != 0;
 }
 
+//! Emit at most one process-wide observation warning without constructing the native Logger.
 void reportProfilerFailure(char const* diagnostic) noexcept
 {
     static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -153,6 +158,7 @@ void ProfilerMetadata::add(std::string_view name, std::int64_t value)
     mEncoded += std::to_string(value);
 }
 
+//! Append a signed integer list, preserving order and allowing an empty vector.
 void ProfilerMetadata::add(std::string_view name, std::vector<std::int64_t> const& value)
 {
     appendName(name);
@@ -176,6 +182,7 @@ std::string ProfilerMetadata::take() &&
     return std::move(mEncoded);
 }
 
+//! Insert a field separator when needed, followed by the quoted key and colon.
 void ProfilerMetadata::appendName(std::string_view name)
 {
     if (!mFirst)
@@ -187,6 +194,7 @@ void ProfilerMetadata::appendName(std::string_view name)
     mEncoded += ':';
 }
 
+//! Escape quotes, backslashes, and control bytes in a UTF-8 Python string literal.
 void ProfilerMetadata::appendQuoted(std::string_view value)
 {
     constexpr char kHexDigits[] = "0123456789abcdef";
@@ -217,6 +225,7 @@ void ProfilerMetadata::appendQuoted(std::string_view value)
     mEncoded += '\'';
 }
 
+//! Prepare a same-thread user scope only when the selected region has an active callback.
 RecordFunctionWithMetadata::RecordFunctionWithMetadata(ProfilerRegion region) noexcept
 {
     if (!customRegionEnabled(region) || !at::hasCallbacks())
@@ -244,6 +253,7 @@ RecordFunctionWithMetadata::RecordFunctionWithMetadata(ProfilerRegion region) no
     }
 }
 
+//! End a started scope once, reporting cleanup failures without replacing an operation exception.
 RecordFunctionWithMetadata::~RecordFunctionWithMetadata() noexcept
 {
     try

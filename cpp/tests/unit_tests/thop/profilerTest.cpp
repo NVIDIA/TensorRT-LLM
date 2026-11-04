@@ -42,6 +42,7 @@ Observation& observation()
     return value;
 }
 
+//! Capture an entered scope and its first string input when callbacks request metadata.
 std::unique_ptr<at::ObserverContext> observeStart(at::RecordFunction const& record)
 {
     auto& value = observation();
@@ -70,6 +71,7 @@ void observeEnd(at::RecordFunction const&, at::ObserverContext*)
 class CallbackGuard
 {
 public:
+    //! Install a thread-local user-scope callback and clear observations from earlier tests.
     explicit CallbackGuard(bool inputs = true)
         : mHandle{at::addThreadLocalCallback(at::RecordFunctionCallback(inputs ? observeStart : observeName, observeEnd)
                                                  .needsInputs(inputs)
@@ -91,6 +93,7 @@ private:
 };
 
 #if !defined(_WIN32)
+//! Check selection in a child process and verify that later environment changes are ignored.
 void checkSelection(char const* selection, std::vector<tc::ProfilerRegion> const& expected)
 {
     if (selection == nullptr)
@@ -124,6 +127,7 @@ void checkSelection(char const* selection, std::vector<tc::ProfilerRegion> const
 } // namespace
 
 #if !defined(_WIN32)
+//! Check default, explicit, trimmed, empty, and none selections in independent child processes.
 TEST(ProfilerStartupDeathTest, DefaultsAndOptInAreCached)
 {
     EXPECT_EXIT(checkSelection(nullptr,
@@ -145,6 +149,7 @@ TEST(ProfilerStartupDeathTest, DefaultsAndOptInAreCached)
     EXPECT_EXIT(checkSelection("none", {}), ::testing::ExitedWithCode(0), "");
 }
 
+//! Verify malformed selections retain their first diagnostic and select the default regions.
 TEST(ProfilerStartupDeathTest, InvalidSelectionReturnsCachedDiagnosticAndDefaults)
 {
     for (auto const* selection : {"workflow,", ",workflow", "workflow,,mpi", "unknown", "mpi,mpi", "none,kv"})
@@ -164,6 +169,7 @@ TEST(ProfilerStartupDeathTest, InvalidSelectionReturnsCachedDiagnosticAndDefault
     }
 }
 
+//! Check that repeated metadata failures warn once while the original operation exception survives.
 TEST(ProfilerStartupDeathTest, ObservationFailureWarnsOnceAndPreservesOperationException)
 {
     EXPECT_EXIT(
@@ -197,6 +203,7 @@ TEST(ProfilerStartupDeathTest, ObservationFailureWarnsOnceAndPreservesOperationE
         ::testing::ExitedWithCode(0), "^TensorRT-LLM profiler warning: observation omitted: factory failed\n$");
 }
 
+//! Verify uninitialized probes neither parse configuration nor evaluate their factories.
 TEST(ProfilerStartupDeathTest, ProbesBeforeStartupNeverParseInvalidConfiguration)
 {
     EXPECT_EXIT(
@@ -211,6 +218,7 @@ TEST(ProfilerStartupDeathTest, ProbesBeforeStartupNeverParseInvalidConfiguration
         ::testing::ExitedWithCode(0), "");
 }
 
+//! Verify an explicit none selection suppresses callbacks and both factories.
 TEST(ProfilerStartupDeathTest, NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes)
 {
     EXPECT_EXIT(
@@ -227,6 +235,7 @@ TEST(ProfilerStartupDeathTest, NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes
 }
 #endif
 
+//! Compare native encoding of Unicode, escaped strings, signed integers, and empty lists to a golden payload.
 TEST(ProfilerMetadataTest, NativeGoldenIncludesUnicodeEscapingSignedIntegersAndEmptyLists)
 {
     tc::ProfilerMetadata metadata{"workflow"};
@@ -237,6 +246,7 @@ TEST(ProfilerMetadataTest, NativeGoldenIncludesUnicodeEscapingSignedIntegersAndE
         std::move(metadata).take(), "TRTLLM18:workflow{'quoted\\'key':'slash\\\\line\\n\\t\\'雪','rank':-7,'ids':[]}");
 }
 
+//! Check UTF-8 region byte lengths, control-byte escapes, and signed integer boundary literals.
 TEST(ProfilerMetadataTest, ByteLengthsAndControlCharactersAreLiteralCompatible)
 {
     tc::ProfilerMetadata metadata{"区域"};
@@ -260,6 +270,7 @@ protected:
     }
 };
 
+//! Verify active scopes own their metadata, evaluate factories once, and end exactly once.
 TEST_F(ProfilerScopeTest, ActiveCallbackReceivesOwnedMetadataAndEndsOnce)
 {
     CallbackGuard callback;
@@ -288,6 +299,7 @@ TEST_F(ProfilerScopeTest, ActiveCallbackReceivesOwnedMetadataAndEndsOnce)
     EXPECT_EQ(observation().ends, 1);
 }
 
+//! Verify a name-only callback records the scope without evaluating the metadata factory.
 TEST_F(ProfilerScopeTest, CallbackWithoutInputsDoesNotInspectMetadata)
 {
     CallbackGuard callback{false};
@@ -301,6 +313,7 @@ TEST_F(ProfilerScopeTest, CallbackWithoutInputsDoesNotInspectMetadata)
     EXPECT_TRUE(observation().metadata.empty());
 }
 
+//! Verify missing callbacks and excluded regions both bypass name and metadata factories.
 TEST_F(ProfilerScopeTest, InactiveAndUnselectedScopesDoNotEvaluateFactories)
 {
     int nameCalls = 0;
@@ -321,6 +334,7 @@ TEST_F(ProfilerScopeTest, InactiveAndUnselectedScopesDoNotEvaluateFactories)
     EXPECT_EQ(observation().starts, 0);
 }
 
+//! Check that metadata failure suppresses observation while preserving the body's exception.
 TEST_F(ProfilerScopeTest, MetadataFailureDoesNotPreventBodyOrMaskItsException)
 {
     CallbackGuard callback;

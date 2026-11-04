@@ -79,7 +79,9 @@ public:
     [[nodiscard]] std::string take() &&;
 
 private:
+    //! Append a quoted field name and the dictionary's required separators.
     void appendName(std::string_view name);
+    //! Append a Python string literal while preserving UTF-8 and escaping control bytes.
     void appendQuoted(std::string_view value);
 
     std::string mEncoded;
