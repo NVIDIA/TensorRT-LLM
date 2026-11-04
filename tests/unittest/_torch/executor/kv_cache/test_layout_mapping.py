@@ -157,16 +157,27 @@ def layout(topology: RankTopology, layers: tuple[int, ...], specs: list[Spec]) -
     return PageLayout(TOKENS, widths, groups, tuple(buffers), topology)
 
 
-def check(src: Instance, dst: Instance, specs: list[Spec], *, src_dp: int = 0) -> None:
+def check(
+    src: Instance,
+    dst: Instance,
+    specs: list[Spec],
+    *,
+    src_dp: int = 0,
+    dst_specs: list[Spec] | None = None,
+    page: int = 0,
+    end: int | None = None,
+) -> None:
     """Every destination rank of every data-parallel group gets each byte it holds exactly once,
-    holding the right element, and only from source ranks of its fan."""
+    holding the right element, and only from source ranks of its fan; for page ``page`` of a
+    request reaching token position ``end`` where axes of token positions are concerned. The
+    destination's buffers follow ``dst_specs`` where given."""
     sources = [layout(t, src.stages[t.pp_rank], specs) for t in src.ranks(src_dp)]
     destinations = [
-        layout(t, dst.stages[t.pp_rank], specs)
+        layout(t, dst.stages[t.pp_rank], dst_specs or specs)
         for dst_dp in range(dst.tp if dst.attention_dp else 1)
         for t in dst.ranks(dst_dp)
     ]
-    assert_layouts_reshard(sources, destinations)
+    assert_layouts_reshard(sources, destinations, page=page, end=end)
 
 
 TPS = (1, 2, 4, 8)
@@ -672,7 +683,8 @@ def test_a_per_request_group_pairs_its_one_slot_and_paged_groups_pair_with_their
 @dataclass(frozen=True)
 class _Halves(AxisKind):
     """A kind only this test defines: rank ``r`` of ``n`` holds the ``r``-th of ``n`` equal runs
-    of the axis. Nothing in page_layout or layout_mapping names it; it registers its sender."""
+    of the axis. It says which indices each rank holds, and nothing else; no function of
+    page_layout or layout_mapping names it."""
 
     name: ClassVar[str] = "test-halves"
     split: tuple[str, ...] = ("tp",)
@@ -685,15 +697,9 @@ class _Halves(AxisKind):
         return None
 
 
-@owned_indices.register(_Halves)
-def _owned_halves(kind, axis, src, fans, key, wanted):
-    # Each index lies on one rank, which sends it to every destination it pairs with.
-    return [held(axis, src)] if grid_place(src, kind.split)[1] in fans["tp"] else []
-
-
-def test_a_new_axis_kind_reshards_by_its_own_registration():
-    """A kind added beside the others, with its sender registered, reshards through the same
-    functions, which name no kind."""
+def test_a_new_axis_kind_reshards_from_the_indices_it_says_each_rank_holds():
+    """A kind added beside the others reshards through the same functions, which derive who sends
+    each index from the indices every rank holds."""
 
     def tensors(topology):
         return (Tensor((Axis("row", 8, HEAD, _Halves()), Axis("byte", HEAD, 1))),)
@@ -707,24 +713,98 @@ def test_a_new_axis_kind_reshards_by_its_own_registration():
     )
 
 
-def test_an_unregistered_split_kind_is_refused_rather_than_sent_whole():
-    """A kind spreading over ranks sends what its registration says; one without is refused, as
-    sending every index it holds could send an index twice. A subclass inherits its base's."""
+@dataclass(frozen=True)
+class _Pairs(AxisKind):
+    """A kind only this test defines whose ranks hold overlapping indices that are not runs: rank
+    ``r`` holds the even indices or the odd ones, ``r`` modulo 2."""
+
+    name: ClassVar[str] = "test-pairs"
+    split: tuple[str, ...] = ("tp",)
+
+    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
+        _, r = grid_place(topology, self.split)
+        return Progression(r % 2, 2, len(range(r % 2, axis.extent, 2)))
+
+    def count(self, axis: Axis) -> None:
+        return None
+
+
+def test_a_kind_holding_overlapping_indices_not_in_runs_says_who_sends_them():
+    """Who sends an index several ranks hold out of runs is not derived: such a kind is refused
+    until it registers ``owned_indices``, which then decides."""
+
+    def specs(kind):
+        return [
+            (
+                "rows",
+                lambda t: (Tensor((Axis("row", 8, HEAD, kind), Axis("byte", HEAD, 1))),),
+                "attention",
+            )
+        ]
+
+    with pytest.raises(ValueError, match="registers owned_indices"):
+        check(Instance(tp=4), Instance(tp=2), specs(_Pairs()))
 
     @dataclass(frozen=True)
-    class Derived(_Halves):
-        name: ClassVar[str] = "test-derived"
+    class Decided(_Pairs):
+        name: ClassVar[str] = "test-pairs-decided"
 
-    assert owned_indices.dispatch(Derived) is _owned_halves
+    @owned_indices.register(Decided)
+    def _owned_pairs(kind, axis, pairing, wanted):
+        # Of the paired ranks holding the same parity, the first sends.
+        _, me = pairing.place(kind.split)
+        holders = [r for r in pairing.paired(kind.split) if r % 2 == me % 2]
+        return [held(axis, pairing.src)] if holders[0] == me else []
 
-    @dataclass(frozen=True)
-    class Bare(AxisKind):
-        name: ClassVar[str] = "test-bare"
+    check(Instance(tp=4), Instance(tp=2), specs(Decided()))
 
-        @property
-        def split(self) -> tuple[str, ...]:
-            return ("tp",)
 
-    axis = Axis("row", 8, HEAD, Bare())
-    with pytest.raises(ValueError, match="registers no owned_indices"):
-        owned_indices(axis.kind, axis, RankTopology(), {"tp": range(1)}, 0, Progression(0, 1, 8))
+@dataclass(frozen=True)
+class _PageHead(AxisKind):
+    """A kind of token positions only this test defines: the first ``extent`` positions of each
+    page, position ``p`` at index ``p % tokens_per_page``. Each side sizes it as it keeps."""
+
+    name: ClassVar[str] = "test-page-head"
+    positional: ClassVar[bool] = True
+
+    def positions(self, axis: Axis, page: int, end: int, tokens_per_page: int) -> range:
+        first = page * tokens_per_page
+        return range(first, min(end, first + min(axis.extent, tokens_per_page)))
+
+    def index_of(self, axis: Axis, positions, tokens_per_page: int):
+        return positions % tokens_per_page
+
+    def corresponds(self, axis: Axis, peer: Axis) -> bool:
+        return isinstance(peer.kind, _PageHead)
+
+
+@pytest.mark.parametrize("src_slots,dst_slots", [(2, 3), (3, 2), (4, 4)])
+@pytest.mark.parametrize("page,end", [(0, 1), (0, 4), (1, 6), (2, 12)])
+def test_a_new_kind_of_token_positions_moves_the_positions_both_sides_hold(
+    src_slots, dst_slots, page, end
+):
+    """A kind of token positions says which positions a page holds and where; the positions both
+    sides hold move, each to its own index, with no rule of its own in layout_mapping."""
+
+    def head(slots):
+        return lambda topology: (
+            Tensor((Axis("position", slots, HEAD, _PageHead()), Axis("byte", HEAD, 1))),
+        )
+
+    check(
+        Instance(),
+        Instance(),
+        [("head", head(src_slots), "attention")],
+        dst_specs=[("head", head(dst_slots), "attention")],
+        page=page,
+        end=end,
+    )
+
+
+def test_a_kind_of_token_positions_says_which_positions_a_page_holds():
+    with pytest.raises(TypeError, match="does not say which a page holds"):
+
+        @dataclass(frozen=True)
+        class _Unsaid(AxisKind):
+            name: ClassVar[str] = "test-unsaid"
+            positional: ClassVar[bool] = True

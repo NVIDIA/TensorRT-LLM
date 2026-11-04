@@ -22,19 +22,33 @@ reaches past a pool slot, and no other byte of the destination's slots is writte
 destination transfers of a model layer the sources hold, of a role they transfer none of for it,
 is one the destination rebuilds per request (``PageLayout.request_rebuilt_roles``).
 
+An axis of token positions (``AxisKind.positional``) holds, at the index its kind
+gives each position it holds of the page (``AxisKind.positions``, ``AxisKind.index_of``), that
+position's elements; a destination must receive exactly the positions both sides hold, each at its
+own index, applying runs as the native transfer does (``layout_mapping.page_runs``). Which
+positions a kind holds, and where, the oracle takes from the kind: that is the declaration, which
+tests running the kernels show to be right.
+
 Use it on hand-written layouts, or on the page layouts real managers build
 (``manager.get_page_table().page_layout``) to check a new cache's declarations across the
 topologies it is served with. It checks that the ranks' declarations agree with one another; that
 they describe what the kernels write is for tests running the kernels to show.
 """
 
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import fan, layer_group_of, map_buffers
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
+    TransferWindow,
+    fan,
+    layer_group_of,
+    map_buffers,
+    page_runs,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     GRID_DIMENSIONS,
+    Axis,
     BufferDesc,
     PageLayout,
     RankTopology,
@@ -61,23 +75,41 @@ def _slots(page: PageLayout, groups: Dict[Tuple[int, int], int]) -> Dict[Slot, n
 
 
 class Elements:
-    """Global element ids, allotted per (layer, role, tensor name) in the order first seen."""
+    """Global element ids, allotted per (layer, role, tensor name) in the order first seen.
 
-    def __init__(self) -> None:
+    Axes of token positions hold those of page ``page`` of a request reaching token position
+    ``end`` (exclusive).
+    """
+
+    def __init__(self, page: int, end: int) -> None:
         self._bases: Dict[tuple, int] = {}
         self._next = 0
+        self._page = page
+        self._end = end
+
+    def _extent(self, axis: Axis) -> int:
+        # An axis of token positions numbers its elements by position, below ``end``.
+        return self._end if axis.kind.positional else axis.extent
 
     def _base(self, buffer: BufferDesc, tensor: Tensor) -> int:
         key = (buffer.layer, buffer.role, tensor.name)
         if key not in self._bases:
             self._bases[key] = self._next
-            self._next += int(np.prod([a.extent for a in tensor.axes]))
+            self._next += int(np.prod([self._extent(a) for a in tensor.axes]))
         return self._bases[key]
 
+    def _positions(self, page: PageLayout, axis: Axis) -> np.ndarray:
+        """The positions ``axis`` holds of the page once the request is written up to ``end``."""
+        held_ = axis.kind.positions(axis, self._page, self._end, page.tokens_per_page)
+        return np.asarray(held_, dtype=np.int64)
+
     def of(
-        self, page: PageLayout, buffer: BufferDesc, tensor: Tensor
+        self, page: PageLayout, buffer: BufferDesc, tensor: Tensor, peer: Optional[Axis] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         """The elements of the tensor's local piece.
+
+        Of an axis of token positions, those of the positions it holds; with ``peer``, the
+        other side's axis of the same name, only those both hold.
 
         Returns:
             Each element's byte offset within the pool slot, and its global element id.
@@ -85,10 +117,19 @@ class Elements:
         offsets = np.array([buffer.slot_offset + tensor.offset], dtype=np.int64)
         ids = np.zeros(1, dtype=np.int64)
         for axis in tensor.axes:
-            h = held(axis, page.topology)
-            local = np.arange(h.count, dtype=np.int64)
+            if axis.kind.positional:
+                index = self._positions(page, axis)
+                if peer is not None:
+                    index = np.intersect1d(index, self._positions(page, peer))
+                local = np.asarray(
+                    axis.kind.index_of(axis, index, page.tokens_per_page), dtype=np.int64
+                )
+            else:
+                h = held(axis, page.topology)
+                local = np.arange(h.count, dtype=np.int64)
+                index = h.start + h.step * local
             offsets = (offsets[:, None] + local[None, :] * axis.stride).ravel()
-            ids = (ids[:, None] * axis.extent + (h.start + h.step * local)[None, :]).ravel()
+            ids = (ids[:, None] * self._extent(axis) + index[None, :]).ravel()
         return offsets, ids + self._base(buffer, tensor)
 
     def memory(self, page: PageLayout) -> Dict[Slot, np.ndarray]:
@@ -121,29 +162,45 @@ def paired(src: RankTopology, dst: RankTopology) -> bool:
 
 
 def assert_layouts_reshard(
-    sources: Sequence[PageLayout], destinations: Sequence[PageLayout]
+    sources: Sequence[PageLayout],
+    destinations: Sequence[PageLayout],
+    *,
+    page: int = 0,
+    end: Optional[int] = None,
 ) -> None:
-    """Check the byte oracle for one request.
+    """Check the byte oracle for one page of one request.
 
     Args:
         sources: The page layouts of every source rank serving the request: one attention
             data-parallel group, all pipeline stages and context ranks.
         destinations: Page layouts of destination ranks, each checked against all sources.
+        page: The page's position among the request's pages, from 0.
+        end: Token position (exclusive) the request's transfer reaches; the page's end by
+            default, the page written whole.
     """
-    elements = Elements()
-    source_memory = [elements.memory(page) for page in sources]
-    source_groups = [layer_group_of(page) for page in sources]
-    sent = {(b.layer, b.role) for page in sources for b in page.buffers if b.transferred}
+    if end is None:
+        end = (page + 1) * sources[0].tokens_per_page
+    elements = Elements(page, end)
+    source_memory = [elements.memory(layout) for layout in sources]
+    source_groups = [layer_group_of(layout) for layout in sources]
+    sent = {(b.layer, b.role) for layout in sources for b in layout.buffers if b.transferred}
+    # The sources' axes of token positions, so that a destination expects the positions both hold.
+    source_positions = {
+        (b.layer, b.role): b.positional
+        for layout in sources
+        for b in layout.buffers
+        if b.transferred and b.positional is not None
+    }
     sent_models = {
-        (_model_layer(page, groups, b), b.role)
-        for page, groups in zip(sources, source_groups)
-        for b in page.buffers
+        (_model_layer(layout, groups, b), b.role)
+        for layout, groups in zip(sources, source_groups)
+        for b in layout.buffers
         if b.transferred
     }
     held_models = {
-        _model_layer(page, groups, b)
-        for page, groups in zip(sources, source_groups)
-        for b in page.buffers
+        _model_layer(layout, groups, b)
+        for layout, groups in zip(sources, source_groups)
+        for b in layout.buffers
     }
     for dst in destinations:
         dst_groups = layer_group_of(dst)
@@ -167,7 +224,7 @@ def assert_layouts_reshard(
             for runs in maps:
                 src_pool = _slot(groups, runs.src)
                 dst_pool = _slot(dst_groups, runs.dst)
-                for s, d, n in zip(runs.src_offsets, runs.dst_offsets, runs.sizes):
+                for s, d, n in zip(*page_runs(runs, page, TransferWindow(0, end))):
                     assert n > 0 and 0 <= s and s + n <= memory[src_pool].size, (src_pool, s, n)
                     assert 0 <= d and d + n <= got[dst_pool].size, (dst.topology, dst_pool, d, n)
                     got[dst_pool][d : d + n] = memory[src_pool][s : s + n]
@@ -177,8 +234,9 @@ def assert_layouts_reshard(
             if not buffer.transferred or (buffer.layer, buffer.role) not in sent:
                 continue
             pool = _slot(dst_groups, buffer)
+            peer = source_positions.get((buffer.layer, buffer.role))
             for tensor in buffer.tensors:
-                offsets, ids = elements.of(dst, buffer, tensor)
+                offsets, ids = elements.of(dst, buffer, tensor, peer)
                 expected[pool][offsets] = True
                 where = (
                     f"{dst.topology} buffer ({buffer.layer}, {buffer.role}) tensor {tensor.name!r}"

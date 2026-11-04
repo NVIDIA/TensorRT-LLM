@@ -16,14 +16,16 @@
 standard library only.
 
 A buffer holds the local pieces of one or more tensors. A tensor names its axes and their extents
-over all ranks together; each axis says how its indices spread over the parallel dimensions
-(``Axis.kind``: whole on every rank, a contiguous run per rank, or every n-th index per rank) and
-the byte stride of its local index. Which global indices a rank holds is therefore a progression
-per axis (``held``), and how two ranks' pages correspond follows from intersecting them
-(``layout_mapping``). An axis may instead index token positions (``AxisKind.positional``), whose
-bytes move by the positions a request has written. How an axis spreads is its
-kind (``AxisKind``), and how a layer group addresses a request's pages is the group's
-(``GroupKind``); a new kind adds a class here and its mapping in ``layout_mapping``."""
+over all ranks together; each axis has a byte stride between the indices a rank holds and a kind
+(``AxisKind``) saying which indices each rank holds:
+
+    Axis("head", 8, 256, Contiguous(("tp",), 4))   # 8 heads of 256 B; TP rank r holds 4r..4r+3
+    Axis("row", 12, 64, Cyclic(("tp",)))           # TP rank r of n holds rows r, r + n, ...
+    Axis("byte", 256, 1)                           # every rank holds all 256 bytes (Whole)
+
+How two ranks' pages correspond is derived from these alone (``layout_mapping``), so a new kind is
+a class here saying which indices a rank holds, or which token positions a page holds and where;
+a layer group's kind (``GroupKind``) says how it addresses a request's pages."""
 
 from __future__ import annotations
 
@@ -203,16 +205,24 @@ def _sparse(kind: object) -> dict:
 class AxisKind:
     """How the indices of an axis spread over ranks, or which token positions the axis holds.
 
-    A subclass is one such way. It states its data here; its mapping between ranks is registered
-    in ``layout_mapping`` (``owned_indices``, and ``position_rule`` for a positional kind), so a new
-    way adds a subclass and edits no existing function. Each subclass names itself (``name``) for
-    peers and for ``layout_id``; its fields are its data, and a subclass overriding none of the
-    methods below holds every index on every rank.
+    A subclass is one such way, a frozen dataclass whose fields are its data, named (``name``)
+    for peers and for ``layout_id``. What moves between ranks is derived from what it says here
+    (``layout_mapping``), so a new kind is one class:
+
+    - A kind spreading indices over ranks gives ``split`` and ``indices``, and ``count`` when every
+      rank holds as many; ``Contiguous`` is one.
+    - A kind of token positions sets ``positional`` and gives ``positions`` and ``index_of``.
+
+    A subclass overriding none of these holds every index on every rank, as ``Whole``.
 
     Attributes:
         name: The kind's name, unique among axis kinds.
         positional: Whether the axis indexes token positions, which a page holds according to the
             positions it has written, rather than fixed indices.
+
+    Raises:
+        TypeError: On defining a positional kind that does not give ``positions`` and
+            ``index_of``.
     """
 
     name: ClassVar[str] = ""
@@ -220,6 +230,13 @@ class AxisKind:
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
+        if cls.positional and (
+            cls.positions is AxisKind.positions or cls.index_of is AxisKind.index_of
+        ):
+            raise TypeError(
+                f"axis kind {cls.__name__} holds token positions but does not say which a page "
+                "holds (positions) or where (index_of)"
+            )
         _register(_AXIS_KINDS, cls, "axis kind")
 
     @property
@@ -238,6 +255,17 @@ class AxisKind:
     def count(self, axis: Axis) -> int | None:
         """How many indices of ``axis`` a rank holds, or None where that differs by rank."""
         return axis.extent
+
+    def positions(self, axis: Axis, page: int, end: int, tokens_per_page: int) -> range:
+        """For a positional kind: the token positions of page ``page`` (its position among a
+        request's pages, from 0, of ``tokens_per_page`` positions each) that ``axis`` holds once
+        the request has written every position below ``end``."""
+        raise NotImplementedError(f"axis kind {self.name!r} holds no token positions")
+
+    def index_of(self, axis: Axis, positions, tokens_per_page: int):
+        """For a positional kind: the index of ``axis`` holding each of ``positions`` (an integer
+        or an integer array; the result is the same) in pages of ``tokens_per_page`` positions."""
+        raise NotImplementedError(f"axis kind {self.name!r} holds no token positions")
 
     def corresponds(self, axis: Axis, peer: Axis) -> bool:
         """Whether ``peer``, a peer's axis of the same name, can pair with ``axis``: by default
@@ -265,7 +293,7 @@ def axis_kind_from_dict(data: Mapping) -> AxisKind:
 
 @dataclass(frozen=True)
 class Whole(AxisKind):
-    """Every rank holds every index."""
+    """Every rank holds every index: ``Axis("byte", 256, 1)`` is 256 bytes alike on every rank."""
 
     name: ClassVar[str] = "whole"
 
@@ -276,7 +304,11 @@ class Whole(AxisKind):
 @dataclass(frozen=True)
 class Contiguous(AxisKind):
     """Rank ``r`` of ``n`` in the grid of the ``split`` dimensions holds ``held`` indices from
-    ``r * extent // n``; ranks hold overlapping or equal runs when ``held * n`` exceeds the extent.
+    ``r * extent // n``.
+
+    8 heads over TP2, ``Contiguous(("tp",), 4)``: rank 0 holds heads 0..3, rank 1 heads 4..7.
+    6 heads over TP4, ``Contiguous(("tp",), 2)``: ranks hold 0..1, 1..2, 3..4 and 4..5; ranks
+    hold overlapping runs where ``held * n`` exceeds the extent.
 
     Attributes:
         split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner, at least one; the
@@ -320,7 +352,7 @@ class Contiguous(AxisKind):
 @dataclass(frozen=True)
 class Cyclic(AxisKind):
     """Rank ``r`` of ``n`` in the grid of the ``split`` dimensions holds indices ``r, r + n, ...``
-    below the extent.
+    below the extent: 12 rows over TP4, rank 1 holds rows 1, 5 and 9.
 
     Attributes:
         split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner, at least one; the
@@ -353,7 +385,8 @@ class Axis:
     """One dimension of a tensor: its extent over all ranks together, the byte stride between
     consecutive indices a rank holds, and its kind, which says which of its indices a rank holds
     (``held``). Local index ``k`` (the k-th index held, in order) lies at byte ``k * stride`` of
-    its tensor.
+    its tensor: with ``Axis("head", 8, 256, Contiguous(("tp",), 4))``, TP rank 1 holds heads
+    4..7, head 5 at byte 256 of its piece.
 
     Attributes:
         name: The axis' name; peers match tensors' axes on it.
