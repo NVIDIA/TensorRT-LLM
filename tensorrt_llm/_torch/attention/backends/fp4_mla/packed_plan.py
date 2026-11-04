@@ -84,6 +84,9 @@ class _PackedPlanGeometry(NamedTuple):
     helix_kv_bounds: torch.Tensor | None
     plan: torch.Tensor | None
     key: tuple | None
+    # Whether the decode stages each task's page table in shared memory (the page-plan
+    # profile) where the task fits it, rather than reading page ids per tile.
+    use_smem_page_plan: bool = True
 
 
 def _fp4_mla_packed_plan_geometry(
@@ -139,11 +142,9 @@ def _fp4_mla_packed_plan_geometry(
     # The kernels clamp the plan to the compiled profile (a bucket >= split_kv_len).
     module = _fp4_mla_cutedsl_kernel_module()
     profile_tiles = module._select_runtime_kv_profile(split_kv_len) // 256
-    if helix_kv_bounds is None and split_kv_len <= module.SMEM_P4_PAGE_PLAN_PROFILE_KV:
-        # Without Helix bounds the decode runs the next bucketed profile, which reads each
-        # tile's page ids from global memory instead of staging the task's page table in
-        # shared memory first; the plan keeps the page-plan profile's task-length cap.
-        split_kv_len = module.SMEM_P4_PAGE_PLAN_PROFILE_KV + 1
+    # Only Helix ranks stage the page table in shared memory; the others read page ids per tile
+    # (the next bucketed profile). The plan keeps the page-plan profile's task-length cap.
+    use_smem_page_plan = helix_kv_bounds is not None
     if splits == 1:
         return _PackedPlanGeometry(
             num_requests,
@@ -156,6 +157,7 @@ def _fp4_mla_packed_plan_geometry(
             helix_kv_bounds,
             None,
             None,
+            use_smem_page_plan,
         )
     from .fp4_mla_packed_reduce import packed_plan_length
 
@@ -192,6 +194,7 @@ def _fp4_mla_packed_plan_geometry(
         helix_kv_bounds,
         plan,
         key,
+        use_smem_page_plan,
     )
 
 

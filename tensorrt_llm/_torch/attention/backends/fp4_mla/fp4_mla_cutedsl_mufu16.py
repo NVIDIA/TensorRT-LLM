@@ -939,7 +939,9 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _select_runtime_kv_profile(max_kv_len: int) -> int:
+def _select_runtime_kv_profile(max_kv_len: int, use_smem_page_plan: bool = True) -> int:
+    """The compiled KV profile covering ``max_kv_len``: the shared-memory page-plan profile
+    where it fits and ``use_smem_page_plan``, else a bucketed runtime profile."""
     if type(max_kv_len) is not int:
         raise TypeError(f"max_kv_len must be an int, got {type(max_kv_len).__name__}")
     if max_kv_len <= 0:
@@ -950,7 +952,9 @@ def _select_runtime_kv_profile(max_kv_len: int) -> int:
             f"{max_kv_len} > {SMEM_P4_RUNTIME_MAX_KV}"
         )
     if max_kv_len <= SMEM_P4_PAGE_PLAN_PROFILE_KV:
-        return SMEM_P4_PAGE_PLAN_PROFILE_KV
+        if use_smem_page_plan:
+            return SMEM_P4_PAGE_PLAN_PROFILE_KV
+        max_kv_len = SMEM_P4_PAGE_PLAN_PROFILE_KV + 1
     # Eager execution can report a different batch maximum on every step.
     # Shifted power-of-two buckets bound the number of compiled variants and
     # retain the established 1 Mi-token plus four-page-reserve profile.
@@ -8038,6 +8042,7 @@ def run_trtllm_fp4_mla_decode_page_native(
     num_splits: int = 1,
     plan: torch.Tensor | None = None,
     softmax_stats: torch.Tensor | None = None,
+    use_smem_page_plan: bool = True,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -8075,7 +8080,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         query_len_per_seq != 1 or helix_kv_bounds is None or split_kv_buffers is None
     ):
         raise ValueError("folded queries require split output and per-task causal bounds")
-    physical_k = _select_runtime_kv_profile(max_kv_len)
+    physical_k = _select_runtime_kv_profile(max_kv_len, use_smem_page_plan)
     for name, value in (
         ("assume_valid_k_prefix_tiles", assume_valid_k_prefix_tiles),
         (
@@ -8665,12 +8670,14 @@ def run_trtllm_fp4_mla_decode_packed(
     helix_kv_bounds: torch.Tensor | None = None,
     softmax_stats: torch.Tensor | None = None,
     split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    use_smem_page_plan: bool = True,
 ) -> None:
     """Packed decode: ``q_fp4``/``q_sf`` hold ``num_requests`` entries of
     ``physical_m`` rows ([query token, head] pairs, 128-padded), ``output`` is
     ``[num_requests * num_heads * query_len, 512]``, ``kv_lens`` is per request
     and ``helix_kv_bounds`` (optional) is per query token. ``max_kv_len`` is
-    the per-task KV length the runtime profile must cover. ``num_splits`` sets
+    the per-task KV length the runtime profile must cover; ``use_smem_page_plan``
+    False reads page ids per tile instead of the page-plan profile. ``num_splits`` sets
     the task budget (``num_requests * num_splits`` grid.z slots) that the plan
     kernel (``fp4_mla_packed_reduce.launch_packed_plan``) shares among requests
     in proportion to their KV length; with ``num_splits > 1`` the kernel reads
@@ -8733,6 +8740,7 @@ def run_trtllm_fp4_mla_decode_packed(
         num_splits=num_splits,
         plan=plan,
         softmax_stats=softmax_stats,
+        use_smem_page_plan=use_smem_page_plan,
     )
 
 

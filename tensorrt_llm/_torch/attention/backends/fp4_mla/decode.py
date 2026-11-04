@@ -827,6 +827,7 @@ def _run_cutedsl_packed_decode(
         stats_rows = softmax_stats_tensor.view(num_requests * valid_m, 2)
     common = dict(
         max_kv_len=plan_geometry.split_kv_len,
+        use_smem_page_plan=plan_geometry.use_smem_page_plan,
         sm_scale=sm_scale,
         num_heads=num_heads,
         query_len=query_len,

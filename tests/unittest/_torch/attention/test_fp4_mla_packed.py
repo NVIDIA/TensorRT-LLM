@@ -502,9 +502,10 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
     module = fp4_mla_config._fp4_mla_cutedsl_kernel_module()
     page_plan_kv = module.SMEM_P4_PAGE_PLAN_PROFILE_KV
     assert geometry.profile_tiles == with_bounds.profile_tiles == page_plan_kv // 256
-    assert with_bounds.split_kv_len == 434 * 256
-    assert geometry.split_kv_len == page_plan_kv + 1
-    assert module._select_runtime_kv_profile(geometry.split_kv_len) > page_plan_kv
+    assert geometry.split_kv_len == with_bounds.split_kv_len == 434 * 256
+    assert with_bounds.use_smem_page_plan and not geometry.use_smem_page_plan
+    assert module._select_runtime_kv_profile(geometry.split_kv_len) == page_plan_kv
+    assert module._select_runtime_kv_profile(geometry.split_kv_len, False) > page_plan_kv
     # Too many rows for the packed layout: the legacy path, no geometry.
     assert (
         fp4_mla_packed_plan._fp4_mla_packed_plan_geometry(
