@@ -170,7 +170,11 @@ protected:
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
         if (std::getenv("TLLM_PROFILE_CUSTOM_REGIONS") == nullptr)
         {
-            setenv("TLLM_PROFILE_CUSTOM_REGIONS", "kv", 1);
+#if defined(_WIN32)
+            ASSERT_EQ(_putenv_s("TLLM_PROFILE_CUSTOM_REGIONS", "kv"), 0);
+#else
+            ASSERT_EQ(setenv("TLLM_PROFILE_CUSTOM_REGIONS", "kv", 1), 0);
+#endif
         }
         ASSERT_FALSE(tc::initializeProfiler().has_value());
         if (!tc::customRegionEnabled(tc::ProfilerRegion::kKv))
