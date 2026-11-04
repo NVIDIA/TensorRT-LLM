@@ -618,6 +618,12 @@ class AttentionMetadata:
             helix_owned_new_tokens: Per-sequence count of this step's new
                 tokens owned by this rank (speculative verify groups). None on
                 the single-token path, where the boolean flag carries it.
+
+        Raises:
+            NotImplementedError: If helix_owned_new_tokens is not None. The base
+                hook has no storage for the owned counts; backends that support
+                helix speculative decoding (TrtllmAttentionMetadata) override
+                this hook.
         """
         if helix_owned_new_tokens is not None:
             raise NotImplementedError(
