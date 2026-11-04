@@ -930,6 +930,19 @@ FAST_PATHS: Tuple[FastPath, ...] = (
             "layer0_qkv_table",
         ),
     ),
+    FastPath(
+        "rejection_sampler",
+        "rejection sampling of a one-request decode step fused into the draft-head tail's walk "
+        "and the distributed verify sampler, when the speculative config asks for it",
+        "draft",
+        (
+            "distributed_head_sampler",
+            "drafter_folds",
+            "verify_fold",
+            "path_walk_tail",
+            "draft_head_tail",
+        ),
+    ),
 )
 
 #: The levers of the single-request decode schedule: built for sm107 at TP8 with EP8 (the
@@ -951,6 +964,7 @@ SM107_TEP8_ONLY: FrozenSet[str] = frozenset(
         "drafter_folds",
         "draft_head_tail",
         "step_loop_inline_commits",
+        "rejection_sampler",
     }
 )
 
@@ -1770,6 +1784,8 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
       leaves out ``draft_head_tail``: its key selection and walk rank the untransformed
       logits, so they would not reproduce the transformed selector (``draft_head``'s
       canonical keys and transformed unary values).
+    * A speculative config that does not ask for rejection sampling, or whose request
+      forced acceptance left inert, or one not known, leaves out ``rejection_sampler``.
     """
     arena = deployment.arena
     exclusions: Dict[str, str] = {}
@@ -1824,7 +1840,33 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
             if deployment.draft_logit_transform
             else "the drafter's logit transform is not known"
         )
+    if "rejection_sampler" in served and deployment.rejection_sampling is not True:
+        exclusions["rejection_sampler"] = (
+            "the speculative config does not ask for rejection sampling, or forced acceptance "
+            "leaves it inert"
+            if deployment.rejection_sampling is False
+            else "whether the speculative config asks for rejection sampling is not known"
+        )
     return StructuralRules(exclusions, requires)
+
+
+def rejection_sampling_of(model_config) -> Optional[bool]:
+    """Whether ``model_config``'s speculative config asks for rejection sampling, or None
+    without one.
+
+    Under forced acceptance (``rs_common.forced_mode``) it is False whatever the config says:
+    the fused path never runs under a forced count. Where the forced-acceptance policy
+    applies (``rs_common.policy_applies``), ``routing.route`` has already switched the
+    engine's flag off; elsewhere the engine's own rejection sampling runs.
+    """
+    spec = getattr(model_config, "spec_config", None)
+    if spec is None:
+        return None
+    if not getattr(spec, "use_rejection_sampling", False):
+        return False
+    from .kernels.rs_sampler import rs_common as _rs_common
+
+    return _rs_common.forced_mode() != "inert"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1910,6 +1952,7 @@ def compose(
             engine,
             snapshot,
             draft_logit_transform=_levers.draft_logit_transform_of(draft_model),
+            rejection_sampling=rejection_sampling_of(model_config),
         )
         rules = structural_rules(served.served, deployment)
         table = _levers.resolve(
@@ -1963,6 +2006,7 @@ def table_for(
     max_num_tokens: Optional[int] = None,
     role_source: Optional[str] = None,
     draft_logit_transform: Optional[bool] = None,
+    rejection_sampling: Optional[bool] = None,
 ) -> "_levers.LeverTable":
     """The lever table ``compose`` resolves for a deployment, without a model or a device.
 
@@ -1971,7 +2015,8 @@ def table_for(
     ``levers.PREFIX``); ``facts`` the shared-path facts; ``role_source`` defaults to what
     a served deployment of that role reports (agg servers derive their role, the others
     take the hint); ``draft_logit_transform`` whether the drafter declares a logit transform
-    (None: not known).
+    (None: not known); ``rejection_sampling`` whether the speculative config asks for
+    rejection sampling once forced acceptance has applied (None: not known).
 
     Raises:
         KeyError: for a key no composition serves.
@@ -1994,6 +2039,7 @@ def table_for(
         arena=_levers.Arena(arena),
         facts=facts or _levers.Facts(),
         draft_logit_transform=draft_logit_transform,
+        rejection_sampling=rejection_sampling,
     )
     rules = structural_rules(served, deployment)
     return _levers.resolve(

@@ -247,6 +247,11 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_DR_DRAFT_TAIL": PREFIX + "DRAFT_HEAD_TAIL",
         "MUSESPARK_OPEN_GR_INLINE_COMMIT": PREFIX + "STEP_LOOP_INLINE_COMMITS",
         "MUSESPARK_OPEN_IA_FOLD": PREFIX + "STEP_LOOP_INLINE_COMMITS",
+        # The fused rejection sampler's switches (sm107 TEP8).
+        "MUSESPARK_OPEN_RS_FUSED": PREFIX + "REJECTION_SAMPLER",
+        "MUSESPARK_OPEN_RS_FORCED": (
+            "nothing: forced acceptance always leaves rejection sampling inert"
+        ),
     }
 )
 #: Name prefixes only retired switches carry; any other name under them raises too.
@@ -257,6 +262,9 @@ RETIRED_PREFIXES: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_HEAD_INBOX_": "nothing: the inbox scopes are system-scope",
         "MUSESPARK_OPEN_MEGAKERNEL_": (
             "nothing: the megakernel's build options are fixed in its served build"
+        ),
+        "MUSESPARK_OPEN_RS_": (
+            "nothing: the fused rejection sampler's q, chain and filters are fixed"
         ),
     }
 )
@@ -341,6 +349,10 @@ class Deployment:
     #: Whether the drafter declares a logit transform (``DFlashForCausalLM.logit_multiplier`` /
     #: ``logit_softcap``); None when there is no drafter to read it from.
     draft_logit_transform: Optional[bool] = None
+    #: Whether the speculative config asks for rejection sampling (``use_rejection_sampling``)
+    #: once forced acceptance (``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS``) has left it
+    #: inert; None when there is no speculative config to read it from.
+    rejection_sampling: Optional[bool] = None
 
     def decodes(self) -> bool:
         """Whether this server runs decode steps (an unknown role counts as one that does)."""
@@ -357,10 +369,15 @@ class Deployment:
             if self.draft_logit_transform is None
             else f", drafter logit transform {'declared' if self.draft_logit_transform else 'none'}"
         )
+        rejection = (
+            ""
+            if self.rejection_sampling is None
+            else f", rejection sampling {'on' if self.rejection_sampling else 'off'}"
+        )
         return (
             f"sm{self.sm} tep{self.tp}, {self.role.value} ({self.role_source}), max_batch_size "
             f"{_count(self.max_batch_size)}, max_num_tokens {_count(self.max_num_tokens)}, "
-            f"{self.arena.value} arena{transform}"
+            f"{self.arena.value} arena{transform}{rejection}"
         )
 
     def as_dict(self) -> dict:
@@ -375,6 +392,8 @@ class Deployment:
         }
         if self.draft_logit_transform is not None:
             out["draft_logit_transform"] = self.draft_logit_transform
+        if self.rejection_sampling is not None:
+            out["rejection_sampling"] = self.rejection_sampling
         return out
 
 
@@ -1316,6 +1335,11 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "step_loop_inline_commits": Rule(
             "LL", Kind.BITWISE, _on_single_request("the one-stream step loop's commits")
         ),
+        "rejection_sampler": Rule(
+            "LL",
+            Kind.COMPOSITION,
+            _on_single_request("rejection-sampled one-request decode steps"),
+        ),
     }
 )
 
@@ -1359,6 +1383,7 @@ BAND_LEVERS: Mapping[Band, FrozenSet[str]] = types.MappingProxyType(
                 "drafter_folds",
                 "draft_head_tail",
                 "step_loop_inline_commits",
+                "rejection_sampler",
             }
         ),
         Band.DEFAULT: frozenset(
@@ -1664,12 +1689,15 @@ def deployment_of(
     engine_facts,
     snapshot: Mapping[str, str],
     draft_logit_transform: Optional[bool] = None,
+    rejection_sampling: Optional[bool] = None,
 ) -> Deployment:
     """The ``Deployment`` of a model: its config's mapping, the device, the arena and the engine.
 
     ``engine_facts`` carries ``max_batch_size``, ``max_num_tokens`` and ``disaggregated``
     (``_router_index.DeploymentFacts``), or is None when the target class was built without
-    them. ``draft_logit_transform`` is ``draft_logit_transform_of`` the drafter.
+    them. ``draft_logit_transform`` is ``draft_logit_transform_of`` the drafter;
+    ``rejection_sampling`` whether the speculative config asks for rejection sampling once
+    forced acceptance has applied (``dispatch.rejection_sampling_of``).
 
     Raises:
         ValueError: as ``role_of``.
@@ -1686,6 +1714,7 @@ def deployment_of(
         arena=arena,
         facts=facts_of(snapshot),
         draft_logit_transform=draft_logit_transform,
+        rejection_sampling=rejection_sampling,
     )
 
 

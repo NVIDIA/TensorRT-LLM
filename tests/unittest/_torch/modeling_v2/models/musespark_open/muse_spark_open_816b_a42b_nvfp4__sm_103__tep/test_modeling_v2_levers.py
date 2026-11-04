@@ -281,6 +281,7 @@ SERVED_AT = {
     "drafter_folds": ({(107, 8)}, "lossless-bitwise", "LL"),
     "draft_head_tail": ({(107, 8)}, "lossless-bitwise", "LL"),
     "step_loop_inline_commits": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "rejection_sampler": ({(107, 8)}, "composition", "LL"),
 }
 
 
@@ -403,6 +404,9 @@ SINGLE = {
     "step_loop_inline_commits",
 }
 SINGLE_TAIL = {"draft_head_tail"}
+#: The fused rejection sampler, on in that deployment only where the speculative config asks for
+#: rejection sampling (forced acceptance leaves it inert) and the draft head's tail is on.
+SINGLE_RS = {"rejection_sampler"}
 
 #: The low-latency levers that stand down where one of ``WIDE_STEPS`` is on (by band on
 #: aggregated sm107 TEP4 servers; elsewhere where a knob turns one on): the sliding-window
@@ -871,10 +875,10 @@ def test_the_duplicate_rings_and_context_parts_share_one_configure():
 
 
 def test_the_single_request_set_is_the_sm107_tep8_set():
-    assert SINGLE | SINGLE_TAIL | {"megakernel_zero_exchange_boundary"} == set(
+    assert SINGLE | SINGLE_TAIL | SINGLE_RS | {"megakernel_zero_exchange_boundary"} == set(
         DISPATCH.SM107_TEP8_ONLY
     )
-    assert SINGLE | SINGLE_TAIL <= TARGET_PATHS[(107, 8)].served
+    assert SINGLE | SINGLE_TAIL | SINGLE_RS <= TARGET_PATHS[(107, 8)].served
     assert not DISPATCH.SM107_TEP8_ONLY & (
         TARGET_PATHS[(103, 8)].served | TARGET_PATHS[(103, 4)].served
     )
@@ -932,7 +936,187 @@ def test_the_draft_head_tail_waits_for_a_drafter_without_a_logit_transform(trans
 )
 def test_the_single_request_set_stays_off_outside_its_deployment(key, mbs, role, arena):
     lever_table = table(key, mbs, role, arena, facts=None)
-    assert not rule_levers_on(lever_table) & (SINGLE | SINGLE_TAIL)
+    assert not rule_levers_on(lever_table) & (SINGLE | SINGLE_TAIL | SINGLE_RS)
+    if key in (TARGET_PATHS.keys() - {(103, 4)}):
+        rs_table = DISPATCH.table_for(
+            TARGET_PATHS,
+            *key,
+            mbs,
+            role,
+            arena,
+            draft_logit_transform=False,
+            rejection_sampling=True,
+        )
+        assert not rule_levers_on(rs_table) & (SINGLE | SINGLE_TAIL | SINGLE_RS)
+
+
+def rs_table(key=(107, 8), mbs=1, role="agg", arena="dense", knob_set=None, **facts):
+    """``table_for`` with the drafter-transform and rejection-sampling facts (default: no
+    transform, rejection sampling asked for)."""
+    facts = {"draft_logit_transform": False, "rejection_sampling": True, **facts}
+    return DISPATCH.table_for(TARGET_PATHS, *key, mbs, role, arena, knob_set, None, **facts)
+
+
+@pytest.mark.parametrize(
+    "transform, rejection_sampling, expected",
+    [
+        (False, True, SINGLE_TAIL | SINGLE_RS),
+        (False, False, SINGLE_TAIL),
+        (False, None, SINGLE_TAIL),
+        (True, True, set()),
+        (None, True, set()),
+        (True, False, set()),
+    ],
+    ids=[
+        "asked",
+        "not-asked-or-forced",
+        "unknown",
+        "declared-transform",
+        "unknown-transform",
+        "both-off",
+    ],
+)
+def test_the_rejection_sampler_needs_rejection_sampling_and_the_tail(
+    transform, rejection_sampling, expected
+):
+    lever_table = rs_table(draft_logit_transform=transform, rejection_sampling=rejection_sampling)
+    assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | VR_SINGLE | expected
+    decision = lever_table.decisions["rejection_sampler"]
+    if rejection_sampling is not True:
+        assert decision.source == "structural"
+    elif transform is not False:
+        assert decision.source == "dependency"
+    else:
+        assert decision.source == "auto"
+
+
+def test_the_rejection_sampler_is_the_only_difference_rejection_sampling_makes():
+    for key in sorted(TARGET_PATHS):
+        for mbs in (1, 2, 8, 48):
+            for role in ("agg", "gen", "ctx"):
+                for arena in ("dense", "windowed", "paged"):
+                    for transform in (None, True, False):
+                        tables = [
+                            DISPATCH.table_for(
+                                TARGET_PATHS,
+                                *key,
+                                mbs,
+                                role,
+                                arena,
+                                draft_logit_transform=transform,
+                                rejection_sampling=rejection_sampling,
+                            )
+                            for rejection_sampling in (None, False, True)
+                        ]
+                        on_sets = [rule_levers_on(t) - SINGLE_RS for t in tables]
+                        assert on_sets[0] == on_sets[1] == on_sets[2], (
+                            key,
+                            mbs,
+                            role,
+                            arena,
+                            transform,
+                        )
+                        assert not rule_levers_on(tables[0]) & SINGLE_RS
+                        assert not rule_levers_on(tables[1]) & SINGLE_RS
+
+
+@pytest.mark.parametrize("key", [(103, 8), (103, 4)])
+def test_the_rejection_sampler_is_not_served_on_sm103(key):
+    assert "rejection_sampler" not in TARGET_PATHS[key].served
+    lever_table = rs_table(key)
+    assert "rejection_sampler" not in rule_levers_on(lever_table)
+    with pytest.raises(ValueError, match="does not serve rejection_sampler"):
+        rs_table(key, knob_set=knobs(rejection_sampler="on"))
+
+
+def test_the_rejection_sampler_follows_its_knob():
+    off = rs_table(knob_set=knobs(rejection_sampler="off"))
+    assert rule_levers_on(off) == LL | DENSE | SINGLE | VR_SINGLE | SINGLE_TAIL
+    assert off.decisions["rejection_sampler"].source == "knob"
+    off_tail = rs_table(knob_set=knobs(draft_head_tail="off"))
+    assert rule_levers_on(off_tail) == LL | DENSE | SINGLE | VR_SINGLE
+    assert off_tail.decisions["rejection_sampler"].source == "dependency"
+    with pytest.raises(ValueError, match="builds on distributed_head_sampler, which is off"):
+        rs_table(mbs=2, knob_set=knobs(rejection_sampler="on"))
+    baseline = rs_table(knob_set={**BASELINE})
+    assert "rejection_sampler" not in rule_levers_on(baseline)
+
+
+@pytest.mark.parametrize(
+    "facts, message",
+    [
+        ({"rejection_sampling": False}, "forced acceptance"),
+        ({"rejection_sampling": None}, "is not known"),
+        ({"draft_logit_transform": True}, "builds on draft_head_tail, which is off"),
+    ],
+    ids=["forced-or-not-asked", "unknown", "declared-transform"],
+)
+def test_the_rejection_sampler_on_raises_where_it_cannot_be_on(facts, message):
+    with pytest.raises(ValueError, match=re.escape(message)):
+        rs_table(knob_set=knobs(rejection_sampler="on"), **facts)
+
+
+def test_the_rejection_sampler_beside_the_single_request_yields():
+    lever_table = rs_table()
+    assert lever_table.on("rejection_sampler")
+    assert not rule_levers_on(lever_table) & VR_YIELD_SINGLE
+    # The vocabulary-parallel head conflicts with the distributed sampler RS builds on.
+    with pytest.raises(ValueError, match="cannot both be on"):
+        rs_table(knob_set=knobs(vocab_parallel_head="on"))
+    vocab_parallel = rs_table(
+        knob_set=knobs(vocab_parallel_head="on", distributed_head_sampler="off")
+    )
+    assert vocab_parallel.on("vocab_parallel_head")
+    assert vocab_parallel.decisions["rejection_sampler"].source == "dependency"
+    # The commit launch and the context K/V fork point are other launches: turned on by their
+    # knobs (the default band's levers), RS stays on beside them.
+    for name, knob_set in (
+        ("step_commit_v2", knobs(step_commit_v2="on")),
+        ("step_commit_v2", knobs(step_loop_inline_commits="off", step_commit_v2="on")),
+        ("drafter_kv_fork_before_head", knobs(drafter_kv_fork_before_head="on")),
+        (
+            "drafter_kv_fork_before_head",
+            knobs(context_kv_fork_last_layer="off", drafter_kv_fork_before_head="on"),
+        ),
+    ):
+        beside = rs_table(knob_set=knob_set)
+        assert beside.on(name) and beside.on("rejection_sampler"), knob_set
+
+
+def test_the_deployment_reports_rejection_sampling():
+    deployment = rs_table().deployment
+    assert deployment.rejection_sampling is True
+    assert deployment.as_dict()["rejection_sampling"] is True
+    assert deployment.describe().endswith("drafter logit transform none, rejection sampling on")
+    unknown = table((107, 8), 1, "agg", "dense").deployment
+    assert "rejection_sampling" not in unknown.as_dict()
+    assert "rejection sampling" not in unknown.describe()
+
+
+@pytest.mark.parametrize(
+    "spec, forced, expected",
+    [
+        (None, "off", None),
+        (types.SimpleNamespace(use_rejection_sampling=False), "inert", False),
+        (types.SimpleNamespace(use_rejection_sampling=True), "off", True),
+        (types.SimpleNamespace(use_rejection_sampling=True), "inert", False),
+        (types.SimpleNamespace(), "off", False),
+    ],
+    ids=["no-spec-config", "not-asked", "asked", "asked-forced", "no-flag"],
+)
+def test_rejection_sampling_of_a_model_config(monkeypatch, spec, forced, expected):
+    rs_common = types.ModuleType(f"{_PACKAGE}.kernels.rs_sampler.rs_common")
+    rs_common.forced_mode = lambda: forced
+    rs_sampler = types.ModuleType(f"{_PACKAGE}.kernels.rs_sampler")
+    rs_sampler.__path__ = []
+    rs_sampler.rs_common = rs_common
+    kernels = types.ModuleType(f"{_PACKAGE}.kernels")
+    kernels.__path__ = []
+    kernels.rs_sampler = rs_sampler
+    for module in (kernels, rs_sampler, rs_common):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    model_config = types.SimpleNamespace(spec_config=spec)
+    assert DISPATCH.rejection_sampling_of(model_config) is expected
 
 
 def test_the_numerics_levers_are_switchable_and_the_megakernel_needs_them():
@@ -1696,6 +1880,8 @@ SPEC_RETIRED = (
     "MUSESPARK_OPEN_DR_DRAFT_TAIL",
     "MUSESPARK_OPEN_GR_INLINE_COMMIT",
     "MUSESPARK_OPEN_IA_FOLD",
+    "MUSESPARK_OPEN_RS_FUSED",
+    "MUSESPARK_OPEN_RS_FORCED",
 )
 
 
@@ -1706,7 +1892,11 @@ def test_retired_is_the_spec_list():
 @pytest.mark.parametrize(
     "name",
     sorted(SPEC_RETIRED)
-    + ["MUSESPARK_OPEN_PS_ANYTHING_ELSE", "MUSESPARK_OPEN_MEGAKERNEL_ANYTHING_ELSE"],
+    + [
+        "MUSESPARK_OPEN_PS_ANYTHING_ELSE",
+        "MUSESPARK_OPEN_MEGAKERNEL_ANYTHING_ELSE",
+        "MUSESPARK_OPEN_RS_Q_TRANSFORM",
+    ],
 )
 def test_a_retired_switch_raises_naming_its_replacement(name):
     replacement = LEVERS.retired_replacement(name)

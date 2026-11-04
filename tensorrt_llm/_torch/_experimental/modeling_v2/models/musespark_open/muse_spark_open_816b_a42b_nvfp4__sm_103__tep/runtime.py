@@ -74,6 +74,7 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
+from .kernels.rs_sampler import rs as _rs
 from .ops.runtime import overlap_offsets as _ia
 from .ops.runtime import step_commit as _sc
 
@@ -221,8 +222,12 @@ class _PrepareStager:
         spec_metadata: Any,
         blocks_memo: Optional[_BlockOffsetsMemo] = None,
         plan: Any = None,
+        stages_batch_slot_ids: bool = False,
     ):
         self.staging = staging
+        #: Whether ``copy`` takes the slot-id table upload (``StepInputStager``): with the
+        #: ``rejection_sampler`` fast path installed (``rs.installed``).
+        self.stages_batch_slot_ids = stages_batch_slot_ids
         self.counts = counts
         #: When set, ``block_offsets`` re-copies only the changed columns (``_BlockOffsetsMemo``).
         self.blocks_memo = blocks_memo
@@ -769,7 +774,13 @@ class StepInputStaging:
             The window, already set as ``step_input_stager`` on the runner and
             both metadata objects; or None when ``ineligible`` names a reason
             (logged once per reason).
+
+        First, on every forward: ``rs.on_step`` (the fused rejection-sampling
+        counters and warnings, or the forced-acceptance guard; nothing when
+        neither is active). The window takes the slot-id table upload only with
+        the fused rejection sampling installed.
         """
+        _rs.on_step(runner, requests, spec_metadata, is_dummy)
         reason = self.ineligible(
             runner,
             requests,
@@ -812,6 +823,7 @@ class StepInputStaging:
             spec_metadata,
             self.blocks_memo,
             self.plan,
+            stages_batch_slot_ids=_rs.installed(),
         )
 
 

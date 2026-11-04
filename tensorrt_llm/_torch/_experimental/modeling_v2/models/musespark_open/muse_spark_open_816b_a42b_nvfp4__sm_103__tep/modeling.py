@@ -418,6 +418,16 @@ context-K/V fork's head fork point right after that GEMM); ``wide_split_sampler`
 sampler takes on the shipped sampler's 512-thread block (``target_head.widen``);
 ``vocab_parallel_head`` (tep4 on sm_103 and sm_107, tep8 on sm_107) samples and argmaxes decode steps of
 16 rows or more from each rank's own vocabulary shard, without the logits all-gather.
+
+``rejection_sampler`` (``kernels/rs_sampler``) is installed last among the head
+paths, after ``distributed_head_sampler``, and only when the model's
+speculative config asks for rejection sampling (``use_rejection_sampling``, as
+the forced-acceptance policy left it: under forced acceptance it is off, and
+the step is the greedy one). The verify sampler's fabric then also holds its
+candidate and digest areas; the draft-head walk draws each draft from the
+drafter's distribution over its candidates, and the distributed verify sampler
+runs the acceptance test against it. Every other step takes the built-in
+rejection path.
 """
 
 from __future__ import annotations
@@ -1938,6 +1948,8 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         to load before its wait behind the sampler's early release, and the
         interleaved LM-head copy and the sampler-state exchange attach to the
         head after ``split_sampler``.
+        ``rejection_sampler`` goes right after that exchange, which sizes its
+        fabric for it, when the speculative config asks for rejection sampling.
         ``drafter_window_compact`` (or ``step_window_compact``) goes last: it
         re-classes the worker as a class derived from the one every other path
         left, and on a repeated call sees its own class through ``isinstance``.

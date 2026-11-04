@@ -15,8 +15,20 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
 
     Each install is idempotent, logs only what it changed, raises ``ValueError``
     for a fast path of the plan it cannot install, and imports its module only
-    when the plan has it.
+    when the plan has it. ``rejection_sampler`` installs only when the model's
+    speculative config asks for rejection sampling, and an install it refuses
+    leaves the built-in rejection path (one warning, on every rank alike).
+
+    First, under forced acceptance on a deployment the policy applies to (sm107
+    TP8 with ``rejection_sampler`` not turned off), the model's speculative config
+    is checked to have rejection sampling off (``rs_common.apply_forced_policy``;
+    the route switched the engine's config off before the model was built),
+    before every install reads it. Elsewhere it is left as it is.
     """
+    from .kernels.rs_sampler import rs_common as _rs_common
+
+    table = getattr(plan, "levers", None)
+    _rs_common.apply_forced_policy(shell, table.deployment if table is not None else None)
     block_conv = plan.enabled("drafter_block_conv")
     block_decode = plan.enabled("drafter_block_decode")
     if block_conv or block_decode:
@@ -159,7 +171,19 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             # exchange. After the head (it attaches to it). Collective.
             from .kernels.s2_sampler import sampler as _s2_sampler
 
-            _s2_sampler.install(shell.llm, shell._mapping)
+            # rejection_sampler: whether the speculative config asks for rejection sampling (as
+            # the forced-acceptance policy above left it) and the forced mode, agreed by the s2
+            # install's refusal before it sizes the fabric (with the RS areas when it does).
+            rs_facts = None
+            if plan.enabled("rejection_sampler"):
+                from .kernels.rs_sampler import rs as _rs_sampler
+
+                rs_facts = _rs_sampler.agreement_facts(shell.llm)
+            _s2_sampler.install(shell.llm, shell._mapping, rs_facts=rs_facts)
+            if rs_facts is not None and rs_facts[0]:
+                # rejection_sampler: fused rejection sampling on the s2 head and the draft
+                # head tail's walk. After s2 (whose fabric holds its areas). Collective.
+                _rs_sampler.install(shell.llm, shell._mapping)
         if plan.enabled("wide_split_sampler"):
             _target_head.widen(shell.llm)
     if drafter_folds:

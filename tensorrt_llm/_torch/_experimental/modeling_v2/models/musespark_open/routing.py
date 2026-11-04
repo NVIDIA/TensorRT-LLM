@@ -19,9 +19,17 @@ deployment runs is the target's own decision at construction
 tensor-parallel size when the GPU topology and the speculative decoding mode
 are the ones the compositions are written for, and the built-in forward
 through the target otherwise. So
-``route`` reads neither the speculative-decoding config nor the GPUs per node
+``route`` decides on neither the speculative-decoding config nor the GPUs per node
 (launcher state: the visible devices, or the tensor-parallel size under Ray),
 and a deployment the target serves without fast paths still lands here.
+
+When it returns the target, ``route`` applies the target's forced-acceptance
+policy to the speculative config (``rs_common.apply_forced_policy_to_spec_config``:
+under ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` rejection sampling is off on
+sm107 TP8, where the ``rejection_sampler`` fast path is built, unless that lever is
+turned off; ``rs_common.policy_applies``). It is the engine's own config object,
+and this is the one point the target sees it before the model loader deep-copies
+the model config for the model. Elsewhere the config is left as it is.
 
 The quantization is not a criterion either: the open-format translation drops
 the inline ``quantization_config`` (``hf_quant_config.json`` is the one copy the
@@ -88,9 +96,14 @@ def route(
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    ``spec_config`` is part of the routing signature and is not read here (see the
-    module docstring). The target is imported where it is returned, so declining
-    costs no import of modeling code.
+    ``spec_config`` does not take part in the decision (see the module docstring);
+    when the target is returned, its forced-acceptance policy is applied to it
+    (on sm107 TP8 only).
+    The target is imported where it is returned, so declining costs no import of
+    modeling code.
+
+    Raises:
+        NoTarget: the deployment is not the target's.
     """
     # A config without one of these fields is another assembly: it reads as None
     # and the shape does not match.
@@ -118,5 +131,10 @@ def route(
     from .muse_spark_open_816b_a42b_nvfp4__sm_103__tep.modeling import ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
     # isort: on
     # fmt: on
+    from .muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.rs_sampler import rs_common
 
+    major, minor = compute_capability
+    rs_common.apply_forced_policy_to_spec_config(
+        spec_config, 10 * int(major) + int(minor), mapping.tp_size
+    )
     return ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
