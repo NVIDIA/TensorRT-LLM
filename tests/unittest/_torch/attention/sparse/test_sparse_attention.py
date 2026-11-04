@@ -36,6 +36,7 @@ from tensorrt_llm._torch.attention.backends.sparse.hooks import (
     MLASparseHooks,
     get_sparse_attention_hooks,
     get_sparse_mla_hooks,
+    has_sparse_mla_hooks,
     prepare_sparse_runtime_params,
     register_attention_sparse_hooks,
     register_mla_sparse_hooks,
@@ -99,6 +100,12 @@ def test_sparse_attn_hook_registration() -> None:
     hook_module = ModuleType("sparse_attn_hook_registration")
     hook_module.sparse_params = _StubSparseParams()
 
+    assert not has_sparse_mla_hooks(None)
+    assert not has_sparse_mla_hooks("skip_softmax")
+    assert not has_sparse_mla_hooks("unregistered_mla_algorithm")
+    assert has_sparse_mla_hooks("dsa")
+    assert has_sparse_mla_hooks("deepseek_v4")
+
     hook_module.sparse_params.algorithm = "dsa"
     dsa_hooks = get_sparse_mla_hooks(hook_module)
     assert isinstance(dsa_hooks, MLASparseHooks)
@@ -118,6 +125,7 @@ def test_sparse_attn_hook_registration() -> None:
     assert get_sparse_mla_hooks(hook_module) is None
 
     register_mla_sparse_hooks("test_mla_hooks", type(dsa_hooks))
+    assert has_sparse_mla_hooks("test_mla_hooks")
     hook_module.sparse_params.algorithm = "test_mla_hooks"
     assert isinstance(get_sparse_mla_hooks(hook_module), type(dsa_hooks))
     assert get_sparse_mla_hooks(hook_module) is not get_sparse_mla_hooks(hook_module)
