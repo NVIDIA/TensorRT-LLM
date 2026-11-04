@@ -89,7 +89,7 @@ from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
 from .gpu_keepalive import GpuKeepalive
-from .guided_decoder import GuidedDecoder
+from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import (HangDetector, all_ranks_crashed,
@@ -387,6 +387,11 @@ class BatchState:
     gpu_forward_start_event: Optional[torch.cuda.Event] = None
     gpu_forward_end_event: Optional[torch.cuda.Event] = None
     gpu_forward_events_from_perf_pool: bool = False
+    # Number of the batch this forward handed to the capturable guided
+    # decoder (CapturableGuidedDecoder.last_added_batch_id), None without
+    # one. Bounds the guided decoding failures consumed once the batch's
+    # sampler event has been synchronized.
+    guided_batch_id: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -434,6 +439,7 @@ class PyExecutor:
         max_total_draft_tokens: int = 0,
         kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
         guided_decoder: Optional[GuidedDecoder] = None,
+        capturable_guided_decoder: Optional[CapturableGuidedDecoder] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
         start_worker: bool = True,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
@@ -561,6 +567,10 @@ class PyExecutor:
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
+        # The decoder installed in the model engine for one-model speculative
+        # decoding. Its build runs as CUDA host functions, so the executor
+        # collects its failures with _handle_capturable_guided_decoder_errors.
+        self.capturable_guided_decoder = capturable_guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
@@ -3381,6 +3391,7 @@ class PyExecutor:
                         gpu_forward_end_event=gpu_forward_end,
                         gpu_forward_events_from_perf_pool=
                         gpu_forward_events_from_perf_pool,
+                        guided_batch_id=self._capturable_guided_batch_id(),
                         microbatch_id=microbatch_id,
                     )
 
@@ -3897,6 +3908,8 @@ class PyExecutor:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
                 self._flush_pending_transfer_responses()
+                self._handle_capturable_guided_decoder_errors(
+                    scheduled_requests, executed_batch.guided_batch_id)
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
@@ -5043,6 +5056,7 @@ class PyExecutor:
                             if self.dwdp_manager is not None:
                                 self.dwdp_manager.prefetch_first_layers()
                             batch_outputs = self._forward_step(scheduled_batch)
+                            guided_batch_id = self._capturable_guided_batch_id()
 
                         # None: _forward_step hit an exception and
                         # _handle_errors already failed the affected requests
@@ -5105,6 +5119,8 @@ class PyExecutor:
                                 scheduled_batch)
                         self._send_kv_async(scheduled_batch.all_requests())
 
+                        self._handle_capturable_guided_decoder_errors(
+                            scheduled_batch, guided_batch_id)
                         self._handle_canceled_requests()
                         finished_requests = self._handle_responses()
                         # Complete ctx send sessions AFTER responses are created so
@@ -6083,7 +6099,8 @@ class PyExecutor:
                         gpu_forward_start_event=gpu_forward_start,
                         gpu_forward_end_event=gpu_forward_end,
                         gpu_forward_events_from_perf_pool=
-                        gpu_forward_events_from_perf_pool)
+                        gpu_forward_events_from_perf_pool,
+                        guided_batch_id=self._capturable_guided_batch_id())
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
@@ -6117,6 +6134,11 @@ class PyExecutor:
         # count, and the write is enqueued on execution_stream before close()
         # records the page release that eviction and reuse wait on.
         self._update_v2_generation_resources(scheduled_requests)
+        # The batch's sampler event was synchronized in _update_requests, so
+        # every guided decoding failure of the batch has been reported; fail
+        # those requests before their responses are built.
+        self._handle_capturable_guided_decoder_errors(
+            scheduled_requests, self.previous_batch.guided_batch_id)
         self._handle_canceled_requests()
         # Skip iter-1 emission when `_emit_first_token_responses` already
         # handled it.
@@ -9683,7 +9705,7 @@ class PyExecutor:
         """Handle errors that occurred during guided decoding.
 
         Args:
-            scheduled_batch: The current batch of scheduled requests
+            scheduled_batch: The batch the failed requests belong to
             failed_requests: List of (request_id, error_message) tuples for failed requests,
                            or None if no failures occurred
         """
@@ -9693,9 +9715,44 @@ class PyExecutor:
         failed_req_id_to_err = {req_id: err for req_id, err in failed_requests}
 
         for request in scheduled_batch.all_requests():
-            if request.py_request_id not in failed_req_id_to_err:
+            error_msg = failed_req_id_to_err.pop(request.py_request_id, None)
+            if error_msg is None:
                 continue
-            error_msg = failed_req_id_to_err[request.py_request_id]
             self._handle_errors(error_msg,
                                 requests=[request],
                                 charge_budget=False)
+        for req_id, error_msg in failed_req_id_to_err.items():
+            logger.warning(
+                f"Guided decoding failure of request {req_id} has no request in its batch: {error_msg}"
+            )
+
+    def _capturable_guided_batch_id(self) -> Optional[int]:
+        """Number of the batch last handed to the capturable guided decoder; None without one."""
+        decoder = self.capturable_guided_decoder
+        return None if decoder is None else decoder.last_added_batch_id
+
+    def _handle_capturable_guided_decoder_errors(
+            self, scheduled_requests: ScheduledRequests,
+            completed_batch_id: Optional[int]) -> None:
+        """Fail the requests whose capturable guided decoding failed in a completed batch.
+
+        CapturableGuidedDecoder (one-model speculative decoding) runs its
+        build as CUDA host functions, which report failures through a queue
+        on the decoder. Call this for a batch after _update_requests has
+        synchronized on its sampler event and before its responses are
+        handled: the failures of that batch and of earlier ones are complete
+        by then, later ones stay queued, so every rank fails a request in the
+        same iteration and before any response for that step.
+
+        Args:
+            scheduled_requests: The completed batch
+            completed_batch_id: Its number from
+                CapturableGuidedDecoder.last_added_batch_id, recorded after
+                its forward; None when the batch had no such decoder
+        """
+        decoder = self.capturable_guided_decoder
+        if decoder is None or completed_batch_id is None:
+            return
+        self._handle_guided_decoder_errors(
+            scheduled_requests,
+            decoder.take_failed_requests(completed_batch_id))

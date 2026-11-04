@@ -20,6 +20,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import guided_decoder as guided_decoder_module
 from tensorrt_llm._torch.pyexecutor.guided_decoder import (
+    CapturableGuidedDecoder,
     GuidedDecoder,
     GuidedRequest,
     GuidedRequests,
@@ -332,3 +333,127 @@ def test_disagg_init_failure_is_skipped_by_rollback(monkeypatch):
     decoder._rollback_draft_tokens(requests)
 
     assert decoder.grammar_matchers[0] is None
+
+
+# --- capturable decoder: failures travel through the host functions ------------
+
+
+def _make_capturable_decoder(monkeypatch, max_num_draft_tokens: int) -> CapturableGuidedDecoder:
+    monkeypatch.setattr(
+        guided_decoder_module, "XGrammarMatcherFactory", lambda *args, **kwargs: None
+    )
+    # The constructor forces the eager torch.compile stance process-wide; keep
+    # the test process unchanged.
+    monkeypatch.setattr(torch.compiler, "set_stance", lambda *args, **kwargs: None)
+    return CapturableGuidedDecoder(
+        GuidedDecodingConfig(),
+        max_num_sequences=4,
+        vocab_size_padded=_VOCAB_SIZE,
+        max_num_draft_tokens=max_num_draft_tokens,
+    )
+
+
+def _run_capturable_step(
+    decoder: CapturableGuidedDecoder, requests: GuidedRequests
+) -> torch.Tensor:
+    """Hand `requests` to the host functions like add_batch does and run one target step."""
+    decoder.requests = requests
+    decoder._hand_over_batch(has_new_tokens=False)
+    logits = torch.zeros(requests.num_bitmask_tokens, _VOCAB_SIZE, device="cuda")
+    decoder.execute(logits)
+    torch.cuda.synchronize()
+    return logits
+
+
+# The CUDA driver runs the host functions on a thread of its own, which the
+# threading module registers as a dummy thread and the leak check would report.
+_runs_host_functions = pytest.mark.threadleak(enabled=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@_runs_host_functions
+def test_capturable_disagg_init_failure_reaches_the_host(monkeypatch):
+    """The build host function hands the failed request back, tagged with its batch.
+
+    `build` runs as a CUDA host function whose return value is lost, so the
+    failure comes back through `take_failed_requests`, which releases it only
+    once the executor reports that batch as complete. The other request of
+    the batch gets its matcher and its logits row is masked, and a healthy
+    request scheduled into the failed slot afterwards is guided as usual.
+    """
+    decoder = _make_capturable_decoder(monkeypatch, max_num_draft_tokens=0)
+    decoder.grammar_matcher_factory = _MatcherFactory()
+    requests = GuidedRequests(
+        [
+            _disagg_generation_request(_INVALID_PARAMS, request_id=7, seq_slot=0),
+            _disagg_generation_request(_GUIDED_PARAMS, request_id=8, seq_slot=1),
+        ],
+        num_contexts=0,
+        num_generations=2,
+        max_num_draft_tokens=0,
+    )
+
+    logits = _run_capturable_step(decoder, requests)
+
+    batch_id = decoder.last_added_batch_id
+    assert batch_id == 1
+    # Not released before the executor has synchronized on this batch.
+    assert decoder.take_failed_requests(batch_id - 1) == []
+    failed_requests = decoder.take_failed_requests(batch_id)
+    assert [req_id for req_id, _ in failed_requests] == [7]
+    assert "matcher compile error" in failed_requests[0][1]
+    assert decoder.grammar_matchers[0] is None
+    assert decoder.grammar_matchers[1] is not None
+    # Request 7 stays unguided; request 8 only allows the scripted token 0.
+    assert torch.all(logits[0] == 0)
+    assert logits[1, 0] == 0
+    assert torch.all(logits[1, 1:] < -1e30)
+    # Reported once.
+    assert decoder.take_failed_requests(batch_id) == []
+
+    # The next batch reuses the failed slot for a healthy request while
+    # request 8 continues: both rows are masked and nothing is reported.
+    next_requests = GuidedRequests(
+        [
+            _disagg_generation_request(_GUIDED_PARAMS, request_id=9, seq_slot=0),
+            _generation_request(is_draft=False, draft_tokens=[], request_id=8, seq_slot=1),
+        ],
+        num_contexts=0,
+        num_generations=2,
+        max_num_draft_tokens=0,
+    )
+    next_logits = _run_capturable_step(decoder, next_requests)
+
+    assert decoder.take_failed_requests(decoder.last_added_batch_id) == []
+    assert decoder.grammar_matchers[0] is not None
+    assert torch.all(next_logits[:, 0] == 0)
+    assert torch.all(next_logits[:, 1:] < -1e30)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@_runs_host_functions
+def test_capturable_failures_are_released_per_batch(monkeypatch):
+    """A later batch's failure stays queued until that batch is reported complete."""
+    decoder = _make_capturable_decoder(monkeypatch, max_num_draft_tokens=0)
+    decoder.grammar_matcher_factory = _MatcherFactory()
+    first = GuidedRequests(
+        [_disagg_generation_request(_INVALID_PARAMS, request_id=7, seq_slot=0)],
+        num_contexts=0,
+        num_generations=1,
+        max_num_draft_tokens=0,
+    )
+    second = GuidedRequests(
+        [_disagg_generation_request(_INVALID_PARAMS, request_id=9, seq_slot=1)],
+        num_contexts=0,
+        num_generations=1,
+        max_num_draft_tokens=0,
+    )
+
+    _run_capturable_step(decoder, first)
+    _run_capturable_step(decoder, second)
+
+    assert decoder.last_added_batch_id == 2
+    assert [req_id for req_id, _ in decoder.take_failed_requests(1)] == [7]
+    assert decoder.take_failed_requests(1) == []
+    assert [req_id for req_id, _ in decoder.take_failed_requests(2)] == [9]
+    assert decoder.take_failed_requests(2) == []

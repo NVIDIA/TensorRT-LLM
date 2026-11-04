@@ -106,6 +106,7 @@ def _loop_executor(monkeypatch):
     executor.kv_cache_transceiver = None
     executor.kv_connector_manager = None
     executor.guided_decoder = None
+    executor.capturable_guided_decoder = None
     executor.drafter = None
     executor.dwdp_manager = None
     executor.speculation_gate = None

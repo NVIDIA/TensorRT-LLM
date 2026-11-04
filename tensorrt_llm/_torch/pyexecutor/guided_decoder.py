@@ -3,7 +3,7 @@
 
 import math
 from dataclasses import dataclass
-from queue import Queue
+from queue import Empty, Queue
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -113,6 +113,9 @@ class GuidedRequests:
     num_contexts: int
     num_generations: int
     max_num_draft_tokens: int
+    # Number given by CapturableGuidedDecoder.add_batch to the batch it hands
+    # to its host functions; 0 for a batch that never went through it.
+    batch_id: int = 0
 
     @classmethod
     def from_scheduled_requests(cls,
@@ -532,6 +535,13 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None
         self.queue = Queue()
+        # The batches handed over through self.queue are numbered on the
+        # host thread (GuidedRequests.batch_id), and the build host function
+        # tags the failures it reports with that number; see
+        # take_failed_requests.
+        self._num_added_batches: int = 0
+        self._failed_requests_queue: Queue = Queue()
+        self._pending_failed_requests: List[Tuple[int, int, str]] = []
 
         self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
                                       self.max_num_sequences,
@@ -581,9 +591,15 @@ class CapturableGuidedDecoder(GuidedDecoder):
             scheduled_requests, num_draft_tokens)
         if new_tokens is not None:
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
-        self.queue.put((self.requests, new_tokens is not None))
+        self._hand_over_batch(has_new_tokens=new_tokens is not None)
         # self.token_event.record() should be called inside CUDA graph capturing;
         # currently, it is in DecoderInputPreparer.preprocess_inputs.
+
+    def _hand_over_batch(self, has_new_tokens: bool) -> None:
+        """Queue self.requests for the host functions under the next batch number."""
+        self._num_added_batches += 1
+        self.requests.batch_id = self._num_added_batches
+        self.queue.put((self.requests, has_new_tokens))
 
     @hostfunc
     def fetch_batch(self) -> None:
@@ -602,17 +618,57 @@ class CapturableGuidedDecoder(GuidedDecoder):
                                                                )
 
     @hostfunc
-    def build(self) -> List[Tuple[int, str]]:
-        return self._build(self.requests_hostfunc)
+    def build(self) -> None:
+        requests = self.requests_hostfunc
+        for request_id, error_msg in self._build(requests):
+            self._failed_requests_queue.put(
+                (requests.batch_id, request_id, error_msg))
+
+    @property
+    def last_added_batch_id(self) -> int:
+        """Number of the batch most recently handed over by add_batch; 0 before the first."""
+        return self._num_added_batches
+
+    def take_failed_requests(self,
+                             completed_batch_id: int) -> List[Tuple[int, str]]:
+        """Return and clear the failures of the batches up to completed_batch_id.
+
+        Called by the executor on the main thread once it has synchronized
+        on the sampler event of that batch. The event is recorded after the
+        batch's host functions on the same stream, so their failures have
+        been queued by then. Failures of later batches stay pending: their
+        host functions may still be running, and consuming them now would
+        make the iteration in which a request fails depend on GPU progress,
+        which differs between ranks.
+        """
+        pending = self._pending_failed_requests
+        while True:
+            try:
+                pending.append(self._failed_requests_queue.get_nowait())
+            except Empty:
+                break
+        taken = [(request_id, error_msg)
+                 for batch_id, request_id, error_msg in pending
+                 if batch_id <= completed_batch_id]
+        self._pending_failed_requests = [
+            failure for failure in pending if failure[0] > completed_batch_id
+        ]
+        return taken
 
     def execute(self,
                 logits: torch.Tensor,
-                d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
+                d2t: Optional[torch.Tensor] = None) -> None:
+        """Enqueue the guided decoding of one target step.
+
+        Unlike GuidedDecoder.execute, this returns no failed requests: the
+        build runs as a host function, and the executor collects its
+        failures with take_failed_requests.
+        """
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_batch()
             self.init_disagg_gen_requests()
-            failed_requests = self.build()
+            self.build()
             self.copy_bitmask()
             self.bitmask_event.record()
 
@@ -620,7 +676,6 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self.apply_bitmask(logits, d2t=d2t)
 
         self._drain_host_functions()
-        return failed_requests
 
     @hostfunc
     def rollback_rejected_tokens(self) -> None:
@@ -730,13 +785,14 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def execute_draft_batch(self,
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
-                            draft_step: int = 0) -> List[Tuple[int, str]]:
+                            draft_step: int = 0) -> None:
+        """Enqueue the guided decoding of one draft step; see execute."""
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)
             if draft_step == 0:
                 self.rollback_rejected_tokens()
-            failed_requests = self.build()
+            self.build()
             if draft_step == self.max_num_draft_tokens - 1:
                 self.rollback_draft_tokens()
             # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
@@ -750,4 +806,3 @@ class CapturableGuidedDecoder(GuidedDecoder):
                            num_bitmask_tokens=len(self.requests))
 
         self._drain_host_functions()
-        return failed_requests

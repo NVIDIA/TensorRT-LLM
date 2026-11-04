@@ -64,7 +64,7 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
-from .guided_decoder import GuidedDecoder
+from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
@@ -4136,6 +4136,7 @@ def create_py_executor_instance(
     sampler,
     drafter,
     guided_decoder: Optional[GuidedDecoder] = None,
+    capturable_guided_decoder: Optional[CapturableGuidedDecoder] = None,
     lora_config: Optional[LoraConfig] = None,
     garbage_collection_gen0_threshold: Optional[int] = None,
     kv_connector_manager: Optional[KvCacheConnectorManager] = None,
@@ -4545,6 +4546,7 @@ def create_py_executor_instance(
                                 1) if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
+        capturable_guided_decoder=capturable_guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
