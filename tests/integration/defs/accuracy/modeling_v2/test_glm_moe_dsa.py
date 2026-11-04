@@ -304,10 +304,7 @@ class TestModelingV2Glm52Nvfp4Sm103Tp8(LlmapiAccuracyTestHarness):
         )
 
     def _evaluate(self, **llm_kwargs) -> None:
-        with (
-            scoped_env_overrides(llm_kwargs["env_overrides"]),
-            LLM(self.MODEL_PATH, **llm_kwargs) as llm,
-        ):
+        with LLM(self.MODEL_PATH, **llm_kwargs) as llm:
             GSM8K(self.MODEL_NAME).evaluate(llm)
 
     @skip_not_sm103
