@@ -12,15 +12,21 @@ from fastapi.responses import JSONResponse, Response
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor.postproc_worker import PostprocArgs
+from tensorrt_llm.llmapi import SchedulingParams
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve._base.errors import error_body
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request)
+    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    validate_subagent_affinity)
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.perf_metrics import build_request_metrics_record
 from tensorrt_llm.serve.postprocess_handlers import PostprocStrategy
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 
 
@@ -209,6 +215,16 @@ class GenerateBaseServing(BaseServing):
         postproc_args.spec_decode_num_spec_tokens = getattr(
             self, "_spec_decode_num_spec_tokens", None)
 
+    def _get_scheduling_params(
+            self, request: ChatCompletionRequest,
+            raw_request: Optional[Request]) -> SchedulingParams:
+        return SchedulingParams(
+            agent_hierarchy=request.agent_hierarchy,
+            subagent_affinity_id=validate_subagent_affinity(
+                getattr(self, "_internal_disagg_auth_key", None), request,
+                getattr(self, "server_role", None),
+                None if raw_request is None else raw_request.headers))
+
 
 def _record_generator_termination(generator) -> None:
     """Classify a fatal generator error without exposing exception details."""
@@ -230,3 +246,33 @@ def _record_generator_termination(generator) -> None:
             exit_code_known=False
             if termination_kind == "worker_failure" else None,
         ))
+
+
+def _configure_parser_special_token_decoding(
+        sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
+        tool_parser_name: Optional[str], has_tools: bool) -> None:
+    """Configure detokenization for parsers that consume special tokens."""
+    needs_compact_special_tokens = False
+    if reasoning_parser_name and ReasoningParserFactory.needs_raw_special_tokens(
+            reasoning_parser_name):
+        # Unlike the tool-parser flag below, this applies to every chat
+        # request: reasoning delimiters are special tokens regardless of
+        # whether tools are attached.
+        sampling_params.skip_special_tokens = False
+        needs_compact_special_tokens = reasoning_parser_name.lower(
+        ) == "kimi_k3"
+
+    if tool_parser_name and has_tools:
+        tool_parser_cls = ToolParserFactory.parsers.get(
+            tool_parser_name.lower())
+        if tool_parser_cls and getattr(tool_parser_cls,
+                                       'needs_raw_special_tokens', False):
+            sampling_params.skip_special_tokens = False
+            needs_compact_special_tokens |= tool_parser_name.lower(
+            ) == "kimi_k3"
+
+    if needs_compact_special_tokens:
+        # K3 XTML places ordinary-text tag names directly between special
+        # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
+        # changes the protocol and prevents the K3 parsers from matching it.
+        sampling_params.spaces_between_special_tokens = False

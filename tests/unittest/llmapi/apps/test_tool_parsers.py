@@ -5434,7 +5434,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_no_strict_tools_returns_none(self):
         """Should return None when no tool has strict=True."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = [
@@ -5454,7 +5454,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_strict_false_returns_none(self):
         """Should return None when all tools have strict=False."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = [
@@ -5475,7 +5475,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_no_tools_returns_none(self):
         """Should return None when tools list is empty or None."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         assert _build_tool_strict_guided_decoding_params(None, "qwen3") is None
@@ -5483,7 +5483,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_no_parser_returns_none(self):
         """Should return None when no tool parser is provided."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = [
@@ -5504,7 +5504,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_strict_tool_with_qwen3_parser(self):
         """Should build GuidedDecodingParams with structural_tag for Qwen3."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = [
@@ -5544,7 +5544,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_mixed_strict_and_non_strict(self):
         """Should constrain strict tools and allow any text for non-strict."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = [
@@ -5593,7 +5593,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_unsupported_parser_returns_none(self):
         """Should return None for parsers that don't support structural tags."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = [
@@ -5615,7 +5615,7 @@ class TestBuildToolStrictGuidedDecoding:
 
     def test_strict_tool_with_deepseek_parser(self):
         """Should build GuidedDecodingParams with structural_tag for DeepSeek."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = [
@@ -5706,7 +5706,7 @@ class TestBuildForcedToolCallDecoding:
         to the function's ``parameters`` JSON Schema.
         """
         from tensorrt_llm.sampling_params import GuidedDecodingParams
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_forced_tool_call_decoding
         from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
             ToolParserFactory
@@ -5735,7 +5735,7 @@ class TestBuildForcedToolCallDecoding:
         well-formed JSON (typically ``{}``).
         """
         from tensorrt_llm.sampling_params import GuidedDecodingParams
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_forced_tool_call_decoding
 
         tools = [
@@ -5758,7 +5758,7 @@ class TestBuildForcedToolCallDecoding:
 
     def test_forced_name_ignores_strict_flag(self):
         """The forced-call path engages regardless of any ``strict=True``."""
-        from tensorrt_llm.serve.openai_server import (
+        from tensorrt_llm.serve.api.openai.chat.serving import (
             _build_forced_tool_call_decoding,
             _build_tool_strict_guided_decoding_params)
 
@@ -5773,7 +5773,7 @@ class TestBuildForcedToolCallDecoding:
 
     def test_forced_name_missing_raises_value_error(self):
         """Forcing a function that is not in tools must raise ValueError."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
@@ -5785,7 +5785,7 @@ class TestBuildForcedToolCallDecoding:
 
     def test_forced_name_no_tools_raises_value_error(self):
         """Forcing a function without any tools provided is a 4xx-class error."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_forced_tool_call_decoding
 
         with pytest.raises(ValueError):
@@ -5795,7 +5795,7 @@ class TestBuildForcedToolCallDecoding:
 
     def test_forced_name_no_parser_raises_value_error(self):
         """Forcing a function on a server without a tool_parser is a 4xx."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
@@ -5806,7 +5806,7 @@ class TestBuildForcedToolCallDecoding:
 
     def test_forced_name_unsupported_parser_raises_value_error(self):
         """Parsers that do not support structural tags cannot honor forced names."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
@@ -5819,7 +5819,7 @@ class TestBuildForcedToolCallDecoding:
 
     def test_forced_name_unknown_parser_raises_value_error(self):
         """An unregistered parser name should also raise."""
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
@@ -5834,7 +5834,7 @@ class TestBuildForcedToolCallDecoding:
         still return ``None`` when no tool has ``strict=True``, independent of
         the new forced-call helper.
         """
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _build_tool_strict_guided_decoding_params
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
@@ -6685,7 +6685,7 @@ class TestConfigureParserSpecialTokenDecoding:
     def _configure(reasoning_parser_name: str | None = None,
                    tool_parser_name: str | None = None,
                    has_tools: bool = False) -> SamplingParams:
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve._base.serving import \
             _configure_parser_special_token_decoding
 
         sampling_params = SamplingParams()
@@ -6805,7 +6805,7 @@ class TestParserExtractsForcedToolCalls:
     """
 
     def test_kimi_k3_is_routed_to_extraction(self) -> None:
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _parser_extracts_forced_tool_calls
 
         assert _parser_extracts_forced_tool_calls("kimi_k3") is True
@@ -6817,7 +6817,7 @@ class TestParserExtractsForcedToolCalls:
         ) is False
 
     def test_json_parsers_use_the_grammar_path(self) -> None:
-        from tensorrt_llm.serve.openai_server import \
+        from tensorrt_llm.serve.api.openai.chat.serving import \
             _parser_extracts_forced_tool_calls
 
         assert _parser_extracts_forced_tool_calls("qwen3") is False
