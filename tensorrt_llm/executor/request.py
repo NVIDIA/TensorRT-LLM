@@ -303,6 +303,17 @@ class CancellingRequest:
         self.id = id
 
 
+_COMMAND_QUEUE_HWM = 16
+
+
+@dataclass(frozen=True)
+class _CommandBarrier:
+    """Acknowledge receipt of preceding commands on this frontend's lane."""
+
+    token: int
+    ack_addr: tuple[str, bytes]
+
+
 class StartProfileRequest:
     """Request the IPC worker to start runtime profiling.
 

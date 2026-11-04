@@ -15,6 +15,7 @@ from typing import Any
 import grpc
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
@@ -542,6 +543,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 priority=DEFAULT_REQUEST_PRIORITY,
                 disaggregated_params=disaggregated_params,
             )
+        except EngineUnavailableError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            return
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return
@@ -669,12 +673,13 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             raise
         # Broad by design: this is the RPC boundary, so any engine/processing
         # failure after acceptance must be reported to the client as an error
-        # event and must still trigger abort + cleanup in the finally below.
+        # event. A dead executor is terminal; other failures still need abort.
         except Exception as error:
             if request_metrics is not None:
                 request_metrics.engine_failed()
             logger.error(f"OpenEngine request {request_id} failed after acceptance: {error}")
-            abort_request("response processing failed")
+            if not isinstance(error, EngineDeadError):
+                abort_request("response processing failed")
             engine_terminal = True
             watchdog.pending()
             yield _engine_error_response(request_id, str(error), result_handle)

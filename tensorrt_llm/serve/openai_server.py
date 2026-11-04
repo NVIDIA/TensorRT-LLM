@@ -44,6 +44,7 @@ from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         EngineUnavailableError,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
@@ -1159,6 +1160,15 @@ class OpenAIServer(_VideoRoutesMixin):
                                        code=code)
         return JSONResponse(content=error_response.model_dump(),
                             status_code=status_code.value)
+
+    @staticmethod
+    def _create_exception_response(error: Exception) -> Response:
+        if isinstance(error, EngineUnavailableError):
+            return OpenAIServer.create_error_response(
+                str(error),
+                err_type="ServiceUnavailableError",
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+        return OpenAIServer.create_error_response(str(error))
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -2524,10 +2534,10 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
         except ValueError as e:
-            return self.create_error_response(str(e))
+            return self._create_exception_response(e)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._create_exception_response(e)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -2939,7 +2949,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._create_exception_response(e)
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
@@ -3049,6 +3059,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield output
             yield "data: [DONE]\n\n"
 
+        promises: List[RequestOutput] = []
         try:
             if isinstance(request.prompt, list) and not request.prompt:
                 return self.create_error_response("'prompt' must not be empty.")
@@ -3064,7 +3075,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 stream_response_id = f"cmpl-{uuid.uuid4().hex}"
                 stream_created = int(time.time())
 
-            promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -3157,6 +3167,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 response = merge_completion_responses(rsps) if len(
                     rsps) > 1 else rsps[0]
                 return JSONResponse(content=response.model_dump())
+        except EngineUnavailableError as error:
+            for promise in promises:
+                try:
+                    promise.abort()
+                except Exception:
+                    logger.warning(
+                        "Failed to abort a partially admitted request",
+                        exc_info=True)
+            return self._create_exception_response(error)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -3164,7 +3183,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._create_exception_response(e)
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
@@ -3317,8 +3336,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
+        except EngineUnavailableError as e:
+            return self._create_exception_response(e)
         except ValueError as e:
-            return self.create_error_response(str(e))
+            return self._create_exception_response(e)
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
@@ -3588,7 +3609,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._create_exception_response(e)
 
         return JSONResponse(content={"detail": "None"})
 
