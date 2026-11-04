@@ -153,8 +153,11 @@ The statuses:
   other self-hosted servers. `pi-responses` and `pi-messages` runs of the same tasks make a protocol
   differential (`smoke.md` section 3a).
 - **Set `--context-window` to the served `max_seq_len`.** pi compacts on its own 16,384 tokens below
-  it. trtllm-serve's over-length answers are not wordings pi reads (`contracts/pi.md` section 11), so
-  a request past `max_seq_len` ends the session instead of compacting.
+  it. On main, a request past `max_seq_len` is refused with OpenAI's over-length wording, which pi
+  reads: after tool turns it compacts and sends the turn again, once per run. The session ends
+  instead on an over-length first request (nothing to compact), and on refusals pi does not read:
+  an older build's wording, or a prompt past `max_num_tokens` with chunked prefill off
+  (`contracts/pi.md` section 11).
 - **Set `--max-tokens` to the model's own agentic output setting.** For example, some GLM-5.3
   replies at effort Max ran 44k to 98k tokens, and a 32,768 cap would cut them at `length`.
 - **Use `--compat-preset`** to send pi's thinking level where the model reads it, and to map pi's

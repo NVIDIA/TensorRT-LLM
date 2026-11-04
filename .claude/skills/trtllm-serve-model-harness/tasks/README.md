@@ -87,8 +87,9 @@ kit, `CONTEXT_WINDOW=32768` for the Codex and pi runners, and Claude Code's sett
 `references/smoke.md` section 2.
 - pi compacts 16,384 tokens below its window, and Codex when its count reaches the window. Both
   happen well before the log has been read, so the session compacts at least once.
-- Keep the window at or below the served `max_seq_len`. A request past it ends a pi session
-  instead of compacting (`scripts/pi_kit/README.md`).
+- Keep the window at or below the served `max_seq_len`. On main, pi compacts after a request past
+  it; an over-length first request, or a refusal pi does not read, ends the session instead
+  (`scripts/pi_kit/README.md`).
 - `pikit status` counts compactions per session.
 
 **Judge** a run like any S4 run: a verdict over its trace (`references/smoke.md` section 3).

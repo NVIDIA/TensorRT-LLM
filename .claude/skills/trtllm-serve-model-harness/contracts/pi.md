@@ -277,10 +277,11 @@ twice: comparable requests for the protocol differential, then pi's defaults.
   `context_length_exceeded_message`, raised from `base_worker.py` when the deduced
   `default_max_tokens` is not positive, code `context_length_exceeded`). Two of pi's patterns match
   it (`maximum context length is \d+ tokens`, `reduce the length of the messages`), so pi compacts.
-  Older builds said `` `default_max_tokens` (N) must be greater than 0 `` or `The prompt length (N)
-  should not exceed max_num_tokens (M)`, which pi reads as neither over-length nor transient: on
-  those builds pi ends the run where it should compact. C-10 judges it on a live run
-  (`errors.overlength.shape: any_error`).
+  Older builds said `` `default_max_tokens` (N) must be greater than 0 ``, and with chunked
+  prefill off main still refuses a prompt past `max_num_tokens` with `The prompt length (N) should
+  not exceed max_num_tokens (M)` (`llmapi/llm.py` `_check_arguments`). pi reads neither as
+  over-length nor transient: there pi ends the run where it should compact. C-10 judges it on a
+  live run (`errors.overlength.shape: any_error`).
 - **[measured] Timeouts.** One undici dispatcher with `headersTimeout` and `bodyTimeout` from
   `httpIdleTimeoutMs`, 300 s by default (`core/http-dispatcher.js:77`, `:81`), and the SDKs'
   timeout, which ends when the headers arrive (`core/sdk.js:200`):
