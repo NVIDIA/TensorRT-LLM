@@ -1744,9 +1744,10 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         where the section does, and the tag is left to the section: at
         ``<|close|>tools<|sep|>`` or ``<|open|>response<|sep|>``, at an
         ``<|open|>tools<|sep|>`` that opens a section, or at a run of close
-        tags that ends the generation. Anywhere else those tags are text of
-        the body. With none of them, the text ending inside the block leaves
-        it undecided, or ends it once the text is complete.
+        tags that ends the generation, whose stray close tags go with the
+        block (see ``_past_stray_closes``). Anywhere else those tags are text
+        of the body. With none of them, the text ending inside the block
+        leaves it undecided, or ends it once the text is complete.
         """
         opened = cls._match_prefix(text, pos, cls._THINK_OPEN, final)
         if not opened:
@@ -1766,20 +1767,22 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                                     body_start=body_start,
                                     body_end=len(text))
             body_end, tag = min(found)
+            end = body_end
             if tag in cls._THINK_BODY_ENDS:
                 ends = True
+                if tag == cls._THINK_CLOSE:
+                    end += len(cls._THINK_CLOSE)
             elif tag == cls.TOOLS_OPEN:
                 ends = cls.tools_section_opens(text, body_end + len(tag), final)
             else:
                 ends = cls._close_run(text, body_end, final)
+                if ends:
+                    end = cls._past_stray_closes(text, body_end, final)
             if ends is None:
                 return None
             if ends:
                 break
             search = body_end + 1
-        end = body_end
-        if tag == cls._THINK_CLOSE:
-            end += len(cls._THINK_CLOSE)
         return cls.XtmlItem("think",
                             pos,
                             end,

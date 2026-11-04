@@ -6792,6 +6792,17 @@ K3_CORPUS = {
         "Answer.",
         [("exec", '{"input": "ls"}')],
     ),
+    # A closing run that ends the generation ends it too; its stray close
+    # tags are not content.
+    "unclosed_think_inside_tools_section_before_closing_run": (
+        _k3_think("t") + _k3_response("") + K3_BOT + _k3_exec(1, "ls") +
+        f"{K3_OPEN}think{K3_SEP}unclosed thought" +
+        f"{K3_CLOSE}response{K3_SEP}" + K3_MESSAGE_END,
+        True,
+        "tunclosed thought",
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
     # Tags a think block quotes, where they are not structure, are its text.
     "think_in_section_quotes_the_tools_opener": (
         _k3_think("t") + _k3_response("") + _k3_section(
