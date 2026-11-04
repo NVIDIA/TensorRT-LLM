@@ -1,0 +1,163 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""GPU test for the qwen4 default target's renorm_moe_routing_op variant
+(models/qwen4_exp/ops/moe/renorm_moe_routing_op).
+
+The entry owns the contract. This file turns a cell into logits and holds the
+claim no cell carries: equivalence to HF's `norm_topk_prob` routing. A cell with
+`capture` runs its call inside a captured CUDA graph and replays it over two steps'
+logits.
+"""
+
+import zlib
+
+import pytest
+import torch
+
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (  # noqa: E501
+    renorm_moe_routing_op as op,
+)
+
+__extra_import_path__ = ["../../.."]
+from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
+
+assert torch.cuda.is_available(), "renorm_moe_routing_op requires a CUDA device"
+
+
+def _compare(
+    out: tuple[torch.Tensor, torch.Tensor],
+    ref: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Ids equal and weights bit-exact.
+
+    The reference is not an approximation of the kernel: over 2040
+    configurations and 16384-token runs at 512 / top-10, not one id and not
+    one weight bit differed. A one-ulp `assert_close` runs first only so a
+    drift reports a readable diff. The nearest wrong answers sit 0.4476
+    away (un-renormalized softmax, `1/topk`), and a `torch.topk` reference
+    differs on a third of the rows at 512 bf16 experts.
+    """
+    ids, weights = out
+    ref_ids, ref_weights = ref
+    assert ids.dtype == ref_ids.dtype == torch.int32, (ids.dtype, ref_ids.dtype)
+    assert weights.dtype == ref_weights.dtype, (weights.dtype, ref_weights.dtype)
+    assert ids.shape == ref_ids.shape == weights.shape, (ids.shape, ref_ids.shape)
+    torch.testing.assert_close(ids, ref_ids, rtol=0, atol=0)
+    eps = torch.finfo(weights.dtype).eps
+    torch.testing.assert_close(weights, ref_weights, rtol=eps, atol=0.0)
+    mismatched = int((weights != ref_weights).sum())
+    assert mismatched == 0, f"{mismatched} of {weights.numel()} weights are not bit-exact"
+
+
+DEV = "cuda"
+
+
+def _logits(tokens, num_experts, logits_dtype, dist="randn", magnitude=1.0, seed=0):
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    if dist == "coarse":
+        x = torch.randint(0, 3, (tokens, num_experts), device=DEV, generator=g).float()
+    else:
+        x = torch.randn(tokens, num_experts, device=DEV, generator=g) * magnitude
+    return x.to(logits_dtype)
+
+
+def _check(logits, topk, output_dtype=None):
+    """Drive the op and gate it through the entry's own reference and `_compare`."""
+    ids, weights = op(logits, topk, output_dtype)
+    assert ids.is_contiguous() and weights.is_contiguous()
+    assert ids.device == weights.device == logits.device
+    _compare((ids, weights), op.reference(logits, topk, output_dtype))
+    return ids, weights
+
+
+def _capture(logits, topk, output_dtype):
+    """Capture one call over a private copy of the step's logits, as the engine's graph
+    runner does after its eager warmup: `(graph, static logits, static outputs)`. One more
+    call on a side stream warms the stream, as `torch.cuda.graph` asks."""
+    static = logits.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(static, topk, output_dtype)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(static, topk, output_dtype)
+    return graph, static, out
+
+
+def _same(a, b) -> bool:
+    """Ids and weights bitwise equal."""
+    return torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
+def _cell_logits(s, seed):
+    return _logits(
+        s["tokens"], s["num_experts"], s["logits_dtype"], s["dist"], s.get("magnitude", 1.0), seed
+    )
+
+
+def _check_sums(weights, s) -> None:
+    """Renormalized: every row sums to 1."""
+    assert weights.dtype == s["output_dtype"]
+    torch.testing.assert_close(
+        weights.float().sum(-1),
+        torch.ones(s["tokens"], device=DEV),
+        rtol=8e-3 if s["output_dtype"] is torch.bfloat16 else 1e-6,
+        atol=0.0,
+    )
+
+
+# ── the certified cells ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves the fixture by this name
+    certifying(op)
+    s = cell.spec
+    seed = zlib.crc32(cell.why.encode())
+    logits = _cell_logits(s, seed)
+    ids, weights = _check(logits, s["topk"], s["output_dtype"])
+    _check_sums(weights, s)
+    if not s.get("capture"):
+        return
+
+    # Captured: the graph replays the step it captured bitwise as the eager call
+    # computed it, then a second step's logits -- other routing -- written into the
+    # captured buffer, bitwise its own eager call and the reference.
+    graph, static, replayed = _capture(logits, s["topk"], s["output_dtype"])
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _same(replayed, (ids, weights)), "the replay differs from the eager call it captured"
+    second = _cell_logits(s, seed + 1)
+    static.copy_(second)
+    graph.replay()
+    torch.cuda.synchronize()
+    step2 = (replayed[0].clone(), replayed[1].clone())
+    assert not torch.equal(step2[0], ids), "the second step reroutes"
+    assert _same(step2, op(second, s["topk"], s["output_dtype"])), (
+        "the second replay differs from its eager call"
+    )
+    _compare(step2, op.reference(second, s["topk"], s["output_dtype"]))
+    _check_sums(step2[1], s)
+
+
+# ── what a cell cannot carry ──────────────────────────────────────────────
+
+
+def test_equivalent_to_hf_norm_topk_prob():
+    """Softmax over all experts, top-k, divide by the selected sum: the same
+    operator up to rounding (5.96e-08 measured); skipping the renormalization
+    lands three orders of magnitude outside that."""
+    logits = _logits(1024, 512, torch.bfloat16, magnitude=2.0, seed=2)
+    _, weights = op(logits, 10, torch.float32)
+    hf_values, _ = torch.topk(torch.softmax(logits.float(), dim=-1), 10, dim=-1)
+    hf_weights = hf_values / hf_values.sum(-1, keepdim=True)
+    # ids can differ on tie rows; the sorted weight multiset cannot
+    torch.testing.assert_close(
+        weights.sort(-1, descending=True).values,
+        hf_weights.sort(-1, descending=True).values,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    assert (weights - hf_values).abs().max().item() > 1e-2

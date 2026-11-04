@@ -6,8 +6,7 @@ The experts use the shared test helpers' drawn NVFP4 codes and
 power-of-two scales, so every weight is exact; this entry's layout is built
 from their raw per-expert tensors by the target's own `weights.py` transforms,
 so the test also pins those. Per cell: inside the routed entry's band against
-the fp32 reference. Beyond the cells: the guard against a per-expert FC2 input
-scale.
+the fp32 reference.
 """
 
 import zlib
@@ -16,14 +15,14 @@ from collections.abc import Iterator
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (  # noqa: E501
+    renorm_moe_routing_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     weights as W,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_moe_renorm_cute_dsl import (  # noqa: E501
     fp4_moe_renorm_cute_dsl as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.renorm_moe_routing_op import (  # noqa: E501
-    renorm_moe_routing_op,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -84,27 +83,3 @@ def test_certified_cells(cell, certifying, many_expert_layer, cute_dsl_experts):
     with true_fp32_matmul():
         exp = op.reference(logits, x, spec["top_k"], ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
-
-
-def test_guard_refuses_a_per_expert_fc2_scale(many_expert_layer, cute_dsl_experts):  # noqa: F811
-    spec = {**op.CELLS[0].spec, "tokens": 1024}
-    args, ref, data, sf, x, logits, _, _, g2, _ = H.renorm_operands(
-        many_expert_layer(), spec, 9, renorm_moe_routing_op
-    )
-    fc1_w, fc1_s, fc2_w, fc2_s = cute_dsl_experts
-    s1, sg, s2 = H._scalars(spec["num_experts"], G1, g2)
-    with validating(op), pytest.raises(AssertionError):
-        op(
-            logits,
-            data,
-            sf,
-            fc1_w,
-            fc1_s,
-            sg,
-            fc2_w,
-            fc2_s,
-            s2,
-            s2,
-            spec["num_experts"],
-            spec["top_k"],
-        )

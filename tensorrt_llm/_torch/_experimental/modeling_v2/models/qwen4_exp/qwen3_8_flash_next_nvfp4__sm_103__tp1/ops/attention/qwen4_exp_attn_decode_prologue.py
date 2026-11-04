@@ -47,14 +47,28 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (
+    qsa_paged_index_scores as _index_scores,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_store import (
+    qsa_paged_index_store as _index_store,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store import (
+    qsa_paged_kv_store as _kv_store,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store_nvfp4 import (
+    _e2m1x2,
+    _quantize_row,
+    _rcp_approx,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store_nvfp4 import (
+    qsa_paged_kv_store_nvfp4 as _kv_store_nvfp4,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_prefill_compress import (
+    qsa_prefill_compress as _compress,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-from .qsa_paged_index_scores import qsa_paged_index_scores as _index_scores
-from .qsa_paged_index_store import qsa_paged_index_store as _index_store
-from .qsa_paged_kv_store import qsa_paged_kv_store as _kv_store
-from .qsa_paged_kv_store_nvfp4 import _e2m1x2, _quantize_row, _rcp_approx
-from .qsa_paged_kv_store_nvfp4 import qsa_paged_kv_store_nvfp4 as _kv_store_nvfp4
-from .qsa_prefill_compress import qsa_prefill_compress as _compress
 from .qwen4_exp_qk_norm_rope import _launch as _qk_launch
 from .qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope as _qk_norm_rope
 

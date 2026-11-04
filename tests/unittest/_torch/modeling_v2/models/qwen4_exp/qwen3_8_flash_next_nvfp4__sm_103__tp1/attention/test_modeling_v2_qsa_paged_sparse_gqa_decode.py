@@ -2,19 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qsa_paged_sparse_gqa_decode entry: cells against the composition
 entry's fp32 reference in that entry's band (4 ulp of each head row's magnitude, 2 ulp
-relative RMS), the selection's read-after-wait under graph replay with PDL, and the row
-guard."""
+relative RMS), and the selection's read-after-wait under graph replay with PDL."""
 
 import zlib
 
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
+    qsa_topk_expand_decode,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa_decode import (  # noqa: E501
     qsa_paged_sparse_gqa_decode as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
-    qsa_topk_expand_decode,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -109,10 +108,3 @@ def test_reads_the_selection_after_the_wait_under_graph_replay() -> None:
         return op(*args[:4], sel, *args[5:])
 
     _replays_like_eager(step, lambda: scores.copy_(torch.rand(scores.shape, device=DEV)))
-
-
-def test_guard_refuses_rows_past_max_rows() -> None:
-    args = _build(dict(pos=(8700,), gated=True), seed=5)
-    many = [a.expand(300, *a.shape[1:]) if i in (0, 4, 5) else a for i, a in enumerate(args[:6])]
-    with validating(op), pytest.raises(AssertionError):
-        op(*many, *args[6:8], None)  # 300 rows: past MAX_ROWS

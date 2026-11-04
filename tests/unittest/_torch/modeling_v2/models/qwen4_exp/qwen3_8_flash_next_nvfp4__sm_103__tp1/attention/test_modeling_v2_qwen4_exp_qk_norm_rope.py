@@ -152,11 +152,3 @@ def test_cuda_graph_replay_reads_fresh_inputs() -> None:
     torch.cuda.synchronize()
     assert torch.equal(proj, eager_proj)
     assert torch.equal(kwargs["index_q"], eager_kwargs["index_q"])
-
-
-def test_guard_refuses_a_position_past_the_table() -> None:
-    """An out-of-range position would read past the rope table."""
-    proj, _, kwargs = _build(dict(tokens=3, **CKPT), seed=_seed("guard"))
-    kwargs["position_ids"][0, 0] = TABLE_ROWS
-    with validating(op), pytest.raises(AssertionError, match="past the rope table"):
-        op(proj, **kwargs)

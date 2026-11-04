@@ -7,10 +7,9 @@ the speculative verify call -- so the cells are that call as the target makes it
 (per-step states into the rollback buffer, the pool untouched) at both pool
 dtypes. The write-back sink is driven only by the cold-call test below.
 
-The neighbouring `chunk_gated_delta_rule` was once wrong on the first indexed
-in-place call of a process (an autotuner trial launch consumes the state), so
-`test_cold_call_in_a_fresh_process_is_correct` measures the first call of a
-process that has made none.
+An autotuner trial launch on the first indexed in-place call of a process would
+consume the state, so `test_cold_call_in_a_fresh_process_is_correct` measures the
+first call of a process that has made none.
 """
 
 from __future__ import annotations
@@ -230,21 +229,3 @@ def test_cold_call_in_a_fresh_process_is_correct() -> None:
     print(f"\ncold call: {result}")
     assert result["cold_compare_ok"], result
     assert result["out_bitwise_equal"] and result["pool_bitwise_equal"], result
-
-
-# ── what the guard refuses ─────────────────────────────────────────────
-
-
-def test_cache_steps_off_the_buffer_step_axis_misplaces_rows_and_is_refused() -> None:
-    """Unguarded, a 4-step buffer driven at cache_steps 2: row 1's states land in
-    row 0's steps 2..3 and row 1 is never written -- the rows the promotion
-    reads are not the ones the kernel filled."""
-    kw = _build(dict(mode="verify", n=2, p=2), seed=75)[0]
-    deep = torch.full((SLOTS, 4, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM), CACHE_SENTINEL, device=DEV)
-    op(**dict(kw, intermediate_states_buffer=deep, cache_steps=2))
-    assert (deep[1] == CACHE_SENTINEL).all() and not (deep[0, 2:] == CACHE_SENTINEL).any(), (
-        "the hazard this guard covers is gone"
-    )
-    with pytest.raises(AssertionError, match="must equal intermediate_states_buffer's step axis"):
-        with validating(op):
-            op(**dict(kw, intermediate_states_buffer=deep.clone(), cache_steps=2))

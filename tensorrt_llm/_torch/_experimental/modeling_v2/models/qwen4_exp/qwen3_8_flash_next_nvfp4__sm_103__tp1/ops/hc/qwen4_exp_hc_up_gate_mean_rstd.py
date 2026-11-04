@@ -43,13 +43,20 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
+    _bf16x2,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
+    _asm,
+    _rcp_approx_ftz,
+    _st_global_b16,
+    _st_global_v4,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 from .qwen4_exp_hc_first_rescale_tc import _lds_v4, _sts_v4
-from .qwen4_exp_hc_inject_norm import _bf16x2
-from .qwen4_exp_hc_up_gate_mean import _asm, _rcp_approx_ftz, _st_global_b16, _st_global_v4
 
 #: Programmatic dependent launch (sm_90+), off with TRTLLM_ENABLE_PDL=0.
 _PDL = get_env_enable_pdl()

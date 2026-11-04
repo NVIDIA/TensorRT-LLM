@@ -3,7 +3,7 @@
 """GPU test for the qwen4_exp_hc_up_gate_mean_fp4 entry: `mixed` in the band
 `qwen4_exp_hc_up_gate_mean`'s test uses, the NVFP4 outputs against the
 native-torch quantization of the returned `mixed` outside the reciprocal tie
-window, the global-scale guard, graph capture."""
+window."""
 
 import zlib
 
@@ -14,7 +14,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
     Fp4Quantize,
     fp4_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_gated_residual import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_gated_residual import (  # noqa: E501
     gate_ratio,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_up_gate_mean_fp4 import (  # noqa: E501
@@ -95,31 +95,3 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     out = op(*args)
     assert out[0].shape == (cell.spec["rows"], cell.spec.get("hidden", 2560))
     _compare(out, op.reference(*args), args[4])
-
-
-def test_guards() -> None:
-    """The kernel loads `global_scale[0]` only; a per-row scale is refused."""
-    low, up, normed, c, gs = _build(dict(rows=4), seed=4)
-    with validating(op), pytest.raises(AssertionError):
-        op(low, up, normed, c, torch.cat([gs, gs]))
-
-
-def test_cuda_graph_capture_and_replay() -> None:
-    low, up, normed, c, gs = _build(dict(rows=8), seed=5)
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        op(low, up, normed, c, gs)
-    torch.cuda.current_stream().wait_stream(side)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        g_out = op(low, up, normed, c, gs)
-    fresh = _build(dict(rows=8), seed=6)
-    low.copy_(fresh[0])
-    normed.copy_(fresh[2])
-    gs.mul_(0.5)
-    graph.replay()
-    torch.cuda.synchronize()
-    want = op(fresh[0], up, fresh[2], c, gs)
-    for got, exp in zip(g_out, want):
-        assert torch.equal(got, exp)

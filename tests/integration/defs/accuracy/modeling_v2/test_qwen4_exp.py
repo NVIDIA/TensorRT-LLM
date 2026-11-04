@@ -12,11 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the qwen4_exp modeling_v2 target.
+"""Whole-model gates for the qwen4_exp modeling_v2 targets.
 
-Every test passes ``modeling_v2="require"``: under ``"auto"`` a configuration
-that missed the target's routing would fall back to the built-in model, pass,
-and report the built-in's numbers as the target's.
+``TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1``: Qwen3.8-Flash-Next-NVFP4 on one sm_103 rank.
+``TestModelingV2Qwen38FlashNextNvfp4Sm103Default``: the same checkpoint on four sm_103 ranks
+(tp4, tep4, dep4) and on two (dep2).
+``TestModelingV2Qwen38FlashNextFp8Sm103Unified``: Qwen3.8-Flash-Next-FP8 (block FP8) on one,
+two or four sm_103 ranks.
+
+Each test runs one engine (two for the breakable-graph comparison) and checks every feature
+that engine carries, so a feature is covered without a test of its own. Every test passes
+``modeling_v2="require"``: under ``"auto"`` a configuration that missed the target's routing
+would fall back to the built-in model, pass, and report the built-in's numbers as the
+target's. Each class also serves its checkpoint disaggregated, the target on both sides of
+the hop.
 """
 
 import random
@@ -45,11 +54,13 @@ from tensorrt_llm.inputs.utils import (
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     KvCacheConfig,
+    MambaStateConfig,
     MoeConfig,
     MTPDecodingConfig,
     QSASparseAttentionConfig,
     SamplingParams,
 )
+from tensorrt_llm.quantization import QuantAlgo
 
 from ...conftest import llm_models_root
 from ..accuracy_core import (
@@ -59,6 +70,7 @@ from ..accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from ..test_disaggregated_serving import launch_disaggregated_llm, run_accuracy_test
 from ._env import scoped_env_overrides
 
 # The target is certified on sm_103 only.
@@ -69,6 +81,32 @@ skip_not_sm103 = pytest.mark.skipif(
 # Check the target's step contract on the first forward, against metadata the
 # engine prepared; the flag has to reach the worker rank.
 _VALIDATE = {MODELING_V2_VALIDATE_ENV: "1"}
+
+# Every worker of a disaggregated test: the step-contract check, and what a worker spawning
+# its second rank over MPI needs in a container running as root (docker/Dockerfile.multi).
+_DISAGG_WORKER_ENV = {
+    **_VALIDATE,
+    "PRTE_ALLOW_RUN_AS_ROOT": "1",
+    "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+}
+
+
+def _disagg_server_config(ctx_router=None, gen_router=None) -> dict:
+    """One context and one generation server on this host, with optional router types."""
+
+    def servers(port, router):
+        config = {"num_instances": 1, "urls": [f"localhost:{port}"]}
+        if router is not None:
+            config["router"] = {"type": router}
+        return config
+
+    return {
+        "hostname": "localhost",
+        "port": 8000,
+        "backend": "pytorch",
+        "context_servers": servers(8001, ctx_router),
+        "generation_servers": servers(8002, gen_router),
+    }
 
 
 def _target_core(llm: LLM):
@@ -306,6 +344,21 @@ def _synthetic_image(color: tuple, size: int = 256) -> Image.Image:
     return image
 
 
+def _mmmu(llm, model_name: str) -> None:
+    """MMMU on ``llm`` against the reference row the engine resolves."""
+    # MMMU adds <|endoftext|> to the stop token, as the built-in model's MMMU test does.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+    MMMU(model_name).evaluate(
+        llm,
+        sampling_params=sampling_params,
+        extra_evaluator_kwargs=dict(chat_template_kwargs=dict(enable_thinking=False)),
+    )
+
+
 def _media_request(tokenizer, processor, text: str, items: list[tuple[str, object]]) -> dict:
     """One request carrying ``items``, ``(modality, data)`` pairs in prompt order.
 
@@ -462,21 +515,6 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
         assert_acceptance_length(key, acceptance_length)
 
-    def _mmmu(self, llm):
-        """MMMU on ``llm`` against the reference row the engine resolves."""
-        # MMMU adds <|endoftext|> to the stop token, as the built-in model's
-        # MMMU test does.
-        sampling_params = SamplingParams(
-            max_tokens=MMMU.MAX_OUTPUT_LEN,
-            truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-            stop="<|endoftext|>",
-        )
-        MMMU(self.MODEL_NAME).evaluate(
-            llm,
-            sampling_params=sampling_params,
-            extra_evaluator_kwargs=dict(chat_template_kwargs=dict(enable_thinking=False)),
-        )
-
     def _video_checks(self, llm):
         """Synthetic videos through ``llm``.
 
@@ -566,7 +604,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             ) as llm,
         ):
             self._gsm8k_and_acceptance(mocker, llm, self.ACCEPTANCE_KEY, "mtp1")
-            self._mmmu(llm)
+            _mmmu(llm, self.MODEL_NAME)
             self._video_checks(llm)
 
     @skip_not_sm103
@@ -611,12 +649,12 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             )
 
     def _long_context_passkey(
-        self, monkeypatch, speculative_config, engine, index_share, lengths, key, label
+        self, monkeypatch, speculative_config, engine, index_share, lengths, key, label, mocker=None
     ):
         """`_passkeys` with the executor in this process, checking the op calls too.
 
-        The draft layer's IndexShare reuse op must run exactly when IndexShare is on, and no
-        prefill graph may replay.
+        With ``mocker``, gsm8k runs first on the same engine. The draft layer's IndexShare
+        reuse op must run exactly when IndexShare is on, and no prefill graph may replay.
         """
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
         reuse_calls = []
@@ -645,6 +683,11 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             ) as llm,
         ):
             assert _target_core(llm).mtp_index_share == index_share
+            if mocker is not None:
+                mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+                GSM8K(self.MODEL_NAME).evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS
+                )
             self._passkeys(llm, lengths, speculative_config.max_draft_len, key, label)
         assert not replays, replays
         if index_share:
@@ -653,16 +696,17 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             assert not reuse_calls, "IndexShare is off and the reuse op ran"
 
     @skip_not_sm103
-    def test_mtp3_long_context_passkey(self, monkeypatch):
-        """Pass key retrieval over 3k-6k-token prompts with three drafts and IndexShare.
+    def test_mtp3_gsm8k_and_long_context(self, mocker, monkeypatch):
+        """gsm8k, then 3k-6k-token pass keys, with three drafts and IndexShare on one engine.
 
-        The KV cache is bf16; the prompts are long enough to run the sparse attention path. The
-        gsm8k prompts never leave the dense path (they are under the indexer's 2048-token
-        budget), so the pass-key cases are the ones that run the target's QSA selection and the
-        draft layer's end to end; a pass key stated back correctly needs the right blocks
-        selected at every depth. IndexShare makes the draft loop reuse the selection of its
-        first step: the acceptance length must not fall below the floor taken from the same
-        prompts with the draft layer selecting on every step, and the reuse op must have run.
+        The KV cache is bf16, the recurrent state fp32, with block reuse and chunked prefill.
+        gsm8k reads the MTP row of references/gsm8k.yaml; its prompts stay on the dense
+        attention path (they are under the indexer's 2048-token budget). The pass keys are
+        past it, so they run the target's QSA selection and the draft layer's end to end; a
+        pass key stated back correctly needs the right blocks selected at every depth.
+        IndexShare makes the draft loop reuse the selection of its first step: the pass keys'
+        acceptance length must not fall below the floor taken from the same prompts with the
+        draft layer selecting on every step, and the reuse op must have run.
         """
         self._long_context_passkey(
             monkeypatch,
@@ -672,6 +716,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             _PASSKEY_LENGTHS,
             self.ACCEPTANCE_KEY_LONG_CONTEXT,
             "mtp3 long context",
+            mocker=mocker,
         )
 
     @skip_not_sm103
@@ -796,3 +841,685 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             self.ACCEPTANCE_KEY_MTP7_LONG_CONTEXT,
             "mtp7 nvfp4 kv bf16 state long context",
         )
+
+    # The target's AgentX deployment environment on both engines: PDL, eight K/V transfer
+    # threads and every opt-in projection of the target.
+    AGENTX_ENV = {
+        "TRTLLM_ENABLE_PDL": "1",
+        "TRTLLM_KV_TRANSFER_NUM_THREADS": "8",
+        "TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD": "1",
+        "TRTLLM_MODELING_V2_DENSE_FP8": "1",
+        "TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4": "1",
+        "TRTLLM_MODELING_V2_MTP_MOE_NVFP4": "1",
+        "TRTLLM_MODELING_V2_MTP_HEAD_NVFP4": "1",
+        "TRTLLM_MODELING_V2_TARGET_HEAD_NVFP4": "1",
+        "TRTLLM_MODELING_V2_MTP_DENSE_FP8": "1",
+    }
+
+    @skip_not_sm103
+    @pytest.mark.timeout(5400)
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_host_memory(204800)
+    def test_disaggregated_mtp2(self, mocker):
+        """One context and one generation GPU, the engines of the target's AgentX deployment.
+
+        NVFP4 K/V, a bf16 recurrent state, MTP with two drafts, per-conversation block reuse
+        on the context engine and rejection sampling on the generation engine, over the
+        Python NIXL transceiver. Acceptance is real.
+        """
+        common_config = {
+            "modeling_v2": "require",
+            "max_seq_len": 262144,
+            "max_num_tokens": 8192,
+            "enable_chunked_prefill": True,
+            "disable_mm_encoder": True,
+            "moe_config": {"backend": "TRTLLM"},
+            "scheduler_config": {"capacity_scheduler_policy": "GUARANTEED_NO_EVICT"},
+            "cache_transceiver_config": {"backend": "NIXL", "transceiver_runtime": "PYTHON"},
+        }
+        kv_cache_config = {
+            "dtype": "nvfp4",
+            "free_gpu_memory_fraction": 0.85,
+            "mamba_ssm_cache_dtype": "bfloat16",
+            "use_kv_cache_manager_v2": True,
+            "tokens_per_block": 32,
+        }
+        # The context engine's breakable prefill graphs, up to max_num_tokens.
+        prefill_capture_num_tokens = (
+            [2**i for i in range(10)] + list(range(768, 3328, 256)) + [4096, 6144, 8192]
+        )
+        ctx_server_config = {
+            **common_config,
+            "max_batch_size": 32,
+            "kv_cache_config": {
+                **kv_cache_config,
+                "enable_block_reuse": True,
+                "block_reuse_config": {"policy": "per_conversation", "max_num_turns": 3},
+                # One recurrent-state snapshot two tokens before each prompt's end.
+                "mamba_state_config": {
+                    "periodic_snapshot_interval": 0,
+                    "additional_snapshot_offsets_from_end": [2],
+                },
+            },
+            "cuda_graph_config": {"enable_padding": True, "max_batch_size": 32},
+            "prefill_cuda_graph_backend": "breakable",
+            "prefill_capture_num_tokens": prefill_capture_num_tokens,
+            "speculative_config": {"decoding_type": "MTP", "max_draft_len": 2},
+        }
+        gen_server_config = {
+            **common_config,
+            "max_batch_size": 128,
+            "kv_cache_config": {**kv_cache_config, "enable_block_reuse": False},
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": list(range(1, 17)) + list(range(24, 129, 8)),
+            },
+            "speculative_config": {
+                "decoding_type": "MTP",
+                "max_draft_len": 2,
+                "use_rejection_sampling": True,
+            },
+        }
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        with launch_disaggregated_llm(
+            _disagg_server_config(ctx_router="conversation", gen_router="load_balancing"),
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            max_workers=128,
+            extra_env={**_DISAGG_WORKER_ENV, **self.AGENTX_ENV},
+            # What the target prints once it has packed the target head for decode rows.
+            assert_worker_log_contains="target head NVFP4",
+        ) as llm:
+            # The served quantization and draft the reference is keyed by; the launcher
+            # reads NVFP4 off the checkpoint's name.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            llm.args.speculative_config = MTPDecodingConfig(max_draft_len=2)
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME,
+                ["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.EXTRA_EVALUATOR_KWARGS},
+                timeout=3000,
+            )
+
+
+# The layouts routing admits, as LLM API parallel arguments. Each cuts the weights
+# differently and crosses ranks differently, and a wrong cut still produces fluent text, so
+# every layout runs one gsm8k against an anchor: tep4, tp4 and dep4 below, dep2 in the
+# disaggregated case.
+# Attention split by head over four ranks, the routed experts by expert.
+_TEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=False)
+# Attention split by head, every expert split by intermediate (160 of 640 rows a rank).
+_TP4 = dict(
+    tensor_parallel_size=4,
+    moe_tensor_parallel_size=4,
+    moe_expert_parallel_size=1,
+    enable_attention_dp=False,
+)
+# Attention replicated, each rank serving its own requests; the routed experts by expert.
+_DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
+
+# The quantized KV pools, one layout each: NVFP4 at tp4 with the breakable prefill graph
+# (routed at attention TP only), FP8 at dep4 (MTP under attention DP, each rank drafting for
+# its own requests).
+_QUANTIZED_KV = [
+    pytest.param(_TP4, "nvfp4", True, id="tp4_nvfp4_kv_breakable"),
+    pytest.param(_DEP4, "fp8", False, id="dep4_fp8_kv"),
+]
+
+
+class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
+    """qwen3.8-flash-next-nvfp4 / sm_103 / default: tp4, tep4, dep4 and dep2."""
+
+    # References are keyed by model name plus the quantization the engine
+    # resolves for this checkpoint (MIXED_PRECISION), and the MTP row by the
+    # speculative mode as well.
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4"
+
+    # The gsm8k anchors were measured under this protocol. `enable_thinking:
+    # false` is required: with thinking on, the answer does not finish inside
+    # GSM8K_MAX_OUTPUT_LEN.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    # The anchor's `max_tokens`; the class default (256) truncates this checkpoint's answers.
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    # The checkpoint's bf16 K/V, a bf16 recurrent state (the one the target serves), no
+    # block reuse.
+    KV_CACHE = KvCacheConfig(
+        free_gpu_memory_fraction=0.6,
+        enable_block_reuse=False,
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+
+    # The routed experts run on trtllm-gen, the one MoE backend the target implements.
+    MOE = MoeConfig(backend="TRTLLM")
+
+    ENGINE = dict(
+        max_seq_len=9216,
+        max_batch_size=128,
+        max_num_tokens=8192,
+        enable_chunked_prefill=False,
+        kv_cache_config=KV_CACHE,
+        cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=128),
+        moe_config=MOE,
+    )
+
+    # One-model MTP-Eagle with the checkpoint's single MTP module replayed three times, on
+    # the engine the MTP configuration is served with (a 16384-token sequence bound).
+    MTP3 = MTPDecodingConfig(max_draft_len=3)
+    ENGINE_MTP = dict(ENGINE, max_seq_len=16384)
+
+    # The breakable prefill CUDA graph, up to max_num_tokens.
+    BREAKABLE_PREFILL = dict(
+        prefill_cuda_graph_backend="breakable",
+        prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
+    )
+
+    # A collapsed or miscomputed draft path accepts nothing and reads 1.0; every draft
+    # accepted reads 1 + max_draft_len. The midpoint of that range is the gsm8k MTP
+    # cases' tripwire: at or above it, more than half the drafts are accepted.
+    MTP3_COLLAPSE_FLOOR = 1.0 + MTP3.max_draft_len / 2
+
+    # The pass keys' acceptance-length floor in references/acceptance_length.yaml.
+    ACCEPTANCE_KEY_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context"
+
+    def _gsm8k(self, mocker, llm, label: str) -> None:
+        """gsm8k against the engine's reference row, then its acceptance length.
+
+        The acceptance length is held above the collapse tripwire. Rejection sampling holds the emitted distribution to
+        the target model's, so a miscomputed draft layer leaves the score in place and only
+        slows generation; the acceptance length is what sees it.
+        """
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        GSM8K(self.MODEL_NAME).evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+        acceptance_length = compute_acceptance_length(llm)
+        print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
+        assert acceptance_length >= self.MTP3_COLLAPSE_FLOOR, (
+            f"{label}: acceptance length {acceptance_length:.3f} is below "
+            f"{self.MTP3_COLLAPSE_FLOOR}: the draft path is rejected more often than accepted"
+        )
+
+    def _passkey_acceptance(self, llm, prompts, label) -> float:
+        """Pass-key retrieval on ``llm`` and the requests' mean acceptance length.
+
+        Every key must be stated back, and two identical requests far apart in one batch
+        (different slots) must give the same tokens, which fails if a request's selection
+        leaks into another slot.
+        """
+        texts = [prompt for prompt, _ in prompts] + [prompts[len(prompts) // 2][0]]
+        outputs = llm.generate(
+            texts,
+            SamplingParams(max_tokens=_PASSKEY_MAX_TOKENS, temperature=0, return_perf_metrics=True),
+            use_tqdm=False,
+        )
+        missed = [
+            key
+            for (_, key), output in zip(prompts, outputs)
+            if key not in output.outputs[0].text[:_PASSKEY_MAX_TOKENS]
+        ]
+        assert not missed, (
+            f"{label}: pass keys not stated back: {missed} of {[key for _, key in prompts]}"
+        )
+        twins = outputs[len(prompts) // 2], outputs[-1]
+        assert twins[0].outputs[0].token_ids == twins[1].outputs[0].token_ids, (
+            f"{label}: the same prompt in two slots gave different tokens"
+        )
+        acceptance_length = _acceptance_length_from_requests(outputs, self.MTP3.max_draft_len)
+        print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
+        return acceptance_length
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_mtp3_gsm8k_and_long_context(self, mocker):
+        """tep4 with three drafts and IndexShare: gsm8k, then pass keys over 3k-6k tokens.
+
+        gsm8k reads the MTP row of references/gsm8k.yaml, its acceptance length held above
+        the collapse tripwire. The pass keys are past the QSA indexer's 2048-token budget, so
+        the target's decode steps and its draft layer's take the sparse attention path, which
+        gsm8k never leaves, and IndexShare makes the draft loop reuse the selection of its
+        first step. A miscomputed draft path keeps the text correct and only lowers the
+        acceptance length, which is held to its floor in references/acceptance_length.yaml.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        prompts = _passkey_prompts(tokenizer, _PASSKEY_LENGTHS)
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                enable_iter_perf_stats=True,
+                sparse_attention_config=QSASparseAttentionConfig(
+                    index_share_for_mtp_iteration=True
+                ),
+                **self.ENGINE_MTP,
+                **_TEP4,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            self._gsm8k(mocker, llm, "tep4 mtp3 gsm8k")
+            acceptance_length = self._passkey_acceptance(llm, prompts, "tep4 mtp3 long context")
+        assert_acceptance_length(self.ACCEPTANCE_KEY_LONG_CONTEXT, acceptance_length)
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("parallel, kv_dtype, breakable", _QUANTIZED_KV)
+    def test_mtp3_gsm8k_quantized_kv(self, mocker, parallel, kv_dtype, breakable):
+        """gsm8k with three drafts over a quantized KV pool, block reuse and chunked prefill.
+
+        gsm8k reads the MTP row of references/gsm8k.yaml for that KV dtype, its acceptance
+        length held above the collapse tripwire.
+        """
+        kv_cache_config = KvCacheConfig(
+            dtype=kv_dtype,
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=True,
+            mamba_ssm_cache_dtype="bfloat16",
+        )
+        engine = dict(self.ENGINE_MTP, enable_chunked_prefill=True, kv_cache_config=kv_cache_config)
+        if breakable:
+            engine.update(self.BREAKABLE_PREFILL)
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                enable_iter_perf_stats=True,
+                **engine,
+                **parallel,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            self._gsm8k(mocker, llm, f"mtp3 {kv_dtype} kv")
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_mtp3_mmmu(self):
+        """MMMU at tep4 with three drafts, against the MTP row of references/mmmu.yaml.
+
+        It runs the vision tower, replicated on every rank, and the mrope path.
+        """
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                **self.ENGINE_MTP,
+                **_TEP4,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            _mmmu(llm, self.MODEL_NAME)
+
+    @skip_not_sm103
+    @pytest.mark.timeout(5400)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_host_memory(204800)
+    def test_disaggregated_dep2(self, mocker):
+        """dep2 on both engines, one context and one generation server of two GPUs each.
+
+        Attention DP over two ranks, the routed experts in two 256-expert windows; both
+        engines run one layout, so each rank's K/V, QSA index, Gated-DeltaNet and PLE pools
+        have one layout on both sides of the Python NIXL transceiver.
+        """
+        # The core configuration on both engines: the checkpoint's bf16 K/V, a bf16
+        # recurrent state, no block reuse, no chunked prefill, the trtllm-gen experts.
+        common_config = {
+            "modeling_v2": "require",
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "max_seq_len": 9216,
+            "max_batch_size": 128,
+            "max_num_tokens": 8192,
+            "enable_chunked_prefill": False,
+            "moe_config": {"backend": "TRTLLM"},
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "mamba_ssm_cache_dtype": "bfloat16",
+                "free_gpu_memory_fraction": 0.6,
+            },
+            # The V2 hybrid manager's pools travel over the Python transceiver.
+            "cache_transceiver_config": {"backend": "NIXL", "transceiver_runtime": "PYTHON"},
+        }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": False,
+            "cuda_graph_config": {"enable_padding": True, "max_batch_size": 128},
+        }
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        with launch_disaggregated_llm(
+            _disagg_server_config(),
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            max_workers=128,
+            extra_env=_DISAGG_WORKER_ENV,
+            # What every rank of both engines prints once it has bound the manager's pools.
+            assert_worker_log_contains="modeling_v2 qwen4_exp default target: rank",
+        ) as llm:
+            # The served quantization the reference is keyed by; the launcher reads NVFP4
+            # off the checkpoint's name.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME,
+                ["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.EXTRA_EVALUATOR_KWARGS},
+                timeout=3000,
+            )
+
+
+# The layouts the FP8 target runs one gsm8k at without speculation, one per way it cuts its
+# forward. It runs every layout's routed experts as whole-expert windows over the TP group
+# (the FP8 experts' 128x128 weight blocks take no 320- or 160-row intermediate share), so a
+# pure-TP layout differs from its expert-parallel twin only in Mapping's MoE split, which the
+# target does not read. tep4 and dep4 run the MTP cases below, dep4 the quantized KV case,
+# tep4 the breakable prefill graph and dep2 the disaggregated one.
+_FP8_GSM8K_LAYOUTS = [
+    # One rank: every expert local, nothing crosses ranks.
+    pytest.param(
+        dict(tensor_parallel_size=1),
+        id="tp1",
+        marks=pytest.mark.skip_less_device_memory(200000),
+    ),
+    # Attention TP over two ranks, the routed experts in two 256-expert windows; tp2 runs the
+    # same forward.
+    pytest.param(
+        dict(tensor_parallel_size=2, moe_expert_parallel_size=2, enable_attention_dp=False),
+        id="tep2",
+        marks=[pytest.mark.skip_less_device(2), pytest.mark.skip_less_device_memory(145000)],
+    ),
+    # Attention TP over four ranks under Mapping's MoE TP, which routing keys apart from tep4;
+    # the target runs tep4's 128-expert windows.
+    pytest.param(
+        _TP4,
+        id="tp4",
+        marks=[pytest.mark.skip_less_device(4), pytest.mark.skip_less_device_memory(145000)],
+    ),
+]
+
+# The FP8 target's quantized KV pools, at dep4: K/V stored as fp8-e4m3, with block reuse (the
+# Gated-DeltaNet and PLE state snapshotted every 256 tokens: attention pages alone cannot
+# restore it, so without a snapshot placement the runtime turns reuse back off) and chunked
+# prefill, which splits the request that straddles a step's token budget.
+_FP8_QUANTIZED_KV = [
+    pytest.param(_DEP4, "fp8", id="dep4_fp8_kv"),
+]
+
+
+class TestModelingV2Qwen38FlashNextFp8Sm103Unified(LlmapiAccuracyTestHarness):
+    """qwen3.8-flash-next-fp8 / sm_103 / unified: tp1, tp2, tep2, dep2, tp4, tep4 and dep4."""
+
+    # References are keyed by model name plus the quantization the engine resolves for this
+    # checkpoint (FP8_BLOCK_SCALES), and the MTP row by the speculative mode as well.
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8"
+
+    # The protocol the FP8_BLOCK_SCALES anchors were measured under: the chat template thinks,
+    # so the system prompt caps the reasoning and asks for the bare answer, which then fits
+    # GSM8K_MAX_OUTPUT_LEN.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        system_prompt=(
+            "Use at most three short reasoning sentences, then end with `#### NUMBER`. "
+            "Do not restate the problem."
+        ),
+        chat_template_kwargs=dict(enable_thinking=True, reasoning_effort="xhigh"),
+    )
+
+    # The anchor's `max_tokens`; the class default (256) truncates this checkpoint's answers.
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    # The checkpoint's bf16 K/V, a bf16 recurrent state (the one the target serves), no
+    # block reuse.
+    KV_CACHE = KvCacheConfig(
+        free_gpu_memory_fraction=0.6,
+        enable_block_reuse=False,
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+
+    # The routed experts run on the trtllm-gen FP8 block-scale runner, the one MoE backend the
+    # target implements.
+    MOE = MoeConfig(backend="TRTLLM")
+
+    ENGINE = dict(
+        max_seq_len=9216,
+        max_batch_size=128,
+        max_num_tokens=8192,
+        enable_chunked_prefill=False,
+        kv_cache_config=KV_CACHE,
+        cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=128),
+        moe_config=MOE,
+    )
+
+    # One-model MTP-Eagle with the checkpoint's single MTP module replayed three times.
+    MTP3 = MTPDecodingConfig(max_draft_len=3)
+
+    # A collapsed or miscomputed draft path accepts nothing and reads 1.0; every draft
+    # accepted reads 1 + max_draft_len. The midpoint of that range is the MTP cases'
+    # tripwire: at or above it, more than half the drafts are accepted.
+    MTP3_COLLAPSE_FLOOR = 1.0 + MTP3.max_draft_len / 2
+
+    # The breakable prefill CUDA graph, up to max_num_tokens. Routing admits it under
+    # attention TP only.
+    BREAKABLE_PREFILL = dict(
+        prefill_cuda_graph_backend="breakable",
+        prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
+    )
+
+    def _gsm8k(self, mocker, llm, label: str) -> None:
+        """gsm8k against the engine's FP8_BLOCK_SCALES row of references/gsm8k.yaml.
+
+        Under speculation the score is held to the MTP row, and then the acceptance length
+        above the collapse tripwire. Rejection sampling holds the emitted distribution to the
+        target model's, so a miscomputed draft layer leaves the score in place and only slows
+        generation; the acceptance length is what sees it.
+        """
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES, (
+            f"{label}: the engine resolved quant_algo {llm.args.quant_config.quant_algo}; the "
+            "references are this checkpoint's FP8_BLOCK_SCALES rows"
+        )
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        GSM8K(self.MODEL_NAME).evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+        if llm.args.speculative_config is None:
+            return
+        acceptance_length = compute_acceptance_length(llm)
+        print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
+        assert acceptance_length >= self.MTP3_COLLAPSE_FLOOR, (
+            f"{label}: acceptance length {acceptance_length:.3f} is below "
+            f"{self.MTP3_COLLAPSE_FLOOR}: the draft path is rejected more often than accepted"
+        )
+
+    @skip_not_sm103
+    @pytest.mark.parametrize("parallel", _FP8_GSM8K_LAYOUTS)
+    def test_gsm8k(self, mocker, request, parallel):
+        """The text model without speculation, against the FP8_BLOCK_SCALES row.
+
+        One layout of each way the target cuts its forward (`_FP8_GSM8K_LAYOUTS`).
+        """
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **self.ENGINE,
+                **parallel,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            self._gsm8k(mocker, llm, request.node.callspec.id)
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.parametrize(
+        "parallel", [pytest.param(_TEP4, id="tep4"), pytest.param(_DEP4, id="dep4")]
+    )
+    def test_mtp3_gsm8k(self, mocker, request, parallel):
+        """Three drafts at tep4 and at dep4, against the FP8_BLOCK_SCALES MTP row.
+
+        The acceptance length is held above the collapse tripwire. At tep4 the draft layer is
+        cut like a trunk attention layer over its own draft KV cache; at dep4 each rank drafts
+        for its own requests over the trunk's manager, and the draft layer's expert window runs
+        the trunk's attention-DP round trip.
+        """
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                enable_iter_perf_stats=True,
+                **self.ENGINE,
+                **parallel,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            self._gsm8k(mocker, llm, f"{request.node.callspec.id} mtp3")
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.parametrize("parallel, kv_dtype", _FP8_QUANTIZED_KV)
+    def test_gsm8k_quantized_kv(self, mocker, parallel, kv_dtype):
+        """gsm8k without speculation over a quantized KV pool, block reuse and chunked prefill.
+
+        The engine options are `_FP8_QUANTIZED_KV`. No FP8_BLOCK_SCALES row of
+        references/gsm8k.yaml names a KV-cache algorithm, so the score is held to the bf16
+        pool's row: a quantized pool that costs accuracy beyond that row's band fails here.
+        """
+        kv_cache_config = KvCacheConfig(
+            dtype=kv_dtype,
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=True,
+            mamba_ssm_cache_dtype="bfloat16",
+            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+        )
+        engine = dict(self.ENGINE, enable_chunked_prefill=True, kv_cache_config=kv_cache_config)
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **engine,
+                **parallel,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo(kv_dtype.upper()), (
+                f"kv_cache_config.dtype={kv_dtype} resolved kv_cache_quant_algo "
+                f"{llm.args.quant_config.kv_cache_quant_algo}"
+            )
+            # The engine is built over the quantized pool; only the reference lookup reads this.
+            llm.args.quant_config.kv_cache_quant_algo = None
+            self._gsm8k(mocker, llm, f"{kv_dtype} kv")
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(145000)
+    def test_gsm8k_breakable_prefill(self, mocker):
+        """tep4 without speculation, against the FP8_BLOCK_SCALES row.
+
+        Each prefill step is replayed from the breakable CUDA graph of its bucket
+        (`BREAKABLE_PREFILL`). The graph captures the core's forward body, with breaks at the
+        PLE block and at each layer's attention core and Gated-DeltaNet recurrence, so a step
+        the graph replays runs none of the host code between them.
+        """
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **self.ENGINE,
+                **self.BREAKABLE_PREFILL,
+                **_TEP4,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            self._gsm8k(mocker, llm, "tep4 breakable prefill")
+
+    @skip_not_sm103
+    @pytest.mark.timeout(5400)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_host_memory(204800)
+    def test_disaggregated_dep2(self, mocker):
+        """dep2 on both engines, one context and one generation server of two GPUs each.
+
+        Attention DP over two ranks, the routed experts in two 256-expert windows; both
+        engines run one layout, so each rank's K/V, QSA index, Gated-DeltaNet and PLE pools
+        have one layout on both sides of the Python NIXL transceiver.
+        """
+        # The core configuration on both engines: the checkpoint's bf16 K/V, a bf16
+        # recurrent state, no block reuse, no chunked prefill, the trtllm-gen FP8 experts.
+        common_config = {
+            "modeling_v2": "require",
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "max_seq_len": 9216,
+            "max_batch_size": 128,
+            "max_num_tokens": 8192,
+            "enable_chunked_prefill": False,
+            "moe_config": {"backend": "TRTLLM"},
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "mamba_ssm_cache_dtype": "bfloat16",
+                "free_gpu_memory_fraction": 0.6,
+            },
+            # The V2 hybrid manager's pools travel over the Python transceiver.
+            "cache_transceiver_config": {"backend": "NIXL", "transceiver_runtime": "PYTHON"},
+        }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": False,
+            "cuda_graph_config": {"enable_padding": True, "max_batch_size": 128},
+        }
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        with launch_disaggregated_llm(
+            _disagg_server_config(),
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            max_workers=128,
+            extra_env=_DISAGG_WORKER_ENV,
+            # What every rank of both engines prints once it has bound the manager's pools.
+            assert_worker_log_contains="modeling_v2 qwen4_exp fp8 unified target: rank",
+        ) as llm:
+            # The served quantization the reference is keyed by; the launcher reads none off
+            # this checkpoint's name.
+            llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME,
+                ["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.EXTRA_EVALUATOR_KWARGS},
+                timeout=3000,
+            )

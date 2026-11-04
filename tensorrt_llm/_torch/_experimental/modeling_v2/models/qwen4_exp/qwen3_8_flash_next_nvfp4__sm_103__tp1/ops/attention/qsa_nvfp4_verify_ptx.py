@@ -22,7 +22,10 @@ from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .qsa_paged_sparse_gqa_nvfp4_decode import _asm, _ir
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
+    _asm,
+    _ir,
+)
 
 # ---------------------------------------------------------------------------------------
 # scalar and memory helpers

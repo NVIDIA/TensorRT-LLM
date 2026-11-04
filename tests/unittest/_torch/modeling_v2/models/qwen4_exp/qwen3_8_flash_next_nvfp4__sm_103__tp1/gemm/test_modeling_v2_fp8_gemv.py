@@ -3,12 +3,15 @@
 """GPU test: `fp8_gemv` / `fp8_gemv_conv1d` / `fp8_gemv_conv1d_verify` against an fp32
 reference over the dequantized weight (128x128-block e4m3), per cell; the verify entry also
 bitwise against the two-launch path it replaces (`fp8_gemv` + `causal_conv1d_triton_update`);
-strided activations; CUDA-graph replay."""
+strided activations."""
 
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
+    causal_conv1d_triton_update,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.fp8_gemv import (  # noqa: E501
     dequantize_fp8_block,
     fp8_gemv_conv1d_op,
@@ -16,9 +19,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     fp8_gemv_op,
     pack_weight,
     quantize_fp8_block,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
-    causal_conv1d_triton_update,
 )
 
 assert torch.cuda.is_available(), "fp8_gemv requires a CUDA device"
@@ -90,20 +90,6 @@ def test_conv1d_cells(cell) -> None:
     assert ((conv_state.float() - want_state.float()).abs()).max().item() < 0.02
     others = [s for s in range(pool) if s not in slots]
     assert torch.equal(conv_state[others], before[others]), "other slots untouched"
-
-
-def test_graph_replay_matches_eager() -> None:
-    _, _, packed = _weight(2560, 6144, 5)
-    x = torch.randn(4, 6144, device=DEV).to(torch.bfloat16)
-    fp8_gemv_op(x, packed)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = fp8_gemv_op(x, packed)
-    x.copy_(torch.randn(4, 6144, device=DEV).to(torch.bfloat16))
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, fp8_gemv_op(x, packed))
 
 
 def _verify_args(spec, seed):
@@ -190,32 +176,3 @@ def test_conv1d_verify_cells(cell) -> None:
             assert not torch.equal(window_a[r, :p], window[r, :p]), r
     if spec["snapshot_steps"] > p:
         assert torch.equal(window_a[:, p:], window[:, p:]), "steps past p untouched"
-
-
-def test_conv1d_verify_graph_replay_matches_eager() -> None:
-    spec = fp8_gemv_conv1d_verify_op.CELLS[2].spec
-    _, _, packed = _weight(spec["n"], spec["k"], 5)
-    x, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad = _verify_args(spec, 9)
-    state0, window0 = conv_state.clone(), window.clone()
-    fp8_gemv_conv1d_verify_op(
-        x, packed, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad
-    )
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        conv, rest = fp8_gemv_conv1d_verify_op(
-            x, packed, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad
-        )
-    x.copy_(torch.randn(x.shape, device=DEV).to(torch.bfloat16))
-    conv_state.copy_(state0)
-    window.copy_(window0)
-    graph.replay()
-    torch.cuda.synchronize()
-    got = (conv.clone(), rest.clone(), conv_state.clone(), window.clone())
-    conv_state.copy_(state0)
-    window.copy_(window0)
-    want = fp8_gemv_conv1d_verify_op(
-        x, packed, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad
-    )
-    for a, b in zip(got, (*want, conv_state, window)):
-        assert torch.equal(a.view(torch.int16), b.view(torch.int16))

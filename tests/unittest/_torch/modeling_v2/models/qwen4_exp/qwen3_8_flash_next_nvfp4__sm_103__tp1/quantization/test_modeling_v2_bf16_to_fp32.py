@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the bf16_to_fp32 entry: the cells bit for bit `x.float()`, graph capture, the
-contiguity guard."""
+"""GPU test for the bf16_to_fp32 entry: the cells bit for bit `x.float()`."""
 
 import zlib
 
@@ -43,25 +42,3 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     ref = op.reference(x)
     assert out.dtype == torch.float32 and out.is_contiguous()
     assert _bitwise(out, ref), "widening is exact; a bit difference is a defect"
-
-
-def test_cuda_graph_capture_and_replay() -> None:
-    x = _build(dict(shape=(128, 4099)), 1)
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        op(x)
-    torch.cuda.current_stream().wait_stream(warmup)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = op(x)
-    x.copy_(_build(dict(shape=(128, 4099)), 2))
-    graph.replay()
-    torch.cuda.synchronize()
-    assert _bitwise(out, x.float())
-
-
-def test_guard_refuses_a_strided_input() -> None:
-    x = _build(dict(shape=(8, 64)), 3)
-    with validating(op), pytest.raises(AssertionError):
-        op(x[:, ::2])

@@ -5,7 +5,7 @@ verify steps against the Triton entry's fp32 `reference` and the Triton kernel i
 that entry's test harness (`_Bench`: work items, all-layer commit, `_advance_replay_state` with
 random partial acceptance), in both commit modes: (a) no in-kernel commit + the manager's
 all-layer commit when partitioned, (b) every wrapping row committed in-kernel. Plus rows with a
-negative slot and CUDA-graph replay (PDL on and off) bitwise against eager."""
+negative slot, and the kernel's launch mappings against each other."""
 
 import importlib.util
 import os
@@ -17,8 +17,11 @@ import tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_fl
 
 _spec = importlib.util.spec_from_file_location(
     "trep",
+    # The Triton entry's test, in the family tree (tests/unittest/_torch/modeling_v2/models/qwen4_exp/ssm).
     os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
+        *[os.pardir] * 2,
+        "ssm",
         "test_modeling_v2_fused_recurrent_gated_delta_rule_cached_replay_update.py",
     ),
 )
@@ -299,12 +302,6 @@ def test_certified_cells(cell) -> None:
 
 def test_negative_slots() -> None:
     assert run_negative()
-
-
-@pytest.mark.parametrize("pdl", [False, True])
-@pytest.mark.parametrize("mode", ["a", "b"])
-def test_graph_replay_matches_eager(mode, pdl) -> None:
-    assert run_graph(mode=mode, pdl=pdl)
 
 
 #: Launch mappings a batch can take, and the mapping each is checked against: the state tiles

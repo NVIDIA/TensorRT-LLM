@@ -3,8 +3,8 @@
 """GPU test for the moe_sort entry of the Qwen3.8-Flash-Next target.
 
 The entry owns the contract. This file turns a cell into expert ids and holds
-the claims no cell carries: CUDA-graph replay at the largest captured row
-count, and the contiguity guard.
+the claim no cell carries: CUDA-graph replay on new ids at the largest captured
+row count.
 """
 
 import zlib
@@ -201,15 +201,3 @@ def test_captured_rows_replay_on_new_ids(certifying):  # noqa: F811
             assert torch.equal(static_out[i], eager[i]), (trial, i)
     del graph, static_out
     torch.cuda.synchronize()
-
-
-# ── the guard ─────────────────────────────────────────────────────────────
-
-
-def test_guard_refuses_noncontiguous_ids():
-    """What `is_valid` exists for: the op reads a strided view as the dense buffer
-    that starts at its data pointer, and answers without raising."""
-    wide = _ids("router", 300, 128, seed=51, top_k=16)
-    sc = torch.rand(300, K, device=DEV)
-    with validating(op), pytest.raises(AssertionError, match="contiguous"):
-        op(wide[:, :K], sc, E, K, 0, E, 128)

@@ -3806,6 +3806,7 @@ class PyExecutor:
                 self.disagg.prepare_context_schedulable(new_requests)
                 self.disagg.poll_gen_transfers()
                 self._activate_completed_remote_tails()
+                self._finish_gen_receives_at_length()
                 self._sweep_transfer_held_failures()
 
                 iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
@@ -5336,6 +5337,7 @@ class PyExecutor:
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
         self._activate_completed_remote_tails()
+        self._finish_gen_receives_at_length()
         self.disagg.check_transfer_timeouts()
         # After the polls so a transfer that completed this iteration releases
         # its parked failure before scheduling can admit the request.
@@ -9607,6 +9609,63 @@ class PyExecutor:
             req.py_draft_tokens = []
             req.py_kv_transfer_start_time = None
             req.py_kv_transfer_timed_out = False
+
+    def _finish_gen_receives_at_length(self) -> None:
+        """Finish received generation requests that the first token already completes.
+
+        A single-beam request with ``max_new_tokens <= 1`` is complete when the context
+        server's first token arrives, so it ends here by ``LENGTH`` instead of being scheduled
+        for a step past its limit. Under attention DP its response and termination wait for
+        ``_flush_pending_transfer_responses``, which every rank enters together.
+        """
+        done = [
+            req for req in self.active_requests
+            if req.is_disagg_generation_transmission_complete and getattr(
+                req, "py_csa2_remote_tail_mode", None) != "destination"
+            and req.py_beam_width == 1 and req.py_max_new_tokens <= 1
+        ]
+        if not done:
+            return
+        batch_token_time = self.perf_manager.get_timestamp()
+        responses = []
+        finished = []
+        for req in done:
+            if not self.disagg.try_finish_gen_receive(req):
+                continue
+            req.decoding_iter = 1
+            req.py_decoding_iter = 1
+            req.py_draft_tokens = []
+            req.draft_tokens = []
+            req.add_new_token(req.context_phase_params.first_gen_tokens[0], 0)
+            self._maybe_prepend_logprobs_and_logits(req, 1)
+            req.finish_by(FinishReason.LENGTH, 0)
+            self.perf_manager.append_step_metrics(
+                req, self.iter_counter, batch_token_time=batch_token_time)
+            if req.return_perf_metrics:
+                req.update_perf_metrics(self.iter_counter)
+            response = req.create_response()
+            if response is not None:
+                response.result.cached_tokens = req.cached_tokens
+                self._maybe_attach_ctx_usage(req, response)
+                responses.append((req.py_request_id, response))
+            finished.append(req)
+        if not finished:
+            return
+        first_token_timer = getattr(self, "_first_token_timer", None)
+        if first_token_timer is not None:
+            first_token_timer.observe(finished, time.monotonic())
+        finished_ids = {id(req) for req in finished}
+        self.active_requests[:] = [
+            req for req in self.active_requests if id(req) not in finished_ids
+        ]
+        if self.enable_attention_dp:
+            # Rank-local completions cannot enter a response gather here.
+            self._pending_transfer_responses.extend(responses)
+            self._pending_response_terminations.extend(finished)
+        else:
+            self._enqueue_responses(responses)
+            for req in finished:
+                self._terminate_request(req)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):

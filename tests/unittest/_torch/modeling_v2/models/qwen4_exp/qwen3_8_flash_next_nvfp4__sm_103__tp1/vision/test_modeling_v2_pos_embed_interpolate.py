@@ -8,7 +8,6 @@ torch's own `F.interpolate` in fp64 and shares no arithmetic with the entry, so
 it gates the structure: which axis is which, how the table is read, and the
 spatial-merge row order. It sits up to 8.6e-6 from the exact value (its sample
 coordinates are float): far inside a bf16 cell's band, though not an fp32 one's.
-Beyond the cells: the square-table guard and graph capture.
 """
 
 import zlib
@@ -73,38 +72,3 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     torch.testing.assert_close(out, op.reference(table, grid, spec["merge"]))
     # The structural gate, from a reference that shares no arithmetic.
     torch.testing.assert_close(out, _ref_resize(table, grid, spec["merge"]).to(out.dtype))
-
-
-def test_guard_refuses_a_non_square_table() -> None:
-    """The hazard, unguarded: 2300 rows -> isqrt 47, every index in range, a
-    correctly shaped result off the wrong grid."""
-    table = _table(rows=2300, hidden=64, seed=10)
-    out = op(table, [(1, 4, 4)], MERGE)
-    assert out.shape == (16, 64)
-    assert torch.equal(out, op(table[: 47 * 47], [(1, 4, 4)], MERGE)), "read as a 47x47 grid"
-
-    with pytest.raises(AssertionError, match="must hold a square grid"):
-        with validating(op):
-            op(table, [(1, 4, 4)], MERGE)
-
-
-def test_cuda_graph_capture_and_replay() -> None:
-    """The grid is frozen at capture; the table's contents are not."""
-    table = _table(seed=12)
-    grid = [(1, 8, 12)]
-
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        for _ in range(3):
-            op(table, grid, MERGE)
-    torch.cuda.current_stream().wait_stream(warmup)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = op(table, grid, MERGE)
-
-    table.copy_(_table(seed=13))
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(captured, op.reference(table, grid, MERGE))

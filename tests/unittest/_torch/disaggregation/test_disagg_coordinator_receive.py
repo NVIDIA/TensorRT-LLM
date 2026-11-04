@@ -7,7 +7,9 @@ admitted gen-init requests and starts their KV receive in the transfer mode
 the environment selects. Receive completion: the executor's
 ``_prepare_disagg_gen_transmission_complete`` prepares the batch, then asks the
 coordinator to finish each completed receive before initialising the request
-for generation.
+for generation; a received request that the context server's first token
+already completes (``max_new_tokens`` 1) is closed out before scheduling by
+``_finish_gen_receives_at_length``.
 
 Single-rank cases run one ``CoordinatorHarness``; the multi-rank case runs one
 per rank over a ``FakeDistGroup``.
@@ -28,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings.executor import FinishReason
 
 pytestmark = pytest.mark.cpu_only
 
@@ -771,3 +774,99 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
     assert h.transceiver.call_log == []
     assert [req.new_tokens for req in (first, second)] == [[], []]
     assert [req.decoding_iter for req in (first, second)] == [0, 0]
+
+
+# -- single-token close-out ---------------------------------------------------
+
+
+class _LengthRequest(_GenRequest):
+    """A received generation request that records how it is finished."""
+
+    def __init__(self, rid: int, max_new_tokens: int, **overrides) -> None:
+        defaults = dict(
+            py_max_new_tokens=max_new_tokens,
+            return_perf_metrics=False,
+            response=SimpleNamespace(result=SimpleNamespace()),
+            cached_tokens=5,
+        )
+        defaults.update(overrides)
+        super().__init__(rid, **defaults)
+        self.finished_reason = None
+
+    def finish_by(self, reason, beam: int) -> None:
+        self.state = LlmRequestState.GENERATION_COMPLETE
+        self.finished_reason = (reason, beam)
+
+
+def _closing_executor(coordinator: DisaggTransferCoordinator, active, attention_dp=False):
+    """Bare executor over ``coordinator`` whose response and termination sinks are mocks."""
+    executor = object.__new__(PyExecutor)
+    executor._disagg_coordinator = coordinator
+    executor.active_requests = list(active)
+    executor.enable_attention_dp = attention_dp
+    executor.iter_counter = 7
+    executor.perf_manager = Mock()
+    executor._enqueue_responses = Mock()
+    executor._terminate_request = Mock()
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    return executor
+
+
+def test_first_token_completes_a_single_token_request_before_scheduling() -> None:
+    """A received request with ``max_new_tokens`` 1 gets the context server's first
+    token, finishes by LENGTH with one terminal response carrying the context-side
+    cached tokens, its blocks committed for reuse, and leaves active_requests
+    terminated, so no generation step appends a second token. A longer request, one
+    still receiving and a beam-search request keep the regular path untouched."""
+    h = CoordinatorHarness()
+    single = _LengthRequest(1, max_new_tokens=1)
+    longer = _LengthRequest(2, max_new_tokens=8)
+    receiving = _LengthRequest(3, max_new_tokens=1, state=_RECEIVING)
+    beams = _LengthRequest(4, max_new_tokens=1, py_beam_width=2)
+    executor = _closing_executor(h.coordinator, [single, longer, receiving, beams])
+
+    executor._finish_gen_receives_at_length()
+
+    assert single.new_tokens == [(41, 0)]
+    assert single.finished_reason == (FinishReason.LENGTH, 0)
+    assert single.state_at_response_creation == LlmRequestState.GENERATION_COMPLETE
+    assert (single.decoding_iter, single.py_decoding_iter) == (1, 1)
+    assert single.response.result.cached_tokens == 5
+    executor._enqueue_responses.assert_called_once_with([(1, single.response)])
+    executor._terminate_request.assert_called_once_with(single)
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+    assert executor.active_requests == [longer, receiving, beams]
+    for req, state in ((longer, _COMPLETE), (receiving, _RECEIVING), (beams, _COMPLETE)):
+        assert req.state == state and req.new_tokens == [] and req.finished_reason is None
+    assert executor._pending_transfer_responses == []
+
+
+def test_single_token_close_out_waits_for_the_synced_flush_under_attention_dp() -> None:
+    """Under attention DP the response and the termination are buffered for
+    ``_flush_pending_transfer_responses`` instead of entering a rank-local gather."""
+    h = CoordinatorHarness()
+    single = _LengthRequest(1, max_new_tokens=1)
+    executor = _closing_executor(h.coordinator, [single], attention_dp=True)
+
+    executor._finish_gen_receives_at_length()
+
+    executor._enqueue_responses.assert_not_called()
+    executor._terminate_request.assert_not_called()
+    assert executor._pending_transfer_responses == [(1, single.response)]
+    assert executor._pending_response_terminations == [single]
+    assert executor.active_requests == []
+
+
+def test_nothing_to_close_out_touches_nothing() -> None:
+    """Without a completed single-token receive nothing is finished, enqueued or committed."""
+    h = CoordinatorHarness()
+    longer = _LengthRequest(2, max_new_tokens=4)
+    executor = _closing_executor(h.coordinator, [longer])
+
+    executor._finish_gen_receives_at_length()
+
+    executor._enqueue_responses.assert_not_called()
+    executor.perf_manager.get_timestamp.assert_not_called()
+    assert executor.active_requests == [longer] and longer.state == _COMPLETE
+    assert h.transceiver.call_log == []

@@ -194,10 +194,10 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl_fp8_kv_bf16_state:
   # accepted fails it.
   min_al: 3.334
 
-# test_mtp3_long_context_passkey: three drafts with IndexShare on, bf16 KV, over
-# 13 prompts of 3k-6k tokens (the sparse attention path). Most of the output is a copy of the
-# document's section headings, which the draft predicts almost always, so the readings sit
-# at the range's ceiling of 4.0.
+# test_mtp3_gsm8k_and_long_context, over its pass keys: three drafts with IndexShare on, bf16
+# KV, over 13 prompts of 3k-6k tokens (the sparse attention path). Most of the output is a copy
+# of the document's section headings, which the draft predicts almost always, so the readings
+# sit at the range's ceiling of 4.0.
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_long_context:
   # The same prompts with the draft layer selecting on every step (IndexShare off): 4.000,
   # equal to the IndexShare reading.
@@ -224,3 +224,15 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_nvfp4_kv_bf16_state_long_context:
   ref_al: 6.867
   # 2.5% below ref_al, as for mtp3_long_context.
   min_al: 6.69
+
+# Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context
+# (test_qwen4_exp.py), over the pass keys of the tp1 target's mtp3_long_context at tep4: three
+# drafts with IndexShare on, bf16 KV.
+ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context:
+  # modeling_v2's own reading on GB300, at the range's ceiling as the tp1 target's. The
+  # built-in implementation does not start this engine (its decode front's router GEMM
+  # asserts a power-of-two K), so there is no stock reading.
+  ref_al: 4.000
+  # 2.5% below ref_al, as for the tp1 target's mtp3_long_context, whose deliberately wrong
+  # reused selection scores 3.760.
+  min_al: 3.9

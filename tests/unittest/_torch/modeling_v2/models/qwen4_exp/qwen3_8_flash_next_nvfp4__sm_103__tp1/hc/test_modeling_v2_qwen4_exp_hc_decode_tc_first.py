@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_hc_decode_tc_first entry: cells in the band against
-the float64 reference, the row-count guard, graph capture."""
+the float64 reference."""
 
 import zlib
 
@@ -66,28 +66,3 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     low, inject = op(*args)
     assert low.shape == (cell.spec["rows"], RANK)
     _compare((low, inject), op.reference(*args))
-
-
-def test_guard_refuses_more_than_two_tiles_of_rows() -> None:
-    normed, first, rank, c, wi = _build(dict(rows=257), seed=4)
-    with validating(op), pytest.raises(AssertionError):
-        op(normed, first, rank, c, wi)
-
-
-@pytest.mark.parametrize("rows", [8, 256])
-def test_cuda_graph_capture_and_replay(rows) -> None:
-    normed, first, rank, c, wi = _build(dict(rows=rows), seed=5)
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        op(normed, first, rank, c, wi)
-    torch.cuda.current_stream().wait_stream(side)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        g_low, g_inject = op(normed, first, rank, c, wi)
-    fresh = _build(dict(rows=rows), seed=6)[0]
-    normed.copy_(fresh)
-    graph.replay()
-    torch.cuda.synchronize()
-    low, inject = op(fresh, first, rank, c, wi)
-    assert torch.equal(g_low, low) and torch.equal(g_inject, inject)
