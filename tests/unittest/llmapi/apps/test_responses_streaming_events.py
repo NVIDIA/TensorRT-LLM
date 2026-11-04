@@ -963,6 +963,7 @@ def _server_streaming(monkeypatch, steps):
     server._extract_metrics = AsyncMock()
 
     class Generation:
+        request_id = 1
         prompt_token_ids = [1, 2, 3]
         finished = False
 

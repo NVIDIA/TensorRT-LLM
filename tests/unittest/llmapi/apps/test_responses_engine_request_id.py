@@ -64,20 +64,19 @@ class _FinishedGeneration:
         return self._steps.pop()
 
 
-def _responses_client(tmp_path, monkeypatch, request_ids):
-    """A client of /v1/responses on a server whose engine names its requests ``request_ids``."""
+def _responses_client(tmp_path, monkeypatch, request_id):
+    """A client of /v1/responses on a server whose engine names its request ``request_id``."""
 
     async def preprocess(**kwargs):
         return [1, 2, 3], kwargs["request"].to_sampling_params()
 
     monkeypatch.setattr(server_module, "responses_api_request_preprocess", preprocess)
-    request_ids = iter(request_ids)
     model_config = type("ModelConfig", (), {"model_type": "qwen3", "vocab_size": 1024})()
     server = make_stub_openai_server(
         tmp_path,
         "test-model",
         model_config,
-        lambda **kwargs: _FinishedGeneration(next(request_ids)),
+        lambda **kwargs: _FinishedGeneration(request_id),
     )
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()
@@ -88,13 +87,11 @@ def _responses_client(tmp_path, monkeypatch, request_ids):
 
 @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
 def test_a_reply_names_its_engine_request_in_a_header(tmp_path, monkeypatch, stream):
-    """The header carries the engine's id for the request; without one there is no header."""
-    client = _responses_client(tmp_path, monkeypatch, request_ids=[42, None])
+    """The header carries the engine's id for the request."""
+    client = _responses_client(tmp_path, monkeypatch, request_id=42)
     body = {"model": "test-model", "input": "What is 2 + 2?", "stream": stream}
 
-    named = client.post("/v1/responses", json=body)
-    unnamed = client.post("/v1/responses", json=body)
+    reply = client.post("/v1/responses", json=body)
 
-    assert (named.status_code, unnamed.status_code) == (200, 200), named.text + unnamed.text
-    assert named.headers.get(_HEADER) == "42"
-    assert _HEADER not in unnamed.headers
+    assert reply.status_code == 200, reply.text
+    assert reply.headers.get(_HEADER) == "42"

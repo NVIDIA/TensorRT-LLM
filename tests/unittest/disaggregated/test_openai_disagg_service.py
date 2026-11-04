@@ -1032,6 +1032,32 @@ async def _generation_worker_answer(request, *_args, **_kwargs):
     return response
 
 
+async def _generation_worker_stream(request, *_args, **_kwargs):
+    """A generation worker's Responses stream, opened under the request_id it parsed."""
+    received = _as_a_worker_parses(request)
+    created = {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": received.request_id},
+    }
+    return _mock_streaming_response([b"data: " + msgspec.json.encode(created) + b"\n\n"])
+
+
+def _service_with_disagg_request_id_101(monkeypatch, schedule_style, generation_worker):
+    """A service that gives every request disaggregated request id 101."""
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service.is_ready = AsyncMock(return_value=True)
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(side_effect=_context_worker_answer)
+    service._gen_client.send_request = AsyncMock(side_effect=generation_worker)
+    return service
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
 async def test_only_a_responses_reply_is_named_after_the_disagg_request_id(
@@ -1043,16 +1069,9 @@ async def test_only_a_responses_reply_is_named_after_the_disagg_request_id(
     worker's engine request id. A Responses request the client named, and a chat
     request, go to the workers as they came.
     """
-    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
-    service = _make_service(schedule_style)
-    service.is_ready = AsyncMock(return_value=True)
-    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
-    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
-    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
-    service._ctx_client = AsyncMock()
-    service._gen_client = AsyncMock()
-    service._ctx_client.send_request = AsyncMock(side_effect=_context_worker_answer)
-    service._gen_client.send_request = AsyncMock(side_effect=_generation_worker_answer)
+    service = _service_with_disagg_request_id_101(
+        monkeypatch, schedule_style, _generation_worker_answer
+    )
 
     def responses(**fields):
         request = ResponsesRequest(model="test-model", input="hello", **fields)
@@ -1077,6 +1096,29 @@ async def test_only_a_responses_reply_is_named_after_the_disagg_request_id(
     assert context_names == [first.id, second.id, "resp_client"]
     assert client_named.id == "resp_client"
     assert chat.id == "chatcmpl-7"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_a_streamed_responses_reply_is_named_after_the_disagg_request_id(
+    monkeypatch, schedule_style
+):
+    """A streamed reply opens under ``resp_<disagg_request_id>_<16 hex>``, the name both workers get."""
+    service = _service_with_disagg_request_id_101(
+        monkeypatch, schedule_style, _generation_worker_stream
+    )
+
+    stream = await service.openai_responses(
+        ResponsesRequest(model="test-model", input="hello", stream=True)
+    )
+    events = [event async for event in stream]
+
+    assert len(events) == 1, events
+    created = msgspec.json.decode(events[0].removeprefix(b"data: "))
+    name = created["response"]["id"]
+    assert re.fullmatch(r"resp_101_[0-9a-f]{16}", name)
+    for worker in (service._ctx_client, service._gen_client):
+        assert _as_a_worker_parses(worker.send_request.call_args.args[0]).request_id == name
 
 
 @pytest.mark.asyncio

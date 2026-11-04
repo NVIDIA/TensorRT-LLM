@@ -213,20 +213,16 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds.
 ENGINE_REQUEST_ID_HEADER = "x-trtllm-engine-request-id"
 
 
-def _engine_request_id_headers(
-        promise: RequestOutput) -> Optional[Dict[str, str]]:
+def _engine_request_id_headers(promise: RequestOutput) -> Dict[str, str]:
     """The response headers that name the engine request behind ``promise``.
 
     A /v1/responses reply is named with a random ``resp_`` id, while the
     server's log lines, perf metrics and post-processor hook name a request by
     the id the engine gave it. ENGINE_REQUEST_ID_HEADER carries that id, so a
-    reply can be matched with them. None, so no header is sent, when the
-    promise carries no request id.
+    reply can be matched with them. The executor gives a request its id when
+    it accepts it, so ``promise`` always has one.
     """
-    request_id = getattr(promise, "request_id", None)
-    if request_id is None:
-        return None
-    return {ENGINE_REQUEST_ID_HEADER: str(request_id)}
+    return {ENGINE_REQUEST_ID_HEADER: str(promise.request_id)}
 
 
 _warned_unresolvable_thinking = False

@@ -112,6 +112,11 @@ def _name_responses_reply(request: UCompletionRequest, disagg_request_id: int) -
     The name is given once, before any worker sees the request, so it stays the
     same if a retried context request gets a new disaggregated request id. A
     ``request_id`` the client set is kept, and other requests are left alone.
+
+    The workers get the name only because assigning a field adds it to
+    pydantic's ``model_fields_set``: ``_encode_request_body`` forwards set
+    fields only (``exclude_unset=True``), and an unset ``request_id`` would
+    leave each worker to draw its own from the field's default factory.
     """
     if isinstance(request, ResponsesRequest) and "request_id" not in request.model_fields_set:
         request.request_id = f"resp_{disagg_request_id}_{os.urandom(8).hex()}"
