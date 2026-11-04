@@ -942,11 +942,15 @@ def test_stamping_leaves_a_frame_without_its_own_number_alone(frame):
     assert _stamp_sequence_number(frame, 7) == frame
 
 
-def _server_streaming(monkeypatch, steps):
-    """An OpenAIServer whose generator streams ``steps`` as (pause, text) pairs."""
+def _server_streaming(monkeypatch, steps, yielded_at=None):
+    """An OpenAIServer whose generator streams ``steps`` as (pause, text) pairs.
+
+    The server clock's time as the generator yields each result is appended to ``yielded_at``.
+    """
     import tensorrt_llm.serve.openai_server as server_module
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
+    yielded_at = [] if yielded_at is None else yielded_at
     server = object.__new__(OpenAIServer)
     server.model = "test-model"
     server.enable_store = False
@@ -992,6 +996,7 @@ def _server_streaming(monkeypatch, steps):
             await asyncio.sleep(pause)
             self._text += diff
             self._take(_step(self._text, diff, done=i == len(steps) - 1))
+            yielded_at.append(server._adjusted_steady_clock.now())
             return self
 
     server.generator = SimpleNamespace(
@@ -1050,18 +1055,43 @@ async def test_a_promise_finished_before_the_stream_reads_it_ends_normally(monke
 @pytest.mark.asyncio
 async def test_the_first_token_time_is_taken_at_the_first_result(monkeypatch):
     """The TTFT the perf metrics record is the wait for the first result, not the whole stream."""
-    server = _server_streaming(monkeypatch, [(0.1, "Hello"), (0.3, " world")])
+    yielded_at = []
+    server = _server_streaming(monkeypatch, [(0.1, "Hello"), (0.3, " world")], yielded_at)
     request = ResponsesRequest(model="test-model", input="hi", stream=True)
     raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
-    clock = server._adjusted_steady_clock
 
-    start = clock.now()
     response = await server.openai_responses(request, raw_request)
     await _collect(response.body_iterator)
-    end = clock.now()
 
     first = getattr(raw_request.state, "server_first_token_time", None)
     assert first is not None, "the stream did not record its first-token time"
-    assert start <= first <= end
-    # The second step's 0.3 s pause comes after the first result.
-    assert end - first >= 0.25
+    # Taken once the first result is in, and before the second one is.
+    assert yielded_at[0] <= first < yielded_at[1]
+
+
+@pytest.mark.asyncio
+async def test_a_single_result_from_a_postprocessing_worker_is_streamed(monkeypatch):
+    """With postprocessing workers the route streams the frames a worker made for the one result."""
+    worker = _processor()
+    result = _step("Hello", "Hello", done=True)
+    frames = worker.process_single_output(result) + [worker.get_final_response_non_store(result)]
+
+    async def generation():
+        # Only the frames the worker made: the server must not post-process the result itself.
+        yield SimpleNamespace(outputs=[SimpleNamespace(_postprocess_result=frames)])
+
+    server = _server_streaming(monkeypatch, steps=[])
+    server.generator.args.num_postprocess_workers = 1
+    server.generator.generate_async = lambda **kwargs: generation()
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(request, raw_request)
+    sent = await _collect(response.body_iterator)
+
+    types = [_event_type(f) for f in sent]
+    assert types[:2] == ["response.created", "response.in_progress"]
+    assert sent[2:] == frames
+    assert "response.output_text.delta" in types
+    assert types[-1] == "response.completed"
+    server._extract_metrics.assert_awaited_once()
