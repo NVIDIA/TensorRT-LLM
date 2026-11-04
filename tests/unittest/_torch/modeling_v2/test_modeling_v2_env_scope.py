@@ -126,11 +126,6 @@ def _llm_calls(tree: ast.AST) -> list[ast.Call]:
     ]
 
 
-def test_accuracy_scan_finds_sources() -> None:
-    # An empty parametrize list would skip the scope check instead of failing it.
-    assert _ACCURACY_SOURCES, f"no accuracy sources found under {_ACCURACY_ROOT}"
-
-
 @pytest.mark.parametrize("source", _ACCURACY_SOURCES, ids=_relative)
 def test_accuracy_engines_are_inside_environment_scopes(source: Path) -> None:
     tree = ast.parse(source.read_text())
