@@ -736,8 +736,18 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             scope.startWithLazyName([&] { return srcIsHot ? "trtllm::kv_cache_offload" : "trtllm::kv_cache_restore"; },
                 [&](common::ProfilerMetadata& metadata)
                 {
+                    PoolGroupIndex const hotPgIdx = srcIsHot ? srcPgIdx : dstPgIdx;
+                    auto const& hotSizes = slotSize(kHotLevel, hotPgIdx);
+                    size_t devicePageBytes = 0;
+                    for (PoolIndex poolIdx{0}; poolIdx < hotSizes.size(); ++poolIdx)
+                    {
+                        if (poolMedium(kHotLevel, hotPgIdx, poolIdx) == CacheTier::GPU_MEM)
+                        {
+                            devicePageBytes += hotSizes.at(poolIdx);
+                        }
+                    }
                     ::tensorrt_llm::batch_manager::detail::addKvTransferMetadata(
-                        metadata, srcIsHot, "v2", coldPageBytes, numPages, stream);
+                        metadata, srcIsHot, "v2", devicePageBytes, numPages, stream);
                 });
         }
 #endif

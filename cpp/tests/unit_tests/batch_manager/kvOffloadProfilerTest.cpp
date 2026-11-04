@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -188,9 +189,18 @@ class V2KvOffloadProfilerTest : public KvOffloadProfilerTest, public ::testing::
 {
 };
 
-void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
+void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected, bool mixedPools = false)
 {
+    constexpr size_t kDevicePageBytes = 4096;
+    constexpr size_t kSparsePageBytes = 8192;
     auto config = v2::test::makeConfig();
+    if (mixedPools)
+    {
+        auto& layer = std::get<v2::AttentionLayerConfig>(config.layers[0]);
+        v2::BufferConfig sparseBuffer{"sparse", kSparsePageBytes, std::nullopt};
+        sparseBuffer.isSparse = true;
+        layer.buffers.push_back(std::move(sparseBuffer));
+    }
     switch (coldTier)
     {
     case v2::CacheTier::HOST_MEM: config.cacheTiers.emplace_back(v2::HostCacheTierConfig{4 << 20}); break;
@@ -208,7 +218,33 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
     auto const coldLevel = v2::CacheLevel{1};
     auto const coldGroup = storage.getPoolGroupIndex(coldLevel, lifeCycle);
     auto const coldBytes = storage.slotSize(coldLevel, coldGroup).at(v2::PoolIndex{0});
-    auto const hotBytes = storage.slotSize(v2::kHotLevel, hotGroup).at(v2::PoolIndex{0});
+    auto const& hotSizes = storage.slotSize(v2::kHotLevel, hotGroup);
+    ASSERT_EQ(storage.cacheTier(v2::kHotLevel), v2::CacheTier::GPU_MEM);
+    ASSERT_EQ(hotSizes.size(), v2::PoolIndex{mixedPools ? 2 : 1});
+    int devicePools = 0;
+    int hostPools = 0;
+    for (v2::PoolIndex pool{0}; pool < hotSizes.size(); ++pool)
+    {
+        auto const medium = storage.poolMedium(v2::kHotLevel, hotGroup, pool);
+        if (medium == v2::CacheTier::GPU_MEM)
+        {
+            ++devicePools;
+            EXPECT_EQ(hotSizes.at(pool), kDevicePageBytes);
+        }
+        else
+        {
+            ASSERT_EQ(medium, v2::CacheTier::HOST_MEM);
+            ++hostPools;
+            EXPECT_EQ(hotSizes.at(pool), kSparsePageBytes);
+        }
+    }
+    ASSERT_EQ(devicePools, 1);
+    ASSERT_EQ(hostPools, mixedPools ? 1 : 0);
+    ASSERT_EQ(coldBytes, kDevicePageBytes + (mixedPools ? kSparsePageBytes : 0));
+    if (mixedPools)
+    {
+        ASSERT_GT(coldBytes, kDevicePageBytes);
+    }
     std::vector<v2::TokenIdExt> tokens;
     for (int index = 0; index < 8; ++index)
     {
@@ -220,9 +256,21 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
     ASSERT_TRUE(source->resize(8));
     for (int page = 0; page < 2; ++page)
     {
-        auto const address = std::get<v2::MemAddress>(storage.slotAddress(
-            v2::kHotLevel, hotGroup, v2::SlotId{source->getBasePageIndices(lifeCycle)[page]}, v2::PoolIndex{0}));
-        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), 0x5A, hotBytes, stream->get()), cudaSuccess);
+        auto const slot = v2::SlotId{source->getBasePageIndices(lifeCycle)[page]};
+        for (v2::PoolIndex pool{0}; pool < hotSizes.size(); ++pool)
+        {
+            auto const address = std::get<v2::MemAddress>(storage.slotAddress(v2::kHotLevel, hotGroup, slot, pool));
+            int const pattern = 0x5A + pool.value();
+            if (storage.poolMedium(v2::kHotLevel, hotGroup, pool) == v2::CacheTier::HOST_MEM)
+            {
+                std::memset(reinterpret_cast<void*>(address), pattern, hotSizes.at(pool));
+            }
+            else
+            {
+                ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), pattern, hotSizes.at(pool), stream->get()),
+                    cudaSuccess);
+            }
+        }
     }
     source->commit(span);
     source->close();
@@ -234,10 +282,27 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
     // Repeating the satisfied requirement must not submit another migration.
     storage.prepareFreeSlots(v2::kHotLevel, goals);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    // Allocation waits for all host-backed slots to finish their background fill.
+    auto hotSlots = storage.newSlotsForPoolGroup(v2::kHotLevel, hotGroup, goals[hotGroup]);
     // Overwrite recycled hot memory so a missing restore cannot reuse the original bytes.
-    auto const base
-        = std::get<v2::MemAddress>(storage.slotAddress(v2::kHotLevel, hotGroup, v2::SlotId{0}, v2::PoolIndex{0}));
-    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(base), 0, hotBytes * goals[hotGroup]), cudaSuccess);
+    for (v2::PoolIndex pool{0}; pool < hotSizes.size(); ++pool)
+    {
+        auto const base = std::get<v2::MemAddress>(storage.slotAddress(v2::kHotLevel, hotGroup, v2::SlotId{0}, pool));
+        size_t const bytes = hotSizes.at(pool) * v2::slotCountToSizeT(goals[hotGroup]);
+        if (storage.poolMedium(v2::kHotLevel, hotGroup, pool) == v2::CacheTier::HOST_MEM)
+        {
+            std::memset(reinterpret_cast<void*>(base), 0, bytes);
+        }
+        else
+        {
+            ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(base), 0, bytes, stream->get()), cudaSuccess);
+        }
+    }
+    stream->synchronize();
+    for (auto& slot : hotSlots)
+    {
+        storage.releaseSlot(lifeCycle, v2::kHotLevel, std::move(slot));
+    }
     auto restored = manager->createKvCache({}, span, 2);
     ASSERT_EQ(restored->numCommittedTokens(), 8);
     // Drive StorageManager::prefetch through the public cache API, including a no-work repeat.
@@ -247,12 +312,16 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
     stream->synchronize();
     for (int page = 0; page < 2; ++page)
     {
-        auto const address = std::get<v2::MemAddress>(storage.slotAddress(
-            v2::kHotLevel, hotGroup, v2::SlotId{restored->getBasePageIndices(lifeCycle)[page]}, v2::PoolIndex{0}));
-        std::vector<unsigned char> bytes(hotBytes);
-        ASSERT_EQ(cudaMemcpy(bytes.data(), reinterpret_cast<void const*>(address), hotBytes, cudaMemcpyDeviceToHost),
-            cudaSuccess);
-        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](auto byte) { return byte == 0x5A; }));
+        auto const slot = v2::SlotId{restored->getBasePageIndices(lifeCycle)[page]};
+        for (v2::PoolIndex pool{0}; pool < hotSizes.size(); ++pool)
+        {
+            auto const address = std::get<v2::MemAddress>(storage.slotAddress(v2::kHotLevel, hotGroup, slot, pool));
+            std::vector<unsigned char> bytes(hotSizes.at(pool));
+            ASSERT_EQ(cudaMemcpy(bytes.data(), reinterpret_cast<void const*>(address), bytes.size(), cudaMemcpyDefault),
+                cudaSuccess);
+            int const pattern = 0x5A + pool.value();
+            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [pattern](auto byte) { return byte == pattern; }));
+        }
     }
     if (!selected || coldTier != v2::CacheTier::HOST_MEM)
     {
@@ -273,10 +342,13 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
             EXPECT_TRUE(value.metadata.empty());
             continue;
         }
+        expectField(value, index == 0 ? "'kv.operation':'offload'" : "'kv.operation':'restore'");
+        expectField(value, index == 0 ? "'kv.source_tier':'gpu'" : "'kv.source_tier':'host'");
+        expectField(value, index == 0 ? "'kv.destination_tier':'host'" : "'kv.destination_tier':'gpu'");
         expectField(value, "'kv.manager_version':'v2'");
         expectField(value, "'kv.copy_count':2");
-        expectField(value, "'kv.bytes_per_copy':" + std::to_string(coldBytes));
-        expectField(value, "'kv.payload_bytes':" + std::to_string(2 * coldBytes));
+        expectField(value, "'kv.bytes_per_copy':" + std::to_string(kDevicePageBytes));
+        expectField(value, "'kv.payload_bytes':" + std::to_string(2 * kDevicePageBytes));
         std::string const streamField = "'kv.cuda_stream_id':";
         auto const fieldPosition = value.metadata.find(streamField);
         ASSERT_NE(fieldPosition, std::string::npos) << value.metadata;
@@ -292,6 +364,11 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
 TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
 {
     expectV2RoundTrip(v2::CacheTier::HOST_MEM, GetParam(), true);
+}
+
+TEST_P(V2KvOffloadProfilerTest, MixedPoolsReportOnlyDevicePayload)
+{
+    expectV2RoundTrip(v2::CacheTier::HOST_MEM, GetParam(), true, true);
 }
 
 INSTANTIATE_TEST_SUITE_P(CallbackInputs, V2KvOffloadProfilerTest, ::testing::Bool());
