@@ -18,6 +18,9 @@ l0_gb300_multi_gpus:
   # MiniMax-M3 target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/comm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/comm
+  # qwen4_exp FP8 target: its 2- and 4-rank collective matrices (tp_sum, the attention-DP
+  # gather and scatter), which skip on the single-GPU l0_b300 stage that collects them.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
@@ -40,6 +43,18 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_disaggregated_dep2 TIMEOUT (90)
+  # qwen4_exp FP8 target, post-merge: gsm8k without speculation at tp1, tep2 (tp2 runs its
+  # forward) and tp4; three drafts at tep4 and dep4; FP8 KV with block reuse and chunked
+  # prefill at dep4; the breakable prefill graph at tep4; and dep2 context and generation
+  # engines on one node.
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_gsm8k[tp1] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_gsm8k[tep2] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_gsm8k[tp4] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[tep4] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[dep4] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_gsm8k_breakable_prefill TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_disaggregated_dep2 TIMEOUT (90)
   # qwen4_exp tp1 target, post-merge: its AgentX engines (NVFP4 KV, MTP2 with rejection
   # sampling, the breakable prefill graph, every opt-in projection) on one context and one
   # generation GPU.

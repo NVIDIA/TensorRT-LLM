@@ -5,7 +5,9 @@
 `qwen4_exp` routes one rank to the tp1 target, and to the default target tp4 and tep4 with
 or without MTP and the attention-DP layouts dep4 (with or without MTP) and dep2 (the
 disaggregated-serving engines' layout, without speculation), neither with a breakable
-prefill graph. The layouts neither target serves fall back under `auto`.
+prefill graph. The layouts neither target serves fall back under `auto`. The configs carry the
+NVFP4 checkpoint's quantization (MIXED_PRECISION): the same geometry at another quantization
+is another checkpoint, which neither NVFP4 target claims.
 """
 
 from dataclasses import replace
@@ -111,13 +113,20 @@ def _qwen4_exp_config(text_overrides=None, **vision_overrides):
     )
 
 
-def _model_config(spec_config=None, pretrained_config=None, **mapping_kwargs) -> ModelConfig:
-    """The loaded config; the checkpoint's own KV is bf16 (no KV-cache algorithm)."""
+# The quantization the engine resolves for Qwen3.8-Flash-Next-NVFP4 (its hf_quant_config).
+_NVFP4_QUANT_ALGO = QuantAlgo.MIXED_PRECISION
+
+
+def _model_config(
+    spec_config=None, pretrained_config=None, quant_algo=_NVFP4_QUANT_ALGO, **mapping_kwargs
+) -> ModelConfig:
+    """The loaded config: the NVFP4 checkpoint's quantization unless `quant_algo` says
+    otherwise, and its own KV in bf16 (no KV-cache algorithm)."""
     return ModelConfig(
         pretrained_config=pretrained_config or _qwen4_exp_config(),
         mapping=Mapping(**mapping_kwargs),
         spec_config=spec_config,
-        quant_config=QuantConfig(kv_cache_quant_algo=None),
+        quant_config=QuantConfig(quant_algo=quant_algo, kv_cache_quant_algo=None),
     )
 
 
@@ -298,6 +307,24 @@ def test_other_layouts_at_four_ranks_decline(mapping_kwargs):
 )
 def test_unsupported_speculation_declines(spec_config):
     _declined(_model_config(spec_config, **_LAYOUTS["tep4"]))
+
+
+@pytest.mark.parametrize("quant_algo", [None, QuantAlgo.NVFP4], ids=["bf16", "nvfp4"])
+def test_another_quantization_declines(quant_algo):
+    """`route` keys on the quantization before the layout, so one member stands for all."""
+    config = _model_config(quant_algo=quant_algo, **_LAYOUTS["tep4"])
+    _declined(config, match=f"quantization {quant_algo or 'none'}")
+
+
+@pytest.mark.parametrize("member", ["tp1", "tep4"])
+def test_the_fp8_checkpoint_is_not_the_nvfp4_targets(member):
+    """Qwen3.8-Flash-Next-FP8 shares every shape with the NVFP4 export; its FP8_BLOCK_SCALES
+    experts are not what either NVFP4 target loads, whichever target the family routes it to.
+    One rank (the tp1 target's branch) and one four-rank member (the default target's)."""
+    mapping_kwargs = dict(_LAYOUTS, tp1={})[member]
+    config = _model_config(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, **mapping_kwargs)
+    target = modeling_v2_resolve(config, _llm_args("auto"))
+    assert target is None or _qualified(target) not in (_TARGET, _TP1_TARGET)
 
 
 def test_another_checkpoint_shape_declines():

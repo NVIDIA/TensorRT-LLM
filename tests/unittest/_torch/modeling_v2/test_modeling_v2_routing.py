@@ -146,13 +146,24 @@ def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
 
 # Stands for "whatever this checkpoint's own hf_quant_config declares".
 _CHECKPOINT_KV = object()
+_CHECKPOINT_QUANT = object()
+
+# The weight quantization the engine resolves for the checkpoints whose route keys on it:
+# Qwen3.8-Flash-Next-NVFP4's hf_quant_config declares MIXED_PRECISION. The other routes read
+# none, so their configs leave it unset.
+_CHECKPOINT_QUANT_ALGOS = {"Qwen4ExpForConditionalGeneration": QuantAlgo.MIXED_PRECISION}
 
 
 def _model_config(
-    pretrained_config, spec_config=None, kv_cache_quant_algo=_CHECKPOINT_KV, **mapping_kwargs
+    pretrained_config,
+    spec_config=None,
+    kv_cache_quant_algo=_CHECKPOINT_KV,
+    quant_algo=_CHECKPOINT_QUANT,
+    **mapping_kwargs,
 ):
     """The loaded config. Its KV-cache algorithm is the checkpoint's own: FP8 for
-    DeepSeek-R1-0528-NVFP4 and GLM-5.2-NVFP4, none (a bf16 pool) for the others."""
+    DeepSeek-R1-0528-NVFP4 and GLM-5.2-NVFP4, none (a bf16 pool) for the others; its weight
+    quantization is `_CHECKPOINT_QUANT_ALGOS`'s."""
     mapping = Mapping(**mapping_kwargs) if mapping_kwargs else Mapping()
     if kv_cache_quant_algo is _CHECKPOINT_KV:
         fp8_kv = pretrained_config.architectures[0] in (
@@ -160,11 +171,13 @@ def _model_config(
             "GlmMoeDsaForCausalLM",
         )
         kv_cache_quant_algo = QuantAlgo.FP8 if fp8_kv else None
+    if quant_algo is _CHECKPOINT_QUANT:
+        quant_algo = _CHECKPOINT_QUANT_ALGOS.get(pretrained_config.architectures[0])
     return ModelConfig(
         pretrained_config=pretrained_config,
         mapping=mapping,
         spec_config=spec_config,
-        quant_config=QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo),
+        quant_config=QuantConfig(quant_algo=quant_algo, kv_cache_quant_algo=kv_cache_quant_algo),
     )
 
 
@@ -173,7 +186,8 @@ _NGRAM = NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2)
 
 
 def _qwen4_exp_config(**vision_overrides):
-    """The shape Qwen3.8-Flash-Next-NVFP4's normalized composite config declares."""
+    """The shape Qwen3.8-Flash-Next's normalized composite config declares (NVFP4 and FP8
+    alike; `_model_config` gives it the NVFP4 checkpoint's quantization)."""
     text = PretrainedConfig(
         num_hidden_layers=48,
         hidden_size=2560,
@@ -1123,6 +1137,26 @@ def test_qwen4_exp_unsupported_speculation_falls_back(spec_config):
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("quant_algo", [None, QuantAlgo.NVFP4], ids=["bf16", "nvfp4"])
+def test_qwen4_exp_another_quantization_does_not_match(quant_algo):
+    """The NVFP4 targets read the checkpoint's MIXED_PRECISION experts; the same geometry at
+    another quantization is another checkpoint."""
+    config = _model_config(_qwen4_exp_config(), quant_algo=quant_algo)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=f"quantization {quant_algo or 'none'}"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_fp8_checkpoint_is_not_the_nvfp4_targets():
+    """Qwen3.8-Flash-Next-FP8 shares every shape with the NVFP4 export; its FP8_BLOCK_SCALES
+    experts are not what the NVFP4 tp1 target loads."""
+    config = _model_config(_qwen4_exp_config(), quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    target = modeling_v2_resolve(config, _llm_args("auto"))
+    assert target is None or not _qualified(target).startswith(_QWEN4_EXP_TARGET)
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
