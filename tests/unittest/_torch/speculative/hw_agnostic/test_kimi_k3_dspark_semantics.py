@@ -1034,7 +1034,9 @@ def _tiny_mla_weights(seed=11):
     return w
 
 
-def _build_mla_drafter(weights, *, dflash_attention_backend="TRTLLM", context_kv_only=False):
+def _build_mla_drafter(
+    weights, *, dflash_attention_backend="TRTLLM", context_kv_only=False, context_kv_dtype="auto"
+):
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
@@ -1043,6 +1045,7 @@ def _build_mla_drafter(weights, *, dflash_attention_backend="TRTLLM", context_kv
         model_config,
         dflash_attention_backend=dflash_attention_backend,
         context_kv_only=context_kv_only,
+        context_kv_dtype=context_kv_dtype,
     ).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -1505,7 +1508,12 @@ def test_mla_dspark_fused_rope_is_bitwise(context_kv_fp8):
 
     torch.manual_seed(0)
     weights = _tiny_mla_weights()
-    drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+    # An FP8 pool is bound only to a drafter built for it (context_kv_dtype="fp8").
+    drafter = _build_mla_drafter(
+        weights,
+        dflash_attention_backend="CUTEDSL",
+        context_kv_dtype="fp8" if context_kv_fp8 else "auto",
+    )
     if not drafter._fused_mla_rope:
         pytest.skip("the fused MLA RoPE kernels do not fit here")
     g = torch.Generator().manual_seed(42)
@@ -1547,7 +1555,9 @@ def test_mla_dspark_fp8_query_head_agrees_to_drafter_rounding():
 
     torch.manual_seed(0)
     weights = _tiny_mla_weights()
-    drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+    drafter = _build_mla_drafter(
+        weights, dflash_attention_backend="CUTEDSL", context_kv_dtype="fp8"
+    )
     if not drafter._fused_mla_qhead:
         pytest.skip("the folded MLA query head does not fit here")
     g = torch.Generator().manual_seed(7)
