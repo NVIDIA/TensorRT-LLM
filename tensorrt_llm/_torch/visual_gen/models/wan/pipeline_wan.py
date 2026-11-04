@@ -140,7 +140,9 @@ class WanPipeline(BasePipeline):
         # noise tensor; it will be used in place of freshly sampled random latents for
         # all T2V requests. Loaded on first use: torch.load fails under MetaInitMode.
         self._fixed_latent: Optional[torch.Tensor] = None
-        self._fixed_latent_path: Optional[str] = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
+        self._fixed_latent_path: Optional[str] = (
+            os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH") or None
+        )
 
         super().__init__(pipeline_config)
         # CUDA graphs capture the VSA partition/mask tensor addresses. Keep
