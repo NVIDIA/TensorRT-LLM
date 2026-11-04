@@ -998,6 +998,17 @@ def test_lamport_step_selection() -> None:
     assert not carries(1, hidden, sf, weights, None)
 
 
+def test_lamport_refused_with_forced_cft(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT", "1")
+    comm = SimpleNamespace(_force_cft=True)
+    with pytest.raises(ValueError, match="both ask for every eligible step"):
+        NVLinkOneSided._setup_lamport(
+            comm, None, 7168, torch.bfloat16, "BF16", fault_tolerant=False
+        )
+
+
 # ============================================================================
 # CFT path selection and capability checks
 # ============================================================================
