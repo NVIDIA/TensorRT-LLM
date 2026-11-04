@@ -302,7 +302,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
 
     def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
         """The fused kernel's persistent grid launches enough whole clusters fewer to leave
-        ``num_sms`` SMs without an FC12 CTA (``sm_reserve`` of the op)."""
+        ``num_sms`` SMs without an FC12 CTA, and the small-batch kernel's grid that many CTAs
+        fewer (``sm_reserve`` of either op)."""
         if num_sms < 0:
             raise ValueError(f"num_sms must be non-negative, got {num_sms}")
         self._concurrent_sm_reserve = num_sms
@@ -614,6 +615,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             push_flags=push.flags if push is not None else None,
             push_rank=push.rank if push is not None else 0,
             push_world=push.world if push is not None else 0,
+            sm_reserve=self._concurrent_sm_reserve,
         )
         return moe_output
 

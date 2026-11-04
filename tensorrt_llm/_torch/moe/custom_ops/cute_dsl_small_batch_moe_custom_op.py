@@ -24,7 +24,7 @@ import functools
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from ...cute_dsl_utils import sm_reserve as global_sm_reserve
 
 __all__ = [
     "SMALL_BATCH_MOE_MAX_TOKENS",
@@ -39,9 +39,6 @@ __all__ = [
 SMALL_BATCH_MOE_MAX_TOKENS = 32
 #: Tiles the counter buffer holds (moe_sort's padded rows / 128 at <= 32 tokens).
 _MAX_TILES = 1024
-#: Persistent CTAs per token tile by SM version (others: one per SM). On Rubin the grid leaves
-#: SMs free for the shared expert, which runs on a concurrent stream.
-_PERSISTENT_CTAS = {107: {8: 204, 16: 196, 32: 180}}
 #: (claim_free, max_slices) of the expert-parallel (permuted) layout and of the token-indexed
 #: layout of MoE-TP slices. Small intermediates make FC2 tasks short, so the token-indexed schedule
 #: claims an FC2 task only once 4 ring stages are free for it and splits the tiles into more
@@ -96,9 +93,10 @@ def small_batch_moe_route_word(counters: torch.Tensor) -> torch.Tensor:
 
 
 @functools.cache
-def _persistent_ctas(device_index: int, n_tok: int) -> int:
+def _persistent_ctas(device_index: int, sm_reserve: int) -> int:
+    """One CTA per SM less the ``sm_reserve`` SMs left free, never below one."""
     num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return min(_PERSISTENT_CTAS.get(get_sm_version(), {}).get(n_tok, num_sms), num_sms)
+    return max(1, num_sms - sm_reserve)
 
 
 class _SmallBatchMoeRunner:
@@ -139,6 +137,7 @@ class _SmallBatchMoeRunner:
         push_flags: torch.Tensor | None,
         push_rank: int,
         push_world: int,
+        sm_reserve: int,
     ) -> None:
         import cutlass
         import cutlass.cute as cute
@@ -193,7 +192,7 @@ class _SmallBatchMoeRunner:
             # the push follows the slice combine
             deterministic_combine = True
         if num_ctas <= 0:
-            num_ctas = _persistent_ctas(x.device.index, n_tok)
+            num_ctas = _persistent_ctas(x.device.index, sm_reserve + global_sm_reserve())
         h = torch.empty(m, k2 // 2, dtype=torch.uint8, device=x.device)
         h_sf = torch.empty(
             (m // 128) * RubinSmallBatchFusedMoeKernel.h_sf_tile_bytes(n1),
@@ -338,6 +337,7 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     push_flags: torch.Tensor | None = None,
     push_rank: int = 0,
     push_world: int = 0,
+    sm_reserve: int = 0,
 ) -> None:
     """Routed NVFP4 SiTU MoE of at most 32 tokens: writes the sum of this rank's experts'
     weighted down-projections into every element of ``output`` [tokens, hidden].
@@ -347,8 +347,10 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     ``[gate16, up16]`` order); the six ``moe_sort`` tables of tile size 128; ``global_sf``: the FC2
     input scale; ``counters``: from :func:`new_small_batch_moe_counters`, zero again afterwards.
     ``token_indexed``: the token-indexed FC1 output layout (MoE-TP slices of the intermediate).
-    ``num_ctas`` > 0 overrides the persistent CTA count. ``deterministic_combine``: the
-    schedule-independent slice combine instead of BF16 vector reds (a test reference).
+    ``num_ctas`` > 0 overrides the persistent CTA count, which is otherwise one per SM less
+    ``sm_reserve`` (SMs left to concurrent kernels) and ``cute_dsl_utils.sm_reserve()``.
+    ``deterministic_combine``: the schedule-independent slice combine instead of BF16 vector reds
+    (a test reference).
     ``die_major``: the four weight tensors hold :func:`die_major_layout` bytes under their
     ``[L, rows, cols]`` shapes (see ``RubinSmallBatchFusedMoeKernel``). ``published_routing``
     (``token_indexed``): instead of the tables, ``expanded_idx_to_permuted_idx`` holds the top-k
@@ -394,6 +396,7 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
         push_flags,
         push_rank,
         push_world,
+        sm_reserve,
     )
 
 
@@ -429,5 +432,6 @@ def _(
     push_flags=None,
     push_rank=0,
     push_world=0,
+    sm_reserve=0,
 ) -> None:
     return None
