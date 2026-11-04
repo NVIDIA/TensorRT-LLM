@@ -46,7 +46,13 @@ PLAN_MAX_REQUESTS = 1024
 # and PLAN_LOAD_CANDIDATES lengths derived from the balanced per-slot load
 # (``plan_load_candidates``).
 PLAN_SIM_CANDIDATES = _PLAN_THREADS // 32
-PLAN_LOAD_CANDIDATES = 9
+# The balanced per-slot load is taken whole and in 2..PLAN_LOAD_PIECES pieces, each also
+# stretched by PLAN_LOAD_STRETCH (num / den); then one even-batch length of the longest request,
+# the best of 1..PLAN_EVEN_BATCH_MAX_TASKS full tasks per request.
+PLAN_LOAD_PIECES = 4
+PLAN_LOAD_STRETCH = (26, 25)
+PLAN_EVEN_BATCH_MAX_TASKS = 15
+PLAN_LOAD_CANDIDATES = 2 * PLAN_LOAD_PIECES + 1
 PLAN_CANDIDATES = PLAN_SIM_CANDIDATES + PLAN_LOAD_CANDIDATES
 # Waves of more slots (four per lane) or batches of more requests keep the rule's length.
 PLAN_SIM_MAX_SLOTS = 128
@@ -520,7 +526,7 @@ def _plan_candidate_tiles(
     if candidate_idx >= cutlass.Int32(PLAN_SIM_CANDIDATES):
         load_idx = candidate_idx - cutlass.Int32(PLAN_SIM_CANDIDATES)
         # Per-slot load of a balanced schedule with every request cut once more at a slot
-        # boundary, and its 1/2, 1/3, 1/4, each also 4% longer.
+        # boundary, and its 1/2 .. 1/PLAN_LOAD_PIECES, each also stretched.
         ideal = cutlass.max(
             (total_tiles + cost * (wave_tasks + num_requests) + wave_tasks - cutlass.Int32(1))
             // wave_tasks
@@ -531,13 +537,15 @@ def _plan_candidate_tiles(
             pieces = load_idx // cutlass.Int32(2) + cutlass.Int32(1)
             tiles = ideal // pieces
             if load_idx % cutlass.Int32(2) == cutlass.Int32(1):
-                tiles = (ideal * cutlass.Int32(26)) // (cutlass.Int32(25) * pieces)
+                tiles = (ideal * cutlass.Int32(PLAN_LOAD_STRETCH[0])) // (
+                    cutlass.Int32(PLAN_LOAD_STRETCH[1]) * pieces
+                )
         else:
             # Even batch of the longest request: q full tasks per request on q * requests slots,
             # the last tasks in rounds on the remaining slots.
             tiles = longest
             best_makespan = cutlass.Int32((1 << 31) - 1)
-            for q in cutlass.range(1, 16, 1, unroll=1):
+            for q in cutlass.range(1, PLAN_EVEN_BATCH_MAX_TASKS + 1, 1, unroll=1):
                 full_slots = q * num_requests
                 if full_slots < wave_tasks:
                     rounds = (num_requests + wave_tasks - full_slots - cutlass.Int32(1)) // (
@@ -1105,10 +1113,10 @@ def plan_load_candidates(
     """Task lengths from the balanced per-slot load (host mirror of ``_plan_candidate_tiles``).
 
     The per-slot load of a perfectly balanced schedule with every request cut
-    once more at a slot boundary (``ideal``), its 1/2, 1/3 and 1/4 (pieces that
-    backfill each other), each also 4% longer; and the closed-form optimum of an
-    even batch of the longest request (``q`` full tasks per request plus the last
-    tasks packed in rounds on the remaining slots).
+    once more at a slot boundary (``ideal``), its 1/2 .. 1/PLAN_LOAD_PIECES (pieces
+    that backfill each other), each also stretched by PLAN_LOAD_STRETCH; and the
+    closed-form optimum of an even batch of the longest request (``q`` full tasks
+    per request plus the last tasks packed in rounds on the remaining slots).
     """
     cost = PLAN_TASK_COST_TILES
     num_requests = len(request_tiles)
@@ -1123,10 +1131,14 @@ def plan_load_candidates(
         1,
     )
     candidates = []
-    for pieces in range(1, 5):
-        candidates += [clamp(ideal // pieces), clamp(ideal * 26 // (25 * pieces))]
+    stretch_num, stretch_den = PLAN_LOAD_STRETCH
+    for pieces in range(1, PLAN_LOAD_PIECES + 1):
+        candidates += [
+            clamp(ideal // pieces),
+            clamp(ideal * stretch_num // (stretch_den * pieces)),
+        ]
     uniform_tiles, uniform_makespan = longest, (1 << 31) - 1
-    for q in range(1, 16):
+    for q in range(1, PLAN_EVEN_BATCH_MAX_TASKS + 1):
         full_slots = q * num_requests
         if full_slots >= wave_tasks:
             continue

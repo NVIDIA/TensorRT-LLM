@@ -144,6 +144,102 @@ def test_plan_packed_tasks_simulates_the_waves() -> None:
     assert simulate([100, 300], 300, 35) == 300 + reduce_mod.PLAN_TASK_COST_TILES
 
 
+@functools.cache
+def _device_plan_candidates():
+    """A launcher of ``_plan_candidate_tiles`` for every candidate index (one thread each)."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cute_dsl_utils import (
+        _compile_cutedsl,
+        _current_cu_stream,
+    )
+
+    reduce_mod = _plan_mod()
+    count = reduce_mod.PLAN_CANDIDATES
+
+    @cute.kernel
+    def candidates_kernel(
+        out: cute.Tensor,
+        rule_tiles: cutlass.Int32,
+        total_tiles: cutlass.Int32,
+        longest: cutlass.Int32,
+        num_requests: cutlass.Int32,
+        wave_tasks: cutlass.Int32,
+        max_tiles_per_task: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        if tidx < cutlass.Int32(count):
+            out[tidx] = reduce_mod._plan_candidate_tiles(
+                tidx, rule_tiles, total_tiles, longest, num_requests, wave_tasks, max_tiles_per_task
+            )
+
+    @cute.jit
+    def candidates_host(
+        out_ptr: cute.Pointer,
+        stream: cuda.CUstream,
+        rule_tiles: cutlass.Int32,
+        total_tiles: cutlass.Int32,
+        longest: cutlass.Int32,
+        num_requests: cutlass.Int32,
+        wave_tasks: cutlass.Int32,
+        max_tiles_per_task: cutlass.Int32,
+    ):
+        out = cute.make_tensor(out_ptr, cute.make_layout((count,), stride=(1,)))
+        candidates_kernel(
+            out, rule_tiles, total_tiles, longest, num_requests, wave_tasks, max_tiles_per_task
+        ).launch(grid=(1, 1, 1), block=((count + 31) // 32 * 32, 1, 1), stream=stream)
+
+    compiled = None
+
+    def run(request_tiles, rule_tiles, wave_tasks, max_tiles_per_task):
+        nonlocal compiled
+        out = torch.full((count,), -1, dtype=torch.int32, device="cuda")
+        ptr = make_ptr(cutlass.Int32, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+        scalars = [
+            cutlass.Int32(v)
+            for v in (
+                rule_tiles,
+                sum(request_tiles),
+                max(request_tiles),
+                len(request_tiles),
+                wave_tasks,
+                max_tiles_per_task,
+            )
+        ]
+        if compiled is None:
+            compiled = _compile_cutedsl(candidates_host, ptr, _current_cu_stream(), *scalars)
+        compiled(ptr, _current_cu_stream(), *scalars)
+        return out.tolist()
+
+    return run
+
+
+def test_plan_candidates_device_match_the_host_mirror() -> None:
+    """``_plan_candidate_tiles`` (device) and ``plan_candidate_lengths`` (host) give the same
+    task lengths for random batches within the simulated limits."""
+    reduce_mod = _plan_mod()
+    run = _device_plan_candidates()
+    generator = torch.Generator().manual_seed(29)
+
+    def draw(low, high):
+        return int(torch.randint(low, high + 1, (1,), generator=generator))
+
+    for _ in range(64):
+        num_requests = draw(1, reduce_mod.PLAN_SIM_MAX_REQUESTS)
+        request_tiles = [draw(1, 4096) for _ in range(num_requests)]
+        wave_tasks = draw(num_requests + 1, reduce_mod.PLAN_SIM_MAX_SLOTS)
+        rule_tiles = draw(1, max(request_tiles))
+        max_tiles_per_task = draw(1, 1024)
+        expected = reduce_mod.plan_candidate_lengths(
+            request_tiles, rule_tiles, wave_tasks, max_tiles_per_task
+        )
+        got = run(request_tiles, rule_tiles, wave_tasks, max_tiles_per_task)
+        assert got == expected, (request_tiles, rule_tiles, wave_tasks, max_tiles_per_task)
+
+
 def test_plan_load_candidates_follow_the_balanced_slot_load() -> None:
     reduce_mod = _plan_mod()
     # 2120 tiles + 12 per slot and per request over 17 slots: 136 tiles per slot, then its
