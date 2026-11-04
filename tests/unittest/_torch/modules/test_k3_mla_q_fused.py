@@ -27,14 +27,15 @@ the fused FP4 generation update with its query rows. Checks:
   (Both read the kernel's BF16 intermediates through ``_ProbedQFusedKernel``.)
 * With the q_a RMSNorm inside the kernel the query rows are those after FlashInfer's separate
   norm (bitwise), and ``k3_mla_latent_row`` is bitwise FlashInfer's norm plus the ``k_pe`` copy.
-* ``KimiK3MLAAttention._forward_generation_fused_query`` (multi-stream, KV half on the aux
-  stream) gives the default chain's cache bytes and, through the FP4 decode, its attention output
-  within the FP4 query quantization.
+* ``KimiK3MLAAttention._forward_generation_fused_query`` of a real module (Helix rank 0 of 2,
+  multi-stream, KV half on the aux stream; the decode without the Helix exchange in place of
+  ``_attn_forward_gen``) gives the default chain's cache bytes and, through the FP4 decode, its
+  attention output within the FP4 query quantization, with and without the fused Helix tail's
+  gate forked behind the KV half.
 """
 
 import functools
 import math
-import types
 from types import SimpleNamespace
 
 import cutlass
@@ -526,79 +527,78 @@ class _DecodeAsAttention:
         return out.view(num_tokens, H * LORA)
 
 
-def _mla_stand_in(w, md, rot, qkv):
-    """The attributes and methods of ``KimiK3MLAAttention`` that
-    ``_forward_generation_fused_query`` uses, with the real kernels behind them."""
-    from flashinfer.norm import rmsnorm
+HIDDEN = 256
 
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
-    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
-    mqa = SimpleNamespace(
-        kv_lora_rank=LORA,
-        qk_rope_head_dim=ROPE,
-        uses_fp4_mla_attention=True,
-        rotary_cos_sin=rot,
-        layer_idx=0,
-        _ensure_rope_table_size=lambda _: None,
-        get_fp4_mla_local_layer_idx=lambda _: 0,
+def _k3_mla(w, md):
+    """A ``KimiK3MLAAttention`` of the K3 decode geometry (Helix rank 0 of 2, FP4 KV cache)
+    holding the test weights: FP8 q_b with power-of-two FP32 block scales, the BF16 W_UK, the
+    q_a / kv_a norms, and random BF16 fused q_a / kv_a and gate projections."""
+    import torch.nn as nn
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import KimiK3MLAAttention
+    from tensorrt_llm._torch.utils import AuxStreamType
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
     )
-    mqa.fp4_mla_kv_append_generation = types.MethodType(
-        TrtllmAttention.fp4_mla_kv_append_generation, mqa
-    )
-    kv_norm = RMSNorm(hidden_size=LORA, eps=EPS, dtype=torch.bfloat16).cuda()
-    kv_norm.weight.data.copy_(w.kv_norm)
-    q_norm = RMSNorm(hidden_size=QL, eps=EPS, dtype=torch.bfloat16).cuda()
-    q_norm.weight.data.copy_(w.q_norm)
-    cute_norm = k3.KimiK3MLAAttention._runs_flashinfer_cute_rmsnorm
-    mla = SimpleNamespace(
-        num_heads_tp=H,
-        q_lora_rank=QL,
-        kv_lora_rank=LORA,
-        qk_rope_head_dim=ROPE,
-        out_scale=None,
-        mqa=mqa,
-        aux_stream=torch.cuda.Stream(),
-        ln_events=[torch.cuda.Event(), torch.cuda.Event()],
-        kv_a_layernorm=kv_norm,
-        q_a_layernorm=q_norm,
-        _fused_latent_row=cute_norm(kv_norm),
-        _fused_decode_query_norm=cute_norm(q_norm),
-        q_b_proj=SimpleNamespace(
-            weight=w.w_qb,
-            weight_scale=w.s_qb_f32,
-            use_cute_dsl_blockscaling_mm=False,
-            disable_deep_gemm=False,
-        ),
-        k_b_proj_trans=w.w_uk,
-        k_b_proj_trans_dequant=None,
-        _q_b_block_exponents=None,
-        _helix_tail_gate_behind_kv=False,
-        _project_qkv_a=lambda hidden_states, prequantized_input: qkv,
-        _q_a_layernorm_maybe_fused=lambda q: rmsnorm(q, w.q_norm, EPS),
-        _attn_forward_gen=_DecodeAsAttention(md),
-    )
-    for name in ("_q_b_exponents", "_absorption_weight_bf16"):
-        setattr(mla, name, types.MethodType(getattr(k3.KimiK3MLAAttention, name), mla))
+    with torch.device("cuda"):
+        mla = KimiK3MLAAttention(
+            hidden_size=HIDDEN,
+            num_heads=H,
+            q_lora_rank=QL,
+            kv_lora_rank=LORA,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=ROPE,
+            v_head_dim=128,
+            rms_norm_eps=EPS,
+            dtype=torch.bfloat16,
+            use_output_gate=True,
+            model_config=model_config,
+            aux_stream_dict={AuxStreamType.Attention: torch.cuda.Stream()},
+            mapping_with_cp=Mapping(
+                world_size=2, tp_size=1, cp_size=2, rank=0, cp_config={"cp_type": "HELIX"}
+            ),
+        )
+    assert mla.mqa.uses_fp4_mla_attention and mla.fuse_qkv_a_proj
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    with torch.no_grad():
+        for proj in (mla.kv_a_proj_with_mqa, mla.g_proj):
+            proj.weight.copy_(torch.randn(proj.weight.shape, device="cuda", generator=gen) * 0.05)
+        mla.q_a_layernorm.weight.copy_(w.q_norm)
+        mla.kv_a_layernorm.weight.copy_(w.kv_norm)
+        mla.k_b_proj_trans.copy_(w.w_uk)
+    mla.q_b_proj.weight = nn.Parameter(w.w_qb, requires_grad=False)
+    mla.q_b_proj.weight_scale = nn.Parameter(w.s_qb_f32, requires_grad=False)
+    # The flags cache_derived_state sets from the loaded norms.
+    mla._fused_latent_row = mla._runs_flashinfer_cute_rmsnorm(mla.kv_a_layernorm)
+    mla._fused_decode_query_norm = mla._runs_flashinfer_cute_rmsnorm(mla.q_a_layernorm)
+    # The decode of every head stands in for the attention and its Helix exchange.
+    mla._attn_forward_gen = _DecodeAsAttention(md)
     return mla
 
 
+@pytest.mark.parametrize("gate_behind_kv", [False, True], ids=["no_gate", "gate_behind_kv"])
 @pytest.mark.parametrize("n", [1, 2])
-def test_forward_generation_fused_query_matches_default_chain(n):
+def test_forward_generation_fused_query_matches_default_chain(n, gate_behind_kv):
     from flashinfer.norm import rmsnorm
 
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as lowm
-    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     w = _weights()
     mgr, md = _fp4_case(n, 2000, seed=30 + n)
     try:
         num_tokens = n * Q_LEN
-        rot = _rotary_table(md.max_seq_len, "identity")
+        mla = _k3_mla(w, md)
+        rot = mla.mqa.rotary_cos_sin
         gen = torch.Generator(device="cuda").manual_seed(6)
-        qkv = torch.randn(num_tokens, QL + LORA + ROPE, device="cuda", generator=gen).bfloat16()
+        hidden = torch.randn(num_tokens, HIDDEN, device="cuda", generator=gen).bfloat16()
+        qkv = mla._project_qkv_a(hidden, None)
         before = [p.clone() for p in _pools(mgr)]
 
         # Default chain: q RMSNorm, q_b GEMM, W_UK BMM, generation update with the query rows.
@@ -618,11 +618,21 @@ def test_forward_generation_fused_query_matches_default_chain(n):
         for p, p0 in zip(_pools(mgr), before):
             p.copy_(p0)
 
-        mla = _mla_stand_in(w, md, rot, qkv)
         out = torch.empty(num_tokens, H * LORA, device="cuda", dtype=torch.bfloat16)
-        with with_multi_stream(True):
-            k3.KimiK3MLAAttention._forward_generation_fused_query(mla, qkv, md, out, None)
-        torch.cuda.synchronize()
+        mla._helix_tail_gate_behind_kv = gate_behind_kv
+        try:
+            with with_multi_stream(True):
+                mla._forward_generation_fused_query(hidden, md, out, None)
+            torch.cuda.synchronize()
+            if gate_behind_kv:
+                assert mla._helix_tail_gate_pending
+                assert torch.equal(mla._helix_tail_gate, mla.g_proj(hidden).sigmoid())
+            else:
+                assert mla._helix_tail_gate is None
+        finally:
+            mla._helix_tail_gate = None
+            mla._helix_tail_gate_pending = False
+            mla._helix_tail_gate_behind_kv = False
         for p, ref in zip(_pools(mgr), ref_pools):
             assert torch.equal(p, ref)
         rel = float((out.float() - ref_out.float()).norm() / ref_out.float().norm())
