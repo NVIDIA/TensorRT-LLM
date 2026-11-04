@@ -255,6 +255,23 @@ def test_the_replay_output_is_readable_by_its_owner_only(tmp_path):
 
 # --------------------------------------------------------------------------- trial build
 
+# What `git rev-parse --local-env-vars` lists: set by a caller (a hook that runs these tests, say),
+# each points git at another repository than the temporary one the test runs it in.
+GIT_LOCATION_VARS = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+                     "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+                     "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+                     "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+                     "GIT_SHALLOW_FILE", "GIT_COMMON_DIR")  # fmt: skip
+
+
+def _git_env():
+    """The caller's environment for git in a temporary repository: its own config and identity."""
+    env = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION_VARS}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")  # fmt: skip
+    return env
+
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 @pytest.mark.parametrize(
@@ -265,9 +282,7 @@ def test_the_replay_output_is_readable_by_its_owner_only(tmp_path):
 )  # fmt: skip
 def test_a_trial_build_takes_its_paths_from_the_caller(tmp_path, branch, prov_args, prov):
     """Relative worktree and provenance paths name what they name from where the script ran."""
-    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")  # fmt: skip
+    env = _git_env()
     repo = tmp_path / "repo"
     sub = repo / "sub"
     sub.mkdir(parents=True)
@@ -299,9 +314,7 @@ def test_a_trial_build_takes_its_paths_from_the_caller(tmp_path, branch, prov_ar
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 def test_a_trial_build_applies_a_binary_change(tmp_path):
     """An item that changes a binary file is applied, not reported as a conflict."""
-    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")  # fmt: skip
+    env = _git_env()
     repo = tmp_path / "repo"
     repo.mkdir()
 
