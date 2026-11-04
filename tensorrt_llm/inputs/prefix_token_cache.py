@@ -46,6 +46,7 @@ from ..logger import logger
 __all__ = [
     "PrefixTokenCache",
     "PrefixTokenCacheConfig",
+    "RouteFailed",
     "create_prefix_token_cache",
     "tokenization_routing_key",
 ]
@@ -76,6 +77,10 @@ def tokenization_routing_key(key: str | None) -> Iterator[None]:
         yield
     finally:
         _ROUTING_KEY.reset(token)
+
+
+class RouteFailed(Exception):
+    """``PrefixTokenCache.route`` could not get the ids from the owning process."""
 
 
 class OffsetTokenizer(Protocol):
@@ -187,11 +192,13 @@ class PrefixTokenCache:
         # Hits on a cached prompt the new one diverges from (also in ``hits``).
         self.divergent_hits = 0
         # Tokenizes a prompt tagged with a routing key in the process that
-        # owns that conversation, or returns None to tokenize it here. Set by
-        # multi-frontend serving.
+        # owns that conversation, or returns None to tokenize it here. Raises
+        # RouteFailed if the owner did not answer. Set by multi-frontend serving.
         self.route: Callable[[str, str], list[int] | None] | None = None
         # Prompts another process tokenized through ``route``.
         self.routed = 0
+        # Prompts tokenized here because ``route`` failed.
+        self.route_failures = 0
 
     def encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         """Return the token ids of ``text`` without special tokens."""
@@ -199,11 +206,17 @@ class PrefixTokenCache:
             return self._tokenize(tokenizer, text)[0]
         key = _ROUTING_KEY.get()
         if self.route is not None and key is not None:
-            ids = self.route(key, text)
-            if ids is not None:
+            try:
+                ids = self.route(key, text)
+            except RouteFailed as e:
+                logger.debug(f"Tokenizing a prompt locally: {e}")
                 with self._lock:
-                    self.routed += 1
-                return ids
+                    self.route_failures += 1
+            else:
+                if ids is not None:
+                    with self._lock:
+                        self.routed += 1
+                    return ids
         try:
             return self._encode(tokenizer, text)
         except Exception as e:
@@ -220,6 +233,7 @@ class PrefixTokenCache:
         return (
             f"{self.hits}/{total} hits ({rate:.1%}, {self.divergent_hits} divergent), "
             f"{self.resync_failures} resync fallbacks, {self.routed} routed, "
+            f"{self.route_failures} route failures, "
             f"{len(self._entries)} entries, {self._total_chars} cached chars"
         )
 

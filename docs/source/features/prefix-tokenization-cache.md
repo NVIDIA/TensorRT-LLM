@@ -85,10 +85,11 @@ feature you turned on.
 - An unexpected exception inside the cache disables it, with a warning, and the
   request is tokenized normally. A cache problem never fails a request.
 - The cache logs its configuration at startup and, every 1000 cache-eligible
-  requests, an `INFO` line with the hit rate (and how many hits were on diverging
-  prompts), the number of re-synchronization
-  fallbacks, and its occupancy, so a cache that is enabled but never hitting is
-  visible in the server log.
+  requests, an `INFO` line with the hit rate (and how many hits were on
+  diverging prompts), the number of re-synchronization fallbacks, how many
+  prompts were routed to another frontend and how many were tokenized locally
+  because routing failed (see below), and its occupancy, so a cache that is
+  enabled but never hitting is visible in the server log.
 
 ## Multiple serving frontends
 
@@ -105,8 +106,8 @@ usually has not seen the conversation's previous turn, so the prompt is
 tokenized in full.
 
 On an agentic multi-turn trace with prompts of about 160k tokens on average,
-at one session, the p90 time spent in the frontend was 453 ms with 8
-frontends and 166 ms with one. Decode throughput per user was the same up to
+at one session, the p90 time spent in the frontend was about 165 ms with 8
+frontends and 44 ms with one. Decode throughput per user was the same up to
 32 concurrent sessions, because at that concurrency the frontend is not the
 bottleneck.
 
@@ -115,18 +116,18 @@ at high request rates with short prompts. That is not the workload this cache
 targets.
 
 If you need several frontends, set
-`TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION=1` to tokenize each
-conversation in one frontend. A chat request's conversation id (the same id
-attention DP routes by, from `conversation_params.conversation_id` or headers
-such as `X-Correlation-ID`) is hashed to an owner frontend, and the frontend the
+`TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION=1` to tokenize each conversation
+in one frontend. A chat request's conversation id (the same id attention DP
+routes by, from `conversation_params.conversation_id` or headers such as
+`X-Correlation-ID`) is hashed to an owner frontend, and the frontend the
 request arrived at sends the prompt text to the owner over a local Unix socket
 and gets back the token ids; the request itself stays where it arrived. A
-request without a conversation id, or whose owner does not answer, is
-tokenized locally. The switch is off by default and has no effect with a
-single frontend or with the cache disabled. On the trace above with 8
-frontends, it brought the p90 frontend time at one session from about 165 ms
-to about 58 ms, against 44 ms with a single frontend (both measured with the
-divergent splice).
+request without a conversation id is tokenized locally, and so is one whose
+owner does not answer within 5 seconds or cannot tokenize the prompt; the
+latter are counted as route failures in the periodic log line. The switch is
+off by default and has no effect with a single frontend or with the cache
+disabled. On the trace above with 8 frontends, it brought the p90 frontend time
+at one session from about 165 ms to about 58 ms.
 
 ## Measured effect
 

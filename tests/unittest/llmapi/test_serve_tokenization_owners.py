@@ -94,15 +94,27 @@ def test_a_conversation_is_tokenized_by_its_owner_wherever_its_turns_arrive(tmp_
             owner.close()
 
 
-def test_a_prompt_is_tokenized_locally_when_its_owner_is_unreachable(tmp_path) -> None:
+class _FailingTokenizer(_CharTokenizer):
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
+        raise ValueError("cannot tokenize")
+
+
+def test_a_prompt_is_tokenized_locally_when_its_owner_does_not_tokenize_it(tmp_path) -> None:
     tokenizer, cache = _CharTokenizer(), _cache()
-    # Frontend 1 never starts.
-    owners = TokenizationOwners(str(tmp_path), 0, 2, cache, tokenizer)
+    owners = [TokenizationOwners(str(tmp_path), 0, 2, cache, tokenizer)]
     try:
         prompt = _turns(1)[0]
         with tokenization_routing_key(_key_owned_by(1, 2)):
+            # Frontend 1 has not started.
             assert cache.encode(tokenizer, prompt) == [ord(c) for c in prompt]
-        assert cache.routed == 0
-        assert cache.misses == 1
+            assert (cache.routed, cache.route_failures, cache.misses) == (0, 1, 1)
+
+            # Frontend 1 runs but its tokenizer fails; the connection survives.
+            owners.append(TokenizationOwners(str(tmp_path), 1, 2, _cache(), _FailingTokenizer()))
+            for _ in range(2):
+                assert cache.encode(tokenizer, prompt) == [ord(c) for c in prompt]
+        assert (cache.routed, cache.route_failures) == (0, 3)
+        assert "3 route failures" in cache.summary()
     finally:
-        owners.close()
+        for owner in owners:
+            owner.close()
