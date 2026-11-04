@@ -14,6 +14,95 @@ except ImportError:
     from cuda import cuda
 
 
+@cute.jit
+def _load_norm_items(
+    src: cute.Tensor,
+    base,
+    weight: cute.Tensor,
+    lane,
+    values: cute.Tensor,
+    scales: cute.Tensor,
+    items: cutlass.Constexpr,
+):
+    """Lane ``lane``'s columns ``lane + 32 i`` of the normalized prefix of row ``src`` (from column
+    ``base``) and of ``weight`` into registers."""
+    for item in cutlass.range_constexpr(items):
+        dim = lane + item * cute.arch.WARP_SIZE
+        values[item] = cutlass.Float32(src[base + dim])
+        scales[item] = cutlass.Float32(weight[dim])
+
+
+@cute.jit
+def _load_rope_pairs(
+    src: cute.Tensor,
+    base,
+    freqs: cute.Tensor,
+    position,
+    lane,
+    reals: cute.Tensor,
+    imags: cute.Tensor,
+    coss: cute.Tensor,
+    sins: cute.Tensor,
+    items: cutlass.Constexpr,
+):
+    """Lane ``lane``'s adjacent pairs ``lane + 32 i`` of row ``src`` from column ``base`` and their
+    ``freqs[position]`` entries into registers."""
+    for item in cutlass.range_constexpr(items):
+        pair = lane + item * cute.arch.WARP_SIZE
+        reals[item] = cutlass.Float32(src[base + pair * 2])
+        imags[item] = cutlass.Float32(src[base + pair * 2 + 1])
+        coss[item] = cutlass.Float32(freqs[position, pair, 0])
+        sins[item] = cutlass.Float32(freqs[position, pair, 1])
+
+
+@cute.jit
+def _store_rms_normalized(
+    dst: cute.Tensor,
+    lane,
+    values: cute.Tensor,
+    scales: cute.Tensor,
+    norm_dim: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    items: cutlass.Constexpr,
+):
+    """RMSNorm of the warp's ``norm_dim`` loaded values (squares summed in item order, then the
+    warp reduction), scaled, into columns ``[0, norm_dim)`` of row ``dst``."""
+    sum_sq = cutlass.Float32(0.0)
+    for item in cutlass.range_constexpr(items):
+        value = values[item]
+        sum_sq += value * value
+    sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+    inverse_rms = cute.math.rsqrt(sum_sq / norm_dim + eps)
+    for item in cutlass.range_constexpr(items):
+        dim = lane + item * cute.arch.WARP_SIZE
+        value = values[item] * inverse_rms
+        value *= scales[item]
+        dst[dim] = value.to(dst.element_type)
+
+
+@cute.jit
+def _store_rotated_pairs(
+    dst: cute.Tensor,
+    base,
+    lane,
+    reals: cute.Tensor,
+    imags: cute.Tensor,
+    coss: cute.Tensor,
+    sins: cute.Tensor,
+    items: cutlass.Constexpr,
+):
+    """The loaded pairs rotated (``real * cos - imag * sin``, ``imag * cos + real * sin``) into
+    row ``dst`` from column ``base``."""
+    for item in cutlass.range_constexpr(items):
+        pair = lane + item * cute.arch.WARP_SIZE
+        real = reals[item]
+        imag = imags[item]
+        cos = coss[item]
+        sin = sins[item]
+        dst[base + pair * 2] = (real * cos - imag * sin).to(dst.element_type)
+        dst[base + pair * 2 + 1] = (imag * cos + real * sin).to(dst.element_type)
+
+
 class DSparkRMSNormRoPEKernel:
     """Apply optional RMSNorm and last-dimension RoPE with one warp per row."""
 
@@ -688,45 +777,32 @@ class DSparkMlaCtxNormRoPEKernel:
             coss = cute.make_rmem_tensor((self.pair_items,), cutlass.Float32)
             sins = cute.make_rmem_tensor((self.pair_items,), cutlass.Float32)
             position = positions[token]
-            for item in cutlass.range_constexpr(self.norm_items):
-                dim = lane + item * cute.arch.WARP_SIZE
-                values[item] = cutlass.Float32(x[token, col0 + dim])
-                scales[item] = cutlass.Float32(weight[layer, dim])
-            for item in cutlass.range_constexpr(self.pair_items):
-                pair = lane + item * cute.arch.WARP_SIZE
-                reals[item] = cutlass.Float32(x[token, col0 + self.norm_dim + pair * 2])
-                imags[item] = cutlass.Float32(x[token, col0 + self.norm_dim + pair * 2 + 1])
-                coss[item] = cutlass.Float32(freqs[position, pair, 0])
-                sins[item] = cutlass.Float32(freqs[position, pair, 1])
-
-            sum_sq = cutlass.Float32(0.0)
-            for item in cutlass.range_constexpr(self.norm_items):
-                value = values[item]
-                sum_sq += value * value
-            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-            inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
-
-            for item in cutlass.range_constexpr(self.norm_items):
-                dim = lane + item * cute.arch.WARP_SIZE
-                value = values[item] * inverse_rms
-                value *= scales[item]
-                output[row, dim] = value.to(output.element_type)
-            for item in cutlass.range_constexpr(self.pair_items):
-                pair = lane + item * cute.arch.WARP_SIZE
-                real = reals[item]
-                imag = imags[item]
-                cos = coss[item]
-                sin = sins[item]
-                output[row, self.norm_dim + pair * 2] = (real * cos - imag * sin).to(
-                    output.element_type
-                )
-                output[row, self.norm_dim + pair * 2 + 1] = (imag * cos + real * sin).to(
-                    output.element_type
-                )
+            src = x[token, None]
+            _load_norm_items(src, col0, weight[layer, None], lane, values, scales, self.norm_items)
+            _load_rope_pairs(
+                src,
+                col0 + self.norm_dim,
+                freqs,
+                position,
+                lane,
+                reals,
+                imags,
+                coss,
+                sins,
+                self.pair_items,
+            )
+            dst = output[row, None]
+            _store_rms_normalized(
+                dst, lane, values, scales, self.norm_dim, self.eps, self.norm_items
+            )
+            _store_rotated_pairs(
+                dst, self.norm_dim, lane, reals, imags, coss, sins, self.pair_items
+            )
 
 
 class DSparkMlaBlockRoPEKernel:
-    """One drafter layer's block RoPE work in one launch, all loads up front.
+    """One drafter layer's block RoPE work in one launch, all loads up front (the row helpers of
+    :class:`DSparkMlaCtxNormRoPEKernel`).
 
     Rows ``[0, T * H)`` rotate the ``rope_dim`` tail of the 192-wide query row
     ``q[r]`` at ``freqs[positions[r // H]]`` into ``query[r, kv_lora_rank:]``
@@ -805,24 +881,21 @@ class DSparkMlaBlockRoPEKernel:
         sins = cute.make_rmem_tensor((self.pair_items,), cutlass.Float32)
         if row < num_q_rows:
             position = positions[row // self.num_heads]
-            for item in cutlass.range_constexpr(self.pair_items):
-                pair = lane + item * cute.arch.WARP_SIZE
-                reals[item] = cutlass.Float32(q[row, self.qk_nope_dim + pair * 2])
-                imags[item] = cutlass.Float32(q[row, self.qk_nope_dim + pair * 2 + 1])
-                coss[item] = cutlass.Float32(freqs[position, pair, 0])
-                sins[item] = cutlass.Float32(freqs[position, pair, 1])
-            for item in cutlass.range_constexpr(self.pair_items):
-                pair = lane + item * cute.arch.WARP_SIZE
-                real = reals[item]
-                imag = imags[item]
-                cos = coss[item]
-                sin = sins[item]
-                query[row, self.norm_dim + pair * 2] = (real * cos - imag * sin).to(
-                    query.element_type
-                )
-                query[row, self.norm_dim + pair * 2 + 1] = (imag * cos + real * sin).to(
-                    query.element_type
-                )
+            _load_rope_pairs(
+                q[row, None],
+                self.qk_nope_dim,
+                freqs,
+                position,
+                lane,
+                reals,
+                imags,
+                coss,
+                sins,
+                self.pair_items,
+            )
+            _store_rotated_pairs(
+                query[row, None], self.norm_dim, lane, reals, imags, coss, sins, self.pair_items
+            )
         elif row < num_q_rows + kv.shape[0]:
             token = row - num_q_rows
             values = cute.make_rmem_tensor((self.norm_items,), cutlass.Float32)
@@ -830,38 +903,24 @@ class DSparkMlaBlockRoPEKernel:
             position = positions[token]
             page = pages[token]
             offset = offsets[token]
-            for item in cutlass.range_constexpr(self.norm_items):
-                dim = lane + item * cute.arch.WARP_SIZE
-                values[item] = cutlass.Float32(kv[token, dim])
-                scales[item] = cutlass.Float32(weight[dim])
-            for item in cutlass.range_constexpr(self.pair_items):
-                pair = lane + item * cute.arch.WARP_SIZE
-                reals[item] = cutlass.Float32(kv[token, self.norm_dim + pair * 2])
-                imags[item] = cutlass.Float32(kv[token, self.norm_dim + pair * 2 + 1])
-                coss[item] = cutlass.Float32(freqs[position, pair, 0])
-                sins[item] = cutlass.Float32(freqs[position, pair, 1])
-
-            sum_sq = cutlass.Float32(0.0)
-            for item in cutlass.range_constexpr(self.norm_items):
-                value = values[item]
-                sum_sq += value * value
-            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-            inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
-
-            for item in cutlass.range_constexpr(self.norm_items):
-                dim = lane + item * cute.arch.WARP_SIZE
-                value = values[item] * inverse_rms
-                value *= scales[item]
-                pool[page, offset, dim] = value.to(pool.element_type)
-            for item in cutlass.range_constexpr(self.pair_items):
-                pair = lane + item * cute.arch.WARP_SIZE
-                real = reals[item]
-                imag = imags[item]
-                cos = coss[item]
-                sin = sins[item]
-                pool[page, offset, self.norm_dim + pair * 2] = (real * cos - imag * sin).to(
-                    pool.element_type
-                )
-                pool[page, offset, self.norm_dim + pair * 2 + 1] = (imag * cos + real * sin).to(
-                    pool.element_type
-                )
+            src = kv[token, None]
+            _load_norm_items(src, 0, weight, lane, values, scales, self.norm_items)
+            _load_rope_pairs(
+                src,
+                self.norm_dim,
+                freqs,
+                position,
+                lane,
+                reals,
+                imags,
+                coss,
+                sins,
+                self.pair_items,
+            )
+            dst = pool[page, offset, None]
+            _store_rms_normalized(
+                dst, lane, values, scales, self.norm_dim, self.eps, self.norm_items
+            )
+            _store_rotated_pairs(
+                dst, self.norm_dim, lane, reals, imags, coss, sins, self.pair_items
+            )
