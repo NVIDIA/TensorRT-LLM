@@ -941,6 +941,17 @@ def _create_py_executor(
         kv_cache_config.enable_block_reuse = False
         model_engine.attn_runtime_features.cache_reuse = False
 
+    # A reused prefix leaves cached tokens in a prefill, and aggregated helix
+    # gathers those across CP ranks only on the chunked-prefill MLA path.
+    if (mapping.has_cp_helix()
+            and not is_disagg_enabled(cache_transceiver_config)
+            and kv_cache_config.enable_block_reuse
+            and not enable_chunked_context):
+        raise ValueError(
+            "Block reuse under aggregated Helix context parallelism requires "
+            "enable_chunked_prefill=True. Enable chunked prefill or set "
+            "kv_cache_config.enable_block_reuse=False.")
+
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
     # tokens_per_block multiple: CacheTransBufferManager requires

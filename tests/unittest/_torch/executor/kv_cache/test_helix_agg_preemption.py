@@ -116,7 +116,7 @@ SCENARIOS = {
 
 
 def _make_rank(
-    cp_rank: int, scenario: Scenario, host_cache_size: int = 0
+    cp_rank: int, scenario: Scenario, host_cache_size: int = 0, enable_block_reuse: bool = False
 ) -> tuple[KVCacheManagerV2, KVCacheV2Scheduler]:
     distributed = Mock()
     distributed.allreduce.side_effect = lambda value, op: value
@@ -124,7 +124,9 @@ def _make_rank(
     with patch.object(Distributed, "get", return_value=distributed):
         manager = KVCacheManagerV2(
             KvCacheConfig(
-                max_tokens=POOL_TOKENS, host_cache_size=host_cache_size, enable_block_reuse=False
+                max_tokens=POOL_TOKENS,
+                host_cache_size=host_cache_size,
+                enable_block_reuse=enable_block_reuse,
             ),
             CacheType.SELF,
             num_layers=NUM_LAYERS,
@@ -159,11 +161,14 @@ def _make_rank(
     return manager, scheduler
 
 
-def _make_request(request_id: int, scenario: Scenario) -> LlmRequest:
+def _make_request(request_id: int, scenario: Scenario, shared_prefix_len: int = 0) -> LlmRequest:
+    prompt_len = scenario.prompt_lens[request_id]
+    # Prompt ids start past the shared prefix's, so only the prefix matches.
+    unique = range(shared_prefix_len + request_id, shared_prefix_len + request_id + prompt_len)
     return LlmRequest(
         request_id=request_id,
         max_new_tokens=scenario.new_tokens(request_id),
-        input_tokens=list(range(request_id, request_id + scenario.prompt_lens[request_id])),
+        input_tokens=(list(range(shared_prefix_len)) + list(unique))[:prompt_len],
         sampling_config=SamplingConfig(1),
         is_streaming=False,
     )
@@ -196,7 +201,10 @@ def _step(
     for request in out.generation_requests:
         _check_helix_fields(request, cp_rank)
     decided = (
-        tuple((r.py_request_id, r.context_chunk_size) for r in out.context_requests),
+        tuple(
+            (r.py_request_id, r.context_current_position, r.context_chunk_size)
+            for r in out.context_requests
+        ),
         tuple(r.py_request_id for r in out.generation_requests),
         tuple(r.py_request_id for r in out.paused_requests),
         tuple(r.py_request_id for r in out.recompute_paused_requests),
@@ -231,10 +239,24 @@ def _step(
     return decided
 
 
-@pytest.mark.parametrize("scenario_name", SCENARIOS)
-def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name: str) -> None:
+# The shared prefix saves enough pages that decode_pressure no longer runs out
+# with reuse on.
+@pytest.mark.parametrize(
+    "scenario_name, enable_block_reuse",
+    [(name, False) for name in SCENARIOS]
+    + [("chunked_context_pressure", True), ("chunked_staggered_arrivals", True)],
+)
+def test_agg_helix_preempts_identically_and_re_prefills_correctly(
+    scenario_name: str, enable_block_reuse: bool
+) -> None:
+    """With block reuse, the requests share a one-ledger-block prefix, and
+    every rank must claim the same reused depth while pages are evicted and
+    requests preempted."""
     scenario = SCENARIOS[scenario_name]
-    ranks = [_make_rank(cp_rank, scenario) for cp_rank in range(CP_SIZE)]
+    ranks = [
+        _make_rank(cp_rank, scenario, enable_block_reuse=enable_block_reuse)
+        for cp_rank in range(CP_SIZE)
+    ]
     context_preemptions = [0] * CP_SIZE
     for cp_rank, (manager, scheduler) in enumerate(ranks):
         # host_cache_size=0 leaves no tier below GPU, so recompute-pause is the
@@ -250,13 +272,20 @@ def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name:
             return preempted
 
         scheduler._try_preempt_for_pages = record_context_preemption
-    pending = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    shared_prefix_len = CP_SIZE * TOKENS_PER_BLOCK if enable_block_reuse else 0
+    pending = [
+        {i: _make_request(i, scenario, shared_prefix_len) for i in scenario.prompt_lens}
+        for _ in ranks
+    ]
     active = [[] for _ in ranks]
 
     preempted_at_tokens: dict[int, int] = {}
     preemptions: Counter = Counter()
     re_prefilled: set[int] = set()
     decoded_after_re_prefill: set[int] = set()
+    # Where each prefill (first run or re-prefill) begins, after any reuse.
+    prefill_starts: list[int] = []
+    prefilling: set[int] = set()
     for iteration in range(MAX_ITERATIONS):
         for rank_pending, rank_active in zip(pending, active):
             for request_id in list(rank_pending):
@@ -276,10 +305,14 @@ def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name:
             if request.py_request_id in recompute_paused:
                 preempted_at_tokens[request.py_request_id] = request.get_num_tokens(0)
                 preemptions[request.py_request_id] += 1
+                prefilling.discard(request.py_request_id)
                 # A repeat preemption replays a longer prompt; check that one too.
                 re_prefilled.discard(request.py_request_id)
                 decoded_after_re_prefill.discard(request.py_request_id)
-        for request_id, _ in ctx:
+        for request_id, position, _ in ctx:
+            if request_id not in prefilling:
+                prefilling.add(request_id)
+                prefill_starts.append(position)
             if request_id in preempted_at_tokens and request_id not in re_prefilled:
                 for rank_active in active:
                     request = next(r for r in rank_active if r.py_request_id == request_id)
@@ -294,10 +327,58 @@ def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name:
     assert preempted_at_tokens, "the pool never ran out, so nothing was preempted"
     assert decoded_after_re_prefill == set(preempted_at_tokens)
     assert context_preemptions[0] == context_preemptions[1]
-    assert (context_preemptions[0] > 0) == scenario.expect_context_preemption
+    if not enable_block_reuse:
+        # The scenarios size prefill pressure for unshared prompts.
+        assert (context_preemptions[0] > 0) == scenario.expect_context_preemption
     # Requests taking turns preempting each other would preempt the same
     # ones over and over; each preemption here has to make lasting room.
     assert max(preemptions.values()) <= MAX_PREEMPTIONS_PER_REQUEST, preemptions
+    # A request that reuses the shared prefix starts its prefill past it.
+    assert any(prefill_starts) == enable_block_reuse, prefill_starts
+
+
+def test_agg_helix_reuses_whole_ledger_blocks_identically() -> None:
+    """A repeated 100-token prompt reuses one 64-token ledger block on every
+    rank: a reusable block spans one page on each rank, and partial reuse is
+    off, so the 36 tokens past it are recomputed."""
+    prompt_len = 100
+    scenario = Scenario(
+        prompt_lens={1: prompt_len, 2: prompt_len},
+        max_num_tokens=256,
+        max_new_tokens={1: 4, 2: 4},
+    )
+    ranks = [_make_rank(cp_rank, scenario, enable_block_reuse=True) for cp_rank in range(CP_SIZE)]
+    for manager, _ in ranks:
+        assert manager.enable_block_reuse and not manager.enable_partial_reuse
+
+    def make_request(request_id: int) -> LlmRequest:
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=scenario.new_tokens(request_id),
+            input_tokens=list(range(prompt_len)),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+
+    active = [[make_request(1)] for _ in ranks]
+    for _ in range(MAX_ITERATIONS):
+        if not any(active):
+            break
+        decisions = [
+            _step(cp_rank, manager, scheduler, rank_active, scenario)
+            for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
+        ]
+        assert all(d == decisions[0] for d in decisions), decisions
+    assert not any(active), "request 1 did not finish"
+
+    reused = []
+    for manager, scheduler in ranks:
+        request = make_request(2)
+        out = scheduler.schedule_request([request], set())
+        assert [r.py_request_id for r in out.context_requests] == [2]
+        reused.append(request.context_current_position)
+        manager.free_resources(request)
+    assert reused == [CP_SIZE * TOKENS_PER_BLOCK] * CP_SIZE
 
 
 # The smallest host tier the manager provisions: four pages.
@@ -473,7 +554,7 @@ def test_agg_helix_chunked_prefill_with_host_tier(scenario_name: str) -> None:
 
         for request_id in recompute_paused:
             suspended_at_position.pop(request_id, None)
-        for request_id, _ in ctx:
+        for request_id, _, _ in ctx:
             if request_id in suspended_at_position:
                 position = suspended_at_position.pop(request_id)
                 for positions in context_positions:
