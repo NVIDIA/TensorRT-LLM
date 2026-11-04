@@ -169,8 +169,10 @@ class PostprocWorker:
         self, input: Union["PostprocWorker.Input", "ResponseWrapper"]
     ) -> [Any, Optional[dict[str, float]]]:
         ''' Handle a single response from await_response worker. '''
-        if input.rsp.result.context_logits is not None or \
-              input.rsp.result.generation_logits is not None:
+        result = input.rsp.result
+        if not isinstance(result, tllm.Result) and (
+                result.context_logits is not None
+                or result.generation_logits is not None):
             raise ValueError(
                 "Context logits or generation logits are not supposed to be "
                 "sent to postprocessing workers.")

@@ -226,7 +226,7 @@ def test_nemotron_h_chunked_prefill():
 # Breakable prefill CUDA graphs (BCG) on the hybrid path. Under BCG the Mamba2
 # layers run through the eager_on_graph boundary op (mamba2_mixer.py), so this
 # covers the NemotronH-specific bridge rather than the generic BCG runner
-# (which unittest/_torch/executor/test_breakable_cuda_graph.py exercises).
+# (which unittest/_torch/pyexecutor/test_breakable_cuda_graph.py exercises).
 _BCG_MAX_NUM_TOKENS = 256
 _BCG_CAPTURE_NUM_TOKENS = [64, 128, 256]
 # Probability-ratio bound shared with ray_orchestrator/multi_gpu/
@@ -252,9 +252,7 @@ _BCG_CONTEXT_BATCHES = [
 # The mixed-batch section adds the streaming decode request and the context
 # request admitted while it decodes.
 _BCG_MIXED_BATCH_REQUESTS = 2
-# Decode length of that streaming request: with EOS ignored this is a ~1 s
-# generation window, orders of magnitude longer than the client-side gap
-# before the second request is submitted.
+# Decode length of the streaming request, with EOS ignored.
 _BCG_STREAM_MAX_TOKENS = 64
 # One (token_ids, logprobs) entry per request from each backend run.
 _BCG_NUM_REQUESTS = (sum(len(batch) for batch in _BCG_CONTEXT_BATCHES) +
@@ -329,11 +327,11 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
                 per_request.append((list(output.outputs[0].token_ids),
                                     _first_step_logprobs(output)))
 
-        # Mixed batch: admit a context request while another request is
-        # decoding, so BCG replays a batch that carries both a context chunk
-        # and decode tokens. The overlap is proved afterwards from the two
-        # requests' iteration metrics rather than assumed.
-        decoding = llm.generate_async([_BCG_PROMPT_TOKEN] * 128,
+        # The first prefill fills the token budget, so the second request
+        # must start in a later iteration alongside the first request's decode.
+        # Submit both before waiting for streamed logits: response transport
+        # can otherwise delay admission until the first request has finished.
+        decoding = llm.generate_async([_BCG_PROMPT_TOKEN] * _BCG_MAX_NUM_TOKENS,
                                       sampling_params=SamplingParams(
                                           max_tokens=_BCG_STREAM_MAX_TOKENS,
                                           temperature=0.0,
@@ -341,10 +339,6 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
                                           return_generation_logits=True,
                                           return_perf_metrics=True),
                                       streaming=True)
-        # In streaming mode every response carries only the newest step's
-        # logits, so the first-step distribution must be read from the first
-        # streamed response, before the stream moves on.
-        next(decoding)
         admitted = llm.generate_async([_BCG_PROMPT_TOKEN] * 65,
                                       sampling_params=SamplingParams(
                                           max_tokens=4,
@@ -353,8 +347,8 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
                                           return_generation_logits=True,
                                           return_perf_metrics=True),
                                       streaming=False)
-        # Submit before the CPU logits conversion so it cannot delay admission.
-        # The first response stays current until the next stream consumption.
+        # Each streamed response carries only its newest step's logits.
+        next(decoding)
         decoding_first_step_logprobs = _first_step_logprobs(decoding)
         decoding_out = decoding.result()
         admitted_out = admitted.result()

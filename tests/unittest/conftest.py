@@ -434,6 +434,12 @@ def torch_empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
+@pytest.fixture(autouse=True)
+def verify_skipped_device_copies(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._device_copy._verify_skipped_device_copies", True)
+
+
 @pytest.fixture(scope="module")
 def mpi_pool_executor(request):
     """

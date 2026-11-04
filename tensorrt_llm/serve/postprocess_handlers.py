@@ -86,6 +86,18 @@ def _ctx_usage_for_postproc(args: PostprocArgs,
     return _ctx_usage_from_outputs(outputs)
 
 
+def _prompt_tokens_details(prompt_tokens: int,
+                           cached_tokens: int) -> PromptTokensDetails:
+    """Cached-token details of a usage block that reports ``prompt_tokens``.
+
+    The engine counts cached tokens over the whole rendered prompt, which can
+    be longer than the prompt usage reports (see
+    ``PostprocArgs.num_prompt_tokens_offset``), so the count is capped at the
+    reported prompt tokens.
+    """
+    return PromptTokensDetails(cached_tokens=min(cached_tokens, prompt_tokens))
+
+
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
@@ -103,6 +115,7 @@ class ChatPostprocArgs(PostprocArgs):
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_parser: Optional[str] = None
+    tool_parser_grammar_constrained: bool = False
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
@@ -299,7 +312,8 @@ def apply_tool_parser(args: ChatPostprocArgs,
         if output_index not in args.tool_parser_dict:
             args.tool_parser_dict[
                 output_index] = ToolParserFactory.create_tool_parser(
-                    args.tool_parser)
+                    args.tool_parser,
+                    grammar_constrained=args.tool_parser_grammar_constrained)
         tool_parser = args.tool_parser_dict[output_index]
 
     if tool_parser is not None and tools is not None:
@@ -418,8 +432,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 prompt_tokens=num_tokens,
                 total_tokens=num_tokens,
                 completion_tokens=0,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=rsp.cached_tokens),
+                prompt_tokens_details=_prompt_tokens_details(
+                    num_tokens, rsp.cached_tokens),
             )
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
@@ -613,11 +627,12 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                              id=stream_response_id,
                                              created=stream_created)
         if include_continuous_usage:
-            chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
-                                    completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens,
-                                    prompt_tokens_details=PromptTokensDetails(
-                                        cached_tokens=rsp.cached_tokens))
+            chunk.usage = UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=output.length,
+                total_tokens=output.length + prompt_tokens,
+                prompt_tokens_details=_prompt_tokens_details(
+                    prompt_tokens, rsp.cached_tokens))
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
@@ -628,8 +643,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=rsp.cached_tokens),
+            prompt_tokens_details=_prompt_tokens_details(
+                prompt_tokens, rsp.cached_tokens),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -785,8 +800,8 @@ def chat_response_post_processor(
         prompt_tokens=num_prompt_tokens,
         completion_tokens=num_generated_tokens,
         total_tokens=num_prompt_tokens + num_generated_tokens,
-        prompt_tokens_details=PromptTokensDetails(
-            cached_tokens=rsp.cached_tokens),
+        prompt_tokens_details=_prompt_tokens_details(num_prompt_tokens,
+                                                     rsp.cached_tokens),
     )
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     response = ChatCompletionResponse(
@@ -1074,6 +1089,16 @@ class ResponsesAPIPostprocArgs(PostprocArgs):
     tool_parser: Optional[str] = None
     streaming_processor: Optional[ResponsesStreamingProcessor] = None
 
+    def usage_num_prompt_tokens(self) -> Optional[int]:
+        """The prompt length usage reports, counted as on the chat route.
+
+        The recorded prompt length less ``num_prompt_tokens_offset``, or
+        ``None`` while no length is recorded.
+        """
+        if self.num_prompt_tokens is None:
+            return None
+        return self.num_prompt_tokens - self.num_prompt_tokens_offset
+
 
 @nvtx_range_debug("responses_api_post_processor")
 def responses_api_post_processor(
@@ -1087,7 +1112,8 @@ def responses_api_post_processor(
         use_harmony=args.use_harmony,
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
-        num_prompt_tokens=args.num_prompt_tokens,
+        num_prompt_tokens=args.usage_num_prompt_tokens(),
+        tokenizer=args.tokenizer,
     )
 
 
@@ -1101,5 +1127,5 @@ def responses_api_streaming_post_processor(
     if rsp._done:
         outputs.append(
             args.streaming_processor.get_final_response_non_store(
-                rsp, args.num_prompt_tokens))
+                rsp, args.usage_num_prompt_tokens(), tokenizer=args.tokenizer))
     return outputs

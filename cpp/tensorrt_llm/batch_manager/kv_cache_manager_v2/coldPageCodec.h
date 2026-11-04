@@ -35,6 +35,11 @@ struct PoolDesc
     PoolIndex poolIndex{0};
     MemAddress baseAddress = 0;
     size_t slotBytes = 0;
+
+    //! What this pool's pages actually are, which is its group's tier except for a sparse
+    //! pool of the GPU tier: those are host-backed, and the group still reports GPU_MEM
+    //! because its other pools are not.
+    CacheTier storageMedium = CacheTier::GPU_MEM;
 };
 
 //! Describes one hot pool group and the lifecycles that share its physical layout.

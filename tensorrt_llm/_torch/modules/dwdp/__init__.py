@@ -16,7 +16,7 @@
 """DWDP (Distributed Weight Data Parallelism) VA-based infrastructure.
 
 MNNVL-based physical memory allocation, composite VA layout, page-aligned
-mapping, and double buffer lifecycle management for DWDP expert weights.
+mapping, and prefetch slot lifecycle management for DWDP expert weights.
 
 Key design principles:
 - No D2D copy: local experts are always zero-copy via cuMemMap
@@ -26,10 +26,12 @@ Key design principles:
   layer-by-layer
 - Separation of concerns: WeightBuffer owns VA layout; Transport owns handle
   exchange; WeightManager owns scheduling
-- MPI everywhere: single communication backend (replaces tekit's TCPDWDPStore)
+- One group API (allgather + Barrier) served by an MPI sub-communicator, or by
+  a TCPStore rendezvous for independently launched workers -- see rendezvous.py
 """
 
 from .page_pool import PagePool, compute_slot_sizes
+from .rendezvous import StoreDwdpGroup, dwdp_global_rank, store_rendezvous_enabled
 from .setup import setup_dwdp, teardown_dwdp
 from .specs import (
     EdgeInfo,
@@ -81,6 +83,10 @@ __all__ = [
     "DWDPTransport",
     "WeightBuffer",
     "DWDPWeightManager",
+    # Rendezvous
+    "StoreDwdpGroup",
+    "dwdp_global_rank",
+    "store_rendezvous_enabled",
     # Setup orchestration
     "setup_dwdp",
     "teardown_dwdp",

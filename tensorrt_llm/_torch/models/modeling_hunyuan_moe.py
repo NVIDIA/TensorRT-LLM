@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Dict, Optional, Union
 
 import torch
@@ -25,7 +40,8 @@ from ..moe.fused_moe import (RenormalizeMoeRoutingMethod, VanillaMoE,
                              create_moe, is_moe_weight_owner)
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, moe_experts_quant_config,
+                             register_auto_model)
 
 
 class HunyuanMoE(nn.Module):
@@ -34,6 +50,7 @@ class HunyuanMoE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: int,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -62,7 +79,9 @@ class HunyuanMoE(nn.Module):
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts"))
 
         self.shared_mlp = GatedMLP(
             hidden_size=config.hidden_size,
@@ -215,7 +234,8 @@ class HunYuanDecoderLayer(DecoderLayer):
 
         if is_moe_single_node:
             self.mlp = HunyuanMoE(
-                model_config, aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
+                model_config, aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+                layer_idx)
         else:
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
                                 intermediate_size=config.intermediate_size,

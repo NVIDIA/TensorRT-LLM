@@ -34,6 +34,9 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     #: ``TRTLLMGenNvfp4Base`` (which the FlashInfer leaf shares).
     supports_situ = True
 
+    #: The native op's pre-routed entry point (``run_moe_prerouted``).
+    supports_prerouted_routing = True
+
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_trtllm_gen_leaf(cls, p, d)

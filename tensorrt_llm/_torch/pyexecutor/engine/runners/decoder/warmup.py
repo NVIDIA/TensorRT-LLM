@@ -16,13 +16,22 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    ResourceManager,
+    ResourceManagerType,
+    is_context_only_kv_cache,
+)
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
+    warmup_sampling_module,
+    warmup_topk_module,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.trace_log_utils import log_mem_snapshot
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
@@ -36,7 +45,6 @@ from tensorrt_llm.mapping import CpType, Mapping
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.compilation.backend import Backend
     from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -238,8 +246,6 @@ class DecoderWarmup:
         dist: Distributed | None,
         model: torch.nn.Module,
         sparse_attention_config: BaseSparseAttentionConfig | None,
-        torch_compile_backend: Backend | None,
-        kv_cache_manager_key: ResourceManagerType,
         warmup_timer: _WarmupTimer,
         metrics: dict[str, float],
         agreement: WarmupAgreement,
@@ -258,8 +264,6 @@ class DecoderWarmup:
         self.dist = dist
         self.model = model
         self.sparse_attention_config = sparse_attention_config
-        self._torch_compile_backend = torch_compile_backend
-        self.kv_cache_manager_key = kv_cache_manager_key
         self._warmup_timer = warmup_timer
         self._metrics = metrics
         self._agreement = agreement
@@ -282,7 +286,11 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
+        warmup_named_allreduce_topologies(self.model)
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
             return self._warmup_scheduled(resource_manager, kv_cache_manager)
@@ -292,9 +300,13 @@ class DecoderWarmup:
     ) -> list[tuple[int, int]]:
         """
         Returns warmup configs covering the maximum context and generation shapes.
+
+        A context-only KV cache cannot hold generation rows, so it gets the context shape only.
         """
 
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         token_num_upper_bound = min(
             self._config.max_num_tokens,
             self._config.max_batch_size * (self._config.max_seq_len - 1),
@@ -310,10 +322,10 @@ class DecoderWarmup:
             // self._config.max_beam_width,
         )
 
-        warmup_requests_configs = [
-            (curr_max_num_tokens, 0),  # max_num_tokens, pure context
-            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
-        ]
+        warmup_requests_configs = [(curr_max_num_tokens, 0)]  # max_num_tokens, pure context
+        if not is_context_only_kv_cache(kv_cache_manager):
+            # max_batch_size, pure generation
+            warmup_requests_configs.append((max_batch_size, max_batch_size))
 
         return warmup_requests_configs
 
@@ -327,8 +339,12 @@ class DecoderWarmup:
         and small-context (2-token path) cases.
         """
         max_configs = self._get_max_shape_warmup_requests(resource_manager)
-        # Specialize for 1 token pure ctx and pure gen
-        one_token_configs = [(1, 0), (1, 1)]
+        # Specialize for 1 token pure ctx and pure gen (no gen on a context-only cache)
+        one_token_configs = [(1, 0)]
+        if not is_context_only_kv_cache(
+            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        ):
+            one_token_configs.append((1, 1))
         # Small ctx specialization
         small_ctx_configs = [(2, 0)]
 
@@ -351,6 +367,8 @@ class DecoderWarmup:
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
             warmup_sampling_module()
+            if self._config.max_beam_width > 1:
+                warmup_topk_module()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
             self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
@@ -479,6 +497,8 @@ class DecoderWarmup:
         # creates; build it when every forward above was skipped.
         with self._warmup_timer.phase("dsa_prewarm"):
             self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
+            if getattr(self._inputs, "_dspark_confidence_enabled", False):
+                self._metadata._warmup_dspark_ragged_compressor_metadata()
             with timing_metric("dg_paged_mqa_warmup_seconds", self._metrics):
                 self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
@@ -529,7 +549,7 @@ class DecoderWarmup:
             self._config.is_spec_decode
             or self.mapping.cp_size != 1
             or self.sparse_attention_config is not None
-            or self._torch_compile_backend is not None
+            or self._config.torch_compile_enabled
             or self._graphs.breakable_cuda_graph_runner is not None
         ):
             logger.info(
@@ -738,7 +758,9 @@ class DecoderWarmup:
         metadata_cls = getattr(self._config.attention_backend, "Metadata", None)
         if metadata_cls is None or not issubclass(metadata_cls, DSAtrtllmAttentionMetadata):
             return
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None:
             return
         self._metadata.setup_attention(
@@ -869,8 +891,13 @@ class DecoderWarmup:
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
-        if self.guided_decoder is None:
-            # doesn't support guided decoding
+        # A context-only cache cannot hold generation rows. The property is the same on every
+        # rank of a role, so its shapes are left out here rather than skipped by agreement.
+        supports_generation = not is_context_only_kv_cache(
+            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        )
+        if self.guided_decoder is None and supports_generation:
+            # doesn't support guided decoding or a context-only cache
             warmup_requests_configs.append(
                 (1 + self._config.max_total_draft_tokens, 1)
             )  # one generation request
@@ -886,7 +913,7 @@ class DecoderWarmup:
         # here: they always run on a ``MambaHybridCacheManager``, so
         # ``can_run_general_warmup`` is False and the configs above never run.
 
-        if self.guided_decoder is None and can_run_general_warmup:
+        if self.guided_decoder is None and supports_generation and can_run_general_warmup:
             # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to
             # warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
             # One MIXED context+generation batch (1 ctx token + 1 gen request).
@@ -955,7 +982,11 @@ class DecoderWarmup:
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
             MXFP8GemmRunner,
         )
-        from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, flashinfer_mxfp8_autotune
+        from tensorrt_llm._torch.modules.linear import (
+            MXFP8LinearMethod,
+            flashinfer_mxfp8_autotune,
+            mxfp8_gemm_backend_override,
+        )
 
         enable_trtllm_autotuner = self._config.enable_autotuner
         if not enable_trtllm_autotuner:
@@ -979,7 +1010,7 @@ class DecoderWarmup:
         compile_all_batches = (
             self._config.torch_compile_enabled and not self._config.torch_compile_prefill_only
         )
-        if compile_all_batches and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ:
+        if compile_all_batches and mxfp8_gemm_backend_override() is None:
             # Compiled auto dispatch uses native; do not tune unused backends.
             # Prefill-only compile retains the eager generation-graph policy.
             for method in mxfp8_methods:
@@ -987,7 +1018,7 @@ class DecoderWarmup:
         use_mxfp8_flashinfer_graph_default = (
             self._graphs.enabled
             and not compile_all_batches
-            and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ
+            and mxfp8_gemm_backend_override() is None
             and any(
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
                 for module in self.model.modules()
@@ -1043,7 +1074,9 @@ class DecoderWarmup:
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if generation_only:
             tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
             num_gen_requests = min(
@@ -1093,7 +1126,11 @@ class DecoderWarmup:
             warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
         else:
             warmup_configs = [(curr_max_num_tokens, 0)]
-            if self.guided_decoder is None and not self.mapping.has_pp():
+            if (
+                self.guided_decoder is None
+                and not self.mapping.has_pp()
+                and not is_context_only_kv_cache(kv_cache_manager)
+            ):
                 # Add generation request to warmup the autotuner cache.
                 warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 
@@ -1156,6 +1193,13 @@ class DecoderWarmup:
             ran_flashinfer_forward = run_autotuner_pass(
                 flashinfer_mxfp8_autotune(), synchronize_trtllm_cache=False
             )
+        # The model's declared hooks (the all-off default when it declares none): the warmup passes also run on
+        # engines built without the runner's constructor.
+        if runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks:
+            # Rank-local profiling noise must not leave tensor-parallel peers
+            # serving different tactics for one shape: keep the fastest everywhere.
+            # Collective; before the native MXFP8 cache below registers the tactics.
+            AutoTuner.get().post_tune_merge_tactics()
 
         if enable_flashinfer_mxfp8_autotuner:
             if ran_flashinfer_forward:
@@ -1240,7 +1284,9 @@ class DecoderWarmup:
         """
         if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
             return
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None or not isinstance(kv_cache_manager, MambaHybridCacheManager):
             return
 

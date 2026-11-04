@@ -30,7 +30,6 @@ set(SRCS
     moeLoadBalancer/gdrwrap.cpp
     moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
     moeLoadBalancer/moeLoadBalancer.cpp
-    moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
     workerPool.cpp)
 
@@ -55,6 +54,14 @@ set(RUNTIME_MEMORY_SRCS cudaMemPool.cpp memoryCounters.cpp)
 set(RUNTIME_BUFFERS_SRCS bufferManager.cpp iBuffer.cpp iTensor.cpp
                          tllmBuffers.cpp virtualMemory.cpp)
 set(RUNTIME_DISTRIBUTED_SRCS utils/mpiUtils.cpp worldConfig.cpp)
+
+add_library(tllm_runtime_topology STATIC moeLoadBalancer/topologyDetector.cpp)
+add_library(tllm::runtime_topology ALIAS tllm_runtime_topology)
+target_link_libraries(tllm_runtime_topology PUBLIC tllm::common_cuda
+                                                   Threads::Threads)
+if(NOT WIN32)
+  target_link_libraries(tllm_runtime_topology PUBLIC NUMA::NUMA)
+endif()
 
 add_library(tllm_runtime_memory STATIC ${RUNTIME_MEMORY_SRCS})
 add_library(tllm::runtime_memory ALIAS tllm_runtime_memory)
@@ -81,7 +88,7 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 foreach(component tllm_runtime_memory tllm_runtime_buffers
-                  tllm_runtime_distributed)
+                  tllm_runtime_distributed tllm_runtime_topology)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(${component} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
@@ -90,7 +97,8 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
-target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src)
+target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src
+                                         tllm::runtime_topology)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
