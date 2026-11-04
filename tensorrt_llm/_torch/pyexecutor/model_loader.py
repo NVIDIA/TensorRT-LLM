@@ -1113,6 +1113,10 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        # The warmup steps that build kernels without a model forward depend on
+        # the configuration alone: run them while the weights load.
+        from tensorrt_llm._torch.pyexecutor import warmup_overlap
+        warmup_overlap.start(config, self.llm_args, self.mapping)
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked
@@ -1265,6 +1269,10 @@ class ModelLoader:
             # No-op if worked as expected
             if load_format != LoadFormat.GMS:
                 model.to("cuda")
+                # The Linear layers' GEMM kernels follow from their shapes:
+                # build them while the allocated weights load.
+                warmup_overlap.start_linear_prebuild(model, self.llm_args,
+                                                     self.mapping)
             memo.clear()
 
             rank_model_storage = get_rank_model_storage(model)
