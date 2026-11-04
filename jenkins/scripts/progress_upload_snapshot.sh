@@ -52,9 +52,9 @@ if [ -n "$FINAL_SNAPSHOT" ] && [ -n "$TIMEOUT_XML_SCRIPT" ]; then
             fi
         fi
         rm -f "${timeout_xml}.tmp"
-    else
-        rm -f "$timeout_xml"
     fi
+    # A missing list is not an empty one (e.g. the SLURM copy of it failed), so an existing
+    # results-timeout.xml is left alone.
 fi
 
 # --- Fix testsuite name in XML files (pytest default -> stage name) ---

@@ -4783,7 +4783,14 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
-    def hasUnfinished = sh(script: "grep -qs '[^[:space:]]' '${stageName}/unfinished_test.txt'", returnStatus: true) == 0
+    // grep: 0 = a test is listed, 1 = the list is empty, 2 = the list is missing or unreadable.
+    def listRc = sh(script: "grep -qs '[^[:space:]]' '${stageName}/unfinished_test.txt'", returnStatus: true)
+    def hasUnfinished = listRc == 0
+    if (listRc > 1) {
+        // An unreadable list is not an empty one: keep the existing report.
+        echo "${stageName}/unfinished_test.txt cannot be read; keeping the existing ${stageName}/results-timeout.xml"
+        return fileExists(outputFilePath)
+    }
     if (!scriptPath) {
         // Without the script no results-timeout.xml is written, but the tests that did not
         // finish must still fail the stage.
