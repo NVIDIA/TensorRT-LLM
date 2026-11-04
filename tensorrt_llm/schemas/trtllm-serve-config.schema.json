@@ -4401,6 +4401,21 @@
           "status": "prototype",
           "title": "Encoder Cuda Graph"
         },
+        "encoder_data_parallel_size": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of multimodal encoder replicas within the LLM tensor-parallel group. None preserves the model's existing encoder parallelism. An explicit value divides the group into this many replicas, each using tensor parallelism over tensor_parallel_size / encoder_data_parallel_size ranks, independently of LLM attention DP. Requires pipeline- and context-parallel sizes of 1.",
+          "status": "prototype",
+          "title": "Encoder Data Parallel Size"
+        },
         "encoder_scheduling_policy": {
           "$ref": "#/$defs/MultimodalEncoderSchedulingPolicy",
           "default": "DEFAULT",

@@ -27,7 +27,8 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalModelMixin, PreparedLlmInputs)
+    EncoderParallelMode, MultimodalModelMixin, PreparedLlmInputs,
+    make_multimodal_encoder_model_config)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -801,6 +802,12 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
 
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+            cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {"vision": frozenset({"tp", "dp"})}
+
     def __init__(
         self,
         model_config: ModelConfig[Mistral3Config],
@@ -849,10 +856,12 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self._vision_tower = None
         self._multi_modal_projector = None
         if not model_config.disable_mm_encoder:
+            encoder_model_config = make_multimodal_encoder_model_config(
+                model_config_cp)
             # NOTE: current `modelopt` does not support quantizing the vision portion.
             # NOTE: attn_backend: Pixtral head size not always divisible by 128
             vision_model_config = self._get_sub_model_config(
-                model_config_cp,
+                encoder_model_config,
                 "vision_config",
                 attn_backend="TRTLLM",
                 quant_config=None)
@@ -860,7 +869,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
             self._vision_tower = modeling_pixtral.PixtralVisionModel(
                 vision_model_config)
             self._multi_modal_projector = Mistral3MultiModalProjector(
-                model_config).eval()
+                encoder_model_config).eval()
         else:
             logger.info(
                 f"{type(self).__name__}: multimodal encoder disabled "
@@ -973,7 +982,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         lora_params: Any | None = None,
         **forward_kwargs: Any,
     ) -> dict[str, Any]:
-        del raw_input_ids, position_ids, mm_inputs, forward_kwargs
         return {
             "spec_metadata": spec_metadata,
             "resource_manager": resource_manager,

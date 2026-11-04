@@ -87,6 +87,7 @@ from .modeling_gemma4mm import (
     Gemma4MultimodalModelBase,
     _gemma4_input_partitions,
 )
+from .modeling_multimodal_mixin import EncoderParallelMode, make_multimodal_encoder_model_config
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 # Raw HF nn.LayerNorm default eps (the unified vision LayerNorms use this, NOT
@@ -252,6 +253,15 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
 class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
     """Gemma 4 12B Unified model with encoder-free multimodal projections."""
 
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {
+            name: frozenset({"dp"})
+            for name in super().get_multimodal_encoder_parallel_modes(model_config)
+        }
+
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
         if config.image_token_id is None:
@@ -293,6 +303,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
         # --- Text backbone (reused verbatim) ---
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
+        encoder_model_config = make_multimodal_encoder_model_config(model_config_cp)
         # Mirror the parent's quant exclude_modules remap so quantized unified
         # checkpoints exclude the right text modules.
         quant_config = model_config_cp.quant_config
@@ -322,7 +333,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
                     config.vision_config,
                     config.text_config,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)
@@ -337,7 +348,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
                     text_hidden_size=config.text_config.hidden_size,
                     eps=config.audio_config.rms_norm_eps,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)

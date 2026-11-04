@@ -28,13 +28,16 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Sequence,
     Tuple,
+    final,
 )
 
 import torch
 
+from tensorrt_llm._torch.distributed import Distributed, allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
@@ -48,6 +51,7 @@ from tensorrt_llm.inputs.multimodal import (
     select_multimodal_fields,
 )
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
@@ -57,10 +61,19 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+from .multimodal_encoder_data_parallel import (
+    EncoderDpItem,
+    encoder_dp_error_guard,
+    execute_encoder_dp_items,
+    iter_encoder_rank_inputs,
+)
 
 
 class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
+
+
+EncoderParallelMode = Literal["tp", "dp"]
 
 
 def _assemble_multimodal_encoder_embeddings(
@@ -275,6 +288,32 @@ def encode_multimodal_by_groups(
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
 
 
+def reorder_multimodal_embeddings_by_modality(
+    multimodal_params: List[MultimodalParams],
+    modalities: Tuple[str, ...],
+    embeddings: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Reorder modality-grouped encoder outputs into request/prompt order."""
+    if len(embeddings) != len(modalities):
+        raise ValueError(
+            f"Expected {len(modalities)} multimodal encoder outputs, got {len(embeddings)}."
+        )
+    item_layouts = []
+    for param in multimodal_params:
+        item_metadata = param.item_metadata
+        if item_metadata is None or item_metadata.output_embedding_lengths is None:
+            # Encoder memory profiling intentionally omits request layout metadata.
+            return torch.cat(list(embeddings), dim=0)
+        item_layouts.append((item_metadata.item_refs, item_metadata.output_embedding_lengths))
+    per_modality_embeds = dict(zip(modalities, embeddings, strict=True))
+    per_modality_lengths = _lengths_by_modality(item_layouts, modalities)
+    return _reorder_embeds_by_manifest(
+        item_layouts,
+        per_modality_embeds,
+        per_modality_lengths,
+    )
+
+
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
@@ -283,6 +322,60 @@ if TYPE_CHECKING:
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
+
+
+def _encoder_data_parallel_size(model_config: ModelConfig) -> int:
+    multimodal_config = model_config.multimodal_config
+    if multimodal_config is None:
+        return 1
+    return multimodal_config.encoder_data_parallel_size or 1
+
+
+def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConfig:
+    """Resolve encoder TP/DP independently of the language model mapping.
+
+    An omitted encoder setting preserves existing model-specific behavior.
+    Explicit DP divides the LLM TP group into encoder TP subgroups. The copied
+    config shares the engine's module registry with the language model.
+    """
+    encoder_config = copy.deepcopy(
+        model_config, {id(model_config.extra_attrs): model_config.extra_attrs}
+    )
+    mm_config = model_config.multimodal_config
+    if mm_config is None or mm_config.encoder_data_parallel_size is None:
+        return encoder_config
+
+    mapping = model_config.mapping
+    encoder_dp_size = mm_config.encoder_data_parallel_size
+    # TorchLlmArgs validates user configs; these checks also cover callers
+    # that construct ModelConfig directly.
+    if mapping.pp_size != 1 or mapping.cp_size != 1:
+        raise NotImplementedError(
+            "Explicit multimodal encoder parallelism requires pipeline "
+            "parallel size 1 and context parallel size 1."
+        )
+    if mapping.tp_size % encoder_dp_size:
+        raise ValueError(
+            "multimodal_config.encoder_data_parallel_size must divide the tensor "
+            f"parallel size ({mapping.tp_size}), got {encoder_dp_size}."
+        )
+
+    encoder_tp_size = mapping.tp_size // encoder_dp_size
+    # pp_size only satisfies Mapping's world-size invariant. The encoder does
+    # not pipeline-partition layers; contiguous TP subgroups are its replicas.
+    encoder_mapping = Mapping(
+        world_size=mapping.world_size,
+        rank=mapping.rank,
+        gpus_per_node=mapping.gpus_per_node,
+        tp_size=encoder_tp_size,
+        pp_size=mapping.world_size // encoder_tp_size,
+    )
+    # ModelConfig is a dataclass with a custom assignment guard. Unlock only
+    # the encoder copy while replacing its mapping, then restore its state.
+    encoder_config._frozen = False
+    encoder_config.mapping = encoder_mapping
+    encoder_config._frozen = model_config._frozen
+    return encoder_config
 
 
 def _build_request_multimodal_input(
@@ -409,6 +502,10 @@ class MultimodalModelMixin:
     Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
     language-model delegation.
 
+    Models provide encoder computation and layout-specific input slicing. They declare optional
+    encoder TP/DP support through `get_multimodal_encoder_parallel_modes`; the shared execution
+    path handles DP work placement, communication, and output ordering.
+
     Current limitations:
 
     * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
@@ -430,6 +527,94 @@ class MultimodalModelMixin:
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        """Return supported parallel modes for each enabled encoder front end.
+
+        The model loader queries this before constructing weights when
+        ``encoder_data_parallel_size`` is set. Overrides inspect the config
+        without constructing modules. Encoder construction uses
+        ``make_multimodal_encoder_model_config`` to apply the selected mapping.
+
+        Keys identify logical encoders, including their projectors. Image and
+        video may share ``vision``; audio may have different capabilities.
+        ``tp`` requires encoder layers and the weight loader to shard weights
+        with the encoder mapping. ``dp`` requires independent replicas using
+        the shared input-slicing and encode interfaces; the framework handles
+        DP placement, communication, and output ordering.
+
+        Every enabled encoder must support the selected mode; hybrid TP/DP
+        requires both. The default empty mapping means explicit encoder
+        parallelism is not integrated. Omitting the encoder setting preserves
+        the existing model path. These declarations describe implementation
+        capabilities; accuracy and performance validation are separate.
+
+        Args:
+            model_config: Resolved model config identifying the enabled encoders.
+
+        Returns:
+            Mapping from enabled logical encoder names to supported modes.
+
+        Example:
+            A model with a TP/DP vision encoder and a DP-only audio encoder returns::
+
+                {"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}
+        """
+        return {}
+
+    @classmethod
+    @final
+    def validate_multimodal_encoder_parallelism(cls, model_config: ModelConfig) -> None:
+        """Validate declared capabilities before model construction.
+
+        Called by the model loader for an explicit encoder parallel setting.
+        All enabled encoders must support the selected modes. Shared encoder
+        TP with LLM attention DP also requires the item scheduling contract.
+        Models customize ``get_multimodal_encoder_parallel_modes`` rather
+        than overriding this shared validation.
+
+        Args:
+            model_config: Resolved model config with the requested encoder parallelism.
+
+        Raises:
+            NotImplementedError: An enabled encoder lacks a requested mode.
+            ValueError: Shared encoder TP requires unavailable item scheduling.
+        """
+        mm_config = model_config.multimodal_config
+        if (
+            mm_config is None
+            or mm_config.encoder_data_parallel_size is None
+            or model_config.disable_mm_encoder
+        ):
+            return
+        encoder_modes = cls.get_multimodal_encoder_parallel_modes(model_config)
+        if not encoder_modes:
+            raise NotImplementedError(
+                f"{cls.__name__} does not support explicit multimodal encoder parallelism."
+            )
+        dp_size = mm_config.encoder_data_parallel_size
+        tp_size = model_config.mapping.tp_size // dp_size
+        required_modes: set[EncoderParallelMode] = set()
+        if dp_size > 1:
+            required_modes.add("dp")
+        if tp_size > 1:
+            required_modes.add("tp")
+        for encoder_name, modes in encoder_modes.items():
+            for mode in sorted(required_modes - modes):
+                parallelism = "tensor" if mode == "tp" else "data"
+                raise NotImplementedError(
+                    f"{cls.__name__} encoder '{encoder_name}' does not support "
+                    f"multimodal encoder {parallelism} parallelism."
+                )
+        if (
+            model_config.mapping.enable_attention_dp
+            and tp_size > 1
+            and not cls.supports_mm_encoder_item_scheduling
+        ):
+            raise ValueError("Encoder TP with attention DP requires MM encoder item scheduling.")
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -588,6 +773,28 @@ class MultimodalModelMixin:
             One encoder output tensor **per item** (not per input tuple). Each tensor has the
             declared embedding row count and retains scheduler input order.
         """
+        if not self.encoder_collective_required:
+            return self._forward_multimodal_encoder_items_local(encoder_inputs)
+
+        outputs: list[torch.Tensor] = []
+        mapping = self.model_config.mapping
+        # Visit one owner's bounded batch at a time. Cache state and returned
+        # embeddings remain on the rank that owns the original requests.
+        for owner, shared_inputs in iter_encoder_rank_inputs(
+            encoder_inputs,
+            mapping=mapping,
+            any_rank_failed=self._any_encoder_dp_rank_failed,
+        ):
+            with encoder_dp_error_guard(self._any_encoder_dp_rank_failed):
+                shared_outputs = self._forward_multimodal_encoder_items_local(shared_inputs)
+            if owner == mapping.tp_rank:
+                outputs = shared_outputs
+        return outputs
+
+    def _forward_multimodal_encoder_items_local(
+        self,
+        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+    ) -> list[torch.Tensor]:
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
         group_lengths: list[int] = []
@@ -596,7 +803,7 @@ class MultimodalModelMixin:
         def flush_group() -> None:
             if not group_params:
                 return
-            embeddings = self.encode_multimodal_inputs(group_params)
+            embeddings = self._run_multimodal_encoder(group_params)
             expected_length = sum(group_lengths)
             if embeddings.shape[0] != expected_length:
                 raise MultimodalEncoderContractError(
@@ -641,6 +848,172 @@ class MultimodalModelMixin:
     def embedding_dtype(self) -> torch.dtype:
         """Return the dtype of each cached multimodal embedding row."""
         raise NotImplementedError
+
+    @property
+    def encoder_data_parallel_size(self) -> int:
+        """Return the explicitly configured encoder DP size."""
+        return _encoder_data_parallel_size(self.model_config)
+
+    @property
+    def encoder_collective_required(self) -> bool:
+        """Whether rank-local ADP requests must rendezvous for encoder TP."""
+        model_config = getattr(self, "model_config", None)
+        if model_config is None:
+            return False
+        mapping = model_config.mapping
+        mm_config = model_config.multimodal_config
+        return (
+            mapping.enable_attention_dp
+            and mm_config is not None
+            and mm_config.encoder_data_parallel_size is not None
+            and mm_config.encoder_data_parallel_size < mapping.tp_size
+        )
+
+    @property
+    def encoder_data_parallel_active(self) -> bool:
+        """Whether an encoder call distributes items between replicas."""
+        mapping = self.model_config.mapping
+        size = self.encoder_data_parallel_size
+        # Fully replicated ADP encoders consume only their owner's requests.
+        return size > 1 and (not mapping.enable_attention_dp or size < mapping.tp_size)
+
+    def _allgather_encoder_dp_output(
+        self, tensor: torch.Tensor, row_counts: list[int]
+    ) -> torch.Tensor:
+        mapping = self.model_config.mapping
+        tp_size = mapping.tp_size // self.encoder_data_parallel_size
+        if tp_size > 1:
+            # Encoder TP ranks hold identical outputs. Send one copy per DP
+            # replica rather than multiplying the gathered output by TP size.
+            if mapping.tp_rank % tp_size:
+                tensor = tensor[:0]
+            row_counts = [
+                rows if rank % tp_size == 0 else 0 for rows in row_counts for rank in range(tp_size)
+            ]
+        return allgather(tensor, mapping, dim=0, sizes=row_counts)
+
+    def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
+        """Exchange CPU status without waiting for queued encoder CUDA work."""
+        return bool(Distributed.get(self.model_config.mapping).tp_allreduce(int(local_failed)))
+
+    def _build_encoder_dp_items(
+        self,
+        multimodal_params: Sequence[MultimodalParams],
+    ) -> tuple[list[EncoderDpItem], list[tuple[int, int | None]]] | None:
+        """Describe encoder work using the shared request item metadata.
+
+        Physical input tokens determine placement; output rows determine
+        reconstruction. Requests whose item metadata has no encoder token
+        lengths stay atomic and use output rows as a fallback cost. This can
+        underestimate physical input work (e.g. spatial merging) and skew
+        placement in mixed batches. Providers should supply
+        encoder_token_lengths for comparable costs.
+        """
+        items: list[EncoderDpItem] = []
+        item_inputs: list[tuple[int, int | None]] = []
+
+        for param_index, param in enumerate(multimodal_params):
+            item_metadata = param.item_metadata
+            raw_lengths = None if item_metadata is None else item_metadata.output_embedding_lengths
+            if not raw_lengths:
+                return None
+            lengths = [int(length) for length in raw_lengths]
+            if any(length <= 0 for length in lengths):
+                raise ValueError("MM item output embedding lengths must be positive.")
+            if item_metadata.encoder_token_lengths is None:
+                row_count = sum(lengths)
+                items.append(EncoderDpItem(len(items), row_count, row_count))
+                item_inputs.append((param_index, None))
+                continue
+            for item_index, row_count in enumerate(lengths):
+                items.append(
+                    EncoderDpItem(
+                        ordinal=len(items),
+                        input_token_count=item_metadata.encoder_token_lengths[item_index],
+                        output_row_count=row_count,
+                    )
+                )
+                item_inputs.append((param_index, item_index))
+
+        return items, item_inputs
+
+    def _prepare_encoder_dp_inputs(
+        self,
+        local_items: Sequence[EncoderDpItem],
+        multimodal_params: Sequence[MultimodalParams],
+        item_inputs: Sequence[tuple[int, int | None]],
+    ) -> list[MultimodalParams]:
+        """Prepare assigned items through the model's shared item interface."""
+        selected = [item_inputs[item.ordinal] for item in local_items]
+        local_params: list[MultimodalParams] = []
+        for param_index, grouped_items_iter in itertools.groupby(
+            selected, key=lambda item_input: item_input[0]
+        ):
+            param = multimodal_params[param_index]
+            item_indices = [index for _, index in grouped_items_iter if index is not None]
+            if not item_indices:
+                local_params.append(param)
+                continue
+            local_params.extend(
+                local_param
+                for local_param, _, _ in self.prepare_multimodal_encoder_inputs(
+                    [(param, index) for index in item_indices]
+                )
+            )
+        return local_params
+
+    def _run_multimodal_encoder(
+        self,
+        multimodal_params: Sequence[MultimodalParams],
+        **encoder_kwargs: Any,
+    ) -> torch.Tensor:
+        """Run the model encoder with the configured multimodal DP behavior."""
+        params = list(multimodal_params)
+        model_config = getattr(self, "model_config", None)
+        if model_config is None:
+            return self.encode_multimodal_inputs(params, **encoder_kwargs)
+        mapping = model_config.mapping
+
+        if not self.encoder_data_parallel_active:
+            return self.encode_multimodal_inputs(params, **encoder_kwargs)
+
+        encoder_dp_inputs = self._build_encoder_dp_items(params)
+        if encoder_dp_inputs is not None:
+            items, item_inputs = encoder_dp_inputs
+
+            def prepare_local_inputs(
+                local_items: Sequence[EncoderDpItem],
+            ) -> list[MultimodalParams]:
+                return self._prepare_encoder_dp_inputs(
+                    local_items,
+                    params,
+                    item_inputs,
+                )
+
+            def encode_local_inputs(local_params: list[MultimodalParams]) -> torch.Tensor:
+                return self.encode_multimodal_inputs(local_params, **encoder_kwargs)
+
+            embedding_weight = self.text_embedding_layer.weight
+            return execute_encoder_dp_items(
+                items,
+                rank=mapping.tp_rank // (mapping.tp_size // self.encoder_data_parallel_size),
+                num_ranks=self.encoder_data_parallel_size,
+                prepare_local_inputs=prepare_local_inputs,
+                encode_local_inputs=encode_local_inputs,
+                any_rank_failed=self._any_encoder_dp_rank_failed,
+                allgather=self._allgather_encoder_dp_output,
+                output_dim=self.embedding_dim,
+                output_dtype=self.embedding_dtype,
+                output_device=embedding_weight.device,
+            )
+
+        # Encoder memory profiling omits the row metadata needed for work
+        # partitioning, so every rank measures the full dummy encoder. Retain a
+        # status collective so a rank-local profiling failure is not observed as
+        # success by peer ranks.
+        with encoder_dp_error_guard(self._any_encoder_dp_rank_failed):
+            local_output = self.encode_multimodal_inputs(params, **encoder_kwargs)
+        return local_output
 
     @property
     def encoder_cache_active(self) -> bool:
@@ -1125,7 +1498,7 @@ class MultimodalModelMixin:
             self._encode_with_partial_cache(partial_hits, encoder_cache)
 
         embeddings = get_multimodal_embeddings(
-            encoder_forward_fn=self.encode_multimodal_inputs,
+            encoder_forward_fn=self._run_multimodal_encoder,
             multimodal_params=list(multimodal_params),
         )
         if encoder_cache is not None:
@@ -1427,7 +1800,7 @@ class MultimodalModelMixin:
         )
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
-        batched_output = self.encode_multimodal_inputs([param for param, _, _ in encoder_inputs])
+        batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
         output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
         encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
