@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -346,3 +348,68 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
     sampled = temperatures >= greedy_threshold
     return torch.where(sampled, scores.argmax(-1),
                        logits.float().argmax(-1)).to(torch.int32)
+
+
+def mpi_worker_env(**env: str):
+    """Decorate a function run in a pooled MPI worker to see ``env`` set, restoring the
+    previous values after it: the pool reuses its processes for later tests."""
+
+    def decorate(fn):
+
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            saved = {name: os.environ.get(name) for name in env}
+            os.environ.update(env)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                for name, value in saved.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+        return wrapped
+
+    return decorate
+
+
+def bf16_bits_differ(ref: torch.Tensor, out: torch.Tensor) -> int:
+    """Number of 16-bit elements whose bits differ."""
+    return int((ref.view(torch.int16) != out.view(torch.int16)).sum())
+
+
+def r128c4_scale_offsets(m: int, h: int, device) -> torch.Tensor:
+    """``[m, h // 32]`` byte offsets of the first ``m`` rows' UE8M0 1x32 scales of ``[*, h]``
+    rows in the R128c4 layout (128-row blocks of 4-column groups)."""
+    r = torch.arange(m, device=device).unsqueeze(1)
+    c = torch.arange(h // 32, device=device).unsqueeze(0)
+    return (((r // 128) * (h // 128) + c // 4) * 512 + (r % 32) * 16 +
+            (r % 128) // 32 * 4 + c % 4)
+
+
+def mnnvl_torch_push(workspace, target, x: torch.Tensor, rank: int) -> None:
+    """Producer stand-in for a pushed MNNVL all-reduce: store ``x`` into the Lamport slots of
+    ``target`` with plain copies (``-0`` sent as ``+0``), through every rank's unicast
+    mapping."""
+    torch.cuda.synchronize()  # the previous call's rotation state is final
+    flags = target.view.flags.cpu().tolist()
+    cur, nbytes = int(flags[0]), int(flags[2])
+    world = target.view.world
+    m, h = x.shape
+    bits = x.view(torch.int16)
+    clean = torch.where(bits == -32768, torch.zeros_like(bits),
+                        bits).view(torch.bfloat16)
+    handle = workspace["handle"]
+    elems = 3 * nbytes // 2
+    for peer in range(world):
+        buf = handle.get_uc_buffer(peer, (elems, ), torch.bfloat16, 0)
+        base = cur * nbytes // 2
+        if target.one_shot:
+            slots = buf[base:base + m * world * h].view(m, world, h)
+            slots[:, rank].copy_(clean)
+        else:
+            for t in range(peer, m, world):
+                slot = (t // world) * world + rank
+                buf[base + slot * h:base + (slot + 1) * h].copy_(clean[t])
+    torch.cuda.synchronize()

@@ -17,7 +17,6 @@ low-M GEMM's push epilogue, the copy push): bitwise equal to the C++ MNNVL all-r
 pushed and C++ calls interleaved on one workspace, eagerly and in CUDA graph replays; also where
 the decode attention-residual mix finishes the call itself (``MnnvlPendingResult``)."""
 
-import os
 import pickle
 import sys
 import traceback
@@ -25,6 +24,9 @@ import traceback
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import bf16_bits_differ as _differ
+from _torch.helpers import mnnvl_torch_push as _torch_push
+from _torch.helpers import mpi_worker_env, r128c4_scale_offsets
 from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
@@ -74,35 +76,6 @@ def _input(m, h, seed, rank, kind=0):
     return bits.view(torch.bfloat16)
 
 
-def _differ(ref, out):
-    return int((ref.view(torch.int16) != out.view(torch.int16)).sum())
-
-
-def _torch_push(workspace, target, x, rank):
-    """Producer stand-in: store ``x`` into the Lamport slots of ``target`` with plain copies
-    (``-0`` sent as ``+0``), through every rank's unicast mapping."""
-    torch.cuda.synchronize()  # the previous call's rotation state is final
-    flags = target.view.flags.cpu().tolist()
-    cur, nbytes = int(flags[0]), int(flags[2])
-    world = target.view.world
-    m, h = x.shape
-    bits = x.view(torch.int16)
-    clean = torch.where(bits == -32768, torch.zeros_like(bits), bits).view(torch.bfloat16)
-    handle = workspace["handle"]
-    elems = 3 * nbytes // 2
-    for peer in range(world):
-        buf = handle.get_uc_buffer(peer, (elems,), torch.bfloat16, 0)
-        base = cur * nbytes // 2
-        if target.one_shot:
-            slots = buf[base : base + m * world * h].view(m, world, h)
-            slots[:, rank].copy_(clean)
-        else:
-            for t in range(peer, m, world):
-                slot = (t // world) * world + rank
-                buf[base + slot * h : base + (slot + 1) * h].copy_(clean[t])
-    torch.cuda.synchronize()
-
-
 def _left_pending(m, h, k, world, in_place_max_rows):
     """Whether an o_proj ``[h, k]`` of ``m`` rows leaves its all-reduce pending for the mix after
     attention: where its GEMM pushes, up to ``in_place_max_rows`` rows (either transport)."""
@@ -127,10 +100,7 @@ def _projection(plain, x, gate=None):
 
 def _scale_rows(xs, m, h):
     """The UE8M0 bytes of the first ``m`` rows of R128c4 scales of ``[*, h]`` rows."""
-    r = torch.arange(m, device=xs.device).unsqueeze(1)
-    c = torch.arange(h // 32, device=xs.device).unsqueeze(0)
-    offsets = ((r // 128) * (h // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
-    return xs[offsets].contiguous()
+    return xs[r128c4_scale_offsets(m, h, xs.device)].contiguous()
 
 
 def _result(out):
@@ -147,10 +117,7 @@ def _mxfp8_operand(x):
     m, k = x.shape
     xq, xs_rows = low_m.mxfp8_quantize_reference(x)
     xs = torch.full((-(-m // 128) * 128 * (k // 32),), 0x7F, dtype=torch.uint8, device="cuda")
-    r = torch.arange(m, device="cuda").unsqueeze(1)
-    c = torch.arange(k // 32, device="cuda").unsqueeze(0)
-    offsets = ((r // 128) * (k // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
-    xs[offsets] = xs_rows
+    xs[r128c4_scale_offsets(m, k, "cuda")] = xs_rows
     return xq, xs
 
 
@@ -173,9 +140,8 @@ def _gemm_weight(n, k, seed):
     return w, w_scale
 
 
+@mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
 def _run_rank(world_size):
-    os.environ["TLLM_TEST_MNNVL"] = "1"
-    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     from tensorrt_llm._torch.distributed import (
         AllReduce,
         AllReduceFusionOp,
@@ -320,12 +286,11 @@ def _run_rank(world_size):
     return True
 
 
+@mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
 def _run_rank_o_proj(world_size):
     """An o_proj that owns its all-reduce (pushed, finished by the mix after attention) against
     the projection followed by the C++ all-reduce and the tensor mix; also its prequantized
     forward, whose output a copy kernel pushes."""
-    os.environ["TLLM_TEST_MNNVL"] = "1"
-    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     from torch import nn
 
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy, MnnvlPendingResult
@@ -451,12 +416,11 @@ def _run_rank_o_proj(world_size):
     return True
 
 
+@mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
 def _run_rank_transport(world_size):
     """The transport and Lamport buffer size ``mnnvl_allreduce_transport`` gives are the ones the
     C++ MNNVL all-reduce uses (read back from the rotation state it leaves: its stage count and
     bytes to clear), and ``push_target`` / ``check_transport`` take that transport."""
-    os.environ["TLLM_TEST_MNNVL"] = "1"
-    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
     from tensorrt_llm._torch.distributed.ops import (
         get_or_scale_allreduce_mnnvl_workspace,
@@ -593,14 +557,13 @@ def _k3_layer(kind, layer_idx, world_size, rank):
     return layer
 
 
+@mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
 def _run_rank_k3_attention(world_size):
     """Kimi-K3 attention as the FP8 swap builds it: only ``o_proj`` gets the attention's
     all-reduce, the attention (KDA ``_project_output``, ``KimiMLARuntime.forward``) skips its own
     reduction exactly when ``o_proj`` reduces, and ``o_proj`` leaves the all-reduce pending only
     up to the rows the mix after attention finishes (none on snapshot layers). Each output is
     bitwise the projection followed by one C++ all-reduce (not unreduced, not reduced twice)."""
-    os.environ["TLLM_TEST_MNNVL"] = "1"
-    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     from tensorrt_llm._torch.distributed import MnnvlPendingResult
     from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res as attn_res
     from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
@@ -955,14 +918,13 @@ def test_attn_res_finishes_one_shot_call(world, m, early_poll):
     assert bool((rearmed == -(2**31)).all())
 
 
+@mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
 def _run_rank_all_gather(world_size):
     """An all-gather call (the column-parallel MoE tail): the shared partial in the slots and
     every rank's columns of ``y`` in the all-gather rows, finished into ``bf16(y + all-reduce)``
     and by the decode MoE-residual mix, against the C++ all-reduce of the partials and the tensor
     mix; one-shot and two-shot sizes of that all-reduce, eagerly and in a CUDA graph with C++
     calls on the workspace in between."""
-    os.environ["TLLM_TEST_MNNVL"] = "1"
-    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy, MnnvlPendingResult
     from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
     from tensorrt_llm._torch.modules.rms_norm import RMSNorm

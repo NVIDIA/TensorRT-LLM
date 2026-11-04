@@ -16,7 +16,6 @@
 ``finish_push``) and the BF16 split-K GEMM push epilogue: bitwise the C++ MNNVL fused all-reduce
 of the same partials, with C++ calls interleaved on the workspace."""
 
-import os
 import pickle
 import sys
 import traceback
@@ -24,6 +23,9 @@ import traceback
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import bf16_bits_differ as _differ
+from _torch.helpers import mnnvl_torch_push as _torch_push
+from _torch.helpers import mpi_worker_env
 from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
@@ -56,38 +58,8 @@ def _input(m, h, seed, rank, special=False):
     return x
 
 
-def _differ(ref, out):
-    return int((ref.view(torch.int16) != out.view(torch.int16)).sum())
-
-
-def _torch_push(workspace, target, x, rank):
-    """Producer stand-in: store ``x`` into the Lamport slots of ``target`` with plain copies
-    (``-0`` sent as ``+0``), through every rank's unicast mapping."""
-    torch.cuda.synchronize()  # the previous call's rotation state is final
-    flags = target.view.flags.cpu().tolist()
-    cur, nbytes = int(flags[0]), int(flags[2])
-    world = target.view.world
-    m, h = x.shape
-    bits = x.view(torch.int16)
-    clean = torch.where(bits == -32768, torch.zeros_like(bits), bits).view(torch.bfloat16)
-    handle = workspace["handle"]
-    elems = 3 * nbytes // 2
-    for peer in range(world):
-        buf = handle.get_uc_buffer(peer, (elems,), torch.bfloat16, 0)
-        base = cur * nbytes // 2
-        if target.one_shot:
-            slots = buf[base : base + m * world * h].view(m, world, h)
-            slots[:, rank].copy_(clean)
-        else:
-            for t in range(peer, m, world):
-                slot = (t // world) * world + rank
-                buf[base + slot * h : base + (slot + 1) * h].copy_(clean[t])
-    torch.cuda.synchronize()
-
-
+@mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
 def _run_rank(world_size):
-    os.environ["TLLM_TEST_MNNVL"] = "1"
-    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     from tensorrt_llm._torch.distributed import (
         AllReduce,
         AllReduceFusionOp,

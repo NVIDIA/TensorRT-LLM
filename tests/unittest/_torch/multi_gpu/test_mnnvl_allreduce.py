@@ -22,6 +22,7 @@ import traceback
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import mpi_worker_env, r128c4_scale_offsets
 from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
@@ -979,6 +980,7 @@ def test_mnnvl_rms_norm_fusion_without_residual(seq_len, hidden_size,
         assert r is True
 
 
+@mpi_worker_env(TLLM_TEST_MNNVL="1")
 def run_rms_norm_mxfp8_single_rank(tensor_parallel_size, seq_len, hidden_size):
     """RMS_NORM_QUANT_MXFP8 against the low-M GEMM's quantization of the RMS_NORM output of the
     same call, and Kimi K3's latent_up on that operand against latent_up on the BF16 rows."""
@@ -990,7 +992,6 @@ def run_rms_norm_mxfp8_single_rank(tensor_parallel_size, seq_len, hidden_size):
         from tensorrt_llm._torch.models.modeling_kimi_linear import \
             _Fp8BlockScaleWeightReadLinear
 
-        os.environ["TLLM_TEST_MNNVL"] = "1"
         allreduce = AllReduce(mapping=Mapping(world_size=tensor_parallel_size,
                                               tp_size=tensor_parallel_size,
                                               rank=rank),
@@ -1023,11 +1024,8 @@ def run_rms_norm_mxfp8_single_rank(tensor_parallel_size, seq_len, hidden_size):
         ref_q, ref_s = low_m.mxfp8_quantize_reference(norm)
         assert xq.dtype == torch.float8_e4m3fn and xs.dtype == torch.uint8
         assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
-        r = torch.arange(seq_len, device="cuda").unsqueeze(1)
-        c = torch.arange(hidden_size // 32, device="cuda").unsqueeze(0)
-        offsets = ((r // 128) * (hidden_size // 128) +
-                   c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
-        assert torch.equal(xs[offsets], ref_s)
+        assert torch.equal(
+            xs[r128c4_scale_offsets(seq_len, hidden_size, "cuda")], ref_s)
 
         weight = (torch.randn(7168, hidden_size, device="cuda", generator=gen) *
                   0.02).to(torch.bfloat16)
@@ -1060,6 +1058,7 @@ def test_mnnvl_rms_norm_mxfp8_fusion(seq_len, hidden_size, mpi_pool_executor):
 
 
 @torch.inference_mode()
+@mpi_worker_env(TLLM_TEST_MNNVL="1")
 def run_own_workspace_single_rank(tensor_parallel_size, hidden_size,
                                   early_state):
     """An all-reduce on a workspace of its own (MnnvlOwnWorkspace): its own buffers, one-shot up
@@ -1073,7 +1072,6 @@ def run_own_workspace_single_rank(tensor_parallel_size, hidden_size,
         from tensorrt_llm._torch.kernels.blackwell import \
             fp8_block_scale_low_m_gemm as low_m
 
-        os.environ["TLLM_TEST_MNNVL"] = "1"
         MPI.COMM_WORLD.barrier()
         mapping = Mapping(world_size=tensor_parallel_size,
                           tp_size=tensor_parallel_size,
