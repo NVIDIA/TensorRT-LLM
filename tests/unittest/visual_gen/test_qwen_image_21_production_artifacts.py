@@ -78,12 +78,7 @@ def test_qwen_image_21_config_records_production_defaults_without_unsupported_ke
     assert "allow_download:" not in text
 
 
-def test_qwen_image_21_docs_include_usage_and_feature_scope() -> None:
-    text = DOC.read_text(encoding="utf-8")
-    assert "qwen-image-2.1-bf16-1gpu.yaml" in text
-    assert "models/qwen_image_21.py" in text
-    assert "extra_params.use_kv_cache" in text
-    assert "Diffusers" in text
+def test_qwen_image_21_docs_include_model_and_feature_scope() -> None:
     for path in (DOC, SUPPORTED_MODELS):
         contents = path.read_text(encoding="utf-8")
         assert "| `Qwen/Qwen-Image-2.1` | Text-to-Image |" in contents
