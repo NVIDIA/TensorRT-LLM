@@ -24,6 +24,7 @@ from ..distributed import AllReduce
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
     DFLASH_FOLDED_DECODE_LOWERING,
+    HelixDraftShard,
     dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
@@ -513,9 +514,6 @@ class DFlashForCausalLM(nn.Module):
         The worker validates the TRTLLM kernels' page sizes when it binds them.
         """
         return self.dflash_attention_backend == "TRTLLM"
-
-    # The helix shard of the context the worker bound (DFlashWorker), or None.
-    ctx_helix_shard = None
 
     # The block decode waits on block_placement.ctx_stored before its first
     # draft-pool write, so the worker may store the context latents on a side stream.
@@ -1694,6 +1692,7 @@ class DFlashForCausalLM(nn.Module):
         ctx_kv_cache: Optional[torch.Tensor] = None,
         ctx_page_table: Optional[torch.Tensor] = None,
         block_placement: Optional[DraftBlockPlacement] = None,
+        ctx_helix_shard: Optional[HelixDraftShard] = None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -1709,6 +1708,9 @@ class DFlashForCausalLM(nn.Module):
             block_placement: where the block's own positions sit in the
                 context pages, from the worker's paged single-latent
                 preparation; a drafter that appends the block itself ignores it
+            ctx_helix_shard: the helix shard of a context held in a helix
+                target manager's pages, or None; only a drafter that
+                ``reads_helix_sharded_ctx_pages`` is given one
         Returns:
             [B * block_size, hidden_size]
         """

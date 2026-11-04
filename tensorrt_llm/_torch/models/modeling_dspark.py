@@ -4332,6 +4332,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ctx_kv_cache=None,
         ctx_page_table=None,
         block_placement: Optional[DraftBlockPlacement] = None,
+        ctx_helix_shard: Optional[HelixDraftShard] = None,
     ):
         """Eager absorbed-MLA block decode over the drafter's latent cache.
 
@@ -4354,7 +4355,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # page tables, so the eager gather also covers the private arena.
         variant = self._mla_block_decode_variant(paged)
         use_kernel = variant != "eager"
-        shard = self.ctx_helix_shard
+        shard = ctx_helix_shard
         # Per layer, one kernel rotates the query's rope half and normalizes,
         # rotates and stores the block latents (the RoPE table read by position);
         # bitwise the separate launches.

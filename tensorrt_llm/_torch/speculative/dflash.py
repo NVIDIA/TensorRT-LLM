@@ -1360,7 +1360,6 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables = None
         self._ctx_block_counts = None
         self._ctx_helix = None
-        draft_model.ctx_helix_shard = None
         self._paged_latent_prepare = False
         self._ctx_store_stream = None
         max_batch = spec_metadata.max_num_requests
@@ -1598,7 +1597,6 @@ class DFlashWorker(SpecWorkerBase):
                     "it needs a separate draft KV cache."
                 )
             shard = HelixDraftShard(mapping.cp_size, mapping.cp_rank, page_size)
-        draft_model.ctx_helix_shard = shard
         return shard
 
     @property
@@ -2126,6 +2124,7 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_kv_cache=inputs["ctx_kv_cache"],
                     ctx_page_table=inputs["ctx_page_table"],
                     block_placement=inputs["block_placement"],
+                    ctx_helix_shard=self._ctx_helix,
                 )
 
                 # Gather K logits per gen request from the block outputs.
