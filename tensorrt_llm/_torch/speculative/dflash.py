@@ -1288,13 +1288,9 @@ class DFlashWorker(SpecWorkerBase):
         # is taken before the clamp erases the placeholders; it is informative
         # only on the python V2 backend, the cpp one already mapped
         # BAD_PAGE_INDEX to 0.
-        encoded = src[self._ctx_pool_idx, :num_seqs, 0]
-        if self._ctx_block_offset:
-            # Use int64 to avoid underflowing negative placeholders, and keep
-            # the metadata's table unchanged when removing the layer offset.
-            encoded = encoded.to(torch.int64) - self._ctx_block_offset
+        # The kernel removes the layer offset in int64 and leaves the metadata's table unchanged.
         decode_draft_block_table(
-            encoded,
+            src[self._ctx_pool_idx, :num_seqs, 0],
             self._ctx_block_divisor,
             self._ctx_block_tables,
             self._ctx_block_counts,

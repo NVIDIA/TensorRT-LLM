@@ -120,8 +120,14 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
     )
 
     def decode_reference(
-        encoded: torch.Tensor, divisor: int, table: torch.Tensor, counts: torch.Tensor
+        src: torch.Tensor,
+        divisor: int,
+        table: torch.Tensor,
+        counts: torch.Tensor,
+        *,
+        block_offset: int = 0,
     ) -> None:
+        encoded = src.to(torch.int64) - block_offset
         rows = encoded.shape[0]
         counts[:rows].copy_((encoded >= 0).sum(dim=1))
         table[:rows].copy_(encoded.clamp(min=0).div(divisor, rounding_mode="floor"))
@@ -133,17 +139,9 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
 
     decode.assert_called_once()
     encoded, divisor, table, counts = decode.call_args.args
-    assert encoded.dtype == (torch.int64 if block_offset else dtype)
-    assert torch.equal(
-        encoded,
-        torch.tensor(
-            [
-                [0, 2, -1 - block_offset, bad_page_index - block_offset],
-                [4, 6, 8, -1 - block_offset],
-            ],
-            dtype=torch.int64,
-        ),
-    )
+    # The layer offset is removed once, by the decode.
+    assert decode.call_args.kwargs == {"block_offset": block_offset}
+    assert torch.equal(encoded, original[1, :2, 0])
     assert divisor == 2
     assert table is worker._ctx_block_tables
     assert counts is worker._ctx_block_counts
