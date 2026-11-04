@@ -220,6 +220,9 @@ def _select_mla_generation_fmha(
         (103, 48, 6, True, True, "cute_dsl_mla"),
         (100, 48, 6, True, True, "cute_dsl_mla"),
         (103, 48, 6, False, True, "cute_dsl_mla"),
+        (103, 24, 6, True, True, "cute_dsl_mla"),
+        (100, 24, 6, True, True, "cute_dsl_mla"),
+        (103, 24, 6, False, True, "cute_dsl_mla"),
         # The same verify shape without Helix keeps the perf gate.
         (103, 48, 6, True, False, "trtllm_gen"),
         # H=48 page-64 single-token Helix needs the coverage path on SM103.
@@ -503,16 +506,22 @@ def test_mla_generation_mixed_helix_coverage(
 
 
 @pytest.mark.cpu_only
-def test_mla_generation_mixed_page_table_offset(monkeypatch) -> None:
+@pytest.mark.parametrize("seq_len_q", [1, 6])
+def test_mla_generation_mixed_page_table_offset(monkeypatch, seq_len_q) -> None:
     page, heads, latent, rope = 64, 48, 512, 64
+    num_tokens = 2 * seq_len_q
     cache = torch.zeros((12, 1, page, 1, latent + rope), dtype=torch.float8_e4m3fn)
     blocks = torch.arange(12).view(1, 4, 1, 3)
     lengths = torch.tensor([999, 888, 5, 7], dtype=torch.int32)
+    # The Helix buffers are generation-relative; the tail stands for entries
+    # past this step's generation tokens.
+    kv_bounds = torch.arange(100, 100 + num_tokens + 4, dtype=torch.int32)
     meta = SimpleNamespace(
         num_contexts=2,
         max_num_requests=4,
-        helix_position_offsets=torch.zeros(2, dtype=torch.int32),
-        _helix_spec_tokens_valid=False,
+        helix_position_offsets=torch.zeros(num_tokens, dtype=torch.int32),
+        helix_kv_bounds=kv_bounds,
+        _helix_spec_tokens_valid=seq_len_q > 1,
         kv_cache_manager=SimpleNamespace(get_buffers=lambda _: cache),
         kv_cache_block_offsets=blocks,
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]]),
@@ -537,7 +546,7 @@ def test_mla_generation_mixed_page_table_offset(monkeypatch) -> None:
             quant_q_buffer=None,
             mla_bmm1_scale=torch.ones(2, dtype=torch.float32),
             mla_bmm2_scale=torch.ones(1, dtype=torch.float32),
-            softmax_stats_tensor=torch.empty((2, heads, 2), dtype=torch.float32),
+            softmax_stats_tensor=torch.empty((num_tokens, heads, 2), dtype=torch.float32),
         ),
     )
     library = CuteDslMlaFmha.__new__(CuteDslMlaFmha)
@@ -551,12 +560,18 @@ def test_mla_generation_mixed_page_table_offset(monkeypatch) -> None:
         raising=False,
     )
     library._run_mla_decode(
-        torch.zeros((2, heads, latent + rope), dtype=torch.bfloat16),
-        torch.empty((2, heads, latent), dtype=torch.bfloat16),
+        torch.zeros((num_tokens, heads, latent + rope), dtype=torch.bfloat16),
+        torch.empty((num_tokens, heads, latent), dtype=torch.bfloat16),
         params,
         torch.float8_e4m3fn,
     )
     assert len(calls) == 1
     torch.testing.assert_close(calls[0][4], blocks[0, 2:, 0].T.to(torch.int32))
     torch.testing.assert_close(calls[0][5], lengths[2:])
+    assert calls[0][9] == seq_len_q
     assert calls[0][14] is params.fwd.softmax_stats_tensor
+    # A verify group passes the bounds of exactly this step's generation tokens.
+    if seq_len_q > 1:
+        torch.testing.assert_close(calls[0][15], kv_bounds[:num_tokens])
+    else:
+        assert calls[0][15] is None
