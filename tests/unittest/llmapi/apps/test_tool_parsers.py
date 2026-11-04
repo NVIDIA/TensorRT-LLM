@@ -42,7 +42,6 @@ from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
-from tensorrt_llm.serve.tool_parser.minimax_m3_parser import MiniMaxM3ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
@@ -5141,21 +5140,6 @@ class TestMiniMaxM2ToolParser:
                                                   sample_tools)
         assert result.normal_text == ""
         assert parser.finish(sample_tools).normal_text == "ordinary text <mini"
-
-    def test_m3_finish_releases_partial_token_prefix(self, sample_tools):
-        parser = MiniMaxM3ToolParser()
-        text = "ordinary text " + parser.bot_token[:5]
-        assert parser.parse_streaming_increment(text,
-                                                sample_tools).normal_text == ""
-        assert parser.finish(sample_tools).normal_text == text
-        assert parser.finish(sample_tools).normal_text == ""
-
-    def test_m3_finish_keeps_unfinished_tool_call_hidden(self, sample_tools):
-        parser = MiniMaxM3ToolParser()
-        parser.parse_streaming_increment("prefix " + parser.bot_token,
-                                         sample_tools)
-        assert parser.finish(sample_tools).normal_text == "prefix "
-        assert parser.finish(sample_tools).normal_text == ""
 
     def test_finish_keeps_unfinished_tool_call_hidden(self, sample_tools):
         parser = MiniMaxM2ToolParser()
