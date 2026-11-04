@@ -928,7 +928,12 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // so age-prune rather than delete per job; reused ones keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
+            // Keep the job workspace (job-output.log etc.) for debugging; the
+            // PruneSlurmOutputs job removes it after the retention period. Drop the
+            // S3 spool and anything holding credentials right away: the launch
+            // script embeds HF/GitHub tokens and OpenSearch credentials, and the
+            // netrc files hold the Artifactory credentials.
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -1404,6 +1409,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (enrootConfigDir) {
                     slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
                 }
+                slurmSubmitCommand = SlurmConfig.withGpuBudget(pipeline, partition.clusterName, slurmSubmitCommand, gpuCount)
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -1852,7 +1858,8 @@ def getPytestBaseCommandLine(
     String pytestUtil = "",
     List<String> extraArgs = [],
     int containerPortStart = 0,
-    int containerPortNum = 0
+    int containerPortNum = 0,
+    String clusterName = ""
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
@@ -1864,6 +1871,10 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
+    // GB200 stages run on multiple clusters; only gcp-iad needs the gIB NCCL network plugin over IB.
+    if (stageName.startsWith("GB200") && clusterName == "gcp-iad") {
+        extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
+    }
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
     // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
@@ -2504,6 +2515,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
+                    0,
+                    0,
+                    partition.clusterName,
                 )
                 pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
                 def pytestCommand = pytestCommandParts.join(" ")
@@ -2711,7 +2725,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
+                    # Keep xtrace off here too: the exported pipeline env includes OpenSearch credentials.
+                    set +x
                     ${envExportStatements}
+                    set -x
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
@@ -2890,9 +2907,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sbatch_max_attempts=6
                     sbatch_attempt=1
                     while true; do
+                        # Silence xtrace around the capture and prints: it would re-echo the
+                        # multi-line sbatch output in every traced command. Restore it only
+                        # if it was on, so a caller that turned it off stays off.
+                        case \$- in
+                            *x*) xtrace_was_on=1 ;;
+                            *)   xtrace_was_on=0 ;;
+                        esac
+                        { set +x; } 2>/dev/null
                         sbatch_rc=0
-                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
-                        printf '%s\\n' "\${sbatch_output}"
+                        sbatch_output=\$(${SlurmConfig.withGpuBudget(pipeline, partition.clusterName, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
+                        printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                        if [ "\${xtrace_was_on}" -eq 1 ]; then
+                            set -x
+                        fi
                         if [ "\${sbatch_rc}" -eq 0 ]; then
                             break
                         fi
