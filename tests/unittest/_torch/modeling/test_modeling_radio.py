@@ -332,3 +332,56 @@ def test_radio_blocks_cuda_graph_matches_eager_multi_context(tiny_vit_config):
     maybe_run.assert_called_once()
 
     torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
+
+
+def _make_temporal_model_config():
+    """bf16 ModelConfig whose vision config groups video frames in pairs (tubelets)."""
+    vision_config = _make_vision_config()
+    vision_config.video_temporal_patch_size = 2
+    return model_config_lib.ModelConfig(
+        pretrained_config=vision_config,
+        quant_config=QuantConfig(),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_radio_video_forward_after_dummy_weight_init(tiny_vit_config):
+    """A video forward runs on the weights the dummy loader fills.
+
+    ``load_format="dummy"`` fills every parameter, ``video_embedder`` included, with
+    ``initialize_dummy_weights`` and never calls ``load_weights``.
+    """
+    from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
+
+    device = torch.device("cuda")
+    model = RADIOVisionModel(_make_temporal_model_config(), disable_quantization=True)
+    for module in model.modules():
+        if isinstance(module, MultimodalEncoderMixin):
+            module.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
+    model = model.to(device).to(torch.bfloat16)
+    model.eval()
+    initialize_dummy_weights(model)
+
+    # Three frames make two tubelets; the second one repeats the last frame.
+    num_frames = 3
+    frames = torch.randn(num_frames, 3, 32, 32, device=device, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        features = model.forward(frames, num_frames=num_frames)
+
+    num_patches = (32 // 16) ** 2
+    assert features.shape == (2, num_patches, _TINY_VIT.embed_dim)
+    assert features.isfinite().all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_radio_load_weights_requires_video_embedder_weights(tiny_vit_config):
+    """A checkpoint without ``video_embedder`` weights is refused when it is loaded."""
+    model = RADIOVisionModel(_make_temporal_model_config(), disable_quantization=True)
+    weights = {
+        f"radio_model.{name}": tensor
+        for name, tensor in model.radio_model.state_dict().items()
+        if ".video_embedder." not in name
+    }
+
+    with pytest.raises(ValueError, match="requires video_embedder weights"):
+        model.load_weights(weights)
