@@ -229,12 +229,15 @@ def _run(world_size: int, test_fn: Callable[..., None], *args: object) -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "batch_size,layout_name,expect_fused_copy,local_sequence_length,local_kv_sequence_length,issue_order",
+    "batch_size,layout_name,expect_fused_copy,local_sequence_length,local_kv_sequence_length,issue_order,accepts_unowned_inputs",
     [
-        (1, "NHD", False, 3, 3, ("v", "q", "k")),
-        (2, "NHD", True, 3, 3, ("v", "q", "k")),
-        (1, "HND", True, 3, 3, ("v", "q", "k")),
-        (1, "NHD", False, 3, 5, ("q", "k", "v")),
+        (1, "NHD", False, 3, 3, ("v", "q", "k"), True),
+        (2, "NHD", True, 3, 3, ("v", "q", "k"), True),
+        (1, "HND", True, 3, 3, ("v", "q", "k"), True),
+        (1, "NHD", False, 3, 5, ("q", "k", "v"), True),
+        (1, "NHD", True, 3, 3, ("v", "q", "k"), None),
+        (1, "NHD", True, 3, 3, ("v", "q", "k"), False),
+        (1, "NHD", True, 3, 5, ("q", "k", "v"), False),
     ],
 )
 def test_async_post_unscatter_avoids_redundant_copy(
@@ -245,6 +248,7 @@ def test_async_post_unscatter_avoids_redundant_copy(
     local_sequence_length: int,
     local_kv_sequence_length: int,
     issue_order: tuple[str, str, str],
+    accepts_unowned_inputs: bool | None,
 ) -> None:
     from tensorrt_llm._torch.visual_gen.attention.backends import parallel
 
@@ -297,9 +301,9 @@ def test_async_post_unscatter_avoids_redundant_copy(
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fused_calls.append(True)
         return (
-            reference_layout(query_receive, is_hnd),
-            reference_layout(key_receive, is_hnd),
-            reference_layout(value_receive, is_hnd),
+            reference_layout(query_receive, is_hnd).clone(),
+            reference_layout(key_receive, is_hnd).clone(),
+            reference_layout(value_receive, is_hnd).clone(),
         )
 
     def record_backend(**forward_kwargs: object) -> torch.Tensor:
@@ -320,9 +324,18 @@ def test_async_post_unscatter_avoids_redundant_copy(
         return query + key + value
 
     monkeypatch.setattr(parallel, "_ulysses_post_unscatter", fused_post_unscatter)
+
+    class RecordingBackend(parallel.AttentionBackend):
+        preferred_layout = layout
+
+        def forward(self, **forward_kwargs: object) -> torch.Tensor:
+            return record_backend(**forward_kwargs)
+
+    if accepts_unowned_inputs is not None:
+        RecordingBackend.accepts_unowned_inputs = accepts_unowned_inputs
     attention = SimpleNamespace(
         world_size=world_size,
-        inner_backend=SimpleNamespace(preferred_layout=layout, forward=record_backend),
+        inner_backend=RecordingBackend(),
         _issue_async=issue_async,
         _join_async=lambda: None,
         _output_a2a=lambda output, batch_argument, sequence_argument: output,
@@ -359,6 +372,8 @@ def test_async_post_unscatter_avoids_redundant_copy(
         assert torch.equal(tensor, expected_tensor)
         if not expect_fused_copy:
             assert tensor.data_ptr() == receive_buffer.data_ptr()
+        else:
+            assert tensor.data_ptr() != receive_buffer.data_ptr()
 
 
 def test_slot_ring_wraparound():
@@ -403,6 +418,7 @@ def _receive_view_lifetime_logic(
     received = []
 
     class DelayedNHDBackend:
+        accepts_unowned_inputs = True
         preferred_layout = AttentionTensorLayout.NHD
         num_heads = local_heads
         num_kv_heads = local_heads

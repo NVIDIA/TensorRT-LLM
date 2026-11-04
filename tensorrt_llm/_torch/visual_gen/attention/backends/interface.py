@@ -20,7 +20,7 @@ Defines shared types, enums, and the abstract base class for attention backends.
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 
@@ -84,6 +84,8 @@ class AttentionBackend(ABC):
     via ``**kwargs``.
     """
 
+    accepts_unowned_inputs: ClassVar[bool] = False
+
     def __call__(self, *args, **kwargs) -> torch.Tensor:
         return self.forward(*args, **kwargs)
 
@@ -97,10 +99,12 @@ class AttentionBackend(ABC):
     ) -> torch.Tensor:
         """Attention over ``q``, ``k``, ``v`` in the backend's ``preferred_layout``.
 
-        Inputs may alias transient communication buffers not owned by PyTorch's
-        caching allocator. Do not retain them after this call. Join any side-stream
-        reads back to the caller's stream before returning, and do not rely on
-        allocator APIs such as ``record_stream`` to track these buffers' lifetime.
+        Set ``accepts_unowned_inputs`` to True only after verifying the backend
+        with ``cudaMallocAsync`` and side-stream reads. Opted-in backends may receive
+        transient communication buffers not owned by PyTorch's caching allocator.
+        Do not retain these inputs after this call. Join any side-stream reads back
+        to the caller's stream before returning, and do not rely on allocator APIs
+        such as ``record_stream`` to track these buffers' lifetime.
 
         Keyword contract shared by every backend (unknown keywords are ignored):
 

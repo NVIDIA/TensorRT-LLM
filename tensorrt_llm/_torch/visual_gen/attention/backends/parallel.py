@@ -820,14 +820,18 @@ class UlyssesAttention(AttentionBackend):
             )
 
         # The fused kernel replaces the materializing post-A2A chain for HND
-        # and batch > 1 NHD. Batch-one NHD receives use views instead.
+        # and batch > 1 NHD. Opted-in backends use views for batch-one NHD.
         # The kernel is only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
         # These views may alias the receive-slot ring. Every rank consumes them
         # before the reverse collective in _output_a2a, whose completion orders
         # the next call's slot reuse after all peers' reads on the caller stream.
-        post_unscatter_is_view = not is_hnd and B_q == 1
+        post_unscatter_is_view = (
+            not is_hnd
+            and B_q == 1
+            and getattr(self.inner_backend, "accepts_unowned_inputs", False) is True
+        )
         use_fused_post_unscatter = (
             self.world_size > 1 and q_5d.dtype == torch.bfloat16 and not post_unscatter_is_view
         )
@@ -871,7 +875,12 @@ class UlyssesAttention(AttentionBackend):
         batch_size: int,
         seq_len_full: int,
     ) -> torch.Tensor:
-        """Reverse all-to-all: [B, S, H/P, D] → [B, S/P, H, D]"""
+        """Reverse all-to-all: [B, S, H/P, D] → [B, S/P, H, D].
+
+        For receive views, keep this the first same-group cross-rank boundary
+        after all backend reads, before the next forward_async can reuse slots.
+        Preserve that ordering if moving this exchange into the caller's compile region.
+        """
         inner_layout = self.inner_backend.preferred_layout
 
         if inner_layout == AttentionTensorLayout.HND:
