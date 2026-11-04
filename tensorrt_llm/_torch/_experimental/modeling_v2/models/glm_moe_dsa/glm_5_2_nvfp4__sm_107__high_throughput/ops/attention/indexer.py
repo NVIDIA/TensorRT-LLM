@@ -25,10 +25,11 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm._torch.modules.top_k import TopKImplementation
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .full_query_policy import fp8_full_query_weight_cache_limit
+from .topk import RubinTopK
 
 
 class RubinIndexer(Indexer):
@@ -72,8 +73,8 @@ class RubinIndexer(Indexer):
             self._enable_heuristic_topk = True
             self._use_self_sampling_topk = True
             # Each CUDA graph runs the same eager forward before capture,
-            # warming the shared GVR launcher's exact rows/stride/envelope key.
-            self.top_k = TopK(
+            # warming the GVR launcher's exact rows/stride/envelope key.
+            self.top_k = RubinTopK(
                 self.index_topk,
                 prefill_implementation=TopKImplementation.CUDA_RADIX,
                 decode_implementation=TopKImplementation.CUTE_DSL_GVR,
