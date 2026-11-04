@@ -88,6 +88,9 @@ ROUTERS: tuple[RouterSpec, ...] = (
     RouterSpec(
         "tensorrt_llm.serve.api.openai.tokenize.api_router", roles=frozenset({RoleGroup.LLM})
     ),
+    RouterSpec(
+        "tensorrt_llm.serve.api.openai.completions.api_router", roles=frozenset({RoleGroup.LLM})
+    ),
 )
 
 

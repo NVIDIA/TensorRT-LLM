@@ -901,6 +901,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 TokenizeServing
             setattr(self.app.state, tokenize_router.APP_STATE_KEY,
                     TokenizeServing(model=self.model, tokenizer=self.tokenizer))
+            from tensorrt_llm.serve.api.openai.completions import \
+                api_router as completions_router
+            from tensorrt_llm.serve.api.openai.completions.serving import \
+                CompletionServing
+            setattr(self.app.state, completions_router.APP_STATE_KEY,
+                    CompletionServing(**self._generate_serving_kwargs()))
             self._register_launcher_forwarding_routes()
             self.register_routes()
 
@@ -1126,10 +1132,24 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _generate_serving_kwargs(self) -> Dict[str, Any]:
         """Constructor arguments of every GenerateBaseServing, read once."""
-        return dict(model=self.model,
-                    generator=self.generator,
-                    tokenizer=self.tokenizer,
-                    model_config=self.model_config)
+        return dict(
+            model=self.model,
+            generator=self.generator,
+            tokenizer=self.tokenizer,
+            model_config=self.model_config,
+            collect_perf_metrics=self._collect_perf_metrics,
+            metrics_collector=self.metrics_collector,
+            adjusted_steady_clock=self._adjusted_steady_clock,
+            iteration_stats_wakeup_event=self._iteration_stats_wakeup_event,
+            # The lifespan creates the collector task after the serving
+            # objects exist, so they read this object's current binding.
+            iteration_stats_collector_task=(
+                lambda: self._iteration_stats_collector_task),
+            internal_disagg_auth_key=self._internal_disagg_auth_key,
+            per_request_spec_decode_stats=self._per_request_spec_decode_stats,
+            spec_decode_num_spec_tokens=self._spec_decode_num_spec_tokens,
+            input_proc_executor=self._input_proc_executor,
+            postproc=self._postproc)
 
     def _check_health(self) -> bool:
         # An embedding server's requests flow through the batcher worker; if it
@@ -1197,9 +1217,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 "/_resource_governor/ will not be available.")
             self.resource_governor = None
 
-        self.app.add_api_route("/v1/completions",
-                               self.openai_completion,
-                               methods=["POST"])
         self.app.add_api_route(
             "/v1/chat/completions",
             self.openai_chat if not self.use_harmony else self.chat_harmony,
