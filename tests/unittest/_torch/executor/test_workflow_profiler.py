@@ -76,6 +76,7 @@ def test_phase_tracks_scheduled_work(
 def test_direct_tensor_metadata_and_decorator_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Describe direct tensors while preserving the decorated call signature."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
     tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
     scalar = torch.tensor(7, dtype=torch.int64)
@@ -84,6 +85,7 @@ def test_direct_tensor_metadata_and_decorator_identity(
 
     @profiler.record_function_with_metadata("workflow::decorated")
     def wrapped(value: torch.Tensor, *, offset: torch.Tensor, nested: object) -> object:
+        """Verify direct and nested argument identity before returning a sentinel."""
         assert value is tensor and offset is scalar
         assert nested is container
         return result
@@ -128,6 +130,7 @@ def test_direct_tensor_metadata_and_decorator_identity(
 def test_metadata_factory_is_lazy(
     monkeypatch: pytest.MonkeyPatch, active: bool, selected: bool
 ) -> None:
+    """Inspect tensor metadata only when workflow is selected and active."""
     monkeypatch.setattr(
         profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
     )
@@ -158,6 +161,7 @@ def test_metadata_factory_is_lazy(
 def test_wrapped_exception_identity(
     monkeypatch: pytest.MonkeyPatch, selected: bool, error: BaseException
 ) -> None:
+    """Preserve body exception identity in decorator and context forms."""
     monkeypatch.setattr(
         profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
     )
@@ -177,6 +181,7 @@ def test_wrapped_exception_identity(
 
 
 def test_none_selection_suppresses_real_trace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Emit no workflow scope when startup selection excludes workflow."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
         with profiler.record_function_with_metadata("workflow::disabled", torch.ones(1)):
@@ -238,6 +243,7 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
     )
 
     def forward(*args: object, **kwargs: object) -> object:
+        """Check forwarded model arguments and record body execution order."""
         assert args == (batch, resources, None)
         assert kwargs == {
             "cache_indirection_buffer": cache_indirection,
@@ -343,6 +349,7 @@ def test_explicit_metadata_is_lazy_and_observational(
     failure = RuntimeError("body")
 
     def metadata(tensor: torch.Tensor, *, fails: bool = False) -> dict[str, profiler.MetadataValue]:
+        """Record factory calls and optionally inject a metadata failure."""
         calls.append(tensor)
         if fails:
             raise ValueError("metadata")
@@ -350,6 +357,7 @@ def test_explicit_metadata_is_lazy_and_observational(
 
     @profiler.record_function_with_metadata("workflow::explicit", metadata_factory=metadata)
     def wrapped(tensor: torch.Tensor, *, fails: bool = False) -> torch.Tensor:
+        """Return the input tensor or raise the original body failure."""
         if fails:
             raise failure
         return tensor
@@ -493,6 +501,7 @@ def test_decoder_capture_and_replay_named_capacity(
         graphs={},
         graph_outputs={},
         memory_pool=object(),
+        _step_input_prologue_keys={},
         _pre_replay_hooks=[],
     )
     with (
@@ -592,6 +601,35 @@ def test_graph_metadata_accepts_additive_call_keywords(kind: str, operation: str
         assert fields["workflow.graph.encoder_hidden_state_rows"] == 5
 
 
+@pytest.mark.parametrize(
+    "features,expected_shape",
+    [
+        pytest.param(torch.ones(2, 8), [2, 8], id="tensor-compatibility"),
+        pytest.param([], None, id="empty-list"),
+        pytest.param([torch.tensor(1)], None, id="scalar"),
+        pytest.param([torch.ones(1, 8), object()], None, id="non-tensor"),
+        pytest.param([torch.ones(1, 8), torch.ones(1, 9)], None, id="different-widths"),
+        pytest.param(
+            [torch.ones(1, 8), torch.ones(1, 8, dtype=torch.float64)],
+            None,
+            id="different-dtypes",
+        ),
+    ],
+)
+def test_encoder_feature_shape_compatibility(
+    features: torch.Tensor | list[object], expected_shape: list[int] | None
+) -> None:
+    """Report packed feature shapes only for compatible tensor inputs."""
+    owner = SimpleNamespace(padding_enabled=True, WARMUP_STEPS=1)
+    fields = cuda_graph_runner._encoder_graph_workflow_metadata(
+        owner, (4, 12, 3), {"input_features": features}, "replay"
+    )
+    if expected_shape is None:
+        assert "workflow.graph.input_feature_shape" not in fields
+    else:
+        assert fields["workflow.graph.input_feature_shape"] == expected_shape
+
+
 @pytest.mark.parametrize("operation", ["capture", "replay"])
 @pytest.mark.parametrize(
     "source_lengths,has_source_counts",
@@ -609,6 +647,7 @@ def test_encoder_graph_preserves_source_and_key_semantics(
     source_lengths: list[int | torch.Tensor] | None,
     has_source_counts: bool,
 ) -> None:
+    """Keep encoder bucket capacities distinct from host source counts."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
     result = object()
     owner = SimpleNamespace(
@@ -637,7 +676,7 @@ def test_encoder_graph_preserves_source_and_key_semantics(
         cuda_graph_runner, "nccl_window_graph_capture", lambda *args, **kwargs: nullcontext()
     )
     inputs = {
-        "input_features": torch.ones(2, 8),
+        "input_features": [torch.ones(1, 8), torch.ones(1, 8)],
         "attn_metadata": object(),
     }
     if source_lengths is not None:
@@ -795,6 +834,7 @@ def test_pp_loop_call_propagates_actual_slot(
 def test_microbatch_slot_unknown_is_not_a_numeric_sentinel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pp_size: int, expected: int | None
 ) -> None:
+    """Omit unknown pipeline slots while preserving the single-stage zero slot."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
     owner = SimpleNamespace(
         iter_counter=1,
@@ -831,6 +871,7 @@ def test_microbatch_slot_unknown_is_not_a_numeric_sentinel(
 def test_graph_metadata_failure_keeps_replay_body_exception(
     monkeypatch: pytest.MonkeyPatch, selected: bool
 ) -> None:
+    """Keep graph replay exceptions independent of metadata selection or failure."""
     monkeypatch.setattr(
         profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
     )
@@ -857,6 +898,7 @@ def test_graph_metadata_failure_keeps_replay_body_exception(
         graphs={key: SimpleNamespace(replay=replay, reset=lambda: None)},
         graph_outputs={},
         memory_pool=None,
+        _step_input_prologue_keys={},
         _pre_replay_hooks=[],
     )
     owner._get_num_tokens_for_key = lambda key: 1

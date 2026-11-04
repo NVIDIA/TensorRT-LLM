@@ -227,6 +227,7 @@ def record_function_metadata_scope(
 
 
 def _tensor_metadata(tensor: torch.Tensor) -> dict[str, MetadataValue]:
+    """Describe tensor shape, dtype, stride, and device without reading values."""
     return {
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype),
@@ -250,6 +251,7 @@ class _RecordFunctionWithMetadata:
         self._scope: AbstractContextManager[None] | None = None
 
     def _metadata(self) -> dict[str, MetadataValue]:
+        """Collect direct tensor descriptors and merge explicit workflow fields."""
         metadata: dict[str, MetadataValue] = {}
         tensor_index = 0
         for value in self._values:
@@ -279,10 +281,12 @@ class _RecordFunctionWithMetadata:
         return self._scope.__exit__(exc_type, exc_value, traceback)
 
     def __call__(self, func: Callable[_P, _R]) -> Callable[_P, _R]:
+        """Decorate a callable only when workflow was selected at startup."""
         if "workflow" not in _CUSTOM_REGIONS:
             return func
 
         def profiled(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            """Run the callable within a fresh scope using its direct arguments."""
             factory = self._metadata_factory
             with _RecordFunctionWithMetadata(
                 self._name,
@@ -297,6 +301,7 @@ class _RecordFunctionWithMetadata:
 
         @wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            """Bypass scope construction unless workflow profiling is active."""
             if not custom_region_active("workflow"):
                 return func(*args, **kwargs)
             return profiled(*args, **kwargs)
