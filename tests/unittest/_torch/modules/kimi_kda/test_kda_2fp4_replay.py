@@ -401,6 +401,101 @@ def test_dspark_native_verify_acceptance_and_rollover(heads: int, tokens: int) -
     torch.testing.assert_close(fused["conv_state"], scalar_conv, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("layout", ["affine", "indirect"])
+def test_dspark_commit_layer_descriptors_and_reduced_token_width(layout: str) -> None:
+    """Address independent layers and keep the configured stride when T shrinks."""
+    batch, heads, layers, max_tokens, tokens = 4, 3, 3, 8, 4
+    capacity = ops.HISTORY_SIZE + max_tokens
+    width = heads * 128
+    if layout == "affine":
+        pooled_states = torch.zeros(
+            (11, layers, heads, 1, ops.STATE_BYTES_PER_HEAD), dtype=torch.uint8, device="cuda"
+        )
+        pooled_conv = torch.randn(11, layers, 3 * width, 3, device="cuda").bfloat16()
+    dummy = torch.tensor([False, False, False, True], device="cuda")
+    accepted = torch.tensor([4, 2, 0, 4], device="cuda", dtype=torch.int32)
+    descriptors, records = [], []
+    for layer in range(layers):
+        pool, slots, original, _ = _fixture(batch, heads)
+        torch.manual_seed(150 + layer)
+        if layout == "affine":
+            pool = pooled_states[:, layer]
+            conv = pooled_conv[:, layer]
+        else:
+            pool = torch.zeros(
+                (11 * (layer + 1), heads, 1, ops.STATE_BYTES_PER_HEAD),
+                dtype=torch.uint8,
+                device="cuda",
+            )[:: layer + 1]
+            conv = torch.randn(11 * (layer + 1), 3 * width, 3, device="cuda").bfloat16()[
+                :: layer + 1
+            ]
+        ops.store_checkpoint(pool, slots, torch.randn(batch, heads, 128, 128, device="cuda") * 0.1)
+        history = _verification_history(original, max_tokens)
+        history.k.normal_(std=0.03)
+        history.u.normal_(std=0.03)
+        history.g.copy_(-torch.rand_like(history.g).cumsum(2) * 0.02)
+        live = history.slot_map[slots.long()].long()
+        old = torch.tensor([12 + layer, 7, 5, 3], device="cuda", dtype=torch.int32)
+        history.length[live] = old
+        raw = torch.randn(batch * tokens, 4 * width, device="cuda").bfloat16()[:, : 3 * width]
+        fused = _fused_inputs(batch * tokens, heads)
+        fused["conv_state"] = conv
+        before_pool, before_conv = pool.clone(), conv.clone()
+        ops.verify(
+            raw,
+            **fused,
+            gate=torch.randn(batch * tokens, width, device="cuda").bfloat16(),
+            beta=torch.randn(batch * tokens, heads, device="cuda").bfloat16(),
+            pool=pool,
+            slots=slots,
+            dummy=dummy,
+            history=history,
+            A_log=torch.full((heads,), -2.0, device="cuda"),
+            dt_bias=torch.full((heads, 128), -1.0, device="cuda"),
+            lower_bound=-5.0,
+            norm_eps=1e-6,
+        )
+        torch.testing.assert_close(pool, before_pool, atol=0, rtol=0)
+        torch.testing.assert_close(conv, before_conv, atol=0, rtol=0)
+        descriptors.append(_verification_descriptors(pool, conv, history))
+        records.append((pool, conv, history, live, old, raw, before_pool, before_conv))
+    ops.commit_verified(
+        torch.cat(descriptors),
+        slots,
+        original.slot_map,
+        accepted,
+        dummy,
+        heads,
+        capacity,
+        max_tokens,
+    )
+    for pool, conv, history, live, old, raw, before_pool, before_conv in records:
+        for row in range(batch):
+            slot, active_row = slots[row].item(), live[row].item()
+            count = 0 if dummy[row] else accepted[row].item()
+            n = old[row].item() + count
+            window = torch.cat((before_conv[slot], raw.view(batch, tokens, -1)[row, :count].T), -1)
+            torch.testing.assert_close(conv[slot], window[:, -3:], atol=0, rtol=0)
+            assert history.length[active_row] == (0 if n >= ops.HISTORY_SIZE else n)
+            if count and n >= ops.HISTORY_SIZE:
+                primary, residual = _read_checkpoint(before_pool, slots[row : row + 1])
+                end = history.g[active_row, :, n - 1]
+                adjusted = (
+                    history.k[active_row, :, :n].float()
+                    * (end[:, None] - history.g[active_row, :, :n]).exp()
+                ).bfloat16()
+                state = (primary + residual)[0] * end.exp()[:, None]
+                state += history.u[active_row, :, :n].float().transpose(-1, -2) @ adjusted.float()
+                target_primary, target_residual = _qdq(state)
+                actual = ops.materialize_checkpoint(
+                    pool, slots[row : row + 1], torch.ones(1, device="cuda", dtype=torch.bool)
+                )
+                _assert_repacked_close(actual[0], target_primary + target_residual)
+            else:
+                torch.testing.assert_close(pool[slot], before_pool[slot], atol=0, rtol=0)
+
+
 def _conv_reference(
     raw: torch.Tensor, fused: dict[str, torch.Tensor], slots: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

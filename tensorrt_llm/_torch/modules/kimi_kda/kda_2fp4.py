@@ -6,8 +6,8 @@ The V2 checkpoint is one packed byte array per head: primary E2M1 values,
 residual E2M1 values, their E4M3 block scales, and a shared FP32 outer scale.
 Only checkpoint materialization/commit reads the residual. K/U histories
 are BF16 and cumulative per-key G is FP32. Batch and pool sizes are runtime
-parameters; no kernel specializes on batch size. Prefill checkpoint helpers
-and the all-layer DSpark post-sampling commit use Triton.
+parameters; no kernel specializes on batch size. DSpark verification and its
+all-layer post-sampling commit use CuTe DSL. Prefill checkpoint helpers use Triton.
 """
 
 from dataclasses import dataclass
@@ -435,98 +435,6 @@ def verify(
     return output
 
 
-@triton.jit
-def _commit_verified_kernel(
-    descriptors,
-    slots,
-    slot_map,
-    accepted,
-    dummy,
-    H: tl.constexpr,
-    CAP: tl.constexpr,
-    TMAX: tl.constexpr,
-    WINDOW: tl.constexpr,
-):
-    batch, head, layer = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    is_dummy = tl.load(dummy + batch)
-    slot = tl.load(slots + batch)
-    live = tl.load(slot_map + slot, mask=~is_dummy, other=-1)
-    if live >= 0:
-        base = descriptors + layer * 10
-        pool = tl.load(base).to(tl.pointer_type(tl.uint8))
-        pool_stride = tl.load(base + 1)
-        conv = tl.load(base + 2).to(tl.pointer_type(tl.bfloat16))
-        conv_stride = tl.load(base + 3)
-        hk = tl.load(base + 4).to(tl.pointer_type(tl.bfloat16))
-        hu = tl.load(base + 5).to(tl.pointer_type(tl.bfloat16))
-        hg = tl.load(base + 6).to(tl.pointer_type(tl.float32))
-        lengths = tl.load(base + 7).to(tl.pointer_type(tl.int32))
-        old_lengths = tl.load(base + 8).to(tl.pointer_type(tl.int32))
-        candidates = tl.load(base + 9).to(tl.pointer_type(tl.bfloat16))
-        count = tl.load(accepted + batch)
-        tl.device_assert((count >= 0) & (count <= TMAX), "invalid accepted prefix")
-        old = tl.load(old_lengths + batch)
-        n = old + count
-        # Each head owns its three disjoint Q/K/V channel sections.
-        channel = tl.arange(0, 512)
-        section, key = channel // 128, channel % 128
-        absolute_channel = (section * H + head) * 128 + key
-        window = tl.arange(0, 4)
-        source = count + window
-        from_old = source < 3
-        old_values = tl.load(
-            conv
-            + slot.to(tl.int64) * conv_stride
-            + absolute_channel[:, None] * 3
-            + source[None, :],
-            mask=(channel[:, None] < 384) & (window[None, :] < 3) & from_old[None, :] & (count > 0),
-            other=0,
-        )
-        new_values = tl.load(
-            candidates
-            + batch.to(tl.int64) * TMAX * (3 * H * 128)
-            + (source[None, :] - 3) * (3 * H * 128)
-            + absolute_channel[:, None],
-            mask=(channel[:, None] < 384)
-            & (window[None, :] < 3)
-            & ~from_old[None, :]
-            & (count > 0),
-            other=0,
-        )
-        tl.store(
-            conv
-            + slot.to(tl.int64) * conv_stride
-            + absolute_channel[:, None] * 3
-            + window[None, :],
-            tl.where(from_old[None, :], old_values, new_values),
-            mask=(channel[:, None] < 384) & (window[None, :] < 3) & (count > 0),
-        )
-        if n >= WINDOW:
-            row = tl.arange(0, 128)
-            col = tl.arange(0, 128)
-            hist = tl.arange(0, 32)
-            state_base = pool + slot.to(tl.int64) * pool_stride + head * _STATE_BYTES
-            state = _load_checkpoint(state_base, row, 128, True)
-            hist_base = (live.to(tl.int64) * H + head) * CAP * 128
-            end_g = tl.load(hg + hist_base + (n - 1) * 128 + col)
-            kval = tl.load(
-                hk + hist_base + hist[:, None] * 128 + col[None, :], mask=hist[:, None] < n, other=0
-            ).to(tl.float32)
-            gval = tl.load(
-                hg + hist_base + hist[:, None] * 128 + col[None, :], mask=hist[:, None] < n, other=0
-            )
-            adjusted = tl.where(hist[:, None] < n, kval * tl.exp(end_g[None, :] - gval), 0).to(
-                tl.bfloat16
-            )
-            uval = tl.load(
-                hu + hist_base + hist[:, None] * 128 + row[None, :], mask=hist[:, None] < n, other=0
-            )
-            updated = state * tl.exp(end_g)[None, :] + tl.dot(tl.trans(uval), adjusted)
-            _store_checkpoint(state_base, updated)
-        if head == 0:
-            tl.store(lengths + live, tl.where(n >= WINDOW, 0, n))
-
-
 def commit_verified(
     descriptors: torch.Tensor,
     slots: torch.Tensor,
@@ -545,18 +453,18 @@ def commit_verified(
     Accepted counts include the golden token. The candidate buffer keeps
     its configured max_tokens stride even when verification uses fewer tokens.
     """
+    from ...custom_ops.cute_dsl_kda_2fp4_mtp_commit import commit
+
     if slots.numel():
-        _commit_verified_kernel[(slots.numel(), heads, descriptors.shape[0])](
+        commit(
             descriptors,
-            slots,
+            slots.to(torch.int32),
             slot_map,
             accepted_tokens.to(torch.int32),
             dummy,
             heads,
             capacity,
             max_tokens,
-            HISTORY_SIZE,
-            num_warps=8,
         )
 
 
