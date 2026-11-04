@@ -1357,7 +1357,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
-    @pytest.mark.parametrize("mode", ["no_reuse", "reuse", "reuse_preempt"])
+    @pytest.mark.parametrize(
+        "mode", ["no_reuse", "reuse", "reuse_preempt", "reuse_host_offload"])
     def test_bfloat16_agg_helix_cp2(self, mode: str) -> None:
         """GSM8K on aggregated Helix (TP1 x CP2) with and without block reuse.
 
@@ -1369,18 +1370,22 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         the few-shot prompts, so reused prefixes reach the cross-rank
         cached-KV gather. reuse_preempt caps the KV pool at a few requests'
         worth of tokens, so requests are suspended and resumed while reused
-        blocks are claimed and evicted. Set TLLM_HELIX_AGG_CHECK_SCHEDULE=1 on
-        every rank to also compare the per-rank schedules each iteration.
+        blocks are claimed and evicted. reuse_host_offload adds a host tier
+        to that small pool, so evicted blocks move to host memory and reuse
+        hits bring them back. Set TLLM_HELIX_AGG_CHECK_SCHEDULE=1 on every
+        rank to also compare the per-rank schedules each iteration.
         """
         enable_block_reuse = mode != "no_reuse"
         kv_cache_kwargs = {}
         llm_kwargs = {}
-        if mode == "reuse_preempt":
+        if mode in ("reuse_preempt", "reuse_host_offload"):
             # max_tokens counts global ledger tokens under Helix. A GSM8K
             # request needs at most 4096 + 256 tokens, so one always fits, but
             # 32 concurrent requests do not.
             kv_cache_kwargs["max_tokens"] = 6144
             llm_kwargs["max_seq_len"] = 4352
+        if mode == "reuse_host_offload":
+            kv_cache_kwargs["host_cache_size"] = 8 << 30
         with LLM(
                 self.MODEL_PATH,
                 tensor_parallel_size=1,
@@ -1413,19 +1418,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # that never hit the cache, or a small-pool run that never
             # suspended a request, would pass without exercising either.
             stats = llm.get_stats(timeout=2)
-            reused_blocks = sum(
-                window.get("iterReusedBlocks", 0) for s in stats
-                for window in (s.get("kvCacheIterationStats") or {}).values())
+            windows = [
+                window for s in stats
+                for window in (s.get("kvCacheIterationStats") or {}).values()
+            ]
+            reused_blocks = sum(w.get("iterReusedBlocks", 0) for w in windows)
+            offloaded = sum(w.get("iterOffloadBlocks", 0) for w in windows)
+            onboarded = sum(w.get("iterOnboardBlocks", 0) for w in windows)
             suspended = sum(s.get("iterSuspendedRequests", 0) for s in stats)
             resumed = sum(s.get("iterResumedRequests", 0) for s in stats)
             print(f"[reuse] reused_blocks = {reused_blocks}, "
-                  f"suspended = {suspended}, resumed = {resumed}")
+                  f"suspended = {suspended}, resumed = {resumed}, "
+                  f"offloaded = {offloaded}, onboarded = {onboarded}")
             if enable_block_reuse:
                 assert reused_blocks > 0
             else:
                 assert reused_blocks == 0
-            if mode == "reuse_preempt":
+            if mode in ("reuse_preempt", "reuse_host_offload"):
                 assert suspended > 0 and resumed > 0
+            if mode == "reuse_host_offload":
+                assert offloaded > 0 and onboarded > 0
 
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
