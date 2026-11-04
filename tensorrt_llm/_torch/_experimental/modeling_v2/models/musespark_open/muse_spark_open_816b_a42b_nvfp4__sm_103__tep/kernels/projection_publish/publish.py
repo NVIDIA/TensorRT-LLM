@@ -177,6 +177,9 @@ class PublishedProjections:
         self._reported = set()
         #: Slots published in the current forward and not consumed yet.
         self._unconsumed = 0
+        #: ``decode_qkv_mxfp8``'s records, when it is installed: the joins of the layers it
+        #: targets (``_decode_qkv_target``) also write the next input in MXFP8 for it.
+        self.decode_qkv = None
 
     @property
     def is_armed(self) -> bool:
@@ -231,6 +234,8 @@ class PublishedProjections:
             self._armed = False
             self._rows = 0
             self._unconsumed = 0
+            if self.decode_qkv is not None:
+                self.decode_qkv.discard()
 
     def _build(self) -> None:
         """Choose the publishing layers, build both transports, assign buffers (collective).
@@ -436,6 +441,24 @@ class PublishedProjections:
                 f"{tuple(residual.shape)} {residual.dtype}); the unpool GEMM already published"
             )
         alpha, beta = join.coefficients()
+        target = getattr(join, "_decode_qkv_target", None)
+        if self.decode_qkv is not None and target is not None:
+            updated, next_input, values, scales = _publish.unpool_publish_join_mxfp8(
+                self.unpool,
+                buffer,
+                rows,
+                residual,
+                gain,
+                alpha,
+                beta,
+                next_norm.weight,
+                eps,
+                next_norm.variance_epsilon,
+                join._preqkv_norm_fp32,
+            )
+            self.decode_qkv.offer(target, next_input, values, scales)
+            self._unconsumed -= 1
+            return updated, next_input
         joined = _publish.unpool_publish_join(
             self.unpool,
             buffer,

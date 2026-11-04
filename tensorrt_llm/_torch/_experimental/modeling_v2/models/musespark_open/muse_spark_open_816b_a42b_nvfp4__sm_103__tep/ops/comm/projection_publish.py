@@ -11,7 +11,8 @@ of a multicast transport, so the GEMM's own epilogue stores publish the slice to
 rank. The consumers -- the pre-expert RMSNorm + NVFP4 quantization
 (``pool_publish_fp4quant``) and the post-FFN join (``unpool_publish_join`` below) --
 poll their rows of their own copy, reset them and compute the built-in kernels'
-arithmetic on the gathered row.
+arithmetic on the gathered row. ``unpool_publish_join_mxfp8`` is that join which also
+writes the MXFP8 quantization of the next input it hands on (``decode_qkv_mxfp8``).
 
 Transport (Lamport, payload as flag). Every rank holds ``BUFFERS x TP source ranks x
 max_rows x columns`` BF16 -- rank-major, so rank ``r``'s slot of buffer ``b`` is one
@@ -88,9 +89,12 @@ __all__ = [
     "check_buffer_sequence",
     "configure",
     "local_columns",
+    "mxfp8_reference",
+    "mxfp8_scale_bytes",
     "producer_refusal",
     "publish_projection",
     "unpool_publish_join",
+    "unpool_publish_join_mxfp8",
 ]
 
 #: The TP size the transports connect: one GB300 tray.
@@ -1145,6 +1149,125 @@ if triton is not None:
         next_output = next_output * (next_weight + 1.0)
         tl.store(next_out_ptr + base, next_output, mask=mask)
 
+    @triton.jit(do_not_specialize=["buffer", "rows", "pad_rows"])
+    def _unpool_publish_join_mxfp8_kernel(
+        out_ptr,  # [T, HIDDEN] fp32, the new residual stream
+        residual_ptr,  # [T, HIDDEN] fp32, the old one
+        receive_ptr,  # int16 [BUFFERS, WORLD, CAPACITY, COLUMNS], this rank's copy
+        gain_ptr,  # [HIDDEN] (1 + w) when HAS_GAIN, else unread
+        alpha_ptr,  # [HIDDEN] fp32
+        beta_ptr,  # [HIDDEN] fp32
+        eps,
+        next_out_ptr,
+        next_weight_ptr,
+        next_eps,
+        values_ptr,  # [T, HIDDEN] E4M3, the MXFP8 values of next_out
+        scales_ptr,  # int32 words of next_out's 128x4-swizzled UE8M0 scales
+        guard_ptr,  # int32, pinned host memory
+        buffer,
+        rows,  # T
+        pad_rows,  # T rounded up to 128
+        WORLD_SIZE: tl.constexpr,
+        CAPACITY: tl.constexpr,
+        COLUMNS: tl.constexpr,
+        HIDDEN: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        HAS_GAIN: tl.constexpr,
+        NORM_FP32_RESIDUAL: tl.constexpr,
+        SENTINEL_I16: tl.constexpr,
+        GUARD: tl.constexpr,
+        GUARD_BREAK: tl.constexpr,
+    ):
+        """``_unpool_publish_join_kernel``, then the MXFP8 quantization of the BF16 row it stored.
+
+        Up to the BF16 store of ``next_out`` the statements are ``_unpool_publish_join_kernel``'s,
+        unchanged, so ``out`` and ``next_out`` are its bits. After a CTA barrier, which makes
+        every thread's BF16 stores of the row visible to the whole program, the program reads
+        the row back as ``[HIDDEN / 32, 32]`` blocks and writes ``quant.mxfp8_quantize``'s
+        recipe of it (``context_fp8_dense``): one UE8M0 scale per 1x32 block, amax / 448
+        rounded up to a power of two, the values divided by it and rounded to E4M3. Reading
+        the row back instead of reusing the registers keeps the join's registers and layouts
+        those of the served kernel (64 registers per thread, two programs per SM).
+
+        Scales go to the 128x4-swizzled layout the MXFP8 GEMMs read
+        (``get_sf_out_offset_128x4``): the four scales of blocks ``4c .. 4c + 3`` of row ``r``
+        are one 32-bit word. Program ``t`` also zeroes the scale rows ``t + rows + j * rows``
+        below ``pad_rows`` (the 128-row pad), so the scale buffer holds what
+        ``mxfp8_quantize`` writes, pad included.
+        """
+        token = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_H)
+        mask = offs < HIDDEN
+        base = token * HIDDEN + offs
+
+        source = offs // COLUMNS
+        box = (
+            receive_ptr
+            + ((buffer * WORLD_SIZE + source) * CAPACITY + token) * COLUMNS
+            + (offs - source * COLUMNS)
+        )
+        raw = tl.load(box, mask=mask, other=0, volatile=True)
+        pending = tl.max((raw == SENTINEL_I16).to(tl.int32), axis=0)
+        rounds = 0
+        while pending != 0:
+            raw = tl.load(box, mask=mask, other=0, volatile=True)
+            pending = tl.max((raw == SENTINEL_I16).to(tl.int32), axis=0)
+            if GUARD > 0:
+                rounds += 1
+                if rounds == GUARD:
+                    tl.atomic_xchg(guard_ptr, 1, sem="relaxed", scope="sys")
+                    if GUARD_BREAK:
+                        pending = pending * 0
+        # Retire the consumed halves before this grid can complete.
+        tl.store(box, tl.full([BLOCK_H], SENTINEL_I16, tl.int16), mask=mask)
+        branch = raw.to(tl.bfloat16, bitcast=True)
+
+        scaled = branch.to(tl.float32)
+        if HAS_GAIN:
+            gain = tl.load(gain_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            scaled = (scaled * gain).to(branch.dtype).to(tl.float32)
+        variance = tl.sum(scaled * scaled, axis=0) / HIDDEN
+        normed = (scaled * tl.rsqrt(variance + eps)).to(branch.dtype).to(tl.float32)
+
+        residual = tl.load(residual_ptr + base, mask=mask, other=0.0).to(tl.float32)
+        alpha = tl.load(alpha_ptr + offs, mask=mask, other=0.0)
+        beta = tl.load(beta_ptr + offs, mask=mask, other=0.0)
+        updated = alpha * residual + beta * normed
+        tl.store(out_ptr + base, updated, mask=mask)
+        if NORM_FP32_RESIDUAL:
+            next_input = updated
+        else:
+            next_input = updated.to(branch.dtype).to(tl.float32)
+        next_variance = tl.sum(next_input * next_input, axis=0) / HIDDEN
+        next_weight = tl.load(next_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        next_output = next_input * tl.rsqrt(next_variance + next_eps)
+        next_output = next_output * (next_weight + 1.0)
+        tl.store(next_out_ptr + base, next_output, mask=mask)
+
+        tl.debug_barrier()
+        GROUPS: tl.constexpr = HIDDEN // 32
+        WORDS: tl.constexpr = GROUPS // 4
+        K_TILES: tl.constexpr = HIDDEN // 128
+        block = tl.arange(0, GROUPS)
+        at = token * HIDDEN + block[:, None] * 32 + tl.arange(0, 32)[None, :]
+        x = tl.load(next_out_ptr + at).to(tl.float32)
+        amax = tl.max(tl.abs(x), axis=1)
+        bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
+        # UE8M0 rounded towards +inf: the exponent, plus one when any mantissa bit is set.
+        exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        exponent = tl.minimum(exponent, 254)
+        # 2^(127 - exponent), the reciprocal of the scale; 0 for an all-zero block.
+        inverse = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+        inverse = tl.where(amax > 0.0, inverse, 0.0)
+        tl.store(values_ptr + at, (x * inverse[:, None]).to(tl.float8e4nv))
+        words = tl.sum(tl.reshape(exponent, (WORDS, 4)) << (tl.arange(0, 4) * 8)[None, :], axis=1)
+        word = tl.arange(0, WORDS) * 128
+        row_word = (token // 128) * (K_TILES * 128) + (token % 32) * 4 + (token % 128) // 32
+        tl.store(scales_ptr + row_word + word, words)
+        for pad in range(rows + token, pad_rows, rows):
+            pad_word = (pad // 128) * (K_TILES * 128) + (pad % 32) * 4 + (pad % 128) // 32
+            tl.store(scales_ptr + pad_word + word, tl.zeros([WORDS], tl.int32))
+
 
 def _residual_num_warps() -> int:
     """The built-in join's warps per program (its reductions follow from them)."""
@@ -1337,6 +1460,172 @@ class UnpoolPublishJoin(OpWrapper):
 
 
 unpool_publish_join = UnpoolPublishJoin()
+
+
+#: Elements per MXFP8 block (one UE8M0 scale each), and the row tile of the swizzled scales.
+MXFP8_BLOCK = 32
+MXFP8_SCALE_ROWS = 128
+
+
+def mxfp8_scale_bytes(rows: int, columns: int = UNPOOL_HIDDEN) -> int:
+    """Bytes of the 128x4-swizzled UE8M0 scales of ``rows`` x ``columns`` MXFP8 values."""
+    padded = -(-rows // MXFP8_SCALE_ROWS) * MXFP8_SCALE_ROWS
+    return padded * (columns // MXFP8_BLOCK)
+
+
+def mxfp8_reference(rows_bf16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(E4M3 values, 128x4-swizzled UE8M0 scales)`` of BF16 ``[M, K]`` rows, in plain torch.
+
+    The recipe of ``context_fp8_dense.quant.mxfp8_quantize`` (and ``trtllm::mxfp8_quantize``):
+    per 1x32 block, scale = amax / 448 rounded up to a power of two, values ``x / scale``
+    rounded to nearest E4M3; an all-zero block has scale byte 0 and zero values. The scale of
+    block ``b`` of row ``r`` sits at ``get_sf_out_offset_128x4(r, b)``; rows past ``M`` up to
+    the 128-row pad are zero.
+    """
+    m, k = rows_bf16.shape
+    blocks = k // MXFP8_BLOCK
+    x = rows_bf16.float().view(m, blocks, MXFP8_BLOCK)
+    amax = x.abs().amax(dim=-1)
+    bits = (amax * (1.0 / 448.0)).view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    exponent = exponent.clamp(max=254)
+    inverse = ((254 - exponent) << 23).view(torch.float32)
+    inverse = torch.where(amax > 0, inverse, torch.zeros_like(inverse))
+    values = (x * inverse[..., None]).view(m, k).to(torch.float8_e4m3fn)
+    padded = -(-m // MXFP8_SCALE_ROWS) * MXFP8_SCALE_ROWS
+    row = torch.arange(padded, device=rows_bf16.device)[:, None]
+    block = torch.arange(blocks, device=rows_bf16.device)[None, :]
+    offset = (
+        (row // 128) * (blocks // 4) * 512
+        + (block // 4) * 512
+        + (row % 32) * 16
+        + ((row % 128) // 32) * 4
+        + (block % 4)
+    )
+    full = torch.zeros((padded, blocks), dtype=torch.uint8, device=rows_bf16.device)
+    full[:m] = exponent.to(torch.uint8)
+    scales = torch.empty(padded * blocks, dtype=torch.uint8, device=rows_bf16.device)
+    scales[offset.flatten()] = full.flatten()
+    return values, scales
+
+
+class UnpoolPublishJoinMxfp8(OpWrapper):
+    """``UnpoolPublishJoin``, which also writes the MXFP8 quantization of the next input.
+
+    The arguments are ``UnpoolPublishJoin``'s. Returns ``(updated, next_input, values,
+    scales)``: the join's two outputs, bit for bit those of ``unpool_publish_join``, and
+    ``mxfp8_reference(next_input)``: E4M3 ``[rows, 8192]`` values and the 128x4-swizzled
+    UE8M0 scales (``mxfp8_scale_bytes(rows)`` bytes), the operands the Rubin MXFP8 GEMMs
+    take for the next layer's QKV projection. A collective over the TP4 group, as
+    ``UnpoolPublishJoin``.
+
+    Ownership: program ``t`` is the only writer of row ``t`` of every output, of its scale
+    row and of the pad scale rows ``rows + t + j * rows``; the values and scales are fresh
+    tensors that no other kernel writes. A consumer launched after this grid (in stream
+    order, or as a PDL dependent that waits on it) reads them complete.
+    """
+
+    ARCHS = frozenset({Arch.SM_107})
+
+    note = """
+    The join part is the served kernel's statements, unchanged; its outputs are certified
+    bit for bit against `unpool_publish_join` and the MXFP8 outputs against
+    `mxfp8_reference` (itself bit for bit `context_fp8_dense.quant.mxfp8_quantize`), on an
+    emulated transport, through CUDA-graph replays with changing inputs.
+    """
+
+    def __call__(
+        self,
+        transport: PublishTransport,
+        buffer: int,
+        rows: int,
+        residual: torch.Tensor,
+        gain: Optional[torch.Tensor],
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        weight: torch.Tensor,
+        post_eps: float,
+        pre_eps: float,
+        norm_fp32_residual: bool = False,
+        guard: int = GUARD_ROUNDS,
+        guard_break: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        updated = torch.empty_like(residual)
+        next_input = torch.empty(
+            (rows, UNPOOL_HIDDEN), dtype=torch.bfloat16, device=residual.device
+        )
+        values = torch.empty(
+            (rows, UNPOOL_HIDDEN), dtype=torch.float8_e4m3fn, device=residual.device
+        )
+        scales = torch.empty(mxfp8_scale_bytes(rows), dtype=torch.uint8, device=residual.device)
+        pad_rows = -(-rows // MXFP8_SCALE_ROWS) * MXFP8_SCALE_ROWS
+        _unpool_publish_join_mxfp8_kernel[(rows,)](
+            updated,
+            residual,
+            transport.receive(),
+            gain if gain is not None else alpha,
+            alpha,
+            beta,
+            post_eps,
+            next_input,
+            weight,
+            pre_eps,
+            values,
+            scales.view(torch.int32),
+            _GuardWords(transport.control_ptr()),
+            int(buffer),
+            int(rows),
+            int(pad_rows),
+            WORLD_SIZE=transport.world,
+            CAPACITY=transport.max_rows,
+            COLUMNS=transport.columns,
+            HIDDEN=UNPOOL_HIDDEN,
+            BLOCK_H=UNPOOL_HIDDEN,
+            HAS_GAIN=gain is not None,
+            NORM_FP32_RESIDUAL=bool(norm_fp32_residual),
+            SENTINEL_I16=_SENTINEL_I16,
+            GUARD=int(guard),
+            GUARD_BREAK=bool(guard_break),
+            num_warps=_residual_num_warps(),
+        )
+        return updated, next_input, values, scales
+
+    def reference(
+        self,
+        per_rank_slices: Sequence[torch.Tensor],
+        residual: torch.Tensor,
+        gain: Optional[torch.Tensor],
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        weight: torch.Tensor,
+        post_eps: float,
+        pre_eps: float,
+        norm_fp32_residual: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``UnpoolPublishJoin.reference``, then ``mxfp8_reference`` of its BF16 next input.
+
+        The collective exception to mirroring, as ``UnpoolPublishJoin.reference``.
+        """
+        updated, next_input = unpool_publish_join.reference(
+            per_rank_slices,
+            residual,
+            gain,
+            alpha,
+            beta,
+            weight,
+            post_eps,
+            pre_eps,
+            norm_fp32_residual,
+        )
+        values, scales = mxfp8_reference(next_input)
+        return updated, next_input, values, scales
+
+    def is_valid(self, *args, **kwargs) -> None:
+        """``UnpoolPublishJoin.is_valid``: the same operands and transport."""
+        unpool_publish_join.is_valid(*args, **kwargs)
+
+
+unpool_publish_join_mxfp8 = UnpoolPublishJoinMxfp8()
 
 
 def available() -> bool:

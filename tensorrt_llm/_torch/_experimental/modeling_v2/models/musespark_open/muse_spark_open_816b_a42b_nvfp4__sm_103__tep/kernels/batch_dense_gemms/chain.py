@@ -185,6 +185,9 @@ class BatchDenseGemms:
         #: and calls left to the built-in (with why, once each).
         self.counts: Dict[str, int] = {}
         self.declined: Dict[str, int] = {}
+        #: ``decode_qkv_mxfp8``'s records, when it is installed: a QKV call whose input the
+        #: post-FFN join also wrote in MXFP8 runs the MXFP8 GEMM on those operands.
+        self.decode_qkv = None
 
     @staticmethod
     def takes(rows: int) -> bool:
@@ -222,8 +225,14 @@ class BatchDenseGemms:
         ``builtin()`` runs the built-in GEMM (``Linear.apply_linear``); ``module`` is the
         re-classed ``Linear`` when the call carries no bias and no LoRA, else ``None``. The
         QKV site runs the TGV GEMM at the rows of the table; every other call runs the
-        built-in GEMM.
+        built-in GEMM. With ``decode_qkv_mxfp8`` installed, a QKV call whose input the
+        previous layer's join also wrote in MXFP8 runs the MXFP8 GEMM on those operands.
         """
+        if site.role == "qkv" and module is not None and self.decode_qkv is not None:
+            out = self.decode_qkv.take(module, input_tensor)
+            if out is not None:
+                self._count("qkv_mxfp8")
+                return out
         if site.role != "qkv" or module is None or not self.qkv_tgv_rows:
             return builtin()
         if call_rows(input_tensor) not in self.qkv_tgv_rows or not tgv_takes(module, input_tensor):

@@ -75,7 +75,9 @@ def install_loaded_features(
     whichever expert call the paths above installed), and last, with the lossy
     ``context_fp8_dense`` lever, ``context_fp8_dense.install`` (FP8 copies of the dense
     projections for the large context calls, at the lever's parameters, with
-    ``context_fp8_attn_gather``'s gather; collective).
+    ``context_fp8_attn_gather``'s gather; collective), and after it, with the lossy
+    ``decode_qkv_mxfp8`` lever, ``decode_qkv_mxfp8.install`` (the published decode steps'
+    QKV projections on those copies; collective).
     """
     if plan.enabled("replicated_experts"):
         _install_ring_buddy(text_model, mapping, plan)
@@ -85,7 +87,7 @@ def install_loaded_features(
         from .kernels.replicated_experts import hot_replicas as _hot_replicas
 
         # After the owner-window install, whose expert and routing hooks it wraps.
-        _hot_replicas.install(text_model, mapping)
+        _hot_replicas.install(text_model, mapping, pin_l061=plan.enabled("l061_tile32_pin"))
     if plan.enabled("prefill_cutedsl_experts"):
         from .kernels.prefill_cutedsl_experts import install as _prefill_cutedsl
 
@@ -135,6 +137,12 @@ def install_loaded_features(
                 "qkv" in names,
                 "the QKV projection keeps BF16 here, so its input is gathered in BF16",
             )
+    if plan.enabled("decode_qkv_mxfp8"):
+        from .kernels.decode_qkv_mxfp8 import install as _decode_qkv_mxfp8
+
+        # Lossy, on only by its knob; after context_fp8_dense, whose QKV copies it reads.
+        # Its refusals are agreed over the TP group and raise: the knob asked for it.
+        _decode_qkv_mxfp8.install(text_model, mapping, compute_capability)
 
 
 def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:
@@ -230,7 +238,9 @@ def install_embedding_features(
     if plan.enabled("replicated_embedding"):
         from .kernels.replicated_embedding import embedding as _replicated_embedding
 
-        _replicated_embedding.install(text_model, mapping)
+        _replicated_embedding.install(
+            text_model, mapping, context_rows=plan.enabled("context_embedding_replicated")
+        )
     if plan.enabled("model_boundary"):
         # After replicated_embedding, whose table it gathers from. Collective (agreed refusal).
         from .kernels.boundary_early_release import triggers as _pdl_triggers
