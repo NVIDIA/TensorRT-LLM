@@ -15,9 +15,13 @@ B96/q4, KV 30K                          392         360          349 (r2 = 4)   
 B64/q4, KV 30K                          274         244          = 4x (r2 = 0)        4x (-10 %)
 B32/q4, KV 30K                          163         131          = 4x                 4x (-19 %)
 B128/q2, KV 16K                         195         159          = 4x                 4x (-18 %)
-B128/q4, KV 8K                          158-172     176          171                  2x
-B128/q4, KV 4K                          101         102          102                  2x (tie)
+B128/q4, KV 8K                          172         176          171 (r2 = 13)        tie (within 2 %)
+B128/q4, KV 4K                          101         102          102                  tie
 ======================================  ==========  ===========  ===================  ===================
+
+Graph-replay medians throughout (the 2x kernel's first replays at 8K are faster, 158 us cold, which is the only
+sense in which 2x "wins" there); on the main tree's slower 2x packed kernel (#20576) the 8K row reads 190 / 191 /
+192 and 4K 106 / 107 / 107.
 
 Below ``TRTLLM_FP4_MLA_4X_MIN_KV`` (default 12 K tokens) the 2x packed kernel keeps the call: the 4x kernel pays
 ~13 us of fixed cost per 256-row item (task identity, barrier init, exposed Q load, pipeline fill and drain) that
