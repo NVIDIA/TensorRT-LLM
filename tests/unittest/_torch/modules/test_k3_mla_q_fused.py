@@ -543,12 +543,16 @@ def _k3_mla(w, md):
         _runs_flashinfer_cute_rmsnorm,
     )
     from tensorrt_llm._torch.utils import AuxStreamType
+    from tensorrt_llm.functional import AllReduceStrategy
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
         quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        # g_proj's AllReduce over the Helix-repurposed TP 2 group: NCCL allocates no IPC
+        # workspace at construction, which a single process cannot.
+        allreduce_strategy=AllReduceStrategy.NCCL,
     )
     with torch.device("cuda"):
         mla = KimiK3MLAAttention(
