@@ -205,23 +205,21 @@ def _run_rank(world_size):
                     f"{_differ(ids_c, ids_t)} differ"
                 )
 
-        # One CUDA graph with several front calls (both workspace halves), replayed on new inputs.
+        # One CUDA graph with an even number of front calls (both workspace halves), replayed on
+        # new inputs with no barrier: the halves alternate across the eager calls before it, the
+        # capture and its replays, which alone order the ranks.
         m = 8
-        xs = [_input(m, 500 + i) for i in range(3)]
+        xs = [_input(m, 500 + i) for i in range(4)]
         gsf = torch.full((1,), 0.25, device="cuda")
         plan = front.make_plan(w, w_scale, router, bias, 2.5, world_size, rank, rank * ep, ep)
         for x in xs:
             front.run_moe_front(x, plan, ws, gsf)
-        torch.cuda.synchronize()
-        comm.Barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             results = [front.run_moe_front(x, plan, ws, gsf) for x in xs]
         for rep in range(3):
             for i, x in enumerate(xs):
                 x.copy_(_input(m, 900 + 10 * rep + i))
-            torch.cuda.synchronize()
-            comm.Barrier()
             graph.replay()
             torch.cuda.synchronize()
             for x, out in zip(xs, results):

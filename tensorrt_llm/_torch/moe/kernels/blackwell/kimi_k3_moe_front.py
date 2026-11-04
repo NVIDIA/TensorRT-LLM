@@ -44,11 +44,20 @@ stream:
   routed experts) at entry and publishes each token's top-k (stores, then a GPU-scope release add
   of 1 to a word of the experts), which build their tables from it while this grid still runs.
 
-Workspace (:class:`MoEFrontWorkspace`): an MNNVL multicast buffer of two halves; consecutive calls
-alternate between them (the half is a launch argument through a constant flags tensor, so a CUDA
-graph replays the same alternation). Rank ``r`` writes half ``h`` of a peer only after every rank
-finished the call that last used ``h``: between two calls on a half there is the other half's call,
-whose route kernel on ``r`` waited for data every peer pushed after its own previous call.
+Workspace (:class:`MoEFrontWorkspace`): an MNNVL multicast buffer of two halves. Rank ``r`` may
+write half ``h`` of a peer only after every rank finished the call that last used ``h``. Two
+orderings provide that:
+
+* Alternation: consecutive calls on a stream use the other half (the half is a launch argument
+  through a constant flags tensor, picked by a host counter), and between two calls on a half
+  there is the other half's call, whose route kernel on ``r`` waited for data every peer pushed
+  after its own previous call. A CUDA graph replays the halves it was captured with, so the
+  alternation holds across replays only for a graph of an even number of calls captured at the
+  counter's parity its replays follow.
+* A collective in between: the caller runs, between two calls, a collective over the same group
+  that consumes every peer's output of the earlier call (the model's routed all-reduce of each
+  MoE layer, whose input the routed experts produce after the route kernel's grid completes).
+  This holds for any halves, so the model's calls need no particular count per graph.
 """
 
 from __future__ import annotations
@@ -1118,7 +1127,8 @@ class MoEFrontWorkspace:
     calls: int = 0
 
     def next_flags(self) -> torch.Tensor:
-        """The flags of the next call (the halves alternate call by call)."""
+        """The flags of the next call (the halves alternate call by call on the host; see the
+        module docstring for when that orders the ranks)."""
         flags = self.flags[self.calls & 1]
         self.calls += 1
         return flags
