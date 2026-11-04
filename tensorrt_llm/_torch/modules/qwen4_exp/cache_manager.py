@@ -31,8 +31,6 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     ReplayStateUpdateMetadata,
     create_gdn_state,
     estimate_gdn_replay_bytes_per_slot,
-    gdn_replay_layout,
-    gdn_replay_reuse_policy,
     validate_gdn_layout,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
@@ -41,20 +39,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHyb
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _get_local_mamba_cache_layout,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
-    ReplayLayout,
-)
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    BufferConfig,
-    DataRole,
-    PageIndexMode,
-    ReusePolicy,
-)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, PageIndexMode
 
 if TYPE_CHECKING:
     import transformers
@@ -725,14 +715,6 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         if global_layer_id in self._ple_layer_ids:
             buffers.extend(self._ple_buffer_configs())
         return buffers
-
-    @override
-    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
-        return gdn_replay_layout(self, global_layer_id)
-
-    @override
-    def _replay_reuse_policy(self) -> Optional[ReusePolicy]:
-        return gdn_replay_reuse_policy(self._speculative_state)
 
     @classmethod
     @override

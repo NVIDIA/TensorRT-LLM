@@ -8831,8 +8831,12 @@ def test_v2_gdn_replay_history_uses_private_kvcm_buffers(manager_cls):
         history_roles = {DataRole(f"gdn_{name}") for name in _GDN_TRITON_HISTORY}
         assert set(mgr._replay_layouts[first]) == history_roles | {DataRole("gdn_replay_meta")}
         assert set(mgr._replay_layouts[second]) == history_roles
+        assert mgr.get_region_group_ids(REPLAY_STATE_REGION) == (replay_group,)
         for layer_id in mgr.mamba_pp_layers:
             local_layer = LayerId(mgr.layer_offsets[layer_id])
+            assert mgr.region_layout.roles(REPLAY_STATE_REGION, local_layer) == tuple(
+                mgr._replay_layouts[layer_id]
+            )
             for role in mgr._replay_layouts[layer_id]:
                 assert mgr.impl.get_buffer_group_id(local_layer, role) == replay_group
             layer_cache = mgr.mamba_layer_cache(layer_id)
@@ -8938,7 +8942,7 @@ def test_gdn_replay_cache_estimate_matches_declared_buffers(
     declared = sum(
         dtype.itemsize * math.prod(shape)
         for layer_id in layout.mamba_pp_layers
-        for dtype, shape in state.pool_layout(layout, layer_id).values()
+        for dtype, shape in state.replay_layout(layout, layer_id).values()
     )
     private = manager_cls._estimate_private_replay_bytes_per_slot(
         None, mapping, spec_config=spec_config
@@ -9113,9 +9117,13 @@ def test_v2_gdn_ring_replay_buffers_share_the_recurrent_state_slot(monkeypatch, 
         first = mgr.mamba_pp_layers[0]
         ring_roles = {DataRole(f"gdn_{name}") for name in _GDN_RING_HISTORY}
         assert set(mgr._replay_layouts[first]) == ring_roles | {DataRole("gdn_replay_meta")}
+        # The rings are planes of the recurrent-state region, which declares them rebuilt.
+        assert REPLAY_STATE_REGION not in mgr.region_layout
+        assert ring_roles <= mgr.region_layout.region(RECURRENT_STATE_REGION).transfer.rebuilt_roles
         for layer_id in mgr.mamba_pp_layers:
             local_layer = LayerId(mgr.layer_offsets[layer_id])
             for role in mgr._replay_layouts[layer_id]:
+                assert mgr.region_layout.owner(local_layer, role).name == RECURRENT_STATE_REGION
                 assert mgr.impl.get_buffer_group_id(local_layer, role) == mgr.ssm_layer_group_id
         assert mgr._mamba_state_bytes_per_slot() == sum(
             buffer.size

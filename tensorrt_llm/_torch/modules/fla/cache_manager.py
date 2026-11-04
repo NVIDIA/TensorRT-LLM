@@ -39,7 +39,7 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole, ReusePolicy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 from .cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
@@ -349,13 +349,23 @@ class GDNReplayState:
     def has_bound_states(self) -> bool:
         return self._state_descriptors is not None or self._state_strides is not None
 
+    @property
+    def replay_shares_state_slot(self) -> bool:
+        """Whether the replay buffers live in the recurrent-state slot.
+
+        The Triton history has replay slots of its own. FlashInfer addresses
+        its rings by the recurrent-state index, so ring buffers share the
+        recurrent-state slot.
+        """
+        return self.use_flashinfer_ring
+
     def validate(self, context: MambaStateLayout) -> None:
         if context.spec_config is None:
             raise ValueError("GDN replay requires speculative decoding")
         if context.n_groups_per_rank <= 0 and context.mamba_pp_layers:
             raise ValueError("GDN replay requires at least one state group per rank")
 
-    def pool_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+    def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
         """Per-slot shapes of one layer's replay history.
 
         The first local layer also holds the replay metadata row.
@@ -459,7 +469,7 @@ class GDNReplayState:
         self.cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
         if self.use_flashinfer_ring:
             self.cache_base = torch.zeros(cache_size, dtype=torch.int32, device=device)
-        layout = self.pool_layout(context, layer_ids[0])
+        layout = self.replay_layout(context, layer_ids[0])
         roles = _GDN_REPLAY_RING_ROLES if self.use_flashinfer_ring else _GDN_REPLAY_HISTORY_ROLES
         for name, role in roles.items():
             dtype, shape = layout[role]
@@ -910,26 +920,6 @@ def validate_gdn_layout(
         state.validate(manager._state_layout)
 
 
-def gdn_replay_layout(manager: MambaHybridCacheManagerV2, global_layer_id: int) -> ReplayLayout:
-    """The replay buffers a GDN manager declares on one local layer."""
-    state = manager._speculative_state
-    if not isinstance(state, GDNReplayState):
-        return {}
-    return state.pool_layout(manager._state_layout, global_layer_id)
-
-
-def gdn_replay_reuse_policy(state: object) -> Optional[ReusePolicy]:
-    """Reuse policy of a GDN manager's replay buffers.
-
-    The Triton history is PRIVATE and has its own replay slots. FlashInfer
-    addresses its rings by the recurrent-state index, so ring buffers share the
-    recurrent-state slot and follow its policy.
-    """
-    if isinstance(state, GDNReplayState) and state.use_flashinfer_ring:
-        return None
-    return ReusePolicy.PRIVATE
-
-
 def _estimated_gdn_replay_state(
     model_config, mapping: Mapping, **kwargs
 ) -> tuple[GDNReplayState, MambaStateLayout] | None:
@@ -991,7 +981,7 @@ def estimate_gdn_replay_bytes_per_slot(
     return sum(
         dtype.itemsize * math.prod(shape)
         for layer_id in layout.mamba_pp_layers
-        for dtype, shape in state.pool_layout(layout, layer_id).values()
+        for dtype, shape in state.replay_layout(layout, layer_id).values()
     )
 
 
@@ -1015,14 +1005,6 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
 
         validate_gdn_layout(self, state)
         return state
-
-    @override
-    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
-        return gdn_replay_layout(self, global_layer_id)
-
-    @override
-    def _replay_reuse_policy(self) -> Optional[ReusePolicy]:
-        return gdn_replay_reuse_policy(self._speculative_state)
 
     @classmethod
     @override
@@ -1085,8 +1067,6 @@ __all__ = [
     "Qwen35HybridCacheManager",
     "create_gdn_state",
     "estimate_gdn_replay_bytes_per_slot",
-    "gdn_replay_layout",
-    "gdn_replay_reuse_policy",
     "select_gdn_replay_state",
     "validate_gdn_layout",
     "get_gdn_cache_params",
