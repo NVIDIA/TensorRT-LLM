@@ -3495,14 +3495,16 @@ def test_dsml_open_block_without_a_complete_invoke_has_no_call(
     _assert_both_views(parser_cls, text, sample_tools, ("Checking.", []))
 
 
-def test_only_the_dsml_parsers_declare_single_call_stops():
+def test_only_the_dsml_and_glm_parsers_declare_single_call_stops():
     """Other formats have no stop, so their requests keep every call."""
     declaring = {
         name
         for name, parser_cls in ToolParserFactory.parsers.items()
         if parser_cls().single_call_stops
     }
-    assert declaring == {"deepseek_v32", "deepseek_v4", "deepseek_v41"}
+    assert declaring == {
+        "deepseek_v32", "deepseek_v4", "deepseek_v41", "glm4", "glm47"
+    }
 
 
 # ============================================================================
@@ -7623,6 +7625,101 @@ class TestGlmStreamingMatchesWholeParse:
 
         assert calls == [("f", dict(code="ls"))]
         assert time.monotonic() - start < 10
+
+
+# ============================================================================
+# GLM parsers: generation stopped after one call (parallel_tool_calls=false)
+# ============================================================================
+
+
+@pytest.mark.parametrize("parser_cls", [Glm4ToolParser, Glm47ToolParser])
+class TestGlmGenerationStoppedAfterItsFirstCall:
+    """The stop is the call's closing tag; what it leaves is that one call."""
+
+    def test_the_single_call_stop_is_the_closing_tag(self, parser_cls):
+        """One token in the GLM tokenizers, so the bare tag is the only form."""
+        assert parser_cls().single_call_stops == ("</tool_call>", )
+
+    def test_a_generation_cut_after_its_first_call_delivers_that_call(
+            self, parser_cls, sample_tools):
+        """Whole and streamed alike, with the text before the call."""
+        call = functools.partial(_glm_call, parser_cls)
+        reply = ("Checking both." + call("get_weather", ("location", "NYC")) +
+                 "\n" + call("search_web", ("query", "AI news")))
+        (stop, ) = parser_cls().single_call_stops
+        stopped = reply[:reply.index(stop) + len(stop)]
+
+        assert _glm_parity(parser_cls, stopped,
+                           sample_tools) == ("Checking both.", [
+                               ("get_weather", dict(location="NYC"))
+                           ])
+
+    def test_the_whole_reply_still_delivers_every_call(self, parser_cls,
+                                                       sample_tools):
+        """The parser does not limit the calls; only the stop does."""
+        call = functools.partial(_glm_call, parser_cls)
+        reply = ("Checking both." + call("get_weather", ("location", "NYC")) +
+                 "\n" + call("search_web", ("query", "AI news")))
+
+        assert _glm_parity(parser_cls, reply,
+                           sample_tools) == ("Checking both.", [
+                               ("get_weather", dict(location="NYC")),
+                               ("search_web", dict(query="AI news"))
+                           ])
+
+
+# One call in the GLM-4.5 layout, name and tags each on their own line; the
+# GLM-4.7 parser reads that layout too.
+_GLM_STOPPED_CALL = ("<tool_call>f\n<arg_key>k</arg_key>\n"
+                     "<arg_value>v</arg_value>\n</tool_call>")
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize("tool_parser", ["glm4", "glm47"])
+@pytest.mark.parametrize(
+    "reasoning_parser, text",
+    [
+        # GLM-4.5 and 4.6: the model opens the block itself.
+        ("glm45", "<think>plan</think>" + _GLM_STOPPED_CALL),
+        # GLM-4.7 and GLM-5: the template prefilled `<think>`.
+        ("glm47", "plan</think>" + _GLM_STOPPED_CALL),
+    ],
+    ids=["model_opens_the_block", "template_opened_the_block"])
+def test_glm_reasoning_then_a_generation_stopped_after_its_first_call(
+        reasoning_parser, text, tool_parser, streaming):
+    """The reasoning parser hands the call on whole; the tool parser reads it."""
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+    from tensorrt_llm.serve.postprocess_handlers import (apply_reasoning_parser,
+                                                         apply_tool_parser)
+
+    request = ChatCompletionRequest(model="glm",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "Do it."
+                                    }],
+                                    tools=[_glm_typed_tool("f", k="string")])
+    args = ChatPostprocArgs.from_request(request)
+    args.reasoning_parser = reasoning_parser
+    args.tool_parser = tool_parser
+    deltas = [text[i:i + 3]
+              for i in range(0, len(text), 3)] if streaming else [text]
+
+    reasoning, normal, calls = "", "", []
+    for index, delta in enumerate(deltas):
+        finished = index == len(deltas) - 1
+        content, reasoning_delta = apply_reasoning_parser(
+            args, 0, delta, streaming, finished)
+        reasoning += reasoning_delta
+        normal_delta, delta_calls = apply_tool_parser(args, 0, content,
+                                                      streaming, finished)
+        normal += normal_delta
+        calls += delta_calls
+
+    assert reasoning == "plan"
+    assert normal.strip() == ""
+    assert [(c.name, json.loads(c.parameters))
+            for c in calls] == [("f", dict(k="v"))]
+    assert args.has_tool_call.get(0) is True
 
 
 # ============================================================================

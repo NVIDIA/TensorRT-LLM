@@ -86,6 +86,8 @@ WEATHER_INVOKE = (
         ("DeepSeek_V41", V41_STOPS),
         ("deepseek_v4", ("</｜DSML｜invoke>\n", "</｜DSML｜invoke>")),
         ("deepseek_v32", ("</｜DSML｜invoke>\n", "</｜DSML｜invoke>")),
+        ("glm47", ("</tool_call>",)),
+        ("glm4", ("</tool_call>",)),
         ("qwen3", ()),
         ("not_a_parser", ()),
         (None, ()),
@@ -185,6 +187,51 @@ def test_the_stop_matches_the_tokens_the_model_writes(model_name, tool_parser):
     assert matches(bare) == 0
 
 
+@pytest.mark.parametrize(
+    "model_name, tool_parser",
+    [("GLM-4.6", "glm4"), ("GLM-4.7", "glm47"), ("GLM-5.3", "glm47")],
+)
+def test_the_glm_stop_is_the_one_token_that_ends_each_call(model_name, tool_parser):
+    """`</tool_call>` is one token in the GLM tokenizers.
+
+    So the bare tag matches once per call whatever the model writes next (GLM-4.6
+    a newline, GLM-4.7 and GLM-5 the next `<tool_call>`), and no second form is
+    needed. `glm4` reads the GLM-4.5/4.6 layout, `glm47` the GLM-4.7 and GLM-5 ones.
+    """
+    root = llm_models_root()
+    model_dir = None if root is None else root / model_name
+    if model_dir is None or not (model_dir / "tokenizer.json").is_file():
+        pytest.skip(f"{model_name} is not under LLM_MODELS_ROOT")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    (stop,) = _single_tool_call_stops(tool_parser)
+    sampling_params = SamplingParams(stop=[stop])
+    sampling_params._setup(tokenizer, None, None)
+    (stop_ids,) = sampling_params._get_stop_words()
+
+    calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+        for index, (name, arguments) in enumerate([("exec", {"cmd": "ls"}), ("wait", {"s": 2})])
+    ]
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "List the files, then wait."},
+            {"role": "assistant", "content": "", "tool_calls": calls},
+        ],
+        tokenize=False,
+    )
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+    assert len(stop_ids) == 1
+    assert prompt.count(stop) == 2
+    assert ids.count(stop_ids[0]) == 2
+
+
 # ---------------------------------------------------------------------------
 # Chat Completions and Anthropic Messages
 # ---------------------------------------------------------------------------
@@ -268,6 +315,7 @@ def _warned(log, key):
     "fields, tool_parser, stop, enforced",
     [
         ({"parallel_tool_calls": False}, "deepseek_v41", list(V41_STOPS), True),
+        ({"parallel_tool_calls": False}, "glm47", ["</tool_call>"], True),
         ({}, "deepseek_v41", [], False),
         ({"parallel_tool_calls": True}, "deepseek_v41", [], False),
         ({"parallel_tool_calls": False, "tool_choice": "none"}, "deepseek_v41", [], False),
@@ -283,6 +331,7 @@ def _warned(log, key):
     ],
     ids=[
         "asked",
+        "asked_glm",
         "omitted",
         "parallel_allowed",
         "tool_choice_none",
@@ -312,7 +361,9 @@ def test_chat_configures_the_stop_only_when_asked_and_possible(
     assert sampling_params.include_stop_str_in_output is (
         "include_stop_str_in_output" in fields or enforced
     )
-    assert seen["postproc_args"].single_call_stops == (V41_STOPS if enforced else ())
+    assert seen["postproc_args"].single_call_stops == (
+        _single_tool_call_stops(tool_parser) if enforced else ()
+    )
     asked = fields.get("parallel_tool_calls") is False and fields.get("tools", [WEATHER_TOOL])
     asked = asked and fields.get("tool_choice") != "none"
     assert _warned(server_logger, "chat_parallel_tool_calls_unenforced") is bool(
@@ -342,11 +393,18 @@ def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(monkeypatch, serv
     "tool_parser, stop_sequences, enforced",
     [
         ("deepseek_v41", [], True),
+        ("glm47", [], True),
         ("deepseek_v41", ["END"], False),
         ("qwen3", [], False),
         (None, [], False),
     ],
-    ids=["supported", "own_stops_dropped", "format_without_stop", "no_tool_parser"],
+    ids=[
+        "supported",
+        "supported_glm",
+        "own_stops_dropped",
+        "format_without_stop",
+        "no_tool_parser",
+    ],
 )
 def test_anthropic_disable_parallel_tool_use_configures_the_stop_when_possible(
     monkeypatch, server_logger, tool_parser, stop_sequences, enforced
@@ -363,9 +421,10 @@ def test_anthropic_disable_parallel_tool_use_configures_the_stop_when_possible(
     response = asyncio.run(server.anthropic_messages(request, _raw_request()))
 
     assert response.status_code == 200, response.body
-    assert seen["sampling_params"].stop == (list(V41_STOPS) if enforced else stop_sequences)
+    stops = _single_tool_call_stops(tool_parser) if enforced else ()
+    assert seen["sampling_params"].stop == (list(stops) if enforced else stop_sequences)
     assert seen["sampling_params"].include_stop_str_in_output is enforced
-    assert seen["postproc_args"].single_call_stops == (V41_STOPS if enforced else ())
+    assert seen["postproc_args"].single_call_stops == stops
     assert _warned(server_logger, "chat_parallel_tool_calls_unenforced") is not enforced
 
 
@@ -444,6 +503,33 @@ def test_a_streamed_chat_reply_reports_its_call_and_no_stop_the_server_added():
     assert "｜DSML｜" not in "".join(choice["delta"].get("content") or "" for choice in choices)
 
 
+# What a GLM-4.5 generation stopped after its first call leaves: that call,
+# closed by the kept stop, and nothing after it.
+GLM_STOPS = ("</tool_call>",)
+GLM_STOPPED_REPLY = (
+    "Checking.\n<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+    "<arg_value>NYC</arg_value>\n</tool_call>"
+)
+
+
+def test_a_glm_chat_reply_stopped_after_its_first_call_reports_that_call():
+    """The GLM stop is the call's own closing tag, so the parser reads the call whole."""
+    args = _chat_args(GLM_STOPS)
+    args.tool_parser = "glm47"
+    rsp = SimpleNamespace(
+        outputs=[_output(GLM_STOPPED_REPLY, "stop", GLM_STOPS[0])],
+        prompt_token_ids=[1],
+        cached_tokens=0,
+    )
+    choice = chat_response_post_processor(rsp, args).choices[0]
+
+    assert choice.finish_reason == "tool_calls"
+    assert choice.stop_reason is None
+    assert choice.message.content == "Checking."
+    calls = [(c.function.name, json.loads(c.function.arguments)) for c in choice.message.tool_calls]
+    assert calls == [("get_weather", {"location": "NYC"})]
+
+
 # ---------------------------------------------------------------------------
 # Responses
 # ---------------------------------------------------------------------------
@@ -489,8 +575,11 @@ def _responses_server(monkeypatch, tool_parser):
     "fields, tool_parser, enforced, warned",
     [
         ({"parallel_tool_calls": False}, "deepseek_v41", True, False),
+        ({"parallel_tool_calls": False}, "glm47", True, False),
         ({}, "deepseek_v41", False, False),
+        ({}, "glm47", False, False),
         ({"parallel_tool_calls": True}, "deepseek_v41", False, False),
+        ({"parallel_tool_calls": True}, "glm47", False, False),
         ({"parallel_tool_calls": False, "tool_choice": "none"}, "deepseek_v41", False, False),
         ({"parallel_tool_calls": False, "tools": []}, "deepseek_v41", False, False),
         ({"parallel_tool_calls": False}, "qwen3", False, True),
@@ -498,8 +587,11 @@ def _responses_server(monkeypatch, tool_parser):
     ],
     ids=[
         "asked",
+        "asked_glm",
         "omitted",
+        "omitted_glm",
         "parallel_allowed",
+        "parallel_allowed_glm",
         "tool_choice_none",
         "no_tools",
         "format_without_stop",
@@ -526,6 +618,8 @@ def test_responses_configures_the_stop_only_when_asked_and_possible(
     asyncio.run(server.openai_responses(request, raw_request))
 
     sampling_params = seen["sampling_params"]
-    assert sampling_params.stop == (list(V41_STOPS) if enforced else None)
+    assert sampling_params.stop == (
+        list(_single_tool_call_stops(tool_parser)) if enforced else None
+    )
     assert sampling_params.include_stop_str_in_output is enforced
     assert _warned(server_logger, "responses_parallel_tool_calls_unenforced") is warned
