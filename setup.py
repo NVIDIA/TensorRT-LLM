@@ -227,6 +227,10 @@ package_data += [
     'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/pv_logits/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
     'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/s2_sampler/*.cu',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/rs_sampler/*.cu',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/rs_sampler/*.cuh',
 ]
 
 

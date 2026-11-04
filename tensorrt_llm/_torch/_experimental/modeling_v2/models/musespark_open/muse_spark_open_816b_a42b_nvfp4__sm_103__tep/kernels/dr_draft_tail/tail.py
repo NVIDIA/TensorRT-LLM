@@ -23,17 +23,30 @@ is issued before the select launch instead of after the key exchange; it reads o
 
 Whether a step takes this path depends only on rank-uniform facts (shapes, dtypes, the request count), so every
 rank runs the same sequence of select / merge calls, which the epoch protocol requires.
+
+Rejection sampling (``walk_tail(..., rs=...)``, variant 3, K = 7): the walk draws each draft from the softmax q over
+its position's 16 candidates instead of taking the greedy token, and writes the slot's q record (``rs_common.cuh``)
+for the verify step. ``rs`` carries the record store and the step's per-token tensors (``RsWalkArgs``: ``records,
+num_slots, dummy_slot, slot_ids, seeds, offsets, temperatures, mode, transform, mult, inv_cap, cap, check, diag,
+top_ks, top_ps, min_ps, filter_mode, filter_mask``); ``mode`` 1 keeps the greedy path (only the drafts and the record
+differ from the greedy walk), 2 follows the drawn lanes and applies the request's top-k / top-p / min-p to q (the
+filters ``filter_mask`` names, none under the strict ``filter_mode``). ``rs_q_transform`` resolves the q transform's
+constants from the drafter's ``config.json``.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
 from tensorrt_llm.logger import logger
+
+from ..rs_sampler import rs_common
 
 #: The kernels' variant (``dr_draft_tail.cu``'s header).
 VARIANT = 3
@@ -77,11 +90,21 @@ def load_library() -> str:
                 sources=[str(SOURCE)],
                 extra_cuda_cflags=list(NVCC_FLAGS)
                 + [f"-gencode=arch=compute_{target},code=sm_{target}"],
+                extra_include_paths=[str(rs_common.INCLUDE_DIR)],
                 is_python_module=False,
                 verbose=False,
             )
             _LOADED = str(path) if path else LIBRARY_NAME
         return _LOADED
+
+
+def walk_rs_attributes(device) -> dict:
+    """Resolve the rejection-sampling walks (kMode 1 / 2) and return ``{mode: (registers, local bytes, static shared
+    bytes, max threads per block)}``, so nothing loads during a later CUDA-graph capture."""
+    load_library()
+    anchor = torch.empty(1, dtype=torch.int32, device=device)
+    rows = torch.ops.musespark_open_dr_tail.walk_rs_attributes(anchor).tolist()
+    return {mode: tuple(int(v) for v in row) for mode, row in zip((1, 2), rows)}
 
 
 def chunks_of(shard: int) -> int:
@@ -115,6 +138,46 @@ def unsupported_reason(world: int, shard: int, selector) -> Optional[str]:
     if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
         return "the tail runs on SM103 or SM107 only"
     return None
+
+
+def rs_q_transform(
+    name: str,
+    drafter_config: Union[str, os.PathLike, dict],
+    mult: Optional[float] = None,
+    cap: Optional[float] = None,
+) -> tuple[int, float, float, float]:
+    """The walk's q transform ``(transform, mult, inv_cap, cap)`` for ``rs`` (``RsWalkArgs``).
+
+    ``name`` is ``raw`` (q from the raw walk scores, the stock law), ``score`` (from f of the walk score) or ``unary``
+    (the walk runs on f of the unary scores); f(x) = cap tanh(x mult / cap), or x mult when cap is 0. ``mult`` and
+    ``cap`` default to ``dflash_config.output_multiplier`` and ``dflash_config.final_logit_softcapping`` of the
+    drafter's ``config.json`` (a path to the file or its directory, or the parsed dict; only read).
+    """
+    transforms = {t.name.lower(): int(t) for t in rs_common.Transform}
+    if name not in transforms:
+        raise ValueError(f"q transform {name!r} is not one of {sorted(transforms)}")
+    if mult is None or cap is None:
+        config = drafter_config
+        if not isinstance(config, dict):
+            path = Path(config)
+            with open(path / "config.json" if path.is_dir() else path) as f:
+                config = json.load(f)
+        dflash = config.get("dflash_config") or {}
+        if mult is None:
+            mult = dflash.get("output_multiplier")
+        if cap is None:
+            cap = dflash.get("final_logit_softcapping")
+        if mult is None or cap is None:
+            raise ValueError(
+                "the drafter config has no dflash_config.output_multiplier / final_logit_softcapping"
+            )
+    mult32 = float(torch.tensor(float(mult), dtype=torch.float32))
+    cap32 = float(torch.tensor(float(cap), dtype=torch.float32))
+    if not (mult32 == mult32 and abs(mult32) != float("inf")) or not (0.0 <= cap32 < float("inf")):
+        raise ValueError(f"q transform constants mult {mult}, cap {cap} are not finite (cap >= 0)")
+    # 1 / cap rounded once to FP32, as capOf's constants.
+    inv_cap = float(torch.tensor(1.0 / cap32, dtype=torch.float32)) if cap32 > 0.0 else 0.0
+    return transforms[name], mult32, inv_cap, cap32
 
 
 class DrDraftTail:
@@ -290,12 +353,19 @@ class DrDraftTail:
         batch_indices: torch.Tensor,
         kv_lens: Optional[torch.Tensor],
         rewind: Optional[torch.Tensor],
+        rs=None,
     ):
         """``draft_path_walk_tail``: ``(tokens [B, K] int32, next_tokens [B, K + 1] int32)``; rewinds in place.
 
         Variants 2 and 3 read ``accepted`` / ``num_accepted`` / ``batch_indices`` / ``kv_lens`` / ``rewind`` before its
         grid-dependency wait: their producers must precede the launch right before this one (in ``draft_tokens``
         they precede the select launch; the einsum is the walk's predecessor).
+
+        ``rs`` (``RsWalkArgs``, rejection sampling): the drafts are drawn from q and the q records of
+        ``rs.slot_ids[:B]`` are written (``walk_tail_rs``). The walk reads ``rs.slot_ids`` and the row-0 entries
+        of ``rs.seeds`` / ``rs.offsets`` / ``rs.temperatures`` (and, with ``rs.filter_mask``, of ``rs.top_ks`` /
+        ``rs.top_ps`` / ``rs.min_ps``) before its wait, like the variant-2 operands. Tests may add ``export_e``
+        (fp32 [B, 7, 16]) and ``export_u`` (int64 [B, 7]) to ``rs``.
         """
         requests, positions, _ = unary.shape
         tokens = torch.empty((requests, positions), dtype=torch.int32, device=unary.device)
@@ -303,6 +373,44 @@ class DrDraftTail:
         rewinds = kv_lens is not None and rewind is not None
         if not edges.is_contiguous():
             edges = edges.contiguous()
+        if rs is not None:
+            torch.ops.musespark_open_dr_tail.walk_tail_rs(
+                edges,
+                unary,
+                ids,
+                tokens,
+                next_tokens,
+                accepted,
+                num_accepted,
+                batch_indices,
+                kv_lens if rewinds else tokens,
+                rewind if rewinds else tokens,
+                rewinds,
+                self.pdl,
+                self.variant,
+                rs.records,
+                int(rs.num_slots),
+                int(rs.dummy_slot),
+                rs.slot_ids,
+                rs.seeds,
+                rs.offsets,
+                rs.temperatures,
+                int(rs.mode),
+                int(rs.transform),
+                float(rs.mult),
+                float(rs.inv_cap),
+                float(rs.cap),
+                int(rs.check),
+                rs.diag,
+                getattr(rs, "export_e", None),
+                getattr(rs, "export_u", None),
+                getattr(rs, "top_ks", None),
+                getattr(rs, "top_ps", None),
+                getattr(rs, "min_ps", None),
+                int(getattr(rs, "filter_mode", 0)),
+                int(getattr(rs, "filter_mask", 0)),
+            )
+            return tokens, next_tokens
         torch.ops.musespark_open_dr_tail.walk_tail(
             edges,
             unary,
@@ -328,8 +436,17 @@ class DrDraftTail:
         selector,
         walk,
         tail_walk,
+        rs=None,
     ):
-        """``draft_head.selector_draft_tokens`` on the tail (the caller checked ``takes``)."""
+        """``draft_head.selector_draft_tokens`` on the tail (the caller checked ``takes``).
+
+        With ``rs`` the drafts are drawn from q (``walk_tail``); that needs the tail walk, since a greedy walk
+        would produce drafts without a q record: ``rs`` without ``tail_walk`` raises before any launch.
+        """
+        if rs is not None and tail_walk is None:
+            raise RuntimeError(
+                "[musespark_open] dr draft tail: rejection sampling needs the tail walk (tail_walk is None)"
+            )
         # The built-in selector's projection call, operand for operand (its fork joins here).
         gate = selector.hidden_projection(
             block_hidden_states.to(selector.hidden_projection.weight.dtype)
@@ -339,6 +456,8 @@ class DrDraftTail:
         # dflash2_score_edges' einsum on tensors of its shapes and strides: the same kernel.
         edges = torch.einsum("blpr,blcr->blpc", predecessors, successors)
         if tail_walk is not None:
+            if rs is not None:
+                return self.walk_tail(edges, unary, ids, *tail_walk, rs=rs)
             return self.walk_tail(edges, unary, ids, *tail_walk)
         return walk(edges, unary, ids)
 
