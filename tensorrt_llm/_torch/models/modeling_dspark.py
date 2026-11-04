@@ -3093,20 +3093,6 @@ def _pushed_linear_add_norm(
     return all_reduce.finish_push(target)
 
 
-def _mlp_activation(mlp: GatedMLP, x: torch.Tensor) -> Optional[torch.Tensor]:
-    """``GatedMLP.forward`` up to its down projection for a BF16 MLP, or None (a quantized
-    activation path)."""
-    if mlp.split_gate_up:
-        return mlp._split_gate_up_forward(x)
-    if mlp._can_fuse_gate_up_swiglu_fp4out() or mlp._can_fuse_gate_up_swiglu():
-        return None
-    if mlp._can_fuse_gate_up_swiglu_bf16(x):
-        return mlp._fused_gate_up_swiglu_bf16(x)
-    if mlp._can_fuse_swiglu_fp8_quant():
-        return None
-    return mlp._apply_activation(mlp.gate_up_proj(x))
-
-
 def _helix_tail_attn_out(
     tail,
     ctx_out: torch.Tensor,
@@ -4680,7 +4666,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     hidden_out, res_flat = _all_reduce_add_norm(
                         attn.o_proj.all_reduce, hidden_out, res_flat, layer.post_attention_layernorm
                     )
-                h2 = _mlp_activation(layer.mlp, hidden_out) if self._ar_push else None
+                h2 = layer.mlp.forward_activation(hidden_out) if self._ar_push else None
                 if h2 is not None:
                     # The down projection runs at the site that reduces it.
                     partial = _PendingDown(layer.mlp, h2)

@@ -529,11 +529,32 @@ class GatedMLP(nn.Module):
             return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
+        h2, fused_output_shape = self._activation(x)
+        output = self.down_proj(h2,
+                                all_reduce_params=final_all_reduce_params,
+                                layer_idx=self.layer_idx)
+        if fused_output_shape is not None:
+            output = output.reshape(*fused_output_shape, output.shape[-1])
+        return output
+
+    def forward_activation(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """The input of ``down_proj`` that :meth:`forward` computes from ``x``
+        (without LoRA) where it is an unquantized tensor; None where the
+        activation quantizes it for ``down_proj``. A caller that runs the down
+        projection itself (e.g. fused with its all-reduce) uses this."""
+        if not self.split_gate_up and (
+                self._can_fuse_gate_up_swiglu_fp4out()
+                or self._can_fuse_gate_up_swiglu() or
+            (not self._can_fuse_gate_up_swiglu_bf16(x)
+             and self._can_fuse_swiglu_fp8_quant())):
+            return None
+        return self._activation(x)[0]
+
+    def _activation(self, x):
+        """``down_proj``'s input of :meth:`forward`, and the leading shape its
+        output is restored to (None: unchanged)."""
         if self.split_gate_up:
-            h2 = self._split_gate_up_forward(x)
-            return self.down_proj(h2,
-                                  all_reduce_params=final_all_reduce_params,
-                                  layer_idx=self.layer_idx)
+            return self._split_gate_up_forward(x), None
 
         fused_output_shape = None
         if self._can_fuse_gate_up_swiglu_fp4out():
@@ -565,13 +586,7 @@ class GatedMLP(nn.Module):
                     h1, self.swiglu_limit, use_r128c4_layout)
             else:
                 h2 = self._apply_activation(h1)
-
-        output = self.down_proj(h2,
-                                all_reduce_params=final_all_reduce_params,
-                                layer_idx=self.layer_idx)
-        if fused_output_shape is not None:
-            output = output.reshape(*fused_output_shape, output.shape[-1])
-        return output
+        return h2, fused_output_shape
 
     def forward_lora(
         self,

@@ -1571,17 +1571,15 @@ def test_mla_dspark_fp8_query_head_agrees_to_drafter_rounding():
 @needs_cuda
 def test_mla_dspark_mlp_split_at_the_down_projection_is_exact():
     """The pushed down_proj site runs the MLP up to its down projection
-    (_mlp_activation) and the projection itself at the all-reduce: together
-    bitwise the module's forward. Without the TP fusions the sites are off."""
-    from tensorrt_llm._torch.models.modeling_dspark import _mlp_activation
-
+    (GatedMLP.forward_activation) and the projection itself at the all-reduce:
+    together bitwise the module's forward. Without the TP fusions the sites are off."""
     torch.manual_seed(3)
     drafter = _build_mla_drafter(_tiny_mla_weights())
     assert not drafter._ar_push
     mlp = drafter.model.layers[0].mlp
     x = torch.randn(7, MLA_HIDDEN, device="cuda").bfloat16()
     with torch.inference_mode():
-        h2 = _mlp_activation(mlp, x)
+        h2 = mlp.forward_activation(x)
         assert h2 is not None
         split = mlp.down_proj(h2)
         whole = mlp(x)
