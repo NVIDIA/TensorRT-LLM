@@ -338,7 +338,12 @@ def check_batch_metadata(
     for a speculative one.
 
     Returns ``[(past_i, n_i), ...]`` in row order: request ``i``'s new tokens sit at the
-    absolute positions ``past_i .. past_i + n_i - 1``. Reads host-side state only.
+    absolute positions ``past_i .. past_i + n_i - 1``. Reads host-side state only, so the
+    structure (request kinds, ``n_i``, the speculative shape) is exact while ``past_i`` and the
+    KV lengths are the host's: under the overlap scheduler the host prepares a speculative step
+    before the previous one's acceptance is known, stating each in-flight request's KV length as
+    if every proposal were accepted (an upper bound, which is also what the capacity check
+    needs), and the engine corrects the device KV lengths and positions the op reads.
     """
     if not isinstance(md, TrtllmAttentionMetadata):
         raise ValueError(f"attn_metadata must be TrtllmAttentionMetadata, got {type(md).__name__}")

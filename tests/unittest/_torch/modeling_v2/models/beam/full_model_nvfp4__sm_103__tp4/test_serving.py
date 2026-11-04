@@ -369,11 +369,13 @@ def _mtp():
 
 
 def test_route_claims_the_dflash_deployment():
+    """With the overlap scheduler on or off: the target reads corrected positions on the device."""
     route = routing_module("BeamForCausalLM").route
     target = route(_beam_config(), _mapping(), (10, 3), _dflash(), None)
     assert target.__name__ == "ModelingV2BeamFullModelNvfp4Sm103Tp4"
-    args = SimpleNamespace(disable_overlap_scheduler=True)
-    assert route(_beam_config(), _mapping(), (10, 3), _dflash(), None, llm_args=args) is target
+    for overlap_off in (True, False):
+        args = SimpleNamespace(disable_overlap_scheduler=overlap_off)
+        assert route(_beam_config(), _mapping(), (10, 3), _dflash(), None, llm_args=args) is target
 
 
 @pytest.mark.parametrize(
@@ -386,14 +388,9 @@ def test_route_claims_the_dflash_deployment():
         (lambda: _dflash(draft_len_schedule={1: 7, 4: 3}), None, "draft_len_schedule"),
         (lambda: _dflash(use_rejection_sampling=True), None, "rejection sampling"),
         (lambda: _dflash(speculative_model=None), None, "drafter checkpoint"),
-        (
-            lambda: _dflash(),
-            SimpleNamespace(disable_overlap_scheduler=False),
-            "overlap scheduler",
-        ),
         (lambda: _mtp(), None, "is not DFlash"),
     ],
-    ids=["vanilla", "fa4", "k15", "k3", "schedule", "rejection", "no-drafter", "overlap", "mtp"],
+    ids=["vanilla", "fa4", "k15", "k3", "schedule", "rejection", "no-drafter", "mtp"],
 )
 def test_route_refuses_other_speculation_clearly(spec, args, reason):
     route = routing_module("BeamForCausalLM").route
