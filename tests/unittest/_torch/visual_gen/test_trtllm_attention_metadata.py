@@ -376,3 +376,35 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
     torch.cuda.synchronize()
 
     torch.testing.assert_close(captured, eager)
+
+
+def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> None:
+    """Without the CUDA graph runner the layer drops the value grouping of a previous
+    K/V shape; under the runner every captured shape keeps its grouping."""
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
+    attention = visual_trtllm.TrtllmAttention(
+        layer_idx=0,
+        num_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        attention_metadata_state=create_attention_metadata_state(),
+        quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", vc_attention=True),
+    )
+
+    def operands(seq_len: int) -> None:
+        x = torch.randn(seq_len, 2 * 128, device="cuda", dtype=torch.bfloat16)
+        attention._vc_operands(x, x, x, 1, seq_len, seq_len, None)
+
+    first = attention._vc_preprocessor
+    operands(256)
+    operands(256)
+    assert attention._vc_preprocessor is first
+    operands(384)
+    second = attention._vc_preprocessor
+    assert second is not first
+    with resolved_extra_keys_scope({"vc_smooth_phase": 2}):
+        operands(512)
+        operands(256)
+    assert attention._vc_preprocessor is second
