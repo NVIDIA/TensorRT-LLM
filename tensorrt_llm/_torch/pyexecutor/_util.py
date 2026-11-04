@@ -951,16 +951,14 @@ def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig,
                           mixed_precision_high_window: bool = False) -> None:
     """Adapt the target's pool_ratio to a separate one-model draft manager's pools.
 
-    ``mixed_precision_high_window``: the cold-page first/last-N window gives an
-    MTP draft manager a mixed-precision high pool, as ``mixed_precision_kv`` does.
+    ``mixed_precision_high_window``: the draft manager also gets the cold-page window.
     """
     if draft_kv_config.pool_ratio is None:
         return
     if (draft_kv_config.mixed_precision_kv is not None
             or mixed_precision_high_window):
-        # An MTP draft manager with mixed-precision KV, or with the cold-page
-        # window, has its own pool plus a mixed-precision high pool, so the
-        # target's pool_ratio does not fit it.
+        # The draft manager then has its own pool plus a mixed-precision high
+        # pool, so the target's pool_ratio does not fit it.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
             "target KV cache only; the MTP draft KV cache with mixed-precision "
@@ -4200,8 +4198,8 @@ def create_kv_cache_compression_manager(
         if config.quant != "nvfp4":
             raise NotImplementedError(
                 f"Unsupported cold-page quantization format {config.quant!r}")
-        # A mixed-precision high layer group must exist in the estimation run so
-        # its attention staging copy is profiled with the other activation memory.
+        # The estimation run needs the window: the high layer group and its staging
+        # copy must be part of the measured memory.
         if estimating_kv_cache and config.mixed_precision_high_window is None:
             return None
         quant_config = model_engine.model.model_config.quant_config

@@ -1873,9 +1873,8 @@ class KVCacheManagerV2(BaseResourceManager):
             and getattr(kv_cache_config, "mixed_precision_kv", None) is not None
         ):
             raise ValueError("layer_specs does not support mixed-precision KV cache.")
-        # The cold-page first/last-N window follows the draft rule of kv_cache_config.dtype:
-        # MTP layers go mixed with the target, a drafter with its own architecture
-        # keeps a plain cache (its separate manager takes no window).
+        # Like mixed_precision_kv: MTP draft layers get the cold-page window, a drafter with
+        # its own architecture keeps a plain cache.
         window_provider = cold_page_codec_provider
         if (
             is_draft
@@ -2415,7 +2414,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         def create_cold_page_codec(cache_config: object) -> Optional[object]:
-            # The estimation run only takes the provider's first/last-N window.
+            # The estimation run builds the high layer group but never migrates a page.
             if cold_page_codec_provider is None or self.is_estimating_kv_cache:
                 return None
             if (
@@ -2425,6 +2424,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise NotImplementedError(
                     "cold-page compression does not yet support mixed-dtype KV-cache layer specs"
                 )
+            if self.mixed_precision_high_layers:
+                # The high layers stay out of the codec, so their pages migrate unchanged.
+                high_layers = set(self.mixed_precision_high_layers.values())
+                cache_config = replace(
+                    cache_config,
+                    layers=[
+                        layer
+                        for layer in cache_config.layers
+                        if int(layer.layer_id) not in high_layers
+                    ],
+                )
             return cold_page_codec_provider.create_cold_page_codec(
                 cache_config,
                 runtime_dtype=self.layer_specs[0].dtype if self.layer_specs else self.dtype,
@@ -2432,7 +2442,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
                 head_dim_per_layer=self.head_dim_per_layer,
                 is_draft=self.is_draft,
-                mixed_precision_high_layers=tuple(self.mixed_precision_high_layers.values()),
             )
 
         candidate: Optional[KVCacheManagerPy] = None
@@ -4079,9 +4088,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"tokens in {mixed.high}, but the model's KV cache dtype resolved to {dtype}."
                 )
         else:
-            # Cold-page mixed precision: the history pool keeps the active dtype and only its
-            # cold pages are quantized. The mixed-precision high group migrates unchanged, and
-            # attention reads both pools through the staging copy.
+            # Cold-page window: the history pool keeps the model's KV dtype and only its cold
+            # pages are quantized; the high layers hold the first/last tokens unchanged.
             self.first_n, self.last_n = window
             self.mixed_precision_low_dtype = self.mixed_precision_high_dtype = dtype
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
@@ -4157,10 +4165,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if all(
                 role in main_buffers and main_buffers[role].size == page_bytes for role in roles
             ):
-                # Same page as the layer itself: mirror its other buffers (such as a sparse
-                # indexer cache) so both slots match and the core keeps the layer and its
-                # mixed-precision high layer in one pool, where sparse attention addresses
-                # the high layer's rows directly.
+                # Same page size as the layer: mirror its other buffers (e.g. the DSA indexer
+                # cache) so the core keeps both in one pool, which sparse attention addresses by row.
                 buffers.extend(
                     BufferConfig(
                         role=buffer.role,

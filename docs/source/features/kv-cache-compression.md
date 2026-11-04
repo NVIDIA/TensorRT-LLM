@@ -240,24 +240,27 @@ kv_cache_compression_config:
   skip_rope_quantization: true
 ```
 
-#### Keeping the First and Last Tokens at the Active Precision
+#### Keeping the First and Last Tokens Unquantized
 
-`mixed_precision_first_n` and `mixed_precision_last_n` keep the leading and the
-most recent N tokens of every sequence at the active-cache precision in the cold
-tiers; the rest of the history is stored in NVFP4. This is the cold-page
-counterpart of the mixed-precision KV cache
-(`KvCacheConfig(dtype="mixed_nvfp4_...")`): the KV cache manager adds the same
-mixed-precision high layer group, Attention reads the first/last-N tokens from
-it (dense backends through the same staging copy; the DSA backend in place,
-since that group shares the history pool's memory), and that group migrates to
-Host or Disk unchanged while the history pool is quantized. The GPU keeps the
-full history at the active precision, plus one window-sized copy of the
-first/last-N tokens per Attention layer.
+Cold-page quantization stores every page that leaves the GPU in the compact
+format selected by `quant`. The first tokens of a sequence, which attention
+uses as anchors, and its most recent tokens are the ones generation is most
+sensitive to. `mixed_precision_first_n` and `mixed_precision_last_n` take them
+out of the quantization: the leading N and the most recent N tokens of every
+sequence are stored in the cold tiers at the runtime KV type, and only the
+tokens in between are stored in the compact format.
 
-The active precision is the one `kv_cache_config.dtype` resolves to: FP8 below,
-or the checkpoint's KV type under the default `auto`. In the cold tiers the
-first/last-N tokens stay in that type and the rest of the history becomes
-NVFP4; on the GPU the whole history stays in that type.
+This is the same split as the
+[mixed-precision KV cache](kvcache.md#mixed-precision-kv-cache-prototype),
+which keeps the first/last tokens at the runtime KV type while the rest of the
+GPU KV cache is NVFP4. The difference is where the compact format lives. With
+`dtype: mixed_nvfp4_*` the GPU history itself is compact. With the cold-page
+option the GPU keeps the whole history at the runtime KV type, and only pages in
+the Host or Disk tier are compact. Both keep the first/last tokens in whole
+cache pages, and the two options cannot be combined.
+
+The runtime KV type is the one `kv_cache_config.dtype` resolves to: FP8 in the
+example below, or the checkpoint's KV type under the default `auto`.
 
 ```yaml
 kv_cache_config:
@@ -271,14 +274,19 @@ kv_cache_compression_config:
   mixed_precision_last_n: 256
 ```
 
-The option is a prototype and shares the limits of the mixed-precision KV cache
-(see [KV cache](kvcache.md)): `use_kv_cache_manager_v2: true` with the TRTLLM or
-FlashInfer Attention backend, the KV cache managers that support the
-mixed-precision KV cache except DeepSeek-V4's, single-beam decoding, speculative decoding except
-dynamic-tree drafting, and no KV connector. MTP layers get mixed-precision high
-layers like the target layers; a drafter with its own architecture keeps a plain
-cache.
-It cannot be combined with `dtype="mixed_nvfp4_..."`.
+The cost is one extra GPU copy of the first/last tokens per attention layer,
+sized by `mixed_precision_first_n + mixed_precision_last_n`, and the full-size
+storage of those tokens in the cold tiers. Attention kernels are unchanged: the
+first/last tokens are served from that copy, as in the mixed-precision KV cache,
+including its per-step staging cost on dense attention backends.
+
+The option is a prototype and has the limits of the mixed-precision KV cache:
+`use_kv_cache_manager_v2: true` with the TRTLLM or FlashInfer attention backend,
+the standard V2 manager, the hybrid Mamba manager and the DSA sparse backend
+(DeepSeek-V4 is not supported yet), single-beam decoding, speculative decoding
+except dynamic-tree drafting, and no KV connector. MTP drafter layers keep their
+first/last tokens like the target layers; a drafter with its own architecture
+keeps a plain cache.
 
 ### TriAttention
 

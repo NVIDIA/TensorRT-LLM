@@ -4759,18 +4759,14 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         default=0,
         status="prototype",
         description=
-        "Number of leading tokens per sequence whose KV stays at the active-cache "
-        "precision in the cold tiers instead of NVFP4. The KV cache manager keeps "
-        "these tokens in a mixed-precision high layer group, as the mixed-precision "
-        "KV cache does, and migrates that group unchanged. Tokens are kept in whole "
-        "cache pages. Requires KV cache manager V2.")
+        "Number of leading tokens per sequence kept unquantized in the cold tiers, "
+        "in whole cache pages.")
     mixed_precision_last_n: NonNegativeInt = Field(
         default=0,
         status="prototype",
         description=
-        "Number of most recent tokens per sequence whose KV stays at the "
-        "active-cache precision in the cold tiers instead of NVFP4; see "
-        "mixed_precision_first_n.")
+        "Number of most recent tokens per sequence kept unquantized in the cold "
+        "tiers, in whole cache pages.")
 
     @property
     def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
@@ -7437,10 +7433,8 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
-        """Reject runtime features the mixed-precision high layers do not support.
-
-        ``kv_cache_config.dtype="mixed_nvfp4_*"`` and cold-page compression with
-        ``mixed_precision_first_n/last_n`` both add a mixed-precision high layer group.
+        """Reject runtime features that the mixed-precision KV cache and the cold-page
+        first/last-N window do not support.
         """
         hot = self.kv_cache_config.mixed_precision_kv is not None
         cold = getattr(self.kv_cache_compression_config,

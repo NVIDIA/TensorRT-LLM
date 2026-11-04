@@ -272,8 +272,10 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert manager.mixed_precision_low_dtype == dtype
     assert (manager.first_n, manager.last_n) == (1, 65)
     assert manager.mixed_precision_high_layers == {0: 1}
-    # The high layer is left to the codec provider, which keeps it out of its codec.
-    assert [call["mixed_precision_high_layers"] for call in provider.calls] == [(1,)]
+    # The codec never sees the high layer, so its pages migrate unchanged.
+    assert [
+        [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
+    ] == [[0]]
     element_size = 1 if dtype == DataType.FP8 else 2
     low = manager.get_buffers(0, "NHD", mixed_precision_pool="low")
     high = manager.get_buffers(0, "NHD", mixed_precision_pool="high")
@@ -593,10 +595,10 @@ def test_cold_page_window_appended_draft_layers(make_manager, drafter):
     assert manager.mixed_precision_high_layers == (
         {0: 3, 1: 4, 2: 5} if drafter == "mtp" else {0: 3, 1: 4}
     )
-    # Every mixed-precision high layer stays out of the cold-page codec.
-    assert [call["mixed_precision_high_layers"] for call in provider.calls] == [
-        tuple(manager.mixed_precision_high_layers.values())
-    ]
+    # The codec sees the model's layers only, never a mixed-precision high layer.
+    assert [
+        [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
+    ] == [[0, 1, 2]]
 
 
 @pytest.mark.parametrize("drafter", ["mtp", "eagle3"])

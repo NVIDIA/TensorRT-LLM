@@ -80,10 +80,8 @@ def forward_context_sparse_attn(
     if getattr(self.mqa, "has_fp4_kv_cache", False) or attn_metadata.has_mixed_precision_high_rows:
         if latent_cache is None:
             raise ValueError("DSA context with a separate KV append requires latent_cache")
-        # Append every uncached context token before sparse prediction, while the
-        # attention op skips its normal KV append. An NVFP4 pool then gathers the
-        # selected TopK rows into a compact FP8 pool; a plain pool is read in place,
-        # and this separate append is what also writes its mixed-precision high pool.
+        # Append every uncached context token before sparse prediction (the attention op
+        # skips its own append); the mixed-precision high pool is written right after.
         self.mqa.mla_rope_append_paged_kv_assign_q(
             q, latent_cache, attn_metadata, is_generation=False
         )

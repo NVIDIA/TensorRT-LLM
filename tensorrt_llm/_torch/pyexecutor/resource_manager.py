@@ -3028,31 +3028,20 @@ class KVCacheCompressionManager(BaseResourceManager):
 
     @property
     def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
-        """``(first_n, last_n)`` tokens per sequence that KVCacheManagerV2 keeps in a
-        mixed-precision high layer group at the active precision, else None.
-
-        A storage-bound method that stores those tokens unchanged in the cold tiers
-        reports the window here; KVCacheManagerV2 reads it before building its pools.
-        """
+        """``(first_n, last_n)`` tokens per sequence left unquantized in cold tiers, else None."""
         return None
 
     def create_cold_page_codec(
-            self,
-            cache_config: object,
-            *,
-            runtime_dtype: DataType,
-            pp_layers: Sequence[int],
-            num_kv_heads_per_layer: Sequence[int],
-            head_dim_per_layer: Sequence[int],
-            is_draft: bool = False,
-            mixed_precision_high_layers: Sequence[int] = (),
+        self,
+        cache_config: object,
+        *,
+        runtime_dtype: DataType,
+        pp_layers: Sequence[int],
+        num_kv_heads_per_layer: Sequence[int],
+        head_dim_per_layer: Sequence[int],
+        is_draft: bool = False,
     ) -> Optional[object]:
-        """Create a native cold-page codec when the algorithm provides one.
-
-        ``mixed_precision_high_layers`` are the mixed-precision high layers of
-        ``cache_config``; a codec that does not own them leaves their lifecycles
-        to KVCM's lossless migration.
-        """
+        """Create a native cold-page codec when the algorithm provides one."""
         return None
 
     def encode_cold_pages(
