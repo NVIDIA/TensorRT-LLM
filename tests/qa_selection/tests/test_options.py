@@ -27,6 +27,8 @@ question for a machine whose profile has none, such as GB200.
 Every kept test is in exactly one published list, and nothing else is kept.
 """
 
+import re
+
 import pytest
 from mocks import DeviceCases
 
@@ -87,9 +89,16 @@ def test_own_host_machines_are_not_catalogued(selection, machine):
     """A machine only selected on its own host is no `--machine` choice; the error lists the six."""
     run = selection.refuse(DeviceCases.MODULE, f"--machine={machine}")
 
-    run.result.stderr.fnmatch_lines(
-        [
-            f"*argument --machine: invalid choice: '{machine}' "
-            "(choose from B200, B300, GB200, GB300, H100, VR200)*"
-        ]
-    )
+    # Whether argparse quotes the choices depends on the Python version; compare the names only.
+    error = run.result.stderr.str()
+    assert f"argument --machine: invalid choice: '{machine}'" in error
+    choices = re.search(r"\(choose from ([^)]*)\)", error)
+    assert choices, error
+    assert [c.strip(" '") for c in choices[1].split(",")] == [
+        "B200",
+        "B300",
+        "GB200",
+        "GB300",
+        "H100",
+        "VR200",
+    ]
