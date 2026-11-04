@@ -30,6 +30,7 @@ import traceback
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import dsv3_router_logits
 from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
@@ -48,12 +49,6 @@ LATENT = 3584
 NUM_EXPERTS = 896
 TOP_K = 16
 TILE = 128
-
-
-def _trt():
-    """``torch.ops.trtllm``, looked up by name: an attribute named ``ops`` in a function cloudpickle
-    ships by value would make it pickle the ``torch.ops`` object."""
-    return getattr(getattr(torch, "ops"), "trtllm")
 
 
 def _operands(seed):
@@ -80,13 +75,7 @@ def _input(m, seed):
 
 def _router_logits(x, router):
     """The replaced path's logits: ``dsv3_router_gemm_op`` per 16-row tile (its MMA kernel)."""
-    parts = [
-        _trt().dsv3_router_gemm_op(
-            x[r : r + 16].contiguous(), router.t(), bias=None, out_dtype=torch.float32
-        )
-        for r in range(0, x.shape[0], 16)
-    ]
-    return torch.cat(parts)
+    return dsv3_router_logits(x, router, tile_rows=16)
 
 
 def _route(logits, bias, offset, num_local):
@@ -194,9 +183,7 @@ def _run_rank(world_size):
                 bad += _differ(ids, r_ids) + _differ(vals, r_vals)
                 bad += _differ(codes, q_front) + _differ(scales, s_front)
             if m > 16:
-                cublas = _trt().dsv3_router_gemm_op(
-                    x, router.t(), bias=None, out_dtype=torch.float32
-                )
+                cublas = dsv3_router_logits(x, router)
                 tiled = _router_logits(x, router)
                 ids_c = _route(cublas, bias, 0, ep)[0]
                 ids_t = _route(tiled, bias, 0, ep)[0]

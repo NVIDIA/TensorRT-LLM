@@ -28,12 +28,16 @@ Against a float64 reference built from the dequantized operands:
 
 import pytest
 import torch
+from _torch.helpers import (
+    SMALL_BATCH_MOE_SITU_BETA,
+    SMALL_BATCH_MOE_SITU_LINEAR_BETA,
+    run_small_batch_moe,
+    small_batch_moe_operands,
+)
 
 from tensorrt_llm._torch.utils import unswizzle_sf
 from tensorrt_llm._utils import get_sm_version
 
-SITU_BETA = 2.5
-SITU_LINEAR_BETA = 0.7
 SF_VEC = 16
 
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
@@ -62,19 +66,10 @@ def _e4m3_to_f64(sf: torch.Tensor) -> torch.Tensor:
 
 
 def _situ(up, gate):
-    g = SITU_BETA * torch.tanh(gate / SITU_BETA) * torch.sigmoid(gate)
-    u = SITU_LINEAR_BETA * torch.tanh(up / SITU_LINEAR_BETA)
+    beta, linear_beta = SMALL_BATCH_MOE_SITU_BETA, SMALL_BATCH_MOE_SITU_LINEAR_BETA
+    g = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    u = linear_beta * torch.tanh(up / linear_beta)
     return g * u
-
-
-def _random_nvfp4_experts(num, rows, cols, gen):
-    """Random e2m1 weights [num, rows, cols / 2] and E4M3 block scales in [0.5, 2) (128x4 layout)."""
-    w = torch.randint(
-        0, 256, (num, rows, cols // 2), dtype=torch.uint8, device="cuda", generator=gen
-    )
-    sf = torch.rand((num, rows, cols // SF_VEC), device="cuda", generator=gen) * 1.5 + 0.5
-    sf = sf.to(torch.float8_e4m3fn).view(torch.uint8)
-    return w, sf
 
 
 def _setup(shape, num_tokens, seed, local_tokens=True):
@@ -88,46 +83,8 @@ def _setup(shape, num_tokens, seed, local_tokens=True):
         ids[0, 0] = offset  # at least one token on this rank
     else:
         ids.fill_((offset + num_local) % num_experts)  # every token on another rank
-    t2g, t2lim, e2p, p2e, _, nnet = torch.ops.trtllm.moe_sort(
-        token_selected_experts=ids,
-        token_final_scales=scales,
-        num_experts=num_experts,
-        top_k=top_k,
-        local_expert_offset=offset,
-        local_num_experts=num_local,
-        tile_tokens_dim=128,
-    )
-    xb = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16, generator=gen)
-    x_gsf = xb.abs().max().float() / (448 * 6)
-    x, x_sf = torch.ops.trtllm.fp4_quantize(xb, 1 / x_gsf, SF_VEC, False, False)
-    x_sf = x_sf.view(num_tokens, hidden // SF_VEC)
-    w1, w1_sf = _random_nvfp4_experts(num_local, 2 * inter_size, hidden, gen)
-    w2, w2_sf = _random_nvfp4_experts(num_local, hidden, inter_size, gen)
-    alpha1 = (torch.linspace(0.5, 1.5, num_local, device="cuda") * x_gsf * 0.004).float()
-    global_sf = torch.tensor([448 * 6 / 64.0], dtype=torch.float32, device="cuda")
-    alpha2 = (torch.linspace(0.5, 1.5, num_local, device="cuda") * 0.003 / global_sf[0]).float()
-    return dict(
-        hidden=hidden,
-        inter_size=inter_size,
-        num_local=num_local,
-        top_k=top_k,
-        offset=offset,
-        ids=ids,
-        scales=scales,
-        t2g=t2g,
-        t2lim=t2lim,
-        p2e=p2e,
-        e2p=e2p,
-        nnet=nnet,
-        x=x,
-        x_sf=x_sf,
-        w1=w1,
-        w1_sf=w1_sf,
-        w2=w2,
-        w2_sf=w2_sf,
-        alpha1=alpha1,
-        alpha2=alpha2,
-        global_sf=global_sf,
+    return small_batch_moe_operands(
+        ids, scales, hidden, inter_size, num_experts, num_local, offset, gen
     )
 
 
@@ -137,35 +94,6 @@ def _counters():
     )
 
     return new_small_batch_moe_counters(torch.device("cuda"))
-
-
-def _run(d, out, counters, *, token_indexed, deterministic, num_ctas=0, die_major=False):
-    torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
-        input=d["x"].view(torch.float4_e2m1fn_x2),
-        input_scale=d["x_sf"].view(torch.uint8),
-        fc1_weight=d["w1"].view(torch.float4_e2m1fn_x2),
-        fc1_weight_scale=d["w1_sf"],
-        fc1_alpha=d["alpha1"],
-        fc2_weight=d["w2"].view(torch.float4_e2m1fn_x2),
-        fc2_weight_scale=d["w2_sf"],
-        fc2_alpha=d["alpha2"],
-        output=out,
-        tile_idx_to_group_idx=d["t2g"],
-        tile_idx_to_mn_limit=d["t2lim"],
-        permuted_idx_to_expanded_idx=d["p2e"],
-        expanded_idx_to_permuted_idx=d["e2p"],
-        num_non_exiting_tiles=d["nnet"],
-        global_sf=d["global_sf"],
-        token_final_scales=d["scales"],
-        counters=counters,
-        top_k=d["top_k"],
-        situ_beta=SITU_BETA,
-        situ_linear_beta=SITU_LINEAR_BETA,
-        token_indexed=token_indexed,
-        num_ctas=num_ctas,
-        deterministic_combine=deterministic,
-        die_major=die_major,
-    )
 
 
 def _rows(d):
@@ -242,7 +170,7 @@ def test_small_batch_moe_matches_reference(shape, num_tokens):
     assert small_batch_moe_supports(inter_size, hidden)
     counters = _counters()
     out = torch.full((num_tokens, hidden), float("nan"), dtype=torch.bfloat16, device="cuda")
-    _run(d, out, counters, token_indexed=False, deterministic=True)
+    run_small_batch_moe(d, out, counters, token_indexed=False, deterministic=True)
     torch.cuda.synchronize()
     assert int(counters.abs().sum().item()) == 0, "counters not reset"
     assert bool(torch.isfinite(out.float()).all()), "output not fully written"
@@ -258,7 +186,9 @@ def test_small_batch_moe_matches_reference(shape, num_tokens):
     # schedule independence: other persistent CTA counts give the same bits
     for ctas in (1, 37):
         out2 = torch.full_like(out, float("nan"))
-        _run(d, out2, counters, token_indexed=False, deterministic=True, num_ctas=ctas)
+        run_small_batch_moe(
+            d, out2, counters, token_indexed=False, deterministic=True, num_ctas=ctas
+        )
         torch.cuda.synchronize()
         assert torch.equal(out.view(torch.int16), out2.view(torch.int16)), f"ctas={ctas}"
         assert int(counters.abs().sum().item()) == 0
@@ -269,7 +199,7 @@ def test_small_batch_moe_matches_reference(shape, num_tokens):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        _run(d, out_g, counters, token_indexed=False, deterministic=True)
+        run_small_batch_moe(d, out_g, counters, token_indexed=False, deterministic=True)
     for _ in range(3):
         out_g.fill_(float("nan"))
         graph.replay()
@@ -279,7 +209,7 @@ def test_small_batch_moe_matches_reference(shape, num_tokens):
 
     # red combine: the slice-combine result within the BF16 accumulation bound of its terms
     out_r = torch.full_like(out, float("nan"))
-    _run(d, out_r, counters, token_indexed=False, deterministic=False)
+    run_small_batch_moe(d, out_r, counters, token_indexed=False, deterministic=False)
     torch.cuda.synchronize()
     assert int(counters.abs().sum().item()) == 0
     bound = d["top_k"] * 2.0**-8 * mag + 2.0**-8 * out.double().abs() + 1e-30
@@ -296,11 +226,11 @@ def test_small_batch_moe_token_indexed_matches_permuted(shape, num_tokens):
     d = _setup(shape, num_tokens, 2468 + num_tokens)
     counters = _counters()
     ref = torch.full((num_tokens, d["hidden"]), float("nan"), dtype=torch.bfloat16, device="cuda")
-    _run(d, ref, counters, token_indexed=False, deterministic=True)
+    run_small_batch_moe(d, ref, counters, token_indexed=False, deterministic=True)
     same_slices = int(d["nnet"].item()) <= 16
     for ctas in (0, 1, 37):
         out = torch.full_like(ref, float("nan"))
-        _run(d, out, counters, token_indexed=True, deterministic=True, num_ctas=ctas)
+        run_small_batch_moe(d, out, counters, token_indexed=True, deterministic=True, num_ctas=ctas)
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, f"counters not reset (ctas={ctas})"
         if same_slices:
@@ -312,7 +242,7 @@ def test_small_batch_moe_token_indexed_matches_permuted(shape, num_tokens):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        _run(d, out_g, counters, token_indexed=True, deterministic=False)
+        run_small_batch_moe(d, out_g, counters, token_indexed=True, deterministic=False)
     for _ in range(2):
         out_g.fill_(float("nan"))
         graph.replay()
@@ -320,44 +250,6 @@ def test_small_batch_moe_token_indexed_matches_permuted(shape, num_tokens):
         assert int(counters.abs().sum().item()) == 0
         a, b = out_g.float(), ref.float()
         assert float((a - b).norm() / b.norm().clamp_min(1e-30)) < 1e-2, "red combine replay"
-
-
-def _run_published(d, out, counters, *, deterministic, num_ctas=0):
-    """The token-indexed kernel on the top-k a routing kernel published: the routing word holds
-    the token count before the launch (the publish), the tables are not passed."""
-    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import (
-        small_batch_moe_route_word,
-    )
-
-    small_batch_moe_route_word(counters).fill_(d["ids"].size(0))
-    ids = d["ids"].reshape(-1)
-    torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
-        input=d["x"].view(torch.float4_e2m1fn_x2),
-        input_scale=d["x_sf"].view(torch.uint8),
-        fc1_weight=d["w1"].view(torch.float4_e2m1fn_x2),
-        fc1_weight_scale=d["w1_sf"],
-        fc1_alpha=d["alpha1"],
-        fc2_weight=d["w2"].view(torch.float4_e2m1fn_x2),
-        fc2_weight_scale=d["w2_sf"],
-        fc2_alpha=d["alpha2"],
-        output=out,
-        tile_idx_to_group_idx=None,
-        tile_idx_to_mn_limit=None,
-        permuted_idx_to_expanded_idx=None,
-        expanded_idx_to_permuted_idx=ids,
-        num_non_exiting_tiles=None,
-        global_sf=d["global_sf"],
-        token_final_scales=d["scales"],
-        counters=counters,
-        top_k=d["top_k"],
-        situ_beta=SITU_BETA,
-        situ_linear_beta=SITU_LINEAR_BETA,
-        token_indexed=True,
-        num_ctas=num_ctas,
-        deterministic_combine=deterministic,
-        published_routing=True,
-        expert_offset=d["offset"],
-    )
 
 
 @pytest.mark.parametrize("shape", list(SHAPES))
@@ -369,10 +261,12 @@ def test_small_batch_moe_published_routing_matches_tables(shape, num_tokens):
     d = _setup(shape, num_tokens, 1357 + num_tokens)
     counters = _counters()
     ref = torch.full((num_tokens, d["hidden"]), float("nan"), dtype=torch.bfloat16, device="cuda")
-    _run(d, ref, counters, token_indexed=True, deterministic=True)
+    run_small_batch_moe(d, ref, counters, token_indexed=True, deterministic=True)
     for ctas in (0, 1, 37):
         out = torch.full_like(ref, float("nan"))
-        _run_published(d, out, counters, deterministic=True, num_ctas=ctas)
+        run_small_batch_moe(
+            d, out, counters, token_indexed=True, deterministic=True, num_ctas=ctas, published=True
+        )
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, f"counters not reset (ctas={ctas})"
         assert torch.equal(ref.view(torch.int16), out.view(torch.int16)), f"ctas={ctas}"
@@ -381,7 +275,9 @@ def test_small_batch_moe_published_routing_matches_tables(shape, num_tokens):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        _run_published(d, out_g, counters, deterministic=True)
+        run_small_batch_moe(
+            d, out_g, counters, token_indexed=True, deterministic=True, published=True
+        )
     for _ in range(2):
         out_g.fill_(float("nan"))
         graph.replay()
@@ -398,7 +294,7 @@ def test_small_batch_moe_no_local_expert(token_indexed, deterministic):
     assert int(d["nnet"].item()) == 0
     counters = _counters()
     out = torch.full((8, d["hidden"]), 3.0, dtype=torch.bfloat16, device="cuda")
-    _run(d, out, counters, token_indexed=token_indexed, deterministic=deterministic)
+    run_small_batch_moe(d, out, counters, token_indexed=token_indexed, deterministic=deterministic)
     torch.cuda.synchronize()
     assert int(out.abs().sum().item()) == 0
     assert int(counters.abs().sum().item()) == 0
@@ -421,7 +317,7 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
     d = _setup(shape, num_tokens, 8642 + num_tokens)
     counters = _counters()
     ref = torch.full((num_tokens, d["hidden"]), float("nan"), dtype=torch.bfloat16, device="cuda")
-    _run(d, ref, counters, token_indexed=token_indexed, deterministic=True)
+    run_small_batch_moe(d, ref, counters, token_indexed=token_indexed, deterministic=True)
 
     two_domains = is_locality_domain_enabled()
     if not two_domains:
@@ -437,7 +333,7 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
 
     for ctas in (0, 1, 37):
         out = torch.full_like(ref, float("nan"))
-        _run(
+        run_small_batch_moe(
             dm,
             out,
             counters,
@@ -454,7 +350,9 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        _run(dm, out_g, counters, token_indexed=token_indexed, deterministic=True, die_major=True)
+        run_small_batch_moe(
+            dm, out_g, counters, token_indexed=token_indexed, deterministic=True, die_major=True
+        )
     for _ in range(2):
         out_g.fill_(float("nan"))
         graph.replay()
@@ -462,7 +360,9 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
         assert torch.equal(ref.view(torch.int16), out_g.view(torch.int16)), "graph replay"
         assert int(counters.abs().sum().item()) == 0
     out_r = torch.full_like(ref, float("nan"))
-    _run(dm, out_r, counters, token_indexed=token_indexed, deterministic=False, die_major=True)
+    run_small_batch_moe(
+        dm, out_r, counters, token_indexed=token_indexed, deterministic=False, die_major=True
+    )
     torch.cuda.synchronize()
     assert int(counters.abs().sum().item()) == 0
     a, b = out_r.float(), ref.float()

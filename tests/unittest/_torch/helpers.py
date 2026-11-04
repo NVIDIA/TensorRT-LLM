@@ -413,3 +413,159 @@ def mnnvl_torch_push(workspace, target, x: torch.Tensor, rank: int) -> None:
                 slot = (t // world) * world + rank
                 buf[base + slot * h:base + (slot + 1) * h].copy_(clean[t])
     torch.cuda.synchronize()
+
+
+SMALL_BATCH_MOE_SITU_BETA = 2.5
+SMALL_BATCH_MOE_SITU_LINEAR_BETA = 0.7
+
+
+def random_nvfp4_experts(
+        num: int, rows: int, cols: int,
+        gen: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Random e2m1 weights ``[num, rows, cols / 2]`` and E4M3 block scales in
+    [0.5, 2) (128x4 layout)."""
+    w = torch.randint(0,
+                      256, (num, rows, cols // 2),
+                      dtype=torch.uint8,
+                      device="cuda",
+                      generator=gen)
+    sf = torch.rand(
+        (num, rows, cols // 16), device="cuda", generator=gen) * 1.5 + 0.5
+    return w, sf.to(torch.float8_e4m3fn).view(torch.uint8)
+
+
+def small_batch_moe_operands(
+        ids: torch.Tensor,
+        scales: torch.Tensor,
+        hidden: int,
+        inter_size: int,
+        num_experts: int,
+        num_local: int,
+        offset: int,
+        gen: torch.Generator,
+        weight_gen: Optional[torch.Generator] = None) -> Dict[str, object]:
+    """Operands of ``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin`` on a rank
+    whose ``num_local`` experts start at ``offset``, for the top-k ``ids`` /
+    ``scales`` ``[num_tokens, top_k]``: the ``moe_sort`` tables, NVFP4 tokens
+    drawn from ``gen`` and NVFP4 experts drawn from ``weight_gen`` (default
+    ``gen``)."""
+    num_tokens, top_k = ids.shape
+    t2g, t2lim, e2p, p2e, _, nnet = torch.ops.trtllm.moe_sort(
+        token_selected_experts=ids,
+        token_final_scales=scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=offset,
+        local_num_experts=num_local,
+        tile_tokens_dim=128,
+    )
+    xb = torch.randn(num_tokens,
+                     hidden,
+                     device="cuda",
+                     dtype=torch.bfloat16,
+                     generator=gen)
+    x_gsf = xb.abs().max().float() / (448 * 6)
+    x, x_sf = torch.ops.trtllm.fp4_quantize(xb, 1 / x_gsf, 16, False, False)
+    weight_gen = gen if weight_gen is None else weight_gen
+    w1, w1_sf = random_nvfp4_experts(num_local, 2 * inter_size, hidden,
+                                     weight_gen)
+    w2, w2_sf = random_nvfp4_experts(num_local, hidden, inter_size, weight_gen)
+    ramp = torch.linspace(0.5, 1.5, num_local, device="cuda")
+    global_sf = torch.tensor([448 * 6 / 64.0],
+                             dtype=torch.float32,
+                             device="cuda")
+    return dict(
+        hidden=hidden,
+        inter_size=inter_size,
+        num_local=num_local,
+        top_k=top_k,
+        offset=offset,
+        ids=ids,
+        scales=scales,
+        t2g=t2g,
+        t2lim=t2lim,
+        p2e=p2e,
+        e2p=e2p,
+        nnet=nnet,
+        x=x,
+        x_sf=x_sf.view(num_tokens, hidden // 16),
+        w1=w1,
+        w1_sf=w1_sf,
+        w2=w2,
+        w2_sf=w2_sf,
+        alpha1=(ramp * x_gsf * 0.004).float(),
+        alpha2=(ramp * 0.003 / global_sf[0]).float(),
+        global_sf=global_sf,
+    )
+
+
+def run_small_batch_moe(d: Dict[str, object],
+                        out: torch.Tensor,
+                        counters: torch.Tensor,
+                        *,
+                        token_indexed: bool,
+                        deterministic: bool,
+                        num_ctas: int = 0,
+                        die_major: bool = False,
+                        published: bool = False,
+                        push=None) -> None:
+    """``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin`` on the operands ``d``
+    of :func:`small_batch_moe_operands`: on their ``moe_sort`` tables or, with
+    ``published``, on their top-k (the routing word holds the token count
+    before the launch); ``push``: the ``LamportWorkspaceView`` of a one-shot
+    MNNVL all-reduce call the kernel pushes its output into."""
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import \
+        small_batch_moe_route_word
+
+    tables = (d["t2g"], d["t2lim"], d["p2e"], d["nnet"])
+    e2p = d["e2p"]
+    if published:
+        small_batch_moe_route_word(counters).fill_(d["ids"].size(0))
+        tables, e2p = (None, ) * 4, d["ids"].reshape(-1)
+    torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
+        input=d["x"].view(torch.float4_e2m1fn_x2),
+        input_scale=d["x_sf"].view(torch.uint8),
+        fc1_weight=d["w1"].view(torch.float4_e2m1fn_x2),
+        fc1_weight_scale=d["w1_sf"],
+        fc1_alpha=d["alpha1"],
+        fc2_weight=d["w2"].view(torch.float4_e2m1fn_x2),
+        fc2_weight_scale=d["w2_sf"],
+        fc2_alpha=d["alpha2"],
+        output=out,
+        tile_idx_to_group_idx=tables[0],
+        tile_idx_to_mn_limit=tables[1],
+        permuted_idx_to_expanded_idx=tables[2],
+        expanded_idx_to_permuted_idx=e2p,
+        num_non_exiting_tiles=tables[3],
+        global_sf=d["global_sf"],
+        token_final_scales=d["scales"],
+        counters=counters,
+        top_k=d["top_k"],
+        situ_beta=SMALL_BATCH_MOE_SITU_BETA,
+        situ_linear_beta=SMALL_BATCH_MOE_SITU_LINEAR_BETA,
+        token_indexed=token_indexed,
+        num_ctas=num_ctas,
+        deterministic_combine=deterministic,
+        die_major=die_major,
+        published_routing=published,
+        expert_offset=d["offset"],
+        push_mc=push.mc_base if push is not None else 0,
+        push_flags=push.flags if push is not None else None,
+        push_rank=push.rank if push is not None else 0,
+        push_world=push.world if push is not None else 0,
+    )
+
+
+def dsv3_router_logits(x: torch.Tensor,
+                       router: torch.Tensor,
+                       tile_rows: int = 0) -> torch.Tensor:
+    """FP32 router logits ``x @ router.T`` from ``trtllm::dsv3_router_gemm_op``,
+    one call per ``tile_rows`` rows of ``x`` where given (0: one call)."""
+    tile_rows = tile_rows or x.shape[0]
+    return torch.cat([
+        torch.ops.trtllm.dsv3_router_gemm_op(x[r:r + tile_rows].contiguous(),
+                                             router.t(),
+                                             bias=None,
+                                             out_dtype=torch.float32)
+        for r in range(0, x.shape[0], tile_rows)
+    ])
