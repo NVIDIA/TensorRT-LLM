@@ -250,6 +250,12 @@ class ProfilerScopeTest : public ::testing::Test
 protected:
     void SetUp() override
     {
+        // Death tests run before this fixture initializes the cached default selection.
+#if defined(_WIN32)
+        ASSERT_EQ(_putenv_s("TLLM_PROFILE_CUSTOM_REGIONS", ""), 0);
+#else
+        ASSERT_EQ(unsetenv("TLLM_PROFILE_CUSTOM_REGIONS"), 0);
+#endif
         ASSERT_FALSE(tc::initializeProfiler().has_value());
     }
 };
