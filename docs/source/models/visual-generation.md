@@ -67,7 +67,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
-| **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
@@ -393,7 +393,7 @@ Skip Softmax and SOL share the `disabled_until_timestep` schedule that keeps the
 
 ### CPU Offloading
 
-CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
+CPU offloading stages move selected Wan, Cosmos3 T2V, and MiniMax-H3 pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
 
 ### Multi-GPU Parallelism
 
