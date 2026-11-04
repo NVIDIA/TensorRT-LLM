@@ -903,6 +903,10 @@ class NVLinkOneSided(Communication):
         count (for the default token limit) and its explicit token limit.
         """
         force_lamport = get_force_lamport()
+        if force_lamport is True and self._force_cft is True:
+            raise ValueError(
+                f"{FORCE_LAMPORT_ENV}=1 and {FORCE_CFT_ENV}=1 both ask for every eligible step"
+            )
         # An explicit CFT request keeps every step for CFT counted writes.
         requested = False if force_lamport is None and self._force_cft is True else force_lamport
         reason = None
