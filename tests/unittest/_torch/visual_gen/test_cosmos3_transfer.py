@@ -208,7 +208,7 @@ class StubSamplingPolicy:
         self.step_kwargs_calls = 0
         self.flow_shift_calls = []
 
-    def set_flow_shift(self, scheduler, target_shift, use_karras_sigmas=None):
+    def set_flow_shift(self, scheduler, schedule):
         """Record the programmed shift and return the scheduler to install.
 
         Returns a distinct instance, like the real policy: the base scheduler
@@ -219,7 +219,7 @@ class StubSamplingPolicy:
         deleted helper ship green.
         """
         del scheduler
-        self.flow_shift_calls.append(target_shift)
+        self.flow_shift_calls.append(schedule.flow_shift)
         return StubScheduler()
 
     def set_timesteps(self, scheduler, num_inference_steps, device=None, schedule=None):

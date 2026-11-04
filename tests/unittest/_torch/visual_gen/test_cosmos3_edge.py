@@ -45,6 +45,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmo
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     Cosmos3SamplingPolicy,
     SamplingSchedule,
+    resolve_sampling_schedule,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     COSMOS3_EDGE_BACKBONE_TYPE,
@@ -73,6 +74,17 @@ def _cleanup_gpu():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _resolved(policy: Cosmos3SamplingPolicy, flow_shift: float) -> SamplingSchedule:
+    """The schedule a request with ``flow_shift`` and no sigma_grid resolves to."""
+    return resolve_sampling_schedule(
+        policy,
+        sigma_grid=None,
+        flow_shift=flow_shift,
+        mode_flow_shift=1.0,
+        mode_use_karras_sigmas=None,
+    )
 
 
 def _native_flow_schedule(shift: float) -> SamplingSchedule:
@@ -592,14 +604,14 @@ class TestNativeFlowSchedule:
     def _native_policy_and_scheduler(self, shift: float):
         scheduler = UniPCMultistepScheduler.from_config(EDGE_UNIPC_CONFIG)
         policy = Cosmos3SamplingPolicy.from_scheduler(scheduler, native_flow_schedule=True)
-        return policy, policy.set_flow_shift(scheduler, shift)
+        return policy, policy.set_flow_shift(scheduler, _resolved(policy, shift))
 
     def test_set_flow_shift_disables_karras(self):
         policy, scheduler = self._native_policy_and_scheduler(3.0)
         assert float(scheduler.config.flow_shift) == 3.0
         assert scheduler.config.use_karras_sigmas is False
         # Already matching → same instance.
-        assert policy.set_flow_shift(scheduler, 3.0) is scheduler
+        assert policy.set_flow_shift(scheduler, _resolved(policy, 3.0)) is scheduler
 
     def test_karras_rebuilt_even_at_checkpoint_shift(self):
         """flow_shift 1.0 equals the checkpoint value, but the native flow
@@ -610,7 +622,7 @@ class TestNativeFlowSchedule:
     def test_non_native_keeps_checkpoint_config(self):
         scheduler = UniPCMultistepScheduler.from_config(EDGE_UNIPC_CONFIG)
         policy = Cosmos3SamplingPolicy.from_scheduler(scheduler, native_flow_schedule=False)
-        assert policy.set_flow_shift(scheduler, 1.0) is scheduler
+        assert policy.set_flow_shift(scheduler, _resolved(policy, 1.0)) is scheduler
         assert scheduler.config.use_karras_sigmas is True
 
     @pytest.mark.parametrize("shift,steps", sorted(COSMOS_FRAMEWORK_FIXTURES))

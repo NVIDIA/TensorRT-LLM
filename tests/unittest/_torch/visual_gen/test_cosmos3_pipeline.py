@@ -936,7 +936,8 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 calls.append((target, use_karras_sigmas))
                 return scheduler
 
@@ -1000,7 +1001,8 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1066,7 +1068,7 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
                 return scheduler
 
         def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
@@ -1126,7 +1128,8 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 calls.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1170,7 +1173,8 @@ class TestCosmos3V2V:
         class FakeSampling:
             checkpoint_flow_shift = 1.0
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 

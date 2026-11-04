@@ -85,6 +85,7 @@ from .sampling import (
     DISTILLED_GUIDANCE_SCALE,
     Cosmos3SamplingPolicy,
     SamplingSchedule,
+    SigmaGrid,
     load_scheduler,
     resolve_sampling_schedule,
 )
@@ -898,24 +899,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # for the worker's lifetime; a one-off value builds a scheduler that is
         # discarded with the request instead.
         if schedule.flow_shift not in self._cacheable_flow_shifts():
-            return self.sampling.set_flow_shift(
-                base, schedule.flow_shift, use_karras_sigmas=schedule.use_karras_sigmas
-            )
+            return self.sampling.set_flow_shift(base, schedule)
 
         cache = getattr(self, "_scheduler_cache", None)
         if cache is None:
             cache = self._scheduler_cache = {}
         key = (schedule.grid, schedule.flow_shift, stream)
         if key not in cache:
-            cache[key] = self.sampling.set_flow_shift(
-                base, schedule.flow_shift, use_karras_sigmas=schedule.use_karras_sigmas
-            )
+            cache[key] = self.sampling.set_flow_shift(base, schedule)
         return cache[key]
 
     def _resolve_schedule(
         self,
         *,
-        sigma_grid: Optional[str],
+        sigma_grid: Optional[SigmaGrid],
         flow_shift: Optional[float],
         mode_flow_shift: float,
         mode_use_karras_sigmas: Optional[bool],
@@ -940,18 +937,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self,
         transfer_config: Cosmos3TransferConfig,
         *,
-        sigma_grid: Optional[str] = None,
-        flow_shift: Optional[float] = None,
+        sigma_grid: Optional[SigmaGrid] = None,
     ) -> SamplingSchedule:
         """The schedule a transfer request samples with.
 
-        The request's ``sigma_grid``, else the mode's non-Karras default; the
-        request's ``flow_shift``, else the hint preset's (see
+        The request's ``sigma_grid``, else the mode's non-Karras default. The shift
+        comes from ``transfer_config`` alone: the request's ``flow_shift`` when
+        ``flow_shift_explicit`` is set, else the hint preset's (see
         :func:`_transfer_flow_shift`).
         """
         return self._resolve_schedule(
             sigma_grid=sigma_grid,
-            flow_shift=flow_shift,
+            flow_shift=transfer_config.flow_shift if transfer_config.flow_shift_explicit else None,
             mode_flow_shift=_transfer_flow_shift(transfer_config),
             mode_use_karras_sigmas=False,
         )
@@ -1138,7 +1135,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             video=video,
             condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
             condition_video_keep=extra_params.get("condition_video_keep"),
-            flow_shift=extra_params.get("flow_shift"),
+            # A transfer request's flow_shift travels in transfer_config.
+            flow_shift=None if transfer_config is not None else extra_params.get("flow_shift"),
             sigma_grid=extra_params.get("sigma_grid"),
             action_mode=action_mode,
             domain_name=extra_params.get("domain_name"),
@@ -1760,7 +1758,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         action_resolution: Optional[int],
         action_fps: Optional[float],
         transfer_config: Optional[Cosmos3TransferConfig],
-        sigma_grid: Optional[str] = None,
+        sigma_grid: Optional[SigmaGrid] = None,
     ) -> _ResolvedRequest:
         """Resolve workflow defaults, schedulers, and action canvas geometry."""
         normalized_action_mode = normalize_action_mode(action_mode)
@@ -1906,9 +1904,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         else:
             # Resolved here so an unsupported selection is rejected before any control
             # is decoded; _forward_transfer builds its scheduler from this schedule.
-            schedule = self._transfer_schedule(
-                transfer_config, sigma_grid=sigma_grid, flow_shift=flow_shift
-            )
+            if flow_shift is not None:
+                raise ValueError(
+                    "A Cosmos3 transfer request takes its flow_shift from the transfer "
+                    "config; set Cosmos3TransferConfig.flow_shift instead."
+                )
+            schedule = self._transfer_schedule(transfer_config, sigma_grid=sigma_grid)
 
         if self.rank == 0:
             logger.info(
@@ -2610,7 +2611,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         action_resolution: Optional[int] = None,
         action_fps: Optional[float] = None,
         transfer_config: Optional[Cosmos3TransferConfig] = None,
-        sigma_grid: Optional[str] = None,
+        sigma_grid: Optional[SigmaGrid] = None,
     ):
         """Run one generation. ``infer()`` is the resolved entry point.
 

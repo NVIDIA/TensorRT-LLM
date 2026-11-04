@@ -311,12 +311,22 @@ class TestValidateRequest:
         _base_policy().validate_request(None, None)
 
 
+def _resolved(policy, flow_shift):
+    return resolve_sampling_schedule(
+        policy,
+        sigma_grid=None,
+        flow_shift=flow_shift,
+        mode_flow_shift=1.0,
+        mode_use_karras_sigmas=None,
+    )
+
+
 class TestFlowShift:
     def test_unipc_rebuilds_on_change(self):
         policy = _base_policy()
         scheduler = _base_scheduler()
 
-        rebuilt = policy.set_flow_shift(scheduler, 3.0)
+        rebuilt = policy.set_flow_shift(scheduler, _resolved(policy, 3.0))
         assert rebuilt is not scheduler
         assert isinstance(rebuilt, UniPCMultistepScheduler)
         assert float(rebuilt.config.flow_shift) == 3.0
@@ -325,17 +335,17 @@ class TestFlowShift:
         """No separate shift-tracking state: a second call with the same target
         on the rebuilt instance is a no-op; restoring rebuilds again."""
         policy = _base_policy()
-        rebuilt = policy.set_flow_shift(_base_scheduler(), 3.0)
-        assert policy.set_flow_shift(rebuilt, 3.0) is rebuilt
+        rebuilt = policy.set_flow_shift(_base_scheduler(), _resolved(policy, 3.0))
+        assert policy.set_flow_shift(rebuilt, _resolved(policy, 3.0)) is rebuilt
 
-        restored = policy.set_flow_shift(rebuilt, 1.0)
+        restored = policy.set_flow_shift(rebuilt, _resolved(policy, 1.0))
         assert restored is not rebuilt
         assert float(restored.config.flow_shift) == 1.0
 
     def test_distilled_is_structural_noop(self):
         policy = _distilled_policy()
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
-        assert policy.set_flow_shift(scheduler, 3.0) is scheduler
+        assert policy.set_flow_shift(scheduler, _resolved(policy, None)) is scheduler
 
 
 class TestSetTimesteps:

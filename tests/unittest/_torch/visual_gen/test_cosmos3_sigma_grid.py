@@ -394,9 +394,7 @@ def _resolve(policy, *, sigma_grid=None, flow_shift=None, mode_flow_shift=1.0, m
 
 def _programmed(policy, base, schedule, steps):
     """Build the request scheduler for ``schedule`` and program its timesteps."""
-    scheduler = policy.set_flow_shift(
-        base, schedule.flow_shift, use_karras_sigmas=schedule.use_karras_sigmas
-    )
+    scheduler = policy.set_flow_shift(base, schedule)
     policy.set_timesteps(scheduler, steps, device="cpu", schedule=schedule)
     return scheduler
 
@@ -758,9 +756,7 @@ class TestUnusableSigmas:
         schedule = _resolve(
             policy, sigma_grid=sigma_grid, flow_shift=flow_shift, mode_karras=mode_karras
         )
-        scheduler = policy.set_flow_shift(
-            base, schedule.flow_shift, use_karras_sigmas=schedule.use_karras_sigmas
-        )
+        scheduler = policy.set_flow_shift(base, schedule)
         with pytest.raises(ValueError, match="cannot step through"):
             policy.set_timesteps(scheduler, steps, device="cpu", schedule=schedule)
 
@@ -945,9 +941,9 @@ class TestRequestPath:
 _V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
 
 
-def _transfer_config():
+def _transfer_config(**extra):
     return resolve_transfer_config(
-        {"edge": True}, SimpleNamespace(num_frames=93, guidance_scale=None), None
+        {"edge": True, **extra}, SimpleNamespace(num_frames=93, guidance_scale=None), None
     )
 
 
@@ -968,13 +964,51 @@ class TestTransferRequestPath:
         _forward(
             pipeline,
             video=_V2V_FIXTURE_MP4.read_bytes(),
-            transfer_config=_transfer_config(),
+            transfer_config=_transfer_config(flow_shift=10.0),
             sigma_grid="native",
-            flow_shift=10.0,
         )
         assert captured["schedule"] == SamplingSchedule(
             grid="native", flow_shift=10.0, flow_shift_explicit=True
         )
+
+    def test_preset_shift_is_implicit_and_request_shift_is_explicit(self):
+        """The transfer config alone says where its shift came from: the hint preset's
+        value is a default that the Karras grid may ignore, the same value set by the
+        request is explicit and conflicts with it."""
+        captured = {}
+        policy, base = _policy()
+        pipeline = self._pipeline(policy, base, captured)
+        preset = _transfer_config()
+        assert not preset.flow_shift_explicit
+        _forward(
+            pipeline,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
+            transfer_config=preset,
+            sigma_grid="karras",
+        )
+        assert captured["schedule"].grid == "karras"
+        explicit = _transfer_config(flow_shift=preset.flow_shift)
+        assert explicit.flow_shift_explicit
+        with pytest.raises(ValueError, match="no effect"):
+            _forward(
+                pipeline,
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                transfer_config=explicit,
+                sigma_grid="karras",
+            )
+
+    def test_a_separate_flow_shift_is_rejected(self):
+        captured = {}
+        policy, base = _policy()
+        pipeline = self._pipeline(policy, base, captured)
+        with pytest.raises(ValueError, match="transfer config"):
+            _forward(
+                pipeline,
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                transfer_config=_transfer_config(),
+                flow_shift=10.0,
+            )
+        assert captured == {}
 
     def test_transfer_without_a_selection_keeps_its_preset_shift(self):
         captured = {}
@@ -986,14 +1020,16 @@ class TestTransferRequestPath:
         assert not captured["schedule"].flow_shift_explicit
 
     @pytest.mark.parametrize(
-        "policy_factory,overrides,match",
+        "policy_factory,transfer_extra,match",
         [
-            (lambda: _policy()[0], {"sigma_grid": "karras", "flow_shift": 10.0}, "no effect"),
-            (_distilled_policy, {"sigma_grid": "native"}, "distilled"),
+            (lambda: _policy()[0], {"flow_shift": 10.0}, "no effect"),
+            (_distilled_policy, {}, "distilled"),
         ],
         ids=["karras-with-shift", "distilled"],
     )
-    def test_invalid_selection_fails_before_transfer_work(self, policy_factory, overrides, match):
+    def test_invalid_selection_fails_before_transfer_work(
+        self, policy_factory, transfer_extra, match
+    ):
         captured = {}
         policy = policy_factory()
         base = UniPCMultistepScheduler.from_config(BASE_UNIPC_CONFIG)
@@ -1002,8 +1038,8 @@ class TestTransferRequestPath:
             _forward(
                 pipeline,
                 video=_V2V_FIXTURE_MP4.read_bytes(),
-                transfer_config=_transfer_config(),
-                **overrides,
+                transfer_config=_transfer_config(**transfer_extra),
+                sigma_grid="karras" if transfer_extra else "native",
             )
         assert captured == {}
 
