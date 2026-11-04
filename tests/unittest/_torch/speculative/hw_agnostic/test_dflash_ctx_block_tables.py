@@ -230,6 +230,7 @@ def _init_dspark_ctx_buffers(
         shift_label=shift_label,
         block_size=block_size,
         dflash_attention_backend="TRTLLM",
+        context_kv_fp8=False,
     )
     worker._lazy_init_ctx_buffers(
         draft_model,
