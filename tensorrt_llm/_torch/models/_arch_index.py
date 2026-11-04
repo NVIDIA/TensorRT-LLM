@@ -240,6 +240,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "mistral3": "modeling_mistral",
     "mistral_common": "modeling_mistral",
     "mistral_large_3": "modeling_mistral",
+    "mistral_large_4": "modeling_mistral",
     "muse_spark": "modeling_musespark_open_omni",
     "nemotron_h_omni": "modeling_nemotron_h_multimodal",
     "phi4mm": "modeling_phi4mm",
