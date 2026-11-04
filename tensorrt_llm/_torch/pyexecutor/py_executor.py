@@ -565,7 +565,7 @@ def _forward_workflow_metadata(
         "workflow.batch.generic_dummy_requests":
         sum(bool(req.is_dummy_request) for req in (*contexts, *generations)),
     }
-    fields["workflow.executor.is_warmup"] = executor.model_engine.is_warmup
+    fields["workflow.executor.is_warmup"] = executor.is_warmup
     fields["workflow.attention_dp_enabled"] = executor.enable_attention_dp
     mapping = executor.dist.mapping
     for name, value in (
