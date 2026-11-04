@@ -207,18 +207,30 @@ _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS = 80
 # Largest token count for which the router GEMM is issued before latent_down.
 _ROUTER_FIRST_MAX_TOKENS = 64
 # Largest token count for which the sharded decode front forks the shared expert after its head
-# instead of before it (the mix before it releases the head at kernel entry; a fork at the start
-# would release the shared GEMMs with the head, onto the SMs the head needs).
+# instead of before it: while the head streams the router and latent_down weights it needs the
+# SMs a fork at the start would hand to the shared GEMMs. The bound is the batch range where that
+# ordering is the faster one.
 _MOE_FRONT_FORK_AT_HEAD_MAX_TOKENS = 16
 # SMs the shared expert's GEMMs keep to while they run beside routed experts whose backend leaves
-# that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``;
-# the fused FC12 kernel on Rubin does). 16 of the R200's SMs is the measured split.
+# that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``).
 _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID = 16
-# The routed latent all-reduce (+ RMSNorm) of the K3 MoE tail on an MNNVL workspace of its own:
-# it no longer orders against the shared expert's all-reduce, and runs one-shot up to 9 MiB of all
-# ranks' input (164 rows of the 3584-wide latent at 8 ranks), above the global threshold. One call
-# per MoE layer, a decoder layer apart, so the kernel takes the workspace state early.
-_LATENT_ALL_REDUCE_WORKSPACE = MnnvlOwnWorkspace("kimi_k3_routed_latent", 9 << 20, early_state=True)
+# The routed latent all-reduce (+ RMSNorm) of the MoE tail runs on an MNNVL workspace of its own
+# (``_latent_all_reduce_workspace``), one-shot while all ranks together send at most this many
+# latent rows.
+_LATENT_ALL_REDUCE_ONE_SHOT_MAX_ROWS = 1316
+
+
+def _latent_all_reduce_workspace(latent_size: int) -> MnnvlOwnWorkspace:
+    """The own MNNVL workspace of the routed latent all-reduce of ``latent_size``-wide BF16 rows.
+
+    It does not order against the shared expert's all-reduce on the group's workspace. One call
+    per MoE layer, a decoder layer apart, so the kernel takes the workspace state early.
+    """
+    return MnnvlOwnWorkspace(
+        "kimi_k3_routed_latent",
+        _LATENT_ALL_REDUCE_ONE_SHOT_MAX_ROWS * latent_size * torch.bfloat16.itemsize,
+        early_state=True,
+    )
 
 
 @contextmanager
@@ -2026,7 +2038,7 @@ class KimiK3MoERuntime(nn.Module):
     # ``(first row, rows)`` of latent_up's output this rank computes in the column-parallel tail
     # (None: no column-parallel tail; set in __init__).
     latent_up_rows: Optional[Tuple[int, int]] = None
-    # The routed latent all-reduce on its own MNNVL workspace (``_LATENT_ALL_REDUCE_WORKSPACE``) for
+    # The routed latent all-reduce on its own MNNVL workspace (``_latent_all_reduce_workspace``) for
     # the sizes it runs one-shot (``_latent_all_reduce``); None: the routed experts' all-reduce.
     _own_latent_all_reduce: Optional[AllReduce] = None
     # The sharded decode front (``kimi_k3_moe_front``): the routed all-reduce group's workspace
@@ -2294,7 +2306,7 @@ class KimiK3MoERuntime(nn.Module):
                 routed_ar.mapping,
                 strategy=AllReduceStrategy.MNNVL,
                 dtype=dtype,
-                mnnvl_own_workspace=_LATENT_ALL_REDUCE_WORKSPACE,
+                mnnvl_own_workspace=_latent_all_reduce_workspace(self.moe_hidden_size),
             )
             if own.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM, self.moe_hidden_size):
                 self._own_latent_all_reduce = own
@@ -2306,7 +2318,7 @@ class KimiK3MoERuntime(nn.Module):
 
     def _latent_all_reduce(self, num_tokens: int) -> AllReduce:
         """The all-reduce of a ``num_tokens``-row routed latent: on its own workspace where that
-        runs one-shot (the size rule of ``_LATENT_ALL_REDUCE_WORKSPACE``), else the routed
+        runs one-shot (the size rule of ``_latent_all_reduce_workspace``), else the routed
         experts' all-reduce (on the group's shared workspace)."""
         own = self._own_latent_all_reduce
         if (
@@ -2316,7 +2328,7 @@ class KimiK3MoERuntime(nn.Module):
                 self.moe_hidden_size,
                 own.mapping.tp_size,
                 torch.bfloat16,
-                _LATENT_ALL_REDUCE_WORKSPACE.one_shot_max_bytes,
+                own.one_shot_max_bytes,
             )[0]
         ):
             return own
