@@ -140,9 +140,11 @@ class MsaRuntimePolicy:
     short_sequence_identity: bool = False
     # The model's one-launch replacement for the update after the KV lengths move.
     kv_update: Optional[MsaKvUpdate] = None
+    # Skip a block-table copy whose inputs equal the previous step's.
+    skip_unchanged_block_offsets: bool = False
     # Build the decode step's slot table, page table and query/KV prefix sums on the host and stage them as copies,
     # instead of filling them with device gathers, zero fills and scans between the decode graphs. The copies are
-    # MSA copy sites (MsaCopySite), merged or skipped as the model's CopyPlan says.
+    # MSA copy sites (MsaCopySite): merged as the model's CopyPlan says, skipped when unchanged with skip_unchanged_h2d.
     stage_tables_on_host: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
@@ -180,12 +182,14 @@ class ExecutorEvents(Protocol):
 class RuntimeHooks:
     """The step-loop hooks a model opts into. All off by default.
 
-    Which per-step copies are merged up to a barrier or skipped is the model's ``CopyPlan``
-    (``device_copy``), not a hook.
+    When the per-step copies land (merged up to a barrier) is the model's ``CopyPlan`` (``device_copy``), not a hook;
+    whether an unchanged upload is skipped is decided by each buffer's owner, which the hooks below turn on.
     """
 
     decode_prologue: Optional[DecodePrologue] = None
     executor_events: Optional[ExecutorEvents] = None
+    # Skip host-to-device metadata copies whose values the destination already holds.
+    skip_unchanged_h2d: bool = False
     # A speculative step under the overlap scheduler re-derives its KV-length metadata (on_update_kv_lens) once,
     # after the forward's KV-length correction, instead of also before it: the first pass's device writes are all
     # rewritten by the second.
@@ -232,6 +236,15 @@ class RuntimeHooks:
     iteration_timing_one_event: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
+
+    @property
+    def skips_unchanged_metadata_uploads(self) -> bool:
+        """Whether a hook skips uploads into graph metadata buffers that already hold the values.
+
+        Such a skip is sound only while no other engine writes those buffers, so the engine
+        then gives its CUDA graph metadata a buffer pool of its own.
+        """
+        return self.skip_unchanged_h2d or self.msa.skip_unchanged_block_offsets
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()

@@ -45,8 +45,8 @@ class MsaCopySite(CopySiteEnum):
     # Flattened page table (fmha_sm100 only), 2-D page table, per-request attended lengths.
     KV_INDICES = ("msa.kv_indices", Direction.H2D)
     # Read on the device before the replay by write_subpage_block_table when the pool has sub-pages
-    # (uniform_subpages_per_slot > 0): a plan for such a pool that merges it must also list it in flush_after, so the
-    # pack is flushed right after this copy and before that reader (which asserts it with expect_landed).
+    # (uniform_subpages_per_slot > 0), only on a step whose copy was issued: a plan for such a pool that merges it must
+    # also list it in flush_after, so that copy lands before that reader (which asserts it with expect_landed).
     BLOCK_TABLE = ("msa.block_table", Direction.H2D)
     # Read on the device before the replay by the KV prefix-sum scan unless
     # MsaRuntimePolicy.stage_tables_on_host: a plan without host staging must not merge it.
@@ -59,8 +59,6 @@ class MsaCopySite(CopySiteEnum):
     Q_BATCH_ROW = ("msa.q_batch_row", Direction.H2D)
     Q_INTRA = ("msa.q_intra", Direction.H2D)
     KV_LENS_STAGED = ("msa.kv_lens_staged", Direction.H2D)
-    # The KV cache manager's decode-only block-offset gathers (target pools and the draft view).
-    BLOCK_OFFSETS = ("msa.block_offsets", Direction.H2D)
 
 
 # Sentinel scores that force init and local blocks into the top-k regardless

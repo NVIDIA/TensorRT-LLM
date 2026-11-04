@@ -116,6 +116,14 @@ class DecoderMetadata:
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
         self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        if self.runtime_hooks.skip_unchanged_h2d:
+            if not isinstance(self.attn_metadata, TrtllmAttentionMetadata):
+                raise ValueError(
+                    "RuntimeHooks.skip_unchanged_h2d requires TRTLLM attention metadata, "
+                    f"got {type(self.attn_metadata).__name__}"
+                )
+            # The metadata's own uploads compare against what they last wrote (device_copy.UploadRecords).
+            self.attn_metadata.skip_unchanged_uploads = True
         self._arm_msa_policy(kv_cache_manager)
 
         return self.attn_metadata
@@ -142,6 +150,7 @@ class DecoderMetadata:
             )
         self.attn_metadata.msa_policy = msa
         kv_cache_manager.configure_decode_shortcuts(
+            skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
         )
 

@@ -127,9 +127,17 @@ SKIP_UNCHANGED_BLOCK_TABLE = True
 TAIL_FILL_IN_FORWARD = True
 
 
-def _fill_unused_slots(buf: torch.Tensor, start: int) -> None:
-    """buf[start:] = -1 after a write of the live slots buf[:start] (see device_copy.fill_tail)."""
-    device_copy.fill_tail(MsaCopySite.OUT_CACHE_LOC_TAIL, buf, start, -1)
+def _fill_unused_slots(
+    buf: torch.Tensor, start: int, records: Optional[device_copy.UploadRecords] = None
+) -> None:
+    """buf[start:] = -1 after a write of the live slots buf[:start], skipped if ``records`` saw the same fill.
+
+    ``records`` is the owner's (see device_copy.UploadRecords.fill_tail), or None to always fill.
+    """
+    if records is not None:
+        records.fill_tail(MsaCopySite.OUT_CACHE_LOC_TAIL, buf, start, -1)
+    else:
+        device_copy.fill_tail(MsaCopySite.OUT_CACHE_LOC_TAIL, buf, start, -1)
 
 
 class MsaDecodeSpan(NamedTuple):
@@ -266,6 +274,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # True only with speculative decoding; otherwise on_update_kv_lens and its
     # staging are skipped and non-speculative steps run as before.
     _msa_kv_lens_dynamic: bool = False
+
+    @property
+    def _skip_records(self) -> Optional[device_copy.UploadRecords]:
+        """The upload records when unchanged uploads are skipped (RuntimeHooks.skip_unchanged_uploads), else None."""
+        return self._upload_records if self.skip_unchanged_uploads else None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -743,6 +756,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         ar = torch.arange(topk, dtype=torch.int32)
         table = torch.where(ar[None, :] < n_valid.to(torch.int32)[:, None], ar[None, :], -1)
         table = table.unsqueeze(0).expand(num_kv_heads, total_q, topk).contiguous()
+        # Never skipped: CUDA graph metadata of every graph key takes this buffer from one pool, so no host record
+        # proves its device contents, and a stale table selects too few blocks.
         device_copy.copy(
             MsaCopySite.SHORT_TABLE,
             self.msa_short_table[: table.numel()],
@@ -1078,7 +1093,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
             )
             total_q = int(n_valid.shape[0])
-            # on_update_kv_lens rewrites this buffer on the device, so no plan may skip it.
+            # on_update_kv_lens rewrites this buffer on the device, so it is never skipped.
             device_copy.copy(
                 MsaCopySite.N_VALID_BLOCKS,
                 self.msa_n_valid_blocks[:total_q],
@@ -1280,11 +1295,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # from the same host block ids the flat page table was built from.
         # Columns past a request's page count are left stale rather than
         # cleared: every consumer bounds its walk by seq_lens.
-        block_table_changed = device_copy.copy(
-            MsaCopySite.BLOCK_TABLE,
-            self.msa_block_table[:batch_size, :block_table_cols],
-            maybe_pin_memory(block_ids_cpu.to(torch.int32)),
-        )
+        # The only writer of msa_block_table is this upload (the device and every captured graph only read it), so
+        # its record describes the device rows even though the buffer is pool-shared across graph keys.
+        block_table_host = maybe_pin_memory(block_ids_cpu.to(torch.int32))
+        if SKIP_UNCHANGED_BLOCK_TABLE:
+            block_table_changed = self._upload_metadata(
+                MsaCopySite.BLOCK_TABLE,
+                self.msa_block_table[:batch_size, :block_table_cols],
+                block_table_host,
+            )
+        else:
+            block_table_changed = device_copy.copy(
+                MsaCopySite.BLOCK_TABLE,
+                self.msa_block_table[:batch_size, :block_table_cols],
+                block_table_host,
+            )
         stage_on_host = self.msa_policy.stage_tables_on_host
         device_copy.copy(
             MsaCopySite.SEQ_LENS,
@@ -1297,13 +1322,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             if stage_on_host:
                 # Both prefix sums from the host lengths (the values the device scans would give), staged with
                 # their leading zero: copies instead of zero / scan kernels between the decode graphs.
+                # Never skipped (pool-shared CUDA graph metadata; see _stage_msa_short_table).
                 device_copy.copy(MsaCopySite.QO_LENS, qo_lens_cuda, qo_lens_cpu)
                 device_copy.copy(
                     MsaCopySite.CU_Q_LENS,
                     self.msa_cu_q_lens[: batch_size + 1],
                     _host_prefix_sum(qo_lens_cpu, self.msa_cu_q_lens.dtype),
                 )
-                # on_update_kv_lens rewrites this buffer on the device, so no plan may skip it.
+                # on_update_kv_lens rewrites this buffer on the device, so it is never skipped.
                 device_copy.copy(
                     MsaCopySite.CU_KV_LENS,
                     self.msa_cu_kv_lens[: batch_size + 1],
@@ -1392,6 +1418,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         intra_np = (
             np.arange(total_new_tokens, dtype=np.int64) - np.repeat(starts_np, qo_np)
         ).astype(np.int32)
+        # Never skipped (pool-shared CUDA graph metadata; see _stage_msa_short_table).
         device_copy.copy(
             MsaCopySite.Q_BATCH_ROW,
             self.msa_q_batch_row[:total_new_tokens],

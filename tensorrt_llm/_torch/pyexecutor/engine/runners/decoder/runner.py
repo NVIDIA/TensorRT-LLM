@@ -150,7 +150,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
-    # The copy sites the model merges up to a barrier or skips when unchanged (device_copy); empty by default.
+    # The copy sites the model merges up to a barrier (device_copy); empty by default.
     copy_plan: CopyPlan = CopyPlan()
     # This engine's copier (None: an empty plan), active only during its own forward.
     _copier: DeviceCopier | None = None
@@ -383,7 +383,8 @@ class DecoderRunner(ScheduledModelRunner):
             try:
                 return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
             except BaseException:
-                # A failed step may not have issued its merged copies, so forget the shadows recorded for them too.
+                # A failed step may not have issued its merged copies: discarding the pack drops them and runs their
+                # on_drop callbacks, so the buffer owners forget the records they made for them.
                 device_copy.discard()
                 raise
 
@@ -484,8 +485,7 @@ class DecoderRunner(ScheduledModelRunner):
             dist=self._dist,
             sparse_attention_config=self._sparse_attention_config,
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
-            # A skipped copy is sound only while no other engine writes the buffer.
-            private_metadata_buffers=bool(self.copy_plan.skip_unchanged),
+            private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.

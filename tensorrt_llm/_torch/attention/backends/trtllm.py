@@ -49,7 +49,7 @@ from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...pyexecutor import device_copy
 from ...pyexecutor.config_utils import is_mla
-from ...pyexecutor.device_copy import CopySite
+from ...pyexecutor.device_copy import CopySite, CopySiteEnum
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -187,6 +187,9 @@ class HelixMlaChunkPlan:
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
+    # Skip metadata uploads whose destination already holds the values (RuntimeHooks.skip_unchanged_uploads). Sound
+    # only while no other engine writes these buffers, so the engine then gives its graph metadata private buffers.
+    skip_unchanged_uploads: bool = field(default=False, init=False, repr=False)
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
@@ -448,7 +451,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
+        # What the skippable uploads last wrote (used only with skip_unchanged_uploads). One record set per engine:
+        # CUDA graph metadata is a shallow copy that shares it, since the copies write the same buffers.
+        if getattr(self, "_upload_records", None) is None:
+            self._upload_records = device_copy.UploadRecords()
         self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _upload_metadata(self, site: CopySiteEnum, dst: torch.Tensor,
+                         src: torch.Tensor) -> bool:
+        """A host-to-device metadata upload, skipped when unchanged if the model opted in; True if issued."""
+        if self.skip_unchanged_uploads:
+            return self._upload_records.copy(site, dst, src)
+        return device_copy.copy(site, dst, src)
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -1101,6 +1115,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
+        # Never skipped: CUDA graph metadata of every graph key takes this buffer
+        # from one pool, so no host record proves its device contents.
         device_copy.copy(CopySite.ATTN_PROMPT_LENS,
                          self.prompt_lens_cuda[:self.num_seqs],
                          self.prompt_lens_cpu[:self.num_seqs])

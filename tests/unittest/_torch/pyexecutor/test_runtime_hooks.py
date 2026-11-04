@@ -753,7 +753,7 @@ class _M3PlainModel(torch.nn.Module):
 
 
 class _M3ClassHooksModel(torch.nn.Module):
-    runtime_hooks = RuntimeHooks(loop_on_execution_stream=True, skip_greedy_rng_upload=True)
+    runtime_hooks = RuntimeHooks(loop_on_execution_stream=True, skip_unchanged_h2d=True)
 
 
 def test_m3_model_without_hooks_gets_the_all_off_default():
@@ -761,6 +761,7 @@ def test_m3_model_without_hooks_gets_the_all_off_default():
 
     assert hooks is DEFAULT_RUNTIME_HOOKS
     assert hooks == RuntimeHooks()
+    assert not hooks.skip_unchanged_h2d
     assert not hooks.loop_on_execution_stream
     assert not hooks.merge_tuned_tactics_across_ranks
     assert not hooks.skip_greedy_rng_upload
@@ -768,6 +769,7 @@ def test_m3_model_without_hooks_gets_the_all_off_default():
     assert hooks.msa == MsaRuntimePolicy()
     assert not hooks.msa.short_sequence_identity
     assert hooks.msa.kv_update is None
+    assert not hooks.msa.skip_unchanged_block_offsets
     assert not hooks.msa.stage_tables_on_host
     assert not hooks.msa.reuse_pool_views
 
@@ -824,6 +826,20 @@ def test_m3_hooks_are_immutable_once_declared():
         hooks.loop_on_execution_stream = True
     with pytest.raises(dataclasses.FrozenInstanceError):
         hooks.msa.reuse_pool_views = True
+
+
+@pytest.mark.parametrize(
+    "hooks, skips",
+    [
+        (RuntimeHooks(), False),
+        (RuntimeHooks(loop_on_execution_stream=True, skip_greedy_rng_upload=True), False),
+        (RuntimeHooks(skip_unchanged_h2d=True), True),
+        (RuntimeHooks(msa=MsaRuntimePolicy(skip_unchanged_block_offsets=True)), True),
+    ],
+    ids=["default", "no_skip_of_metadata", "h2d_skip", "msa_block_offset_skip"],
+)
+def test_m3_every_metadata_upload_skip_asks_for_private_metadata_buffers(hooks, skips):
+    assert hooks.skips_unchanged_metadata_uploads is skips
 
 
 @pytest.mark.parametrize(
