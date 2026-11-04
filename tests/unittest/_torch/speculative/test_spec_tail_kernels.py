@@ -20,12 +20,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import triton_num_compiled
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.spec_tail_kernels import (
+    _paged_latent_prepare_kernel,
+    _strict_accept_kernel,
     decode_draft_block_table,
+    dflash_paged_latent_prepare,
     strict_accept,
 )
 from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
@@ -62,6 +66,23 @@ def test_strict_accept_matches_eager(num_ctx, num_gens, draft_len):
     assert torch.equal(num_accepted, ref_num)
     assert torch.equal(accepted[:num_ctx, 0], ref_accepted[:num_ctx, 0])
     assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
+
+
+def test_strict_accept_reuses_the_compiled_kernel_across_batches():
+    draft_len = 3
+
+    def accept(num_ctx, num_gens):
+        target = torch.zeros(num_ctx + num_gens * (draft_len + 1), dtype=torch.int64, device="cuda")
+        draft = torch.zeros((num_gens, draft_len), dtype=torch.int32, device="cuda")
+        strict_accept(target, draft, num_ctx, num_ctx + num_gens)
+
+    # One BLOCK_B (32); the request counts are 0, 1, multiples of 16 and neither.
+    batches = [(0, 17), (1, 31), (16, 17), (17, 16), (3, 32), (20, 1)]
+    accept(*batches[0])
+    compiled = triton_num_compiled(_strict_accept_kernel)
+    for batch in batches[1:]:
+        accept(*batch)
+    assert triton_num_compiled(_strict_accept_kernel) == compiled
 
 
 def test_decode_draft_block_table_matches_eager():
@@ -265,3 +286,40 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     assert torch.equal(placement.offsets, fixup.offsets)
     assert torch.equal(placement.seq_lens, fixup.seq_lens_i32)
     assert torch.equal(placement.kv_bounds, fixup.kv_bounds_i32)
+
+
+def test_paged_latent_prepare_reuses_the_compiled_kernel_across_batches():
+    page_size, max_blocks, max_batch, width = 16, 4, 32, 4
+    slot_of_row = torch.arange(max_batch, device="cuda")
+    ctx_len = torch.zeros(max_batch + 1, dtype=torch.int64, device="cuda")
+    block_counts = torch.full((max_batch,), max_blocks, dtype=torch.int64, device="cuda")
+    block_tables = torch.arange(max_batch * max_blocks, dtype=torch.int32, device="cuda")
+    num_accepted = torch.ones(max_batch, dtype=torch.int32, device="cuda")
+    accepted = torch.zeros((max_batch, width), dtype=torch.int32, device="cuda")
+    seq_lens = torch.zeros(max_batch, dtype=torch.int32, device="cuda")
+
+    def prepare(first_row, num_gens):
+        dflash_paged_latent_prepare(
+            num_accepted,
+            accepted,
+            slot_of_row[first_row : first_row + num_gens],
+            ctx_len,
+            block_counts,
+            block_tables.view(max_batch, max_blocks),
+            seq_lens,
+            first_row,
+            dummy_slot=max_batch,
+            max_ctx=page_size * max_blocks,
+            page_size=page_size,
+            block_size=width,
+            width=width,
+        )
+
+    # One BLOCK_G (16); the first rows are 0, 1, multiples of 16 and neither,
+    # and an odd first row misaligns the int64 slot view.
+    batches = [(0, 9), (1, 16), (3, 12), (16, 16), (2, 9)]
+    prepare(*batches[0])
+    compiled = triton_num_compiled(_paged_latent_prepare_kernel)
+    for batch in batches[1:]:
+        prepare(*batch)
+    assert triton_num_compiled(_paged_latent_prepare_kernel) == compiled
