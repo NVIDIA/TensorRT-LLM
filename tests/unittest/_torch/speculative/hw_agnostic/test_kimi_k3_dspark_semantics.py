@@ -883,18 +883,13 @@ def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_si
 
 
 @needs_trtllm_gen
-@pytest.mark.parametrize(
-    "cache_dtype,tolerance",
-    [(torch.bfloat16, 0.02), (torch.float8_e4m3fn, 0.05)],
-    ids=["bf16", "fp8"],
-)
+@pytest.mark.parametrize("cache_dtype,tolerance", [(torch.bfloat16, 0.02)], ids=["bf16"])
 def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype, tolerance):
-    """The TRTLLM non-causal block attention over a paged BF16 or FP8 cache
-    matches the eager reference for requests with different history lengths.
+    """The TRTLLM non-causal block attention over a paged BF16 cache matches the
+    eager reference for requests with different history lengths.
 
     Each block query runs as its own one-token decode request over its
     parent's pages, so a wrong table, length or block write shows up here.
-    An FP8 cache also takes the block's K/V and queries in FP8.
     """
     weights = _tiny_weights()
     drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
@@ -916,6 +911,20 @@ def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype,
         expected = expected.float()
         rel_err = ((out[row] - expected).norm() / expected.norm()).item()
         assert rel_err < tolerance, f"request {row}: relative error {rel_err}"
+
+
+@needs_trtllm_gen
+def test_trtllm_paged_block_decode_rejects_a_quantized_cache():
+    """The plain DFlash paged block decode writes the block's K/V in the draft
+    activation dtype; an FP8 cache is rejected, not written lossily."""
+    weights = _tiny_weights()
+    drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
+    g = torch.Generator().manual_seed(44)
+    captured = [torch.randn(CTX_LEN, TINY["hidden_size"] * NUM_CAPTURE, generator=g) * 0.5]
+    noise_embed = [torch.randn(TINY["block_size"], TINY["hidden_size"], generator=g) * 0.5]
+
+    with pytest.raises(ValueError, match="quantized context-cache writes are not supported"):
+        _run_paged_block_decode(drafter, captured, noise_embed, torch.float8_e4m3fn)
 
 
 # ---------------------------------------------------------------------------
