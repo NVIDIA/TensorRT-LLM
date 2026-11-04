@@ -18,9 +18,9 @@ One rank's shard of the shared expert (gate/up ``[2 I, 7168]``, down ``[7168, I]
 ``N`` CTAs and writes its partial ``[M, 7168]``. Checks, over back-to-back launches (counter
 re-arm) and a CUDA graph replay:
 
-* the slot rows against an FP64 reference of the math, and against today's path (BF16 GEMM,
-  ``situ_and_mul``, BF16 GEMM): no further from FP64 than that path (plus a margin for the BF16
-  rounding of the activation), and close to it;
+* the slot rows against an FP64 reference of the math, and against the GatedMLP path (BF16
+  GEMM, ``situ_and_mul``, BF16 GEMM): no further from FP64 than that path (plus a margin for the
+  BF16 rounding of the activation), and close to it;
 * every element written, the exchange counters back at zero.
 """
 
@@ -52,7 +52,7 @@ def _situ64(gate, up, lbeta=LBETA):
     return a * up
 
 
-def _today(x, gu, dn, lbeta=LBETA):
+def _gated_mlp(x, gu, dn, lbeta=LBETA):
     """The GatedMLP path: BF16 gate/up GEMM, SiTU (BF16 out), BF16 down GEMM."""
     from tensorrt_llm._torch.modules.situ import SituAndMul
 
@@ -114,15 +114,15 @@ def test_shared_persist(world, m, sms, lbeta):
         )
 
     ideal = _ideal(x, gu, dn, lbeta)
-    today, act_today = _today(x, gu, dn, lbeta)
-    err_today = _rel(today, ideal)
+    mlp, act_mlp = _gated_mlp(x, gu, dn, lbeta)
+    err_mlp = _rel(mlp, ideal)
     for it in range(4):
         if it >= 2:
             # New inputs between launches.
             x.copy_((torch.randn(m, HIDDEN, device="cuda", generator=g) * 0.5).bfloat16())
             ideal = _ideal(x, gu, dn, lbeta)
-            today, act_today = _today(x, gu, dn, lbeta)
-            err_today = _rel(today, ideal)
+            mlp, act_mlp = _gated_mlp(x, gu, dn, lbeta)
+            err_mlp = _rel(mlp, ideal)
         buf.fill_(float("nan"))
         launch()
         torch.cuda.synchronize()
@@ -130,16 +130,10 @@ def test_shared_persist(world, m, sms, lbeta):
         out = buf.clone()
         assert not bool(torch.isnan(out).any()), "unwritten element"
         err = _rel(out, ideal)
-        diff = _rel(out, today)
-        same = float((out.view(torch.int16) == today.view(torch.int16)).float().mean())
+        diff = _rel(out, mlp)
         act_ours = ws.xch[:m].float()
-        act_diff = _rel(act_ours, act_today)
-        print(
-            f"[persist] W={world} m={m} N={sms} lbeta={lbeta} it={it}: vs FP64 {err:.3e} (today's "
-            f"path {err_today:.3e}), vs today's path {diff:.3e} ({100 * same:.1f}% equal BF16), "
-            f"activation vs situ_and_mul {act_diff:.3e}"
-        )
-        assert err <= err_today * 1.05 + 1e-4, (err, err_today, _worst(out, today, "eager"))
+        act_diff = _rel(act_ours, act_mlp)
+        assert err <= err_mlp * 1.05 + 1e-4, (err, err_mlp, _worst(out, mlp, "eager"))
         assert diff < 5e-3, diff
         assert act_diff < 3e-3, act_diff
 
@@ -157,12 +151,10 @@ def test_shared_persist(world, m, sms, lbeta):
         torch.cuda.synchronize()
         out = buf.clone()
         assert not bool(torch.isnan(out).any()), f"graph {step}: unwritten element"
-        today = _today(x, gu, dn, lbeta)[0]
+        mlp = _gated_mlp(x, gu, dn, lbeta)[0]
         err = _rel(out, _ideal(x, gu, dn, lbeta))
-        err_today = _rel(today, _ideal(x, gu, dn, lbeta))
-        print(f"[persist] graph {step}: vs FP64 {err:.3e} (today's path {err_today:.3e}); "
-              + _worst(out, today, "vs today"))  # fmt: skip
-        assert err <= err_today * 1.05 + 1e-4, (step, err, err_today)
+        err_mlp = _rel(mlp, _ideal(x, gu, dn, lbeta))
+        assert err <= err_mlp * 1.05 + 1e-4, (step, err, err_mlp)
         assert ws.ctr.tolist() == [0, 0]
 
 

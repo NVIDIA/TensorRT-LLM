@@ -20,7 +20,7 @@ into a local all-gather buffer (``mc_out=False``). Checks:
 
 * the all-gather rows against an FP64 reference of the math (latent sum in the all-reduce's
   order, RMSNorm, latent_up), and against an emulation of the column-parallel tail it replaces
-  (MXFP8 activation): the error of TAIL1 must not exceed the column-parallel tail's;
+  (MXFP8 activation): the kernel's error must not exceed the column-parallel tail's;
 * the kernel's own arithmetic (BF16 ``x * gamma``, FP32 products, late RMS scale) to FP32
   accumulation-order accuracy;
 * the latent all-reduce's protocol (``mnnvl_pushed_allreduce``): the previous call's buffer
@@ -45,7 +45,7 @@ EPS = 1e-6
 SENT = -(2**31)  # 0x80000000 as int32
 
 
-def _t1():
+def _tail_module():
     from tensorrt_llm._torch.kernels.blackwell import kimi_k3_moe_tail
 
     return kimi_k3_moe_tail
@@ -131,7 +131,7 @@ def _block_rows(world, rank):
 
 
 def _run_world(world, m, seed=0, blocks=False):
-    t1 = _t1()
+    tail = _tail_module()
     g = torch.Generator(device="cuda").manual_seed(100 + seed)
     w8, exps = _weights(7 + seed)
     gamma = (torch.rand(LATENT, device="cuda", generator=g) + 0.5).bfloat16()
@@ -154,8 +154,8 @@ def _run_world(world, m, seed=0, blocks=False):
     for rank in range(world):
         ws.lat_buffer(dirty).copy_(garbage)
         ws.lat_flags.copy_(flags0)
-        c0, n = _block_rows(world, rank) if blocks else t1.rank_rows(world, rank)
-        t1.run_moe_tail(
+        c0, n = _block_rows(world, rank) if blocks else tail.rank_rows(world, rank)
+        tail.run_moe_tail(
             m=m, world=world, lat_uc=ws.lat.data_ptr(), lat_flags=ws.lat_flags, weight=w8,
             wexp=exps, gamma=gamma, eps=EPS, ag_base=ws.ag.data_ptr(), ag_flags=ws.ag_flags,
             c0=c0, rows=n, mc_out=False,
@@ -200,17 +200,12 @@ def _run_world(world, m, seed=0, blocks=False):
     def rel(a, b):
         return float((a.double() - b.double()).norm() / b.double().norm())
 
-    err_tail1 = rel(out, ideal)
+    err_tail = rel(out, ideal)
     err_cp = rel(cp, ideal)
     err_emul = rel(out, emul)
-    print(
-        f"[kimi_k3_moe_tail] W={world} m={m}: vs FP64 {err_tail1:.3e}, column-parallel tail "
-        f"vs FP64 {err_cp:.3e}, vs own-arithmetic emulation {err_emul:.3e}"
-    )
     assert err_emul < 2e-3, err_emul
-    assert err_tail1 <= err_cp, (err_tail1, err_cp)
-    assert err_tail1 < 5e-3, err_tail1
-    return err_tail1, err_cp
+    assert err_tail <= err_cp, (err_tail, err_cp)
+    assert err_tail < 5e-3, err_tail
 
 
 @pytest.mark.parametrize(
@@ -218,15 +213,15 @@ def _run_world(world, m, seed=0, blocks=False):
     [(16, 8), (16, 1), (16, 5), (8, 8), (8, 3), (4, 8)],
 )
 @pytest.mark.parametrize("blocks", [False, True])
-def test_tail1_emulated_ranks(world, m, blocks):
-    assert _t1().can_run(m, world)
+def test_moe_tail_emulated_ranks(world, m, blocks):
+    assert _tail_module().can_run(m, world)
     _run_world(world, m, blocks=blocks)
 
 
-def test_tail1_block_exponents():
+def test_moe_tail_block_exponents():
     """The exponents from the low-M GEMM's DeepGEMM-packed scale (byte kb % 4 of word kb // 4,
     MN-major) are the 128x128 block exponents."""
-    t1 = _t1()
+    tail = _tail_module()
     _, exps = _weights(3)
     nb, kb = exps.shape
     padded = torch.zeros((HIDDEN, (kb + 3) // 4 * 4), dtype=torch.uint8, device="cuda")
@@ -234,17 +229,17 @@ def test_tail1_block_exponents():
     words = padded.view(torch.int32)
     packed = torch.empty((words.shape[1], HIDDEN), dtype=torch.int32, device="cuda").t()
     packed.copy_(words)
-    assert torch.equal(t1.block_exponents(packed, HIDDEN, LATENT), exps)
+    assert torch.equal(tail.block_exponents(packed, HIDDEN, LATENT), exps)
 
 
-def test_tail1_shapes():
-    t1 = _t1()
-    assert not t1.can_run(9, 16)
-    assert not t1.can_run(0, 16)
-    assert not t1.can_run(8, 3)
-    assert t1.can_run(8, 16) and t1.can_run(1, 2)
-    assert t1.rank_rows(16, 3) == (3 * 448, 448)
+def test_moe_tail_shapes():
+    tail = _tail_module()
+    assert not tail.can_run(9, 16)
+    assert not tail.can_run(0, 16)
+    assert not tail.can_run(8, 3)
+    assert tail.can_run(8, 16) and tail.can_run(1, 2)
+    assert tail.rank_rows(16, 3) == (3 * 448, 448)
     # The column-parallel tail's whole 128-row blocks per rank (4 or 3 blocks at 16 ranks).
-    assert t1.cluster_rows(512) == 128 and t1.cluster_rows(384) == 128
-    assert t1.cluster_rows(448) == 112 and t1.cluster_rows(100) == 0
-    assert t1.can_run(8, 16, 512) and not t1.can_run(8, 16, 100)
+    assert tail.cluster_rows(512) == 128 and tail.cluster_rows(384) == 128
+    assert tail.cluster_rows(448) == 112 and tail.cluster_rows(100) == 0
+    assert tail.can_run(8, 16, 512) and not tail.can_run(8, 16, 100)
