@@ -63,6 +63,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
+  # Per-layer dynamic EPLB on MegaMoE CuteDSL: the HALO-Q plan, the in-switch
+  # copy of hot experts into helper slots, and the MoE output.
+  - unittest/_torch/moe/test_per_layer_dynamic_eplb_gpu.py
   - unittest/_torch/moe/test_moe_routing.py
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM) and the LL TP exchanges.
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py

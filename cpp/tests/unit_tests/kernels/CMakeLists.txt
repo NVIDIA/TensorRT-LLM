@@ -172,6 +172,17 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;moe-load-balance;gpu")
 
+add_tllm_gtest(
+  moeRebalanceHaloQTest
+  OWNER
+  kernel
+  SOURCES
+  moe/moeRebalanceHaloQTest.cu
+  LINK_LIBRARIES
+  ${CUDA_RT_LIB}
+  LABELS
+  "unit;kernels;moe-load-balance;gpu")
+
 if(USING_OSS_CUTLASS_MOE_GEMM)
   add_tllm_gtest(
     moeLoraPointerExpandTest
