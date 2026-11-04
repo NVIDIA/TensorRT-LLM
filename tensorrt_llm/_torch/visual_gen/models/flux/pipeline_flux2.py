@@ -49,6 +49,7 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, 
 from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
+from .checkpoint import probe_native_flux2
 from .transformer_flux2 import Flux2Transformer2DModel
 
 # TeaCache coefficients for FLUX.2 (different from FLUX.1)
@@ -97,6 +98,7 @@ def format_input(prompts: List[str], system_message: str) -> List[List[dict]]:
 @register_pipeline(
     "Flux2Pipeline",
     hf_ids=["black-forest-labs/FLUX.2-dev"],
+    checkpoint_probe=probe_native_flux2,
     doc="Black Forest Labs FLUX.2 family (text-to-image and reference-image generation).",
 )
 class Flux2Pipeline(BasePipeline):

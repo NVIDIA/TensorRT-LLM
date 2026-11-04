@@ -33,6 +33,7 @@ from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qw
 
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.checkpoint import probe_native_h3
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import (
     BasePipeline,
@@ -166,6 +167,7 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
     "MiniMaxH3ModularPipeline",
     hf_ids=["MiniMaxAI/MiniMax-H3"],
     defaults={"workflow": "fl2va"},
+    checkpoint_probe=probe_native_h3,
     download_patterns=[
         "modular_model_index.json",
         "LICENSE",
