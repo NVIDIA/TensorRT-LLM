@@ -2175,13 +2175,12 @@ def test_native_text_chat_encoding_and_continuation():
         [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "A"}],
         add_generation_prompt=False,
     )
+    assert context.startswith(_NATIVE_CHAT_TOKENS_PREFIX)
     assert wrapper.tok_encode(context) == [1, 3, 1000, 4, 1001]
     kwargs = llm.tokenizer.apply_chat_template.call_args.kwargs
     assert kwargs["continue_final_message"] is True
     assert kwargs["reasoning_effort"] == "none"
     llm.tokenizer.encode.assert_not_called()
-    with pytest.raises(ValueError, match="Invalid native chat token context"):
-        wrapper._prepare_prompt(_NATIVE_CHAT_TOKENS_PREFIX + "[true, -1]")
     llm.args.checkpoint_format = "hf"
     non_native = LmEvalWrapper(llm)
     assert non_native._prepare_prompt(context) == context

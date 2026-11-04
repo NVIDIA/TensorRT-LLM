@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
 import json
 import os
 from copy import deepcopy
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from packaging.version import Version
 from transformers import PretrainedConfig, WhisperConfig
 
 from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
@@ -45,8 +47,6 @@ def resolve_native_dspark_config(
     if os.path.realpath(checkpoint) != os.path.realpath(target_model):
         raise ValueError("Native Mistral DSpark must use the target checkpoint")
     layers = [int(layer) for layer in mtp["target_activation_layers"].split(",")]
-    if not layers or layers != sorted(set(layers)) or layers[0] < 0:
-        raise ValueError("Mistral DSpark target activation layers must be unique and ascending")
     trained = dict(
         target_layer_ids=layers,
         block_size=int(mtp["depth"]),
@@ -113,12 +113,7 @@ def adapt_config_dict(
     defaults: dict[str, Any] = {},
 ) -> PretrainedConfig:
     if _is_mistral_large4(config_dict):
-        if config_dict.get("quantization"):
-            raise ValueError(
-                "Mistral-Large-4 is served from the ModelOpt MIXED_PRECISION export, whose "
-                "params.json states quantization_config; found quantization="
-                f"{config_dict['quantization']!r}"
-            )
+        _require_mistral_common_for_mistral_large4()
         config_dict = deepcopy(config_dict)
         config_dict = _remap_general_mistral_args(config_dict)
         config_dict = _remap_moe_args(config_dict)
@@ -185,6 +180,19 @@ def _is_mistral_large4(config: dict) -> bool:
     return bool(config.get("dsa") and config.get("kv_lora_rank") and config.get("lerope"))
 
 
+_MISTRAL_LARGE4_MISTRAL_COMMON = "1.13.0"
+
+
+def _require_mistral_common_for_mistral_large4() -> None:
+    """Mistral-Large-4's tekken.json and chat settings need mistral-common 1.13.0 or later."""
+    installed = importlib.metadata.version("mistral-common")
+    if Version(installed) < Version(_MISTRAL_LARGE4_MISTRAL_COMMON):
+        raise ImportError(
+            f"Mistral-Large-4 requires mistral-common>={_MISTRAL_LARGE4_MISTRAL_COMMON} "
+            f"(Python 3.11 or later); the installed version is {installed}."
+        )
+
+
 def _adapt_mistral_large4_config(config: dict) -> MistralLarge4Config:
     """Adapt the native MLA/DSA language model, preserving the quantized-layer policy."""
     dsa = config.pop("dsa")
@@ -200,6 +208,8 @@ def _adapt_mistral_large4_config(config: dict) -> MistralLarge4Config:
         index_sharing=dsa["sharing"].split(","),
         fp8_kv_cache=dsa["fp8_kv_cache"],
     )
+    if dsa["fp8_kv_cache"] and config.get("quantization_config"):
+        config["quantization_config"].setdefault("kv_cache_quant_algo", "FP8")
     num_layers = config["num_hidden_layers"]
     pattern = config.pop("nope").split(",")
     if set(pattern) - {"rope", "nope"} or num_layers % len(pattern):
@@ -213,8 +223,6 @@ def _adapt_mistral_large4_config(config: dict) -> MistralLarge4Config:
     config["kv_source_layers"] = [
         int(layer) for layer in config.pop("kv_sharing")["source_layers_str"].split(",")
     ]
-    if len(config["kv_source_layers"]) != num_layers or len(config["index_sharing"]) != num_layers:
-        raise ValueError("KV and indexer sharing must contain one entry per layer")
     config = _remap_mistral_yarn_args(config)
     rope = config.pop("rope_scaling")
     if rope.pop("apply_yarn_scaling", False):

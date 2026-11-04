@@ -771,12 +771,6 @@ class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
         self._native_chat = getattr(config, "model_type",
                                     None) == "mistral_large_4"
         self.supports_token_id_mm_expansion = self._native_chat
-        # A Mistral-Large-4 target encodes images when its export carries a vision encoder.
-        self._serves_images = True
-        if self._native_chat:
-            from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.routing import \
-                serves_images
-            self._serves_images = serves_images(config)
         self._tokenizer = MistralTokenizer.from_pretrained(model_path)
         self._processor = MistralCommonImageProcessor(
             tokenizer=self._tokenizer,
@@ -845,12 +839,6 @@ class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
             raise ValueError("Image grid is missing its end token")
         return blocks
 
-    def _check_images_served(self, images) -> None:
-        if images and not self._serves_images:
-            raise ValueError(
-                "this Mistral-Large-4 checkpoint's target serves text only; "
-                "images need an NVFP4 export")
-
     @staticmethod
     def _image_payload(processed):
         processed.pop("input_ids")
@@ -865,7 +853,6 @@ class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
         token_ids = list(inputs["prompt_token_ids"])
         images = self.processor.image_list(
             inputs.get("multi_modal_data", {}).get("image"))
-        self._check_images_served(images)
         if not images:
             if any(token in self.get_mm_token_ids() for token in token_ids):
                 raise ValueError("Image tokens require image data")
@@ -928,7 +915,6 @@ class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
             return self.call_with_token_ids(inputs, sampling_params)
         images = self.processor.image_list(
             inputs.get("multi_modal_data", {}).get("image"))
-        self._check_images_served(images)
         if not images:
             return self.tokenizer.transformers_tokenizer.encode(
                 inputs["prompt"]), None

@@ -129,10 +129,8 @@ def _nvfp4_mixed_precision(cfg: Any) -> bool:
 
 
 def serves_images(pretrained_config: Any) -> bool:
-    """Whether this config's target encodes images: an NVFP4 export with a vision encoder."""
-    return getattr(pretrained_config, "vision_config", None) is not None and (
-        _nvfp4_mixed_precision(pretrained_config)
-    )
+    """Whether this config's target encodes images: the export carries a vision encoder."""
+    return getattr(pretrained_config, "vision_config", None) is not None
 
 
 def route(

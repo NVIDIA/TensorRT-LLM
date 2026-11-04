@@ -140,11 +140,7 @@ def test_physical_roles_and_layer_views(kind: str) -> None:
                 view.view(torch.uint8)[0, 0, 0, 0, 0] = layer
             else:
                 assert manager.get_buffers(layer) is None
-                assert manager._primary_pool_page_index_params[layer] is None
-                with pytest.raises(ValueError, match="owns no"):
-                    manager.get_layer_page_index_scale(layer)
-                with pytest.raises(ValueError, match="owns no"):
-                    manager.get_primary_pool_page_index_params(layer)
+                assert manager.get_primary_pool_page_index_params(layer) is None
             if ml4:
                 assert manager.latent_pool_row(layer) == owners.index(source)
 

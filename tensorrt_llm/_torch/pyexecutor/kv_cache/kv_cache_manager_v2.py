@@ -5720,10 +5720,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Page-index scale of this layer's KV buffer. Layers in one pool can
         have different scales (e.g. different head_dim), so per-layer callers
         must not use the pool-level scale."""
-        local_layer_idx = self.layer_offsets[layer_idx]
-        if not self.has_buffer(local_layer_idx, Role.KEY):
-            raise ValueError(f"Layer {layer_idx} owns no KEY buffer")
-        return int(self.impl.get_page_index_scale(local_layer_idx, Role.KEY))
+        return int(self.impl.get_page_index_scale(self.layer_offsets[layer_idx], Role.KEY))
 
     def get_batch_cache_indices(
         self,

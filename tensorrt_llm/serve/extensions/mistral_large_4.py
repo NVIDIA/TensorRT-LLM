@@ -45,26 +45,13 @@ def native_tool_guided_decoding(request, tokenizer):
     return GuidedDecodingParams(grammar=grammar)
 
 
-def _known_reasoning_efforts() -> list[str]:
-    from mistral_common.protocol.instruct.request import ReasoningEffort
+def _reasoning_effort(value: Any) -> Any:
+    """The effort name of an enum member, or ``value`` itself.
 
-    return [effort.value for effort in ReasoningEffort]
-
-
-def _reasoning_effort(value: Any, field: str) -> str:
-    """``value`` as a mistral-common reasoning effort, or ValueError naming ``field``.
-
-    Whether the checkpoint accepts a known effort is checked when the chat is rendered,
-    against the efforts its tekken.json declares.
+    mistral-common checks the effort when the chat is rendered, against the
+    efforts the checkpoint's tekken.json declares.
     """
-    effort = getattr(value, "value", value)
-    known = _known_reasoning_efforts()
-    if effort not in known:
-        raise ValueError(
-            f"{field}={effort!r} is not a reasoning effort. mistral-common knows {known}; "
-            "the checkpoint's tekken.json declares which of them it accepts."
-        )
-    return effort
+    return getattr(value, "value", value)
 
 
 @register_serving_extension(
@@ -89,9 +76,9 @@ class MistralLarge4ServingExtension(ServingExtension):
         kwargs = dict(request.chat_template_kwargs or {})
         from_kwargs = kwargs.get("reasoning_effort")
         if from_kwargs is not None:
-            from_kwargs = _reasoning_effort(from_kwargs, "chat_template_kwargs['reasoning_effort']")
+            from_kwargs = _reasoning_effort(from_kwargs)
         if "reasoning_effort" in request.model_fields_set and request.reasoning_effort is not None:
-            effort = _reasoning_effort(request.reasoning_effort, "reasoning_effort")
+            effort = _reasoning_effort(request.reasoning_effort)
             if from_kwargs is not None and from_kwargs != effort:
                 raise ValueError(
                     f"reasoning_effort={effort!r} conflicts with "

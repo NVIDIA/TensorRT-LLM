@@ -742,21 +742,13 @@ def _native_mistral_response_format(response_format):
     """An OpenAI `response_format` as mistral-common's, or None if it renders nothing.
 
     `json_object` and a named `json_schema` render into the prompt's model
-    settings when the installed mistral-common has `JsonSchema`; otherwise, and
-    for other formats, the response format only constrains decoding.
+    settings; other formats only constrain decoding.
     """
     if not isinstance(response_format, dict):
         return None
-    try:
-        from mistral_common.protocol.instruct.request import (JsonSchema,
-                                                              ResponseFormat,
-                                                              ResponseFormats)
-    except ImportError:
-        logger.warning_once(
-            "The installed mistral-common cannot state a response_format in "
-            "the prompt's model settings; the chat renders without it and the "
-            "response format only constrains decoding.")
-        return None
+    from mistral_common.protocol.instruct.request import (JsonSchema,
+                                                          ResponseFormat,
+                                                          ResponseFormats)
     kind = response_format.get("type")
     if kind == "json_object":
         return ResponseFormat(type=ResponseFormats.json_object)
@@ -845,8 +837,6 @@ def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
     if set(mm_data) - {"image"}:
         raise ValueError("Mistral Large 4 currently supports image inputs only")
     images = MistralCommonImageProcessor.image_list(mm_data.get("image"))
-    if len(conversation) != len(mm_placeholder_counts):
-        raise ValueError("Missing per-message image counts")
     image_index = 0
     messages = []
     for conv, counts in zip(conversation, mm_placeholder_counts):
@@ -857,28 +847,15 @@ def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
         }
         if counts or conv.get("content_parts"):
             content = _build_openai_content(conv, counts)
-            used = 0
             for part in content:
                 if part["type"] == "text":
                     continue
-                if part["type"] != "image":
-                    raise ValueError(
-                        "Mistral Large 4 currently supports image inputs only")
-                if image_index >= len(images):
-                    raise ValueError(
-                        "Image placeholder count exceeds resolved images")
                 part["base64"] = encode_base64_image(
                     MistralCommonImageProcessor.to_pil_image(
                         images[image_index]))
                 image_index += 1
-                used += 1
-            if used != sum(counts.values()):
-                raise ValueError(
-                    "Image content positions do not match message image counts")
             message["content"] = content
         messages.append(message)
-    if image_index != len(images):
-        raise ValueError("Resolved images exceed image placeholder count")
     return messages
 
 
@@ -912,9 +889,6 @@ def apply_chat_template(
     """
 
     if model_type == "mistral_large_4":
-        if chat_template is not None:
-            raise ValueError(
-                "Mistral Large 4 uses its native Tekken chat template")
         from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
             MistralTokenizer
         if isinstance(tokenizer, TransformersTokenizer) and not isinstance(

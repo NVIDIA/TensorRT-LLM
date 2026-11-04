@@ -291,11 +291,7 @@ class LmEvalWrapper(TemplateLM):
     def _prepare_prompt(self, prompt):
         if (self._native_chat_tokens and isinstance(prompt, str)
                 and prompt.startswith(_NATIVE_CHAT_TOKENS_PREFIX)):
-            token_ids = json.loads(prompt[len(_NATIVE_CHAT_TOKENS_PREFIX):])
-            if not isinstance(token_ids, list) or not all(
-                    type(token) is int and token >= 0 for token in token_ids):
-                raise ValueError("Invalid native chat token context")
-            return token_ids
+            return json.loads(prompt[len(_NATIVE_CHAT_TOKENS_PREFIX):])
         return prompt
 
     def tok_encode(self, string: str, **kwargs) -> List[int]:

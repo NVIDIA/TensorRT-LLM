@@ -23,7 +23,6 @@ read it through the ``mistral_common`` alias instead. A complete HF checkpoint
 keeps the AutoTokenizer path, even with a ``tekken.json`` beside it.
 """
 
-import gc
 import json
 import pickle
 import shutil
@@ -130,115 +129,6 @@ def test_hf_checkpoint_directory_keeps_the_transformers_path(tokenizer_json_dir)
     ):
         assert type(tokenizer) is TransformersTokenizer
         assert tokenizer.encode("the capital of france is") == expected
-
-
-@pytest.fixture(scope="module")
-def tekken_v15_dir(tmp_path_factory):
-    from mistral_common.tokens.tokenizers.base import SpecialTokens
-
-    metadata = json.loads(_bundled_tekken_file().read_text())
-    metadata["config"]["version"] = "v15"
-    metadata["special_tokens"] = [
-        {"rank": rank, "token_str": token.value, "is_control": True}
-        for rank, token in enumerate(SpecialTokens)
-    ]
-    metadata["model_settings_builder"] = {
-        "reasoning_effort": {
-            "type": "enum",
-            "accepts_none": True,
-            "default": "none",
-            "values": ["none", "high"],
-        }
-    }
-    model_dir = tmp_path_factory.mktemp("tekken_v15")
-    (model_dir / "tekken.json").write_text(json.dumps(metadata))
-    return model_dir
-
-
-@pytest.fixture
-def unsupported_schema_dir(tekken_v15_dir, tmp_path, monkeypatch):
-    # Exercise the compatibility branch even when the installed mistral-common
-    # already understands json_schema. Other validation errors must still escape.
-    from pydantic import ValidationError
-
-    from tensorrt_llm._torch.models.checkpoints.mistral import tokenizer as module
-
-    original_init = module.TransformersMistralTokenizer.__init__
-
-    def legacy_init(self, *args, **kwargs):
-        path = Path(kwargs.get("tokenizer_path") or args[0])
-        settings = json.loads(path.read_text()).get("model_settings_builder", {})
-        extra = set(settings) - {"reasoning_effort"}
-        if extra:
-            raise ValidationError.from_exception_data(
-                "ModelSettingsBuilder",
-                [
-                    {"type": "extra_forbidden", "loc": (key,), "input": settings[key]}
-                    for key in sorted(extra)
-                ],
-            )
-        return original_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(module.TransformersMistralTokenizer, "__init__", legacy_init)
-    metadata = json.loads((tekken_v15_dir / "tekken.json").read_text())
-    metadata["model_settings_builder"]["json_schema"] = {
-        "type": "json_schema",
-        "accepts_none": False,
-        "default": None,
-    }
-    (tmp_path / "tekken.json").write_text(json.dumps(metadata))
-    return tmp_path
-
-
-@pytest.mark.parametrize("as_file", [False, True])
-def test_unsupported_schema_preserves_tokenization(unsupported_schema_dir, tekken_v15_dir, as_file):
-    source = unsupported_schema_dir / "tekken.json"
-    original = source.read_bytes()
-    reference = MistralCommonTokenizer.from_file(str(tekken_v15_dir / "tekken.json"))
-    tokenizer = MistralTokenizer.from_pretrained(str(source if as_file else unsupported_schema_dir))
-    for prompt in (PROMPT, "71432", "Grüße — 你好 👋"):
-        expected = reference.instruct_tokenizer.tokenizer.encode(prompt, bos=True, eos=False)
-        assert tokenizer.encode(prompt) == expected
-        assert tokenizer.encode(prompt, add_special_tokens=True) == expected
-        assert tokenizer.decode(expected, skip_special_tokens=True) == prompt
-    assert tokenizer.eos_token_id == reference.instruct_tokenizer.tokenizer.eos_id
-    assert (
-        tokenizer.tokenizer.model_settings_builder
-        == reference.instruct_tokenizer.tokenizer.model_settings_builder
-    )
-    assert source.read_bytes() == original
-
-
-def test_schema_fallback_pickle_reloads_original_checkpoint(unsupported_schema_dir):
-    tokenizer = load_hf_tokenizer(str(unsupported_schema_dir))
-    expected = tokenizer.encode(PROMPT)
-    serialized = pickle.dumps(tokenizer)
-    # Restore only after the original, and any temporary file it owns, is collected.
-    del tokenizer
-    gc.collect()
-    restored = pickle.loads(serialized)
-    _assert_reads_like_mistral_common(restored, expected)
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("unknown_setting", {"type": "invalid"}),
-        ("reasoning_effort", {"type": "invalid"}),
-        # The fixture's json_schema entry with accepts_none flipped: unrecognized metadata.
-        ("json_schema", {"type": "json_schema", "accepts_none": True, "default": None}),
-    ],
-    ids=["unknown_setting", "reasoning_effort", "unrecognized_json_schema"],
-)
-def test_schema_fallback_preserves_other_validation_errors(unsupported_schema_dir, field, value):
-    from pydantic import ValidationError
-
-    source = unsupported_schema_dir / "tekken.json"
-    metadata = json.loads(source.read_text())
-    metadata["model_settings_builder"][field] = value
-    source.write_text(json.dumps(metadata))
-    with pytest.raises(ValidationError):
-        MistralTokenizer.from_pretrained(str(unsupported_schema_dir))
 
 
 def test_tokenizer_json_without_a_config_reads_through_mistral_common(

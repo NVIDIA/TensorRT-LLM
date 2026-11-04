@@ -533,12 +533,12 @@ class DSACacheManagerV2(KVCacheManagerV2):
         # The base wrapper may remove empty layers while building the cache.
         return [self._indexer_k_cache_layer_mask[layer_idx] for layer_idx in self.pp_layers]
 
-    def get_primary_pool_page_index_params(self, local_layer_idx: int) -> Tuple[int, int]:
-        """Return the formal V2 page scale and layer offset for sparse MLA."""
-        params = self._primary_pool_page_index_params[local_layer_idx]
-        if params is None:
-            raise ValueError(f"Local layer {local_layer_idx} owns no latent KEY buffer")
-        return params
+    def get_primary_pool_page_index_params(self, local_layer_idx: int) -> Optional[Tuple[int, int]]:
+        """Return the formal V2 page scale and layer offset for sparse MLA.
+
+        None for a layer that owns no latent KEY buffer.
+        """
+        return self._primary_pool_page_index_params[local_layer_idx]
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {

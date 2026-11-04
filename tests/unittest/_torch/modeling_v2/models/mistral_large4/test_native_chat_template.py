@@ -14,8 +14,7 @@ mistral-common, not a Jinja template, renders the chat. The serving rules:
 - tools reach the encoder without a null `strict`, and each text part of a content
   list reaches it as its own chunk;
 - a `json_object` or named `json_schema` response format is stated in the prompt's
-  model settings when the installed mistral-common has `JsonSchema`, and otherwise
-  renders nothing;
+  model settings;
 - a named `tool_choice`, whose prefix is text, is a bad request on rendered token ids.
 
 The request-rule tests run on CPU without a checkpoint. The rendering tests need
@@ -210,11 +209,6 @@ def test_null_strict_is_dropped_from_tools():
     assert tools == original
 
 
-def test_a_chat_template_is_rejected():
-    with pytest.raises(ValueError, match="native Tekken chat template"):
-        _render(_RecordingTokenizer(), [{"role": "user", "content": "Hi."}], chat_template="{{x}}")
-
-
 @pytest.mark.parametrize("effort", ["low", "high"])
 def test_top_level_reasoning_effort_reaches_the_renderer(effort):
     request = _request(reasoning_effort=effort, chat_template_kwargs={"x": 1})
@@ -245,12 +239,11 @@ def test_reasoning_effort_in_kwargs_is_kept_and_must_agree():
         )
 
 
-def test_an_unknown_reasoning_effort_is_rejected():
-    """mistral-common's own efforts pass; whether the checkpoint declares one is the renderer's."""
-    with pytest.raises(ValueError, match="is not a reasoning effort"):
-        apply_model_chat_extensions(
-            _request(chat_template_kwargs={"reasoning_effort": "turbo"}), "mistral_large_4"
-        )
+def test_the_renderer_judges_the_reasoning_effort_name():
+    """The extension passes an effort on unchecked; mistral-common rejects it at rendering."""
+    request = _request(chat_template_kwargs={"reasoning_effort": "turbo"})
+    apply_model_chat_extensions(request, "mistral_large_4")
+    assert request.chat_template_kwargs == {"reasoning_effort": "turbo"}
 
 
 def test_a_request_chat_template_is_rejected():
@@ -284,20 +277,6 @@ def test_a_response_format_reaches_the_renderer(response_format, passed):
     apply_model_chat_extensions(request, "mistral_large_4")
     expected = request.response_format.model_dump(exclude_none=True) if passed else None
     assert (request.chat_template_kwargs or {}).get("response_format") == expected
-
-
-@pytest.mark.parametrize("response_format", [_CITY_FORMAT, {"type": "json_object"}])
-def test_a_response_format_renders_nothing_without_json_schema(monkeypatch, response_format):
-    request_module = pytest.importorskip("mistral_common.protocol.instruct.request")
-    monkeypatch.delattr(request_module, "JsonSchema", raising=False)
-    tokenizer = _RecordingTokenizer()
-    _render(
-        tokenizer,
-        [{"role": "user", "content": "Give a city as JSON."}],
-        chat_template_kwargs={"response_format": response_format},
-    )
-    ((_, kwargs),) = tokenizer.calls
-    assert "response_format" not in kwargs
 
 
 def test_a_named_tool_choice_on_token_ids_is_a_bad_request(monkeypatch):
@@ -458,11 +437,21 @@ def test_top_level_reasoning_effort_renders(tokenizer):
     assert _server_ids(tokenizer, messages=messages) == _raw_ids(tokenizer, messages)
 
 
-def test_a_reasoning_effort_the_checkpoint_does_not_declare_is_an_invalid_request(tokenizer):
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"reasoning_effort": "max"},
+        {"chat_template_kwargs": {"reasoning_effort": "minimal"}},
+        {"chat_template_kwargs": {"reasoning_effort": "turbo"}},
+    ],
+    ids=["undeclared", "undeclared_in_kwargs", "unknown_in_kwargs"],
+)
+def test_a_reasoning_effort_the_checkpoint_does_not_declare_is_an_invalid_request(
+    tokenizer, fields
+):
+    # openai_chat returns HTTP 400 for a ValueError raised while rendering.
     with pytest.raises(ValueError, match="reasoning_effort"):
-        _server_ids(
-            tokenizer, messages=[{"role": "user", "content": "Think."}], reasoning_effort="max"
-        )
+        _server_ids(tokenizer, messages=[{"role": "user", "content": "Think."}], **fields)
 
 
 def test_ignored_fields_leave_the_tokens_unchanged(tokenizer):
@@ -499,14 +488,7 @@ def _direct_ids(tokenizer, messages, **kwargs):
 
 
 def test_a_response_format_renders_in_the_model_settings(tokenizer):
-    try:
-        from mistral_common.protocol.instruct.request import (
-            JsonSchema,
-            ResponseFormat,
-            ResponseFormats,
-        )
-    except ImportError:
-        pytest.skip("the installed mistral-common has no JsonSchema")
+    from mistral_common.protocol.instruct.request import JsonSchema, ResponseFormat, ResponseFormats
 
     messages = [{"role": "user", "content": "Give a city as JSON."}]
     named = _CITY_FORMAT["json_schema"]

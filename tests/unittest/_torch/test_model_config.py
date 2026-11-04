@@ -468,7 +468,11 @@ def _mistral_large4_expected_config(**overrides) -> dict:
         "q_lora_rank": None,
         "qk_nope_head_dim": 64,
         "qk_rope_head_dim": 64,
-        "quantization_config": _mistral_large4_modelopt_quantization_config(),
+        # dsa.fp8_kv_cache is stated as the ModelOpt KV-cache algorithm.
+        "quantization_config": {
+            **_mistral_large4_modelopt_quantization_config(),
+            "kv_cache_quant_algo": "FP8",
+        },
         "return_dict": True,
         "rms_norm_eps": 1e-05,
         "rope_parameters": {
@@ -686,7 +690,11 @@ def test_mistral_large4_modelopt_mixed_precision_keeps_quantized_layers(tmp_path
     algos = [(q.quant_algo, q.group_size) for q in layers.values()]
     assert algos.count((QuantAlgo.NVFP4, 16)) == 71
     assert algos.count((QuantAlgo.FP8_BLOCK_SCALES, None)) == 404
-    assert model_config.pretrained_config.quantization_config == quantization_config
+    # The adapter adds only the KV-cache algorithm that dsa.fp8_kv_cache states.
+    assert model_config.pretrained_config.quantization_config == {
+        **quantization_config,
+        "kv_cache_quant_algo": "FP8",
+    }
 
     llm_args = TorchLlmArgs(
         model=str(tmp_path),
@@ -943,17 +951,13 @@ def test_hf_config_loads_beside_an_unrelated_params_json(tmp_path, params):
         assert config.hidden_size == 128
 
 
-@pytest.mark.parametrize("field", ["nope", "kv_sharing", "dsa", "yarn"])
+@pytest.mark.parametrize("field", ["nope", "yarn"])
 def test_mistral_large4_invalid_native_patterns(field):
     from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import adapt_config_dict
 
     params = _mistral_large4_native_params()
     if field == "nope":
         params["nope"] = "rope,unknown"
-    elif field == "kv_sharing":
-        params["kv_sharing"]["source_layers_str"] = "0,1"
-    elif field == "dsa":
-        params["dsa"]["sharing"] = "full,shared"
     else:
         params["yarn"]["apply_scale"] = True
     with pytest.raises(ValueError):

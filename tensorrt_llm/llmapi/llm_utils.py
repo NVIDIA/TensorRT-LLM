@@ -194,17 +194,6 @@ class ModelLoader:
                 logger.info(
                     f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
                 )
-            # Mistral-Large-4 states its FP8 latent cache as `fp8_kv_cache`;
-            # read it as the checkpoint's kv_cache_quant_algo, which only an
-            # explicit kv_cache_config.dtype overrides.
-            if (self.llm_args.checkpoint_format == "mistral_large_4"
-                    and hf_config.get("fp8_kv_cache")
-                    and explicit_kv_cache_quant_algo is None
-                    and self.llm_args.quant_config.kv_cache_quant_algo is None):
-                logger.info(
-                    f"Setting kv_cache_quant_algo={QuantAlgo.FP8} from fp8_kv_cache in {hf_config_path}."
-                )
-                self.llm_args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         if self.llm_args.model_kwargs is not None and "quantization_config" in self.llm_args.model_kwargs:
             logger.info(
                 f"Update hf_quant_config from model_kwargs: quantization_config={self.llm_args.model_kwargs['quantization_config']} (previous value: {hf_quant_config})"
