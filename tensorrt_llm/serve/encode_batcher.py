@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dynamic batcher for encoder-only (embedding) serving.
+"""Dynamic batcher for encode-only embedding and rerank serving.
 
 Coalesces independent concurrent requests into a single batched `encode_fn` call,
 mirroring NVIDIA Triton Inference Server's dynamic batcher: a configurable hold
@@ -121,7 +121,7 @@ class EncodeBatcher:
         try:
             self._queue.put_nowait(request)
         except asyncio.QueueFull:
-            raise QueueFullError("Embedding request queue is full; retry later.")
+            raise QueueFullError("Request queue is full; retry later.")
         return await future
 
     async def _run(self) -> None:

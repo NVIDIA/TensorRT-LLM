@@ -296,7 +296,13 @@ def test_configured_worker_role_takes_precedence(role: ServerRole) -> None:
 
 
 @pytest.mark.parametrize(
-    "role", [ServerRole.MM_ENCODER, ServerRole.VISUAL_GEN, ServerRole.EMBEDDING]
+    "role",
+    [
+        ServerRole.MM_ENCODER,
+        ServerRole.VISUAL_GEN,
+        ServerRole.EMBEDDING,
+        ServerRole.RERANK,
+    ],
 )
 def test_explicit_non_worker_role_does_not_infer_affinity(role: ServerRole) -> None:
     request = _make_affinity_request(ServerRole.CONTEXT)
