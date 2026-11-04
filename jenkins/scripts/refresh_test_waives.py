@@ -38,7 +38,7 @@ from pathlib import Path
 
 import open_search_db
 from open_search_db import WAIVE_PROJECT_NAME, OpenSearchDB
-from test_rerun import parse_name
+from test_rerun import parse_name, update_junit_counts
 
 EXIT_ALL_WAIVED = 0
 EXIT_FAILURES_RETAINED = 1
@@ -74,10 +74,12 @@ def _parse_rules(content: str) -> list[WaiveRule]:
     """Parse baseline markers, allowing omitted reasons except for numeric TIMEOUT values."""
     rules = []
     for line in content.splitlines():
-        line = line.partition("#")[0].strip()
-        if not line:
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        match = re.fullmatch(r"(.+?)\s+(SKIP|XFAIL|UNSTABLE|TIMEOUT)(?:\s*\((.+)\))?", line)
+        match = re.fullmatch(
+            r"(.+?)\s+(SKIP|XFAIL|UNSTABLE|TIMEOUT)(?:\s*\((.+?)\))?\s*(?:#.*)?", line
+        )
         if not match:
             raise ValueError(f"Unsupported waive rule: {line}")
         nodeid, marker, reason = match.groups()
@@ -106,7 +108,7 @@ def _scoped_test_name(nodeid: str, stage_name: str, sm_version: int | None) -> s
         sm_match = re.match(r"sm(\d+)/", name)
         if sm_match:
             sm = int(sm_match.group(1))
-            if sm_version is None or sm != sm_version:
+            if not sm_version or sm != sm_version:
                 return None
             name = name.replace(f"sm{sm}", stage_name)
         else:
@@ -162,24 +164,6 @@ def _failed_cases(root: ET.Element) -> list[ET.Element]:
         for case in root.iter("testcase")
         if case.find("failure") is not None or case.find("error") is not None
     ]
-
-
-def _update_counts(root: ET.Element) -> None:
-    """Recount suites the same way as test_rerun.merge_junit_xmls (one outcome per case)."""
-    for node in reversed(list(root.iter())):
-        if node.tag not in {"testsuites", "testsuite"}:
-            continue
-        counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
-        for case in node.iter("testcase"):
-            counts["tests"] += 1
-            if case.find("failure") is not None:
-                counts["failures"] += 1
-            elif case.find("error") is not None:
-                counts["errors"] += 1
-            elif case.find("skipped") is not None:
-                counts["skipped"] += 1
-        for attribute, value in counts.items():
-            node.set(attribute, str(value))
 
 
 def _latest_states(records: list[dict]) -> list[dict]:
@@ -347,6 +331,24 @@ def _apply_waive(
     }
 
 
+def _jenkins_summary(report: dict) -> dict:
+    """Prepare the summary and individual messages shown as Jenkins steps."""
+    waived, retained = report["waived"], report["remaining_failures"]
+    verdict = "all failures waived" if report["all_failures_waived"] else "failure retained"
+    return {
+        "summary": (
+            f"{len({entry['test'] for entry in waived})} skipped, "
+            f"{len({entry['test'] for entry in retained})} retained"
+        ),
+        "messages": [
+            f"TOT waive result: {verdict}. Full report: "
+            f"{report['stage_name']}/waive_refresh/report.json in the test-results artifact.",
+            *(f"SKIPPED by new TOT waive: {e['test']}; {e['reason']}" for e in waived),
+            *(f"FAILURE RETAINED: {e['test']}; {e['reason']}" for e in retained),
+        ],
+    }
+
+
 def reclassify_failures(
     result_dir: Path,
     latest_waives: list[WaiveRule],
@@ -356,6 +358,8 @@ def reclassify_failures(
     sm_version: int | None = None,
     expected_tests: Iterable[str] | None = None,
     isolated_tests: Iterable[str] | None = None,
+    *,
+    trees: dict[Path, ET.ElementTree] | None = None,
 ) -> dict:
     """Replace newly waived failures with audited skips; retain all other errors.
 
@@ -377,6 +381,7 @@ def reclassify_failures(
         isolated_tests: Isolated test names. "isolated_failures_waived" is true
             only when an isolated test was waived and no retained failure belongs
             to an isolated test or cannot be attributed to a test.
+        trees: Already parsed result reports, reused by the CLI.
 
     Returns:
         The decision report, also written to waive_refresh/report.json.
@@ -392,7 +397,8 @@ def reclassify_failures(
         for name, rule in latest_rules.items()
         if name not in initial_rules and rule.recorded_ms > snapshot_ms
     }
-    trees = {path: ET.parse(path) for path in sorted(result_dir.glob("results*.xml"))}
+    if trees is None:
+        trees = {path: ET.parse(path) for path in sorted(result_dir.glob("results*.xml"))}
 
     recorded = set()
     timeouts = set()
@@ -455,7 +461,7 @@ def reclassify_failures(
                 {"test": name or case.get("name", ""), "file": path.name, "reason": reason}
             )
     report["remaining_failures"].extend(
-        {"test": name, "file": "", "reason": "not executed: no result in any report"}
+        {"test": name, "file": "", "reason": "no matching test result in any report"}
         for name in missing
     )
 
@@ -466,19 +472,50 @@ def reclassify_failures(
         and not any(entry["test"] in isolated for entry in report["remaining_failures"])
     )
     report["has_unfinished_failures"] = any(
-        entry["file"] in {_TIMEOUT_REPORT, ""} for entry in report["remaining_failures"]
+        entry["file"] == _TIMEOUT_REPORT for entry in report["remaining_failures"]
     )
 
     audit_dir.mkdir(parents=True, exist_ok=True)
     for path in changed_paths:
         shutil.copyfile(path, audit_dir / (path.name + ".original"))
-        _update_counts(trees[path].getroot())
+        update_junit_counts(trees[path].getroot())
         temporary = path.with_suffix(".xml.tmp")
         trees[path].write(temporary, encoding="utf-8", xml_declaration=True)
         temporary.replace(path)
     report["all_failures_waived"] = bool(report["waived"]) and not report["remaining_failures"]
+    report["jenkins"] = _jenkins_summary(report)
     (audit_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
+
+
+def _jenkins_arguments() -> argparse.Namespace:
+    """Read Jenkins context and shard-list options without depending on Groovy parsing."""
+    stage_name = os.environ["WAIVE_REFRESH_STAGE"]
+    result_dir = Path(os.environ["WORKSPACE"]) / stage_name
+    options = json.loads(os.environ["WAIVE_REFRESH_OPTIONS"])
+    branch = os.environ.get("gitlabTargetBranch")
+    if not branch:
+        branch = json.loads(os.environ.get("globalVars") or "{}").get("target_branch")
+    lists = options.get("expectedTestLists")
+    if lists is None:
+        lists = [
+            options[kind] for kind in ("regular", "isolate") if options.get(kind + "Count", 0) > 0
+        ]
+    sm_version = options.get("smVersion")
+    if sm_file := options.get("smVersionFile"):
+        capability = Path(sm_file).read_text().strip()
+        sm_version = (
+            int(capability.replace(".", "")) if re.fullmatch(r"\d+\.\d+", capability) else 0
+        )
+    return argparse.Namespace(
+        result_dir=result_dir,
+        stage_name=stage_name,
+        target_branch=branch,
+        initial_waives=result_dir / "waive_refresh" / "initial_tot_waives.txt",
+        sm_version=int(sm_version) if sm_version is not None else None,
+        expected_tests=os.pathsep.join(lists),
+        isolated_tests=options.get("isolatedTestList") or options.get("isolate", ""),
+    )
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -491,13 +528,16 @@ def run(argv: list[str] | None = None) -> int:
         EXIT_ALL_WAIVED or EXIT_FAILURES_RETAINED. Errors are raised.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--result-dir", type=Path, required=True)
-    parser.add_argument("--stage-name", required=True)
-    parser.add_argument("--target-branch", required=True)
     parser.add_argument(
-        "--initial-waives", type=Path, required=True, help="initial TOT waive-list snapshot"
+        "--jenkins", action="store_true", help="read context from Jenkins environment"
     )
-    parser.add_argument("--sm-version", type=int)
+    parser.add_argument("--result-dir", type=Path)
+    parser.add_argument("--stage-name")
+    parser.add_argument("--target-branch")
+    parser.add_argument("--initial-waives", type=Path, help="initial TOT waive-list snapshot")
+    parser.add_argument(
+        "--sm-version", type=int, help="GPU SM; 0 means unknown, omitted detects the local GPU"
+    )
     parser.add_argument(
         "--expected-tests",
         default="",
@@ -509,10 +549,15 @@ def run(argv: list[str] | None = None) -> int:
         help="isolated test list used to attribute failures to the isolated stage",
     )
     args = parser.parse_args(argv)
+    if args.jenkins:
+        args = _jenkins_arguments()
+    if not (args.result_dir and args.stage_name and args.target_branch and args.initial_waives):
+        parser.error("result directory, stage name, target branch and initial waives are required")
+    trees = {path: ET.parse(path) for path in sorted(args.result_dir.glob("results*.xml"))}
     names = set()
-    for path in args.result_dir.glob("results*.xml"):
+    for path, tree in trees.items():
         if path.name != "results-stage.xml":
-            cases = _failed_cases(ET.parse(path).getroot())
+            cases = _failed_cases(tree.getroot())
             names.update(filter(None, (_test_name(case, args.stage_name) for case in cases)))
     if not names:
         print("[TOT-WAIVE] No named test failures to check.")
@@ -533,6 +578,7 @@ def run(argv: list[str] | None = None) -> int:
         args.sm_version if args.sm_version is not None else _detect_sm_version(),
         expected_tests,
         _read_test_lists(args.isolated_tests),
+        trees=trees,
     )
     (args.result_dir / "waive_refresh" / "opendb_snapshot.json").write_text(
         json.dumps(snapshot, indent=2) + "\n"
@@ -545,7 +591,7 @@ def run(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the refresh and map expected failures to EXIT_UNAVAILABLE.
+    """Run the refresh and map execution errors to EXIT_UNAVAILABLE.
 
     Args:
         argv: Command-line arguments; defaults to sys.argv[1:].
@@ -555,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     try:
         return run(argv)
-    except (OSError, ValueError, RuntimeError, LookupError, TypeError, ET.ParseError) as error:
+    except Exception as error:
         traceback.print_exc()
         print(
             f"[TOT-WAIVE] Refresh unavailable, keeping the original failure: "
