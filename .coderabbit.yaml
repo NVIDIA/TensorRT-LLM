@@ -90,6 +90,14 @@ reviews:
     - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"
 
   path_instructions:
+    - path: "**"
+      instructions: |
+        Do not report minor maintainability or code-quality issues, including
+        findings labeled "Maintainability & Code Quality | Minor". Omit these
+        from inline comments and summaries. Continue reporting actionable
+        correctness, reliability, security, performance, and test-coverage
+        issues at their warranted severity.
+
     # Production-code coverage review. This is required because tests/** rules
     # do not run when a PR changes source code without changing a test file.
     - path: "tensorrt_llm/**"
@@ -195,6 +203,16 @@ reviews:
 
         Test coverage principles:
         - Prefer behavior and contract coverage over raw line coverage.
+        - Verify that tests execute the behavior they claim to cover. Flag
+          mocks, stubs, or fake objects (including SimpleNamespace) only when
+          they bypass that behavior. Respect focused unit tests that isolate
+          external dependencies, and check for complementary coverage before
+          requesting broader execution.
+        - Flag assertions that would pass despite a plausible regression, or
+          trivial inputs that leave materially different logic or boundaries
+          uncovered. Recommend non-trivial inputs or parameterization when
+          they exercise distinct behavior; do not require every unit test to
+          execute the full production stack.
         - Check normal behavior, meaningful boundaries, invalid inputs, error
           paths, recovery paths, and regression scenarios when relevant.
         - Prefer assertions on observable results and side effects over only
@@ -205,6 +223,22 @@ reviews:
           identifiable from the PR context.
 
         TensorRT-LLM-specific test checks:
+        - For new or renamed tests under tests/unittest/ or
+          tests/integration/defs/, determine their intended execution scope:
+          CI, QA, or local development. Follow tests/AGENTS.md: not every test
+          requires CI registration. If intent is unclear, ask rather than
+          assuming an unlisted test is a defect.
+        - For tests intended to run in CI or QA, verify coverage by the
+          appropriate test-list selectors, accounting for parent file/directory
+          selectors and exact parameter IDs when a specific variant is listed.
+          Check for stale selectors and duplicate entries within the relevant
+          list. Allow intentional overlap across CI, QA, and hardware lists;
+          do not require a separate list entry for every test function.
+        - Check pytest markers against the intended execution stage and
+          repository collection conventions. For CPU-stage tests, verify that
+          imports and fixtures can run without a GPU and that cpu_only markers
+          are applied at the appropriate scope. Do not require cpu_only solely
+          because a test body does not use a GPU.
         - Require explicit, precise capability gating for CUDA version, GPU
           architecture, GPU count, memory requirements, NCCL/distributed
           availability, external model availability, and optional dependencies.

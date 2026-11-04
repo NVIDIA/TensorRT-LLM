@@ -5,10 +5,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, CUDAGraphRunnerConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.mapping import Mapping
 
 
@@ -245,25 +246,22 @@ def create_mock_cuda_graph_runner(
         max_num_tokens: int = 1,
         static_input_ids: Optional[torch.Tensor] = None,
         static_position_ids: Optional[torch.Tensor] = None):
-    config = CUDAGraphRunnerConfig(
-        use_cuda_graph=True,
-        cuda_graph_padding_enabled=False,
-        cuda_graph_batch_sizes=[batch_size],
-        max_cuda_graph_batch_size=batch_size,
-        batch_size=batch_size,
-        max_beam_width=1,
-        max_num_tokens=max_num_tokens,
-        use_mrope=use_mrope,
-        spec_config=None,
-        cuda_graph_mem_pool=None,
-        enable_attention_dp=False,
-        original_max_total_draft_tokens=0,
-        is_encoder_decoder=False,
-        mapping=Mapping(),
-        dist=None,
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
-        static_input_ids=static_input_ids,
-        static_position_ids=static_position_ids)
+    config = CUDAGraphRunnerConfig(use_cuda_graph=True,
+                                   cuda_graph_padding_enabled=False,
+                                   cuda_graph_batch_sizes=[batch_size],
+                                   max_cuda_graph_batch_size=batch_size,
+                                   batch_size=batch_size,
+                                   max_beam_width=1,
+                                   max_num_tokens=max_num_tokens,
+                                   use_mrope=use_mrope,
+                                   spec_config=None,
+                                   enable_attention_dp=False,
+                                   original_max_total_draft_tokens=0,
+                                   is_encoder_decoder=False,
+                                   mapping=Mapping(),
+                                   dist=None,
+                                   static_input_ids=static_input_ids,
+                                   static_position_ids=static_position_ids)
     return CUDAGraphRunner(config)
 
 
@@ -284,3 +282,67 @@ def make_hf_hybrid_cache_for_tests(
     from transformers.cache_utils import StaticCache
 
     return StaticCache(config=config, max_cache_len=max_cache_len)
+
+
+def dspark_markov_chain_logits_reference(base_logits: torch.Tensor,
+                                         first_prev_tokens: torch.Tensor,
+                                         markov_w1: torch.Tensor,
+                                         markov_w2: torch.Tensor,
+                                         argmax_fn=None) -> torch.Tensor:
+    """Eager DSpark vanilla-Markov chain on raw tensors; the biased logits only.
+
+    The reference for the fused chain (``vocab_parallel.markov_chain_logits``).
+    ``markov_w2`` may be sliced to one TP rank's vocab shard; ``argmax_fn``
+    then maps a shard-local row to its full-vocab token id.
+    """
+    from tensorrt_llm._torch.models.modeling_speculative import (
+        dspark_markov_chain, dspark_markov_step_bias)
+
+    def _step_bias(prev_tokens, step_hidden):
+        del step_hidden
+        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
+
+    _, corrected = dspark_markov_chain(base_logits,
+                                       first_prev_tokens,
+                                       _step_bias,
+                                       next_token_fn=argmax_fn,
+                                       cast_bias_to_logits=True)
+    return corrected
+
+
+@triton.jit
+def _gumbel_scores_kernel(logits_ptr, temp_ptr, seed_ptr, out_ptr, vocab,
+                          BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    ok = cols < vocab
+    x = tl.load(logits_ptr + row * vocab + cols, mask=ok,
+                other=0.0).to(tl.float32)
+    u = tl.rand(tl.load(seed_ptr), row * vocab + cols)
+    u = tl.minimum(tl.maximum(u, 1e-12), 0.99999994)
+    x = x / tl.load(temp_ptr + row) - tl.log(-tl.log(u))
+    tl.store(out_ptr + row * vocab + cols, x, mask=ok)
+
+
+def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
+                         seed: torch.Tensor,
+                         greedy_threshold: float) -> torch.Tensor:
+    """Temperature samples (int32 [rows]) of ``logits`` [rows, vocab] by
+    Gumbel-max with the noise ``TPKeyExchange.argmax_logits`` draws:
+    ``tl.rand(seed, row * vocab + token)`` for ``seed`` (int64 [1]). Rows below
+    ``greedy_threshold`` take the argmax."""
+    rows, vocab = logits.shape
+    scores = torch.empty((rows, vocab),
+                         dtype=torch.float32,
+                         device=logits.device)
+    block = 1024
+    grid = (rows, triton.cdiv(vocab, block))
+    _gumbel_scores_kernel[grid](logits.contiguous(),
+                                temperatures,
+                                seed,
+                                scores,
+                                vocab,
+                                BLOCK=block)
+    sampled = temperatures >= greedy_threshold
+    return torch.where(sampled, scores.argmax(-1),
+                       logits.float().argmax(-1)).to(torch.int32)

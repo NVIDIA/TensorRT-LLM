@@ -68,14 +68,14 @@ def resolve_deepseek_group_config(model_config: MoeModelConfig) -> tuple[int, in
 
 
 def ensure_cute_dsl_importable_for_benchmark() -> None:
-    """Install a local sentinel module when optional CUTEDSL imports are absent.
+    """Install a local sentinel package when optional CUTEDSL imports are absent.
 
-    Production MoE modules import ``fused_moe_cute_dsl`` at module load time.
+    Production MoE modules import the ``cutedsl`` package at module load time.
     ``bench_moe`` can still benchmark non-CUTEDSL backends in environments that
     do not package CUTLASS DSL; keep that fallback local to the benchmark rather
-    than weakening the production module.
+    than weakening the production package.
     """
-    module_name = "tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl"
+    module_name = "tensorrt_llm._torch.moe.fused_moe.cutedsl"
     if module_name in sys.modules:
         return
     try:
@@ -84,7 +84,7 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
     except ImportError as exc:
         import_error = exc
 
-    class CuteDslFusedMoE:
+    class CuteDslFusedMoEBase:
         @classmethod
         def can_implement(cls, p, d):
             from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
@@ -99,8 +99,23 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError(f"CUTLASS DSL is unavailable: {import_error}")
 
+    def find_cutedsl_grouped_gemm_leaf(quant_algo: object) -> type:
+        del quant_algo
+        return CuteDslFusedMoEBase
+
     module = types.ModuleType(module_name)
-    module.CuteDslFusedMoE = CuteDslFusedMoE
+    module.CuteDslFusedMoEBase = CuteDslFusedMoEBase
+    # Stubs for the leaves the MoE package imports by name; they inherit the
+    # root stub's DEP_MISSING verdict.
+    for leaf_name in (
+        "TrtllmCutedslGroupedGemmNvfp4Impl",
+        "TrtllmCutedslGroupedGemmBf16Impl",
+        "TrtllmCutedslFusedFc12Nvfp4Impl",
+        "TrtllmCutedslDenseGemmNvfp4Impl",
+    ):
+        setattr(module, leaf_name, type(leaf_name, (CuteDslFusedMoEBase,), {}))
+    module.find_cutedsl_grouped_gemm_leaf = find_cutedsl_grouped_gemm_leaf
+    module.cutedsl_grouped_gemm_leaf = find_cutedsl_grouped_gemm_leaf
     sys.modules[module_name] = module
 
 
@@ -109,8 +124,8 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
 
     For a caller enumerating combinations to decide which are worth running,
     "no leaf publishes this format" is an answer and not a failure. Only the
-    TRTLLM and CUTLASS branches can give it, so the rest is delegated rather
-    than restated.
+    TRTLLM, CUTLASS and CUTEDSL branches can give it, so the rest is delegated
+    rather than restated.
 
     Names one class. A caller deciding whether a configuration is *runnable*
     wants :func:`find_backend_classes` instead, because for ``TRTLLM`` that
@@ -124,6 +139,10 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
         from tensorrt_llm._torch.moe.fused_moe.cutlass import find_cutlass_leaf
 
         return find_cutlass_leaf(quant_algo)
+    if backend_type == MoeBackendType.CUTEDSL:
+        from tensorrt_llm._torch.moe.fused_moe.cutedsl import find_cutedsl_grouped_gemm_leaf
+
+        return find_cutedsl_grouped_gemm_leaf(quant_algo)
     return get_backend_class(backend_type, quant_algo)
 
 
@@ -154,10 +173,10 @@ def find_backend_classes(backend_type: MoeBackendType, quant_algo=None) -> tuple
 def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
     """Import and return the concrete backend class for ``backend_type`` lazily.
 
-    ``quant_algo`` is only consulted for ``TRTLLM`` and ``CUTLASS``, whose
-    leaves are keyed by quantization format; every other backend is one class.
-    Raises when no leaf publishes the format -- see :func:`find_backend_class`
-    for the lookup that reports absence instead.
+    ``quant_algo`` is only consulted for ``TRTLLM``, ``CUTLASS`` and
+    ``CUTEDSL``, whose leaves are keyed by quantization format; every other
+    backend is one class. Raises when no leaf publishes the format -- see
+    :func:`find_backend_class` for the lookup that reports absence instead.
     """
     if backend_type == MoeBackendType.CUTLASS:
         from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaf
@@ -172,9 +191,9 @@ def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
 
         return trtllm_gen_leaf(quant_algo)
     if backend_type == MoeBackendType.CUTEDSL:
-        from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+        from tensorrt_llm._torch.moe.fused_moe.cutedsl import cutedsl_grouped_gemm_leaf
 
-        return CuteDslFusedMoE
+        return cutedsl_grouped_gemm_leaf(quant_algo)
     if backend_type == MoeBackendType.DEEPGEMM:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 

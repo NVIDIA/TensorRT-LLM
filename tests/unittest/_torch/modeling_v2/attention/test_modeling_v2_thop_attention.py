@@ -206,8 +206,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     MLA_CONTEXT,
+    MLA_GENERATION,
+    QM_FP8_KV_CACHE,
+    QM_NVFP4_KV_CACHE,
+    QWEN4_DENSE,
+    QWEN4_VISION,
     STANDARD,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
@@ -221,6 +227,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import (  # noqa: E402,F401 — needs the path declared above
     ULP,
     assert_within_ulp,
@@ -624,7 +631,7 @@ class _PagedAttnEnv:
             v=None,
             output=output,
             output_sf=None,
-            workspace_=self.workspace,
+            workspace=self.workspace,
             sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
             host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
             host_total_kv_lens=torch.tensor([total_ctx_kv, total_gen_kv], dtype=torch.int32),
@@ -692,7 +699,7 @@ class _PagedAttnEnv:
             use_spec_decoding=False,
             is_spec_dec_tree=False,
             spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
+            spec_decoding_position_offsets=None,
             spec_decoding_packed_mask=None,
             spec_decoding_bl_tree_mask_offset=None,
             spec_decoding_bl_tree_mask=None,
@@ -1111,7 +1118,7 @@ class _MultiLayerPagedAttnEnv:
                 v=None,
                 output=output,
                 output_sf=None,
-                workspace_=self.workspace,
+                workspace=self.workspace,
                 sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
                 host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
                 host_total_kv_lens=torch.tensor(
@@ -1182,7 +1189,7 @@ class _MultiLayerPagedAttnEnv:
                 use_spec_decoding=False,
                 is_spec_dec_tree=False,
                 spec_decoding_generation_lengths=None,
-                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
                 spec_decoding_bl_tree_mask_offset=None,
                 spec_decoding_bl_tree_mask=None,
@@ -2539,8 +2546,10 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        the decoy changes the output, while the page holding only this call's
        own new tokens is invisible (the append lands wherever the offsets
        point and is read straight back from there).
-    3. use_paged_context_fmha=False on a context call with a cached prefix is
-       silently wrong — no exception, an answer far off the reference.
+    3. The packed path sees only the new tokens, so omitting the cached
+       prefix gives an answer far off the reference. Its KV lengths must
+       match the supplied packed rows; including the prefix would read
+       beyond the QKV buffer.
     4. context_lengths on a context row must be this call's new-token count;
        0 is far off. A larger value is not probed: the context FMHA then
        writes past the output buffer, which holds this call's new tokens
@@ -2614,7 +2623,7 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
     env.check_cache(0)
     env.check_unwritten_pool_zero()
 
-    # (3) the flag itself, and (4) the context length
+    # (3) packed attention without the prefix, and (4) the context length
     penv, pq = prepared()
     assert _bitwise_equal(pq, qkv), "the prepared state is not reproducible"
     _assert_far_outside(
@@ -2625,11 +2634,12 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
             [0],
             MASK_CAUSAL,
             record=False,
+            seq_lens_override=[new],
             ctx_lens_override=[new],
             use_paged_context_fmha=False,
         ),
         base,
-        "cached-prefix context at use_paged_context_fmha=False",
+        "packed context without the cached prefix",
     )
     cenv, cq = prepared()
     _assert_far_outside(
@@ -2869,6 +2879,7 @@ MLA_TOKENS_PER_BLOCK = 64
 MLA_PAGE32 = 32
 MLA_MAX_SEQ_LEN = 1024
 POSITION_EMBEDDING_TYPE_YARN = 8  # PositionEmbeddingType.yarn (MLA models)
+POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX = 2  # PositionEmbeddingType.rope_gpt_neox (Kimi K3's MLA)
 # q-LoRA rank. DeepSeek-V3 down-projects q through a rank-1536 q_a_proj;
 # checkpoints with "q_lora_rank": null (deepseek-v3-lite) have no q-LoRA at
 # all and pass 0. Both are covered — see the inertness cases at the end.
@@ -3044,9 +3055,11 @@ class _MlaPagedEnv:
         pool_dtype: torch.dtype = torch.bfloat16,
         quant_mode: int = 0,
         kv_scaling_factor: Optional[float] = None,
+        position_embedding_type: int = POSITION_EMBEDDING_TYPE_YARN,
     ) -> None:
         self.num_heads = num_heads
         self.max_batch = max_batch
+        self.position_embedding_type = position_embedding_type
         self.tokens_per_block = tokens_per_block
         self.q_lora_rank = q_lora_rank
         self.max_seq_len = max_blocks_per_seq * tokens_per_block
@@ -3237,7 +3250,7 @@ class _MlaPagedEnv:
                 v=v,
                 output=output,
                 output_sf=None,
-                workspace_=self.workspace,
+                workspace=self.workspace,
                 sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
                 host_past_key_value_lengths=torch.tensor(
                     kv_lens if host_past_lens is None else host_past_lens,
@@ -3280,7 +3293,7 @@ class _MlaPagedEnv:
                 mask_type=mask_type,
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
-                position_embedding_type=POSITION_EMBEDDING_TYPE_YARN,
+                position_embedding_type=self.position_embedding_type,
                 rope_dim=QK_ROPE_HEAD_DIM,
                 rope_base=self.rope_scalars.rope_base,
                 rope_scale_type=self.rope_scalars.rope_scale_type,
@@ -3309,7 +3322,7 @@ class _MlaPagedEnv:
                 use_spec_decoding=False,
                 is_spec_dec_tree=False,
                 spec_decoding_generation_lengths=None,
-                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
                 spec_decoding_bl_tree_mask_offset=None,
                 spec_decoding_bl_tree_mask=None,
@@ -3884,6 +3897,123 @@ YARN_TABLE_MIN_SEPARATION = 10.0
 # token. The checkpoint's per-layer k_scale/v_scale are both 1.0, so s = 1.0
 # is the production scale; 1.5 and 2.0 are swept beside it because the
 # scale tensors are the caller's only defence (None is read as 1.0).
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_mla_context_bf16_page64() -> None:
+    """Kimi K3's MLA context calls (the generic path's prefill): bf16 latent
+    pool (quant_mode 0), page 64, the per-rank head counts 6 / 12 / 24 / 96
+    (TP16 / TP8 / TP4 / one rank), q_lora_rank 1536, q_scaling 1.0,
+    position_embedding_type 2 (rope_gpt_neox, what its MLA passes) and its
+    NoPE rope table -- every (cos, sin) pair (1, 0), written over the
+    backend's table -- so the in-kernel "rotation" is a copy.
+
+    1. Fresh prefill (latent_cache given): the output within the bf16 band of
+       the fp32 causal reference, the appended rows [compressed_kv | k_pe]
+       bit for bit, and no page outside the requests' written.
+    2. Cached-KV context (latent_cache=None): explicit K / V over cached
+       prefixes, bottom-right causal, within the same band; nothing mutated.
+    """
+    for heads in (6, 12, 24, 96):
+        torch.manual_seed(500 + heads)
+        env = _MlaPagedEnv(
+            num_heads=heads,
+            tokens_per_block=MLA_TOKENS_PER_BLOCK,
+            q_lora_rank=Q_LORA_RANK_DSV3,
+            q_scaling=1.0,
+            position_embedding_type=POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX,
+        )
+        table = env.rotary_cos_sin.reshape(-1)
+        table[0::2] = 1.0
+        table[1::2] = 0.0
+
+        lens = [65, 130]  # one token into page 2, and two full pages plus two tokens
+        for rid, ln in enumerate(lens):
+            env.add_request(rid, ln)
+        q, k, v, latent = _random_context_inputs(sum(lens), heads)
+        pre = (q.clone(), k.clone(), v, latent.clone())
+        out = env.call_context([0, 1], lens, q, k, v, latent)
+        torch.testing.assert_close(out, env.context_reference(lens, *pre), rtol=RTOL, atol=ATOL)
+        for rid in (0, 1):
+            env.check_cache(rid)
+            rows = torch.cat(env.latent_rows[rid])
+            pooled = torch.cat([env.pool[p] for p in env.pages[rid]])[: rows.shape[0]]
+            assert torch.equal(pooled, rows), (
+                f"identity-rope rows not bitwise (H={heads}, request {rid})"
+            )
+        env.check_unwritten_pool_zero([0, 1])
+
+        cached_lens, new_lens = [64, 129], [7, 64]
+        kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
+        for rid, (n, total) in zip((2, 3), zip(new_lens, kv_lens)):
+            env.add_request(rid, n)
+            env.reserve_cache_pages(rid, total)
+        q2 = torch.randn(sum(new_lens), heads * QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        k2, packed_kv = _random_explicit_kv(sum(kv_lens), heads)
+        v2 = _v_split_view(packed_kv, heads)
+        operands = (q2.clone(), k2.clone(), v2.clone())
+        pool_before = env.pool.clone()
+        out2 = env.call_context_no_append([2, 3], new_lens, kv_lens, q2, k2, v2)
+        ref2, _ = _explicit_kv_reference(
+            q2, k2, v2, new_lens, kv_lens, MASK_CAUSAL, heads, softmax_scale=env.softmax_scale
+        )
+        torch.testing.assert_close(out2, ref2, rtol=RTOL, atol=ATOL)
+        for got, want in zip((q2, k2, v2), operands):
+            assert torch.equal(got, want)
+        assert torch.equal(env.pool, pool_before), "the no-append context call touched the pool"
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_mla_generation_bf16_page64() -> None:
+    """Kimi K3's MLA generation calls (the generic path's decode steps above
+    the fused decode kernels' bounds): latent MQA over the bf16 pool, page 64,
+    6 heads per rank (TP16 attention) and 96 (one rank), one query row per
+    request (no speculation) and 8 (DSpark's token plus 7 drafts, bottom-right
+    causal), two steps each over histories of one exact page and of 31
+    tokens. Within the bf16 band of the fp32 latent-MQA reference; the pool is
+    only read. (At 24 heads per rank, TP4, the trtllm-gen FMHA kernel
+    selection raises for these calls; the contract records it.)
+    """
+    for heads in (6, 96):
+        for p in (1, 8):
+            torch.manual_seed(700 + heads + p)
+            env = _MlaPagedEnv(
+                num_heads=heads,
+                tokens_per_block=MLA_TOKENS_PER_BLOCK,
+                q_lora_rank=Q_LORA_RANK_DSV3,
+                q_scaling=1.0,
+                position_embedding_type=POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX,
+            )
+            table = env.rotary_cos_sin.reshape(-1)
+            table[0::2] = 1.0
+            table[1::2] = 0.0
+            lens = [64, 31]
+            for rid, ln in enumerate(lens):
+                env.add_request(rid, ln)
+            q, k, v, latent = _random_context_inputs(sum(lens), heads)
+            env.call_context([0, 1], lens, q, k, v, latent)
+            for _ in range(2):
+                for rid in (0, 1):
+                    for _ in range(p):
+                        env.append_decode_latent(
+                            rid,
+                            torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
+                        )
+                pool_before = env.pool.clone()
+                fused_q = (
+                    torch.randn(2 * p, heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda")
+                    * 0.3
+                )
+                out = env.call_generation([0, 1], fused_q, predicted_tokens_per_seq=p)
+                ref = env.generation_reference([0, 1], fused_q, predicted_tokens_per_seq=p)
+                torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+                assert _bitwise_equal(pool_before, env.pool), (
+                    f"the MLA generation call wrote to the pool (H={heads}, P={p})"
+                )
 
 
 def _fp8_mla_env(
@@ -5501,8 +5631,7 @@ def test_fp8_mla_mtp_decode_sees_a_torn_pool_h128() -> None:
 
 
 def test_mla_rejects_null_q_lora_rank() -> None:
-    """q_lora_rank must be an int on the MLA path: the C++ unwraps the
-    optional unconditionally, so None raises rather than defaulting."""
+    """The catalog requires an explicit int rank for MLA, including zero for no q-LoRA."""
     torch.manual_seed(309)
     h = MLA_NUM_HEADS_H32
     q, k, v, latent = _random_context_inputs(32, h)
@@ -5515,8 +5644,8 @@ def test_mla_rejects_null_q_lora_rank() -> None:
     env.add_request(0, 32)
     try:
         env.call_context([0], [32], q, k, v, latent)
-    except RuntimeError as exc:
-        assert "bad optional access" in str(exc), f"unexpected message: {exc}"
+    except ValueError as exc:
+        assert "q_lora_rank must be an int for MLA" in str(exc), f"unexpected message: {exc}"
     else:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")
 
@@ -6702,7 +6831,7 @@ _ENCODER_SERVING_SEGMENTS: List[List[int]] = [
     [12544, 9600],
 ]
 
-# What `workspace_` grows to across that sequence, from empty: the op sizes it
+# What `workspace` grows to across that sequence, from empty: the op sizes it
 # in place per call and never shrinks it, and the dump's largest recorded size
 # is this figure.
 _ENCODER_SERVING_WORKSPACE = 33732608
@@ -6729,7 +6858,7 @@ def _encoder_call(
         v=None,
         output=output,
         output_sf=None,
-        workspace_=workspace,
+        workspace=workspace,
         sequence_length=torch.tensor(seg_lens, dtype=torch.int32, device="cuda"),
         host_past_key_value_lengths=torch.tensor(seg_lens, dtype=torch.int32),
         host_total_kv_lens=torch.tensor([total, 0], dtype=torch.int32),
@@ -6796,7 +6925,7 @@ def _encoder_call(
         use_spec_decoding=False,
         is_spec_dec_tree=False,
         spec_decoding_generation_lengths=None,
-        spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_position_offsets=None,
         spec_decoding_packed_mask=None,
         spec_decoding_bl_tree_mask_offset=None,
         spec_decoding_bl_tree_mask=None,
@@ -6922,7 +7051,7 @@ def test_encoder_no_kv_cache_cache_arguments_are_inert() -> None:
 
 
 def test_encoder_no_kv_cache_workspace_high_water() -> None:
-    """`workspace_` over the mmmu serving sequence, from empty: sized in place
+    """`workspace` over the mmmu serving sequence, from empty: sized in place
     per call, never shrunk, and topping out at the largest size the runtime
     dump records -- which a tower that preallocates it must cover."""
     workspace = torch.empty(0, dtype=torch.int8, device="cuda")
@@ -6932,9 +7061,9 @@ def test_encoder_no_kv_cache_workspace_high_water() -> None:
         qkv = torch.randn(sum(seg_lens), 48 * 72, dtype=torch.bfloat16, device="cuda")
         _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace)
         sizes.append(workspace.numel())
-    assert sizes == sorted(sizes), f"workspace_ did not grow monotonically: {sizes}"
+    assert sizes == sorted(sizes), f"workspace did not grow monotonically: {sizes}"
     assert sizes[-1] == _ENCODER_SERVING_WORKSPACE, (
-        f"workspace_ grew to {sizes[-1]} bytes over the serving shapes, expected "
+        f"workspace grew to {sizes[-1]} bytes over the serving shapes, expected "
         f"{_ENCODER_SERVING_WORKSPACE}; the sequence was {sizes}"
     )
 
@@ -7264,7 +7393,517 @@ def _cell_encoder(cell, arm) -> None:
     torch.cuda.empty_cache()
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+#: The qwen4_exp full-attention call over an fp8-e4m3 pool at the production kv
+#: scale 1.0 (fp32 [1] scale tensors, quant_mode 128): what the trunk layers and
+#: the MTP draft layer pass when the engine serves an fp8 KV cache. Same chosen
+#: pool sizes as `QWEN4_DENSE`.
+_QWEN4_FP8 = dict(QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
+#: The same call over an NVFP4 pool: e2m1 data and a second pool of e4m3 block
+#: scales, fp32 [3] unit kv scales, `[1, 2, 2]` pool pointers, bf16 output --
+#: what the trunk layers and the MTP draft layer pass when the engine serves an
+#: NVFP4 KV cache. Same chosen pool sizes as `QWEN4_DENSE`.
+_QWEN4_NVFP4 = dict(QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
+#: `QWEN4_DENSE` and `_QWEN4_FP8` for a verify step of up to 32 requests, the captured-batch
+#: ceiling: one block-offset row per request and pages for 32 histories (the largest cell
+#: needs 133 of the 144).
+_QWEN4_DENSE_G32 = dict(QWEN4_DENSE, max_num_requests=32, num_blocks=144)
+_QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
+
+
+def _spread(batch: int, longest: int) -> tuple[int, ...]:
+    """`batch` histories rising evenly from 1 to `longest` tokens: one-page, page-boundary
+    and multi-page sequences in one verify step."""
+    return tuple(1 + (longest - 1) * i // (batch - 1) for i in range(batch))
+
+
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",
+            spec=dict(
+                input_type=MLA_CONTEXT,
+                num_heads=128,
+                num_kv_heads=128,
+                head_size=576,
+                v_head_dim=128,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek MLA generation: one kv head, latent 576 -> 512, fp8 pool",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=128,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        # The per-rank head counts the deepseek default target runs under
+        # attention TP: the same two MLA code paths as the cells above, at the
+        # 128 heads split 2, 4 or 8 ways.
+        Cell(
+            why="deepseek default at attention TP8: MLA context, 16 heads per rank",
+            spec=dict(
+                input_type=MLA_CONTEXT,
+                num_heads=16,
+                num_kv_heads=16,
+                head_size=576,
+                v_head_dim=128,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek default at attention TP2: MLA generation, 64 heads per rank",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=64,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek default at attention TP8: MLA generation, 16 heads per rank",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=16,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        # MTP3 under attention TP: the verify step's taller query block (draft
+        # length 3 + 1 rows per sequence) at a split head count. The P > 1 mask
+        # itself is pinned at 128 heads by the MTP cases in the test.
+        Cell(
+            why="deepseek default MTP3 at attention TP8: MLA generation, 16 heads, P=4",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=16,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+    ),
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=64,
+                num_kv_heads=8,
+                head_size=64,
+                v_head_dim=64,
+                sinks=True,
+                window=128,
+                quant_mode=0,
+            ),
+        ),
+        Cell(
+            why="gpt-oss full layer: the same heads with no window",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=64,
+                num_kv_heads=8,
+                head_size=64,
+                v_head_dim=64,
+                sinks=True,
+                window=None,
+                quant_mode=0,
+            ),
+        ),
+        # The per-rank head counts the gpt-oss default target runs under
+        # attention TP: the same code path as the two cells above, at the
+        # head counts a rank holds after the split.
+        Cell(
+            why="gpt-oss default at attention TP8: 8q/1kv per rank, 128-token window",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=8,
+                num_kv_heads=1,
+                head_size=64,
+                v_head_dim=64,
+                sinks=True,
+                window=128,
+                quant_mode=0,
+            ),
+        ),
+    ),
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+        Cell(
+            why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
+            "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(0, 48),
+                new=(70, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp decode P=1: one row per generation sequence over "
+            "page-crossing histories (70, 35)",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp MTP verify P=2 (max_draft_len 1): draft row t attends "
+            "[0, L-P+t], bottom-right causal within the block",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp MTP verify P=3 (max_draft_len 2): a separate decode "
+            "compile, P reaches the kernel as maxSeqLenQ",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(3, 3),
+                num_contexts=0,
+                predicted_tokens_per_seq=3,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp MTP verify P=4 (max_draft_len 3)",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(4, 4),
+                num_contexts=0,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp MTP verify P={p} (max_draft_len {p - 1})"
+                + (": the target's ceiling" if p == 8 else ""),
+                spec=dict(
+                    QWEN4_DENSE,
+                    cached=(70, 35),
+                    new=(p, p),
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (5, 6, 7, 8)
+        ),
+        Cell(
+            why="qwen4_exp P=8 G=1: one draft block from row 95, across the page edge at 96",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(95,),
+                new=(8,),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        # The trtllm-gen launch picks its generation kernel by batch size at P 5..8, so each P
+        # is also driven at 32 requests and at one batch in 17..20, with histories of every
+        # page shape in the step.
+        *(
+            Cell(
+                why=f"qwen4_exp bf16 batch P={p} G=32: 32 blocks over histories 1..218, "
+                f"{32 * p} q rows",
+                spec=dict(
+                    _QWEN4_DENSE_G32,
+                    cached=_spread(32, 218),
+                    new=(p,) * 32,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (5, 6, 7, 8)
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp bf16 batch P={p} G={g}: {g} blocks over histories 200..1, "
+                f"{g * p} q rows",
+                spec=dict(
+                    _QWEN4_DENSE_G32,
+                    cached=tuple(reversed(_spread(g, 200))),
+                    new=(p,) * g,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p, g in ((5, 17), (6, 18), (7, 19), (8, 20))
+        ),
+        Cell(
+            why="qwen4_exp mixed step: a fresh 20-row context ahead of two P=2 "
+            "draft blocks, generation rows token-major after the context rows",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(0, 70, 35),
+                new=(20, 2, 2),
+                num_contexts=1,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp mixed step P=8: a fresh 20-row context ahead of two P=8 "
+            "draft blocks over histories 70 and 35",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(0, 70, 35),
+                new=(20, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp hybrid pool: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11), P=2 verify",
+            spec=dict(
+                QWEN4_DENSE,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp P=8 hybrid pool: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11), P=8 verify",
+            spec=dict(
+                QWEN4_DENSE,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp vision tower: no KV cache, MHA 16/16 d72, padding mask, "
+            "frames of 27/9/41 rows each attending only to itself",
+            spec=dict(QWEN4_VISION, seg_lens=(27, 9, 41)),
+        ),
+        Cell(
+            why="mmmu serving shape: one 5580-row frame, the 62x90 patch grid",
+            spec=dict(QWEN4_VISION, seg_lens=(5580,)),
+        ),
+        Cell(
+            why="mmmu serving shape: one 8160-row frame, the largest single-segment call",
+            spec=dict(QWEN4_VISION, seg_lens=(8160,)),
+        ),
+        Cell(
+            why="mmmu serving shape: 2204 rows in four frames",
+            spec=dict(QWEN4_VISION, seg_lens=(728, 728, 460, 288)),
+        ),
+        Cell(
+            why="mmmu serving shape: 1892 rows in five frames, the most segments per call",
+            spec=dict(QWEN4_VISION, seg_lens=(480, 480, 400, 352, 180)),
+        ),
+        Cell(
+            why="mmmu serving shape: 9008 rows in two frames",
+            spec=dict(QWEN4_VISION, seg_lens=(8000, 1008)),
+        ),
+        Cell(
+            why="mmmu serving shape: 22144 rows in two frames, the largest call; its "
+            "12544-row frame is the longest segment",
+            spec=dict(QWEN4_VISION, seg_lens=(12544, 9600)),
+        ),
+        # qwen4_exp's own geometry over an fp8 pool: the kv head count changes the compiled
+        # decode kernel, so the 24/4/256 cells above do not cover it.
+        Cell(
+            why="qwen4_exp fp8 pool paged-context prefill, 24/2/256: a fresh 48-row "
+            "sequence beside 33 rows over a 48-token e4m3 prefix",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 48),
+                new=(48, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool decode P=1, 24/2/256: histories 200 and 48 span "
+            "pages and KV tiles",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(200, 48),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp fp8 pool MTP verify P={p}, 24/2/256 (max_draft_len {p - 1})",
+                spec=dict(
+                    _QWEN4_FP8,
+                    cached=(70, 35),
+                    new=(p, p),
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (2, 4, 5, 6, 7, 8)
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool mixed step P=3, 24/2/256: a 20-row context ahead "
+            "of two P=3 blocks over histories 31 and 64",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 31, 64),
+                new=(20, 3, 3),
+                num_contexts=1,
+                predicted_tokens_per_seq=3,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool mixed step P=8, 24/2/256: a 20-row context ahead "
+            "of two P=8 blocks over histories 31 and 64",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 31, 64),
+                new=(20, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        # KV stays within one 128-key tile (histories to 119 plus 8 rows), where the e4m3
+        # probability model of `reference` is the kernel's own at any batch.
+        Cell(
+            why="qwen4_exp fp8 batch P=8 G=32: 32 blocks over histories 1..119, 256 q rows",
+            spec=dict(
+                _QWEN4_FP8_G32,
+                cached=_spread(32, 119),
+                new=(8,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 hybrid pool P=2: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11) over e4m3 slabs",
+            spec=dict(
+                _QWEN4_FP8,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 hybrid pool P=8: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11) over e4m3 slabs",
+            spec=dict(
+                _QWEN4_FP8,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool paged-context prefill, 24/2/256: a fresh 48-row "
+            "sequence beside 33 rows over a 48-token e2m1 prefix",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 48),
+                new=(48, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool decode P=1, 24/2/256: histories 200 and 48",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(200, 48),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool MTP verify P=2, 24/2/256 (max_draft_len 1)",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(70, 35),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool MTP verify P=4, 24/2/256 (max_draft_len 3)",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(70, 35),
+                new=(4, 4),
+                num_contexts=0,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool mixed step P=1: a 20-row context ahead of two "
+            "1-row sequences over histories 31 and 64",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 31, 64),
+                new=(20, 1, 1),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool mixed step P=4: a 20-row context ahead of two 4-row blocks",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 31, 64),
+                new=(20, 4, 4),
+                num_contexts=1,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     """Drive every configuration the entry claims.
 

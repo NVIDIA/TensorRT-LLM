@@ -20,10 +20,11 @@ implementation of block hashing without importing the whole router module.
 import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, Optional, Union
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
+from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import kv_cache_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -35,7 +36,11 @@ from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
     uses_harmony_tokenization,
 )
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ResponsesRequest,
+)
 from tensorrt_llm.serve.render import (
     HarmonyConversionError,
     PreparedContext,
@@ -62,7 +67,7 @@ KV_CACHE_HASH_ALGOS = frozenset(
 hash_v1_block_key = kv_cache_hash.hash_v1_block_key
 truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
-OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
+OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest, ResponsesRequest]
 BlockHash = Union[int, str]
 
 __all__ = [
@@ -75,70 +80,36 @@ __all__ = [
     "truncate_sha256_hash_to_int64",
     "OpenAIRequest",
     "BlockHash",
+    "responses_request_text",
     "get_request_num_tokens",
     "block_key_hasher",
     "BlockHashMixin",
-    "PrefixBlockSet",
 ]
 
 
-class PrefixBlockSet:
-    """Single-owner block-hash index -- a flat ``set`` of held block hashes.
+def responses_request_text(request: ResponsesRequest) -> str:
+    """Return the instructions and input as ``role:content`` lines, like a chat request's text.
 
-    A KV-cache block hash folds in its parent chain (the worker computes it with
-    ``BlockKeyHasher.hash(block_key, parent_hash)``), so every block-hash *value*
-    is globally unique to one position in one prefix path. A request's ordered
-    block-hash list is itself the prefix path, so longest-common-prefix against a
-    set of held blocks is just "walk the list until the first hash the owner
-    doesn't hold" -- no explicit tree needed.
-
-    This is the exact structure the orchestrator ``KvCacheAwareServerState`` uses
-    (a ``set[block_hash]`` per server, walked until the first miss). It is the
-    right index whenever there is only ONE logical owner -- e.g. the centralized
-    router's per-instance ``combined_trie`` (owner = instance) and each rank's
-    trie (owner = that rank). Those are only ever queried for a single owner's
-    prefix depth (:meth:`match_one`), so a ``hash -> {owner}`` reverse map with
-    per-depth set intersections would be pure overhead here.
-
-    The ``owner_id`` argument on :meth:`add` / :meth:`remove` / :meth:`match_one`
-    is accepted and ignored so this is a drop-in for the single-owner call sites.
+    A later turn re-sends the earlier turns' input, so its text extends theirs.
     """
+    from tensorrt_llm.serve.responses_utils import chat_messages_from_responses_input
 
-    __slots__ = ("_blocks",)
-
-    def __init__(self) -> None:
-        self._blocks: set[int] = set()
-
-    def add(self, owner_id: str, block_hashes: Iterable[int]) -> None:
-        self._blocks.update(block_hashes)
-
-    def remove(self, owner_id: str, block_hashes: Iterable[int]) -> None:
-        self._blocks.difference_update(block_hashes)
-
-    def remove_worker(self, owner_id: str) -> None:
-        self._blocks.clear()
-
-    def match_one(self, owner_id: str, block_hashes: List[int]) -> int:
-        """Consecutive prefix-block count held by the (single) owner.
-
-        Identical to ``KvCacheAwareServerState.matched_tokens``: walk the query
-        path, counting blocks present in the set, and stop at the first miss.
-        """
-        blocks = self._blocks
-        depth = 0
-        for h in block_hashes:
-            if h not in blocks:
-                break
-            depth += 1
-        return depth
-
-    def has_worker(self, owner_id: str) -> bool:
-        return bool(self._blocks)
+    messages = chat_messages_from_responses_input(request, [])
+    return "\n".join(f"{m.get('role', '')}:{m.get('content', '')}" for m in messages)
 
 
 def get_request_num_tokens(request: Optional[OpenAIRequest]) -> int:
     if request is None:
         return 0
+
+    if isinstance(request, ResponsesRequest):
+        # Without relayed token ids the text is counted in characters, as a
+        # string completion prompt is below, which weighs a request several
+        # times what its token count would. A router sees one kind only: the
+        # context router routes before any ids exist, and the generation
+        # router gets them relayed (context-first) or never (generation-first).
+        token_ids = request.relayed_prompt_token_ids()
+        return len(responses_request_text(request) if token_ids is None else token_ids)
 
     if (
         request.disaggregated_params is None
@@ -203,6 +174,7 @@ class BlockHashMixin:
         tokenizer_dir: Optional[str] = None,
         use_harmony: Optional[bool] = None,
         model_path: Optional[str] = None,
+        enable_tokenization_cache: bool = False,
     ) -> None:
         env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
@@ -215,12 +187,17 @@ class BlockHashMixin:
         self._tokenizer_dir = tokenizer_dir
         self._model_path = model_path
         self._use_harmony = use_harmony
+        self._tok_prefix_cache: OrderedDict = OrderedDict()
+        self._enable_tokenization_cache = enable_tokenization_cache
+        # id(tokenizer) -> (tokenizer, its prefix token cache or None)
+        self._prefix_token_caches: dict[int, tuple[object, Optional[PrefixTokenCache]]] = {}
         logger.info(
             f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
             f", custom_tokenizer={self._custom_tokenizer}"
             f", model_path={self._model_path}"
             f", use_harmony={self._use_harmony}"
+            f", enable_tokenization_cache={self._enable_tokenization_cache}"
         )
 
     def _get_tokenizer(self, model: str):
@@ -246,17 +223,29 @@ class BlockHashMixin:
                 self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
+    def _prefix_token_cache(self, tokenizer) -> Optional[PrefixTokenCache]:
+        """The prefix token cache of ``tokenizer`` with enable_tokenization_cache, else None."""
+        if not self._enable_tokenization_cache:
+            return None
+        entry = self._prefix_token_caches.get(id(tokenizer))
+        if entry is None or entry[0] is not tokenizer:
+            entry = (tokenizer, create_prefix_token_cache(tokenizer))
+            self._prefix_token_caches[id(tokenizer)] = entry
+        return entry[1]
+
     def _encode_with_prefix_cache(self, rendered: str, key: int, tokenizer) -> list[int]:
-        cache = getattr(self, "_tok_prefix_cache", None)
-        if cache is None:
-            cache = self._tok_prefix_cache = OrderedDict()
+        cache = self._tok_prefix_cache
         entry = cache.get(key)
         if entry is not None and rendered == entry[0]:
             ids = entry[1]
         else:
-            # Tokenizing a suffix independently is not generally composable:
-            # BPE/SentencePiece merges can cross the cached string boundary.
-            ids = tokenizer.encode(rendered, add_special_tokens=False)
+            prefix_token_cache = self._prefix_token_cache(tokenizer)
+            if prefix_token_cache is not None:
+                ids = prefix_token_cache.encode(tokenizer, rendered)
+            else:
+                # Tokenizing a suffix independently is not generally composable:
+                # BPE/SentencePiece merges can cross the cached string boundary.
+                ids = tokenizer.encode(rendered, add_special_tokens=False)
         cache[key] = (rendered, ids)
         cache.move_to_end(key)
         while len(cache) > 1024:
@@ -474,6 +463,9 @@ class BlockHashMixin:
         return rendered.token_ids
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
+        if isinstance(request, ResponsesRequest):
+            return [self._tokenize_responses_request(request)]
+
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
             return [self._tokenize_chat(request)]
@@ -497,6 +489,45 @@ class BlockHashMixin:
         # skips re-tokenization
         request.prompt = token_lists if len(token_lists) > 1 else token_lists[0]
         return token_lists
+
+    def _tokenize_responses_request(self, request: ResponsesRequest) -> list[int]:
+        """Return the token ids of the prompt a worker builds for a Responses request.
+
+        The ids only drive routing and are not stored on the request, so the
+        context worker still renders the prompt itself.
+        """
+        token_ids = request.relayed_prompt_token_ids()
+        if token_ids is not None:
+            return token_ids
+        from tensorrt_llm.serve import responses_utils
+
+        # A disaggregated server rejects previous_response_id, so there is no
+        # stored history: the input is the whole conversation.
+        if uses_harmony_tokenization(
+            use_harmony=self._use_harmony, model_type_resolver=self._get_model_type
+        ):
+            return responses_utils._render_for_completion(
+                responses_utils._construct_harmony_messages(request, None)
+            )
+        tools = responses_utils._get_chat_completion_function_tools(request.tools)
+        # As on the worker, developer messages render as system for a chat
+        # template that has no developer role.
+        messages = responses_utils._render_developer_as_system(
+            responses_utils.chat_messages_from_responses_input(request, []),
+            self._get_tokenizer(request.model),
+            None,
+            [tool.model_dump() for tool in tools],
+        )
+        chat_request = ChatCompletionRequest.model_construct(
+            model=request.model,
+            messages=messages,
+            tools=tools,
+            chat_template_kwargs=responses_utils.reasoning_chat_template_kwargs(request),
+            injected_chat_template_kwargs=list(
+                responses_utils.reasoning_injected_chat_template_keys(request)
+            ),
+        )
+        return self._tokenize(chat_request)[0]
 
     def _compute_block_hashes(
         self,
