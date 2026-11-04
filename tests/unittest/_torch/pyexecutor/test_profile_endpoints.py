@@ -20,6 +20,7 @@ the attributes the handlers touch, so they run without GPUs, models,
 or an MPI/RPC environment.
 """
 
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -440,18 +441,22 @@ def test_runtime_profile_flushes_on_executor_thread(
     executor.is_warmup = False
     executor.print_log = False
     executor.enable_iter_perf_stats = False
-    executor.start_profile(output_dir=str(tmp_path), activities=["CPU"])
-    assert executor._runtime_profile_pending_start_iter is not None
-    executor._apply_profile_start_config({"output_dir": str(tmp_path), "activities": ["CPU"]})
+    start_configs: list[dict] = []
     ready = threading.Event()
     stop_requested = threading.Event()
     executor.executor_request_queue = SimpleNamespace(
-        enqueue_profile_stop_request=stop_requested.set
+        enqueue_profile_start_request=start_configs.append,
+        enqueue_profile_stop_request=stop_requested.set,
     )
+    executor.start_profile(output_dir=str(tmp_path), activities=["CPU"])
+    assert executor._runtime_profile_pending_start_iter is not None
+    assert len(start_configs) == 1
     errors: list[BaseException] = []
 
     def run_loop() -> None:
+        """Apply the queued caller config and own the entire profiler lifetime."""
         try:
+            executor._apply_profile_start_config(start_configs.pop())
             with executor._profile_manager.profile_step() as step:
                 executor.iter_counter = 1
                 step()
@@ -480,4 +485,8 @@ def test_runtime_profile_flushes_on_executor_thread(
     assert executor._runtime_profile_pending_start_iter is None
     assert executor._runtime_profile_pending_stop_iter is None
     assert not executor._profile_enabled
-    assert len(list(tmp_path.glob("trtllm-trace-*-rank-0.json"))) == 1
+    assert not start_configs
+    paths = list(tmp_path.glob("trtllm-trace-*-rank-0.json"))
+    assert len(paths) == 1
+    trace = json.loads(paths[0].read_text())
+    assert any(event.get("name") == "aten::add" for event in trace["traceEvents"])
