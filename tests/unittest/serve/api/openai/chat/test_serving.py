@@ -168,7 +168,7 @@ def test_constructor_stores_each_dependency_where_the_handlers_read_it(tmp_path)
 
 
 def test_chat_serving_is_the_roots_and_uses_its_render_resources(serve_env):
-    server, _ = _llm_server(serve_env, chat_template=SERVER_TEMPLATE)
+    server, client = _llm_server(serve_env, chat_template=SERVER_TEMPLATE)
     serving = _serving(server)
     assert serving is server._chat_serving
     assert serving._render_resources is server._render_resources, (
@@ -182,6 +182,20 @@ def test_chat_serving_is_the_roots_and_uses_its_render_resources(serve_env):
         assert getattr(serving, name) == getattr(server, name)
     assert serving.allow_request_chat_template is server.allow_request_chat_template
     assert serving.use_harmony is server.use_harmony is False
+    # Through the route: the prompt the handler renders and hands to the input
+    # processor, and the ids that reach the engine, come from the server
+    # template, not from the fake tokenizer's own.
+    response = client.post("/v1/chat/completions", json=BODY)
+    assert response.status_code == 200, response.text
+    message = (
+        "the chat handler rendered the prompt without the server chat template: it must use "
+        "the RenderResources the composition root built, never RenderResources.from_server("
+        "serving) on the serving object"
+    )
+    [preprocess] = server.generator.preprocess_calls
+    assert preprocess.inputs["prompt"] == "[user] hi", f"{message}; rendered: {preprocess.inputs!r}"
+    [call] = server.generator.generate_calls
+    assert list(call.inputs.prompt_token_ids) == server.tokenizer.encode("[user] hi"), message
 
 
 def test_chat_serving_shares_the_roots_objects(serve_env):

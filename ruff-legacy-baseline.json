@@ -531,6 +531,9 @@
   "tensorrt_llm/serve/_base/sse.py": {
     "F821": 1
   },
+  "tensorrt_llm/serve/api/openai/chat/serving.py": {
+    "F821": 1
+  },
   "tensorrt_llm/serve/api/openai/completions/_merge.py": {
     "F821": 1
   },
