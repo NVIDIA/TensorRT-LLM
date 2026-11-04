@@ -28,11 +28,14 @@ from starlette.routing import Match
 from test_common.serve.routes import effective_routes
 
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve.api.openai.completions import api_router as completions_router
+from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
 from tensorrt_llm.serve.api.openai.tokenize.serving import TokenizeServing
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.multi_frontend import FORWARDED_ROUTES
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.postprocess_handlers import select_postproc_strategy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -65,6 +68,26 @@ PER_FRONTEND_SAFE = {
 }
 
 
+def _completion_serving() -> CompletionServing:
+    """A completions serving object with placeholder dependencies: only routed to, never called."""
+    return CompletionServing(
+        model="m",
+        generator=None,
+        tokenizer=None,
+        model_config=None,
+        collect_perf_metrics=False,
+        metrics_collector=None,
+        adjusted_steady_clock=None,
+        iteration_stats_wakeup_event=None,
+        iteration_stats_collector_task=lambda: None,
+        internal_disagg_auth_key=None,
+        per_request_spec_decode_stats=False,
+        spec_decode_num_spec_tokens=None,
+        input_proc_executor=None,
+        postproc=select_postproc_strategy(postproc_worker_enabled=False),
+    )
+
+
 def _llm_server_routes() -> list[tuple[str, str]]:
     """(method, path) pairs the LLM server registers, without building an LLM."""
     server = object.__new__(OpenAIServer)
@@ -80,14 +103,15 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     server.resource_governor = None
     # As OpenAIServer.__init__ does: the serving objects the routers read go on
     # app.state, the role's own table is registered, then the routers of the role
-    # (the system router with /health, /version and /v1/models, and the tokenize
-    # router) are attached.
+    # (the system router with /health, /version and /v1/models, the tokenize
+    # router and the completions router) are attached.
     server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
     setattr(
         server.app.state,
         tokenize_router.APP_STATE_KEY,
         TokenizeServing(model="m", tokenizer=None),
     )
+    setattr(server.app.state, completions_router.APP_STATE_KEY, _completion_serving())
     server.register_routes()
     attach_routers(server.app, ServerCapabilities.for_role(None))
     # effective_routes walks included routers, which FastAPI 0.139 keeps as
