@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import enum
 import itertools
 import json
@@ -373,6 +374,48 @@ def test_exclude_from_cache_op_reuses_profiles_within_window(
             tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
         tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
     assert (len(profiled), len(prepared)) == (4, 3)
+
+    # Different profile settings for the same op and shapes are profiled.
+    wider_config = dataclasses.replace(tuning_config, tune_max_num_tokens=8)
+    with autotune():
+        tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
+        tuner.choose_one(op, [GemmRunner()], wider_config, [x, w])
+    assert len(profiled) == 6
+
+
+def test_exclude_from_cache_op_is_reprofiled_until_every_profile_is_cached(
+        monkeypatch) -> None:
+    """A profile that failed to produce a cache entry is retried on the next
+    call in the same autotune() context."""
+    x = torch.randn(3, 64)
+    w = torch.randn(64, 128)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=(3, 4, 5),
+        map_to_tuning_buckets=lambda value: value), ),
+                                 exclude_from_cache=True)
+    op = "test_exclude_from_cache_op_is_reprofiled_until_every_profile_is_cached"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    profiled = []
+    profile_runners = tuner._profile_runners
+
+    def fail_first_profile(custom_op, runners, tensors, profile, config,
+                           **kwargs):
+        profiled.append(profile.get_opt_shapes()[0][0])
+        if len(profiled) == 1:
+            return None, -1, float("inf"), True
+        return profile_runners(custom_op, runners, tensors, profile, config,
+                               **kwargs)
+
+    monkeypatch.setattr(tuner, "_profile_runners", fail_first_profile)
+    with autotune():
+        for _ in range(3):
+            tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
+    # Call 1 profiles all 3 buckets (the first fails), call 2 retries only the
+    # failed one, call 3 is served from the cache.
+    assert len(profiled) == 4
 
 
 @torch.library.custom_op("autotuner_test::get_best_gemm_tactic",

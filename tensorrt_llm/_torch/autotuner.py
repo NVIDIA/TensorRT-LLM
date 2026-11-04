@@ -947,8 +947,9 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
-        # (custom_op, runner ids, input shapes) of exclude_from_cache ops
-        # profiled in the current autotune() context.
+        # exclude_from_cache ops whose profiles all have cache entries in the
+        # current autotune() context, keyed by op, runners, input shapes and
+        # profile settings.
         self._tuned_excluded_ops: set[tuple] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
@@ -1159,14 +1160,17 @@ class AutoTuner:
         # warmup actually runs even if a stale on-disk entry was loaded.
         # In inference mode we still consult the in-process cache, which
         # was populated by this process's own warmup. Once this process has
-        # profiled the op for these shapes in the current autotune() window,
-        # later calls use the in-process cache like any other op.
+        # profiled every profile of the op for these shapes and profile
+        # settings in the current autotune() context, later calls use the
+        # in-process cache like any other op.
         excluded_key = None
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
             excluded_key = (custom_op,
-                            tuple(str(r.unique_id())
-                                  for r in runners), input_shapes)
+                            tuple(str(r.unique_id()) for r in runners),
+                            input_shapes, tuning_config.dynamic_tensor_specs,
+                            tuning_config.constraint_specs,
+                            tuning_config.tune_max_num_tokens)
         if (excluded_key is not None and self.is_tuning_mode
                 and excluded_key not in self._tuned_excluded_ops):
             is_cache_hit = False
@@ -1249,7 +1253,14 @@ class AutoTuner:
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
-        if excluded_key is not None:
+        if excluded_key is not None and all(
+                self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False,
+                )[0] for p in profiles):
             self._tuned_excluded_ops.add(excluded_key)
         self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
                                    **kwargs)
