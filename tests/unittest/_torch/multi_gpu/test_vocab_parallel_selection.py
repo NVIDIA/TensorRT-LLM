@@ -322,6 +322,11 @@ def _markov_v3_check(rank, tp, mnnvl):
             _assert_markov_near_ties(full, anchors, w1, w2, v3, atol=0.05)
             v3_32 = head.markov_tokens(local, anchors.to(torch.int32), w1, w2)
             assert torch.equal(v3_32, v3), (num_reqs, block)
+    # The rank's state holds the next launch's set, not a launch count that wraps.
+    from tensorrt_llm._torch.kernels.blackwell.dspark_markov_greedy import NUM_SETS
+
+    state = head._exchange.markov_exchange()[2]
+    assert int(state[0]) == (2 * 2 * len(cases)) % NUM_SETS
     gathered = MPI.COMM_WORLD.allgather(v3.cpu())
     assert all(torch.equal(g, gathered[0]) for g in gathered)
     # Zero bias: exact against the reference, with cross-shard ties, a NaN

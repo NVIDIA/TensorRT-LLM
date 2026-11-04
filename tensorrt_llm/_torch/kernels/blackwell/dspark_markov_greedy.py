@@ -28,8 +28,8 @@ other CTA's keys). Per CTA:
   index, NaN above everything and ``-0 == +0``, which is ``torch.argmax`` on the gathered logits.
 
 Exchange: three sets of ``[position, entry = rank x CTAs + CTA, request]`` u64 keys, 0 where
-nothing was written (a key never has a zero 32-bit word). Launch ``L`` (from a per-rank ordinal
-that CTA 0 advances after its last poll) uses set ``L % 3`` and clears set ``(L + 2) % 3``, which
+nothing was written (a key never has a zero 32-bit word). Launch ``L`` uses set ``L % 3`` (kept
+per rank, which CTA 0 advances after its last poll) and clears set ``(L + 2) % 3``, which
 launch ``L - 1`` used: every CTA of this rank finished reading it before launch ``L - 1``
 completed, and peers write it again only in launch ``L + 2``, which needs this rank's keys of
 launch ``L + 1``. The kernel never triggers its dependents early, so the next launch starts only
@@ -71,7 +71,8 @@ MAX_STEPS = 16
 MAX_WIDTH = 16
 #: Exchange sets in rotation.
 NUM_SETS = 3
-#: Int32 words of the per-rank state: launch ordinal, then the bytes each set's last launch used.
+#: Int32 words of the per-rank state: the next launch's set, then the bytes each set's last launch
+#: used.
 STATE_WORDS = 4
 
 
@@ -558,12 +559,11 @@ class DSparkMarkovGreedyKernel:
             if c < MAX_WIDTH * self.pitch // 16:
                 _st_shared_v4(w1s + c * 16, Int32(0), Int32(0), Int32(0), Int32(0))
 
-        # Launch ordinal and the bytes each set's last launch used. The previous launch has
+        # This launch's set and the bytes each set's last launch used. The previous launch has
         # completed: it never triggers its dependents early.
         st = _ld_volatile_v4(state)
-        launch = st[0]
-        cur_set = launch % NUM_SETS
-        clear_set = (launch + 2) % NUM_SETS
+        cur_set = st[0]
+        clear_set = (cur_set + 2) % NUM_SETS
         clear_bytes = st[1]
         if clear_set == 1:
             clear_bytes = st[2]
@@ -749,7 +749,7 @@ class DSparkMarkovGreedyKernel:
 
         if cta == 0:
             if tid == 0:
-                _st_global_b32(state, launch + 1)
+                _st_global_b32(state, (cur_set + 1) % NUM_SETS)
                 _st_global_b32(state + Int64(4 + 4 * cur_set), Int32(steps * self.keys * 8))
 
     def load_base(self, base, stride_req, stride_step, rows, q, load_ok, i: int):
