@@ -66,6 +66,19 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(ENABLE_NANOBIND_PROFILING
+       "Emit PyTorch profiler regions around TensorRT-LLM nanobind calls" OFF)
+option(ENABLE_NCCL_PROFILING
+       "Emit PyTorch profiler regions around NcclCommunicatorOp send/recv calls"
+       OFF)
+if(ENABLE_NANOBIND_PROFILING AND NOT BUILD_PYT)
+  message(FATAL_ERROR "ENABLE_NANOBIND_PROFILING requires BUILD_PYT=ON")
+endif()
+if(ENABLE_NCCL_PROFILING AND (NOT BUILD_PYT OR NOT ENABLE_MULTI_DEVICE))
+  message(
+    FATAL_ERROR
+      "ENABLE_NCCL_PROFILING requires BUILD_PYT=ON and ENABLE_MULTI_DEVICE=ON")
+endif()
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
 option(CUBLAS_DYNAMIC_LINKING
        "Link against the dynamic cublas/cublasLt libraries" ON)
