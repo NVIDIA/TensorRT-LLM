@@ -22,7 +22,7 @@
   offsets by the per-token index list, and into the KV-length offsets by slot, minus the tokens per step).
 
 Every buffer is int32 and passed as a raw address, so a call passes integers only. Row and element offsets are
-arguments. One thread per element.
+arguments, and so are the strides of the forward's 2-D outputs the scatter reads. One thread per element.
 """
 
 from __future__ import annotations
@@ -47,10 +47,10 @@ def _i32_at(address, index):
 
 @cute.kernel
 def scatter_kernel(
-    out_new_tokens: cutlass.Int64,  # int32 [rows_total, out_new_width], the forward's accepted tokens
-    out_next_new_tokens: cutlass.Int64,  # int32 [rows_total, out_next_width]
+    out_new_tokens: cutlass.Int64,  # int32 [rows_total, out_new_width] (strided), the forward's accepted tokens
+    out_next_new_tokens: cutlass.Int64,  # int32 [rows_total, out_next_width] (strided)
     out_lens: cutlass.Int64,  # int32 [rows_total]
-    out_next_draft: cutlass.Int64,  # int32 [rows_total, out_draft_width]
+    out_next_draft: cutlass.Int64,  # int32 [rows_total, out_draft_width] (strided)
     slots: cutlass.Int64,  # int32 [rows]
     store_new_tokens: cutlass.Int64,  # int32 [new_width, num_slots] (token-major)
     store_next_new_tokens: cutlass.Int64,  # int32 [next_width, num_slots]
@@ -66,6 +66,12 @@ def scatter_kernel(
     out_next_width: cutlass.Int32,
     draft_width: cutlass.Int32,
     out_draft_width: cutlass.Int32,
+    new_row_stride: cutlass.Int32,  # element strides of out_new_tokens / out_next_new_tokens / out_next_draft
+    new_col_stride: cutlass.Int32,
+    next_row_stride: cutlass.Int32,
+    next_col_stride: cutlass.Int32,
+    draft_row_stride: cutlass.Int32,
+    draft_col_stride: cutlass.Int32,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -82,17 +88,23 @@ def scatter_kernel(
             value = zero
             if col < out_new_width:
                 if col < accepted:
-                    value = _i32_at(out_new_tokens, src_row * out_new_width + col)[0]
+                    value = _i32_at(
+                        out_new_tokens, src_row * new_row_stride + col * new_col_stride
+                    )[0]
             _i32_at(store_new_tokens, col * num_slots + slot)[0] = value
         if col < next_width:
             value = zero
             if col < out_next_width:
-                value = _i32_at(out_next_new_tokens, src_row * out_next_width + col)[0]
+                value = _i32_at(
+                    out_next_new_tokens, src_row * next_row_stride + col * next_col_stride
+                )[0]
             _i32_at(store_next_new_tokens, col * num_slots + slot)[0] = value
         if col < draft_width:
             value = zero
             if col < out_draft_width:
-                value = _i32_at(out_next_draft, src_row * out_draft_width + col)[0]
+                value = _i32_at(
+                    out_next_draft, src_row * draft_row_stride + col * draft_col_stride
+                )[0]
             _i32_at(store_next_draft, slot * draft_width + col)[0] = value
         if col == zero:
             _i32_at(store_lens, slot)[0] = accepted
@@ -119,12 +131,19 @@ def scatter(
     out_next_width: cutlass.Int32,
     draft_width: cutlass.Int32,
     out_draft_width: cutlass.Int32,
+    new_row_stride: cutlass.Int32,
+    new_col_stride: cutlass.Int32,
+    next_row_stride: cutlass.Int32,
+    next_col_stride: cutlass.Int32,
+    draft_row_stride: cutlass.Int32,
+    draft_col_stride: cutlass.Int32,
     stream: cuda_driver.CUstream,
 ) -> None:
     scatter_kernel(
         out_new_tokens, out_next_new_tokens, out_lens, out_next_draft, slots, store_new_tokens,
         store_next_new_tokens, store_lens, store_next_draft, rows, row_begin, columns, num_slots, new_width,
-        out_new_width, next_width, out_next_width, draft_width, out_draft_width,
+        out_new_width, next_width, out_next_width, draft_width, out_draft_width, new_row_stride, new_col_stride,
+        next_row_stride, next_col_stride, draft_row_stride, draft_col_stride,
     ).launch(
         grid=[(rows * columns + THREADS - 1) // THREADS, 1, 1],
         block=[THREADS, 1, 1],

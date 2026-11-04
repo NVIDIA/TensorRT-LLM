@@ -45,6 +45,9 @@ from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
 
+# Import-time opt-in for the grouped-GEMM leaf's tiled BF16 input quantizer.
+TRITON_INPUT_QUANT = os.environ.get("TRTLLM_MOE_TRITON_FP4_QUANT", "0") == "1"
+
 # Kill switch for TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async.
 ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
 # Largest batch quantize_input_async moves to the aux stream. Only
@@ -126,7 +129,26 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             and getattr(self, "_locality_domain_runtime", None) is None
         )
 
-    quantize_input = quantize_input_nvfp4
+    def quantize_input(
+        self,
+        x: torch.Tensor | Fp4QuantizedTensor,
+        post_quant_comm: bool = True,
+        *,
+        enable_triton: bool = TRITON_INPUT_QUANT,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize eligible inputs with the tiled Triton kernel when enabled.
+
+        ``TRTLLM_MOE_TRITON_FP4_QUANT`` sets this grouped-GEMM leaf's default
+        at import time; it does not enable the dense-GEMM or fused-FC12 leaves.
+        Callers can override it with ``enable_triton``; input eligibility and
+        the NVFP4 backend's architecture requirements still apply.
+        """
+        return quantize_input_nvfp4(
+            self,
+            x,
+            post_quant_comm,
+            enable_triton=enable_triton,
+        )
 
     def quantize_input_async(
         self,
