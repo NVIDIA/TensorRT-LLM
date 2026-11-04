@@ -124,9 +124,9 @@ attention_config:
 - SageAttention is supported on H100/H200/H800/H20, B200/GB200, B300/GB300, and Rubin (SM107) GPUs.
 - On H100/H200/H800/H20, only one recipe with fixed `qk_dtype: "int8"` is supported.
 - On B200/GB200, it is recommended to use the `qk_dtype: "int8"` recipes.
-- On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200.
+- On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200. INT8 SageAttention is unsupported and raises an error.
 - On Rubin (SM107), use `qk_dtype: "fp8"`, Q/V block size 1, and K block size 1, 4, or 16. INT8 SageAttention is unsupported and raises an error.
-- `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once. PrimTS runs on B200/GB200 and B300/GB300 only, so H100/H200/H800/H20 and Rubin reject `smooth_v`.
+- `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once. VisualGen currently enables `smooth_v` on B200/GB200 and B300/GB300 only; H100/H200/H800/H20 and Rubin reject it.
 
 **Configuration.**
 
@@ -160,7 +160,8 @@ attention_config:
     v_block_size: 1
 ```
 
-These examples work on B200/GB200, B300/GB300, and Rubin. For Hopper
+These examples work on B200/GB200, B300/GB300, and Rubin. On B200/GB200,
+`qk_dtype: int8` with the same block sizes is recommended. For Hopper
 SageAttention, set `qk_dtype` to `int8` and `q_block_size` to `2`, keeping
 `k_block_size: 16` and `v_block_size: 1`.
 

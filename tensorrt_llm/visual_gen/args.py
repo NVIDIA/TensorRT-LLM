@@ -247,10 +247,15 @@ class AttentionConfig(StrictBaseModel):
         recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
-            if sm_version in (103, 107) and q_config.qk_dtype == "int8":
+            sage_recipes = SAGE_RECIPES.get(sm_version, set())
+            if (
+                q_config.qk_dtype == "int8"
+                and sage_recipes
+                and not any(r[0] == "int8" for r in sage_recipes)
+            ):
                 raise ValueError(
-                    f"INT8 SageAttention is unsupported on SM{sm_version}; "
-                    "use qk_dtype='fp8' with a supported SageAttention block-size recipe."
+                    f"INT8 SageAttention is unsupported on SM{sm_version}; supported SageAttention "
+                    f"recipes on this device: {sorted(sage_recipes)}."
                 )
             if q_config.vc_attention:
                 # The recipe fixes its scaling granularity. QK16 keeps bf16 Q/K with one V
@@ -267,9 +272,7 @@ class AttentionConfig(StrictBaseModel):
                 recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
                 family = "VC-Attention"
             else:
-                recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(
-                    sm_version, set()
-                )
+                recipes = sage_recipes | PRIMSTS_RECIPES.get(sm_version, set())
                 family = "SAGE and PrimTS"
             if recipe not in recipes:
                 raise ValueError(

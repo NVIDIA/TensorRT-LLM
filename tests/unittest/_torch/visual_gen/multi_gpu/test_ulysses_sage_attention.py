@@ -19,7 +19,7 @@ Verifies that SageAttention TRTLLM kernels produce correct results when
 combined with Ulysses sequence parallelism (sharding the sequence across GPUs).
 
 Run with:
-    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_sage_ulysses_attention.py -v
+    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py -v
 """
 
 import functools
@@ -90,16 +90,20 @@ def _logic_sage_ulysses_forward(rank, world_size, *, sage_attn_qk_int8: bool):
     torch.cuda.manual_seed_all(42)
 
     blk_k = 16 if sage_attn_qk_int8 else 1
-    inner = TrtllmAttention(
-        layer_idx=0,
-        num_heads=num_heads // world_size,
-        head_dim=head_dim,
+    config = AttentionConfig(
+        backend="TRTLLM",
         quant_attention_config=QuantAttentionConfig(
             qk_dtype="int8" if sage_attn_qk_int8 else "fp8",
             q_block_size=1,
             k_block_size=blk_k,
             v_block_size=1,
         ),
+    )
+    inner = TrtllmAttention(
+        layer_idx=0,
+        num_heads=num_heads // world_size,
+        head_dim=head_dim,
+        quant_attention_config=config.quant_attention_config,
         attention_metadata_state=ATTENTION_META_DICT.metadata,
     )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
@@ -205,10 +209,16 @@ class TestSageUlyssesAttention:
     """SageAttention TRTLLM kernels combined with Ulysses sequence parallelism."""
 
     @pytest.mark.parametrize("sage_attn_qk_int8", [True, False])
-    def test_sage_ulysses_forward(self, sage_attn_qk_int8: bool):
+    def test_sage_ulysses_forward(self, sage_attn_qk_int8: bool, require_sage_recipe):
         """Forward pass runs without error and produces finite output."""
-        if sage_attn_qk_int8 and _cuda_cc() in ((10, 3), (10, 7)):
-            pytest.skip("SM103 and SM107 do not support INT8 SageAttention tensor instructions.")
+        require_sage_recipe(
+            QuantAttentionConfig(
+                qk_dtype="int8" if sage_attn_qk_int8 else "fp8",
+                q_block_size=1,
+                k_block_size=16 if sage_attn_qk_int8 else 1,
+                v_block_size=1,
+            )
+        )
         run_test_in_distributed(
             world_size=2,
             test_fn=functools.partial(
@@ -227,11 +237,17 @@ class TestSageUlyssesAttention:
         ],
     )
     def test_sage_ulysses_vs_reference(
-        self, sage_attn_qk_int8: bool, sage_attn_num_elts_per_blk_k: int
+        self, sage_attn_qk_int8: bool, sage_attn_num_elts_per_blk_k: int, require_sage_recipe
     ):
         """Ulysses+SageAttention output matches full-sequence SDPA within approximation tolerance."""
-        if sage_attn_qk_int8 and _cuda_cc() in ((10, 3), (10, 7)):
-            pytest.skip("SM103 and SM107 do not support INT8 SageAttention tensor instructions.")
+        require_sage_recipe(
+            QuantAttentionConfig(
+                qk_dtype="int8" if sage_attn_qk_int8 else "fp8",
+                q_block_size=1,
+                k_block_size=sage_attn_num_elts_per_blk_k,
+                v_block_size=1,
+            )
+        )
         run_test_in_distributed(
             world_size=2,
             test_fn=functools.partial(
