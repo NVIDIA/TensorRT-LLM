@@ -242,7 +242,12 @@ def payload_check(payload, spec):
 
 def check_call(call, decl):
     """One class for one call against its own request's declarations."""
-    name = call.get("name") or ""
+    name = call.get("name")
+    if name is not None and not isinstance(name, str):
+        # A name that is not a string answers to no declaration.
+        return {"name": name, "type": call["type"], "namespace": call.get("namespace"),
+                "class": "undeclared", "detail": {"reason": "malformed_name"}}  # fmt: skip
+    name = name or ""
     nested = decl.get("__nested__") or {}
     spec = decl.get(name) if name != "__nested__" else None
     result = {"name": name, "type": call["type"], "namespace": call.get("namespace")}

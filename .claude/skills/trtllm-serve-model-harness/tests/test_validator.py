@@ -172,6 +172,19 @@ def test_check_tool_calls_cannot_judge_a_cut_shard(tmp_path, side, workers):
     assert str(cut) in result.stderr and "Traceback" not in result.stderr
 
 
+@pytest.mark.parametrize("name", [["exec"], {"name": "exec"}, 7], ids=["list", "dict", "number"])
+def test_check_tool_calls_reads_a_name_that_is_not_a_string_as_malformed(name):
+    """A call name that is not a string answers to no declaration: undeclared, not a crash."""
+    import check_tool_calls
+
+    tool = {"type": "function", "name": "exec", "parameters": {"type": "object"}}
+    decl, _ = check_tool_calls.declarations({"tools": [tool]})
+    call = {"type": "function_call", "name": name, "payload": "{}"}
+    result = check_tool_calls.check_call(call, decl)
+    assert (result["class"], result["detail"]) == ("undeclared", {"reason": "malformed_name"})
+    assert check_tool_calls.check_call(dict(call, name="exec"), decl)["class"] == "valid"
+
+
 def test_harness_signals_refuses_a_file_it_cannot_read(tmp_path):
     """A shard's name says which side it holds: a file named otherwise is an error, not a crash."""
     import harness_signals
