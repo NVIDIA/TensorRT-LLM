@@ -3956,6 +3956,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.DSPARK
 
 
+def drafter_reads_helix_sharded_context(
+        decoding_type: Optional[str], attention_backend: Optional[str]) -> bool:
+    """Whether a speculative_config's drafter reads a helix-sharded context.
+
+    Only the standalone MLA DSpark drafter's CUTEDSL block decode does.
+    """
+    return decoding_type == "DSpark" and attention_backend == "CUTEDSL"
+
+
 class AutoDecodingConfig(DecodingBaseConfig):
     """Configuration for auto speculative decoding.
 

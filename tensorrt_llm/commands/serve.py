@@ -62,7 +62,8 @@ from tensorrt_llm.llmapi.disagg_utils import (
     validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           KvCacheConnectorConfig, SleepConfig,
-                                          TorchLlmArgs, build_cli_config)
+                                          TorchLlmArgs, build_cli_config,
+                                          drafter_reads_helix_sharded_context)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -2711,13 +2712,14 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
         return ("the same attention tensor parallelism (tensor_parallel_size, "
                 "or 1 with enable_attention_dp) in context_servers and "
                 "generation_servers")
-    # Only the CUTEDSL MLA DSpark drafter reads a helix-sharded context.
     if any(
             cfg.other_args.get("context_parallel_size", 1) != 1
-            for cfg in server_configs) and any(
-                cfg.other_args["speculative_config"].get(
-                    "attention_backend") != "CUTEDSL"
-                for cfg in server_configs):
+            for cfg in server_configs
+    ) and not all(
+            drafter_reads_helix_sharded_context(
+                cfg.other_args["speculative_config"].get("decoding_type"),
+                cfg.other_args["speculative_config"].get("attention_backend"))
+            for cfg in server_configs):
         return ("context_parallel_size 1, or DSpark with attention_backend "
                 "CUTEDSL, in both sections")
     for cfg in server_configs:

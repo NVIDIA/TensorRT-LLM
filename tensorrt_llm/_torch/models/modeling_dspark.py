@@ -91,6 +91,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
+from tensorrt_llm.llmapi.llm_args import drafter_reads_helix_sharded_context
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -3768,7 +3769,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     @property
     def reads_helix_sharded_ctx_pages(self) -> bool:
         """The CuTe DSL decode reads rank-local pages and returns softmax stats."""
-        return self._helix_mapping is not None and self.dflash_attention_backend == "CUTEDSL"
+        return self._helix_mapping is not None and drafter_reads_helix_sharded_context(
+            "DSpark", self.dflash_attention_backend
+        )
 
     def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
         """Every backend pages (``_paged_ctx_cache``); the kernels bound the page size:
