@@ -677,6 +677,13 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         if self.spec_worker is not None:
             self.spec_worker.release_request_state(request_id)
 
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        """Hand the executor's capturable guided decoder to the DFlash worker, which masks the
+        verification rows and rolls back rejected proposals (as SpecDecOneEngineForCausalLM)."""
+        if self.spec_worker is not None and hasattr(self.spec_worker, "set_guided_decoder"):
+            return self.spec_worker.set_guided_decoder(guided_decoder)
+        return False
+
     def forward(
         self,
         attn_metadata,
