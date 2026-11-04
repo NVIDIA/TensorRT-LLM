@@ -12,7 +12,7 @@ _SPLITS = {(40, 8): 4, (48, 8): 4, (48, 6): 4, (56, 8): 3, (60, 6): 3}
 _ENVELOPE = 1048576
 _WORKSPACE_ELEMENTS = (2048 + 160 * 16384 * 8) // 4
 _workspaces: dict[tuple[int, int], torch.Tensor] = {}
-_launchers: dict[tuple[int, int, int], tuple] = {}
+_launchers: dict[tuple[int, int, int, int], tuple] = {}
 
 
 @lru_cache(maxsize=None)
@@ -34,10 +34,11 @@ def supports(
         and scores.ndim == 2
         and (scores.shape[0], next_n) in _SPLITS
         and scores.dtype == torch.float32
-        and scores.stride() == (_ENVELOPE, 1)
-        and scores.shape[1] <= _ENVELOPE
+        and max_seq_len is not None
+        and _ENVELOPE <= max_seq_len <= _ENVELOPE + 256
+        and scores.stride() == (((max_seq_len + 255) // 256) * 256, 1)
+        and scores.shape[1] <= max_seq_len
         and scores.data_ptr() % 16 == 0
-        and max_seq_len == _ENVELOPE
         and lengths.device == scores.device
         and lengths.dtype == torch.int32
         and lengths.shape == (scores.shape[0] // next_n,)
@@ -48,7 +49,7 @@ def supports(
         and indices.is_contiguous()
         and indices.data_ptr() % 16 == 0
         and scores.untyped_storage().nbytes()
-        >= (scores.storage_offset() + scores.shape[0] * _ENVELOPE) * 4
+        >= (scores.storage_offset() + scores.shape[0] * scores.stride(0)) * 4
     )
 
 
@@ -68,7 +69,8 @@ def run(
     buffer: torch.Tensor,
     next_n: int,
 ) -> None:
-    key = (scores.get_device(), scores.shape[0], next_n)
+    stride = scores.stride(0)
+    key = (scores.get_device(), scores.shape[0], next_n, stride)
     launcher = _launchers.get(key)
     if launcher is None:
         if torch.cuda.is_current_stream_capturing():
@@ -88,12 +90,14 @@ def run(
         # All selected grids have 148 < rows * split <= 212. These are the
         # shared varlen launcher's tail parameters for those actual rows.
         assert rows * split > 148
-        pre = (0, _ENVELOPE, 2048, 8192, 4096, split, 0, 0, 0, 0, 0)
+        pre = (0, stride, 2048, 8192, 4096, split, 0, 0, 0, 0, 0)
         tail = (2816, 48, 7168, 1, 0)
         launcher = (fn, pre, tail)
         _launchers[key] = launcher
-        logger.info(f"Rubin GVR TopK: rows={rows}, next_n={next_n}, R={split}, CTAs={rows * split}")
+        logger.info(
+            f"Rubin GVR TopK: rows={rows}, next_n={next_n}, R={split}, CTAs={rows * split}, stride={stride}"
+        )
     fn, pre, tail = launcher
-    logits = scores.as_strided((scores.shape[0], _ENVELOPE), (_ENVELOPE, 1))
+    logits = scores.as_strided((scores.shape[0], stride), (stride, 1))
     # The hint-free engine does not read the legacy pre_idx ABI slot.
     fn(logits, indices, indices, buffer, *pre, lengths, *tail)
