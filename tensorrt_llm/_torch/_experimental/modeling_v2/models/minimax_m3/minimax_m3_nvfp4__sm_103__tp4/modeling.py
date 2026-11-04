@@ -102,7 +102,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+    MiniMaxM3MsaSparseAttention,
+    msa_backend,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MsaCopySite
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -4477,10 +4480,14 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
       noise otherwise splits them, and the slowest rank sets every step).
     * ``skip_greedy_rng_upload``: all-greedy speculative batches never read the Philox seeds.
     * ``spec_step_fold``: the spec sampler's slot stores and the engine's next-step input gathers in one launch each.
+    * ``skip_unchanged_h2d``: steady decode re-uploads slot indices, query lengths and page tables that rarely change;
+      each metadata buffer's owner skips an upload whose values the buffer already holds.
     * MSA: identity selections for short sequences (and short/long graph families), the one-launch KV-length update,
-      the decode tables built on the host (staged as copies, see ``_COPY_PLAN``), pool views built once.
+      unchanged block-table gathers skipped, the decode tables built on the host (staged as copies, see
+      ``_COPY_PLAN``), pool views built once.
     """
     return RuntimeHooks(
+        skip_unchanged_h2d=True,
         loop_on_execution_stream=True,
         merge_tuned_tactics_across_ranks=True,
         skip_greedy_rng_upload=True,
@@ -4488,30 +4495,34 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
         msa=MsaRuntimePolicy(
             short_sequence_identity=True,
             kv_update=_msa_kv_update_kernel.msa_kv_update,
+            skip_unchanged_block_offsets=True,
             stage_tables_on_host=True,
             reuse_pool_views=True,
         ),
     )
 
 
-#: The step's copies this target merges (one upload and one scatter per barrier instead of a chain of copies the next
-#: graph waits on, ~30 us of idle GPU at one request) and skips when unchanged (steady decode re-uploads slot indices,
-#: query lengths and page tables that rarely change). Each entry asserts, for this target's decode step, that no device
-#: work touches the destination before its barrier (``merge``; the graph replay unless ``flush_after`` adds an earlier
-#: one) or that nothing else writes it (``skip_unchanged``); ``TLLM_DEVICE_COPY_CHECK=1`` verifies both.
+#: The step's copies this target merges: one upload and one scatter per barrier instead of a chain of copies the next
+#: graph waits on (~30 us of idle GPU at one request). Each entry asserts, for this target's decode step, that no device
+#: work touches the destination before its barrier: the graph replay, or right after the anchor's own staged copy for a
+#: ``flush_after`` site. ``TLLM_DEVICE_COPY_CHECK=1`` verifies it. Whether an upload is skipped as unchanged is not the
+#: plan's business: the buffer owners decide (``skip_unchanged_h2d`` in ``_runtime_hooks``).
 _COPY_PLAN = CopyPlan(
     merge={
         CopySite.GRAPH_INPUT_IDS,
         CopySite.GRAPH_POSITION_IDS,
         CopySite.INPUT_POSITION_IDS,
         CopySite.ATTN_KV_LENS,
+        CopySite.ATTN_PROMPT_LENS,
         MsaCopySite.SHORT_TABLE,
         MsaCopySite.N_VALID_BLOCKS,
         MsaCopySite.OUT_CACHE_LOC,
         MsaCopySite.KV_INDICES,
-        # This target's KV pool has sub-pages, so write_subpage_block_table reads the block table on the device right
-        # after its copy, before the replay: BLOCK_TABLE is a barrier (flush_after below). SEQ_LENS has no such reader
-        # because the runtime hooks stage tables on the host.
+        # This target's KV pool has sub-pages. The forward expands the sub-page table from the block table
+        # (msa_backend.SUBPAGE_IN_GRAPH), so nothing reads it on the device before the replay; with that switch off,
+        # write_subpage_block_table reads it right after its copy, on exactly the steps the copy was issued, and
+        # BLOCK_TABLE is a barrier (flush_after below). SEQ_LENS has no such reader because MSA stages tables on the
+        # host.
         MsaCopySite.BLOCK_TABLE,
         MsaCopySite.SEQ_LENS,
         MsaCopySite.QO_LENS,
@@ -4521,18 +4532,7 @@ _COPY_PLAN = CopyPlan(
         MsaCopySite.Q_INTRA,
         MsaCopySite.KV_LENS_STAGED,
     },
-    flush_after={MsaCopySite.BLOCK_TABLE},
-    skip_unchanged={
-        CopySite.ATTN_PROMPT_LENS,
-        MsaCopySite.SHORT_TABLE,
-        MsaCopySite.OUT_CACHE_LOC_TAIL,
-        MsaCopySite.BLOCK_TABLE,
-        MsaCopySite.QO_LENS,
-        MsaCopySite.CU_Q_LENS,
-        MsaCopySite.Q_BATCH_ROW,
-        MsaCopySite.Q_INTRA,
-        MsaCopySite.BLOCK_OFFSETS,
-    },
+    flush_after=set() if msa_backend.SUBPAGE_IN_GRAPH else {MsaCopySite.BLOCK_TABLE},
 )
 
 
