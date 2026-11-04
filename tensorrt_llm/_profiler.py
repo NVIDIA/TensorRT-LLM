@@ -61,6 +61,7 @@ _METADATA_PREFIX = "TRTLLM1"
 
 
 def _parse_custom_regions(value: str | None) -> frozenset[ProfilerRegion]:
+    """Parse the startup selector, rejecting unknown or repeated region names."""
     if value is None or not value.strip():
         return _CUSTOM_REGION_DEFAULTS
     regions = [region.strip(" \t\r\n") for region in value.split(",")]
@@ -79,6 +80,7 @@ def _parse_custom_regions(value: str | None) -> frozenset[ProfilerRegion]:
 
 
 def _load_custom_regions() -> frozenset[ProfilerRegion]:
+    """Load the startup selector and warn before falling back to defaults."""
     try:
         return _parse_custom_regions(os.environ.get(_CUSTOM_REGIONS_ENV))
     except ValueError as error:
@@ -127,6 +129,7 @@ def warn_profiler_failure(name: str, region: ProfilerRegion, phase: str, error: 
 
 
 def _validate_metadata_value(value: MetadataValue) -> None:
+    """Reject values that cannot be encoded as supported finite literals."""
     if type(value) not in (type(None), str, bool, int, float, list, tuple, dict):
         raise TypeError(f"Unsupported profiler metadata value: {type(value).__name__}")
     if value is None or isinstance(value, (str, bool, int)):

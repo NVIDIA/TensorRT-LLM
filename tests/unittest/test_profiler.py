@@ -131,6 +131,7 @@ def test_decoder_rejects_invalid_envelopes(payload: str) -> None:
 def test_inactive_scopes_do_not_evaluate_metadata(
     monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
+    """Avoid metadata evaluation while the PyTorch profiler is inactive."""
     monkeypatch.setattr(
         profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if enabled else frozenset()
     )
@@ -148,6 +149,7 @@ def test_inactive_scopes_do_not_evaluate_metadata(
 
 
 def test_none_selection_emits_no_custom_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Suppress custom events and metadata when no regions are selected."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
     calls = 0
 
@@ -167,6 +169,7 @@ def test_none_selection_emits_no_custom_scopes(monkeypatch: pytest.MonkeyPatch) 
 def test_active_scope_preserves_result_and_records_real_cpu_event(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Record a real CPU event while preserving the observed operation."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
     calls = 0
 
@@ -192,6 +195,7 @@ def test_active_scope_preserves_result_and_records_real_cpu_event(
 def test_real_execution_trace_receives_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Preserve typed fields in a real execution-trace observer output."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
     trace_file = tmp_path / "execution.json"
     observer = torch.profiler.ExecutionTraceObserver().register_callback(str(trace_file))
@@ -214,9 +218,50 @@ def test_real_execution_trace_receives_metadata(
     )
 
 
+@pytest.mark.skipif(
+    not hasattr(torch.profiler, "ExecutionTraceObserver"), reason="requires ExecutionTraceObserver"
+)
+def test_real_execution_trace_preserves_preencoded_metadata_and_body_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Preserve encoded bytes, body side effects, and return identity."""
+    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    payload = "TRTLLM18:workflow{'rank':-7,'ids':[],'label':'preencoded'}"
+    result = object()
+    effects: list[str] = []
+
+    @profiler.record_function_metadata_scope("preencoded", "workflow", lambda: payload)
+    def operation() -> object:
+        effects.append("body")
+        torch.ones(1)
+        return result
+
+    trace_file = tmp_path / "preencoded-execution.json"
+    observer = torch.profiler.ExecutionTraceObserver().register_callback(str(trace_file))
+    try:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ):
+            assert operation() is result
+    finally:
+        observer.unregister_callback()
+    assert effects == ["body"]
+    nodes = [
+        node for node in json.loads(trace_file.read_text())["nodes"] if node["name"] == "preencoded"
+    ]
+    assert len(nodes) == 1
+    recorded = nodes[0]["inputs"]["values"][0]
+    assert recorded == payload
+    assert decode_profiler_metadata(recorded) == (
+        "workflow",
+        {"rank": -7, "ids": [], "label": "preencoded"},
+    )
+
+
 def test_contextmanager_decorator_preserves_arguments_and_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Preserve decorated call arguments, result, and CPU scope emission."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
 
     @profiler.record_function_metadata_scope("decorated", "workflow", lambda: {"rank": -7})
@@ -294,6 +339,7 @@ def test_metadata_diagnostic_failures_preserve_workload_outcome(
     real_import = builtins.__import__
 
     def fail_logger_import(name: str, *args: object, **kwargs: object) -> object:
+        """Fail logger imports while preserving all unrelated imports."""
         if name in {"logger", "tensorrt_llm.logger"}:
             raise ImportError("diagnostic import failed")
         return real_import(name, *args, **kwargs)
@@ -317,12 +363,14 @@ def test_metadata_diagnostic_failures_preserve_workload_outcome(
 def test_metadata_failures_preserve_body_and_original_exception(
     monkeypatch: pytest.MonkeyPatch, active: bool, metadata_fails: bool
 ) -> None:
+    """Keep body results and exceptions independent of metadata failures."""
     monkeypatch.setattr(
         profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if active else frozenset()
     )
     original = RuntimeError("operation failed")
 
     def metadata() -> dict[str, profiler.MetadataValue]:
+        """Return literal fields or inject the selected metadata failure."""
         if metadata_fails:
             raise LookupError("observational metadata failed")
         return {"rank": -7}
@@ -376,6 +424,7 @@ def test_profiler_failures_preserve_body_and_original_exception(
 def test_profiler_operation_failures_warn_once(
     monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
+    """Warn once for repeated scope entry or cleanup failures."""
     from tensorrt_llm.logger import logger
 
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
@@ -386,6 +435,7 @@ def test_profiler_operation_failures_warn_once(
     original = getattr(torch.profiler.record_function, method)
 
     def fail(scope: object, *args: object) -> None:
+        """Inject the selected scope failure after any required real cleanup."""
         if boundary == "cleanup":
             original(scope, *args)
         raise RuntimeError("injected observational failure")
