@@ -107,8 +107,8 @@ _W_HEAD_BYTES = V_HEAD_DIM * LATENT_DIM * 2
 _LAT_ROW_BYTES = LATENT_DIM * 2
 #: Row stride of ``W_UV`` in shared memory (64 bytes of padding against bank conflicts).
 _W_ROW_BYTES = _LAT_ROW_BYTES + 64
-#: Warps whose lane 0 issues an equal share of ``W_UV``'s row copies: the copies of one warp
-#: issue one at a time, and four issuing warps land the 128 KB about 1.5 us sooner than one.
+#: Warps whose lane 0 issues an equal share of ``W_UV``'s row copies (the copies of one thread
+#: issue one at a time).
 _W_ISSUE_WARPS = 4
 #: Row stride of the token-major BF16 output staging (128 values + 16 bytes against bank conflicts).
 _C_ROW_BYTES = V_HEAD_DIM * 2 + 16

@@ -928,7 +928,7 @@ class _AllReducePushMixin:
         return cur, nbytes
 
     #: Features of one Lamport slot row of the push (0: the GEMM's N). Ranks that push slices of
-    #: different widths into the slots of one all-gather (``kimi_k3_moe_front``) set it wider.
+    #: different widths into the slots of one all-gather set it wider.
     push_slot_n: int = 0
 
     @cute.jit
@@ -3623,8 +3623,8 @@ _SM107_TABLES = _ShapeTables(
     nvfp4_out_route={
         (3584, 7168): ((1, 16, "low", 3), (17, 96, "mid", 4), (97, 256, "mid", None)),
     },
-    # o_proj + MNNVL all-reduce on 4 Rubin ranks, default GEMM + copy push + finish against the
-    # mid-M push + finish: 15.97 / 13.06 us at 120 rows, 16.49 / 14.74 at 144, 18.24 / 17.77 at 192.
+    # The mid-M push + finish beats the default GEMM + copy push + finish of the MNNVL
+    # all-reduce up to these rows.
     push_max_m={
         (7168, 1536): 192,
     },
@@ -4081,9 +4081,8 @@ def default_prequantized_tactic(m: int, n: int, k: int) -> MidMTactic:
     return best
 
 
-#: Shared memory of a staged CTA (:func:`staged_prequantized_tactic`): with the producer's CTAs
-#: at the largest carve-out (``kimi_k3_attn_res`` ``entry_trigger``), a CTA of up to 225 KB lands
-#: on an SM that runs a 1 KB CTA (measured on Rubin); 220 KB leaves room for a few KB more.
+#: Shared memory of a staged CTA (:func:`staged_prequantized_tactic`): small enough to land on
+#: an SM at the largest carve-out next to a producer CTA with a few KB of shared memory.
 STAGED_SMEM_BYTES = 220 * 1024
 
 
