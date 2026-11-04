@@ -18,7 +18,6 @@ import json
 import os
 import pickle  # nosec B403
 import shutil
-import sys
 import tempfile
 import threading
 import time
