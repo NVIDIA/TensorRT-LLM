@@ -72,12 +72,14 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
-| **Qwen-Image 2.1** | No | No | No | No | Untested | No | No | No | Untested | Untested | Untested | No | No | No | No | No |
+| **Qwen-Image 2.1** | No | No | No | No | No | No | No | No | No | No | No | No | No | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
+
+Qwen-Image 2.1's conditioning-prefix KV cache is distinct from TeaCache and Cache-DiT.
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
@@ -168,40 +170,6 @@ params.image_reference = [
 FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
 
 The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
-
-## Qwen-Image 2.1 Notes
-
-Qwen-Image 2.1 uses a separate single-stream transformer with block-causal
-attention, Qwen3-VL conditioning, and a 64-channel image VAE. It does not inherit
-the original Qwen-Image model's optimization support. The baseline configuration
-uses single-GPU BF16 inference with `VANILLA` attention and disables CUDA graphs
-and `torch.compile`. `Untested` in the feature matrix means the feature is not
-validated for this model, even if shared infrastructure exposes the option.
-
-Run the text-to-image example from the repository root:
-
-```bash
-python examples/visual_gen/models/qwen_image_21.py \
-    --model Qwen/Qwen-Image-2.1 \
-    --visual_gen_args examples/visual_gen/configs/qwen-image-2.1-bf16-1gpu.yaml \
-    --prompt "A mountain lake at sunrise, watercolor style" \
-    --height 1024 --width 1024 --num_inference_steps 40 \
-    --seed 42 --output_path qwen_image_21.png
-```
-
-- Prefix KV caching reuses static conditioning keys and values across denoising
-  steps. It is enabled by default through `extra_params.use_kv_cache`; pass
-  `--disable_kv_cache` to the example for comparison. This is distinct from
-  TeaCache and Cache-DiT, which are not integrated into this denoising loop.
-- The runtime reuses Diffusers' `AutoencoderKLQwenImage21`,
-  `FlowMatchEulerDiscreteScheduler`, `Timesteps`, `TimestepEmbedding`, and regular
-  Q/K `RMSNorm`. The text projection retains its separate zero-centered norm.
-  The installed Diffusers version must expose `AutoencoderKLQwenImage21`;
-  the older `AutoencoderKLQwenImage` is not a compatible substitute.
-- The example exposes optional reference-image conditioning, but image-editing
-  parity is not established here. The supported-task list is limited to
-  text-to-image. Negative-prompt classifier-free guidance is not implemented
-  by this forward path.
 
 ## MiniMax-H3 Notes
 
