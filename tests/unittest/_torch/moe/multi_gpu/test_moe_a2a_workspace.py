@@ -48,6 +48,8 @@ def _run_worker(capture, in_workspace, low_precision):
         with pytest.MonkeyPatch.context() as patch:
             # Pin worker-side policy rather than inheriting user/CI overrides.
             patch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB", raising=False)
+            patch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT", raising=False)
+            patch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT_MAX_TOKENS", raising=False)
             try:
                 rank = tllm.mpi_rank()
                 assert tllm.mpi_world_size() == _EP_SIZE
