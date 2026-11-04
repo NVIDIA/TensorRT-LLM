@@ -92,7 +92,7 @@ def _serving(engine: _FailingEngine) -> CompletionServing:
         metrics_collector=None,
         adjusted_steady_clock=AdjustedSteadyClock(time_source=time.monotonic),
         iteration_stats_wakeup_event=asyncio.Event(),
-        iteration_stats_collector_task=lambda: None,
+        iteration_stats_collector_task_getter=lambda: None,
         internal_disagg_auth_key=None,
         per_request_spec_decode_stats=False,
         spec_decode_num_spec_tokens=None,

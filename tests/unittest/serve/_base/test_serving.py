@@ -26,7 +26,7 @@ GENERATE_ATTRIBUTES = {
     "metrics_collector": "metrics_collector",
     "adjusted_steady_clock": "_adjusted_steady_clock",
     "iteration_stats_wakeup_event": "_iteration_stats_wakeup_event",
-    "iteration_stats_collector_task": "_iteration_stats_collector_task_getter",
+    "iteration_stats_collector_task_getter": "_iteration_stats_collector_task_getter",
     "internal_disagg_auth_key": "_internal_disagg_auth_key",
     "per_request_spec_decode_stats": "_per_request_spec_decode_stats",
     "spec_decode_num_spec_tokens": "_spec_decode_num_spec_tokens",
@@ -46,7 +46,7 @@ def _generate_dependencies():
         "metrics_collector": None,
         "adjusted_steady_clock": object(),
         "iteration_stats_wakeup_event": object(),
-        "iteration_stats_collector_task": lambda: None,
+        "iteration_stats_collector_task_getter": lambda: None,
         "internal_disagg_auth_key": None,
         "per_request_spec_decode_stats": False,
         "spec_decode_num_spec_tokens": None,
@@ -87,7 +87,7 @@ def test_iteration_stats_collector_task_reads_the_roots_current_binding():
     # follows the root's binding instead of freezing the value at construction.
     root = SimpleNamespace(task=None)
     serving = GenerateBaseServing(
-        **{**_generate_dependencies(), "iteration_stats_collector_task": lambda: root.task}
+        **{**_generate_dependencies(), "iteration_stats_collector_task_getter": lambda: root.task}
     )
     assert serving._iteration_stats_collector_task is None
     root.task = object()

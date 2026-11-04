@@ -59,7 +59,7 @@ class GenerateBaseServing(BaseServing):
                  metrics_collector: Optional[MetricsCollector],
                  adjusted_steady_clock: AdjustedSteadyClock,
                  iteration_stats_wakeup_event: asyncio.Event,
-                 iteration_stats_collector_task: Callable[
+                 iteration_stats_collector_task_getter: Callable[
                      [], Optional[asyncio.Task]],
                  internal_disagg_auth_key: Optional[str],
                  per_request_spec_decode_stats: bool,
@@ -77,7 +77,7 @@ class GenerateBaseServing(BaseServing):
         self._adjusted_steady_clock = adjusted_steady_clock
         self._iteration_stats_wakeup_event = iteration_stats_wakeup_event
         self._iteration_stats_collector_task_getter = (
-            iteration_stats_collector_task)
+            iteration_stats_collector_task_getter)
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._per_request_spec_decode_stats = per_request_spec_decode_stats
         self._spec_decode_num_spec_tokens = spec_decode_num_spec_tokens

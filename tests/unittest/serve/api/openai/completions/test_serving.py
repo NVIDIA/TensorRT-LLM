@@ -35,7 +35,7 @@ REQUIRED = (
     "metrics_collector",
     "adjusted_steady_clock",
     "iteration_stats_wakeup_event",
-    "iteration_stats_collector_task",
+    "iteration_stats_collector_task_getter",
     "internal_disagg_auth_key",
     "per_request_spec_decode_stats",
     "spec_decode_num_spec_tokens",
@@ -75,7 +75,7 @@ def _dependencies(tmp_path):
         "metrics_collector": None,
         "adjusted_steady_clock": AdjustedSteadyClock(),
         "iteration_stats_wakeup_event": asyncio.Event(),
-        "iteration_stats_collector_task": lambda: None,
+        "iteration_stats_collector_task_getter": lambda: None,
         "internal_disagg_auth_key": None,
         "per_request_spec_decode_stats": False,
         "spec_decode_num_spec_tokens": None,
@@ -172,6 +172,29 @@ def test_completions_route_single_prompt(role, serve_env):
     assert call.inputs == {"prompt_token_ids": [6]}  # "hello" through the real input processor
     assert call.kwargs["streaming"] is False
     assert call.kwargs["kv_hints"] is None
+
+
+def test_completions_route_merges_several_prompts(serve_env):
+    server, client = _llm_server(serve_env)
+    response = client.post("/v1/completions", json={**BODY, "prompt": ["hello", "hi"]})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # One choice per prompt, in prompt order, merged into one response.
+    assert [(choice["index"], choice["text"]) for choice in body["choices"]] == [
+        (0, "ok"),
+        (1, "ok"),
+    ]
+    # Usage sums the per-prompt usages: one prompt token ("hello", "hi") and one
+    # completion token each; the merged response lists prompt ids only for
+    # context-only requests, so here the list is empty.
+    assert body["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 2,
+        "total_tokens": 4,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    assert body["prompt_token_ids"] == []
+    assert [call.kwargs["streaming"] for call in server.generator.generate_calls] == [False, False]
 
 
 def test_completions_route_streams_several_prompts(serve_env):

@@ -1143,7 +1143,7 @@ class OpenAIServer(_VideoRoutesMixin):
             iteration_stats_wakeup_event=self._iteration_stats_wakeup_event,
             # The lifespan creates the collector task after the serving
             # objects exist, so they read this object's current binding.
-            iteration_stats_collector_task=(
+            iteration_stats_collector_task_getter=(
                 lambda: self._iteration_stats_collector_task),
             internal_disagg_auth_key=self._internal_disagg_auth_key,
             per_request_spec_decode_stats=self._per_request_spec_decode_stats,
