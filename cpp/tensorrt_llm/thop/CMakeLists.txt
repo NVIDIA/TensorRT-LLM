@@ -29,6 +29,9 @@ else() # Windows
 endif()
 
 add_library(th_utils STATIC thUtils.cpp)
+# Shared-library consumers must explicitly link ${SHARED_TARGET} before the
+# transitive static components of tllm::torch_utils to share its logger and
+# driver-wrapper singletons (see cmake/modules/modeling_v2.cmake).
 add_library(tllm::torch_utils ALIAS th_utils)
 # Torch headers require C++20 reversed operator== synthesis.
 target_compile_features(th_utils PUBLIC cxx_std_20)
