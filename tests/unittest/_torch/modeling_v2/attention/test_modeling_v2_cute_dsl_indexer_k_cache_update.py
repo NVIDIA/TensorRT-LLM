@@ -305,9 +305,7 @@ def _build_manager(spec, seed):
         assert sum(manager.indexer_k_cache_local_layer_mask) == spec["pool_layers"]
         assert manager.indexer_k_cache_page_scale == spec["pool_layers"]
         ids = list(range(len(new)))
-        added = manager.add_dummy_requests(
-            ids, [c + n for c, n in zip(cached, new)], is_gen=False, prepare_resource=True
-        )
+        added = manager.add_dummy_requests(ids, [c + n for c, n in zip(cached, new)], is_gen=False)
         assert added is not None, "the pool cannot hold the cell's requests"
         if "max_num_tokens" in spec:
             contexts = sum(1 for c, n in zip(cached, new) if c == 0 or n > 1)

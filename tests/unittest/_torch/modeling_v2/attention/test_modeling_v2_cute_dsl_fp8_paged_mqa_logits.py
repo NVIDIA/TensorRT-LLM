@@ -261,7 +261,7 @@ def _ml4_manager(spec):
         lens = spec["context_lens"]
         ids = list(range(len(lens)))
         # A manager refuses a population past its `max_tokens` quota by returning None.
-        added = manager.add_dummy_requests(ids, lens, is_gen=False, prepare_resource=True)
+        added = manager.add_dummy_requests(ids, lens, is_gen=False)
         assert added is not None, f"the manager refused {lens} at max_tokens {spec['max_tokens']}"
         if not v2:
             # V1 reads the block ids back from the offsets the attention metadata copies.
