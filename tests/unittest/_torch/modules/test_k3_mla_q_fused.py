@@ -293,7 +293,11 @@ def _run_fused(md, w, x, rot, norm=None):
     )
 
 
-class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
+# _run_probed swaps the module's class for the probe; the probe calls these production methods.
+_PRODUCTION_KERNEL = fused_mod.K3MlaQFusedKernel
+
+
+class _ProbedQFusedKernel(_PRODUCTION_KERNEL):
     """The fused kernel, also storing its BF16 intermediates at the device addresses ``qb_addr``
     (q_b output ``[t_pad, 96 * 192]``, q_pe before RoPE) and ``ob_addr`` (absorbed query
     ``[t_pad, 96, 512]``), set on a subclass per launch."""
@@ -303,7 +307,7 @@ class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
 
     @cute.jit
     def absorb(self, warp: Int32, lane: Int32, wuk_s: Int32, qn_s: Int32, ob_s: Int32):
-        fused_mod.K3MlaQFusedKernel.absorb(self, warp, lane, wuk_s, qn_s, ob_s)
+        _PRODUCTION_KERNEL.absorb(self, warp, lane, wuk_s, qn_s, ob_s)
         # Both CTAs of the head hold all of q_nope; both store it.
         bidx, _, _ = cute.arch.block_idx()
         head = bidx // Int32(2)
@@ -321,7 +325,7 @@ class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
     @cute.jit
     def store_prefix_group(self, t, grp, rank, head, gs, ob_s, qfp4_addr, qsf_addr, gen_len,
                            rows_per_seq):  # fmt: skip
-        fused_mod.K3MlaQFusedKernel.store_prefix_group(
+        _PRODUCTION_KERNEL.store_prefix_group(
             self, t, grp, rank, head, gs, ob_s, qfp4_addr, qsf_addr, gen_len, rows_per_seq
         )
         src = ob_s + t * Int32(fused_mod._OB_PITCH) + grp * Int32(32)
@@ -333,7 +337,7 @@ class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
     @cute.jit
     def store_rope_group(self, t, rg, head, gs, qpe_s, cs_s, qfp4_addr, qsf_addr, gen_len,
                          rows_per_seq):  # fmt: skip
-        fused_mod.K3MlaQFusedKernel.store_rope_group(
+        _PRODUCTION_KERNEL.store_rope_group(
             self, t, rg, head, gs, qpe_s, cs_s, qfp4_addr, qsf_addr, gen_len, rows_per_seq
         )
         src = qpe_s + t * Int32(fused_mod._QPE_PITCH) + rg * Int32(32)
@@ -354,14 +358,13 @@ def _run_probed(md, w, x, rot):
     probe = type(
         "_Probe", (_ProbedQFusedKernel,), {"qb_addr": qb.data_ptr(), "ob_addr": ob.data_ptr()}
     )
-    production = fused_mod.K3MlaQFusedKernel
     fused_mod._compiled.cache_clear()
     fused_mod.K3MlaQFusedKernel = probe
     try:
         _run_fused(md, w, x, rot)
         torch.cuda.synchronize()
     finally:
-        fused_mod.K3MlaQFusedKernel = production
+        fused_mod.K3MlaQFusedKernel = _PRODUCTION_KERNEL
         fused_mod._compiled.cache_clear()
     return qb[:num_tokens], ob[:num_tokens]
 
