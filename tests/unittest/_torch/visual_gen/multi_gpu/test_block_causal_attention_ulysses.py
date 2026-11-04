@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BlockCausalKVCacheManager under Ulysses: two ranks, each holding a head slice of the cache.
+"""PagedRolloutKVCache under Ulysses: two ranks, each holding a head slice of the cache.
 
 Every rank builds the same random full-head q/k/v, feeds the wrapper its token
 slice, and checks its token slice of the output against a full-head dense
@@ -38,13 +38,11 @@ from tensorrt_llm._torch.distributed import all_to_all_4d
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
-from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
-from tensorrt_llm._torch.visual_gen.config import (
-    DiffusionModelConfig,
-    create_attention_metadata_state,
-)
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
+from tensorrt_llm._torch.visual_gen.cache import PagedRolloutKVCache, RolloutSpec
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 WORLD = 2
@@ -93,15 +91,7 @@ def make_backend(name, chunk, prompt=PROMPT, window=WINDOW):
         return CuDNNAttention(
             layer_idx=0, num_heads=heads, head_dim=HEAD_DIM, num_kv_heads=kv_heads, dtype=DTYPE
         )
-    return TrtllmAttention(
-        layer_idx=0,
-        num_heads=heads,
-        head_dim=HEAD_DIM,
-        num_kv_heads=kv_heads,
-        dtype=DTYPE,
-        max_seq_len=prompt + window + chunk + TPB,
-        attention_metadata_state={},
-    )
+    return CuTeDSLAttention(layer_idx=0, num_heads=heads, head_dim=HEAD_DIM, num_kv_heads=kv_heads)
 
 
 def make_cache(chunk, prompt=PROMPT, window=WINDOW, kv_heads=NUM_KV_HEADS // WORLD, sizes=None):
@@ -114,13 +104,13 @@ def make_cache(chunk, prompt=PROMPT, window=WINDOW, kv_heads=NUM_KV_HEADS // WOR
         causal_blocks={size: chunk // size for size in sizes},
         max_pin_tokens=prompt,
     )
-    cache = BlockCausalKVCacheManager(
+    cache = PagedRolloutKVCache(
         num_layers=1,
         num_kv_heads=kv_heads,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=TPB,
-        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(spec, tokens_per_page=TPB),
+        pool_tokens=PagedRolloutKVCache.pool_tokens_for(spec, tokens_per_page=TPB),
     )
     cache.test_spec = spec
     return cache
@@ -161,9 +151,7 @@ def make_ulysses(rank, world_size, backend, chunk, prompt=PROMPT, window=WINDOW)
 
 def read_kv(cache, positions):
     buf = cache.kv_buffer(0)
-    table = cache.table.long()
-    page = table[positions // cache.tokens_per_page]
-    slot = positions % cache.tokens_per_page
+    page, slot = (torch.from_numpy(x).to(buf.device) for x in cache.locate(positions.cpu()))
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
@@ -197,7 +185,7 @@ def _logic_rollout(rank, world_size, backend):
         history_k, history_v = [], []
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
         per = chunk // world_size
-        for step in range(8):  # rotates the table more than once
+        for step in range(8):  # recycles every resident page
             q, k, v = rand_qkv(chunk)
             out = forward(attn, cache, q, k, v, rank)
             torch.cuda.synchronize()
@@ -219,7 +207,6 @@ def _logic_rollout(rank, world_size, backend):
             cache.commit(cache.max_staged_tokens)
             history_k.append(k)
             history_v.append(v)
-        assert cache.history_tokens < 8 * chunk, "window never rotated"
     finally:
         cache.shutdown()
 
@@ -338,9 +325,6 @@ def _logic_through_the_attention_module(rank, world_size, backend):
         attention=AttentionConfig(backend=backend.upper()),
         skip_create_weights_in_init=True,
     )
-    config.attention_metadata_state = (
-        create_attention_metadata_state() if backend == "trtllm" else None
-    )
     config.visual_gen_mapping = vgm
     attn = Attention(
         hidden_size=NUM_HEADS * HEAD_DIM,
@@ -385,9 +369,21 @@ def _logic_all(rank, world_size, backend):
     _logic_through_the_attention_module(rank, world_size, backend)
 
 
-@pytest.mark.parametrize("backend", ["cudnn", "trtllm"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "cudnn",
+        pytest.param(
+            "cutedsl",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available() or get_sm_version() not in (100, 103),
+                reason="the CuTe DSL kernel runs on SM100/SM103",
+            ),
+        ),
+    ],
+)
 def test_kv_cache_attention_under_ulysses(backend):
-    """A rollout through rotations, the clean pass in four page-unaligned causal blocks
+    """A rollout recycling its pages, the clean pass in four page-unaligned causal blocks
     cut after the all-to-all, a padded single-frame first chunk, a refused cache built
     for the full head count, and the model's path through the Attention module."""
     run_distributed(functools.partial(_logic_all, backend=backend))

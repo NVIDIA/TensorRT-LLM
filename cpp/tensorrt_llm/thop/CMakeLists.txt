@@ -154,9 +154,6 @@ add_th_common_family(
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
   sageQuantizeOp.cpp
-  blockCausalLayoutOp.cpp
-  rotateRowsOp.cpp
-  scatterKvSlotsOp.cpp
   denseFp8FmhaOp.cpp
   fusedDiTQKNormRopeFp8Op.cpp)
 # denseFp8FmhaOp.cpp includes the trtllm-gen FMHA runner headers; the interface
