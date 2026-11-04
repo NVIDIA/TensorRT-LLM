@@ -41,6 +41,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
+| `Qwen/Qwen-Image-2.1` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
 | `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
@@ -57,6 +58,11 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json` (or `modular_model_index.json` for modular pipelines); LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
 ### Feature Matrix
+
+Qwen-Image 2.1 has a separate pipeline and transformer from Qwen-Image.
+Its example configuration uses single-GPU BF16 inference; the Qwen-Image
+feature row below does not apply to it. See the
+[Qwen-Image 2.1 example](../examples/visual_gen/qwen-image-2.1.md).
 
 | Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | Text Encoder TP | SOL-Attn |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|

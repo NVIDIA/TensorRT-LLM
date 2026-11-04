@@ -296,6 +296,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
+| `Qwen/Qwen-Image-2.1` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
 | `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
@@ -320,3 +321,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+
+Qwen-Image 2.1 uses a separate pipeline and transformer; the Qwen-Image
+feature row does not apply to it. See the
+[Qwen-Image 2.1 example](../examples/visual_gen/qwen-image-2.1.md)
+for its single-GPU BF16 configuration.
