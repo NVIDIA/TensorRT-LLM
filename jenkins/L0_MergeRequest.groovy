@@ -1954,6 +1954,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/api/anthropic/api_router.py",
         "tensorrt_llm/serve/api/anthropic/serving.py",
         // Code moved out of tensorrt_llm/serve/openai_server.py keeps its trigger.
+        "tensorrt_llm/serve/api/openai/chat/",
         "tensorrt_llm/serve/api/openai/completions/",
         "tensorrt_llm/serve/api/openai/embeddings/",
         "tensorrt_llm/serve/api/openai/mm_encoder/",

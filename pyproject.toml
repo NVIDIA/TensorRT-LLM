@@ -890,6 +890,7 @@ files = [
     "tensorrt_llm/serve/_base/request_context.py",
     "tensorrt_llm/serve/_base/routing.py",
     "tensorrt_llm/serve/api/anthropic/api_router.py",
+    "tensorrt_llm/serve/api/openai/chat/api_router.py",
     "tensorrt_llm/serve/api/openai/completions/api_router.py",
     "tensorrt_llm/serve/api/openai/embeddings/api_router.py",
     "tensorrt_llm/serve/api/openai/mm_encoder/api_router.py",

@@ -589,8 +589,21 @@ class OpenAIServer(_VideoRoutesMixin):
             # They register before the routers so that they keep winning
             # over the local handlers: FastAPI matches in registration order.
             self._register_launcher_forwarding_routes()
-            messages_serving = AnthropicMessagesServing(
-                _AggregatedChatBackend(self))
+            from tensorrt_llm.serve.api.openai.chat import \
+                api_router as chat_router
+            from tensorrt_llm.serve.api.openai.chat.serving import ChatServing
+            self._chat_serving = ChatServing(
+                tool_parser=self.tool_parser,
+                tool_call_id_type=self.tool_call_id_type,
+                multimodal_server_config=self.multimodal_server_config,
+                allow_request_chat_template=self.allow_request_chat_template,
+                use_harmony=self.use_harmony,
+                harmony_adapter=self.harmony_adapter,
+                render_resources=self._render_resources,
+                **self._generate_serving_kwargs())
+            setattr(self.app.state, chat_router.APP_STATE_KEY,
+                    self._chat_serving)
+            messages_serving = AnthropicMessagesServing(self._chat_serving)
             self.app.state.anthropic_serving_messages = messages_serving
             # Transitional: RenderResources per request until it is built once.
             self.app.state.anthropic_serving_count_tokens = (
@@ -946,10 +959,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 "/_resource_governor/ will not be available.")
             self.resource_governor = None
 
-        self.app.add_api_route(
-            "/v1/chat/completions",
-            self.openai_chat if not self.use_harmony else self.chat_harmony,
-            methods=["POST"])
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
