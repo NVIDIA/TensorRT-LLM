@@ -354,6 +354,8 @@ The optional safetensors backend uses a private shared directory on one host.
 It applies the same single-use and request-identity checks, with a 64 MiB tensor
 limit and a 256 MiB serialized-cache limit.
 
-The helpers require the matching OpenEngine encoder-handoff schema. Serving
-role discovery, request dispatch and lifecycle integration are provided by the
-stacked serving change.
+The helpers use the encoder-handoff contract proposed in
+[OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
+immutable source revision in the vendor lock. It is not in a published BSR
+release. Serving role discovery, request dispatch and lifecycle integration are
+provided by the stacked serving change.

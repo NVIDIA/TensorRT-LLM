@@ -187,7 +187,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
             assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
             assert info.schema_revision == 1
             assert info.minimum_client_revision == 1
-            assert info.schema_release == "768a93c7b44e40f28c692ad0b471a8f2"
+            assert info.schema_release == "9b6f34f9efb17aa2c6b7e0ad737b78106a8ecca3"
         finally:
             await channel.close()
             await server.stop(grace=0)
