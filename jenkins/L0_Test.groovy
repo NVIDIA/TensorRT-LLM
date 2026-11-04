@@ -533,11 +533,9 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
-                throw e
-            }
             def rerunResult = rerunFailedTests(
                 pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext)
+            def testFailed = rerunResult.failed
             if (rerunResult.failed) {
                 echo "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
                 // Mark that at least one isolated test failed, but continue processing other tests
@@ -558,6 +556,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     // the duration/no-signature message below, which doesn't apply.
                     generateTimeoutTestResultXml(pipeline, stageName)
                     echo "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
+                    testFailed = true
                 } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
                     String scope = retryContext?.scope ?: InfraFailure.K8S
                     def classified = classifyFailure(pipeline, e, scope, retryContext)
@@ -570,6 +569,12 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     // <failure> with nothing here to flag it.
                     echo "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
                     hasUnrerunFailure = true
+                    testFailed = true
+                }
+            }
+            if (testFailed) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                    throw e
                 }
             }
         } finally {
@@ -6120,9 +6125,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
-                            throw e
-                        }
                         def rerunResult = rerunFailedTests(
                             pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag, retryContext)
                         // Unconditional: a test can crash again during the rerun itself
@@ -6149,6 +6151,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             // them, so without this the stage silently reports green.
                             echo "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
                             hasUnrerunFailure = true
+                        }
+                        if (rerunResult.failed || hadUnfinishedTests || hasUnrerunFailure) {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                                throw e
+                            }
                         }
                     }
 
