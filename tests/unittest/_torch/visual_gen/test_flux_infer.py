@@ -19,6 +19,7 @@ from tensorrt_llm._torch.modules.linear import (
 )
 from tensorrt_llm._torch.visual_gen.batching import BatchInfo
 from tensorrt_llm._torch.visual_gen.models.flux import Flux2Pipeline, FluxPipeline
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -62,6 +63,41 @@ def test_batching_quantization_eligibility(
     torch.nn.Module.__init__(pipeline)
     # A nested quantized layer among unquantized layers also gates the pipeline.
     pipeline.transformer = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Sequential(layer))
+    pipeline.transformer.model_config = SimpleNamespace(attention=AttentionConfig())
+    assert pipeline.supports_dynamic_batching is expected
+
+
+@pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
+@pytest.mark.parametrize(
+    "backend,qk_dtype,v_dtype,expected",
+    [
+        ("CUDNN", None, None, True),
+        ("CUDNN", "fp8", "fp8", False),
+        ("CUDNN", "mxfp8", "mxfp8", True),
+        ("FLASHINFER", None, None, True),
+        ("FLASHINFER", "mxfp8", "fp8", False),
+        ("FLASHINFER", "nvfp4", "fp8", False),
+        ("FLASHINFER", "nvfp4", "nvfp4", False),
+    ],
+)
+def test_batching_attention_quantization_eligibility(
+    pipeline_cls: type[FluxPipeline] | type[Flux2Pipeline],
+    backend: str,
+    qk_dtype: str | None,
+    v_dtype: str | None,
+    expected: bool,
+) -> None:
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    pipeline.transformer.model_config = SimpleNamespace(
+        attention=AttentionConfig(
+            backend=backend,
+            quant_attention_config=(
+                {"qk_dtype": qk_dtype, "v_dtype": v_dtype} if qk_dtype is not None else None
+            ),
+        )
+    )
     assert pipeline.supports_dynamic_batching is expected
 
 

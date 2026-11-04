@@ -861,6 +861,7 @@ class QwenImageTransformerBlock(nn.Module):
         txt_modulated, txt_gate1 = self._modulate(self.txt_norm1(encoder_hidden_states), txt_mod1)
 
         # Joint attention.
+        attention_kwargs = {} if request_batch is None else {"request_batch": request_batch}
         img_attn_output, txt_attn_output = self.attn(
             hidden_states=img_modulated,
             encoder_hidden_states=txt_modulated,
@@ -868,7 +869,7 @@ class QwenImageTransformerBlock(nn.Module):
             fused_rotary_emb=fused_rotary_emb,
             attention_mask=attention_mask,
             timestep=timestep,
-            request_batch=request_batch,
+            **attention_kwargs,
         )
 
         # Residual.

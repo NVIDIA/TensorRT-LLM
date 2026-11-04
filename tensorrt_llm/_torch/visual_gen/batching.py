@@ -14,6 +14,8 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 if TYPE_CHECKING:
+    from tensorrt_llm.visual_gen.args import AttentionConfig
+
     from .executor import DiffusionRequest
     from .output import PipelineOutput
 
@@ -27,9 +29,19 @@ class BatchInfo:
     seeds: tuple[int, ...]
 
 
-def has_unsupported_batch_quantization(module: torch.nn.Module) -> bool:
+def has_unsupported_batch_quantization(
+    module: torch.nn.Module, attention_config: AttentionConfig
+) -> bool:
     """Detect activation quantization that requires independent requests."""
     from ..modules.linear import FP8QDQLinearMethod
+
+    attention_quant = attention_config.quant_attention_config
+    if attention_quant is not None and (
+        (attention_config.backend == "CUDNN" and attention_quant.qk_dtype == "fp8")
+        or attention_config.backend == "FLASHINFER"
+    ):
+        # These attention recipes derive global scales from the merged Q/K/V.
+        return True
 
     for layer in module.modules():
         method = getattr(layer, "quant_method", None)

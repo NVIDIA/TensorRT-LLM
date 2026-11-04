@@ -57,7 +57,9 @@ class FluxPipeline(BasePipeline):
 
     @property
     def supports_dynamic_batching(self) -> bool:
-        return not has_unsupported_batch_quantization(self.transformer)
+        return not has_unsupported_batch_quantization(
+            self.transformer, self.transformer.model_config.attention
+        )
 
     def __init__(self, pipeline_config):
         if (

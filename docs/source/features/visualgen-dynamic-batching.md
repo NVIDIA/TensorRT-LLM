@@ -60,8 +60,8 @@ FLUX.1 and FLUX.2 text-to-image support batching. Qwen-Image supports unquantize
 single-GPU execution with `VANILLA` attention. Unsupported configurations,
 image-edit requests and denoising-cache configurations run independently.
 FLUX requests also run independently when a transformer layer uses NVFP4
-activation quantization (static or dynamic) or dynamic per-tensor FP8, to
-preserve per-request image quality.
+activation quantization (static or dynamic), dynamic per-tensor FP8, cuDNN FP8
+attention, or FlashInfer quantized attention, to preserve per-request image quality.
 Each request keeps its seed and its own outputs, although batched computation
 can introduce small floating-point differences.
 

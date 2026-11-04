@@ -80,6 +80,96 @@ def test_dynamic_batching_matches_singletons(
     if quant_algo == "NVFP4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("NVFP4 requires Blackwell or newer")
     expect_batching = not (quant_algo == "NVFP4" or (quant_dynamic and quant_algo == "FP8"))
+    args = VisualGenArgs(
+        batching_config={"max_batch_size": 2 * num_images, "max_queue_delay_ms": 100},
+        compilation_config={"skip_warmup": True},
+        torch_compile_config={"enable": compile_enabled},
+        cuda_graph_config={"enable": cuda_graph},
+        # Static checkpoints supply their calibrated scales and excluded layers.
+        quant_config={"quant_algo": quant_algo, "dynamic": True} if quant_dynamic else None,
+    )
+    _check_request_batching(
+        checkpoint,
+        args,
+        num_images,
+        golden,
+        steps,
+        expect_batching,
+        tmp_path,
+        capfd,
+        monkeypatch,
+        quant_algo=quant_algo,
+        quant_dynamic=quant_dynamic,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices are required")
+@pytest.mark.parametrize(
+    "checkpoint,parallel_config",
+    [("FLUX.1-dev", {"ulysses_size": 2}), ("FLUX.2-dev", {"tp_size": 2})],
+    ids=["flux1-ulysses2", "flux2-tp2"],
+)
+def test_dynamic_batching_multi_gpu(
+    checkpoint: str,
+    parallel_config: dict[str, int],
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real worker broadcasts merge requests and preserve each output against serial calls."""
+    args = VisualGenArgs(
+        parallel_config=parallel_config,
+        batching_config={"max_batch_size": 2, "max_queue_delay_ms": 100},
+        compilation_config={"skip_warmup": True},
+        torch_compile_config={"enable": False},
+        cuda_graph_config={"enable": False},
+    )
+    _check_request_batching(checkpoint, args, 1, None, 4, True, tmp_path, capfd, monkeypatch)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "backend,qk_dtype,v_dtype",
+    [("CUDNN", "fp8", "fp8"), ("FLASHINFER", "mxfp8", "fp8")],
+    ids=["cudnn-fp8", "flashinfer-mxfp8"],
+)
+def test_dynamic_batching_quantized_attention_fallback(
+    backend: str,
+    qk_dtype: str,
+    v_dtype: str,
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("These quantized attention recipes require SM100/SM103")
+    args = VisualGenArgs(
+        attention_config={
+            "backend": backend,
+            "quant_attention_config": {"qk_dtype": qk_dtype, "v_dtype": v_dtype},
+        },
+        batching_config={"max_batch_size": 2, "max_queue_delay_ms": 100},
+        compilation_config={"skip_warmup": True},
+        torch_compile_config={"enable": False},
+        cuda_graph_config={"enable": False},
+    )
+    _check_request_batching("FLUX.1-dev", args, 1, None, 4, False, tmp_path, capfd, monkeypatch)
+
+
+def _check_request_batching(
+    checkpoint: str,
+    args: VisualGenArgs,
+    num_images: int,
+    golden: str | None,
+    steps: int,
+    expect_batching: bool,
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    quant_algo: str | None = None,
+    quant_dynamic: bool = False,
+) -> None:
     monkeypatch.setenv("TLLM_LOG_LEVEL", "INFO")
     prompts = [
         "a tiny astronaut hatching from an egg on the moon",
@@ -96,14 +186,6 @@ def test_dynamic_batching_matches_singletons(
         )
         for seed in (42, 17)
     ]
-    args = VisualGenArgs(
-        batching_config={"max_batch_size": 2 * num_images, "max_queue_delay_ms": 100},
-        compilation_config={"skip_warmup": True},
-        torch_compile_config={"enable": compile_enabled},
-        cuda_graph_config={"enable": cuda_graph},
-        # Static checkpoints supply their calibrated scales and excluded layers.
-        quant_config={"quant_algo": quant_algo, "dynamic": True} if quant_dynamic else None,
-    )
     # Serial calls exercise the singleton path on the same weights/device/RNG mode.
     with VisualGen(model=get_checkpoint(checkpoint), args=args) as generator:
         baselines = [generator.generate(prompt, param) for prompt, param in zip(prompts, params)]
