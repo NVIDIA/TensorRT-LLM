@@ -107,6 +107,56 @@ void expectField(Observation const& value, std::string const& field)
     EXPECT_NE(value.metadata.find(field), std::string::npos) << value.metadata;
 }
 
+class StreamObservingColdPageCodec : public v2::IKvCacheColdPageCodec
+{
+public:
+    bool configure(v2::PoolGroupDesc const* gpuDescs, v2::PoolGroupIndex numGpuDescs) noexcept override
+    {
+        return mCodec->configure(gpuDescs, numGpuDescs);
+    }
+
+    size_t queryColdPageBytes(v2::LayerGroupId layerGroupId) const noexcept override
+    {
+        return mCodec->queryColdPageBytes(layerGroupId);
+    }
+
+    v2::LayerGroupId getBatchingLayerGroupId(v2::LayerGroupId layerGroupId) const noexcept override
+    {
+        return mCodec->getBatchingLayerGroupId(layerGroupId);
+    }
+
+    v2::PageIndexLocation queryPageIndexLocation(v2::LayerGroupId layerGroupId) const noexcept override
+    {
+        return mCodec->queryPageIndexLocation(layerGroupId);
+    }
+
+    bool encode(v2::LayerGroupId layerGroupId, void* dstBasePtr, v2::PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        observeStream(stream);
+        return mCodec->encode(layerGroupId, dstBasePtr, pageIndices, numBasePages, stream);
+    }
+
+    bool decode(v2::LayerGroupId layerGroupId, void const* srcBasePtr, v2::PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        observeStream(stream);
+        return mCodec->decode(layerGroupId, srcBasePtr, pageIndices, numBasePages, stream);
+    }
+
+    std::vector<unsigned long long> streamIds;
+
+private:
+    void observeStream(cudaStream_t stream)
+    {
+        unsigned long long streamId{};
+        EXPECT_EQ(cudaStreamGetId(stream, &streamId), cudaSuccess);
+        streamIds.push_back(streamId);
+    }
+
+    std::unique_ptr<v2::IKvCacheColdPageCodec> mCodec{v2::createDefaultKvCacheColdPageCodec()};
+};
+
 class KvOffloadProfilerTest : public ::testing::Test
 {
 protected:
@@ -144,7 +194,9 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
     case v2::CacheTier::DISK: config.cacheTiers.emplace_back(v2::DiskCacheTierConfig{4 << 20, "/tmp"}); break;
     }
 
-    auto manager = std::make_shared<v2::KvCacheManager>(config);
+    auto codec = std::make_unique<StreamObservingColdPageCodec>();
+    auto* observedCodec = codec.get();
+    auto manager = std::make_shared<v2::KvCacheManager>(config, nullptr, std::move(codec));
     auto stream = std::make_shared<tr::CudaStream>();
     auto& storage = manager->storage();
     auto const lifeCycle = manager->getLayerGroupId(v2::LayerId{0});
@@ -206,10 +258,12 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
         return;
     }
     ASSERT_EQ(observations().size(), 2);
+    ASSERT_EQ(observedCodec->streamIds.size(), observations().size());
     EXPECT_EQ(observations()[0].name, "trtllm::kv_cache_offload");
     EXPECT_EQ(observations()[1].name, "trtllm::kv_cache_restore");
-    for (auto const& value : observations())
+    for (size_t index = 0; index < observations().size(); ++index)
     {
+        auto const& value = observations()[index];
         if (!inputs)
         {
             EXPECT_TRUE(value.metadata.empty());
@@ -219,7 +273,13 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
         expectField(value, "'kv.copy_count':2");
         expectField(value, "'kv.bytes_per_copy':" + std::to_string(coldBytes));
         expectField(value, "'kv.payload_bytes':" + std::to_string(2 * coldBytes));
-        expectField(value, "'kv.cuda_stream_id':");
+        std::string const streamField = "'kv.cuda_stream_id':";
+        auto const fieldPosition = value.metadata.find(streamField);
+        ASSERT_NE(fieldPosition, std::string::npos) << value.metadata;
+        auto const valuePosition = fieldPosition + streamField.size();
+        EXPECT_EQ(
+            value.metadata.substr(valuePosition, value.metadata.find_first_of(",}", valuePosition) - valuePosition),
+            std::to_string(observedCodec->streamIds[index]));
     }
     restored->close();
     manager->shutdown();
