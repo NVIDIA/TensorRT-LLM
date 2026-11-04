@@ -149,6 +149,18 @@ shared across processes or across separate `LLM` instances; when the post-proces
 enabled, all chunks of a single request are still routed to the same worker, so per-request state
 remains consistent for that request.
 
+When the post-processing worker pool is enabled, a request that ends in an error — the executor
+reports one, or post-processing its response raises — gets no final chunk. A hook that keeps
+per-request state can define an optional `on_request_end(self, request_id, reason)` method: the worker
+calls it when it drops such a request, with `reason` set to `"error"` or `"postprocessing_error"`, so
+the hook can release (or record) what it holds for that request. A hook without the method is left
+alone, and an exception raised by it is logged rather than propagated.
+
+Without the worker pool, the hook runs as the server reads each response of a request, and
+`on_request_end` is not called. A request whose final response the server does not read that way gets
+no final chunk: one that ends in an executor error (the error is raised before the hook runs), or a
+stream whose client disconnects before it finishes.
+
 Engine-level batching is transparent to the hook: even when requests are batched together in the
 engine, the hook is invoked **once per request** (per output, per chunk) — there is no batched-call
 form — so keying state on `chunk.request_id` is sufficient to keep concurrent requests isolated.
