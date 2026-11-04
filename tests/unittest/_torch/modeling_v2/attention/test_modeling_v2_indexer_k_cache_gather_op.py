@@ -242,7 +242,7 @@ def _build_manager(spec, seed) -> _Built:
         if "cached" in spec:
             assert manager.max_seq_len == max_seq_len, (manager.max_seq_len, max_seq_len)
         ids = list(range(len(lens)))
-        added = manager.add_dummy_requests(ids, lens, is_gen=False, prepare_resource=True)
+        added = manager.add_dummy_requests(ids, lens, is_gen=False)
         assert added is not None, "the manager's quota refused the cell's prompts"
         if not v2:
             # V1 reads the block ids back from the offsets the attention metadata copies.

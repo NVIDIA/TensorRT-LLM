@@ -2236,6 +2236,7 @@ def test_long_spec_rejection_rewinds_real_cache(
     manager._has_cp_helix = False
     manager.kv_compression_manages_history = False
     manager._sharing = None
+    manager.enable_block_reuse = False
     req = SimpleNamespace(
         py_request_id=1,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
