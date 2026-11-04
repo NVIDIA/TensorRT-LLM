@@ -200,6 +200,47 @@ def test_follow_up_turn_takes_over_the_kept_slot():
     assert worker._prefix_hits == 1 and worker._prefix_misses == 0
 
 
+def test_adopted_slot_keeps_a_chunked_tail_contiguous():
+    worker, tracker = _worker(), DFlashPromptTracker(MAX_BATCH)
+    first = _request(1, range(100, 108))
+    slot = _start(worker, tracker, first)
+    first.tokens += [200, 201, 202, 203]
+    _generate(worker, first, 3)
+    _finish(worker, tracker, first)
+
+    # The uncached tail arrives in two prefill chunks; the second continues the adopted slot.
+    second = _request(2, first.tokens[:10] + [300, 301, 302, 303])
+    _schedule(tracker, second)
+    _prefill(worker, tracker, [(second, 10, 2)])
+    _prefill(worker, tracker, [(second, 12, 2)])
+
+    assert worker._req_to_slot[2] == slot
+    assert worker._ctx_len_host[slot] == 14 and int(worker._ctx_len[slot]) == 14
+    assert _columns(worker, slot, 14) == [(t, p) for p, t in enumerate(second.tokens)]
+    assert worker._prefix_hits == 1 and worker._prefix_misses == 0
+
+
+def test_spec_resource_manager_is_the_prompt_tracker_for_dflash():
+    """Without sa_config, DFlash gets the tracker that the prefix-hit resume reads."""
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+    from tensorrt_llm._torch.speculative.utils import get_spec_resource_manager
+
+    def engine(sa_config):
+        return SimpleNamespace(
+            spec_config=SimpleNamespace(
+                spec_dec_mode=SpeculativeDecodingMode.DFLASH, sa_config=sa_config
+            ),
+            model=SimpleNamespace(config=SimpleNamespace()),
+            batch_size=MAX_BATCH,
+            max_seq_len=CAPACITY,
+            max_num_tokens=CAPACITY,
+        )
+
+    manager = get_spec_resource_manager(engine(None))
+    assert isinstance(manager, DFlashPromptTracker)
+    assert manager.max_num_requests == MAX_BATCH and manager.active
+
+
 def test_prefix_mismatch_starts_from_the_tail_as_before():
     worker, tracker = _worker(), DFlashPromptTracker(MAX_BATCH)
     first = _request(1, range(100, 108))
