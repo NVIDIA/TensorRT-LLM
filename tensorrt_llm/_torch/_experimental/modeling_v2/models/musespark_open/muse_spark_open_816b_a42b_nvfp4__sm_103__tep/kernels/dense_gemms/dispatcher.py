@@ -919,6 +919,10 @@ class DenseGemmDispatcher:
         #: The producer policy the feature that owns this site's slot claimed at install
         #: (``claim_publish``); ``None`` while no feature publishes from this site.
         self.publish_policy: Optional[PublishPolicy] = None
+        #: While set (by a fast path that already produced this call's product another way,
+        #: for one call), the next call of its row count and width returns this tensor after the
+        #: joins and the prefetch fork, without a GEMM, and clears it. ``None`` otherwise.
+        self.substitute: Optional[torch.Tensor] = None
 
     @staticmethod
     def is_decode_call(input_tensor: torch.Tensor) -> bool:
@@ -971,6 +975,11 @@ class DenseGemmDispatcher:
             plan.join()
         if plan.named_forks:
             plan.join_role(self.site.role)
+        if self.substitute is not None:
+            if deferred:
+                # No GEMM to launch first: the deferred join runs now.
+                plan.join()
+            return self._apply_substitute(input_tensor, weight)
         if self.publish is not None:
             return self._apply_publish(module, input_tensor, weight, bias, force_active, deferred)
         if not self.fits(input_tensor, weight, bias):
@@ -1078,6 +1087,24 @@ class DenseGemmDispatcher:
             and rows == int(self.publish.shape[0])
             and parse_kernel(kernel)[0] in policy.direct
         )
+
+    def _apply_substitute(self, input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """``apply`` with ``self.substitute`` as the product: no GEMM; the prefetch fork as ``apply``.
+
+        Raises:
+            RuntimeError: if the call's rows or width are not the substitute's.
+        """
+        product, self.substitute = self.substitute, None
+        k = int(weight.shape[1])
+        rows = input_tensor.numel() // max(k, 1)
+        if tuple(product.shape) != (rows, int(weight.shape[0])):
+            raise RuntimeError(
+                f"[musespark_open] layer {self.site.layer_idx} {self.site.role} was handed a "
+                f"{tuple(product.shape)} product for a call of {rows} rows x {int(weight.shape[0])}"
+            )
+        if _keeps_prefetch(self.site, rows):
+            self.site.plan.fork_prefetch(self.site.next_weight())
+        return product.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
     def _apply_publish(
         self,

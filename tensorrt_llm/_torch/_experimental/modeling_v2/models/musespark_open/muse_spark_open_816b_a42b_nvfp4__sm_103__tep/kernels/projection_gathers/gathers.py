@@ -124,6 +124,30 @@ def fused_rows(owner) -> int:
     return WIDE_ROWS if wide is not None and wide.is_armed else MAX_ROWS
 
 
+#: The reasons the armed last-layer join (``last_layer_boundary``) fell back to the built-in chain,
+#: each logged once per process.
+_G2_FALLBACKS: set = set()
+
+
+def _g2_fallback(reason: str) -> None:
+    """Log once that the armed last-layer join (``last_layer_boundary``) runs the built-in chain,
+    and why."""
+    if reason not in _G2_FALLBACKS:
+        _G2_FALLBACKS.add(reason)
+        logger.warning(f"[musespark_open] last_layer_boundary armed but not run: {reason}")
+
+
+def _operands(**tensors: Optional[torch.Tensor]) -> str:
+    """Shapes, dtypes and contiguity of ``tensors``, for a fallback log line."""
+    return ", ".join(
+        f"{name} None"
+        if t is None
+        else f"{name} {tuple(t.shape)} {str(t.dtype).replace('torch.', '')}"
+        f"{'' if t.is_contiguous() else ' strided'}"
+        for name, t in tensors.items()
+    )
+
+
 def _require_aligned(**tensors: torch.Tensor) -> None:
     """Raise unless every operand starts on a 16-byte boundary (the fused ops' vector accesses).
 
@@ -327,6 +351,41 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
     _boundary_trigger: str = "exit"
     _capture_fold: Optional[torch.Tensor] = None
     _capture_stored: bool = False
+    #: ``last_layer_boundary`` (``modeling.G2_L61_BOUNDARY``, set by ``DecodeTarget`` on the last
+    #: layer's join only): the final model norm. A call whose ``next_norm`` is this norm is the last
+    #: layer's join followed by the final norm, which ``unpool_final_boundary`` runs on the unpool
+    #: slice in one launch.
+    _g2_final_norm: Optional[RMSNorm] = None
+    #: The route of the last layer's boundary (``modeling.G2_L61_BOUNDARY``; 1: exact orders,
+    #: value-identical; 2: the final norm's sum in the kernel's order), trigger placement and whether
+    #: the constant operands may be read before the dependency wait.
+    _g2_route: int = 1
+    _g2_trigger: str = "exit"
+    _g2_prewait: bool = False
+    #: The post-FFN norm's cached ``1 + w`` (a load-time constant) when ``DecodeTarget`` found it
+    #: cached, else ``None``; the gain may be read before the wait only when it is this tensor.
+    _g2_const_gain: Optional[torch.Tensor] = None
+
+    def arm_g2(
+        self,
+        final_norm: RMSNorm,
+        route: int,
+        trigger: str,
+        prewait: bool,
+        const_gain: Optional[torch.Tensor],
+    ) -> None:
+        """Arm ``last_layer_boundary`` on this join: a call whose next norm is ``final_norm`` runs
+        ``unpool_final_boundary``.
+
+        ``final_norm`` is stored as a plain attribute. Assigned through ``nn.Module.__setattr__`` it
+        would become a registered submodule of this join, which attribute lookup never reaches past
+        the class default ``None``.
+        """
+        object.__setattr__(self, "_g2_final_norm", final_norm)
+        self._g2_route = route
+        self._g2_trigger = trigger
+        self._g2_prewait = prewait
+        self._g2_const_gain = const_gain
 
     def _add_after_rmsnorm_and_norm(
         self,
@@ -341,6 +400,20 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
             joined = published.consume_unpool(self, residual, branch, eps, next_norm, gain)
             if joined is not None:
                 return joined
+        if (
+            self._g2_final_norm is not None
+            and next_norm is self._g2_final_norm
+            and branch.dim() == 2
+            and branch.shape[1] == _unpool.local_columns(self._gather.world)
+            and residual.shape[-1] == _unpool.HIDDEN
+        ):
+            return self._g2_join_and_final_norm(residual, branch, eps, next_norm, gain)
+        if self._g2_final_norm is not None and next_norm is self._g2_final_norm:
+            _g2_fallback(
+                "the join got no unpool slice ("
+                + _operands(branch=branch, residual=residual)
+                + "; the unpool was gathered before the join)"
+            )
         if (
             branch.dim() == 2
             # The built-in workspace's TP size is the one the slices are cut for.
@@ -403,6 +476,94 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
             # Gather as the built-in would have, then join as it would have.
             branch = self._gather.gather(branch)
         return super()._add_after_rmsnorm_and_norm(residual, branch, eps, next_norm, gain)
+
+    def _g2_join_and_final_norm(
+        self,
+        residual: torch.Tensor,
+        local: torch.Tensor,
+        eps: float,
+        final_norm: RMSNorm,
+        gain: Optional[torch.Tensor],
+    ):
+        """The last layer's join of its unpool slice ``local``, then the final norm: ``(updated, normed)``.
+
+        ``unpool_final_boundary`` when the built-in chain would run its fused kernels (the gated
+        residual's Triton kernel, flashinfer's norm without gemma) on these operands; otherwise the
+        built-in chain itself (gather, join, cast, norm). The choice reads only shapes, dtypes,
+        contiguity and construction-time flags, so every rank makes it alike.
+        """
+        from ...ops.comm import unpool_final_boundary as _final
+
+        alpha, beta = self.coefficients()
+        rows = residual.shape[0] if residual.dim() == 2 else 0
+        weight = final_norm.weight
+        if (
+            self._gather_inbox is not None
+            and self._fused_enabled
+            and not torch.compiler.is_compiling()
+            and residual.is_cuda
+            and local.shape[0] == rows
+            and not final_norm.use_gemma
+            and isinstance(weight, torch.Tensor)
+            and final_norm.nvfp4_scale is None
+            and _final.fits(local, residual, gain, alpha, beta, weight)
+        ):
+            _require_aligned(
+                residual=residual, branch=local, gain=gain, alpha=alpha, beta=beta, weight=weight
+            )
+            # The constant operands may be read before the wait only when they are the
+            # load-time caches (the gated residual's coefficients, the post-FFN gain) and the
+            # norm's parameter.
+            prewait = (
+                self._g2_prewait
+                and alpha is self._alpha
+                and beta is self._beta
+                and gain is not None
+                and gain is self._g2_const_gain
+            )
+            normed, updated = _final.unpool_final_boundary(
+                local,
+                self._gather_inbox,
+                residual,
+                gain,
+                alpha,
+                beta,
+                weight,
+                eps,
+                final_norm.variance_epsilon,
+                route=self._g2_route,
+                trigger=self._g2_trigger,
+                prewait=prewait,
+                return_updated=True,
+            )
+            return updated, normed
+        # The built-in last-layer chain on the gathered branch.
+        failed = [
+            name
+            for name, held in (
+                ("no inbox", self._gather_inbox is not None),
+                ("fused residual off", self._fused_enabled),
+                ("compiling", not torch.compiler.is_compiling()),
+                ("not CUDA", residual.is_cuda),
+                ("rows differ", local.shape[0] == rows),
+                ("gemma final norm", not final_norm.use_gemma),
+                ("weight not a tensor", isinstance(weight, torch.Tensor)),
+                ("FP4 final norm", final_norm.nvfp4_scale is None),
+            )
+            if not held
+        ]
+        operands = _operands(
+            local=local,
+            residual=residual,
+            gain=gain,
+            alpha=alpha,
+            beta=beta,
+            weight=weight if isinstance(weight, torch.Tensor) else None,
+        )
+        _g2_fallback(f"{', '.join(failed) or 'operands do not fit'} ({operands})")
+        branch = self._gather.gather(local)
+        updated = self.add_after_rmsnorm(residual, branch, eps, gain)
+        return updated, final_norm(updated.to(branch.dtype))
 
     def _inbox_for(self, residual: torch.Tensor) -> Optional[ProjectionInbox]:
         """The inbox a call of ``residual``'s row count takes: the 8-row one up to 8 rows,

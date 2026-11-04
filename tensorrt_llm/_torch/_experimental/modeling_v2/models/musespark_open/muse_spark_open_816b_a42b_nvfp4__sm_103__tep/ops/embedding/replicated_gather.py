@@ -157,10 +157,15 @@ def _replicated_embedding_gather2_kernel(
     vocab,
     HIDDEN: tl.constexpr,
     BLOCK: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr = False,
 ):
     # _replicated_embedding_gather_kernel's body, with the same bits also stored to copy_ptr.
     row = tl.program_id(0)
     chunk = tl.program_id(1)
+    if LAUNCH_WITH_PDL:
+        # Before any global read: the ids are the previous kernel's output.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     token = tl.load(ids_ptr + row).to(tl.int64)
     valid = (token >= 0) & (token < vocab)
     cols = chunk * BLOCK + tl.arange(0, BLOCK)
@@ -173,10 +178,11 @@ def _replicated_embedding_gather2_kernel(
     tl.store(copy_ptr + row.to(tl.int64) * HIDDEN + cols, bits, mask=in_row)
 
 
-def replicated_embedding_gather_twice(table: torch.Tensor, ids: torch.Tensor):
+def replicated_embedding_gather_twice(table: torch.Tensor, ids: torch.Tensor, pdl: bool = False):
     """``(out, copy)``: ``replicated_embedding_gather(table, ids)`` and a second tensor with its bytes.
 
     One launch in place of the gather and a later ``out.clone()`` (the drafter's residual).
+    ``pdl``: launched with PDL, waiting before its first read and releasing its dependent after.
     """
     vocab, hidden = table.shape
     out = torch.empty((*ids.shape, hidden), dtype=table.dtype, device=table.device)
@@ -192,6 +198,7 @@ def replicated_embedding_gather_twice(table: torch.Tensor, ids: torch.Tensor):
         vocab,
         HIDDEN=hidden,
         BLOCK=BLOCK,
+        **({"LAUNCH_WITH_PDL": True, "launch_pdl": True} if pdl else {}),
         num_warps=4,
     )
     return out, copy
