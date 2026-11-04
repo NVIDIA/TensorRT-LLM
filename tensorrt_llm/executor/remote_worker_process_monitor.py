@@ -10,10 +10,14 @@ import hmac
 import json
 import logging
 import os
-import pickle
+
+# Only serializes reports; IpcQueue authenticates frames before deserialization.
+import pickle  # nosec B403
 import select
 import socket
-import subprocess
+
+# Runs this interpreter and this helper with fixed argv, without a shell.
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -49,7 +53,11 @@ class RemoteWorkerProcessMonitor:
         self._failure: dict | None = None
         host_override = os.environ.get("TRTLLM_WORKER_WATCH_HOST")
         host = socket.gethostbyname(host_override or socket.gethostname())
-        if host == "0.0.0.0" or (host.startswith("127.") and not host_override):
+        # Reject wildcard advertised addresses; this comparison does not bind.
+        if (
+            host == "0.0.0.0"  # nosec B104
+            or (host.startswith("127.") and not host_override)
+        ):
             raise RuntimeError(
                 "Set TRTLLM_WORKER_WATCH_HOST to a leader address reachable from all MPI workers"
             )
