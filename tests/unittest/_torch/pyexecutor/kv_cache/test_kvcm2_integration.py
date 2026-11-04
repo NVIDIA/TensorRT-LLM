@@ -1925,6 +1925,7 @@ def test_long_spec_rejection_rewinds_real_cache(
     manager._has_cp_helix = False
     manager.kv_compression_manages_history = False
     manager._sharing = None
+    manager.enable_block_reuse = False
     req = SimpleNamespace(
         py_request_id=1,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
@@ -3323,6 +3324,8 @@ def test_adp_dummy_joint_draft_admission_and_rollback(transactional: bool) -> No
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         executor.enable_attention_dp = True
+        # Two attention-DP ranks: a single-rank group skips dummy padding.
+        executor.dist = SimpleNamespace(tp_size=2)
         executor.kv_cache_transceiver = object() if transactional else None
         executor.adp_router = SimpleNamespace(exclude_retiring_requests=False)
         executor.active_requests = []
