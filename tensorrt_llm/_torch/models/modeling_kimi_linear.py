@@ -132,6 +132,7 @@ from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
+from ..modules.helix_tail import HelixTail
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import (
@@ -3424,6 +3425,7 @@ class KimiMLARuntime(nn.Module):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
+        helix_tail: Optional[HelixTail] = None,
     ) -> None:
         super().__init__()
 
@@ -3508,6 +3510,7 @@ class KimiMLARuntime(nn.Module):
             model_config=attention_config,
             aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
+            helix_tail=helix_tail,
         )
 
     def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
@@ -3551,6 +3554,7 @@ class KimiLinearDecoderLayer(nn.Module):
         cfg,
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        helix_tail: Optional[HelixTail] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -3596,6 +3600,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 aux_stream_dict=aux_stream_dict,
                 mapping_with_cp=model_config.mapping_with_cp,
                 reduce_output=not self.token_sliced,
+                helix_tail=helix_tail,
             )
 
         if self.is_moe:
@@ -3895,9 +3900,25 @@ class KimiLinearModel(DecoderModel):
         }
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
+        # One fused Helix generation tail (and receive buffer) for every MLA layer.
+        mapping_with_cp = model_config.mapping_with_cp
+        self.helix_tail = (
+            HelixTail(mapping_with_cp)
+            if mapping_with_cp is not None
+            and HelixTail.max_tokens(
+                mapping_with_cp,
+                cfg.num_attention_heads // mapping_with_cp.tp_size,
+                cfg.kv_lora_rank,
+                cfg.v_head_dim,
+            )
+            > 0
+            else None
+        )
         self.layers = nn.ModuleList(
             [
-                KimiLinearDecoderLayer(model_config, cfg, layer_idx, self.aux_stream_dict)
+                KimiLinearDecoderLayer(
+                    model_config, cfg, layer_idx, self.aux_stream_dict, helix_tail=self.helix_tail
+                )
                 for layer_idx in range(cfg.num_hidden_layers)
             ]
         )

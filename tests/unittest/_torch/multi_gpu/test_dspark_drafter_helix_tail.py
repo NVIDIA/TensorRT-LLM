@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The helix MLA DSpark drafter's tail on the target's ``K3HelixTail``: every head's latent
+"""The helix MLA DSpark drafter's tail on a ``HelixTail``: every head's latent
 partials and softmax stats of this rank's pages, V up-projected, exchanged and combined in one
 launch, agree to BF16 rounding with the up-projection followed by ``_helix_post_process``; with
 the target's head count launched on the same receive buffer in between, eagerly and in a CUDA
@@ -68,7 +68,7 @@ def _run_rank(world_size, token_counts):
     from tensorrt_llm._torch.attention import attention
     from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
     from tensorrt_llm._torch.models.modeling_dspark import _helix_tail_attn_out
-    from tensorrt_llm._torch.modules.kimi_k3_mla.helix_tail import K3HelixTail
+    from tensorrt_llm._torch.modules.helix_tail import HelixTail
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -81,8 +81,8 @@ def _run_rank(world_size, token_counts):
             cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": False, "fifo_version": 2},
         )
         init_helix_cp_comm(mapping)
-        assert K3HelixTail.max_tokens(mapping, DRAFT_HEADS, LATENT, V_DIM) >= max(token_counts)
-        tail = K3HelixTail.get(mapping)
+        assert HelixTail.max_tokens(mapping, DRAFT_HEADS, LATENT, V_DIM) >= max(token_counts)
+        tail = HelixTail(mapping)
         local = DRAFT_HEADS // world_size
         gen = torch.Generator(device="cuda").manual_seed(123)  # the same W_UV on every rank
         w_uv = (torch.randn((DRAFT_HEADS, V_DIM, LATENT), device="cuda", generator=gen) * 0.05).to(

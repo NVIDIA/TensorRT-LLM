@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3 fused Helix tail across CP ranks (``K3HelixTail``, MNNVL receive buffers).
+"""Kimi-K3 fused Helix tail across CP ranks (``HelixTail``, MNNVL receive buffers).
 
 With a ``W_UV`` that selects 128 latent columns the V up-projection is exact, so each rank's
 output is bitwise the production combine (``_helix_post_process``: FIFO all-to-all +
@@ -88,7 +88,7 @@ def _run_rank(world_size, configs):
     from tensorrt_llm._torch.attention import attention
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_packed_reduce as reduce_mod
     from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
-    from tensorrt_llm._torch.modules.kimi_k3_mla.helix_tail import K3HelixTail
+    from tensorrt_llm._torch.modules.helix_tail import HelixTail
 
     rank = MPI.COMM_WORLD.Get_rank()
     torch.cuda.set_device(rank)
@@ -101,8 +101,8 @@ def _run_rank(world_size, configs):
             cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": False, "fifo_version": 2},
         )
         init_helix_cp_comm(mapping)
-        assert K3HelixTail.max_tokens(mapping, NUM_HEADS, 512, 128) >= 128
-        tail = K3HelixTail.get(mapping)
+        assert HelixTail.max_tokens(mapping, NUM_HEADS, 512, 128) >= 128
+        tail = HelixTail(mapping)
         heads_local = NUM_HEADS // world_size
         num_sms = torch.cuda.get_device_properties(rank).multi_processor_count
         w_select = torch.zeros((NUM_HEADS, 128, 512), dtype=torch.bfloat16, device="cuda")

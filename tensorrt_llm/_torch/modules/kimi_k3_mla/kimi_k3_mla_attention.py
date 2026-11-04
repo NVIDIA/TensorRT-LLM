@@ -33,11 +33,11 @@ from ...distributed import AllReduceParams
 from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
+from ..helix_tail import HelixTail
 from ..linear import Linear, TensorParallelMode, _fp8_block_scales_uses_cute_dsl_sm107
 from ..multi_stream_utils import do_multi_stream
 from ..projection_capabilities import GatedEpilogueProjection, PrequantizedInputProjection
 from ..rms_norm import RMSNorm
-from .helix_tail import K3HelixTail
 
 
 def _make_pos_embd_params(
@@ -150,7 +150,7 @@ class KimiK3MLAAttention(MLA):
     _fused_latent_row = False
     # (q_b weight scale, its block exponents or None), cached on first use.
     _q_b_block_exponents: Optional[tuple] = None
-    # Largest generation batch whose Helix tail runs as one kernel (K3HelixTail); 0: never.
+    # Largest generation batch whose Helix tail runs as one kernel (helix_tail); 0: never.
     _helix_tail_max_tokens: int = 0
     # Set for one generation-only forward of a fused-tail batch: the output gate, forked when the
     # forward starts (beside q_a / q_b) and joined before the tail, and whether it is still to join.
@@ -183,7 +183,10 @@ class KimiK3MLAAttention(MLA):
         model_config: ModelConfig,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
+        helix_tail: Optional[HelixTail] = None,
     ) -> None:
+        """``helix_tail``: the fused Helix generation tail over ``mapping_with_cp``'s CP
+        group, which the owning model builds once for all its MLA layers; None: never fused."""
         projection_configs = model_config.quant_config_dict or {}
         q_a_config = projection_configs.get("q_a_proj", model_config.quant_config)
         kv_a_config = projection_configs.get("kv_a_proj_with_mqa", model_config.quant_config)
@@ -230,6 +233,7 @@ class KimiK3MLAAttention(MLA):
         # the registered and eager paths before the row-parallel o_proj.
 
         self.use_output_gate = use_output_gate
+        self.helix_tail = helix_tail
         if use_output_gate:
             if self.mapping.has_cp_helix():
                 # The gate GEMM runs beside the Helix all-to-all (_output_gate), or beside the
@@ -309,8 +313,12 @@ class KimiK3MLAAttention(MLA):
 
         self._o_proj_takes_prequantized = isinstance(self.o_proj, PrequantizedInputProjection)
         self._helix_tail_max_tokens = 0
-        if self._helix_v_up_before_exchange and self.helix_v_b_proj_full.is_contiguous():
-            self._helix_tail_max_tokens = K3HelixTail.max_tokens(
+        if (
+            self.helix_tail is not None
+            and self._helix_v_up_before_exchange
+            and self.helix_v_b_proj_full.is_contiguous()
+        ):
+            self._helix_tail_max_tokens = HelixTail.max_tokens(
                 self.mapping, self.num_heads_tp, self.kv_lora_rank, self.v_head_dim
             )
 
@@ -680,7 +688,7 @@ class KimiK3MLAAttention(MLA):
     ) -> torch.Tensor:
         """``MLA._attn_forward_gen``; a Helix batch of at most ``_helix_tail_max_tokens`` tokens
         with the V up-projection before the exchange runs the decode with its split reduction
-        left to one tail kernel (fold, V up-projection, exchange, combine; K3HelixTail) instead
+        left to one tail kernel (fold, V up-projection, exchange, combine; ``helix_tail``) instead
         of the reduction, the BMM, the all-to-all and the combine. The output gate of such a
         batch (forked in :meth:`forward`) is joined before the tail, so o_proj only depends on
         the tail; where o_proj takes a prequantized input, the tail also stores the MXFP8 form of
@@ -732,7 +740,7 @@ class KimiK3MLAAttention(MLA):
         out = helix_output
         if out is None:
             out = partial_o.new_empty((num_tokens, width))
-        return K3HelixTail.get(self.mapping)(
+        return self.helix_tail(
             partial_o,
             softmax_stats,
             self.helix_v_b_proj_full,

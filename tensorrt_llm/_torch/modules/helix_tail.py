@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Kimi-K3 Helix generation tail as one kernel (``kernels/blackwell/k3_helix_tail.py``).
+"""The Helix MLA generation tail as one kernel (``kernels/blackwell/k3_helix_tail.py``).
 
-In a Helix generation batch whose V up-projection runs before the exchange, :class:`K3HelixTail`
+In a Helix generation batch whose V up-projection runs before the exchange, :class:`HelixTail`
 replaces the packed split-KV reduction, the V up-projection BMM, the all-to-all and the combine
 by one launch: the decode's FP32 split partials are folded by the senders, every head's rows are
 projected and pushed into the head owner's Lamport receive buffer (MNNVL fabric memory), and the
@@ -12,7 +12,7 @@ directly (no split partials) take the same kernel without the fold.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -20,25 +20,26 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...distributed.mnnvl_memory import HelixCpMnnvlMemory, MnnvlMemory, _check_cu_result, cuda
-from ...flashinfer_utils import get_env_enable_pdl
+from ..distributed.mnnvl_memory import HelixCpMnnvlMemory, MnnvlMemory, _check_cu_result, cuda
+from ..flashinfer_utils import get_env_enable_pdl
 
 if TYPE_CHECKING:
-    from ...attention.backends.fp4_mla.fp4_mla_packed_reduce import PackedSplitPartials
+    from ..attention.backends.fp4_mla.fp4_mla_packed_reduce import PackedSplitPartials
 
 # Receive buffer per rank (two halves): a helix8 rank with 96 heads fits 331 tokens per launch.
 _RECV_BUFFER_BYTES = 16 << 20
 _HALF_BYTES = _RECV_BUFFER_BYTES // 2 // 16 * 16
 
 
-class K3HelixTail:
-    """The fused Helix tail over the CP group of ``mapping``: one receive buffer per mapping,
-    shared by every layer (launches are ordered on one stream)."""
+class HelixTail:
+    """The fused Helix tail over the CP group of ``mapping`` and its receive buffer.
 
-    _cache: Dict[Mapping, "K3HelixTail"] = {}
+    Its owner builds it at construction (a collective allocation) and may share it between
+    layers whose launches are ordered on one stream.
+    """
 
     def __init__(self, mapping: Mapping):
-        from ...kernels.blackwell.k3_helix_tail import SENTINEL
+        from ..kernels.blackwell.k3_helix_tail import SENTINEL
 
         self.mapping = mapping
         MnnvlMemory.initialize()
@@ -66,12 +67,6 @@ class K3HelixTail:
         HelixCpMnnvlMemory.get_comm(mapping).barrier()
 
     @staticmethod
-    def get(mapping: Mapping) -> "K3HelixTail":
-        if mapping not in K3HelixTail._cache:
-            K3HelixTail._cache[mapping] = K3HelixTail(mapping)
-        return K3HelixTail._cache[mapping]
-
-    @staticmethod
     def max_tokens(mapping: Mapping, num_heads: int, latent_dim: int, v_head_dim: int) -> int:
         """Largest generation batch (tokens) the fused tail serves for ``num_heads`` decoded heads
         per rank; 0 where it never does: it needs Helix with one attention-TP rank per CP group,
@@ -82,7 +77,7 @@ class K3HelixTail:
             return 0
         if mapping.cp_config.get("use_nccl_for_alltoall", True):
             return 0
-        from ...kernels.blackwell import k3_helix_tail as kernel
+        from ..kernels.blackwell import k3_helix_tail as kernel
 
         if not kernel.can_run(mapping.cp_size, num_heads, latent_dim, v_head_dim):
             return 0
@@ -113,7 +108,7 @@ class K3HelixTail:
             mx_out: Optional ``(gate, xq, xs)``: also store the MXFP8 form of
                 ``bf16(out * gate)`` (see ``k3_helix_tail``).
         """
-        from ...kernels.blackwell.k3_helix_tail import k3_helix_tail
+        from ..kernels.blackwell.k3_helix_tail import k3_helix_tail
 
         num_tokens = rows.shape[0]
         num_heads = w_uv.shape[0]

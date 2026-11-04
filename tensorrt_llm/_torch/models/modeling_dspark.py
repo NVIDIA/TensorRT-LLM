@@ -106,6 +106,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
+from ..modules.helix_tail import HelixTail
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
@@ -3115,7 +3116,7 @@ def _helix_tail_attn_out(
 ) -> torch.Tensor:
     """``[T, num_heads, v]`` o_proj rows of this rank's heads from every head's latent partials
     ``ctx_out`` (``[..., heads * cp, latent]``) and their softmax ``stats``: V up-projection,
-    exchange and combine in one ``K3HelixTail`` launch (``_helix_post_process`` after the
+    exchange and combine in one ``HelixTail`` launch (``_helix_post_process`` after the
     up-projection, to BF16 rounding)."""
     all_heads, v_dim, latent_dim = w_uv.shape
     num_tokens = ctx_out.numel() // (all_heads * latent_dim)
@@ -3552,6 +3553,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # (draft_qhead); the folded weights, built with the fused KV buffers.
     _fused_mla_qhead: bool = False
     _qb_folded: Optional[List[torch.Tensor]] = None
+    # The fused Helix tail of the block decode and the largest token count it serves.
+    _helix_tail: Optional[HelixTail] = None
+    _helix_tail_max_tokens: int = 0
     # Every head's V up-projection per layer ([heads * cp, v, latent]) for the fused Helix tail.
     _helix_tail_w_uv: Optional[List[torch.Tensor]] = None
     # Side stream of the step's split-KV plan, joined before the first decode.
@@ -3659,6 +3663,15 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         if context_kv_only:
             self._keep_context_kv_modules()
+        elif self.reads_helix_sharded_ctx_pages:
+            self._helix_tail_max_tokens = HelixTail.max_tokens(
+                self._helix_mapping,
+                self._num_heads * self._helix_mapping.cp_size,
+                self.kv_lora_rank,
+                self.v_head_dim,
+            )
+            if self._helix_tail_max_tokens > 0:
+                self._helix_tail = HelixTail(self._helix_mapping)
         self._ar_push = (
             self._tp_split
             and not context_kv_only
@@ -3998,22 +4011,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
         return out if stats is None else (out, stats)
 
-    def _drafter_helix_tail(self, num_tokens: int):
-        """The target's ``K3HelixTail`` on this drafter's helix mapping for ``num_tokens``
-        tokens, with every head's V up-projection gathered once (eagerly, on every rank); None
-        where the tail does not fit or its operands do not exist yet inside a graph capture."""
-        from ..modules.kimi_k3_mla.helix_tail import K3HelixTail
-
-        mapping = self._helix_mapping
-        all_heads = self._num_heads * mapping.cp_size
-        if num_tokens > K3HelixTail.max_tokens(
-            mapping, all_heads, self.kv_lora_rank, self.v_head_dim
-        ):
+    def _drafter_helix_tail(self, num_tokens: int) -> Optional[HelixTail]:
+        """The fused Helix tail for ``num_tokens`` tokens, with every head's V up-projection
+        gathered once (eagerly, on every rank); None where the tail does not fit or its operands
+        do not exist yet inside a graph capture."""
+        if not 0 < num_tokens <= self._helix_tail_max_tokens:
             return None
-        capturing = torch.cuda.is_current_stream_capturing()
-        tail = K3HelixTail._cache.get(mapping)
-        if self._helix_tail_w_uv is None or tail is None:
-            if capturing:
+        if self._helix_tail_w_uv is None:
+            if torch.cuda.is_current_stream_capturing():
                 return None
             self._helix_tail_w_uv = [
                 allgather(
@@ -4023,8 +4028,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 ).contiguous()
                 for layer in self.model.layers
             ]
-            tail = K3HelixTail.get(mapping)
-        return tail
+        return self._helix_tail
 
     @staticmethod
     def _reduce_partial(all_reduce, partial, residual, norm):
