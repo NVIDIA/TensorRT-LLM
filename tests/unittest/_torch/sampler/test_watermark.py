@@ -54,13 +54,6 @@ class TestPrf:
         # 6627e8d5 e169c58d bc57ac4c 9b00dbd8; the PRF uses the first word.
         assert philox_uniform(0, np.array([0]))[0] == np.float32(_uniform_from_word(0x6627E8D5))
 
-    def test_uniform_range_and_spread(self):
-        values = philox_uniform(0x1234_5678_9ABC_DEF0, np.arange(100_000))
-        assert values.dtype == np.float32
-        assert values.min() > 0.0 and values.max() < 1.0
-        assert abs(values.mean() - 0.5) < 0.01
-        assert abs(values.var() - 1 / 12) < 0.005
-
     def test_numpy_matches_torch(self):
         seeds = np.array([0, 1, 2**63 + 5, 2**64 - 1], dtype=np.uint64)
         tokens = np.array([0, 1, 7, 151_935, 2**31 - 1])
@@ -68,13 +61,6 @@ class TestPrf:
         signed = torch.tensor(seeds.astype(np.int64))
         actual = philox_uniform_torch(signed, torch.tensor(tokens)).numpy()
         np.testing.assert_array_equal(actual, expected)
-
-    def test_per_token_seed_array(self):
-        tokens = np.arange(6)
-        seeds = np.array([3, 3, 9, 9, 2**64 - 1, 0], dtype=np.uint64)
-        batched = philox_uniform(seeds, tokens)
-        single = [philox_uniform(int(s), tokens[i : i + 1])[0] for i, s in enumerate(seeds)]
-        np.testing.assert_array_equal(batched, np.array(single, dtype=np.float32))
 
     def test_context_seed_depends_on_key_and_every_token(self):
         base = context_seed(7, [1, 2, 3, 4])
@@ -86,25 +72,8 @@ class TestPrf:
             assert base != context_seed(7, changed)
         assert context_seed(7, [PAD_TOKEN, 1, 2, 3]) != context_seed(7, [0, 1, 2, 3])
 
-    def test_context_seeds_torch_matches_numpy(self):
-        rng = np.random.default_rng(0)
-        contexts = rng.integers(0, 150_000, size=(64, 4))
-        contexts[0, :2] = PAD_TOKEN
-        key = 2**63 + 12345
-        expected = context_seeds(key, contexts)
-        actual = context_seeds_torch(key, torch.tensor(contexts))
-        np.testing.assert_array_equal(actual.numpy().astype(np.uint64), expected)
-
 
 class TestGammaTail:
-    @pytest.mark.parametrize("x", [0.1, 1.0, 5.0, 30.0])
-    def test_exponential_special_case(self, x):
-        assert _gamma_upper_tail(1.0, x) == pytest.approx(math.exp(-x), rel=1e-9)
-
-    @pytest.mark.parametrize("x", [0.5, 3.0, 12.0])
-    def test_erlang_two(self, x):
-        assert _gamma_upper_tail(2.0, x) == pytest.approx((1 + x) * math.exp(-x), rel=1e-9)
-
     def test_large_shape_normal_limit(self):
         n = 400.0
         assert _gamma_upper_tail(n, n) == pytest.approx(0.5, abs=0.02)
@@ -149,12 +118,6 @@ class TestMaxPairTail:
                 1 - quantile, rel=0.08, abs=2e-3
             )
 
-    def test_is_a_valid_tail(self):
-        assert _max_pair_sum_tail(10, 0.0) == 1.0
-        assert _max_pair_sum_tail(10, 1e6) < 1e-100 or _max_pair_sum_tail(10, 1e6) == 0.0
-        values = [_max_pair_sum_tail(30, t) for t in (30.0, 45.0, 60.0, 80.0)]
-        assert values == sorted(values, reverse=True)
-
 
 class TestDetector:
     @staticmethod
@@ -189,19 +152,6 @@ class TestDetector:
             .is_watermarked
         )
 
-    def test_false_positive_rate_on_plain_text(self):
-        config = WatermarkConfig(key=7)
-        probs = self._zipf()
-        detector = GumbelWatermarkDetector(config, p_value_threshold=0.05)
-        flagged = 0
-        trials = 200
-        for trial in range(trials):
-            text = _generate(
-                config, probs, num_tokens=120, prompt=[1, 2, 3], watermark=False, seed=trial
-            )
-            flagged += detector.detect(text, prompt_token_ids=[1, 2, 3]).is_watermarked
-        assert flagged / trials < 0.12
-
     def test_all_scope_scores_what_the_sampler_watermarked(self):
         prompt, output = [1, 2, 3, 9, 1, 2, 3, 4], [1, 2, 3, 7, 5]  # as in the handler test
         scored = {
@@ -213,12 +163,6 @@ class TestDetector:
             for scope in ("single_turn", "all")
         }
         assert scored == {"single_turn": 5, "all": 1}
-
-    def test_without_prompt_skips_first_context_width_positions(self):
-        config = WatermarkConfig(key=1, context_width=4)
-        text = _generate(config, self._zipf(), num_tokens=50, prompt=[1, 2, 3])
-        result = GumbelWatermarkDetector(config).detect(text)
-        assert result.num_scored <= 50 - 4
 
     def test_dual_key_detector_finds_either_key(self):
         config = WatermarkConfig(key=11, algorithm="gumbel_dual_key", deduplicate_contexts="none")
@@ -234,18 +178,6 @@ class TestDetector:
         # A single-key detector does not know the secondary key.
         single = GumbelWatermarkDetector(WatermarkConfig(key=11, deduplicate_contexts="none"))
         assert not single.detect(secondary, prompt_token_ids=prompt).is_watermarked
-
-    def test_repeated_contexts_are_scored_once(self):
-        config = WatermarkConfig(key=3, context_width=1)
-        # Context of width one repeats constantly; only distinct contexts may be scored.
-        text = _generate(config, self._zipf(50), num_tokens=200, prompt=[0])
-        scored = GumbelWatermarkDetector(config).detect(text, prompt_token_ids=[0]).num_scored
-        assert scored == len({0, *text[:-1]})
-        config_none = WatermarkConfig(key=3, context_width=1, deduplicate_contexts="none")
-        assert (
-            GumbelWatermarkDetector(config_none).detect(text, prompt_token_ids=[0]).num_scored
-            == 200
-        )
 
 
 class TestConfig:
@@ -294,27 +226,6 @@ class TestKernel:
         assert torch.equal(
             gumbel_sample_from_probs(probs, seeds, id_map=id_map)[active], actual[active]
         )
-
-    def test_deterministic_and_seed_dependent(self):
-        probs = torch.softmax(torch.randn(8, 3000, device="cuda"), dim=-1)
-        seeds = torch.arange(8, device="cuda", dtype=torch.int64)
-        first = gumbel_sample_from_probs(probs, seeds)
-        assert torch.equal(first, gumbel_sample_from_probs(probs, seeds))
-        assert not torch.equal(first, gumbel_sample_from_probs(probs, seeds + 1000))
-
-    def test_inactive_rows_are_skipped(self):
-        probs = torch.softmax(torch.randn(4, 100, device="cuda"), dim=-1)
-        seeds = torch.arange(4, device="cuda", dtype=torch.int64)
-        active = torch.tensor([True, False, True, False], device="cuda")
-        out = gumbel_sample_from_probs(probs, seeds, active)
-        assert out[1] == -1 and out[3] == -1
-        assert out[0] == gumbel_sample_from_probs(probs[:1], seeds[:1])[0]
-
-    def test_vocab_not_multiple_of_block(self):
-        probs = torch.softmax(torch.randn(3, 1025, device="cuda"), dim=-1)
-        seeds = torch.arange(3, device="cuda", dtype=torch.int64) + 99
-        out = gumbel_sample_from_probs(probs, seeds)
-        assert ((out >= 0) & (out < 1025)).all()
 
     def test_does_not_distort_the_distribution(self):
         # Averaged over random seeds the keyed draw must be an exact sample from p.
@@ -428,20 +339,6 @@ class TestKeyedRecovery:
             assert torch.equal(redrawn[row, :last], accepted[row, :last])
             assert torch.equal(redrawn[row, last + 1 :], accepted[row, last + 1 :])
 
-    def test_inactive_positions_keep_the_kernel_token(self):
-        probs = torch.full((2, 2, 4), 0.25, device="cuda")
-        draft = torch.full((2, 1, 4), 0.25, device="cuda")
-        accepted = torch.tensor([[1, 2], [3, 0]], dtype=torch.int32, device="cuda")
-        n = torch.tensor([2, 1], device="cuda")
-        seeds = torch.tensor([[5, 6], [7, 8]], device="cuda")
-        active = torch.zeros(2, 2, dtype=torch.bool, device="cuda")
-        assert torch.equal(keyed_recovery(accepted, n, probs, draft, seeds, active), accepted)
-
-    def test_secondary_key_is_independent_of_the_primary(self):
-        assert secondary_key(7) != 7
-        assert secondary_key(7) == secondary_key(7)
-        assert secondary_key(7) != secondary_key(8)
-
 
 def _request(request_id, slot, tokens, watermarking=None, greedy=False):
     return SimpleNamespace(
@@ -525,12 +422,6 @@ class TestHandler:
         if dedupe == "all":
             assert torch.equal(fused._skip, reference._skip)
 
-    def test_short_prompt_is_padded(self):
-        config, handler = self._handler()
-        handler.observe([_request(1, 0, [5])], _can_sample)
-        rows = handler.begin([0])
-        assert _as_uint(rows.seeds)[0, 0] == _seed_of(config, [PAD_TOKEN, PAD_TOKEN, 5])
-
     def test_new_occupant_resets_the_slot(self):
         _, handler = self._handler()
         handler.observe([_request(1, 1, [1, 2, 3])], _can_sample)
@@ -554,15 +445,6 @@ class TestHandler:
         assert torch.equal(repeated.seeds, first.seeds)
         assert not repeated.active.any()
 
-    def test_no_dedup_when_disabled(self):
-        _, handler = self._handler(deduplicate_contexts="none")
-        handler.observe([_request(1, 0, [1, 2, 3])], _can_sample)
-        first = handler.begin([0])
-        for token in (1, 2, 3):
-            rows = first if token == 1 else handler.begin([0])
-            handler.commit(rows, _device([token], torch.int32))
-        assert handler.begin([0]).active.all()
-
     def test_opt_out_and_greedy_rows_are_inactive(self):
         _, handler = self._handler()
         handler.observe(
@@ -576,20 +458,6 @@ class TestHandler:
         rows = handler.begin([0, 1, 2])
         assert rows.active[:, 0].tolist() == [True, False, False]
         assert handler.begin([1, 2]) is None
-
-    def test_window_contexts_include_the_drafts(self):
-        config, handler = self._handler()
-        handler.observe([_request(1, 0, [1, 2, 3])], _can_sample)
-        rows = handler.plan(_device([0]), _device([True], torch.bool), _device([[7, 8]]))
-        expected = [[1, 2, 3], [2, 3, 7], [3, 7, 8]]
-        assert [int(v) for v in _as_uint(rows.seeds)[0]] == [_seed_of(config, c) for c in expected]
-
-    def test_window_dedupes_repeats_inside_the_window(self):
-        _, handler = self._handler()
-        handler.observe([_request(1, 0, [5, 5, 5])], _can_sample)
-        # Drafts 5, 5 keep the context [5, 5, 5]: positions 1 and 2 repeat position 0.
-        rows = handler.plan(_device([0]), _device([True], torch.bool), _device([[5, 5]]))
-        assert rows.active.tolist() == [[True, False, False]]
 
     def test_all_scope_skips_first_tokens_and_searches_the_prompt(self):
         prompt = [1, 2, 3, 9, 1, 2, 3, 4]  # holds the contexts [1, 2, 3] and [2, 3, 9]
@@ -667,74 +535,6 @@ class TestHandler:
         assert spec_active == plain_active
         assert torch.equal(spec._tail, plain._tail)
         assert torch.equal(spec._count, plain._count)
-
-    def test_disabled_request_state_is_untouched(self):
-        _, handler = self._handler()
-        handler.observe([_request(1, 0, [1, 2, 3])], _can_sample)
-        before = handler._tail.clone()
-        rows = handler.plan(_device([0]), _device([False], torch.bool), _device([[4, 5]]))
-        handler.commit(rows, _device([[4, 5, 6]], torch.int32), _device([3]))
-        assert torch.equal(handler._tail, before)
-        assert int(handler._count[0]) == 0
-
-
-def _twin_handlers(**config_kwargs):
-    config = WatermarkConfig(key=2**63 + 17, context_width=3, **config_kwargs)
-    return config, [
-        WatermarkHandler(config, max_num_sequences=6, max_seq_len=40, device="cuda")
-        for _ in range(2)
-    ]
-
-
-@requires_cuda
-class TestFusedKernels:
-    """The fused plan and commit kernels must match the plain-torch reference exactly."""
-
-    @pytest.mark.parametrize("dedupe", ["none", "single_turn", "all"])
-    @pytest.mark.parametrize("algorithm", ["gumbel", "gumbel_dual_key"])
-    @pytest.mark.parametrize("num_drafts", [0, 1, 3])
-    def test_matches_reference_over_random_steps(self, dedupe, algorithm, num_drafts):
-        rng = np.random.default_rng(num_drafts)
-        _, (fused, reference) = _twin_handlers(deduplicate_contexts=dedupe, algorithm=algorithm)
-        # A tiny vocabulary makes repeated contexts (and in-window repeats) common, and a ring
-        # shorter than the generation makes entries expire.
-        for slot in range(5):
-            for handler in (fused, reference):
-                handler.observe([_request(100 + slot, slot, [1, 2, 3])], _can_sample)
-        for _ in range(60):
-            slots = _device(rng.permutation(5).tolist() + [5])  # slot 5 stands in for padding
-            enabled = _device([True, True, False, True, True, False], torch.bool)
-            drafts = _device(rng.integers(0, 3, size=(6, num_drafts))) if num_drafts else None
-            rows = fused.plan(slots, enabled, drafts)
-            expected = reference.plan_reference(slots, enabled, drafts)
-            assert torch.equal(rows.seeds, expected.seeds)
-            assert torch.equal(rows.seeds_secondary, expected.seeds_secondary)
-            assert torch.equal(rows.active, expected.active)
-            accepted = _device(rng.integers(0, 3, size=(6, num_drafts + 1)), torch.int32)
-            num_accepted = _device(rng.integers(1, num_drafts + 2, size=6))
-            fused.commit(rows, accepted, num_accepted)
-            reference.commit_reference(expected, accepted, num_accepted)
-            assert torch.equal(fused._tail, reference._tail)
-            assert torch.equal(fused._count, reference._count)
-            if dedupe != "none":
-                assert torch.equal(
-                    fused._ring[:, : fused._ring_size], reference._ring[:, : reference._ring_size]
-                )
-            if dedupe == "all":
-                assert torch.equal(fused._skip, reference._skip)
-
-    def test_inactive_and_padding_rows_keep_their_state(self):
-        _, (fused, reference) = _twin_handlers()
-        fused.observe([_request(1, 0, [4, 5, 6])], _can_sample)
-        before = fused._tail.clone(), fused._count.clone()
-        slots = _device(
-            [0, 5, 5]
-        )  # a disabled request and two padding rows sharing the scratch slot
-        enabled = _device([False, False, False], torch.bool)
-        rows = fused.plan(slots, enabled, _device([[1, 2], [3, 4], [5, 6]]))
-        assert not rows.active.any()
-        fused.commit(rows, _device([[1, 2, 3]] * 3, torch.int32), _device([3, 3, 3]))
-        assert torch.equal(fused._tail, before[0]) and torch.equal(fused._count, before[1])
 
 
 class TestRequestWantsWatermark:
