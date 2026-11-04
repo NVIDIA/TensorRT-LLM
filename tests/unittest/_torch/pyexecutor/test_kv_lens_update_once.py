@@ -30,9 +30,9 @@ class _Metadata:
         self.seen.append(self.kv_lens_cuda.tolist())
 
 
-def _preparer(once: bool, disable_overlap: bool = False) -> DecoderInputPreparer:
+def _preparer(disable_overlap: bool = False) -> DecoderInputPreparer:
     r = object.__new__(DecoderInputPreparer)
-    r.runtime_hooks = RuntimeHooks(kv_lens_update_once=once)
+    r.runtime_hooks = RuntimeHooks()
     r._config = types.SimpleNamespace(disable_overlap_scheduler=disable_overlap)
     r._buffers = types.SimpleNamespace(
         previous_pos_id_offsets_cuda=torch.full((64,), -2, dtype=torch.int32),
@@ -55,18 +55,13 @@ def _inputs(md: _Metadata, tokens: int) -> dict:
 @pytest.mark.parametrize("gen", [1, 4])
 def test_corrected_step_updates_once_with_the_same_inputs(gen) -> None:
     t = 4
-    outs = {}
-    for once in (False, True):
-        md = _Metadata(gen, t)
-        inputs = _preparer(once).preprocess_inputs(
-            _inputs(md, gen * t), enable_spec_decode=True, runtime_draft_len=t - 1
-        )
-        outs[once] = (md.seen, inputs["position_ids"].tolist(), md.kv_lens_cuda.tolist())
+    md = _Metadata(gen, t)
+    _preparer().preprocess_inputs(
+        _inputs(md, gen * t), enable_spec_decode=True, runtime_draft_len=t - 1
+    )
     corrected = [100 + i - 3 for i in range(gen)]
-    # The upstream path updates after correction for both legacy hook values.
-    assert outs[False][0] == [corrected]
-    assert outs[True][0] == [corrected]
-    assert outs[True][1:] == outs[False][1:]
+    # One update, after the correction, for every model.
+    assert md.seen == [corrected]
 
 
 @pytest.mark.parametrize(
@@ -75,18 +70,11 @@ def test_corrected_step_updates_once_with_the_same_inputs(gen) -> None:
     ids=["no spec decode", "no overlap scheduler", "no kv cache manager"],
 )
 def test_uncorrected_steps_keep_their_update(spec, disable_overlap, with_kv_cache) -> None:
-    """Steps that do not correct the lengths still re-derive them once (the per-forward invalidation), with the same
-    inputs as without the hook."""
-    outs = {}
-    for once in (False, True):
-        md = _Metadata(2, 4, with_kv_cache)
-        inputs = _preparer(once, disable_overlap).preprocess_inputs(
-            _inputs(md, 8), enable_spec_decode=spec, runtime_draft_len=3
-        )
-        outs[once] = (md.seen, inputs["position_ids"].tolist(), md.kv_lens_cuda.tolist())
-    assert len(outs[True][0]) == 1
-    assert outs[True] == outs[False]
-
-
-def test_off_by_default() -> None:
-    assert RuntimeHooks().kv_lens_update_once is False
+    """Steps that do not correct the lengths still re-derive them once (the per-forward invalidation), from the
+    uncorrected lengths."""
+    md = _Metadata(2, 4, with_kv_cache)
+    inputs = _preparer(disable_overlap).preprocess_inputs(
+        _inputs(md, 8), enable_spec_decode=spec, runtime_draft_len=3
+    )
+    assert md.seen == [[100, 101]]
+    assert inputs["position_ids"].tolist() == [list(range(8))]

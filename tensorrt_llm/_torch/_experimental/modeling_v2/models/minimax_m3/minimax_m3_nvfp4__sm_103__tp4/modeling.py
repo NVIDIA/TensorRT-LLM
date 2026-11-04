@@ -135,7 +135,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.device_copy import CopyPlan, CopySite
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._torch.speculative.interface import (
@@ -159,7 +159,6 @@ from .ops import m3_mc_allreduce, m3_prequant, m3_spec_tail
 from .ops import m3_sampled_accept as m3_sampled_accept_kernel
 from .ops import m3_shard_accept as m3_shard_accept_kernel
 from .ops import m3_target_head as m3_target_head_kernel
-from .ops import msa_kv_update as _msa_kv_update_kernel
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_attn_c1 import m3_attn_c1
 from .ops.attention.m3_attn_mega import m3_attn_mega
@@ -4478,27 +4477,16 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
       inputs wait on graph N in program order rather than through two cross-stream event hops.
     * ``merge_tuned_tactics_across_ranks``: tensor-parallel peers capture the same GEMM tactics (rank-local profiling
       noise otherwise splits them, and the slowest rank sets every step).
-    * ``skip_greedy_rng_upload``: all-greedy speculative batches never read the Philox seeds.
     * ``spec_step_fold``: the spec sampler's slot stores and the engine's next-step input gathers in one launch each.
-    * ``skip_unchanged_h2d``: steady decode re-uploads slot indices, query lengths and page tables that rarely change;
-      each metadata buffer's owner skips an upload whose values the buffer already holds.
-    * MSA: identity selections for short sequences (and short/long graph families), the one-launch KV-length update,
-      unchanged block-table gathers skipped, the decode tables built on the host (staged as copies, see
-      ``_COPY_PLAN``), pool views built once.
+
+    The MSA backend's own decode preparation (identity selections for short sequences and the short/long graph
+    families, the one-launch KV-length update, unchanged uploads and block-table gathers skipped, the decode tables
+    built on the host, pool views built once) needs no hook.
     """
     return RuntimeHooks(
-        skip_unchanged_h2d=True,
         loop_on_execution_stream=True,
         merge_tuned_tactics_across_ranks=True,
-        skip_greedy_rng_upload=True,
         spec_step_fold=spec_fold,
-        msa=MsaRuntimePolicy(
-            short_sequence_identity=True,
-            kv_update=_msa_kv_update_kernel.msa_kv_update,
-            skip_unchanged_block_offsets=True,
-            stage_tables_on_host=True,
-            reuse_pool_views=True,
-        ),
     )
 
 
@@ -4506,7 +4494,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
 #: graph waits on (~30 us of idle GPU at one request). Each entry asserts, for this target's decode step, that no device
 #: work touches the destination before its barrier: the graph replay, or right after the anchor's own staged copy for a
 #: ``flush_after`` site. ``TLLM_DEVICE_COPY_CHECK=1`` verifies it. Whether an upload is skipped as unchanged is not the
-#: plan's business: the buffer owners decide (``skip_unchanged_h2d`` in ``_runtime_hooks``).
+#: plan's business: the buffer owners decide (the MSA attention metadata skips its unchanged uploads).
 _COPY_PLAN = CopyPlan(
     merge={
         CopySite.GRAPH_INPUT_IDS,

@@ -336,10 +336,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     :meth:`_prepare_page_table_tensor`.
     """
 
-    # Decode-step shortcuts a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
+    # Skip a decode-only block-table copy whose inputs equal the previous copy's into the same destination. Sound
+    # only while nothing else writes the destination: the MSA attention metadata, whose engine keeps its CUDA graph
+    # buffers private, turns it on for its own manager (MiniMaxM3MsaSparseAttentionMetadata.__post_init__).
     skip_unchanged_block_offsets = False
-    reuse_pool_views = False
-    block_ids_from_views = False
+    # Hand out one pool view per pool geometry instead of re-wrapping the pool memory on every attention call. The
+    # view is a pure function of the pool's address and geometry (see _pool_view), so this holds for every caller.
+    reuse_pool_views = True
+    # Fill get_block_ids_per_seq rows by slice-copying each request's page-index view instead of building a Python list
+    # of the whole padded row first; the table is the same.
+    block_ids_from_views = True
 
     _main_kv_mapper_kind = MapperKind.HND
     _main_kv_view_layout = "NHD"
@@ -1036,27 +1042,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             page_shape,
             transpose=kv_layout != self._main_kv_layout_name(),
         )
-
-    def configure_decode_shortcuts(
-        self,
-        skip_unchanged_block_offsets: bool,
-        reuse_pool_views: bool,
-        block_ids_from_views: bool = False,
-    ) -> None:
-        """Turn on the decode-step shortcuts a model opted into.
-
-        ``skip_unchanged_block_offsets``: skip a decode-only block-table copy
-        whose inputs equal the previous copy's into the same destination.
-        ``reuse_pool_views``: hand out one pool view per geometry instead of
-        re-wrapping the pool memory on every attention call.
-        ``block_ids_from_views``: fill :meth:`get_block_ids_per_seq` rows from the
-        page-index views directly (see there).
-        """
-        self.skip_unchanged_block_offsets = skip_unchanged_block_offsets
-        self.reuse_pool_views = reuse_pool_views
-        self.block_ids_from_views = block_ids_from_views
-        if block_ids_from_views:
-            logger.info("[M3 host] block-id tables filled from page-index views")
 
     def _pool_view(
         self,
