@@ -1444,12 +1444,7 @@ class SpecMetadata:
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling
                 or self.enable_penalty) and self.batch_slot_ids is not None:
-            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
-                torch.tensor(per_request_slot_ids,
-                             dtype=torch.long,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            self._upload_batch_slot_ids(per_request_slot_ids)
 
         # Penalties are independent of the greedy/advanced split -- they rewrite the
         # logits before sampling, so an all-greedy batch is penalized too (its argmax
@@ -1547,6 +1542,25 @@ class SpecMetadata:
                 self.min_ps[:len(min_ps)].copy_(torch.tensor(
                     min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                                 non_blocking=True)
+
+    def _upload_batch_slot_ids(self, slot_ids: list[int]) -> None:
+        """Copy this batch's slot ids into ``batch_slot_ids``.
+
+        An open step-input stager that takes this table
+        (``stages_batch_slot_ids``) records the write into its launch (its
+        source is read on the host, so it needs no pinned block); otherwise, or
+        when the stager declines, the copy is issued here.
+        """
+        dst = self.batch_slot_ids[:len(slot_ids)]
+        stager = self.step_input_stager
+        if (stager is not None
+                and getattr(stager, "stages_batch_slot_ids", False)
+                and stager.copy(dst, torch.tensor(slot_ids, dtype=torch.long))):
+            return
+        dst.copy_(torch.tensor(slot_ids,
+                               dtype=torch.long,
+                               pin_memory=prefer_pinned()),
+                  non_blocking=True)
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, float, int]]

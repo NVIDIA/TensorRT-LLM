@@ -70,6 +70,11 @@ class StepInputStager(Protocol):
     window, so the rest of the preparation runs natively and in its original
     order. ``end`` issues every recorded write; ``discard`` drops them after a
     failed preparation.
+
+    The speculative metadata's slot-id table upload
+    (``SpecMetadata._upload_batch_slot_ids``) goes to ``copy`` only when the
+    stager sets ``stages_batch_slot_ids`` True; without that attribute it is
+    issued natively.
     """
 
     def copy(self, dst: "torch.Tensor", src: "torch.Tensor") -> bool:
