@@ -35,7 +35,7 @@ def _isolate_mimalloc_thp_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV, "")
     monkeypatch.delenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV)
     monkeypatch.setattr(_bootstrap, "_mimalloc_thp_default_applied", False)
-    monkeypatch.setattr(_bootstrap, "_thp_disabled_before_torch", None)
+    monkeypatch.setattr(_bootstrap, "_thp_disable_before_torch", None)
 
 
 def test_unified_cache_is_disabled_without_root() -> None:
@@ -181,7 +181,7 @@ def _mimalloc_default_state(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_prepare_environment_keeps_mimalloc_arenas_off_thp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: False)
+    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: 0)
     for name in (
         "_setup_unified_cache",
         "_add_trt_llm_dll_directory",
@@ -194,15 +194,15 @@ def test_prepare_environment_keeps_mimalloc_arenas_off_thp(
 
     assert os.environ[_bootstrap._MIMALLOC_ALLOW_THP_ENV] == "0"
     assert _bootstrap._mimalloc_thp_default_applied
-    assert _bootstrap._thp_disabled_before_torch is False
+    assert _bootstrap._thp_disable_before_torch == 0
 
 
 @pytest.mark.usefixtures("_mimalloc_default_state")
 def test_explicit_mimalloc_thp_setting_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV, "1")
     calls = []
-    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: True)
-    monkeypatch.setattr(_bootstrap, "_clear_thp_disable_flag", lambda: calls.append("clear"))
+    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: 1)
+    monkeypatch.setattr(_bootstrap, "_set_thp_disable_flag", calls.append)
 
     _bootstrap._keep_mimalloc_arenas_off_thp()
     _bootstrap._restore_process_thp()
@@ -250,51 +250,47 @@ def test_mimalloc_thp_default_is_set_before_torch_can_load(
 
 @pytest.mark.usefixtures("_mimalloc_default_state")
 @pytest.mark.parametrize(
-    ("before", "after", "cleared"),
+    ("before", "after", "restored"),
     [
-        (False, True, True),  # the torch import disabled THP: undo it
-        (False, False, False),  # nothing changed
-        (True, True, False),  # disabled before TensorRT LLM was imported: keep it
-        (None, True, False),  # flag not readable before the import: keep it
+        (0, 1, 0),  # the torch import disabled THP: undo it
+        (0, 0, None),  # nothing changed
+        (1, 1, None),  # disabled before TensorRT LLM was imported: keep it
+        # disabled except where advised before, and the import made it plain: put it back
+        (3, 1, 3),
+        (None, 1, None),  # flag not readable before the import: keep it
     ],
 )
 def test_restore_process_thp_withdraws_the_default(
-    monkeypatch: pytest.MonkeyPatch, before, after, cleared
+    monkeypatch: pytest.MonkeyPatch, before: int | None, after: int, restored: int | None
 ) -> None:
     calls = []
     monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: before)
     _bootstrap._keep_mimalloc_arenas_off_thp()
     assert os.environ[_bootstrap._MIMALLOC_ALLOW_THP_ENV] == "0"
     monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: after)
-    monkeypatch.setattr(_bootstrap, "_clear_thp_disable_flag", lambda: calls.append("clear"))
+    monkeypatch.setattr(_bootstrap, "_set_thp_disable_flag", calls.append)
 
     _bootstrap._restore_process_thp()
     _bootstrap._restore_process_thp()
 
     assert _bootstrap._MIMALLOC_ALLOW_THP_ENV not in os.environ
-    assert calls == (["clear"] if cleared else [])
+    assert calls == ([] if restored is None else [restored])
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_THP_DISABLE is Linux-only")
 def test_thp_disable_flag_round_trip() -> None:
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    original = libc.prctl(_bootstrap._PR_GET_THP_DISABLE, 0, 0, 0, 0)
-    if original == 3:
-        # PR_THP_DISABLE_EXCEPT_ADVISED (Linux 6.18+), inherited from the parent.
-        # The round trip below would restore it as the plain flag, so only check
-        # that it reads as disabled.
-        assert _bootstrap._thp_disable_flag() is True
-        return
-    assert original in (0, 1)
+    # 3 is PR_THP_DISABLE_EXCEPT_ADVISED (Linux 6.18+), possibly inherited from the
+    # parent; it is restored exactly like the others.
+    original = _bootstrap._thp_disable_flag()
+    assert original in (0, 1, 1 | _bootstrap._PR_THP_DISABLE_EXCEPT_ADVISED)
     try:
-        assert libc.prctl(_bootstrap._PR_SET_THP_DISABLE, 1, 0, 0, 0) == 0
-        assert _bootstrap._thp_disable_flag() is True
-        _bootstrap._clear_thp_disable_flag()
-        assert _bootstrap._thp_disable_flag() is False
+        _bootstrap._set_thp_disable_flag(1)
+        assert _bootstrap._thp_disable_flag() == 1
+        _bootstrap._set_thp_disable_flag(0)
+        assert _bootstrap._thp_disable_flag() == 0
     finally:
-        libc.prctl(_bootstrap._PR_SET_THP_DISABLE, original, 0, 0, 0)
+        _bootstrap._set_thp_disable_flag(original)
+    assert _bootstrap._thp_disable_flag() == original
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_THP_DISABLE is Linux-only")

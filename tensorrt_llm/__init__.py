@@ -26,7 +26,9 @@ from ._bootstrap import _init, _prepare_environment, _restore_process_thp
 try:
     # Phase 1: cache environment, DLL search path, Python-library preload and
     # vendored triton_kernels precedence. Must run before torch and before any
-    # TensorRT-LLM shared object.
+    # TensorRT-LLM shared object. It also sets a temporary MIMALLOC_ALLOW_THP=0
+    # for torch's CPU allocator, which the finally below withdraws, so the
+    # torch import stays inside this try.
     _prepare_environment()
 
     # The package's public surface is loaded lazily (PEP 562): importing
@@ -43,8 +45,8 @@ try:
     # ImportError: libc10.so: cannot open shared object file: No such file or directory
     import torch  # noqa
 finally:
-    # Undo the process-wide part of the mimalloc option phase 1 set (see
-    # _bootstrap), also when phase 1 or the torch import raises.
+    # Withdraw the mimalloc default of phase 1 (see _bootstrap), also when
+    # phase 1 or the torch import raises.
     _restore_process_thp()
 
 from .logger import logger
