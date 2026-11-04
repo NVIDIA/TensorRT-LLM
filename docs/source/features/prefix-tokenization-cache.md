@@ -94,7 +94,8 @@ feature you turned on.
 ## Multiple serving frontends
 
 Use a single serving frontend (`num_serve_frontends: 1`, the default) when you
-enable the cache for multi-turn traffic.
+enable the cache for multi-turn traffic. Multiple frontends are available only
+with the classic IPC executor, so this section applies only there.
 
 The cache lives in the memory of one frontend process and is not shared
 between processes. With `num_serve_frontends: K`, the K frontend processes

@@ -44,7 +44,7 @@ _LENGTH = struct.Struct("!q")
 # Sent in place of a token count when the owner could not tokenize the prompt.
 _FAILED = -1
 # Lone surrogates, which JSON can carry, survive the trip and fail in the
-# tokenizer as they would locally.
+# tokenizer as they would locally, and do not fail a conversation id's hash.
 _TEXT_ERRORS = "surrogatepass"
 
 
@@ -55,7 +55,7 @@ def routing_enabled() -> bool:
 
 def owner_of(key: str, num_frontends: int) -> int:
     """The frontend that tokenizes conversation ``key``, the same in every process."""
-    return zlib.crc32(key.encode()) % num_frontends
+    return zlib.crc32(key.encode(errors=_TEXT_ERRORS)) % num_frontends
 
 
 class TokenizationOwners:

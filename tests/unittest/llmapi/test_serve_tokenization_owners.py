@@ -118,3 +118,8 @@ def test_a_prompt_is_tokenized_locally_when_its_owner_does_not_tokenize_it(tmp_p
     finally:
         for owner in owners:
             owner.close()
+
+
+def test_a_conversation_id_with_a_lone_surrogate_has_an_owner() -> None:
+    # JSON can carry one; it must not fail the request it arrives with.
+    assert owner_of("conversation-\ud800", 2) in (0, 1)
