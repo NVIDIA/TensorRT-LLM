@@ -470,9 +470,15 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             self._join_pending_x_ready()
             return moe_output
 
-        if sort_tables is not None and sort_tables.published:
-            assert token_selected_experts.size(0) <= self.small_batch_max_tokens
-            assert not enable_alltoall and self.tp_size > 1
+        if (
+            sort_tables is not None
+            and sort_tables.published
+            and not (small_batch and self.tp_size > 1)
+        ):
+            raise RuntimeError(
+                "published routing needs the token-indexed small-batch kernel (MoE-TP), not "
+                f"{num_tokens} tokens{' with all-to-all' if enable_alltoall else ''}"
+            )
         if small_batch:
             return self._run_small_batch(
                 x,
@@ -550,23 +556,25 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         ``push``)."""
         published = sort_tables is not None and sort_tables.published
         if published:
-            # the kernel builds the tables from the published ids; nothing reads these
-            ids = token_selected_experts.reshape(-1)
-            sort_outputs = (ids, ids, ids, ids, ids, ids)
-        elif sort_tables is not None and sort_tables.tile_size == 128:
-            sort_outputs = sort_tables.outputs
+            # the kernel builds the tables from the published top-k ids
+            tile_idx_to_expert_idx = tile_idx_to_mn_limit = permuted_idx_to_expanded_idx = None
+            num_non_exiting_tiles = None
+            expanded_idx_to_permuted_idx = token_selected_experts.reshape(-1)
         else:
-            sort_outputs = self._sort_routing(
-                token_selected_experts, token_final_scales, weight_view, 128
-            )
-        (
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_expanded_idx,
-            _total_num_padded_tokens,
-            num_non_exiting_tiles,
-        ) = sort_outputs
+            if sort_tables is not None and sort_tables.tile_size == 128:
+                sort_outputs = sort_tables.outputs
+            else:
+                sort_outputs = self._sort_routing(
+                    token_selected_experts, token_final_scales, weight_view, 128
+                )
+            (
+                tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx,
+                _total_num_padded_tokens,
+                num_non_exiting_tiles,
+            ) = sort_outputs
         self._join_pending_x_ready()
         if self._small_batch_counters is None:
             self._small_batch_counters = new_small_batch_moe_counters(x.device)
@@ -584,7 +592,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            expanded_idx_to_permuted_idx=ids if published else expanded_idx_to_permuted_idx,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             global_sf=self.fc2_input_scale,
             token_final_scales=token_final_scales,

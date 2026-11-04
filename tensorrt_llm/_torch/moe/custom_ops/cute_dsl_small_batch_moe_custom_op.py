@@ -109,11 +109,11 @@ class _SmallBatchMoeRunner:
         w2_sf: torch.Tensor,
         alpha2: torch.Tensor,
         out: torch.Tensor,
-        tile_idx_to_group_idx: torch.Tensor,
-        tile_idx_to_mn_limit: torch.Tensor,
-        permuted_idx_to_expanded_idx: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor | None,
+        tile_idx_to_mn_limit: torch.Tensor | None,
+        permuted_idx_to_expanded_idx: torch.Tensor | None,
         expanded_idx_to_permuted_idx: torch.Tensor,
-        num_non_exiting_tiles: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor | None,
         global_sf: torch.Tensor,
         token_final_scales: torch.Tensor,
         counters: torch.Tensor,
@@ -157,11 +157,24 @@ class _SmallBatchMoeRunner:
             sm_domain_words = pack_sm_domain_words(sm_locality_domains(x.device.index))
         k2 = n1 // 2
         assert k2 % 256 == 0, "the FC1-output scale buffer is not zero-padded"
-        m = permuted_idx_to_expanded_idx.size(0)
+        tables = (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+        )
         if published_routing:
             from ..kernels.blackwell.kimi_k3_routing import sort_buffer_sizes
 
+            if any(t is not None for t in tables):
+                raise ValueError("published routing takes no moe_sort tables")
             m = sort_buffer_sizes(orig_m, num_local)[1]
+            # the kernel reads none of the tables; any device address fills their slots
+            tables = (counters,) * len(tables)
+        elif any(t is None for t in tables):
+            raise ValueError("the moe_sort tables are required without published routing")
+        else:
+            m = permuted_idx_to_expanded_idx.size(0)
         assert m // 128 <= _MAX_TILES and counters.numel() >= counter_words(m // 128)
         assert expanded_idx_to_permuted_idx.numel() == orig_m * top_k
         n_tok = n_tok_for(orig_m)
@@ -201,10 +214,10 @@ class _SmallBatchMoeRunner:
             ptr(cutlass.Float8E4M3FN, w2_sf, 16),
             ptr(cutlass.Float32, alpha2),
             ptr(cutlass.BFloat16, out, 16),
-            ptr(cutlass.Int32, tile_idx_to_group_idx),
-            ptr(cutlass.Int32, tile_idx_to_mn_limit),
-            ptr(cutlass.Int32, permuted_idx_to_expanded_idx),
-            ptr(cutlass.Int32, num_non_exiting_tiles),
+            ptr(cutlass.Int32, tables[0]),
+            ptr(cutlass.Int32, tables[1]),
+            ptr(cutlass.Int32, tables[2]),
+            ptr(cutlass.Int32, tables[3]),
             ptr(cutlass.Float32, global_sf),
             ptr(cutlass.Float32, token_final_scales),
             ptr(cutlass.Int32, expanded_idx_to_permuted_idx),
@@ -293,11 +306,11 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     fc2_weight_scale: torch.Tensor,
     fc2_alpha: torch.Tensor,
     output: torch.Tensor,
-    tile_idx_to_group_idx: torch.Tensor,
-    tile_idx_to_mn_limit: torch.Tensor,
-    permuted_idx_to_expanded_idx: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor | None,
+    tile_idx_to_mn_limit: torch.Tensor | None,
+    permuted_idx_to_expanded_idx: torch.Tensor | None,
     expanded_idx_to_permuted_idx: torch.Tensor,
-    num_non_exiting_tiles: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor | None,
     global_sf: torch.Tensor,
     token_final_scales: torch.Tensor,
     counters: torch.Tensor,
@@ -329,7 +342,7 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     ``[L, rows, cols]`` shapes (see ``RubinSmallBatchFusedMoeKernel``). ``published_routing``
     (``token_indexed``): instead of the tables, ``expanded_idx_to_permuted_idx`` holds the top-k
     ids, which a routing kernel publishes into :func:`small_batch_moe_route_word` of ``counters``
-    (the other table arguments are not read); ``expert_offset``: this rank's first expert.
+    (the other four tables are None); ``expert_offset``: this rank's first expert.
     ``push_world`` > 0: also push the output rows into slot ``(token, push_rank)`` of the
     one-shot MNNVL all-reduce over ``push_world`` ranks whose multicast base is ``push_mc`` and
     state ``push_flags`` (its consumer finishes it); runs the slice combine.
