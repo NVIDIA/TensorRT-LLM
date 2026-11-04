@@ -4111,15 +4111,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # pool, so writing it afterwards would attend uninitialised slots.
         pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
         blk_rows = blk_kv.reshape(-1, blk_kv.shape[-1])
-        if pool.dtype == torch.float8_e4m3fn:
-            # Stored like the context latents; byte views because index_put
-            # support for FP8 varies across builds.
-            pool, blk_rows = pool.view(torch.uint8), to_draft_fp8(blk_rows).view(torch.uint8)
         pages, offsets = fixup.pages.reshape(-1), fixup.offsets.reshape(-1)
         if fixup.owned is not None:
-            # Helix: positions on other ranks rewrite their local slot unchanged.
-            blk_rows = torch.where(fixup.owned, blk_rows, pool[pages, offsets])
-        pool[pages, offsets] = blk_rows
+            # Helix: positions on other ranks write nothing; an FP8 pool stores to_draft_fp8.
+            scatter_rows_to_pool(blk_rows, pool, pages, offsets, rows_mask=fixup.owned)
+        else:
+            if pool.dtype == torch.float8_e4m3fn:
+                # Stored like the context latents; byte views because index_put
+                # support for FP8 varies across builds.
+                pool, blk_rows = pool.view(torch.uint8), to_draft_fp8(blk_rows).view(torch.uint8)
+            pool[pages, offsets] = blk_rows
 
         if self._mla_block_decode_variant(paged=True) == "cute_dsl":
             return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)

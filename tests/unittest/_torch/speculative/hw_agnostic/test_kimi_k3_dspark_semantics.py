@@ -2353,8 +2353,7 @@ def test_helix_sharded_block_decode_matches_the_full_context(cp_size, fp8):
 @needs_cuda
 def test_helix_context_store_writes_only_owned_positions():
     """A helix rank stores the positions of its own pages at their local slots;
-    another rank's position rewrites the slot it maps to unchanged. A step's
-    window (at most one page) never maps two positions to one slot."""
+    another rank's position leaves the slot it maps to unchanged."""
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
     from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
 
@@ -2370,7 +2369,7 @@ def test_helix_context_store_writes_only_owned_positions():
         for _ in range(layers)
     ]
     positions = torch.tensor([6, 7, 8, 9], device="cuda")
-    k = positions.view(-1, 1, 1, 1).expand(-1, layers, 1, MLA_LATENT).bfloat16()
+    k = positions.view(-1, 1, 1, 1).expand(-1, layers, 1, MLA_LATENT).bfloat16().contiguous()
     worker._store_context_kv_paged(k, None, torch.zeros_like(positions), positions)
 
     for layer in range(layers):
@@ -2380,3 +2379,24 @@ def test_helix_context_store_writes_only_owned_positions():
         # Positions 8, 9 (global page 2, rank 0's) map to local page 1 =
         # physical page 0 and leave it unchanged.
         assert pool[0].tolist() == [sentinel] * page
+
+
+@needs_cuda
+def test_helix_context_store_owned_position_wins_a_shared_slot():
+    """A window wider than a page maps another rank's position and an owned one to
+    the same local slot; the owned value is stored, whatever the launch order."""
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+    page = 4
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_page_size = page
+    # Rank 1 of 2: global page 0 (rank 0's) and page 1 (its own) both map to local page 0.
+    worker._ctx_helix = HelixDraftShard(2, 1, page)
+    worker._ctx_block_tables = torch.tensor([[2, 0]], device="cuda")
+    worker._ctx_kv_buf = [torch.full((3, 1, 1, page, MLA_LATENT), -7.0, device="cuda").bfloat16()]
+    positions = torch.arange(2 * page, device="cuda")
+    k = positions.view(-1, 1, 1, 1).expand(-1, 1, 1, MLA_LATENT).bfloat16().contiguous()
+    worker._store_context_kv_paged(k, None, torch.zeros_like(positions), positions)
+
+    assert worker._ctx_kv_buf[0][2, 0, 0, :, 0].tolist() == [4.0, 5.0, 6.0, 7.0]

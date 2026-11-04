@@ -48,6 +48,7 @@ from .spec_tail_kernels import (
     DraftBlockPlacement,
     decode_draft_block_table,
     dflash_paged_latent_prepare,
+    scatter_rows_to_pool,
     store_context_latents,
 )
 from .vocab_parallel import VocabParallelHead, VocabShardedLogits
@@ -1676,20 +1677,22 @@ class DFlashWorker(SpecWorkerBase):
             positions = positions.long()
             owned = None
             if self._ctx_helix is not None:
-                # Positions on other ranks rewrite their local slot unchanged; a
-                # row's positions within one page apart never share a slot.
+                # Positions on other ranks write nothing; their local slots keep their values.
                 positions, owned = self._ctx_helix.local_slots(positions)
-                owned = owned.view(-1, 1)
             pages = table[rows.long(), positions // page_size].long()
             offsets = positions % page_size
             for layer_idx in range(k.size(1)):
                 pool, new = self._ctx_kv_buf[layer_idx], k[:, layer_idx, 0]
+                if owned is not None:
+                    # An FP8 pool stores to_draft_fp8, as below.
+                    scatter_rows_to_pool(
+                        new, pool[:, 0, 0], pages, offsets, rows_mask=owned.contiguous()
+                    )
+                    continue
                 if pool.dtype == torch.float8_e4m3fn:
                     # Saturated FP8, as the block decode quantizes its query;
                     # byte views because index_put support for FP8 varies.
                     pool, new = pool.view(torch.uint8), to_draft_fp8(new).view(torch.uint8)
-                if owned is not None:
-                    new = torch.where(owned, new, pool[pages, 0, 0, offsets])
                 pool[pages, 0, 0, offsets] = new
             return
         append_paged_kv_cache = self._get_ctx_paged_append()
