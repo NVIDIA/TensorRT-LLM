@@ -25,6 +25,27 @@
           "NAMESPACE": "+",
           "ARCHS": "+"
         }
+      },
+      "add_modeling_v2_family": {
+        "pargs": 1
+      },
+      "add_modeling_v2_shared": {
+        "pargs": 1,
+        "kwargs": {
+          "ARCHS": "+",
+          "SOURCES": "+",
+          "DEPS": "+",
+          "REQUIRES": "+"
+        }
+      },
+      "add_modeling_v2_target": {
+        "pargs": 2,
+        "kwargs": {
+          "ARCHS": "+",
+          "SOURCES": "+",
+          "DEPS": "+",
+          "REQUIRES": "+"
+        }
       }
     },
     "_help_vartags": [

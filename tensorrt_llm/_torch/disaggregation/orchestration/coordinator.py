@@ -135,7 +135,7 @@ class DisaggTransferCoordinator:
     # -- loop head -----------------------------------------------------------
 
     @nvtx_range("handle_errors_synced")
-    def handle_errors_synced(self) -> None:
+    def handle_errors_synced(self) -> bool:
         """Rank-safe disagg cache error and poison handler.
 
         Called from the top of every executor iteration. Buffer poison is
@@ -144,6 +144,11 @@ class DisaggTransferCoordinator:
         vote on failed request IDs and fail matching local replicas together;
         otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
         deadlocks or leaves peer replicas running.
+
+        Returns:
+            Whether ADP peers must flush buffered responses before an idle
+            request fetch. The decision is uniform across the TP group,
+            including ranks without a local failed request.
         """
         pending_ids = self.take_pending_context_failures()
         pending_requests = (
@@ -164,12 +169,12 @@ class DisaggTransferCoordinator:
                 self._effects.fail_fatal(
                     "Disagg KV cache transfer buffer is poisoned; process restart is required"
                 )
-                return
+                return False
 
         if not (self._enable_attention_dp and self._dist.world_size != 1):
             if pending_requests:
                 self._check_transfer_errors("context requests")
-            return
+            return False
 
         local_error_requests = [
             req
@@ -189,7 +194,7 @@ class DisaggTransferCoordinator:
         blocked_error_ids = {rid for vote in all_votes for rid in vote["blocked_ids"]}
         ready_error_ids = voted_error_ids - blocked_error_ids
         if not ready_error_ids:
-            return
+            return False
         local_voted_error_requests = [
             req for req in self._registry.active_requests() if self._vote_id(req) in ready_error_ids
         ]
@@ -202,6 +207,7 @@ class DisaggTransferCoordinator:
         self._effects.fail_requests(
             "Disagg KV cache transfer error", local_voted_error_requests, charge_budget=False
         )
+        return True
 
     @nvtx_range("prepare_context_schedulable")
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
@@ -236,6 +242,60 @@ class DisaggTransferCoordinator:
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
 
+    def _describe_transfer_timeout(self, request: LlmRequest) -> str:
+        """Get optional native progress only when an existing deadline expires.
+
+        Args:
+            request: Request whose executor timeout is being reported.
+
+        Returns:
+            Owner and observation-time progress, without changing timeout policy.
+        """
+        owner = "deadline_owner=executor_request"
+        describe = getattr(self._transceiver, "_describe_transfer_timeout", None)
+        if not callable(describe):
+            return f"{owner} progress_at_observation=unavailable(transceiver)"
+        try:
+            progress = describe(request)
+        except Exception:  # noqa: BLE001 - reporting must not prevent timeout handling
+            return f"{owner} progress_at_observation=unavailable(snapshot_failed)"
+        return f"{owner} {progress}"
+
+    def _flag_transfer_timeout(
+        self,
+        request: LlmRequest,
+        kind: str,
+        timeout_ms: int,
+        *,
+        current_time: float | None = None,
+    ) -> None:
+        """Report and flag an expired transfer without restarting its clock.
+
+        Args:
+            request: Request checked against its existing transfer start time.
+            kind: Context or generation label used in the warning.
+            timeout_ms: Existing executor transfer timeout budget.
+            current_time: Shared sweep timestamp, or None to sample per request.
+        """
+        if request.py_kv_transfer_start_time is None:
+            return
+        if current_time is None:
+            current_time = time.monotonic()
+        elapsed_ms = (current_time - request.py_kv_transfer_start_time) * 1000
+        if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
+            verb = (
+                "Requesting cancellation for"
+                if self.inflight_cancel_active()
+                else "Observed timeout on"
+            )
+            logger.warning(
+                f"{verb} {kind} request {request.py_request_id} due to KV cache "
+                f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
+                f"kv_transfer_timeout_ms={timeout_ms}ms; "
+                f"{self._describe_transfer_timeout(request)}"
+            )
+            request.py_kv_transfer_timed_out = True
+
     @nvtx_range("check_transfer_timeouts")
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:
         """Flag transfers that exceeded ``kv_transfer_timeout_ms``.
@@ -249,31 +309,14 @@ class DisaggTransferCoordinator:
         if timeout_ms is None:
             return
 
-        def flag_if_timed_out(req: LlmRequest, kind: str) -> None:
-            if req.py_kv_transfer_start_time is None:
-                return
-            elapsed_ms = (time.monotonic() - req.py_kv_transfer_start_time) * 1000
-            if elapsed_ms > timeout_ms and not req.py_kv_transfer_timed_out:
-                verb = (
-                    "Requesting cancellation for"
-                    if self.inflight_cancel_active()
-                    else "Observed timeout on"
-                )
-                logger.warning(
-                    f"{verb} {kind} request {req.py_request_id} due to KV cache "
-                    f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
-                    f"kv_transfer_timeout_ms={timeout_ms}ms"
-                )
-                req.py_kv_transfer_timed_out = True
-
         # Context requests start their clock on the last chunk, which is also
         # when they enter the transfer manager, so this covers the whole
         # context side.
         for req in self._transfers.requests_in_transfer().values():
-            flag_if_timed_out(req, "context")
+            self._flag_transfer_timeout(req, "context", timeout_ms)
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
-                flag_if_timed_out(req, "generation")
+                self._flag_transfer_timeout(req, "generation", timeout_ms)
 
     # -- scheduling ----------------------------------------------------------
 
@@ -364,11 +407,15 @@ class DisaggTransferCoordinator:
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
+        controller = self._admission_controller
         return (
-            self._admission_controller is not None
-            and self._admission_controller.enabled()
-            and not transfer_window_bypass_eligible(
-                self._transceiver, self._dist, self._is_kv_manager_v2
+            controller is not None
+            and controller.enabled()
+            and (
+                controller.budget_is_explicit
+                or not transfer_window_bypass_eligible(
+                    self._transceiver, self._dist, self._is_kv_manager_v2
+                )
             )
         )
 
@@ -407,6 +454,8 @@ class DisaggTransferCoordinator:
                     req,
                     fences.get(req.py_request_id),
                 )
+            # Admission is rank-uniform: report before any rank starts one.
+            self._report_deferred_gen_receives()
             self._publish_ready_gen_receives()
             # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
             # every admitted request ends in the same state on every rank and
@@ -501,6 +550,17 @@ class DisaggTransferCoordinator:
             self._transceiver.request_and_receive_async(req)
             published.append(req)
         self._stamp_gen_transfer_start(published)
+        self._report_deferred_gen_receives()
+
+    def _report_deferred_gen_receives(self) -> None:
+        """Tell the transceiver how many admitted receives wait for publication.
+
+        Every rank admits the same receives, but each publishes them as its own
+        readiness events complete. The transceiver's idle-poll skip must see a
+        waiting receive from admission on: if a peer starts it first, the peer
+        resumes the status collectives while this rank would still skip them.
+        """
+        self._transceiver.set_gen_deferred_receives(len(self._unpublished_gen_receives))
 
     def _stamp_gen_transfer_start(self, requests: List[LlmRequest]) -> None:
         """Start the transfer-timeout clock of each receive now in flight."""
@@ -806,15 +866,9 @@ class DisaggTransferCoordinator:
         }
         current_time = time.monotonic()
         for request in requests_in_transfer.values():
-            if request.py_kv_transfer_start_time is None:
-                continue
-            elapsed_ms = (current_time - request.py_kv_transfer_start_time) * 1000
-            if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
-                logger.warning(
-                    f"Requesting cancellation for generation request "
-                    f"{request.py_request_id} due to KV cache transfer timeout"
-                )
-                request.py_kv_transfer_timed_out = True
+            self._flag_transfer_timeout(
+                request, "generation", timeout_ms, current_time=current_time
+            )
 
         user_canceled_ids = set(self._registry.canceled_request_ids())
         local_timed_out_ids = sorted(
@@ -954,8 +1008,8 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             force_terminate_ctx_for_partial_reuse=False,
         )
 
-    def handle_errors_synced(self) -> None:
-        return None
+    def handle_errors_synced(self) -> bool:
+        return False
 
     def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
         return fitting_gen_init, False

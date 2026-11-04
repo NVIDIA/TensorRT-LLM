@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import enum
 import itertools
 import json
@@ -1707,6 +1708,60 @@ def test_trtllm_gen_moe_dummy_topk_local_experts_less_than_topk(
         assert all(0 <= x < num_experts for x in row), row
 
 
+def test_fp4_moe_tunes_on_dummy_topk_and_runs_on_runtime_topk(monkeypatch):
+    """With precomputed top-k (attention DP), the tuner gets the local-shard dummy top-k and the
+    kernel the runtime top-k: restoring the runtime tensors must not reach the tuner's inputs."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import \
+        FP4BlockScaleMoERunner
+
+    seen = {}
+
+    def fake_choose_one(self, custom_op, runners, tuning_config, inputs,
+                        **kwargs):
+        seen["tuner"] = list(inputs)
+        return runners[0], -1
+
+    def fake_forward(self, inputs, tactic, output=None, prerouted=None):
+        seen["kernel"] = list(inputs)
+        return [torch.zeros(1, device="cuda")]
+
+    monkeypatch.setattr(AutoTuner, "choose_one", fake_choose_one)
+    monkeypatch.setattr(FP4BlockScaleMoERunner, "forward", fake_forward)
+    num_tokens, top_k = 8, 4
+    num_experts, local_num_experts, local_expert_offset = 32, 8, 8
+    hidden_states = torch.zeros(num_tokens,
+                                64,
+                                dtype=torch.uint8,
+                                device="cuda")
+    # Expert 0 lies outside this rank's shard; the dummy never picks it.
+    topk_ids = torch.zeros(num_tokens, top_k, dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones(num_tokens,
+                              top_k,
+                              dtype=torch.bfloat16,
+                              device="cuda")
+    # Weights, scales and biases: the op only passes them on.
+    passthrough = [torch.zeros(1, device="cuda")] * 13
+    scalars = (num_experts, top_k, None, None, 128, local_expert_offset,
+               local_num_experts, None, 1, True)
+
+    with autotune():
+        torch.ops.trtllm.fp4_block_scale_moe_runner(None,
+                                                    None,
+                                                    hidden_states,
+                                                    *passthrough,
+                                                    *scalars,
+                                                    topk_weights=topk_weights,
+                                                    topk_ids=topk_ids,
+                                                    use_dp=True)
+
+    tuner_ids = seen["tuner"][-1]
+    assert tuner_ids is not topk_ids and seen["tuner"][0] is None
+    assert ((tuner_ids >= local_expert_offset) &
+            (tuner_ids < local_expert_offset + local_num_experts)).all()
+    assert seen["kernel"][-1] is topk_ids
+    assert seen["kernel"][-2] is topk_weights
+
+
 def test_post_tune_merge_tactics_min_time_and_subset_kept():
     tuner = autotuner.AutoTuner()
     tuner.mapping = Mapping(world_size=2, rank=0, tp_size=2)
@@ -1940,3 +1995,95 @@ def test_deep_gemm_jit_warmup_buckets():
     assert max(deep_gemm_jit_warmup_buckets(32)) < 128
     assert deep_gemm_jit_warmup_buckets(16384) == deep_gemm_jit_warmup_buckets(
         8192)
+
+
+def _record_profile_graph_pools(monkeypatch):
+    """Record the pool of every profiling capture and of every owner release / abandon."""
+    events = {"capture": [], "release": [], "abandon": []}
+    real_capture = autotuner.nccl_window_graph_capture
+    real_release = autotuner.release_nccl_window_graph_owner
+    real_abandon = autotuner.abandon_nccl_window_graph_owner
+
+    @contextlib.contextmanager
+    def capture(graph, pool, **kwargs):
+        events["capture"].append(pool)
+        with real_capture(graph, pool, **kwargs):
+            yield
+
+    def release(pool):
+        events["release"].append(pool)
+        real_release(pool)
+
+    def abandon(pool):
+        events["abandon"].append(pool)
+        real_abandon(pool)
+
+    monkeypatch.setattr(autotuner, "nccl_window_graph_capture", capture)
+    monkeypatch.setattr(autotuner, "release_nccl_window_graph_owner", release)
+    monkeypatch.setattr(autotuner, "abandon_nccl_window_graph_owner", abandon)
+    return events
+
+
+def test_profiling_captures_share_one_graph_pool_per_tuning_pass(monkeypatch):
+    """All profiling captures of one choose_one() tuning pass capture into one
+    CUDA graph memory pool, each capture still releases its NCCL-window owner,
+    and the pool is dropped when the pass ends."""
+    events = _record_profile_graph_pools(monkeypatch)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    x = torch.randn(M, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (4, 8, 16, 32)), ))
+
+    pools_per_pass = []
+    for op in ("autotuner_test::shared_pool_a",
+               "autotuner_test::shared_pool_b"):
+        for v in events.values():
+            v.clear()
+        with autotune():
+            tuner.choose_one(op, [GemmRunner()], config, [x, w])
+        # 4 profiles x 3 tactics, at least one capture each.
+        assert len(events["capture"]) >= 12, events["capture"]
+        assert len(set(events["capture"])) == 1, (
+            f"one tuning pass must use one pool; got {set(events['capture'])}")
+        assert events["release"] == events["capture"]
+        assert events["abandon"] == []
+        assert tuner._profile_graph_pool is None
+        assert tuner._profile_graph_pool_depth == 0
+        pools_per_pass.append(events["capture"][0])
+    assert pools_per_pass[0] != pools_per_pass[1], (
+        "a new tuning pass must not reuse the dropped pool")
+
+
+def test_failed_profiling_capture_moves_to_a_fresh_graph_pool(monkeypatch):
+    """A capture that fails abandons its owner, and the captures after it use a
+    new pool rather than the one the failed capture used."""
+
+    class CaptureFailingRunner(GemmRunner):
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            if tactic == 0 and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("tactic 0 fails under capture")
+            return super().forward(inputs, tactic=tactic, **kwargs)
+
+    events = _record_profile_graph_pools(monkeypatch)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    x = torch.randn(M, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    with autotune():
+        tuner.choose_one("autotuner_test::fresh_pool_after_failure",
+                         [CaptureFailingRunner()], TuningConfig(), [x, w])
+
+    captures = events["capture"]
+    assert len(events["abandon"]) == 1, events
+    failed_pool = events["abandon"][0]
+    # The failed capture is the last one in its pool.
+    failed_at = len(captures) - 1 - captures[::-1].index(failed_pool)
+    assert captures[:failed_at + 1] == [failed_pool] * (failed_at + 1)
+    after = captures[failed_at + 1:]
+    assert after, "tactic 1 must still be profiled after tactic 0 fails"
+    assert len(set(after)) == 1 and after[0] != failed_pool, captures
+    assert events["release"] == captures[:failed_at] + after
+    assert tuner._profile_graph_pool is None

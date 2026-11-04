@@ -529,13 +529,17 @@ def prompt_tokens_excluded_from_usage(
 ) -> int:
     """Rendered prompt tokens the chat route leaves out of the reported prompt usage.
 
-    The model extension decides from the request (kimi_k3: the trailing generation channel
-    opener); the model still sees those tokens. A server-level chat template may end
-    differently, so nothing is left out when one is configured.
+    ``RenderResources.prompt_tokens_excluded_from_usage`` asked with how ``request`` is
+    rendered (kimi_k3: the trailing generation channel opener); the model still sees those
+    tokens. The chat route, its preparation context and count_tokens all ask here, so they
+    leave out the same tokens.
     """
-    if res.default_chat_template is not None:
-        return 0
-    return int(res.extension.prompt_tokens_excluded_from_usage(request) or 0)
+    return res.prompt_tokens_excluded_from_usage(
+        add_generation_prompt=request.add_generation_prompt,
+        pre_tokenized=request.prompt_token_ids is not None
+        or request.prompt_token_ids_b64 is not None,
+        request_chat_template=request.chat_template,
+    )
 
 
 def preparation_context(

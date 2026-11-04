@@ -806,7 +806,7 @@ class TestCountTokens:
         from tensorrt_llm.serve.serving_extensions import ServingExtension
 
         class ExcludingExtension(ServingExtension):
-            def prompt_tokens_excluded_from_usage(self, request) -> int:
+            def prompt_tokens_excluded_from_usage(self, **facts) -> int:
                 return excluded
 
         monkeypatch.setitem(serving_extensions._BY_MODEL_TYPE, MODEL_TYPE, ExcludingExtension())

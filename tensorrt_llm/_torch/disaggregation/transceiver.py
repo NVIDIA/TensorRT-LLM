@@ -35,12 +35,13 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     get_unique_rid,
 )
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    _KV_LIFECYCLE_ENFORCEMENT_ENV,
     CtxTransferStatus,
     GenTransferStatus,
     KvCacheTransceiver,
 )
-from tensorrt_llm._torch.disaggregation.native.bounce import (
-    config_from_size as bounce_config_from_size,
+from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
+    supports_context_first_bf16,
 )
 from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
@@ -51,6 +52,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TransferWorker,
     TransferWorkerConfig,
+    TxSession,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -92,6 +94,7 @@ def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
             "other executors in the same job. Retaining KV "
             f"and transport roots until process teardown. request_id={event.request_id}, "
             f"direction={event.direction}, reason={event.reason}, "
+            "deadline_owner=retirement_grace progress_at_observation=unproven_quiescence, "
             f"deadline={event.deadline}, expired_at={event.expired_at}"
         )
     except Exception:  # noqa: BLE001 - diagnostics cannot alter containment
@@ -133,7 +136,23 @@ def _fail_unproven_kv_transfer(
         hang_detector.propagate_hard_kill(diagnostics=False, communicator=communicator)
 
 
-def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
+def _warn_retirement_termination_scope(mapping: Mapping) -> None:
+    """Warn the executor's lead rank about the configured containment boundary.
+
+    Args:
+        mapping: The executor's rank mapping.
+    """
+    if mapping.rank == 0:
+        logger.warning(
+            "KV transfer lifecycle enforcement ENABLED. KV retirement fail-stop may "
+            "terminate the entire MPI job, including other "
+            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
+            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
+            "and qualify their termination boundaries."
+        )
+
+
+def _retirement_executor_comm(mapping: Mapping, *, warn: bool = True) -> "MPI.Comm":
     """Capture the MPI executor world that the deadline watchdog may abort.
 
     Rank/size validation does not isolate termination. Shared MPI launches can
@@ -141,6 +160,7 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
 
     Args:
         mapping: The executor's expected worker rank and world size.
+        warn: Emit the launcher-wide termination warning when selecting the communicator.
 
     Returns:
         The exact communicator, retained rather than resolved on another thread.
@@ -167,13 +187,8 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
         or communicator.Get_rank() != mapping.rank
     ):
         raise ValueError(message)
-    if mapping.rank == 0:
-        logger.warning(
-            "KV retirement fail-stop may terminate the entire MPI job, including other "
-            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
-            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
-            "and qualify their termination boundaries."
-        )
+    if warn:
+        _warn_retirement_termination_scope(mapping)
     return communicator
 
 
@@ -194,9 +209,13 @@ def _validate_fp4_mla_bridge_profile(
     mapping: Mapping,
     kv_cache_manager: KVCacheManagerV2,
     cache_transceiver_config: CacheTransceiverConfig,
+    *,
+    enabled: bool | None = None,
 ) -> bool:
     """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
-    if os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") != "1":
+    if enabled is None:
+        enabled = os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") == "1"
+    if not enabled:
         return False
     fp4_mla_layout = (
         isinstance(kv_cache_manager, KVCacheManagerV2)
@@ -213,6 +232,9 @@ def _validate_fp4_mla_bridge_profile(
         and mapping.enable_attention_dp
         and mapping.pp_size == 1
         and mapping.cp_size == 1
+        # The C++ agent bounce scatters into the destination on the receiver agent's threads,
+        # which can still be writing after a failure is reported; the bridge cannot prove that
+        # those writes stopped.
         and cache_transceiver_config.kv_cache_bounce_size_mb == 0
         and not cache_transceiver_config.enable_pipelined_transfer
         and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
@@ -223,9 +245,77 @@ def _validate_fp4_mla_bridge_profile(
             "FP4 MLA lifecycle bridge requires a disaggregated NVFP4 SELFKONLY "
             "KVCacheManagerV2, the C++ NIXL agent binding, a finite timeout, "
             "no-retry ADP, PP1/CP1, "
-            "async monolithic non-layerwise transfer, and bounce disabled"
+            "async monolithic non-layerwise transfer, and kv_cache_bounce_size_mb=0 "
+            "(transfer-agent bounce disabled)"
         )
     return True
+
+
+def _select_lifecycle_ownership(
+    mapping: Mapping,
+    manager: KVCacheManagerV2,
+    config: CacheTransceiverConfig,
+    dist: Distributed,
+) -> tuple[bool, bool, Optional["MPI.Comm"]]:
+    """Agree on protection before any rank publishes transfer metadata.
+
+    The global setting requires a supported profile when explicitly enabled.
+    Unset preserves the legacy FP4 opt-in and leaves context-first inactive.
+    Selection failures participate in the collective so peers cannot continue
+    with a different ownership mode. This is executor-local agreement, not
+    negotiation with a remote executor or a general startup-failure handler.
+
+    Args:
+        mapping: Executor rank and topology.
+        manager: Initialized local cache manager.
+        config: Resolved transfer settings.
+        dist: The executor's startup collective interface.
+
+    Returns:
+        FP4 and context-first activation, and the local containment communicator.
+
+    Raises:
+        ValueError: Requested protection cannot be established on every rank.
+    """
+    fp4 = context_first = False
+    communicator = None
+    failure = None
+    try:
+        setting = os.getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
+        legacy_fp4 = os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") == "1"
+        if setting not in (None, "0", "1"):
+            raise ValueError(f"{_KV_LIFECYCLE_ENFORCEMENT_ENV} must be 0 or 1")
+        if setting == "0" and legacy_fp4:
+            raise ValueError("KV lifecycle enforcement is disabled but the FP4 bridge is enabled")
+        if setting != "0":
+            fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config)
+        if setting == "1" and not fp4:
+            if manager.dtype == DataType.NVFP4:
+                fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config, enabled=True)
+            else:
+                context_first = supports_context_first_bf16(mapping, manager, config)
+                if not context_first:
+                    raise ValueError(
+                        "KV lifecycle enforcement requires a supported no-retry FP4 MLA or "
+                        "direct BF16 context-first profile; the local configuration is unsupported"
+                    )
+        if fp4 or context_first:
+            communicator = _retirement_executor_comm(mapping, warn=False)
+    except Exception as error:
+        # Exchange all rank-local failures before raising so peers reach agreement.
+        failure = f"{type(error).__name__}: {error}"
+
+    selections = dist.allgather((fp4, context_first, failure))
+    failures = [f"rank {rank}: {item[2]}" for rank, item in enumerate(selections) if item[2]]
+    if failures:
+        raise ValueError("KV lifecycle initialization rejected: " + "; ".join(failures))
+    if len(selections) != mapping.world_size or any(
+        item[:2] != (fp4, context_first) for item in selections
+    ):
+        raise ValueError("KV lifecycle ownership must agree on every executor rank")
+    if fp4 or context_first:
+        _warn_retirement_termination_scope(mapping)
+    return fp4, context_first, communicator
 
 
 def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
@@ -237,10 +327,6 @@ def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
     mappers move, never physical slot bytes: a coalesced pool carries one view per role class
     (summing slot_bytes per view would double count the slot) and ignored-role buffers occupy
     slot offsets no view transfers.
-
-    Bounce sizing (bounce/impl.py block_bytes_per_group) counts physical slot bytes once per
-    pool, ignored-role regions included; keep the two accountings in mind together when
-    changing either.
     """
     if page_table is None:
         return 0, 0
@@ -268,6 +354,11 @@ def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # GEN idle-poll skip state; _init_gen_idle_poll sets the instance values.
+    _gen_idle_poll_skip: bool = False
+    _gen_idle_agreed: bool = False
+    _gen_deferred_receives: int = 0
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -308,13 +399,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
-            mapping, kv_cache_manager, cache_transceiver_config
-        )
+        (
+            enforce_physical_ownership,
+            self._context_first_ownership,
+            self._retirement_mpi_comm,
+        ) = _select_lifecycle_ownership(mapping, kv_cache_manager, cache_transceiver_config, dist)
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
-        self._retirement_mpi_comm = (
-            _retirement_executor_comm(mapping) if enforce_physical_ownership else None
-        )
+        self._context_first_ownership_logged = False
+        ownership_capable = enforce_physical_ownership or self._context_first_ownership
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -344,25 +436,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
                 enforce_physical_ownership=enforce_physical_ownership,
+                context_first_ownership=self._context_first_ownership,
                 quiescence_fatal_callback=(
-                    self._fail_unproven_transfer if enforce_physical_ownership else None
+                    self._fail_unproven_transfer if ownership_capable else None
                 ),
-                # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
-                # routes it to exactly one implementation: the Python bounce below (per-region,
-                # size 0 = off; the per-transfer size gates are internal, tuned via env:
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads) or the C++
-                # transfer-agent staging buffer (bounce v2, one buffer shared by send and recv).
-                bounce=bounce_config_from_size(
-                    0
-                    if cache_transceiver_config.agent_bounce_buffer_enable
-                    else cache_transceiver_config.kv_cache_bounce_size_mb
-                ),
-                agent_buffer_size_mb=(
-                    cache_transceiver_config.kv_cache_bounce_size_mb
-                    if cache_transceiver_config.agent_bounce_buffer_enable
-                    else 0
-                ),
+                # kv_cache_bounce_size_mb sizes the C++ transfer-agent bounce buffer (one
+                # arena shared by send and receive); 0 disables it.
+                agent_buffer_size_mb=cache_transceiver_config.kv_cache_bounce_size_mb,
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
             )
         )
@@ -406,6 +486,37 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    @staticmethod
+    def _gen_idle_poll_skip_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
+        """Whether an idle generation worker may skip its receive-status collectives.
+
+        Requires a synchronized status poll in which every rank owns every
+        request (no attention DP, one PP stage, no context parallelism), so
+        every rank requests the same receives in the same iteration.
+        """
+        return (
+            gen_need_sync
+            and not mapping.enable_attention_dp
+            and mapping.pp_size == 1
+            and mapping.cp_size == 1
+        )
+
+    def _init_gen_idle_poll(self, enabled: bool) -> None:
+        """Set up the idle-poll skip of check_gen_transfer_status (called by _init_sync_policy).
+
+        Precondition of ``enabled``: every rank requests the same receives in the
+        same iteration (_gen_idle_poll_skip_applies), so all ranks clear the
+        agreement together and never split on whether to enter a collective.
+        """
+        self._gen_idle_poll_skip = enabled
+        # Set from a gathered status round in which no rank held a receive session,
+        # cleared by every receive request; while set, every rank skips the
+        # status-poll collectives.
+        self._gen_idle_agreed = False
+        # Admitted receives the caller has not started yet (set_gen_deferred_receives);
+        # they count as sessions in the idle check.
+        self._gen_deferred_receives = 0
 
     def _fail_unproven_transfer(self, event: QuiescenceFatalEvent) -> None:
         """Fail-stop while the watchdog retains this transceiver's resource roots.
@@ -511,6 +622,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         else:
             self._gen_need_sync = m.world_size > 1
             self._gen_allgather = self._dist.allgather
+        self._init_gen_idle_poll(self._gen_idle_poll_skip_applies(m, self._gen_need_sync))
 
     def _dp_group_allgather(self, obj):
         """Allgather over the CP ranks, then the PP ranks, of this DP group.
@@ -715,23 +827,44 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
     def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
-        if not getattr(self, "_fp4_mla_bridge_enabled", False):
-            return True
         params = req.py_disaggregated_params
+        fp4_bridge = getattr(self, "_fp4_mla_bridge_enabled", False)
+        context_first = (
+            getattr(self, "_context_first_ownership", False)
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
+        if not fp4_bridge and not context_first:
+            return True
+        required_schedule = (
+            DisaggScheduleStyle.GENERATION_FIRST
+            if fp4_bridge
+            else DisaggScheduleStyle.CONTEXT_FIRST
+        )
         rid = None if params is None else params.disagg_request_id
         if (
             synchronous
             or params is None
-            or params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST
+            or params.schedule_style != required_schedule
             or type(rid) is not int
             or rid < 0
         ):
             logger.error(
-                "FP4 MLA lifecycle bridge requires async generation-first requests "
+                f"KV ownership requires async {required_schedule.name} requests "
                 "with a non-negative integer disagg_request_id"
             )
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
+        if context_first and not self._context_first_ownership_logged:
+            logger.info(
+                "Context-first BF16 KV ownership ENABLED: "
+                f"rank={self._mapping.rank}/{self._mapping.world_size}, "
+                "backend=NIXL/UCX, runtime=PYTHON, attention_dp=False, pp=1, cp=1, "
+                "retry=False, async=True, layerwise=False, bounce_mb=0, "
+                "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher; "
+                "MPI abort may terminate other CTX/GEN executors in the same launcher job"
+            )
+            self._context_first_ownership_logged = True
         return True
 
     def _ctx_consensus(self, local_ids: list) -> list:
@@ -788,16 +921,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         need_sync: bool,
         locally_quiesced=None,
         locally_verified=None,
+        local_session_count: Optional[int] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
         # agreement from every rank.
         # Batch the id lists into one allgather to cut the per-step collective count.
+        # With local_session_count, the payload also carries each rank's
+        # receive-session count and the result ends with whether every rank
+        # reported zero sessions.
         local_outcome = [list(cancelled), list(failed), list(completed)]
         if locally_quiesced is not None:
             local_outcome.append(list(locally_quiesced))
         if locally_verified is not None:
             local_outcome.append(list(locally_verified))
+        if local_session_count is not None:
+            local_outcome.append([local_session_count])
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -828,8 +967,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # the same tokens, so a request counts as write-verified only
             # when EVERY rank verified its local shard.
             all_verified = [p[idx] for p in packed]
+            idx += 1
             global_verified = self._intersection(all_verified, n)
             result.append({rid for rid in to_process if rid in global_verified})
+        if local_session_count is not None:
+            result.append(all(p[idx][0] == 0 for p in packed))
         return tuple(result)
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
@@ -840,18 +982,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
-        new_cancelled, new_failed, new_completed, globally_retirable, verified = (
-            self._consensus_outcome(
-                to_process,
-                cancelled,
-                failed,
-                completed,
-                self._gen_allgather,
-                self._gen_need_sync,
-                locally_retirable,
-                locally_verified,
-            )
+        idle_skip = self._gen_idle_poll_skip
+        deferred = self._gen_deferred_receives
+        outcome = self._consensus_outcome(
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            locally_retirable,
+            locally_verified,
+            local_session_count=len(self._recv_sessions) + deferred if idle_skip else None,
         )
+        new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
+        if idle_skip:
+            # Every rank derives this from the same gathered payload.
+            self._gen_idle_agreed = outcome[5]
         retirable = set(globally_retirable)
         return (
             [rid for rid in new_cancelled if rid in retirable],
@@ -1147,7 +1294,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session = self._get_or_create_send_session(req)
         if session is None:
             return
-        bridge_enabled = getattr(self, "_fp4_mla_bridge_enabled", False)
+        bridge_enabled = getattr(session, "_enforce_physical_ownership", False)
         if bridge_enabled:
             # Root the request before backend admission so its source pages
             # outlive every ownership-enabled NIXL operation.
@@ -1185,6 +1332,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest) -> None:
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         if not self._validate_bridge_req(req, synchronous=True):
             return
         rid = get_unique_rid(req)
@@ -1253,6 +1403,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """
         return fetches.session
 
+    def set_gen_deferred_receives(self, count: int) -> None:
+        """Report the admitted receives whose start the caller defers.
+
+        The disagg coordinator starts each admitted receive only once that
+        rank's admission readiness event completes, so ranks start the same
+        receive in different iterations, while admission is the same on every
+        rank. A nonzero count clears the idle-poll agreement on every rank in
+        the admitting iteration, and the count joins the session count of the
+        idle check, so no rank agrees it is idle while a peer still has a
+        receive to start (the start would clear the flag on that rank only and
+        send it into a status collective its peers skip).
+        """
+        if count:
+            self._gen_idle_agreed = False
+        self._gen_deferred_receives = count
+
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest) -> None:
         """Start background KV cache receive from the context server.
@@ -1265,6 +1431,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req: The generation request whose KV cache blocks to receive
                 into.
         """
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         if not self._validate_bridge_req(req):
             return
         self._ever_had_recv_session = True
@@ -1298,10 +1467,40 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise
         finally:
             # The session exists even when publication failed, and the legacy sweep owns it.
-            # TODO: An idle bounce reservation is not handed back on the failure path.
             session = self._legacy_session(fetches)
             if session is not None:
                 self._recv_sessions[rid] = session
+
+    @staticmethod
+    def _describe_timeout_session(session: TxSessionBase | RxSessionBase | None) -> str:
+        """Read optional native progress without changing timeout handling.
+
+        Args:
+            session: Existing local transfer session, if still retained.
+
+        Returns:
+            Local progress or an explicit unavailable reason.
+        """
+        if isinstance(session, (TxSession, RxSession)):
+            try:
+                return session._timeout_progress_description()
+            except Exception:  # noqa: BLE001 - Reporting must not change timeout handling.
+                return "progress_at_observation=unavailable(snapshot_failed)"
+        reason = "session_not_found" if session is None else "alternate_session"
+        return f"progress_at_observation=unavailable({reason})"
+
+    def _describe_transfer_timeout(self, req: LlmRequest) -> str:
+        """Describe local progress for an executor-owned timeout observation.
+
+        Args:
+            req: Request whose existing executor clock expired.
+
+        Returns:
+            Best-effort native progress; no deadline or backend is polled.
+        """
+        rid = get_unique_rid(req)
+        sessions = self._send_sessions if req.is_context_only_request else self._recv_sessions
+        return self._describe_timeout_session(sessions.get(rid))
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
@@ -1351,7 +1550,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 logger.warning(
                     f"TxSession rid={session.disagg_request_id} exceeded "
                     f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms; "
-                    "keeping it in progress"
+                    "keeping it in progress; deadline_owner=native_sender_overall_wait "
+                    f"{self._describe_timeout_session(session)}"
                 )
             else:
                 logger.warning(f"TxSession rid={session.disagg_request_id} failed")
@@ -1369,6 +1569,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]
+        owned_cancelled = [
+            rid
+            for rid in cancelled
+            if getattr(self._send_sessions[rid], "_enforce_physical_ownership", False)
+        ]
 
         for rid in cancelled:
             self._retire_send_session(rid, outcome="cancelled")
@@ -1384,16 +1589,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
-        if getattr(self, "_fp4_mla_bridge_enabled", False):
-            # CtxTransferStatus has no cancellation channel. In the qualified
-            # no-retry bridge, a globally quiesced cancellation is a terminal
-            # send failure that the executor must consume to release its
-            # matching AsyncTransferManager claim.
-            failed.extend(rid for rid in cancelled if rid not in failed)
+        # CtxTransferStatus has no cancellation channel. An owned session's
+        # quiesced cancellation must release its AsyncTransferManager claim.
+        failed.extend(rid for rid in owned_cancelled if rid not in failed)
         return CtxTransferStatus(completed, failed)
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
+            return GenTransferStatus([], [], [])
+        if self._gen_idle_agreed:
+            # Zero sessions on every rank last round and no receive requested
+            # since (that clears the flag on all ranks in the same iteration):
+            # this round's consensus would be empty everywhere.
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -1569,6 +1776,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"_try_schedule_disagg_gen_init."
             )
 
+    def supports_idle_request_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
+        """Allow bridge cancellation or a session-free generation-first CTX wait."""
+        if getattr(self, "_fp4_mla_bridge_enabled", False) is True:
+            return True
+        return (
+            req is not None
+            and req.is_context_only_request
+            and req.py_disaggregated_params is not None
+            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            and not self.has_inflight_transfer(req)
+        )
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
@@ -1603,6 +1822,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif self._recv_sessions[rid].close() is False:
                 has_transferring = True
             else:
+                # The bridge has a stable, rank-local receive outcome. Keep
+                # an earlier failure when cancellation retires the session.
+                if (
+                    getattr(self, "_fp4_mla_bridge_enabled", False)
+                    and self._recv_sessions[rid].status == SessionStatus.ERROR
+                ):
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
 
@@ -1691,15 +1917,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not cfg.enable_pipelined_transfer:
             return False
         blockers = []
-        # The Python bounce reserves a receiver region for the whole request, not per chunk.
-        # The C++ transfer-agent bounce (agent_bounce_buffer_enable) stages each transfer request
-        # independently below the Python layer, so a pipelined chunk is just another request.
-        # TODO: This only sees the local config, so a chunking sender and a bouncing receiver pass.
-        if cfg.kv_cache_bounce_size_mb != 0 and not cfg.agent_bounce_buffer_enable:
-            blockers.append(
-                f"the Python bounce buffer (kv_cache_bounce_size_mb="
-                f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
-            )
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             blockers.append("a Mamba/hybrid cache manager")
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
