@@ -14,6 +14,10 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 source = Path(__file__).parents[1] / "integration/defs/accuracy/modeling_v2/ruler.py"
 spec = importlib.util.spec_from_file_location("ruler_accuracy", source)
 ruler = importlib.util.module_from_spec(spec)
