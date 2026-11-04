@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +30,7 @@ from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.math import ceil_div
 from ..helpers.ops import fmax_f32, warp_reduce_max_f32, warp_reduce_sum_f32
 from ..helpers.query import flat_query_row_state, query_batch_bounds
+from ..helpers.softmax_stats import store_reduced_softmax_stats
 from .work_partition import (
     runtime_row_prefix_active_split_count,
     runtime_split_kv_cap,
@@ -94,7 +96,11 @@ def _parallel_reduction_row_state(
     )
     tile_k = cache_seqs[batch_idx]
     row_k = tile_k
-    if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value and seq_len_q > 1):
+    if cutlass.const_expr(
+        not cfg.use_kv_bounds
+        and cfg.mask_type == MaskType.CAUSAL.value
+        and seq_len_q > 1
+    ):
         _, logical_seq_len_q = query_batch_bounds(
             cu_seqlens_q,
             batch_idx,
@@ -154,6 +160,11 @@ def _store_parallel_reduction_result(
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
+    softmax_stats=None,
+    acc_lse=None,
+    row_lse=None,
+    active_split_kv=None,
+    softmax_stats_scale=None,
 ):
     """Publish one normalized FP32 output fragment and final LSE."""
 
@@ -164,6 +175,19 @@ def _store_parallel_reduction_result(
             lse[logical_head_idx, storage_q_idx] = global_lse
         else:
             lse[logical_head_idx, logical_q_idx, batch_idx] = global_lse
+        public_row = logical_head_idx + output.shape[0] * storage_q_idx
+        if cutlass.const_expr(cu_seqlens_q is None):
+            public_row = logical_head_idx + output.shape[0] * (
+                logical_q_idx + output.shape[2] * batch_idx
+            )
+        store_reduced_softmax_stats(
+            softmax_stats,
+            public_row,
+            acc_lse,
+            row_lse,
+            active_split_kv,
+            softmax_stats_scale,
+        )
 
     if cutlass.const_expr(output_quant is not None):
         if query_is_valid:
@@ -216,6 +240,8 @@ def run_parallel_reduction_kernel(
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
 ):
     """Reduce one D=512 row cooperatively across a padded CTA cluster.
 
@@ -419,6 +445,11 @@ def run_parallel_reduction_kernel(
             finalize_attention,
             output_quant,
             output_quant_args,
+            softmax_stats,
+            acc_lse,
+            acc_lse[row_in_tile, None, query_tile_idx, batch_idx],
+            active_split_kv,
+            softmax_stats_scale,
         )
         return
 
@@ -536,6 +567,11 @@ def run_parallel_reduction_kernel(
             tidx,
             batch_idx,
             cu_seqlens_q,
+            softmax_stats=softmax_stats,
+            acc_lse=acc_lse,
+            row_lse=acc_lse[row_in_tile, None, query_tile_idx, batch_idx],
+            active_split_kv=active_split_kv,
+            softmax_stats_scale=softmax_stats_scale,
         )
 
     prims.barrier_cluster_arrive_relaxed()

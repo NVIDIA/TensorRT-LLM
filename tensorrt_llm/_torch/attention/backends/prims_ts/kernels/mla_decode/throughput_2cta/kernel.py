@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -159,6 +160,7 @@ def build_mla_decode_task_manager(
     acc_output=None,
     lse=None,
     acc_lse=None,
+    softmax_stats=None,
     # Domain (k_tile_count)
     domain=4,
     # Persistent loop support
@@ -166,6 +168,7 @@ def build_mla_decode_task_manager(
     # For k_index_base computation (split_kv support)
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     split_kv=None,
     logical_num_heads_q=128,
     logical_seq_len_q=1,
@@ -441,6 +444,8 @@ def build_mla_decode_task_manager(
 
     tmem_s = TmemSResource(
         page_offsets=page_offsets,
+        kv_bounds=kv_bounds,
+        store_softmax_stats=softmax_stats is not None,
         smem_q_latent=smem_q_latent_arr,
         smem_q_rope=smem_q_rope_arr,
         smem_p=smem_p_arr,
@@ -491,6 +496,7 @@ def build_mla_decode_task_manager(
         partial_output=acc_output,
         lse=lse,
         partial_lse=acc_lse,
+        softmax_stats=softmax_stats,
         tmem_o_ref=tmem_o,
         tmem_corr_ref=tmem_corr,
         atten_sinks=atten_sinks,
@@ -831,6 +837,7 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        use_kv_bounds: bool = False,
     ):
         """
         Parameters
@@ -913,6 +920,7 @@ class MlaDecodeTs:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
+        self.use_kv_bounds = use_kv_bounds
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
         self.output_quant = None
@@ -977,6 +985,7 @@ class MlaDecodeTs:
             self.num_heads,
             self.seq_len_q,
             self.mask_type,
+            self.use_kv_bounds,
             self.reduction_split_capacity,
             self.query_tile_layout,
             self.num_q_tiles,
@@ -1069,6 +1078,7 @@ class MlaDecodeTs:
             is_var_seq=self.is_var_seq,
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
+            use_kv_bounds=self.use_kv_bounds,
             sparse_gather_warps=self.sparse_gather_warps,
             sparse_kv_stages=self.sparse_kv_stages,
             cache_uniform_sparse_pages=self.sparse_uniform_pages,
@@ -1112,6 +1122,8 @@ class MlaDecodeTs:
         output_scale: cutlass.Float32,
         stream: object,
         output_quant_args=None,
+        softmax_stats: cute.Tensor | None = None,
+        kv_bounds: cute.Tensor | None = None,
     ):
         """Execute the MLA decode TS kernel."""
         if cutlass.const_expr(self.fuse_sparse_reduction):
@@ -1400,6 +1412,7 @@ class MlaDecodeTs:
             )
 
         softmax_scale_log2 = softmax_scale * LOG2_E
+        softmax_stats_scale = softmax_scale if softmax_stats is not None else None
 
         kernel_split_kv = (
             Int32(self.static_split_kv)
@@ -1450,6 +1463,10 @@ class MlaDecodeTs:
         # before reading partials. Persistent schedules retain stream ordering.
         use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
+        if cutlass.const_expr(self.use_kv_bounds):
+            from ..helpers.kv_bounds import initialize_empty_rows
+
+            initialize_empty_rows(o, lse, softmax_stats, kv_bounds, stream)
         self.split_kv_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -1473,6 +1490,9 @@ class MlaDecodeTs:
             clc_tile_sched_params,
             output_quant_args,
             tma_desc_o,
+            softmax_stats,
+            softmax_stats_scale,
+            kv_bounds,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1498,6 +1518,8 @@ class MlaDecodeTs:
                     cu_seqlens_q,
                     block_split_kvs,
                     output_quant_args,
+                    softmax_stats,
+                    softmax_stats_scale,
                 ).launch(
                     grid=(
                         (
@@ -1528,6 +1550,8 @@ class MlaDecodeTs:
                     cache_seqs,
                     cu_seqlens_q,
                     block_split_kvs,
+                    softmax_stats,
+                    softmax_stats_scale,
                 ).launch(
                     grid=(
                         ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1571,6 +1595,9 @@ class MlaDecodeTs:
         clc_tile_sched_params: object,
         output_quant_args=None,
         tma_desc_o: cutlass.GridConstant[cuda.TensorMap] = None,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
+        kv_bounds: cute.Tensor | None = None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
@@ -1848,7 +1875,9 @@ class MlaDecodeTs:
                 tile_batch_idx,
             )
             if cutlass.const_expr(
-                cfg.mask_type == MaskType.CAUSAL.value and self.seq_len_q > 1
+                not cfg.use_kv_bounds
+                and cfg.mask_type == MaskType.CAUSAL.value
+                and self.seq_len_q > 1
             ):
                 _, _, logical_q_idx, _, _ = flat_query_row_state(
                     Int32(self.mma_qk_tiler_mn[0] - 1),
@@ -2005,10 +2034,12 @@ class MlaDecodeTs:
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,
+                softmax_stats=softmax_stats,
                 domain=Int32(1),  # dummy; MlaTask recomputes per-task to avoid spills
                 work_queue=mla_work_queue,
                 cache_seqs=cache_seqs,
                 cu_seqlens_q=cu_seqlens_q,
+                kv_bounds=kv_bounds,
                 split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
@@ -2077,6 +2108,7 @@ class MlaDecodeTs:
             # Set runtime params on GmemO (epilogue)
             named_res["gmem_o"].output_scale = output_scale
             named_res["gmem_o"].softmax_scale_log2 = softmax_scale_log2
+            named_res["gmem_o"].softmax_stats_scale = softmax_stats_scale
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
@@ -2157,6 +2189,8 @@ class MlaDecodeTs:
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: cute.Tensor,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the throughput 2CTA split-KV reduction body."""
         cfg = make_mla_decode_config(
@@ -2167,6 +2201,7 @@ class MlaDecodeTs:
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            use_kv_bounds=self.use_kv_bounds,
         )
         if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -2183,6 +2218,8 @@ class MlaDecodeTs:
             cfg,
             self.reduction_split_capacity,
             REDUCTION_ROWS_PER_CTA,
+            softmax_stats,
+            softmax_stats_scale,
         )
 
     @cute.kernel
@@ -2197,6 +2234,8 @@ class MlaDecodeTs:
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
         output_quant_args=None,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the high-split fixed-D512 cluster reducer."""
 
@@ -2208,6 +2247,7 @@ class MlaDecodeTs:
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            use_kv_bounds=self.use_kv_bounds,
         )
         if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -2236,4 +2276,6 @@ class MlaDecodeTs:
             self.fuse_sparse_reduction,
             self.output_quant,
             output_quant_args,
+            softmax_stats,
+            softmax_stats_scale,
         )

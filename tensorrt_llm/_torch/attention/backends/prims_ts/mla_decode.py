@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -90,6 +90,8 @@ class _MLADecodeCompileSpec:
     has_kernel_workspace: bool
     split_kv: int
     kernel: Any = field(compare=False, hash=False, repr=False)
+    store_softmax_stats: bool = False
+    use_kv_bounds: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,8 @@ class _MLADecodePlanState:
     compiled: Callable[..., object]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
+    store_softmax_stats: bool = False
+    use_kv_bounds: bool = False
 
 
 @dataclass(frozen=True)
@@ -410,6 +414,7 @@ def _validate_mla_run_metadata(
     max_kv_len: int,
     page_size: int,
     mask_type: str,
+    kv_bounds: Optional[torch.Tensor] = None,
 ) -> None:
     """Validate per-run request metadata against one static MLA plan.
 
@@ -464,8 +469,10 @@ def _validate_mla_run_metadata(
         q_lengths = (max_seq_len_q,) * batch_size
 
     seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
-    if any(seq_len <= 0 for seq_len in seq_lens_host):
+    if kv_bounds is None and any(seq_len <= 0 for seq_len in seq_lens_host):
         raise ValueError("every runtime request must contain at least one KV token")
+    if kv_bounds is not None and any(seq_len < 0 for seq_len in seq_lens_host):
+        raise ValueError("runtime KV lengths must be nonnegative with kv_bounds")
     runtime_max_kv_len = max(seq_lens_host)
     if runtime_max_kv_len > max_kv_len:
         raise ValueError(
@@ -486,7 +493,25 @@ def _validate_mla_run_metadata(
                 f"K/V cache in [0, {runtime.num_physical_pages}); request "
                 f"{request_idx} contains an invalid page ID"
             )
-    if mask_type == "causal":
+    if kv_bounds is not None:
+        bounds_host = kv_bounds.tolist()
+        offset = 0
+        for request_idx, (q_len, kv_len) in enumerate(
+            zip(q_lengths, seq_lens_host, strict=True)
+        ):
+            row_bounds = bounds_host[offset : offset + q_len]
+            if any(bound < 0 or bound > kv_len for bound in row_bounds):
+                raise ValueError(
+                    "kv_bounds values must be in [0, seq_lens[request]]; "
+                    f"request {request_idx} has K/V={kv_len}"
+                )
+            if any(
+                left > right
+                for left, right in zip(row_bounds[:-1], row_bounds[1:], strict=True)
+            ):
+                raise ValueError("kv_bounds must be nondecreasing within each request")
+            offset += q_len
+    elif mask_type == "causal":
         for request_idx, (q_len, kv_len) in enumerate(
             zip(q_lengths, seq_lens_host, strict=True)
         ):
@@ -689,6 +714,56 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _validate_mla_kv_bounds(
+    query: torch.Tensor,
+    kv_bounds: Optional[torch.Tensor],
+    use_kv_bounds: bool,
+    validate: bool,
+) -> None:
+    """Enforce mode agreement and optionally check per-logical-query storage."""
+    if (kv_bounds is not None) != use_kv_bounds:
+        raise ValueError("kv_bounds must be supplied exactly when use_kv_bounds=True")
+    if validate and kv_bounds is not None:
+        _validate_int32_cuda_tensor(
+            kv_bounds, "kv_bounds", ndim=1, require_16byte_alignment=False
+        )
+        if kv_bounds.device != query.device:
+            raise ValueError("kv_bounds must be on the query device")
+        expected = math.prod(query.shape[:-2])
+        if kv_bounds.numel() != expected:
+            raise ValueError(
+                f"kv_bounds must have shape [{expected}], one bound per query token"
+            )
+        if kv_bounds.data_ptr() % 4:
+            raise ValueError("kv_bounds must be 4-byte aligned")
+
+
+def _validate_mla_softmax_stats(
+    query: torch.Tensor,
+    softmax_stats: Optional[torch.Tensor],
+    store_softmax_stats: bool,
+    validate: bool,
+) -> None:
+    """Always enforce plan/buffer agreement; validate storage without CUDA sync."""
+    if (softmax_stats is not None) != store_softmax_stats:
+        raise ValueError(
+            "softmax_stats must be supplied exactly when store_softmax_stats=True"
+        )
+    if validate and softmax_stats is not None:
+        if not isinstance(softmax_stats, torch.Tensor):
+            raise TypeError("softmax_stats must be a torch.Tensor")
+        if softmax_stats.dtype != torch.float32:
+            raise TypeError("softmax_stats must have dtype torch.float32")
+        if softmax_stats.device != query.device:
+            raise ValueError("softmax_stats must be on the query device")
+        if tuple(softmax_stats.shape) != (*query.shape[:-1], 2):
+            raise ValueError("softmax_stats must have shape [*query.shape[:-1], 2]")
+        if not softmax_stats.is_contiguous():
+            raise ValueError("softmax_stats must be contiguous")
+        if softmax_stats.data_ptr() % 4:
+            raise ValueError("softmax_stats must be 4-byte aligned")
+
+
 def _kernel_dtype_name(dtype_key: str) -> str:
     names = {
         "bfloat16": "bf16",
@@ -738,6 +813,8 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -868,6 +945,7 @@ def _resolve_mla_decode_launch_spec(
                 explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
+                use_kv_bounds=use_kv_bounds,
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
@@ -875,6 +953,7 @@ def _resolve_mla_decode_launch_spec(
                 cfg=final_cfg,
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
+                store_softmax_stats=store_softmax_stats,
             )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
@@ -926,6 +1005,28 @@ def _resolve_mla_decode_launch_spec(
             if not decision.implementation_ready:
                 raise NotImplementedError(decision.reason)
             split_kv = two_cta_split_kv
+            # These short, bounded SM107 plans avoid split scratch and a
+            # separate reduction. The rule describes local geometry, including
+            # packed queries, rather than a context-parallel rank count.
+            if (
+                policy_source == "auto"
+                and batch_size == 1
+                and num_heads == 96
+                and seq_len_q == 8
+                and kv_lora_rank == 512
+                and qk_rope_head_dim == 64
+                and page_size == 128
+                and max_kv_len == 1024
+                and q_dtype_key == kv_dtype_key == "float8_e4m3fn"
+                and output_dtype_key == "bfloat16"
+                and mask_type == "causal"
+                and store_softmax_stats
+                and use_kv_bounds
+                and torch.cuda.get_device_capability(device_index) == (10, 7)
+                and torch.cuda.get_device_properties(device_index).multi_processor_count
+                == 212
+            ):
+                split_kv = 1
             work_clusters = batch_size * launch_shape.num_tiles * max(split_kv, 1)
             # Dynamic cluster stealing only helps once logical work exceeds a
             # resident wave.  Within one wave every cluster already launches,
@@ -950,6 +1051,7 @@ def _resolve_mla_decode_launch_spec(
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
+                use_kv_bounds=use_kv_bounds,
             )
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
@@ -959,6 +1061,7 @@ def _resolve_mla_decode_launch_spec(
                 split_kv=split_kv,
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
+                store_softmax_stats=store_softmax_stats,
             )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
@@ -1024,6 +1127,8 @@ def _make_mla_decode_compile_spec(
     output_dtype_key: str,
     max_seq_len_q: int,
     packed_query: bool,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
@@ -1041,6 +1146,8 @@ def _make_mla_decode_compile_spec(
         has_kernel_workspace=launch_spec.kernel_workspace_bytes > 0,
         split_kv=launch_spec.split_kv,
         kernel=launch_spec.kernel,
+        store_softmax_stats=store_softmax_stats,
+        use_kv_bounds=use_kv_bounds,
     )
 
 
@@ -1225,8 +1332,25 @@ def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
             sink,
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    stats_fake = None
+    if compile_spec.store_softmax_stats:
+        stats_rows = (
+            runtime_total_q * num_heads
+            if packed_query
+            else batch_size * max_seq_len_q * num_heads
+        )
+        stats_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (stats_rows, 2), stride_order=(1, 0), assumed_align=4
+        )
 
     output_quant_args = _fake_output_quant_args(getattr(kernel, "output_quant", None))
+    bounds_fake = None
+    if compile_spec.use_kv_bounds:
+        bounds_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (runtime_total_q if packed_query else batch_size * max_seq_len_q,),
+            assumed_align=4,
+        )
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
@@ -1248,7 +1372,9 @@ def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             stream_fake,
-            output_quant_args=output_quant_args,
+            output_quant_args,
+            stats_fake,
+            bounds_fake,
             options=_COMPILE_OPTIONS,
         )
 
@@ -1279,6 +1405,8 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     out_dtype: torch.dtype = torch.bfloat16,
     mask_type: Literal["dense", "causal"] = "causal",
     device=None,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
 
@@ -1289,11 +1417,20 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     packed-query launches;
     ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
     supplied, the bound is one. The returned byte count includes both split-KV
-    scratch and the internal FP32 LSE tensor. Allocate a contiguous
+    scratch and the internal FP32 LSE tensor. With ``store_softmax_stats=True``,
+    it also includes split maxima and sums to export actual maximum/denominator
+    statistics; the public statistics buffer is caller-owned and excluded.
+    ``use_kv_bounds=True`` selects per-query prefix masking without adding
+    scratch; supply the same flag to the plan that consumes this workspace.
+    Allocate a contiguous
     ``torch.int8`` or ``torch.uint8`` CUDA buffer; MLA does not require its
     contents to be initialized before first use.
     """
 
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
+    if not isinstance(use_kv_bounds, bool):
+        raise TypeError("use_kv_bounds must be a bool")
     batch_size = _validate_positive_int(batch_size, "batch_size")
     num_heads = _validate_positive_int(num_heads, "num_heads")
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
@@ -1330,6 +1467,8 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         _dtype_key(out_dtype),
         mask_type,
         max_seq_len_q,
+        store_softmax_stats,
+        use_kv_bounds,
     )
     return _make_mla_workspace_layout(
         spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
@@ -1439,6 +1578,8 @@ def _launch_mla_decode(
     split_kv: int,
     workspace: _MLAWorkspaceViews,
     compiled: Callable[..., object],
+    softmax_stats: Optional[torch.Tensor] = None,
+    kv_bounds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1480,12 +1621,11 @@ def _launch_mla_decode(
         runtime.sparse_inputs,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
-        # Passed positionally and also when None. The kernel was compiled with
-        # ``output_quant_args`` in its signature (``None`` for unquantized
-        # output), and a kernel reloaded from the persistent compile cache is
-        # a positional TVM-FFI entry with no Python defaults: it rejects both
-        # a missing parameter and a keyword argument.
+        # Reloaded persistent-cache kernels expose a positional TVM-FFI entry
+        # without Python defaults. Keep all optional arguments in the ABI.
         runtime.output_quant_args,
+        None if softmax_stats is None else softmax_stats.view(-1, 2),
+        kv_bounds,
     )
     return runtime.out
 
@@ -1515,6 +1655,8 @@ class BatchMLADecodePagedTSWrapper:
         kv_data_type: torch.dtype,
         o_data_type: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
+        store_softmax_stats: bool = False,
+        use_kv_bounds: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> None:
@@ -1554,6 +1696,13 @@ class BatchMLADecodePagedTSWrapper:
             Query, K/V, and output dtypes used to compile the plan.
         mask_type : {"dense", "causal"}
             Attention mask mode.
+        store_softmax_stats : bool
+            Compile final FP32 maximum/denominator export. Supply its caller-owned
+            buffer to every run when enabled. Defaults to ``False``.
+        use_kv_bounds : bool
+            Compile explicit per-query KV prefix masking. When enabled, every
+            run requires ``kv_bounds`` and may use zero runtime K/V lengths.
+            Bounds override ``mask_type``; the static K/V capacity stays positive.
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
@@ -1564,6 +1713,10 @@ class BatchMLADecodePagedTSWrapper:
             Disable only for previously validated inputs and warmed topology.
         """
 
+        if not isinstance(store_softmax_stats, bool):
+            raise TypeError("store_softmax_stats must be a bool")
+        if not isinstance(use_kv_bounds, bool):
+            raise TypeError("use_kv_bounds must be a bool")
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
         if validate:
@@ -1603,6 +1756,8 @@ class BatchMLADecodePagedTSWrapper:
             _dtype_key(o_data_type),
             mask_type,
             max_seq_len_q,
+            store_softmax_stats,
+            use_kv_bounds,
         )
         spec = _resolve_mla_decode_launch_spec(*spec_key)
         compile_spec = _make_mla_decode_compile_spec(
@@ -1616,6 +1771,8 @@ class BatchMLADecodePagedTSWrapper:
             output_dtype_key=_dtype_key(o_data_type),
             max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
+            store_softmax_stats=store_softmax_stats,
+            use_kv_bounds=use_kv_bounds,
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -1657,6 +1814,8 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=int(dict(policy)["split_kv"]),
+            store_softmax_stats=store_softmax_stats,
+            use_kv_bounds=use_kv_bounds,
         )
 
     @flashinfer_experimental_api
@@ -1668,9 +1827,11 @@ class BatchMLADecodePagedTSWrapper:
         seq_lens: torch.Tensor,
         *,
         qo_indptr: Optional[torch.Tensor] = None,
+        kv_bounds: Optional[torch.Tensor] = None,
         bmm1_scale: float = 1.0,
         bmm2_scale: float = 1.0,
         out: Optional[torch.Tensor] = None,
+        softmax_stats: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
         """Launch the most recently planned MLA decode on the current stream.
@@ -1699,10 +1860,25 @@ class BatchMLADecodePagedTSWrapper:
             Runtime K/V lengths with one element per request.
         qo_indptr : torch.Tensor, optional
             Runtime cumulative query offsets for a packed-query plan.
+        kv_bounds : torch.Tensor, optional
+            Contiguous CUDA int32 prefix counts, flat ``[B * SQ]`` for fixed Q
+            or ``[total_q]`` for packed Q, shared by every head of a query token.
+            Required exactly when ``plan(use_kv_bounds=True)``, even with
+            ``validate=False``. Counts must be nondecreasing within each request
+            and lie in ``[0, seq_lens[b]]``. They replace dense/causal visibility.
+            A zero prefix returns zero O and FP32 statistics ``(-inf, 0)``.
+            Structure and values are caller preconditions with ``validate=False``.
         bmm1_scale, bmm2_scale : float
             QK and value/output scaling factors.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
+        softmax_stats : torch.Tensor, optional
+            Contiguous FP32 buffer ``[*query.shape[:-1], 2]`` on the query device.
+            The last dimension stores the actual maximum scaled logit in natural-log
+            units and ``sum(exp(logit - max))``, without internal FP8 scaling.
+            Required exactly when the plan has ``store_softmax_stats=True``, even
+            with ``validate=False``. Must not alias inputs, output, or workspace;
+            overlap is a caller precondition and is not checked.
         validate : bool
             Enable explicit runtime validation. Defaults to ``True``.
 
@@ -1717,6 +1893,10 @@ class BatchMLADecodePagedTSWrapper:
             raise RuntimeError("plan() must be called before run()")
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        _validate_mla_softmax_stats(
+            query, softmax_stats, state.store_softmax_stats, validate
+        )
+        _validate_mla_kv_bounds(query, kv_bounds, state.use_kv_bounds, validate)
         runtime_qo_indptr = qo_indptr if state.packed_query else None
         runtime = _prepare_mla_runtime(
             query,
@@ -1750,6 +1930,7 @@ class BatchMLADecodePagedTSWrapper:
                 max_kv_len=state.max_kv_len,
                 page_size=state.page_size,
                 mask_type=state.mask_type,
+                kv_bounds=kv_bounds,
             )
         return _launch_mla_decode(
             runtime,
@@ -1761,6 +1942,8 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=state.split_kv,
             workspace=state.workspace_views,
             compiled=state.compiled,
+            softmax_stats=softmax_stats,
+            kv_bounds=kv_bounds,
         )
 
 
@@ -1783,6 +1966,9 @@ def batch_mla_decode_with_paged_kv_cache(
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
     validate: bool = True,
+    store_softmax_stats: bool = False,
+    kv_bounds: Optional[torch.Tensor] = None,
+    softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1820,6 +2006,16 @@ def batch_mla_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype
         Output dtype.
+    store_softmax_stats : bool
+        Compile statistics export; defaults to ``False``.
+    kv_bounds : torch.Tensor, optional
+        Per-query CUDA int32 prefix counts with the same contract as
+        :meth:`BatchMLADecodePagedTSWrapper.run`. Supplying this tensor enables
+        bounded mode and permits zero runtime K/V lengths. If all lengths are
+        zero, an omitted static ``max_kv_len`` is conservatively set to one.
+    softmax_stats : torch.Tensor, optional
+        Caller-owned FP32 maximum/denominator buffer with shape
+        ``[*query.shape[:-1], 2]``; required exactly when statistics are enabled.
 
     workspace_buffer : torch.Tensor, optional
         Caller-owned byte scratch, exclusive to one in-flight launch/graph.
@@ -1840,8 +2036,9 @@ def batch_mla_decode_with_paged_kv_cache(
     ``max_seq_len_q``.
     Warm this exact topology outside capture first. Retain stable tensor storage
     and mutate metadata only between completed launches/replays. All live K/V
-    lengths must be positive and within the static bound, active page IDs must
-    index the cache, and causal per-request Q lengths must not exceed K/V lengths.
+    lengths must be positive (nonnegative with ``kv_bounds``) and within the
+    static bound, and active page IDs must index the cache. Without ``kv_bounds``,
+    causal per-request Q lengths must not exceed K/V lengths.
     Packed offsets must start at zero, end at the query token count, and have
     nonnegative deltas within the Q bound. Scratch/output must not alias
     any inputs or each other. No metadata is copied to the host on the trusted
@@ -1901,6 +2098,8 @@ def batch_mla_decode_with_paged_kv_cache(
         max_seq_len_q = int(query.shape[1])
     if max_kv_len is None:
         max_kv_len = int(seq_lens.max().item())
+        if kv_bounds is not None:
+            max_kv_len = max(max_kv_len, 1)
     assert max_seq_len_q is not None
     if validate and out is not None:
         _validate_out(
@@ -1927,6 +2126,8 @@ def batch_mla_decode_with_paged_kv_cache(
             out_dtype=out_dtype,
             mask_type=mask_type,
             device=query.device,
+            store_softmax_stats=store_softmax_stats,
+            use_kv_bounds=kv_bounds is not None,
         )
         workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.int8, device=query.device
@@ -1949,6 +2150,8 @@ def batch_mla_decode_with_paged_kv_cache(
         mask_type=mask_type,
         workspace_buffer=workspace_buffer,
         validate=validate,
+        store_softmax_stats=store_softmax_stats,
+        use_kv_bounds=kv_bounds is not None,
     )
     return wrapper.run(
         query,
@@ -1960,6 +2163,8 @@ def batch_mla_decode_with_paged_kv_cache(
         bmm2_scale=bmm2_scale,
         out=out,
         validate=validate,
+        softmax_stats=softmax_stats,
+        kv_bounds=kv_bounds,
     )
 
 
@@ -2959,6 +3164,8 @@ class BatchSparseMLADecodePagedTSWrapper:
             (indices, ci, lengths, cl, s0, s1, sinks),
             bmm1,
             bmm2,
+            None,
+            None,
             None,
         )
         return out

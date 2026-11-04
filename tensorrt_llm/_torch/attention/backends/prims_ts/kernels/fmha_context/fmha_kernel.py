@@ -246,7 +246,7 @@ def _init_task_with_domain(
     """Initialize a captured Task with its static validation loop domain."""
     schedule = kwargs.get("schedule")
     if schedule is None:
-        raise ValueError("Causal domain tasks require a captured schedule.")
+        raise ValueError("Domain tasks require a captured schedule.")
     if domain is not None:
         schedule.loop_end = domain
     task_init(task, **kwargs)
@@ -323,6 +323,40 @@ def _init_causal_domain_state(
     task._offset = offset
     task._window_size_left = window_size_left
     task._packed_window = packed_window
+
+
+class PackedDenseDomainTask(Task):
+    """Request-local dense KV extent with one masked tile for empty rows."""
+
+    def __init__(
+        self,
+        num_kv_tiles: int | Int32,
+        tile_size_kv: int,
+        batch_idx: int,
+        cum_seqlen_k: cute.Tensor,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Retain the planned domain for validation and bound runtime KV work."""
+        static_domain = (
+            max(num_kv_tiles - offset, 0) if isinstance(num_kv_tiles, int) else None
+        )
+        _init_task_with_domain(self, kwargs, static_domain)
+        self._num_kv_tiles = num_kv_tiles
+        self._tile_size_kv = tile_size_kv
+        self._batch_idx = batch_idx
+        self._cum_seqlen_k = cum_seqlen_k
+        self._offset = offset
+
+    def get_domain(self, tile_coord: cute.Coord) -> int | Int32:
+        """Use the same live KV bound for each task's N or N-1 domain."""
+        batch_coord = Int32(tile_coord[self._batch_idx])
+        k_begin = Int32(self._cum_seqlen_k[batch_coord])
+        seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
+        runtime_tiles = cute.ceil_div(seqlen_k, self._tile_size_kv)
+        # Empty KV still traverses HEAD/TAIL to write zero O and (-inf, 0).
+        domain = _domain_min(self._num_kv_tiles, _domain_max(1, runtime_tiles))
+        return domain - self._offset
 
 
 class CausalDomainTask(Task):
@@ -671,6 +705,30 @@ class FmhaDomainPolicy:
     softmax1_domain_kwargs: DomainKwargs
 
 
+def _uses_sm107_dense_mla_q_pruning(cfg: FmhaConfig) -> bool:
+    """Prune unused packed-Q pairs in native SM107 FP8 expanded MLA."""
+    if not (
+        not cfg.is_causal
+        and not cfg.has_variable_window
+        and cfg.window_size_left == 0
+        and not cfg.head_paired
+        and not cfg.use_paged_kv
+        and cfg.has_varlen
+        and not cfg.has_uniform_varlen
+        and cfg.num_qkv_instances == 2
+        and not cfg.two_cta_umma
+        and cfg.logical_head_dim_qk == 192
+        and cfg.pv_mma_tiler[1] == 128
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cutlass.Float8E4M3FN
+        and cfg.o_dtype == cutlass.BFloat16
+    ):
+        return False
+    from cutlass.cutlass_dsl import BaseDSL
+
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return (arch.major, arch.minor) == (10, 7)
+
+
 def build_context_task_manager(
     *,
     cfg: FmhaConfig,
@@ -691,7 +749,9 @@ def build_context_task_manager(
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
+    softmax_stats: cute.Tensor | None = None,
     g_block_tables: cute.Pointer | None = None,
+    stats_scale: cute.Tensor | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
@@ -1124,7 +1184,7 @@ def build_context_task_manager(
             "name": "work_queue",
         }
         if (
-            cfg.is_causal
+            (cfg.is_causal or _uses_sm107_dense_mla_q_pruning(cfg))
             and cfg.has_varlen
             and not cfg.has_uniform_varlen
             and cum_seqlen_q is not None
@@ -1198,6 +1258,7 @@ def build_context_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         smem_p=smem_p0,
+        store_softmax_stats=softmax_stats is not None,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1214,6 +1275,10 @@ def build_context_task_manager(
         tmem_vec_offset=cfg.tmem_vec0_offset,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        softmax_stats=softmax_stats,
+        stats_scale=stats_scale,
+        cum_seqlen_q=cum_seqlen_q,
+        q_half=0,
         name="tmem_vec0",
     )
     smem_o_0 = SmemOResource(
@@ -1291,6 +1356,7 @@ def build_context_task_manager(
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             smem_p=smem_p1,
+            store_softmax_stats=softmax_stats is not None,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1299,6 +1365,10 @@ def build_context_task_manager(
             tmem_vec_offset=cfg.tmem_vec1_offset,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
+            cum_seqlen_q=cum_seqlen_q,
+            q_half=1,
             name="tmem_vec1",
         )
         smem_o_1 = SmemOResource(
@@ -2537,6 +2607,24 @@ def _select_fmha_domain_policy(
             softmax0_domain_kwargs=softmax0_domain,
             softmax1_domain_kwargs=softmax1_domain,
         )
+    if _uses_sm107_dense_mla_q_pruning(cfg):
+        if cum_seqlen_k is None:
+            raise ValueError("Packed dense MLA domains require runtime KV offsets")
+        dense_kwargs: DomainKwargs = {
+            "task_class": PackedDenseDomainTask,
+            "num_kv_tiles": num_kv_tiles,
+            "tile_size_kv": cfg.kv_tile_n,
+            "batch_idx": batch_idx,
+            "cum_seqlen_k": cum_seqlen_k,
+        }
+        domain_n_kwargs = {**dense_kwargs, "offset": 0}
+        domain_n_minus_1_kwargs = {**dense_kwargs, "offset": 1}
+        return FmhaDomainPolicy(
+            domain_n_kwargs=domain_n_kwargs,
+            domain_n_minus_1_kwargs=domain_n_minus_1_kwargs,
+            softmax0_domain_kwargs=domain_n_kwargs,
+            softmax1_domain_kwargs=domain_n_kwargs,
+        )
     # Dense query-paired fallback: no head-pairing or causal mask, so both
     # peers traverse the full static K/V domain.
     domain_n_kwargs = {"domain": num_kv_tiles}
@@ -2581,6 +2669,7 @@ def build_fmha_task_manager(
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
+    softmax_stats: cute.Tensor | None = None,
     q_offset: int | Int32 = 0,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
@@ -2590,6 +2679,7 @@ def build_fmha_task_manager(
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
     exhaustive_deadlock_race_check: bool = True,
+    stats_scale: cute.Tensor | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -2674,6 +2764,8 @@ def build_fmha_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        softmax_stats=softmax_stats,
+        stats_scale=stats_scale,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -3065,6 +3157,8 @@ class FmhaTs:
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
+        softmax_stats: cute.Tensor | None = None,
+        stats_scale: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3383,6 +3477,7 @@ class FmhaTs:
             tile_sched_params,
             scale_softmax_log2,
             output_scale,
+            softmax_stats,
             num_kv_tiles,
             num_seq_tiles,
             q_offset,
@@ -3398,6 +3493,7 @@ class FmhaTs:
             Int32(s_q),
             self.is_persistent,
             self.is_clc_dynamic,
+            stats_scale=stats_scale,
         ).launch(
             grid=grid,
             block=[block_size, 1, 1],
@@ -3423,6 +3519,7 @@ class FmhaTs:
         ),
         scale_softmax_log2: cute.Tensor,
         output_scale: cute.Tensor,
+        softmax_stats: cute.Tensor | None,
         num_kv_tiles: Int32,
         num_seq_tiles: Int32,
         q_offset: Int32,
@@ -3438,6 +3535,7 @@ class FmhaTs:
         variable_window_q_stride: Int32,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
+        stats_scale: cute.Tensor | None = None,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
@@ -3500,6 +3598,8 @@ class FmhaTs:
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
             q_offset=q_offset,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,

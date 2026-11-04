@@ -63,7 +63,11 @@ from .fmha_resources import (
 
 @dataclass(kw_only=True)
 class PackedContextWorkQueue(WorkQueue):
-    """Persistent queue that skips Q tiles outside a live packed request."""
+    """Persistent queue that skips Q tiles outside a live packed request.
+
+    The predicate depends only on Q validity, not mask type or K/V length.
+    Valid Q rows with no K/V still execute the output/statistics epilogue.
+    """
 
     cfg: cutlass.Constexpr[FmhaConfig] = field(init=False, default=None)
     cum_seqlen_q: Any = field(init=False, default=None)

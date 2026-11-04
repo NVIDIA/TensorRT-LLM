@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TRT-LLM FMHA adapter for the vendored PrimTS Blackwell kernels."""
+"""TRT-LLM FMHA adapter for the vendored PrimTS Blackwell/Rubin kernels."""
 
 from __future__ import annotations
 
@@ -40,7 +40,11 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .utils import get_kv_page_offset, get_multi_processor_count_for_device
+from .utils import (
+    get_kv_page_offset,
+    get_multi_processor_count_for_device,
+    has_uniform_generation_query_lengths,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.context import (
@@ -58,8 +62,44 @@ if TYPE_CHECKING:
 
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
+_MIN_RUBIN_CUTLASS_DSL_VERSION = Version("4.8.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
+
+
+def _mla_context_capacities(
+    query_length: int,
+    kv_length: int,
+    *,
+    head_dim: int,
+    head_dim_vo: int | None,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    packed: bool,
+    uniform_packed_lengths: bool,
+    mask_type: str,
+    window_left: int,
+) -> tuple[int, int]:
+    """Bucket expanded MLA capacities without changing its live packed lengths."""
+    query_capacity = 1 << (max(query_length, 1) - 1).bit_length()
+    kv_capacity = 1 << (max(kv_length, 1) - 1).bit_length()
+    if (
+        (head_dim, head_dim_vo) == (192, 128)
+        and packed
+        and not uniform_packed_lengths
+        and mask_type in ("causal", "dense")
+        and window_left == -1
+        and qk_dtype == pv_dtype
+        and qk_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        and output_dtype in (torch.float16, torch.bfloat16)
+    ):
+        # This query-paired kernel has two M128 peers and N128 KV tiles.
+        # Raising sub-tile capacities preserves the work domain; indptrs
+        # continue to supply the actual ragged lengths and causal offsets.
+        query_capacity = max(query_capacity, 256)
+        kv_capacity = max(kv_capacity, 128)
+    return query_capacity, kv_capacity
 
 
 def get_paged_kv_storage_unsupported_reason(
@@ -105,16 +145,15 @@ def get_paged_kv_storage_unsupported_reason(
 def get_paged_kv_policy_unsupported_reason(
     attn: "TrtllmAttention",
     metadata: "TrtllmAttentionMetadata",
+    *,
+    allow_linear_mla: bool = False,
 ) -> Optional[str]:
     """Return why the request's decoding policy is outside the fixed page-table envelope."""
     if metadata.beam_width != 1:
         return "beam search is not supported."
-    if (
-        metadata.is_spec_decoding_enabled
-        or metadata.use_spec_decoding
-        or metadata.is_spec_dec_tree
-        or metadata.is_spec_dec_dynamic_tree
-    ):
+    if metadata.is_spec_dec_tree or metadata.is_spec_dec_dynamic_tree:
+        return "tree speculative decoding is not supported."
+    if not allow_linear_mla and (metadata.is_spec_decoding_enabled or metadata.use_spec_decoding):
         return "speculative decoding is not supported by the initial adapter."
     position_embedding_type = int(attn.position_embedding_type)
     if position_embedding_type in (4, 5, 6, 7, 10):
@@ -130,16 +169,18 @@ def get_paged_kv_policy_unsupported_reason(
         and not quant_mode.has_fp4_kv_cache()
     )
     if quant_mode.has_kv_cache_quant() and not is_fp8_mla:
-        return "quantized KV cache is supported only for FP8 MLA decode."
+        return "quantized KV cache is supported only for FP8 MLA."
     return None
 
 
 def get_attention_feature_unsupported_reason(
     metadata: "TrtllmAttentionMetadata",
     forward_args: "AttentionForwardArgs",
+    *,
+    allow_helix: bool = False,
 ) -> Optional[str]:
     """Return which optional attention feature the fused-kernel adapters do not implement."""
-    if metadata.helix_position_offsets is not None:
+    if metadata.helix_position_offsets is not None and not allow_helix:
         return "Helix parallelism is not supported."
     if forward_args.relative_attention_bias is not None:
         return "relative attention bias is not supported."
@@ -153,11 +194,11 @@ def get_attention_feature_unsupported_reason(
 
 
 class PrimsTSFmha(PhasedFmha):
-    """Blackwell task-scheduled paged context and decode FMHA library."""
+    """Blackwell/Rubin task-scheduled standard/MLA context and decode FMHA library."""
 
     supports_per_tensor_fp8 = True
 
-    SUPPORTED_SMS = frozenset({100, 103})
+    SUPPORTED_SMS = frozenset({100, 103, 107})
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
     SUPPORTED_DECODE_HEAD_DIMS = {64, 128, 256}
@@ -170,13 +211,17 @@ class PrimsTSFmha(PhasedFmha):
         # the manager itself.
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
         self._multi_processor_count: Optional[int] = None
-        # Every other plan attribute is fixed by this layer/model instance.
-        # Batch size is the only execution profile that needs its own wrapper.
+        # Standard-attention decode admits only single-token generation.
         self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
         # Cache-free context plans, keyed by (batch, seq_len, q/v/out dtype, mask).
         self._contiguous_context_wrappers: dict[tuple[Any, ...], "BatchPrefillTSWrapper"] = {}
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
-        self._mla_decode_wrappers: dict[int, "BatchMLADecodePagedTSWrapper"] = {}
+        self._mla_decode_wrappers: dict[tuple[int, int], "BatchMLADecodePagedTSWrapper"] = {}
+        self._mla_decode_workspace_sizes: dict[tuple[int, int], int] = {}
+        self._mla_decode_workspace_capacity: int | None = None
+        self._mla_context_wrappers: dict[
+            tuple[int, int, int, str, bool], "BatchPrefillTSWrapper"
+        ] = {}
         # Dense MLA's quantization scales are fixed for this layer/model. PrimTS
         # takes host scalars, so read them once during eager warmup, not capture.
         self._mla_fp8_scales: tuple[float, float] | None = None
@@ -192,17 +237,20 @@ class PrimsTSFmha(PhasedFmha):
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         sm = get_sm_version()
         if sm not in cls.SUPPORTED_SMS:
-            logger.debug(f"PrimTS FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
+            logger.debug(f"PrimTS FMHA is unavailable: requires SM100, SM103 or SM107, got SM{sm}.")
             return False
+        min_dsl_version = _MIN_RUBIN_CUTLASS_DSL_VERSION if sm == 107 else _MIN_CUTLASS_DSL_VERSION
         try:
             installed_version = Version(version("nvidia-cutlass-dsl"))
         except (PackageNotFoundError, InvalidVersion):
-            logger.debug("PrimTS FMHA is unavailable: nvidia-cutlass-dsl>=4.7 is required.")
+            logger.debug(
+                f"PrimTS FMHA is unavailable: nvidia-cutlass-dsl>={min_dsl_version} is required."
+            )
             return False
-        if installed_version < _MIN_CUTLASS_DSL_VERSION:
+        if installed_version < min_dsl_version:
             logger.debug(
                 "PrimTS FMHA is unavailable: "
-                f"nvidia-cutlass-dsl>={_MIN_CUTLASS_DSL_VERSION} is required, "
+                f"nvidia-cutlass-dsl>={min_dsl_version} is required, "
                 f"got {installed_version}."
             )
             return False
@@ -293,7 +341,7 @@ class PrimsTSFmha(PhasedFmha):
         if meta.kv_cache_manager is None:
             if k is None or v is None or fwd.is_fused_qkv:
                 return False, "cache-free attention takes separate Q, K and V."
-        elif k is not None or v is not None or (not attn.is_mla_enable and not fwd.is_fused_qkv):
+        elif not attn.is_mla_enable and (k is not None or v is not None or not fwd.is_fused_qkv):
             return False, "only fused QKV input is supported."
         if meta.is_cross:
             return False, "cross attention is not supported."
@@ -314,7 +362,13 @@ class PrimsTSFmha(PhasedFmha):
             return False, "sparse attention metadata is not supported."
         if meta.num_sparse_topk > 0:
             return False, "sparse attention metadata is not supported."
-        feature_reason = get_attention_feature_unsupported_reason(meta, fwd)
+        is_mla = attn.is_mla_enable
+        is_mla_generation = (
+            is_mla and fwd.attention_input_type == AttentionInputType.generation_only
+        )
+        feature_reason = get_attention_feature_unsupported_reason(
+            meta, fwd, allow_helix=is_mla_generation
+        )
         if feature_reason is not None:
             return False, feature_reason
         if fwd.sage_attn_qk_dtype is not None:
@@ -331,10 +385,15 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the attention mask is not causal or dense."
         if mask_type not in (AttentionMaskType.causal, AttentionMaskType.padding):
             return False, f"attention mask type {mask_type} is not supported."
-        policy_reason = get_paged_kv_policy_unsupported_reason(attn, meta)
+        policy_reason = get_paged_kv_policy_unsupported_reason(
+            attn,
+            meta,
+            allow_linear_mla=is_mla
+            and fwd.attention_input_type
+            in (AttentionInputType.context_only, AttentionInputType.generation_only),
+        )
         if policy_reason is not None:
             return False, policy_reason
-        is_mla = attn.is_mla_enable
         is_fp8_mla = is_mla and QuantMode(attn.quant_mode).has_fp8_kv_cache()
 
         input_type = fwd.attention_input_type
@@ -361,12 +420,12 @@ class PrimsTSFmha(PhasedFmha):
             )
         if attn.num_heads <= 0 or attn.num_kv_heads <= 0:
             return False, "query and KV head counts must be positive."
-        if is_mla:
+        if is_mla and has_generation:
             if attn.num_kv_heads != 1:
                 return False, "MLA decode requires one logical KV head."
             if attn.num_heads > 128:
                 return False, "MLA decode supports at most 128 local query heads."
-        else:
+        elif not is_mla:
             if attn.num_heads % attn.num_kv_heads != 0:
                 return False, "the query head count must be divisible by the KV head count."
             if has_generation and attn.num_heads // attn.num_kv_heads > self.MAX_DECODE_GQA_RATIO:
@@ -376,7 +435,9 @@ class PrimsTSFmha(PhasedFmha):
             return False, f"query dtype {q.dtype} is unsupported."
         cache_dtype = binding_to_torch_dtype(meta.kv_cache_manager.dtype)
         if is_fp8_mla and cache_dtype != torch.float8_e4m3fn:
-            return False, "FP8 MLA decode requires an FP8 E4M3 KV cache."
+            return False, "FP8 MLA requires an FP8 E4M3 KV cache."
+        if is_fp8_mla and getattr(meta.kv_cache_manager, "mla_kv_cache_residual_dim", 0):
+            return False, "FP8 MLA requires a full FP8 KV cache without a high-precision residual."
         if not is_fp8_mla and cache_dtype != q.dtype:
             return False, f"query and KV-cache dtypes must match, got {q.dtype} and {cache_dtype}."
         if output.dtype != q.dtype:
@@ -384,9 +445,49 @@ class PrimsTSFmha(PhasedFmha):
 
         if q.ndim != 2:
             return False, f"fused attention input must be rank 2, got rank {q.ndim}."
-        if is_mla:
+        if is_mla and has_context:
+            if input_type != AttentionInputType.context_only:
+                return False, "MLA context must be dispatched separately from generation."
+            if (
+                attn.head_dim,
+                attn.qk_nope_head_dim,
+                attn.qk_rope_head_dim,
+                attn.v_head_dim,
+                attn.kv_lora_rank,
+            ) != (192, 128, 64, 128, 512):
+                return False, "MLA context requires QK=192, V=128 and latent=512."
+            if attn.num_kv_heads != attn.num_heads:
+                return False, "MLA context requires expanded K/V for every query head."
+            if k is None or v is None or fwd.is_fused_qkv:
+                return False, "MLA context requires separate Q/K/V."
+            if q.shape[1] != attn.num_heads * 192:
+                return False, "MLA context query has an incompatible extent."
+            if (
+                k.ndim != 2
+                or k.shape[1] != attn.num_heads * 192
+                or v.ndim != 2
+                or v.shape != (k.shape[0], attn.num_heads * 128)
+            ):
+                return False, "MLA context K/V have incompatible extents."
+            if (
+                k.device != q.device
+                or v.device != q.device
+                or k.dtype != q.dtype
+                or v.dtype != q.dtype
+                or not k.is_contiguous()
+            ):
+                return False, "MLA context requires contiguous K and matching Q/K/V dtype/device."
+            if v.stride(1) != 1 or (is_fp8_mla and v.stride(0) != attn.num_heads * 256):
+                return False, "FP8 MLA context requires the strided kv_b_proj V view."
+            if output.numel() != q.shape[0] * attn.num_heads * 128:
+                return False, "MLA context output has an incompatible extent."
+        elif is_mla:
             if has_context or input_type != AttentionInputType.generation_only:
                 return False, "MLA is supported only for generation-only requests."
+            # The latent and RoPE components form one query, not fused QKV.
+            # PhasedFmha routes this through query_input with is_fused_qkv=False.
+            if k is not None or v is not None or fwd.is_fused_qkv:
+                return False, "MLA decode requires query-only input and no separate K/V."
             if q.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
                 return False, "MLA decode requires BF16 query input and output."
             if attn.kv_lora_rank != 512 or attn.qk_rope_head_dim != 64:
@@ -428,14 +529,58 @@ class PrimsTSFmha(PhasedFmha):
             num_gen_tokens <= 0 or num_generations <= 0 or num_gen_tokens % num_generations != 0
         ):
             return False, "generation tokens must be uniformly divisible across requests."
-        if has_generation and num_gen_tokens != num_generations:
+        if has_generation and not is_mla and num_gen_tokens != num_generations:
             return False, "only single-token generation is supported by the initial adapter."
+        is_helix = meta.helix_position_offsets is not None
+        if is_mla_generation:
+            seq_len_q = num_gen_tokens // num_generations
+            if seq_len_q > 1:
+                if mask_type != AttentionMaskType.causal:
+                    return False, "MLA multi-token generation requires a causal mask."
+                if not has_uniform_generation_query_lengths(meta, num_gen_tokens):
+                    return False, "MLA generation requires uniform per-request query lengths."
+            stats = fwd.softmax_stats_tensor
+            if is_helix and stats is None:
+                return False, "Helix MLA generation requires softmax statistics."
+            if stats is not None and (
+                stats.dtype != torch.float32
+                or stats.device != q.device
+                or not stats.is_contiguous()
+                or stats.shape != (num_gen_tokens, attn.num_heads, 2)
+            ):
+                return False, "MLA softmax statistics must be contiguous FP32 [tokens, heads, 2]."
+            if is_helix:
+                if mask_type != AttentionMaskType.causal:
+                    return False, "Helix MLA generation requires a causal mask."
+                if meta._helix_spec_tokens_valid:
+                    bounds = meta.helix_kv_bounds
+                    if (
+                        bounds is None
+                        or bounds.dtype != torch.int32
+                        or bounds.device != q.device
+                        or bounds.ndim != 1
+                        or not bounds.is_contiguous()
+                        or bounds.numel() < num_gen_tokens
+                    ):
+                        return False, "Helix MLA requires contiguous int32 per-token KV bounds."
+                elif seq_len_q != 1:
+                    return (
+                        False,
+                        "Helix MLA multi-token generation requires valid per-token KV bounds.",
+                    )
 
         host_kv_lens = meta.kv_lens_runtime
         if host_kv_lens is None or host_kv_lens.numel() < num_contexts + num_generations:
             return False, "host KV lengths are required for safe policy selection."
         active_kv_lens = host_kv_lens[: num_contexts + num_generations]
-        if active_kv_lens.numel() == 0 or int(active_kv_lens.min()) <= 0:
+        allows_empty_chunk = (
+            is_mla
+            and has_context
+            and mask_type == AttentionMaskType.padding
+            and fwd.softmax_stats_tensor is not None
+        )
+        min_kv_length = 0 if allows_empty_chunk or (is_mla_generation and is_helix) else 1
+        if active_kv_lens.numel() == 0 or int(active_kv_lens.min()) < min_kv_length:
             return False, "every active request must contain at least one KV token."
         max_kv_length = int(active_kv_lens.max())
         max_seq_len = int(meta.max_seq_len)
@@ -776,10 +921,15 @@ class PrimsTSFmha(PhasedFmha):
         kv_dtype: torch.dtype,
         output_dtype: torch.dtype,
         mask_type: str,
+        store_softmax_stats: bool = False,
+        use_kv_bounds: bool = False,
     ) -> "BatchMLADecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
-        wrapper = self._mla_decode_wrappers.get(batch_size)
+        # Within a prepared KV capacity, dense MLA instances fix the mask,
+        # dtypes and Helix stats/bounds modes. Only batch and verify width vary.
+        key = (batch_size, max_seq_len_q)
+        wrapper = self._mla_decode_wrappers.get(key)
         if wrapper is not None:
             return wrapper
         if torch.cuda.is_current_stream_capturing():
@@ -803,9 +953,11 @@ class PrimsTSFmha(PhasedFmha):
             kv_data_type=kv_dtype,
             o_data_type=output_dtype,
             mask_type=mask_type,
+            store_softmax_stats=store_softmax_stats,
+            use_kv_bounds=use_kv_bounds,
             workspace_buffer=workspace_buffer,
         )
-        self._mla_decode_wrappers[batch_size] = wrapper
+        self._mla_decode_wrappers[key] = wrapper
         return wrapper
 
     def forward(
@@ -913,7 +1065,7 @@ class PrimsTSFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
     ) -> None:
-        del k, v
+        del v
         block_offsets = metadata.kv_cache_block_offsets
         if block_offsets is None:
             raise RuntimeError("PrimTS requires paged KV-cache block offsets.")
@@ -927,6 +1079,11 @@ class PrimsTSFmha(PhasedFmha):
             self._multi_processor_count = get_multi_processor_count_for_device(q.device.index)
 
         required_preprocess_bytes = 0
+        if has_context and self.attn.is_mla_enable:
+            assert k is not None
+            required_preprocess_bytes = self._mla_context_workspace_layout(
+                q, k, int(metadata.num_contexts)
+            )[1]
         if has_context and not self.attn.is_mla_enable:
             context_layout = thop.get_trtllm_gen_context_workspace_layout(
                 q.dtype,
@@ -984,29 +1141,41 @@ class PrimsTSFmha(PhasedFmha):
         window_left = -1
 
         if self.attn.is_mla_enable:
-            from tensorrt_llm._torch.attention.backends.prims_ts import (
-                get_prims_ts_batch_mla_decode_workspace_size,
-            )
+            # Like MLA decode plans, scalar sizes fix the layer's mask, dtypes
+            # and statistics mode. Warmup can replace the page-table capacity.
+            if self._mla_decode_workspace_capacity != max_seq_len:
+                if self._mla_decode_workspace_capacity is not None:
+                    self._mla_decode_wrappers.clear()
+                self._mla_decode_workspace_capacity = max_seq_len
+                self._mla_decode_workspace_sizes.clear()
+            size_key = (batch_size, seq_len_q)
+            required_bytes = self._mla_decode_workspace_sizes.get(size_key)
+            if required_bytes is None:
+                from tensorrt_llm._torch.attention.backends.prims_ts import (
+                    get_prims_ts_batch_mla_decode_workspace_size,
+                )
 
-            kernel_dtype = (
-                torch.float8_e4m3fn
-                if QuantMode(self.attn.quant_mode).has_fp8_kv_cache()
-                else q.dtype
-            )
-            required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
-                batch_size,
-                self.attn.num_heads,
-                int(self.attn.kv_lora_rank),
-                int(self.attn.qk_rope_head_dim),
-                int(metadata.tokens_per_block),
-                max_seq_len,
-                max_seq_len_q=seq_len_q,
-                q_dtype=kernel_dtype,
-                kv_dtype=kernel_dtype,
-                out_dtype=forward_args.output.dtype,
-                mask_type=mask_type,
-                device=q.device,
-            )
+                kernel_dtype = (
+                    torch.float8_e4m3fn
+                    if QuantMode(self.attn.quant_mode).has_fp8_kv_cache()
+                    else q.dtype
+                )
+                required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
+                    batch_size,
+                    self.attn.num_heads,
+                    int(self.attn.kv_lora_rank),
+                    int(self.attn.qk_rope_head_dim),
+                    int(metadata.tokens_per_block),
+                    max_seq_len,
+                    max_seq_len_q=seq_len_q,
+                    q_dtype=kernel_dtype,
+                    kv_dtype=kernel_dtype,
+                    out_dtype=forward_args.output.dtype,
+                    mask_type=mask_type,
+                    store_softmax_stats=forward_args.softmax_stats_tensor is not None,
+                    device=q.device,
+                )
+                self._mla_decode_workspace_sizes[size_key] = required_bytes
         else:
             from tensorrt_llm._torch.attention.backends.prims_ts import (
                 get_prims_ts_batch_decode_workspace_size,
@@ -1088,6 +1257,141 @@ class PrimsTSFmha(PhasedFmha):
         return (
             kv_pool.narrow(0, 0, usable_pages),
             kv_pool.narrow(0, kv_page_offset, usable_pages),
+        )
+
+    def _mla_context_workspace_layout(
+        self, q: torch.Tensor, k: torch.Tensor, batch_size: int
+    ) -> tuple[dict[str, tuple[int, int, torch.dtype, tuple[int, ...]]], int]:
+        """Pack context scratch into the shared, memory-accounted FMHA allocation."""
+        fp8 = QuantMode(self.attn.quant_mode).has_fp8_kv_cache()
+        tensors = [
+            ("kv_indptr", (batch_size + 1,), torch.int32),
+            ("bmm1_scale", (2,), torch.float32),
+            ("bmm2_scale", (1,), torch.float32),
+            ("v", (k.shape[0], self.attn.num_heads * 128), torch.float8_e4m3fn if fp8 else q.dtype),
+        ]
+        if fp8:
+            tensors.extend(
+                (name, tuple(tensor.shape), torch.float8_e4m3fn)
+                for name, tensor in (("q", q), ("k", k))
+            )
+        layout = {}
+        offset = 0
+        for name, shape, dtype in tensors:
+            size = math.prod(shape) * dtype.itemsize
+            layout[name] = (offset, size, dtype, shape)
+            offset = pad_up(offset + size, _WORKSPACE_ALIGNMENT)
+        return layout, offset
+
+    def run_mla_context(self, params: FmhaParams) -> None:
+        """Run expanded MLA, including cached-prefix and chunk-merge calls."""
+        attn, meta, fwd = params.attn, params.meta, params.fwd
+        q, k, v = params.query_input, params.key_input, params.value_input
+        assert q is not None and k is not None and v is not None
+        assert params.output is not None
+        layout, _ = self._mla_context_workspace_layout(q, k, params.batch_size)
+        workspace = params.workspace.view(torch.uint8).view(-1)
+        buffers = {
+            name: workspace.narrow(0, offset, size).view(dtype).view(shape)
+            for name, (offset, size, dtype, shape) in layout.items()
+        }
+        qo_indptr = meta.mla_prepare_ctx_cu_seqlens()
+        assert qo_indptr is not None
+        kv_indptr = buffers["kv_indptr"]
+        kv_indptr[0].zero_()
+        # KV lengths change for each cached-prefill chunk, unlike the Q offsets.
+        torch.cumsum(
+            params.sequence_lengths[: params.batch_size], 0, dtype=torch.int32, out=kv_indptr[1:]
+        )
+        attn._ensure_rope_table_size(meta.max_seq_len)
+        fp8 = QuantMode(attn.quant_mode).has_fp8_kv_cache()
+        q_processed, k_processed = (buffers["q"], buffers["k"]) if fp8 else (q, k)
+        v_processed = buffers["v"]
+        sm_scale = self._get_bmm1_scale(attn)
+        torch.ops.trtllm.mla_context_preprocess(
+            q,
+            k,
+            v,
+            fwd.latent_cache,
+            qo_indptr,
+            params.sequence_lengths[: params.batch_size],
+            attn.rotary_cos_sin,
+            meta.kv_cache_block_offsets,
+            meta.host_kv_cache_pool_pointers,
+            meta.host_kv_cache_pool_mapping,
+            fwd.kv_scale_orig_quant,
+            fwd.kv_scale_quant_orig,
+            attn.num_heads,
+            params.input_seq_length,
+            attn.get_local_layer_idx(meta),
+            params.tokens_per_block,
+            params.cyclic_attention_window_size,
+            attn.quant_mode,
+            sm_scale,
+            q_processed,
+            k_processed,
+            v_processed,
+            buffers["bmm1_scale"],
+            buffers["bmm2_scale"],
+        )
+        mask = self._get_prims_mask_type(fwd)
+        stats = fwd.softmax_stats_tensor
+        # Dense cached chunks traverse the planned KV domain. Bucket current
+        # capacities instead of traversing max_seq_len for every small chunk.
+        q_capacity, kv_capacity = _mla_context_capacities(
+            params.input_seq_length,
+            params.max_past_kv_length,
+            head_dim=192,
+            head_dim_vo=128,
+            qk_dtype=q_processed.dtype,
+            pv_dtype=v_processed.dtype,
+            output_dtype=params.output.dtype,
+            packed=True,
+            uniform_packed_lengths=False,
+            mask_type=mask,
+            window_left=-1,
+        )
+        key = (params.batch_size, q_capacity, kv_capacity, mask, stats is not None)
+        wrapper = self._mla_context_wrappers.get(key)
+        if wrapper is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("PrimTS MLA context must be planned before CUDA graph capture.")
+            from tensorrt_llm._torch.attention.backends.prims_ts.context import (
+                BatchPrefillTSWrapper,
+            )
+
+            wrapper = BatchPrefillTSWrapper()
+            wrapper.plan(
+                device=q.device,
+                batch_size=params.batch_size,
+                max_seq_len_q=q_capacity,
+                max_kv_len=kv_capacity,
+                num_qo_heads=attn.num_heads,
+                num_kv_heads=attn.num_heads,
+                head_dim=192,
+                head_dim_vo=128,
+                q_dtype=q_processed.dtype,
+                k_dtype=k_processed.dtype,
+                v_dtype=v_processed.dtype,
+                out_dtype=params.output.dtype,
+                packed=True,
+                mask_type=mask,
+                sm_scale=sm_scale,
+                store_softmax_stats=stats is not None,
+            )
+            self._mla_context_wrappers[key] = wrapper
+        wrapper.run(
+            q_processed.view(-1, attn.num_heads, 192),
+            k_processed.view(-1, attn.num_heads, 192),
+            v_processed.view(-1, attn.num_heads, 128),
+            qo_indptr,
+            kv_indptr,
+            out=params.output,
+            softmax_stats=stats,
+            softmax_scale=buffers["bmm1_scale"][:1] if fp8 and stats is not None else None,
+            scale_softmax_log2=buffers["bmm1_scale"][1:] if fp8 else None,
+            output_scale=buffers["bmm2_scale"] if fp8 else None,
+            validate=False,
         )
 
     def run_context(self, params: FmhaParams) -> None:
@@ -1472,6 +1776,21 @@ class PrimsTSFmha(PhasedFmha):
             params.sequence_lengths,
             batch_size,
         )
+        kv_bounds = None
+        if meta.helix_position_offsets is not None:
+            if meta._helix_spec_tokens_valid:
+                # Helix token buffers are generation-relative, even when the
+                # batch's request metadata has a context prefix.
+                kv_bounds = meta.helix_kv_bounds[: batch_size * seq_len_q]
+            elif seq_len_q == 1:
+                # The ordinary Helix length is already rank-local and corrected
+                # on device. Reuse its view without allocating a graph buffer.
+                kv_bounds = seq_lens
+            else:
+                raise RuntimeError("Helix MLA multi-token generation requires per-token KV bounds.")
+        stats = params.fwd.softmax_stats_tensor
+        if stats is not None:
+            stats = stats.view(batch_size, seq_len_q, attn.num_heads, 2)
         caller_workspace = params.workspace.reshape(-1).view(torch.uint8)
         wrapper = self._get_or_plan_mla_decode_wrapper(
             caller_workspace,
@@ -1486,6 +1805,8 @@ class PrimsTSFmha(PhasedFmha):
             kv_dtype=kv_cache.dtype,
             output_dtype=output.dtype,
             mask_type=mask_type,
+            store_softmax_stats=stats is not None,
+            use_kv_bounds=kv_bounds is not None,
         )
         wrapper.run(
             query,
@@ -1495,6 +1816,8 @@ class PrimsTSFmha(PhasedFmha):
             out=output,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
+            softmax_stats=stats,
+            kv_bounds=kv_bounds,
             validate=False,
         )
 
