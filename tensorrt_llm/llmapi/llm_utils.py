@@ -13,6 +13,7 @@ from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
 from ..bindings.executor import (CapacitySchedulerPolicy, ContextChunkingPolicy,
                                  KvCacheRetentionConfig)
+from ..checkpoint_format import CheckpointFormat
 # yapf: enable
 from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
@@ -186,14 +187,22 @@ class ModelLoader:
 
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
-        if os.path.exists(hf_config_path):
+        hf_config = None
+        if self.llm_args.checkpoint_format == CheckpointFormat.MISTRAL_LARGE_4:
+            from .._torch.models.checkpoints.mistral.config_loader import \
+                MistralConfigLoader
+            hf_config = MistralConfigLoader().load_pretrained_config(
+                self._model_dir).to_dict()
+            hf_config_path = f"{self._model_dir}/params.json"
+        elif os.path.exists(hf_config_path):
             with open(hf_config_path, "r") as f:
                 hf_config = json.load(f)
-                hf_quant_config = hf_config.get("quantization_config", None)
-                if hf_quant_config is not None:
-                    logger.info(
-                        f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
-                    )
+        if hf_config is not None:
+            hf_quant_config = hf_config.get("quantization_config", None)
+            if hf_quant_config is not None:
+                logger.info(
+                    f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
+                )
         if self.llm_args.model_kwargs is not None and "quantization_config" in self.llm_args.model_kwargs:
             logger.info(
                 f"Update hf_quant_config from model_kwargs: quantization_config={self.llm_args.model_kwargs['quantization_config']} (previous value: {hf_quant_config})"

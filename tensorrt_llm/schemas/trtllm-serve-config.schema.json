@@ -2693,6 +2693,13 @@
           "title": "Spec Dec Variant",
           "type": "integer"
         },
+        "spec_dec_variant": {
+          "default": 3,
+          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {

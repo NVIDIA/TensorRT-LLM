@@ -1231,6 +1231,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
          "This is a parameter used by chat template in tokenizer config of the "
          "model."),
     )
+    continue_final_message: bool = Field(
+        default=False,
+        description="Continue the final assistant message without closing it. "
+        "Cannot be combined with add_generation_prompt.",
+    )
     add_special_tokens: bool = Field(
         default=False,
         description=(
@@ -1414,6 +1419,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
         return data
+
+    @model_validator(mode="after")
+    def check_continue_final_message(self):
+        if "continue_final_message" in self.model_fields_set:
+            if self.continue_final_message and self.add_generation_prompt:
+                raise ValueError(
+                    "Cannot set both add_generation_prompt and continue_final_message to True."
+                )
+            self.chat_template_kwargs = {
+                **(self.chat_template_kwargs or {}),
+                "continue_final_message":
+                self.continue_final_message,
+            }
+        return self
 
     @model_validator(mode="before")
     @classmethod

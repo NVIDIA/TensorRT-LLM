@@ -371,6 +371,10 @@ class AccuracyTask:
                                        self.HIGHER_IS_BETTER),
             threshold=entry.get("threshold"))
 
+    def evaluator_num_samples(self, num_samples: int) -> int:
+        """The evaluator's num_samples for a total sample count."""
+        return num_samples
+
     def create_evaluator(
             self,
             num_samples: int,
@@ -379,7 +383,8 @@ class AccuracyTask:
 
         Creating it up front loads the dataset and evaluation harness while
         the GPUs are still idle; pass the result to `evaluate` as
-        `prepared_evaluator`.
+        `prepared_evaluator`. `num_samples` is the total sample count; the
+        evaluator receives `evaluator_num_samples(num_samples)`.
         """
         assert self.EVALUATOR_CLS is not None
 
@@ -388,7 +393,9 @@ class AccuracyTask:
             evaluator_kwargs.update(self.EVALUATOR_KWARGS)
         if extra_evaluator_kwargs is not None:
             evaluator_kwargs.update(extra_evaluator_kwargs)
-        return self.EVALUATOR_CLS(num_samples=num_samples, **evaluator_kwargs)
+        return self.EVALUATOR_CLS(
+            num_samples=self.evaluator_num_samples(num_samples),
+            **evaluator_kwargs)
 
     def evaluate(self,
                  llm: PyTorchLLM,
@@ -440,19 +447,20 @@ class AccuracyTask:
             if sampling_params.truncate_prompt_tokens is None:
                 sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
 
+        evaluator_num_samples = self.evaluator_num_samples(
+            hypothesis_testing_params.num_samples)
         if prepared_evaluator is None:
             prepared_evaluator = self.create_evaluator(
                 hypothesis_testing_params.num_samples, extra_evaluator_kwargs)
         elif (hasattr(prepared_evaluator, "num_samples")
-              and prepared_evaluator.num_samples
-              != hypothesis_testing_params.num_samples):
+              and prepared_evaluator.num_samples != evaluator_num_samples):
             # E.g. a full-size evaluator in INTEGRATION_TEST mode would run every
             # sample while the hypothesis test assumes one. Evaluators that do
             # not expose num_samples cannot be checked here.
             raise ValueError(
                 f"prepared_evaluator has num_samples="
                 f"{prepared_evaluator.num_samples}, but this evaluation uses "
-                f"{hypothesis_testing_params.num_samples}")
+                f"{evaluator_num_samples}")
         evaluate_kwargs = {}
         if hasattr(self, 'EVALUATE_KWARGS'):
             evaluate_kwargs.update(self.EVALUATE_KWARGS)
@@ -692,6 +700,17 @@ class MMMU(AccuracyTask):
                             apply_chat_template=True)
 
     EVALUATE_KWARGS = dict(model_type=None, is_force_single_image=False)
+
+    # mmmu_val groups 30 subjects and lm-eval applies the evaluator's
+    # num_samples to each of them; references count questions in total.
+    NUM_SUBJECTS = 30
+
+    def evaluator_num_samples(self, num_samples: int) -> int:
+        # INTEGRATION_TEST asks for one sample: one question per subject.
+        assert num_samples == 1 or num_samples % self.NUM_SUBJECTS == 0, (
+            f"MMMU num_samples={num_samples} must split evenly across "
+            f"{self.NUM_SUBJECTS} subjects")
+        return max(num_samples // self.NUM_SUBJECTS, 1)
 
 
 class PassKeyRetrieval64k(AccuracyTask):

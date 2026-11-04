@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import json
+import os
 from collections.abc import Mapping as AbcMapping
 from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Union
 
@@ -1046,17 +1048,45 @@ def build_minimax_dspark_draft_config(
     return config
 
 
+def _require_native_format_for_mistral_large_4(model_name_or_path: str) -> None:
+    """Name the format a Mistral-Large-4 checkpoint needs.
+
+    It ships Mistral-native files only (params.json, tekken.json, consolidated
+    safetensors), which checkpoint_format="mistral_large_4" reads.
+    """
+    params_path = os.path.join(str(model_name_or_path), "params.json")
+    if not os.path.isfile(params_path):
+        return
+    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+        _is_mistral_large4
+    try:
+        with open(params_path) as f:
+            params = json.load(f)
+    except (OSError, ValueError):
+        return  # Not a Mistral-native checkpoint the default format could be confused with.
+    if isinstance(params, dict) and _is_mistral_large4(params):
+        raise ValueError(
+            f"{model_name_or_path} is a Mistral-Large-4 checkpoint in the "
+            "Mistral-native format; load it with "
+            "checkpoint_format='mistral_large_4'")
+
+
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: CheckpointFormat | str
                            | None = None,
                            **kwargs) -> transformers.PretrainedConfig:
     if checkpoint_format in (CheckpointFormat.MISTRAL,
-                             CheckpointFormat.MISTRAL_LARGE_3):
+                             CheckpointFormat.MISTRAL_LARGE_3,
+                             CheckpointFormat.MISTRAL_LARGE_4):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
-        return MistralConfigLoader().load(model_name_or_path).pretrained_config
+        loader = MistralConfigLoader()
+        if checkpoint_format == CheckpointFormat.MISTRAL_LARGE_4:
+            return loader.load_pretrained_config(model_name_or_path)
+        return loader.load(model_name_or_path).pretrained_config
 
+    _require_native_format_for_mistral_large_4(model_name_or_path)
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
@@ -1064,13 +1094,7 @@ def load_pretrained_config(model_name_or_path: str,
     model_kwargs = kwargs.get("model_kwargs") or {}
     requested_architectures = model_kwargs.get("architectures") or architectures
 
-    if checkpoint_format in (CheckpointFormat.MISTRAL,
-                             CheckpointFormat.MISTRAL_LARGE_3):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-            MistralConfigLoader
-        model_config = MistralConfigLoader().load(
-            model_name_or_path).pretrained_config
-    elif is_speculators_dspark_config(config_dict):
+    if is_speculators_dspark_config(config_dict):
         # A DSpark drafter in the vLLM speculators format: no top-level
         # model_type, and its auto_map needs the speculators package. Build
         # the backbone's config from the translation the spec config uses.

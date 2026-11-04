@@ -1351,15 +1351,24 @@ class DSparkWorker(DFlashWorker):
         gen_logits: torch.Tensor,
         inputs: dict,
         spec_metadata,
+        draft_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Add the greedy-chained Markov intra-block bias to the block logits.
 
         A DSpark drafter checkpoint may omit the Markov head (``markov_rank``
         0), which loads as a drafter without one; that case falls through to
-        the unmodified backbone logits.
+        the unmodified backbone logits. A drafter with a recurrent Markov head
+        (``has_recurrent_markov_head``) chains its own bias over the full-vocab
+        block logits, conditioned on ``draft_hidden_states``.
         """
         if not getattr(draft_model, "has_markov_head", False):
             return gen_logits
+        if getattr(draft_model, "has_recurrent_markov_head", False):
+            # The recurrent head's state reads each position's draft hidden
+            # state as well, so it is not the shared vanilla chain.
+            return draft_model.apply_markov_chain_logits(
+                gen_logits, inputs["first_prev_tokens"], hidden_states=draft_hidden_states
+            )
         return self._apply_dspark_markov_bias(draft_model, gen_logits, inputs["first_prev_tokens"])
 
     def _apply_dspark_markov_bias(

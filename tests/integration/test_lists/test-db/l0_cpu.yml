@@ -73,6 +73,9 @@ l0_cpu:
   - unittest/others/test_sparse_offload_accuracy.py
   # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
   - unittest/others/test_perf_sanity_port_reservation.py
+  - unittest/test_ruler_accuracy.py
+  - unittest/test_mmmu_accuracy.py
+  - unittest/test_multimodal_accuracy.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
   # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a
@@ -155,6 +158,11 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
+  # mistral_large4 targets' cpu_only tests (weight manifests, engine configs, tiny-config
+  # slicing and loading). Run with -m cpu_only, this entry collects only the marked files; the
+  # rest of unittest/_torch/modeling_v2 needs a GPU. Cases that read the checkpoint skip when it
+  # is not under LLM_MODELS_ROOT.
+  - unittest/_torch/modeling_v2/models/mistral_large4
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -418,6 +426,7 @@ l0_cpu:
   - unittest/llmapi/test_startup_checks.py
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_tokenizer_decode.py
+  - unittest/llmapi/test_tokenizer_factory_mistral.py
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_visual_gen_startup_shutdown.py
