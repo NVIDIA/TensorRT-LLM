@@ -30,16 +30,18 @@ class DeepseekV41ServingExtension(ServingExtension):
     """Tool namespaces in the form the DeepSeek-V4.1 checkpoint takes them."""
 
     def serialize_tool(self, tool) -> Dict[str, Any]:
-        """Dump a namespaced tool with its namespace, any other tool as usual.
+        """Dump a tool with only the fields the client set, a namespaced one with its namespace.
 
-        The checkpoint's encoder reads a ``namespace`` (name and description)
-        beside ``function``. It shows the tool as ``<namespace>::<name>``, the
-        name the model was trained to call it by, and puts the namespace
-        description in front of the tool's own. A tool without a namespace is
-        dumped exactly as on the generic path. Like that path, the namespaced
-        form leaves out a description the tool or its namespace did not declare.
+        The checkpoint's encoder prints each tool as JSON and reads no field by
+        name, so unlike the generic dump, which is made for chat templates, a
+        tool declared without ``parameters`` is dumped without the key. The
+        encoder reads a ``namespace`` (name and description) beside
+        ``function``. It shows the tool as ``<namespace>::<name>``, the name
+        the model was trained to call it by, and puts the namespace description
+        in front of the tool's own. The namespaced form also leaves out a
+        description the tool or its namespace did not declare.
         """
-        dumped = super().serialize_tool(tool)
+        dumped = tool.model_dump(exclude_none=True)
         if not isinstance(tool, NamespacedFunctionToolParam):
             return dumped
         if "::" in tool.namespace or "::" in tool.declared_name:

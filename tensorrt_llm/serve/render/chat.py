@@ -425,7 +425,7 @@ def render_chat(
 
 
 class _LengthExtension(ServingExtension):
-    """No extension hooks, but the model's tool serialization (deepseek_v41 shows namespaces)."""
+    """No extension hooks, but the model's tool serialization (kimi_k3 drops null defaults)."""
 
     def __init__(self, model_extension: ServingExtension):
         self._model_extension = model_extension

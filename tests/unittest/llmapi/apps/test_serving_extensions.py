@@ -794,7 +794,6 @@ class TestExtensionHooks:
     @pytest.mark.parametrize(
         "function",
         [
-            pytest.param({"name": "noop"}, id="name_only"),
             pytest.param(
                 {"name": "read", "description": "Read a file.", "parameters": _READ_PARAMETERS},
                 id="no_strict",
@@ -831,13 +830,41 @@ class TestExtensionHooks:
     def test_a_null_optional_field_is_left_out_like_an_unset_one(self, model_type) -> None:
         sent = {
             "type": "function",
-            "function": {"name": "read", "description": None, "parameters": None, "strict": None},
+            "function": {
+                "name": "read",
+                "description": None,
+                "parameters": _READ_PARAMETERS,
+                "strict": None,
+            },
         }
         extension = serving_extensions.get_serving_extension(model_type)
 
         assert extension.serialize_tool(_chat_request(tools=[sent]).tools[0]) == {
             "type": "function",
-            "function": {"name": "read"},
+            "function": {"name": "read", "parameters": _READ_PARAMETERS},
+        }
+
+    @pytest.mark.parametrize(
+        "model_type, dumped_parameters",
+        [
+            # Chat templates read ``tool.function.parameters`` by name and fail when it is missing.
+            pytest.param(None, {"parameters": None}, id="generic"),
+            pytest.param("nemotron_h", {"parameters": None}, id="nemotron_h"),
+            # These checkpoints' own renderers print each tool as JSON, as the client declared it.
+            pytest.param("deepseek_v41", {}, id="deepseek_v41"),
+            pytest.param("kimi_k3", {}, id="kimi_k3"),
+        ],
+    )
+    @pytest.mark.parametrize("sent", [{}, {"parameters": None}], ids=["unset", "null"])
+    def test_a_tool_without_parameters_is_dumped_for_its_renderer(
+        self, model_type, dumped_parameters, sent
+    ) -> None:
+        tool = {"type": "function", "function": {"name": "noop", **sent}}
+        extension = serving_extensions.get_serving_extension(model_type)
+
+        assert extension.serialize_tool(_chat_request(tools=[tool]).tools[0]) == {
+            "type": "function",
+            "function": {"name": "noop", **dumped_parameters},
         }
 
     def test_load_builtin_extensions_keeps_its_private_alias(self) -> None:

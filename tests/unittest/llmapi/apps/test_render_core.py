@@ -21,6 +21,7 @@ import copy
 import dataclasses
 import gc
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -64,6 +65,15 @@ from .render_helpers import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+# Shipped for ``trtllm-serve --chat_template``; it reads each tool's fields by name.
+_DEEPSEEK_V31_TOOL_TEMPLATE = (
+    Path(__file__).parents[4]
+    / "examples"
+    / "serve"
+    / "chat_templates"
+    / "tool_chat_template_deepseekv31.jinja"
+)
 
 
 @pytest.fixture(scope="module")
@@ -109,6 +119,20 @@ class TestRenderChat:
         assert ('"strict"' in result.text) is (strict is not None)
         assert result.text == text
         assert result.token_ids == ids
+
+    def test_a_tool_without_parameters_renders_with_a_template_that_reads_them(
+        self, tokenizer
+    ) -> None:
+        """The template prints ``tool.function.parameters | tojson``: it gets ``null``."""
+        tool = {
+            "type": "function",
+            "function": {"name": "get_time", "description": "Current UTC time"},
+        }
+        res = resources(tokenizer, default_chat_template=_DEEPSEEK_V31_TOOL_TEMPLATE.read_text())
+
+        result = render_chat(chat_request(tools=[tool]), res, tokenize=False)
+
+        assert "\n### get_time\nDescription: Current UTC time\n\nParameters: null\n" in result.text
 
     def test_tokenize_false_leaves_only_the_text(self, tokenizer) -> None:
         result = render_chat(chat_request(), resources(tokenizer), tokenize=False)
