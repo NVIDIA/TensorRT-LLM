@@ -43,6 +43,8 @@ _DTYPE_ATTRS = {
 _PIN_MIN_BYTES = 64 * 1024
 # One pread call reads at most this much.
 _READ_BYTES = 64 * 1024 * 1024
+# The SafeTensors reference reader rejects larger headers.
+_MAX_HEADER_BYTES = 100 * 1000 * 1000
 
 
 class PinnedSafetensorsFile:
@@ -57,10 +59,8 @@ class PinnedSafetensorsFile:
         self._fd = os.open(self._path, os.O_RDONLY)
         try:
             (header_len,) = struct.unpack("<Q", self._pread(8, 0))
-            if header_len > os.fstat(self._fd).st_size - 8:
-                raise ValueError(
-                    f"{self._path}: SafeTensors header length {header_len} exceeds the file"
-                )
+            if header_len > min(_MAX_HEADER_BYTES, os.fstat(self._fd).st_size - 8):
+                raise ValueError(f"{self._path}: invalid SafeTensors header length {header_len}")
             header = json.loads(self._pread(header_len, 8))
             data_start = 8 + header_len
             for key, info in header.items():
@@ -102,7 +102,10 @@ class PinnedSafetensorsFile:
         return buf.view(dtype).reshape(shape)
 
     def _pread(self, n: int, offset: int) -> bytes:
-        data = os.pread(self._fd, n, offset)
-        if len(data) != n:
-            raise OSError(f"{self._path}: truncated SafeTensors header")
+        data = b""
+        while len(data) < n:
+            chunk = os.pread(self._fd, n - len(data), offset + len(data))
+            if not chunk:
+                raise OSError(f"{self._path}: truncated SafeTensors header")
+            data += chunk
         return data

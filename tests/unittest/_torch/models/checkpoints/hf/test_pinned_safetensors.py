@@ -134,11 +134,25 @@ def test_failed_open_does_not_leak_the_file_descriptor(tmp_path, header):
 
 
 @pytest.mark.cpu_only
-def test_header_length_beyond_the_file_is_rejected(tmp_path):
+@pytest.mark.parametrize("file_size", [10, 1 << 31], ids=["beyond_file", "above_cap_sparse"])
+def test_oversized_header_length_is_rejected(tmp_path, file_size):
     path = tmp_path / "bad.safetensors"
-    path.write_bytes(struct.pack("<Q", 1 << 40) + b"{}")
-    with pytest.raises(ValueError, match="exceeds the file"):
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", 1 << 30) + b"{}")
+        f.truncate(file_size)  # sparse: the declared header fits in the file but exceeds the cap
+    with pytest.raises(ValueError, match="invalid SafeTensors header length"):
         PinnedSafetensorsFile(str(path)).__enter__()
+
+
+@pytest.mark.cpu_only
+def test_partial_header_reads_are_resumed(tmp_path, monkeypatch):
+    path = str(tmp_path / "shard.safetensors")
+    ints = torch.arange(16, dtype=torch.int32)
+    _write_shard(path, {"a": ("I32", ints)})
+    real_pread = os.pread
+    monkeypatch.setattr(os, "pread", lambda fd, n, offset: real_pread(fd, min(n, 3), offset))
+    with PinnedSafetensorsFile(path) as shard:
+        assert torch.equal(shard.get_tensor("a"), ints)
 
 
 @pytest.mark.skipif(not prefer_pinned(), reason="pinned host memory needs CUDA")
