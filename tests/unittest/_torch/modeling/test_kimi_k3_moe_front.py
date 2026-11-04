@@ -67,6 +67,16 @@ class _RoutedExperts:
 
 def _runtime(log):
     runtime = KimiK3MoERuntime.__new__(KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
     runtime._column_parallel_tail_supported = False
     runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)

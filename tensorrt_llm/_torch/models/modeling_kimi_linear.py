@@ -1298,13 +1298,6 @@ class _Fp8BlockScaleWeightReadLinear(
     kernel pushes its output).
     """
 
-    # See ``set_output_rows`` (stand-ins built without ``__init__`` have none).
-    _output_rows: Optional[Tuple[int, int]] = None
-    _output_rows_operands: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    # Largest row count :meth:`forward` pushes into ``output_all_reduce`` from the low-M GEMM
-    # (``all_reduce_push_max_m_for``, at least the GEMM's range; 0: never); set at post-load.
-    _push_max_m: int = 0
-
     def __init__(
         self,
         weight_fp8: torch.Tensor,
@@ -1329,6 +1322,8 @@ class _Fp8BlockScaleWeightReadLinear(
         self._low_m_weight_scale: Optional[torch.Tensor] = None
         # Largest row count :meth:`forward_nvfp4` serves (0: never); set at post-load.
         self._nvfp4_out_max_m = 0
+        # Largest row count :meth:`forward` pushes into ``output_all_reduce`` from the low-M
+        # GEMM (``all_reduce_push_max_m_for``, at least the GEMM's range; 0: never).
         self._push_max_m = 0
         self._output_all_reduce = output_all_reduce
         self._in_place_max_rows = in_place_max_rows
@@ -2044,28 +2039,6 @@ def _is_helix_a2a(model_config: ModelConfig) -> bool:
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
-    # SMs the shared expert's GEMMs keep to beside the routed experts (0: all; set in __init__).
-    _shared_sms: int = 0
-    # ``(first row, rows)`` of latent_up's output this rank computes in the column-parallel tail
-    # (None: no column-parallel tail; set in __init__).
-    latent_up_rows: Optional[Tuple[int, int]] = None
-    # The routed latent all-reduce on its own MNNVL workspace (``_latent_all_reduce_workspace``) for
-    # the sizes it runs one-shot (``_latent_all_reduce``); None: the routed experts' all-reduce.
-    _own_latent_all_reduce: Optional[AllReduce] = None
-    # The sharded decode front (``kimi_k3_moe_front``): the routed all-reduce group's workspace
-    # and this layer's operands on this rank, built after loading where the front applies.
-    _moe_front_ws = None
-    _moe_front_plan = None
-    # enable_min_latency on the column-parallel tail: latent_up's UE8M0 block exponents for the
-    # one-kernel MoE tail (``kimi_k3_moe_tail``), the shared expert's weights in the persistent
-    # kernel's order, its workspace and TP size (``kimi_k3_shared_expert``); None where they do
-    # not apply.
-    _min_latency: bool = False
-    _moe_tail_wexp: Optional[torch.Tensor] = None
-    _shared_frags: Optional[torch.Tensor] = None
-    _shared_ws = None
-    _shared_world: int = 0
-
     def __init__(
         self,
         model_config: ModelConfig,
@@ -2090,8 +2063,27 @@ class KimiK3MoERuntime(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
-        # Lossy decode kernels at <= 8 rows (``_prepare_min_latency_tail``).
+        # SMs the shared expert's GEMMs keep to beside the routed experts (0: all).
+        self._shared_sms = 0
+        # ``(first row, rows)`` of latent_up's output this rank computes in the column-parallel
+        # tail (None: no column-parallel tail).
+        self.latent_up_rows: Optional[Tuple[int, int]] = None
+        # The routed latent all-reduce on its own MNNVL workspace (``_latent_all_reduce_workspace``)
+        # for the sizes it runs one-shot (``_latent_all_reduce``); None: the routed experts'.
+        self._own_latent_all_reduce: Optional[AllReduce] = None
+        # The sharded decode front (``kimi_k3_moe_front``): the routed all-reduce group's
+        # workspace and this layer's operands on this rank, built after loading where it applies.
+        self._moe_front_ws = None
+        self._moe_front_plan = None
+        # Lossy decode kernels at <= 8 rows (``_prepare_min_latency_tail``): latent_up's UE8M0
+        # block exponents for the one-kernel MoE tail (``kimi_k3_moe_tail``), the shared expert's
+        # weights in the persistent kernel's order, its workspace and TP size
+        # (``kimi_k3_shared_expert``); None where they do not apply.
         self._min_latency = model_config.enable_min_latency
+        self._moe_tail_wexp: Optional[torch.Tensor] = None
+        self._shared_frags: Optional[torch.Tensor] = None
+        self._shared_ws = None
+        self._shared_world = 0
         # Row-independent conditions of the column-parallel tail and of latent_up's MXFP8 input;
         # set in cache_derived_state.
         self._column_parallel_tail_supported = False

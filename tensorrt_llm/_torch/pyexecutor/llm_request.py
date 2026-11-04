@@ -695,8 +695,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
     but detour some features to Python implementation"""
 
-    py_uncached_prefill_probed: bool = False
-
     def __init__(
             self,
             *args,

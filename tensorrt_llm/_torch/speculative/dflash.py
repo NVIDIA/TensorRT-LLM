@@ -756,14 +756,6 @@ class DFlashWorker(SpecWorkerBase):
     Reference: https://arxiv.org/pdf/2602.06036
     """
 
-    # Pages of the drafter's context this helix CP rank holds when a helix
-    # target manager hosts them; None when every rank holds the whole context.
-    _ctx_helix: Optional[HelixDraftShard] = None
-    # The paged context latent store's side stream, and the operands of its
-    # last launch (kept alive until the next step, after the drafter joined it).
-    _ctx_store_stream: Optional[torch.cuda.Stream] = None
-    _ctx_store_operands: tuple = ()
-
     def __init__(
         self,
         spec_config: "DFlashDecodingConfig",
@@ -773,6 +765,13 @@ class DFlashWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        # Pages of the drafter's context this helix CP rank holds when a helix
+        # target manager hosts them; None when every rank holds the whole context.
+        self._ctx_helix: Optional[HelixDraftShard] = None
+        # The paged context latent store's side stream, and the operands of its
+        # last launch (kept alive until the next step, after the drafter joined it).
+        self._ctx_store_stream: Optional[torch.cuda.Stream] = None
+        self._ctx_store_operands: tuple = ()
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
         self._compute_block_size = None

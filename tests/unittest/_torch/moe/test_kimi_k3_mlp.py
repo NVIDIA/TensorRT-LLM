@@ -487,6 +487,16 @@ def test_kimi_k3_shared_allreduce_ordering(
             return self.down_proj.all_reduce(partial)
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
     runtime._column_parallel_tail_supported = False
     runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
@@ -613,6 +623,16 @@ def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
             return value
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
     runtime._column_parallel_tail_supported = False
     runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
@@ -729,6 +749,16 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
         return value
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
     runtime._column_parallel_tail_supported = False
     runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
@@ -1051,6 +1081,16 @@ def test_kimi_k3_router_down_fusion_gate(
             self.bias = None
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
     runtime._column_parallel_tail_supported = False
     runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)

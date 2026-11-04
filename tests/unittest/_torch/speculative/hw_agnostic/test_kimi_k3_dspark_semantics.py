@@ -2115,6 +2115,9 @@ def test_fp8_paged_context_store_writes_saturated_fp8():
 
     page, num_pages, layers, num_tokens = 32, 6, 2, 11
     worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker._ctx_page_size = page
     worker._ctx_block_tables = torch.tensor([[4, 1, 5], [0, 2, 3]], device="cuda")
     worker._ctx_kv_buf = [
@@ -2359,6 +2362,9 @@ def test_helix_context_store_writes_only_owned_positions():
 
     page, layers = 4, 2
     worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker._ctx_page_size = page
     # Rank 1 of 2 owns global pages 1, 3, ... as its local pages 0, 1, ...
     worker._ctx_helix = HelixDraftShard(2, 1, page)
@@ -2390,6 +2396,9 @@ def test_helix_context_store_owned_position_wins_a_shared_slot():
 
     page = 4
     worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker._ctx_page_size = page
     # Rank 1 of 2: global page 0 (rank 0's) and page 1 (its own) both map to local page 0.
     worker._ctx_helix = HelixDraftShard(2, 1, page)

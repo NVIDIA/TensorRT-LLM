@@ -376,6 +376,9 @@ def test_select_candidate_path_restricts_logits_to_the_walk():
 
 def _worker(mapping=None):
     worker = DFlashWorker.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker.mapping = mapping
     worker._d2t = None
     return worker

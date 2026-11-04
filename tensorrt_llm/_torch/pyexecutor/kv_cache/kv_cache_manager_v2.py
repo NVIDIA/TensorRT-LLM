@@ -18,6 +18,7 @@ import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -1833,9 +1834,12 @@ class KVCacheManagerV2(BaseResourceManager):
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
     # Local layer id -> storage of the draft-owned layers a subclass appends
-    # after the layers it describes itself (MambaHybridCacheManagerV2).
-    # Empty when ``layer_specs`` describes every layer.
-    _appended_draft_layer_specs: dict[int, KVCacheLayerSpec] = {}
+    # after the layers it describes itself (MambaHybridCacheManagerV2, which
+    # sets its own before this __init__ reads it). Empty when ``layer_specs``
+    # describes every layer; read-only, so no instance shares a mutable default.
+    _appended_draft_layer_specs: (
+        dict[int, KVCacheLayerSpec] | MappingProxyType[int, KVCacheLayerSpec]
+    ) = MappingProxyType({})
 
     @property
     def _kv_alloc_extra_tokens(self) -> int:

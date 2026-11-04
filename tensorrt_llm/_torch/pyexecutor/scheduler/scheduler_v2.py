@@ -171,9 +171,6 @@ class KVCacheV2Scheduler(RequestScheduler):
     assignment into one unified loop.
     """
 
-    # First-chunk requests ordered as short on the router's estimate alone this iteration.
-    _ctx_unverified_short: set[int] | frozenset[int] = frozenset()
-
     def __init__(
         self,
         max_batch_size: int,
@@ -311,7 +308,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
         )
         self._ctx_demote_skips: dict[int, int] = {}
-        self._ctx_unverified_short = set()
+        # First-chunk requests ordered as short on the router's estimate alone this iteration.
+        self._ctx_unverified_short: set[int] = set()
         if self._ctx_demote_uncached_tokens:
             logger.info(
                 f"KVCacheV2Scheduler: demoting context requests with more than "

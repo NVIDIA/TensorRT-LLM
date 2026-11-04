@@ -52,6 +52,9 @@ def _draft_manager(*, layer_groups, layer_scales):
 
 def _worker(*, unified):
     worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker._ctx_layer_ids = (0, 1)
     worker._ctx_unified_cache = unified
     worker._ctx_kv_factor = 2
