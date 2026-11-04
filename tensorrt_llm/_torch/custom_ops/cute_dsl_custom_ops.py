@@ -3536,7 +3536,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
-            weight_evict_first = (not self.use_expert_counts
+            # A kernel class a subclass swaps in need not take the L2 hint.
+            weight_evict_first = (issubclass(
+                self.__class__.kernel_class,
+                Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
+                                  and not self.use_expert_counts
                                   and _moe_weight_evict_first(
                                       num_tokens, self.top_k, self.num_experts,
                                       self.num_local_experts, self.tile_size))
@@ -3552,7 +3556,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raster_along_m=raster_along_m,
                     use_expert_counts=self.use_expert_counts,
                     num_local_experts=self.num_local_experts,
-                    weight_evict_first=weight_evict_first,
+                    **({
+                        "weight_evict_first": True
+                    } if weight_evict_first else {}),
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
