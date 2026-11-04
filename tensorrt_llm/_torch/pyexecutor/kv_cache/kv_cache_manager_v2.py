@@ -2414,7 +2414,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         def create_cold_page_codec(cache_config: object) -> Optional[object]:
-            # The estimation run builds the high layer group but never migrates a page.
+            # The estimation run never migrates a page, so it builds no codec.
             if cold_page_codec_provider is None or self.is_estimating_kv_cache:
                 return None
             if (
@@ -4154,20 +4154,10 @@ class KVCacheManagerV2(BaseResourceManager):
         for local in range(self.num_local_layers):
             if not self._is_mixed_precision_layer(local):
                 continue
-            page_bytes = get_size_in_bytes(
-                self._mixed_precision_rows_per_page(local)
-                * self.num_kv_heads_per_layer[local]
-                * self.head_dim_per_layer[local],
-                self.mixed_precision_high_dtype,
-            )
-            buffers = [BufferConfig(role=role, size=page_bytes) for role in roles]
-            main_buffers = {buffer.role: buffer for buffer in layer_by_id[local].buffers}
-            if all(
-                role in main_buffers and main_buffers[role].size == page_bytes for role in roles
-            ):
-                # Same page size as the layer: mirror its other buffers (e.g. the DSA indexer
-                # cache) so the core keeps both in one pool, which sparse attention addresses by row.
-                buffers.extend(
+            if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
+                # Cold-page window: the high layer's page is a copy of its layer's page, so the
+                # core keeps both in one pool and sparse attention addresses its rows directly.
+                buffers = [
                     BufferConfig(
                         role=buffer.role,
                         size=buffer.size,
@@ -4177,8 +4167,15 @@ class KVCacheManagerV2(BaseResourceManager):
                         sparse_unit_chunks=buffer.sparse_unit_chunks,
                     )
                     for buffer in layer_by_id[local].buffers
-                    if buffer.role not in roles
+                ]
+            else:
+                page_bytes = get_size_in_bytes(
+                    self._mixed_precision_rows_per_page(local)
+                    * self.num_kv_heads_per_layer[local]
+                    * self.head_dim_per_layer[local],
+                    self.mixed_precision_high_dtype,
                 )
+                buffers = [BufferConfig(role=role, size=page_bytes) for role in roles]
             self.mixed_precision_high_layers[local] = len(layers)
             layers.append(
                 AttentionLayerConfig(

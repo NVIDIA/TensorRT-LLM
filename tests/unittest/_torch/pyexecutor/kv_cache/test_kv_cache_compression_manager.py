@@ -404,7 +404,6 @@ class TestKvCacheCreatorLifecycle:
             config,
             model_engine=creator._model_engine,
             kv_cache_config=creator._kv_cache_config,
-            estimating_kv_cache=True,
         )
         assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target_manager
         assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is expected_manager
@@ -525,7 +524,6 @@ def test_build_routes_compression_manager_by_capabilities(
         compression_config,
         model_engine=creator._model_engine,
         kv_cache_config=target_config,
-        estimating_kv_cache=False,
     )
     assert (
         creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
