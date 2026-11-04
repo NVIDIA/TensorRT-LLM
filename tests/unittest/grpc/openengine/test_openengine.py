@@ -498,6 +498,70 @@ def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
     asyncio.run(exercise_server())
 
 
+def test_dead_engine_reported_by_llm_engine_dead_fails_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead engine reported only through BaseLLM.engine_dead fails inference and liveness.
+
+    The LLM and the executor proxy are the real classes: the server polls the
+    real check_health() chain and reads the proxy's worker-death flag through
+    BaseLLM.engine_dead, with no fatal error recorded.
+    """
+    from queue import Queue
+
+    import tensorrt_llm.grpc.openengine.server as oe_server
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+    from tensorrt_llm.llmapi.llm import LLM
+
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    # The proxy fields check_health(), engine_dead and shutdown() read, with no workers.
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy._request_sender = None
+    proxy.doing_shutdown = False
+    proxy._error_queue = Queue()
+    proxy._worker_process_monitor = SimpleNamespace(find_dead_worker=lambda: None)
+    proxy._fatal_error = None
+    proxy._engine_dead = False
+    # The LLM fields BaseLLM.__init__ sets that the server reads.
+    llm = object.__new__(LLM)
+    llm.args = SimpleNamespace(guided_decoding_backend=None)
+    llm._llm_id = "test-instance"
+    llm._tokenizer = None
+    llm._encode_only = False
+    llm._executor = proxy
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                inference = health_pb2.HealthCheckRequest(service="inference")
+                live_stream = health.Watch(health_pb2.HealthCheckRequest(service="liveness"))
+                try:
+                    assert (
+                        await health.Check(inference, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    assert (
+                        await asyncio.wait_for(live_stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    # A worker died: the sticky flag is set, no fatal error is recorded.
+                    proxy._engine_dead = True
+                    assert (
+                        await asyncio.wait_for(live_stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(inference, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                finally:
+                    live_stream.cancel()
+        finally:
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
 def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed poll clears readiness and a later successful poll restores it."""
     import tensorrt_llm.grpc.openengine.server as oe_server
