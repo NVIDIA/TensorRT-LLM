@@ -270,6 +270,7 @@ def _build_tiny_model(backend: str, device: torch.device, seed: int = 0):
     return model, model_config, config
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "TestSparkModel requires CUDA")
 class TestSparkModel(unittest.TestCase):
     def _assert_most_elems_close(self, actual, ref, atol, rtol, max_failed_fraction):
         matches = torch.isclose(actual.float(), ref.float(), atol=atol, rtol=rtol)
@@ -799,6 +800,7 @@ class AlignScenario:
         return f"backend:{self.backend.lower()}_dtype:{str(self.dtype).split('.')[-1]}"
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "TestSparkHfAlignment requires CUDA")
 class TestSparkHfAlignment(unittest.TestCase):
     """Logits parity against the checkpoint's HF reference implementation on a
     tiny config with identical synthetic weights.
