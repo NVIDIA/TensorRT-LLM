@@ -563,6 +563,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         spec_config = kwargs.get("spec_config")
         # Appended draft layers grow with every token like the target's pages.
         draft_layer_specs = kwargs.pop("layer_specs", None) or ()
+        # The drafter's block width only adds tokens a request holds past its history;
+        # like the target's speculative tokens those cost the per-token slope through
+        # the scheduler's token budget, not a per-request intercept.
         kwargs.pop("shared_draft_block_width", None)
         draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
         num_reserved_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(

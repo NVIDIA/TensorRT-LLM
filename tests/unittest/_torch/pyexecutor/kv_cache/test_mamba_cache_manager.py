@@ -2480,6 +2480,45 @@ def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
     ) == (11, expected_intercept)
 
 
+def test_v2_hybrid_estimator_prices_appended_draft_layers_per_token(monkeypatch):
+    """Appended draft layers add their bytes per token to the slope; the drafter's block
+    width adds no intercept, since its tokens are priced per token like the target's."""
+    monkeypatch.setattr(
+        KVCacheManager,
+        "get_cache_size_per_token",
+        lambda *args, **kwargs: 11,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common._get_local_mamba_cache_layout",
+        lambda *args, **kwargs: (
+            SimpleNamespace(get_states_bytes_per_layer=lambda mapping: 64),
+            1,
+            1,
+        ),
+    )
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+    draft = KVCacheLayerSpec(
+        global_layer_id=3,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.FP8,
+        num_kv_heads=1,
+        head_dim=576,
+        buffer_roles=(Role.KEY,),
+    )
+
+    def estimate(**kwargs):
+        return MambaHybridCacheManagerV2.get_cache_size_per_token(
+            object(), mapping, max_batch_size=4, kv_cache_config=KvCacheConfig(), **kwargs
+        )
+
+    base_slope, base_intercept = estimate()
+    for width in (0, 8):
+        assert estimate(layer_specs=(draft,), shared_draft_block_width=width) == (
+            base_slope + 576,
+            base_intercept,
+        )
+
+
 def test_v2_hybrid_attention_bound_is_snapshot_alignment_agnostic():
     model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
