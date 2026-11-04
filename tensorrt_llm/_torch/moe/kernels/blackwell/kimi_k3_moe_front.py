@@ -14,10 +14,10 @@
 # limitations under the License.
 """Kimi-K3 MoE decode front sharded over the routed all-reduce's group (``M <= 32`` rows).
 
-Replaces, per MoE layer and rank, the router logits (``kimi_k3_router_logits`` /
-``dsv3_router_gemm_op``), the routing kernel (``kimi_k3_routing``) and the replicated latent_down
-with its NVFP4 output (``fp8_block_scale_low_m_gemm.run_low_m_gemm_nvfp4``) by two kernels on one
-stream:
+Computes, per MoE layer and rank, the router logits (as ``kimi_k3_router_logits``), the routing
+(as ``kimi_k3_routing``) and the latent_down projection with its NVFP4 output (as
+``fp8_block_scale_low_m_gemm.run_low_m_gemm_nvfp4``) in two kernels on one stream, the latent GEMM
+sharded over the routed all-reduce's group:
 
 * **Head** (:class:`KimiK3MoEFrontHeadKernel`, one grid, cluster size = the latent GEMM's split-K):
 

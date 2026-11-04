@@ -8,13 +8,11 @@ One launch computes, for ``x`` of ``1 <= M <= 256`` token rows,
 * ``beta = bfa[:, 128 : 128 + H]``;
 * ``forget_gate = bf16(bfa[:, :128] @ W_fb^T)`` (FP32 accumulation),
 
-i.e. what a ``[f_a | b]`` GEMM, a slice copy and an ``f_b`` GEMM produce in three to five
-launches.
+i.e. the values of a ``[f_a | b]`` GEMM, a slice and an ``f_b`` GEMM.
 
-The kernel runs on a second stream next to the KDA ``qkvg`` GEMM, which fills 96-120 SMs with
-~220 KB of shared memory each (clusters of 4-5 CTAs). It therefore uses 27-28 large CTAs that fit
-in the SMs the GEMM leaves free; more CTAs (or small ones that land between the GEMM's clusters)
-delay the GEMM.
+The kernel runs on a second stream beside the KDA ``qkvg`` GEMM, so its grid is a few large CTAs
+that fit in the SMs the GEMM's clusters leave free (:func:`default_config`); more CTAs, or small
+ones that land between the GEMM's clusters, delay the GEMM.
 
 Design:
 
@@ -1604,14 +1602,12 @@ def _base_config(n_tiles: int) -> FabConfig:
 
 @functools.cache
 def default_config(n_tiles: int, n2: int, k: int) -> FabConfig:
-    """Tiling for ``ceil(M / 8) = n_tiles``, tuned on GB300 next to the concurrent ``qkvg`` GEMM.
-
-    The concurrent ``qkvg`` GEMM (``k3_fp8w_lowm_gemm``, clusters of 4-5 CTAs) occupies 96-120 of
-    the 152 SMs; more than ~28 CTAs here break its single-wave cluster placement. So the grid is
-    27 CTAs (``mma.sync``, M <= 64) or 28 CTAs (UMMA, larger M), with at most one tail item each.
-    Other shapes keep the tiling with at most ``k / 64`` K splits and enough ``W_fb`` rows per
-    tail item to cover ``n2`` with the CTAs available. When those tail items do not fit the grid
-    or their ``W_fb`` block does not fit shared memory (helix8's N2 = 1536 above 128 rows), each
+    """Tiling for ``ceil(M / 8) = n_tiles`` beside the concurrent ``qkvg`` GEMM
+    (``k3_fp8w_lowm_gemm``, clusters of 4-5 CTAs), whose single-wave cluster placement leaves room
+    for 27 CTAs (``mma.sync``, M <= 64) or 28 CTAs (UMMA, larger M), with at most one tail item
+    each. Other shapes keep the tiling with at most ``k / 64`` K splits and enough ``W_fb`` rows
+    per tail item to cover ``n2`` with the CTAs available. When those tail items do not fit the
+    grid or their ``W_fb`` block does not fit shared memory (e.g. N2 = 1536 above 128 rows), each
     tail worker takes 2, 4, ... token tiles instead of one (fewer, smaller items); a tiling that
     fits keeps ``ntb`` as above.
     """

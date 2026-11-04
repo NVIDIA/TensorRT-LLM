@@ -624,13 +624,9 @@ class DSparkMlaCtxNormRoPEKernel:
     ``DSparkRMSNormRoPEKernel(kv_lora_rank + rope_dim, rope_dim, 1, eps, True,
     True, False, norm_dim=kv_lora_rank)``: lane ``l`` owns columns ``l + 32 i``,
     accumulates their squares in ``i`` order, the warp reduction and ``rsqrt``
-    are the same calls, and each output is the same chain of FP32 products. The
-    results are therefore bitwise those of the per-layer launches. What differs:
-    every load of a row is issued before its first store (the per-layer kernel
-    interleaves loads with stores the compiler cannot reorder, so each of its
-    16 weight loads waits for the previous store), the layers share one launch,
-    and the RoPE table is indexed by position in the kernel instead of through a
-    gathered copy.
+    are the same calls, and each output is the same chain of FP32 products, so
+    the results are bitwise that kernel's. Every load of a row is issued before
+    its first store, and the RoPE table is indexed by position in the kernel.
     """
 
     num_warps = 4
@@ -740,11 +736,9 @@ class DSparkMlaBlockRoPEKernel:
     rotate its ``k_pe`` at ``freqs[positions[t]]`` and store the 576-wide row
     straight into the paged pool at ``pool[pages[t], offsets[t]]``.
 
-    Per row the arithmetic is that of the separate launches it replaces --
-    ``cute_dsl_dspark_rope_into`` for the query rows and
-    ``cute_dsl_dspark_rmsnorm_rope(norm_dim=kv_lora_rank)`` followed by the
-    pool scatter for the latent rows -- so the values written are bitwise the
-    same.
+    Per row the arithmetic is that of ``cute_dsl_dspark_rope_into`` (query rows)
+    and of ``cute_dsl_dspark_rmsnorm_rope(norm_dim=kv_lora_rank)`` followed by
+    the pool scatter (latent rows), so the values written are bitwise theirs.
     """
 
     num_warps = 4
