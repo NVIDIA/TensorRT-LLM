@@ -106,17 +106,35 @@ def test_openai_server_routes_are_msgspec(live_snapshots):
                 )
 
 
-def test_disagg_and_coordinator_routes_are_plain(live_snapshots):
+_API_ROUTE_CLASSES = {
+    "disagg_server": (
+        "KvHintsRoute",
+        "every API route of the disaggregated frontend must keep KvHintsRoute: it strips "
+        "kv_hints from request bodies unless the server trusts its ingress "
+        "(TRTLLM_TRUST_KV_HINTS=1), and a plain APIRoute skips that policy.",
+    ),
+    "coordinator_server": (
+        "APIRoute",
+        "the coordinator app registers FastAPI's plain routes; it takes neither the "
+        "disaggregated frontend's KvHintsRoute nor the aggregated server's msgpack route "
+        "class.",
+    ),
+}
+
+
+def test_disagg_and_coordinator_route_classes(live_snapshots):
     for name, snapshot in live_snapshots.items():
         if snapshot.get("error") or snapshot["kind"] == "openai_server":
             continue
+        expected, reason = _API_ROUTE_CLASSES[snapshot["kind"]]
         for record in snapshot["routes"]:
-            cls = _parse(record)[2]
-            assert cls in ("APIRoute", "Route", "Mount"), (
-                f"configuration '{name}': {record}: the disaggregated frontend and the "
-                "coordinator app register plain routes; they do not take the aggregated "
-                "server's msgpack route class."
-            )
+            methods, path, cls = _parse(record)
+            if path in _DOC_ROUTES:
+                assert cls == "Route", record
+            elif methods == "MOUNT":
+                assert cls == "Mount", record
+            else:
+                assert cls == expected, f"configuration '{name}': {record}: {reason}"
 
 
 def test_control_route_groups(live_snapshots):

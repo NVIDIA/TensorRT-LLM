@@ -504,15 +504,15 @@ configs:
     - GET,HEAD /docs Route
     - GET,HEAD /docs/oauth2-redirect Route
     - GET,HEAD /redoc Route
-    - POST /v1/completions APIRoute
-    - POST /v1/chat/completions APIRoute
-    - POST /v1/messages APIRoute
-    - POST /v1/messages/count_tokens APIRoute
-    - POST /v1/responses APIRoute
-    - GET /v1/models APIRoute
-    - GET /health APIRoute
-    - GET /cluster_info APIRoute
-    - GET /version APIRoute
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
     - MOUNT /prometheus/metrics Mount
   disagg_local_perf_metrics:
     kind: disagg_server
@@ -521,15 +521,15 @@ configs:
     - GET,HEAD /docs Route
     - GET,HEAD /docs/oauth2-redirect Route
     - GET,HEAD /redoc Route
-    - POST /v1/completions APIRoute
-    - POST /v1/chat/completions APIRoute
-    - POST /v1/messages APIRoute
-    - POST /v1/messages/count_tokens APIRoute
-    - POST /v1/responses APIRoute
-    - GET /v1/models APIRoute
-    - GET /health APIRoute
-    - GET /cluster_info APIRoute
-    - GET /version APIRoute
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
     - MOUNT /prometheus/metrics Mount
   disagg_local_http_cluster_storage:
     kind: disagg_server
@@ -538,21 +538,21 @@ configs:
     - GET,HEAD /docs Route
     - GET,HEAD /docs/oauth2-redirect Route
     - GET,HEAD /redoc Route
-    - POST /v1/completions APIRoute
-    - POST /v1/chat/completions APIRoute
-    - POST /v1/messages APIRoute
-    - POST /v1/messages/count_tokens APIRoute
-    - POST /v1/responses APIRoute
-    - GET /v1/models APIRoute
-    - GET /health APIRoute
-    - GET /cluster_info APIRoute
-    - GET /version APIRoute
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
     - MOUNT /prometheus/metrics Mount
-    - POST /set APIRoute
-    - GET /get APIRoute
-    - DELETE /delete APIRoute
-    - GET /expire APIRoute
-    - GET /get_prefix APIRoute
+    - POST /set KvHintsRoute
+    - GET /get KvHintsRoute
+    - DELETE /delete KvHintsRoute
+    - GET /expire KvHintsRoute
+    - GET /get_prefix KvHintsRoute
   disagg_fleet:
     kind: disagg_server
     routes:
@@ -560,15 +560,15 @@ configs:
     - GET,HEAD /docs Route
     - GET,HEAD /docs/oauth2-redirect Route
     - GET,HEAD /redoc Route
-    - POST /v1/completions APIRoute
-    - POST /v1/chat/completions APIRoute
-    - POST /v1/messages APIRoute
-    - POST /v1/messages/count_tokens APIRoute
-    - POST /v1/responses APIRoute
-    - GET /v1/models APIRoute
-    - GET /health APIRoute
-    - GET /cluster_info APIRoute
-    - GET /version APIRoute
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
     - MOUNT /prometheus/metrics Mount
   disagg_fleet_perf_metrics:
     kind: disagg_server
@@ -577,15 +577,15 @@ configs:
     - GET,HEAD /docs Route
     - GET,HEAD /docs/oauth2-redirect Route
     - GET,HEAD /redoc Route
-    - POST /v1/completions APIRoute
-    - POST /v1/chat/completions APIRoute
-    - POST /v1/messages APIRoute
-    - POST /v1/messages/count_tokens APIRoute
-    - POST /v1/responses APIRoute
-    - GET /v1/models APIRoute
-    - GET /health APIRoute
-    - GET /cluster_info APIRoute
-    - GET /version APIRoute
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
     - MOUNT /prometheus/metrics Mount
   disagg_fleet_http_cluster_storage:
     kind: disagg_server
@@ -594,21 +594,21 @@ configs:
     - GET,HEAD /docs Route
     - GET,HEAD /docs/oauth2-redirect Route
     - GET,HEAD /redoc Route
-    - POST /v1/completions APIRoute
-    - POST /v1/chat/completions APIRoute
-    - POST /v1/messages APIRoute
-    - POST /v1/messages/count_tokens APIRoute
-    - POST /v1/responses APIRoute
-    - GET /v1/models APIRoute
-    - GET /health APIRoute
-    - GET /cluster_info APIRoute
-    - GET /version APIRoute
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
     - MOUNT /prometheus/metrics Mount
-    - POST /set APIRoute
-    - GET /get APIRoute
-    - DELETE /delete APIRoute
-    - GET /expire APIRoute
-    - GET /get_prefix APIRoute
+    - POST /set KvHintsRoute
+    - GET /get KvHintsRoute
+    - DELETE /delete KvHintsRoute
+    - GET /expire KvHintsRoute
+    - GET /get_prefix KvHintsRoute
   coordinator:
     kind: coordinator_server
     routes:

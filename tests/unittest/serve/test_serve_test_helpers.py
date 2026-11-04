@@ -233,10 +233,6 @@ def test_cpu_tests_selection():
     for target in expected_new_files:
         assert target in targets, f"the serve CPU runner must select {target}"
     assert "unittest/llmapi/apps/test_anthropic_routes.py" in targets
-    # A node-id entry stays a node id: only that node runs, never the whole file.
-    harmony = "unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting"
-    assert harmony in targets
-    assert "unittest/llmapi/apps/test_harmony_parsing.py" not in targets
     for target in targets:
         file_part = target.split("::")[0]
         text = (REPO_ROOT / "tests" / file_part).read_text(errors="replace")
@@ -244,6 +240,16 @@ def test_cpu_tests_selection():
             f"{file_part} is selected but carries no cpu_only marker; the CPU stage would "
             "collect nothing from it"
         )
+
+
+def test_cpu_tests_selection_keeps_node_ids(tmp_path):
+    # A node-id entry stays a node id: only that node runs, never the whole file.
+    node = "unittest/serve/test_serve_test_helpers.py::test_cpu_tests_selection"
+    cpu_list = tmp_path / "l0_cpu.yml"
+    cpu_list.write_text(f"l0_cpu:\n- tests:\n  - {node}\n")
+    kept, notes = select_entries(cpu_list)
+    assert [entry.targets for entry in kept] == [(node,)], kept
+    assert not notes, notes
 
 
 # ---------------------------------------------------------------------------
