@@ -1,0 +1,1 @@
+Run the test suite with `python3 -m unittest -v` from the workspace root; some of the tests fail. The tests are correct, so find the cause in wordstats.py, fix it with the smallest change that makes sense, and run the suite again until every test passes. Then report which tests failed at first, what the bug was, and how many tests pass at the end.

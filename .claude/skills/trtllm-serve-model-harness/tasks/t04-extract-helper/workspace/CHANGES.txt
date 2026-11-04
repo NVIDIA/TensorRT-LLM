@@ -1,0 +1,12 @@
+Changes
+=======
+
+0.3.0 (unreleased)
+- The weekly summary reports the busiest day.
+
+0.2.0
+- The monthly summary includes the cost at a given rate.
+- Totals are rounded half up instead of to even.
+
+0.1.0
+- Daily, weekly and monthly summaries.

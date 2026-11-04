@@ -1,0 +1,19 @@
+convert: a length converter
+
+Usage
+  python3 -m convert VALUE FROM_UNIT TO_UNIT
+
+  Converts VALUE from FROM_UNIT to TO_UNIT and prints the result with
+  two decimal places.
+
+Units
+  mm cm m km in ft yd mi
+
+Examples
+  python3 -m convert 10 km mi     prints 6.21 mi
+  python3 -m convert 3 ft cm      prints 91.44 cm
+
+Exit status
+  0  the result was printed
+  1  a unit is unknown
+  2  the command line is wrong
