@@ -29,7 +29,6 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention.backends.trtllm import \
@@ -39,6 +38,8 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor._util import (
     _derive_draft_max_attention_window,
     _expand_attention_window_pattern_to_global_layers)
+from tensorrt_llm._torch.pyexecutor.device_copy import (CopySite,
+                                                        DeviceCopyBuffer)
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
 from tensorrt_llm._torch.speculative.eagle3 import (Eagle3OneModelSpecMetadata,
@@ -487,8 +488,10 @@ def test_eagle3_prepare_skipped_uploads_keep_slot_ids_current() -> None:
                                        dtype=torch.int,
                                        device="cuda")
     md.slot_ids = torch.full((8, ), -1, dtype=torch.long, device="cuda")
-    md._batch_indices_upload = DeviceCopyBuffer(md.batch_indices_cuda)
-    md._slot_ids_upload = DeviceCopyBuffer(md.slot_ids)
+    md._batch_indices_upload = DeviceCopyBuffer(
+        md.batch_indices_cuda, site=CopySite.EAGLE3_BATCH_INDICES)
+    md._slot_ids_upload = DeviceCopyBuffer(md.slot_ids,
+                                           site=CopySite.EAGLE3_SLOT_IDS)
     md.spec_resource_manager = SimpleNamespace(slot_manager=SimpleNamespace(
         get_slot=lambda rid: slots[rid]))
     md.spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)

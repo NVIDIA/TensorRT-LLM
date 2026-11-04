@@ -12,7 +12,7 @@ from importlib import import_module
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 
 spec_accept_op = import_module(
     "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept.op"
@@ -191,7 +191,9 @@ def slot_worker(spec_worker):
     """A target's DSpark worker (``spec_worker.KimiK3DSparkWorker``) with three requests in slots 2, 0 and 1."""
     worker = object.__new__(spec_worker.KimiK3DSparkWorker)
     torch.nn.Module.__init__(worker)
-    worker._batch_to_slot_buffer = DeviceCopyBuffer(torch.zeros(3, dtype=torch.long))
+    worker._batch_to_slot_buffer = DeviceCopyBuffer(
+        torch.zeros(3, dtype=torch.long), site=CopySite.DFLASH_BATCH_TO_SLOT
+    )
     worker._req_to_slot = {100: 2, 101: 0, 102: 1}
     worker._dummy_slot = 3
     worker._ctx_len = torch.tensor([10, 20, 30, 0])

@@ -26,20 +26,24 @@ Two questions decide what happens to it, and two different owners answer them:
   set, and every site of an engine whose model declares no plan, is ``dst.copy_(src, non_blocking=True)``.
 * **Whether** a copy is needed at all is the buffer owner's business. It depends on the values and on who else writes
   the buffer, which only the owner knows: the owner passes ``unchanged=True`` when the destination already holds what
-  the call would write, and the call is not issued. Owners keep that state themselves, with main's
-  ``DeviceCopyBuffer`` (``UploadRecords`` packages the usual pattern), record only copies that were issued, and pass
-  ``on_drop`` so a merged copy that never lands (its step failed and the pack was discarded) invalidates the record.
-  ``unchanged=True`` is refused during CUDA graph capture: a captured copy reruns on every replay.
+  the call would write, and the call is not issued. ``DeviceCopyBuffer`` is that owner-side record for one buffer and
+  one site: ``update`` compares the host values with what its last issued copy wrote, issues the copy through its site
+  otherwise, records only a copy that was issued, and passes ``on_drop`` so a merged copy that never lands (its step
+  failed and the pack was discarded) invalidates the record. ``unchanged=True`` is refused during CUDA graph capture:
+  a captured copy reruns on every replay.
 
 Model-specific backends name their own sites with their own ``CopySiteEnum``. Adding a model: declare the plan from
 the readers of each destination (merge what no device work touches before the replay, and anchor a barrier on each
-copy that has an eager reader), and let each buffer owner decide on its own whether its uploads may be skipped.
+copy that has an eager reader), and let each buffer owner decide on its own whether its uploads may be skipped (a
+``DeviceCopyBuffer`` with the copy's site).
 
-``TLLM_DEVICE_COPY_CHECK=1`` (``CHECK_MODE``, read once at import) verifies the assertions at runtime, at the cost of a
-device synchronization per check: a write of a merged destination before its flush, and an ``unchanged`` copy or fill
-whose destination does not hold the values. A read of a merged destination before its barrier is caught only where
-the reader asserts it with ``expect_landed`` under ``if device_copy.CHECK_MODE:``; elsewhere an early reader sees the
-poison bytes instead and fails downstream.
+``CHECK_MODE`` verifies the assertions at runtime, at the cost of a device synchronization per check: a write of a
+merged destination before its flush, and an ``unchanged`` copy or fill (including every copy a ``DeviceCopyBuffer``
+skips) whose destination does not hold the values. A read of a merged destination before its barrier is caught only
+where the reader asserts it with ``expect_landed`` under ``if device_copy.CHECK_MODE:``; elsewhere an early reader sees
+the poison bytes instead and fails downstream. It is read once at import from ``TLLM_DEVICE_COPY_CHECK=1``, or from
+``TLLM_DEBUG_MODE=1``, which turned on the verification of ``DeviceCopyBuffer``'s skipped copies before the two were
+one switch.
 
 Each engine with a plan owns one ``DeviceCopier`` and makes it the active one for its forward (``active``); the module
 functions act on the calling context's copier, so engines on other threads or devices never share one. The attention
@@ -57,12 +61,14 @@ from typing import Callable, Iterator, Optional
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._utils import prefer_pinned
 
 CHECK_ENV = "TLLM_DEVICE_COPY_CHECK"
-#: Whether the plans' assertions are verified at runtime (``TLLM_DEVICE_COPY_CHECK=1``), read once at import.
-CHECK_MODE: bool = os.environ.get(CHECK_ENV, "0") == "1"
+#: Whether the copies' assertions are verified at runtime (``TLLM_DEVICE_COPY_CHECK=1``, or ``TLLM_DEBUG_MODE=1``), read
+#: once at import.
+CHECK_MODE: bool = (
+    os.environ.get(CHECK_ENV, "0") == "1" or os.environ.get("TLLM_DEBUG_MODE", "")[0:1] == "1"
+)
 # Byte written into a merged copy's destination in check mode, so an early reader sees garbage and an early writer
 # is caught at the flush.
 _POISON = 0xA5
@@ -89,13 +95,26 @@ class CopySite(CopySiteEnum):
     # CUDAGraphRunner.replay: the step's input ids / position ids into the graph's static inputs.
     GRAPH_INPUT_IDS = ("graph.input_ids", Direction.D2D)
     GRAPH_POSITION_IDS = ("graph.position_ids", Direction.D2D)
-    # Decoder inputs: host position ids. (The speculative gather and previous-batch tables, and the speculative
-    # metadata's batch-index and slot uploads, skip unchanged values for every model through DeviceCopyBuffer or a
-    # host-side comparison, and no plan merges them.)
+    # Decoder inputs: host position ids.
     INPUT_POSITION_IDS = ("inputs.position_ids", Direction.H2D)
+    # The DeviceCopyBuffer uploads below skip unchanged values for every model; no plan merges them today. Decoder
+    # inputs: the speculative gather ids. (The previous-batch tables skip through a host-side comparison.)
+    INPUT_GATHER_IDS = ("inputs.gather_ids", Direction.H2D)
     # TrtllmAttentionMetadata.
     ATTN_KV_LENS = ("attn.kv_lens", Direction.H2D)
     ATTN_PROMPT_LENS = ("attn.prompt_lens", Direction.H2D)
+    # Speculative metadata and samplers (DeviceCopyBuffer): Eagle3's batch indices and slot ids, DFlash's batch
+    # indices and batch-to-slot map (also DSpark's), the speculative sampler's slot table.
+    EAGLE3_BATCH_INDICES = ("eagle3.batch_indices", Direction.H2D)
+    EAGLE3_SLOT_IDS = ("eagle3.slot_ids", Direction.H2D)
+    DFLASH_BATCH_INDICES = ("dflash.batch_indices", Direction.H2D)
+    DFLASH_BATCH_TO_SLOT = ("dflash.batch_to_slot", Direction.H2D)
+    SPEC_SAMPLER_SLOT_TABLE = ("spec_sampler.slot_table", Direction.H2D)
+    SPEC_SAMPLER_SLOT_IDS = ("spec_sampler.slot_ids", Direction.H2D)
+    # Mamba cache managers and Mamba2 metadata (DeviceCopyBuffer): per-request state slots and the dummy-request mask.
+    MAMBA_STATE_INDICES = ("mamba.state_indices", Direction.H2D)
+    MAMBA_DUMMY_REQUEST_MASK = ("mamba.dummy_request_mask", Direction.H2D)
+    MAMBA2_METADATA_STATE_INDICES = ("mamba2_metadata.state_indices", Direction.H2D)
     # SpecMetadata: the one-model speculative sampler's per-step Philox seeds and offsets (the forward reads them first).
     SPEC_RNG_REQUEST_SEEDS = ("spec.rng_request_seeds", Direction.H2D)
     SPEC_RNG_REQUEST_OFFSETS = ("spec.rng_request_offsets", Direction.H2D)
@@ -431,6 +450,7 @@ class DeviceCopier:
         src: torch.Tensor,
         unchanged: bool = False,
         on_drop: Optional[Callable[[], None]] = None,
+        snapshot: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> bool:
         if site.direction is Direction.FILL:
             raise ValueError(f"{_site_name(site)} is a fill site; use fill_tail")
@@ -454,7 +474,7 @@ class DeviceCopier:
                 return True
             # Cannot be staged: what is staged lands first, then this copy (which keeps the order).
             pack.barrier()
-        dst.copy_(src, non_blocking=True)
+        dst.copy_(src if snapshot is None else snapshot(src), non_blocking=True)
         return True
 
     def fill_tail(
@@ -508,74 +528,6 @@ def _fill_tail(
             )
 
 
-class UploadRecords:
-    """A buffer owner's record of what its uploads last wrote, to pass ``unchanged`` to ``copy`` and ``fill_tail``.
-
-    The usual owner-side pattern around main's ``DeviceCopyBuffer``: compare, issue, record only an issued copy, drop
-    the record before issuing (so a copy that fails leaves none) and on ``on_drop`` (so a merged copy that never lands
-    leaves none), and never skip or record during capture. Keyed by device storage, and each entry keeps the storage
-    alive so the address is not reused by a new buffer; the record key is the destination view, so a write through
-    another view of the same storage replaces the record. The owner calls ``forget`` when it writes a recorded buffer
-    by other means.
-    """
-
-    def __init__(self) -> None:
-        # Storage address -> (storage, the host values last uploaded into it, keyed by the view).
-        self._copies: dict[int, tuple[object, DeviceCopyBuffer]] = {}
-        # Storage address -> (storage, (view, first row, value) of its last tail fill).
-        self._tails: dict[int, tuple[object, tuple]] = {}
-
-    def forget(self, t: torch.Tensor) -> None:
-        """Drop the records of ``t``'s storage: something other than these uploads wrote it."""
-        addr = t.untyped_storage().data_ptr()
-        entry = self._copies.pop(addr, None)
-        if entry is not None:
-            entry[1].invalidate()
-        self._tails.pop(addr, None)
-
-    def clear(self) -> None:
-        self._copies.clear()
-        self._tails.clear()
-
-    def copy(self, site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> bool:
-        """``device_copy.copy(site, dst, src)``, passing unchanged=True when the record says ``dst`` holds ``src``."""
-        if torch.cuda.is_current_stream_capturing():
-            self.forget(dst)
-            return copy(site, dst, src)
-        storage = dst.untyped_storage()
-        addr = storage.data_ptr()
-        key = _view_key(dst)
-        entry = self._copies.get(addr)
-        if entry is not None and entry[1].matches(src, key=key, exact=True):
-            return copy(site, dst, src, unchanged=True)
-        record = entry[1] if entry is not None else DeviceCopyBuffer(dst)
-        record.invalidate()
-        self._copies[addr] = (storage, record)
-        issued = copy(site, dst, src, on_drop=record.invalidate)
-        record.record(src, key=key)
-        return issued
-
-    def fill_tail(self, site: CopySiteEnum, buf: torch.Tensor, start: int, value: int) -> None:
-        """``device_copy.fill_tail``, passing unchanged=True when the last fill of ``buf`` was the same.
-
-        Call it after every write of the live rows ``buf[:start]``, including one that covers the whole of ``buf``
-        (``start == len(buf)``, which fills nothing): a live-row write past the recorded start overwrites the tail.
-        """
-        storage = buf.untyped_storage()
-        addr = storage.data_ptr()
-        if start >= buf.shape[0] or torch.cuda.is_current_stream_capturing():
-            self._tails.pop(addr, None)
-            fill_tail(site, buf, start, value)
-            return
-        key = (_view_key(buf), start, value)
-        entry = self._tails.get(addr)
-        unchanged = entry is not None and entry[1] == key
-        if not unchanged:
-            self._tails.pop(addr, None)
-        fill_tail(site, buf, start, value, unchanged=unchanged)
-        self._tails[addr] = (storage, key)
-
-
 _active: ContextVar[Optional[DeviceCopier]] = ContextVar("trtllm_device_copier", default=None)
 
 
@@ -600,20 +552,23 @@ def copy(
     *,
     unchanged: bool = False,
     on_drop: Optional[Callable[[], None]] = None,
+    snapshot: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> bool:
     """``dst.copy_(src, non_blocking=True)``, merged as the active copier's plan says; True if issued.
 
     ``unchanged``: the caller's assertion that ``dst`` already holds ``src``; the copy is not issued and False is
     returned. Refused during CUDA graph capture, and verified in check mode. ``on_drop``: called if the copy was merged
-    and its pack is then discarded without issuing it (the caller's record of the copy is then stale).
+    and its pack is then discarded without issuing it (the caller's record of the copy is then stale). ``snapshot``:
+    applied to ``src`` when the copy is issued eagerly, for a caller that writes ``src`` again before the copy runs (a
+    merged copy is snapshotted into the pack already).
     """
     copier = _active.get()
     if copier is not None:
-        return copier.copy(site, dst, src, unchanged, on_drop)
+        return copier.copy(site, dst, src, unchanged, on_drop, snapshot)
     if unchanged:
         _check_unchanged_copy(site, dst, src, None)
         return False
-    dst.copy_(src, non_blocking=True)
+    dst.copy_(src if snapshot is None else snapshot(src), non_blocking=True)
     return True
 
 
@@ -681,3 +636,164 @@ def discard() -> None:
     copier = _active.get()
     if copier is not None:
         copier.discard()
+
+
+class DeviceCopyBuffer:
+    """A device buffer's record of what its last issued copy wrote, so its owner skips uploads of values it holds.
+
+    ``site`` names the buffer's uploads (a host-to-device ``CopySiteEnum`` member): ``update`` issues them through
+    ``copy``, so a model's plan may merge them, and check mode verifies every skipped one. ``site=None`` makes a
+    record-only buffer for an owner that writes the buffer through its own path and keeps the record with ``matches`` /
+    ``record`` / ``invalidate``.
+
+    The record follows the copy: it is dropped before a copy is issued (a copy that fails leaves none), written only
+    after the copy was issued, dropped again if a merged copy never lands (``on_drop``, the pack was discarded), and
+    neither consulted nor written during CUDA graph capture, where a copy is always issued: a captured copy reruns on
+    every replay. An owner that writes the buffer by other means calls ``invalidate``.
+
+    ``update(host)`` writes the leading ``host.numel()`` elements, and a recorded longer run whose prefix matches still
+    holds them, so it is skipped. ``update(host, view=v)`` writes ``host`` into the view ``v`` of the buffer's storage
+    instead and is skipped only for the same view geometry and host shape. The host values are snapshotted when the
+    copy runs eagerly (into pinned memory with ``pin_memory``), since owners reuse their host buffers; a merged copy is
+    snapshotted into the pack instead. ``snapshot=False`` skips the eager snapshot for an owner that passes a host
+    tensor it does not write again.
+
+    ``fill_tail`` fills ``tensor[start:]`` and records the fill (start, value), so an identical fill is skipped. Call it
+    after every write of the live rows ``tensor[:start]``, including one that covers the whole buffer (``start ==
+    len(tensor)``, which fills nothing): a live-row write past the recorded start overwrites the tail.
+    """
+
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        *,
+        site: Optional[CopySiteEnum],
+        pin_memory: bool = False,
+        snapshot: bool = True,
+    ) -> None:
+        if site is not None and site.direction is not Direction.H2D:
+            raise ValueError(
+                f"DeviceCopyBuffer uploads from the host; {_site_name(site)} is not an h2d site"
+            )
+        self._tensor = tensor
+        self._site = site
+        self._pin_memory = pin_memory
+        self._snapshot = self._stage if snapshot else None
+        self._last_host_values = None
+        self._last_host_shape: torch.Size | None = None
+        self._copy_key: object = None
+        # (view, start, value) of the last tail fill.
+        self._tail: Optional[tuple] = None
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        return self._tensor
+
+    @property
+    def site(self) -> Optional[CopySiteEnum]:
+        return self._site
+
+    @property
+    def host_values(self) -> Optional[torch.Tensor]:
+        """Last recorded host values, reshaped to the submitted view; callers must not mutate them."""
+        if self._last_host_values is None:
+            return None
+        count = self._last_host_shape.numel()
+        return self._last_host_values[:count].view(self._last_host_shape)
+
+    def invalidate(self) -> None:
+        """Forget a pending or externally overwritten copy (and the tail fill)."""
+        self._last_host_values = None
+        self._last_host_shape = None
+        self._copy_key = None
+        self._tail = None
+
+    def matches(self, host: torch.Tensor, *, key: object = None, exact: bool = False) -> bool:
+        """Whether the recorded host inputs match, including any copy-specific layout key.
+
+        ``exact`` requires the same host shape instead of accepting a matching prefix.
+        Callers that transform or defer their copies must record only successful submissions
+        and invalidate the record if the submission is discarded or another writer intervenes.
+        """
+        last = self._last_host_values
+        flat = host.reshape(-1)
+        return (
+            last is not None
+            and key == self._copy_key
+            and last.dtype == host.dtype
+            and (not exact or self._last_host_shape == host.shape)
+            and last.numel() >= flat.numel()
+            and torch.equal(last[: flat.numel()], flat)
+        )
+
+    def record(self, host: torch.Tensor, *, key: object = None) -> None:
+        """Remember the inputs of a copy issued by this buffer or a specialized copy path."""
+        flat = host.reshape(-1)
+        last = self._last_host_values
+        if (
+            last is None
+            or key != self._copy_key
+            or last.dtype != host.dtype
+            or last.numel() <= flat.numel()
+        ):
+            self._last_host_values = flat.clone()
+        else:
+            last = last.clone()
+            last[: flat.numel()] = flat
+            self._last_host_values = last
+        self._last_host_shape = host.shape
+        self._copy_key = key
+
+    def _stage(self, src: torch.Tensor) -> torch.Tensor:
+        staging = torch.empty_like(src, device="cpu", pin_memory=self._pin_memory)
+        staging.copy_(src)
+        return staging
+
+    def update(
+        self, host: torch.Tensor, force: bool = False, *, view: Optional[torch.Tensor] = None
+    ) -> bool:
+        """Upload ``host`` through the buffer's site unless the record says the buffer holds it; True if issued.
+
+        ``force`` issues the copy whatever the record says. ``view``: the destination, a view of the buffer's storage
+        (default: the buffer's leading ``host.numel()`` elements).
+        """
+        site = self._site
+        if site is None:
+            raise ValueError("a record-only DeviceCopyBuffer (site=None) does not issue copies")
+        if view is None:
+            src = host.reshape(-1)
+            dst = self._tensor.view(-1)[: src.numel()]
+            key, exact = None, False
+            if self._tail is not None and src.numel() > self._tail[1]:
+                self._tail = None
+        else:
+            src, dst = host, view
+            key, exact = _view_key(view), True
+            self._tail = None
+        if torch.cuda.is_current_stream_capturing():
+            self.invalidate()
+            return copy(site, dst, src, snapshot=self._snapshot)
+        if not force and self.matches(host, key=key, exact=exact):
+            return copy(site, dst, src, unchanged=True)
+        # Dropped while the copy is issued, then recorded on top of what the buffer held (a longer recorded run
+        # keeps its tail).
+        previous = (self._last_host_values, self._last_host_shape, self._copy_key)
+        self._last_host_values = self._last_host_shape = self._copy_key = None
+        issued = copy(site, dst, src, on_drop=self.invalidate, snapshot=self._snapshot)
+        self._last_host_values, self._last_host_shape, self._copy_key = previous
+        self.record(host, key=key)
+        return issued
+
+    def fill_tail(self, site: CopySiteEnum, start: int, value: int) -> None:
+        """``fill_tail(site, tensor, start, value)``, passing unchanged=True when the last fill was the same."""
+        buf = self._tensor
+        if start >= buf.shape[0] or torch.cuda.is_current_stream_capturing():
+            self._tail = None
+            fill_tail(site, buf, start, value)
+            return
+        key = (_view_key(buf), start, value)
+        unchanged = self._tail == key
+        if not unchanged:
+            self._tail = None
+        fill_tail(site, buf, start, value, unchanged=unchanged)
+        self._tail = key

@@ -705,7 +705,9 @@ def test_overlap_offsets_follow_the_packed_prefix(
         "gather_ids_cuda",
     ):
         setattr(decoder._buffers, name, torch.full((32,), -99, dtype=torch.int32))
-    decoder._gather_ids_buffer = decoder_module.DeviceCopyBuffer(decoder._buffers.gather_ids_cuda)
+    decoder._gather_ids_buffer = decoder_module.DeviceCopyBuffer(
+        decoder._buffers.gather_ids_cuda, site=decoder_module.CopySite.INPUT_GATHER_IDS
+    )
     windows = [prefix_window, *previous_windows]
     requests = [
         SimpleNamespace(

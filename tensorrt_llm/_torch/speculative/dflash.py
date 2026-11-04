@@ -22,8 +22,8 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
@@ -625,6 +625,7 @@ class DFlashSpecMetadata(SpecMetadata):
     def __post_init__(self):
         self._batch_indices_buffer = DeviceCopyBuffer(
             torch.empty([self.max_num_requests], dtype=torch.int, device="cuda"),
+            site=CopySite.DFLASH_BATCH_INDICES,
             pin_memory=prefer_pinned(),
         )
         self.batch_indices_cuda = self._batch_indices_buffer.tensor
@@ -1538,6 +1539,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_base_host = [0] * num_slots
         self._batch_to_slot_buffer = DeviceCopyBuffer(
             torch.zeros(max_batch, dtype=torch.long, device="cuda"),
+            site=CopySite.DFLASH_BATCH_TO_SLOT,
             pin_memory=prefer_pinned(),
         )
 

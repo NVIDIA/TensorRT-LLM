@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor.device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
@@ -826,7 +826,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         if self.skip_unchanged_block_offsets:
             address = dst_tensor.untyped_storage().data_ptr()
-            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            guard = self._unchanged_copies.setdefault(
+                address, DeviceCopyBuffer(dst_tensor, site=None)
+            )
             if num_contexts != 0 or (
                 dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
             ):
@@ -1425,7 +1427,9 @@ class MiniMaxM3DraftKVCacheView:
         )
         if manager.skip_unchanged_block_offsets:
             address = dst_tensor.untyped_storage().data_ptr()
-            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            guard = self._unchanged_copies.setdefault(
+                address, DeviceCopyBuffer(dst_tensor, site=None)
+            )
             if num_contexts != 0 or (
                 dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
             ):

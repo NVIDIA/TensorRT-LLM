@@ -452,15 +452,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
-        self._ensure_upload_records()
+        self._ensure_upload_buffers()
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
-    def _ensure_upload_records(self) -> None:
-        """What the skippable uploads last wrote (used only with skips_unchanged_uploads). One record set per
-        engine: CUDA graph metadata is a shallow copy that re-runs __post_init__ and shares it, since the copies of
-        different batch sizes write the same graph-metadata buffers."""
-        if getattr(self, "_upload_records", None) is None:
-            self._upload_records = device_copy.UploadRecords()
+    def _ensure_upload_buffers(self) -> None:
+        """The skippable uploads' DeviceCopyBuffers, by destination storage (used only with skips_unchanged_uploads).
+        One set per engine: CUDA graph metadata is a shallow copy that re-runs __post_init__ and shares it, since the
+        copies of different batch sizes write the same graph-metadata buffers."""
+        if getattr(self, "_upload_buffers", None) is None:
+            self._upload_buffers: Dict[int, device_copy.DeviceCopyBuffer] = {}
+
+    def _upload_buffer(self, site: Optional[CopySiteEnum],
+                       dst: torch.Tensor) -> device_copy.DeviceCopyBuffer:
+        """The DeviceCopyBuffer of ``dst``'s storage for ``site``'s uploads (None: tail fills only). It holds the
+        destination, which keeps the storage alive, so a new buffer at a reused address cannot inherit its record;
+        a write through another site replaces it."""
+        addr = dst.untyped_storage().data_ptr()
+        buffer = self._upload_buffers.get(addr)
+        if buffer is None or buffer.site is not site:
+            buffer = device_copy.DeviceCopyBuffer(dst,
+                                                  site=site,
+                                                  snapshot=False)
+            self._upload_buffers[addr] = buffer
+        return buffer
 
     @classmethod
     def short_long_seq_len_threshold(
@@ -474,9 +488,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def _upload_metadata(self, site: CopySiteEnum, dst: torch.Tensor,
                          src: torch.Tensor) -> bool:
-        """A host-to-device metadata upload, skipped when unchanged if the model opted in; True if issued."""
+        """A host-to-device metadata upload, skipped when unchanged if the metadata class skips them; True if issued.
+
+        ``src`` is a host tensor the caller does not write again before the copy runs."""
         if self.skips_unchanged_uploads:
-            return self._upload_records.copy(site, dst, src)
+            return self._upload_buffer(site, dst).update(src, view=dst)
         return device_copy.copy(site, dst, src)
 
     def _post_init_with_buffers(self, buffers) -> None:

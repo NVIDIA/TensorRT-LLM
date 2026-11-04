@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
@@ -23,7 +22,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     get_mrope_dummy_seq_slot,
 )
-from tensorrt_llm._torch.pyexecutor.device_copy import CopySite
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -377,7 +376,9 @@ class DecoderInputPreparer:
         self.cuda_graph_runner: CUDAGraphRunner | None = None
         self._prepare_inputs_event: torch.cuda.Event | None = None
         self._gather_ids_buffer = (
-            DeviceCopyBuffer(buffers.gather_ids_cuda, pin_memory=prefer_pinned())
+            DeviceCopyBuffer(
+                buffers.gather_ids_cuda, site=CopySite.INPUT_GATHER_IDS, pin_memory=prefer_pinned()
+            )
             if config is not None and config.is_spec_decode
             else None
         )

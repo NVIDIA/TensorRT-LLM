@@ -384,8 +384,9 @@ model arming it from outside (MiniMax-M3's MSA metadata sets both):
 - `skips_unchanged_uploads`: its per-step uploads (`_upload_metadata`) skip
   values their destination already holds. This is sound only while nothing
   else writes those buffers, so the decoder runner then gives the CUDA-graph
-  metadata private buffers. The CUDA-graph metadata copies share one
-  `device_copy.UploadRecords`.
+  metadata private buffers. Each skippable destination keeps its record in a
+  `device_copy.DeviceCopyBuffer` with the upload's site; the CUDA-graph
+  metadata copies share one set of them.
 - `short_long_seq_len_threshold(sparse_config)`: a sequence length at which
   `prepare()` stages different work, so the runner keys decode CUDA graphs by
   short and long contexts.

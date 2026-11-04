@@ -89,7 +89,7 @@ def _short_table_metadata(
     metadata.cuda_graph_buffers = None
     metadata.is_cuda_graph = False
     metadata.mapping = Mapping()
-    metadata._upload_records = device_copy.UploadRecords()
+    metadata._upload_buffers = {}
     return metadata
 
 
@@ -394,14 +394,14 @@ def test_reused_pool_views_are_kept_per_inference_mode(manager, pools):
 
 @requires_cuda
 def test_unused_slots_are_filled_after_a_full_buffer_step():
+    """The tail fill is never skipped (pooled CUDA graph metadata), so it follows every live-row write."""
     buf = torch.full((8,), 7, dtype=torch.int32, device="cuda")
-    records = device_copy.UploadRecords()
-    _fill_unused_slots(buf, 3, records)
+    _fill_unused_slots(buf, 3)
     # A step whose live rows cover the whole buffer overwrites the filled tail.
     buf.copy_(torch.arange(8, dtype=torch.int32, device="cuda"))
-    _fill_unused_slots(buf, buf.shape[0], records)
+    _fill_unused_slots(buf, buf.shape[0])
     buf[:3] = 0
-    _fill_unused_slots(buf, 3, records)
+    _fill_unused_slots(buf, 3)
     assert buf.tolist() == [0, 0, 0, -1, -1, -1, -1, -1]
 
 
@@ -649,12 +649,12 @@ def test_cuda_graph_metadata_copies_share_one_record_set():
     from tensorrt_llm._torch.pyexecutor.device_copy import CopySite
 
     engine_md = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
-    engine_md._ensure_upload_records()
+    engine_md._ensure_upload_buffers()
     graphs = [copy.copy(engine_md) for _ in range(3)]
     for g in graphs:
-        # CUDA graph metadata re-runs __post_init__, which keeps the shared records.
-        g._ensure_upload_records()
-    assert all(g._upload_records is engine_md._upload_records for g in graphs)
+        # CUDA graph metadata re-runs __post_init__, which keeps the shared DeviceCopyBuffers.
+        g._ensure_upload_buffers()
+    assert all(g._upload_buffers is engine_md._upload_buffers for g in graphs)
 
     buf = torch.zeros(4, dtype=torch.int32, device="cuda")
     one = torch.tensor([1, 2, 3, 4], dtype=torch.int32).pin_memory()
@@ -667,3 +667,7 @@ def test_cuda_graph_metadata_copies_share_one_record_set():
     assert graphs[2]._upload_metadata(site, buf, one) is False
     torch.cuda.synchronize()
     assert buf.tolist() == [1, 2, 3, 4]
+    # One DeviceCopyBuffer per destination, with the upload's site, shared by every copy.
+    shared = graphs[0]._upload_buffer(site, buf)
+    assert shared is graphs[2]._upload_buffer(site, buf) is engine_md._upload_buffer(site, buf)
+    assert shared.site is site and shared.tensor is buf

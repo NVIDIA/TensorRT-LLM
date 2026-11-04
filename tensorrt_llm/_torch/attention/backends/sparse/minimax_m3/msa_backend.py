@@ -127,17 +127,10 @@ SKIP_UNCHANGED_BLOCK_TABLE = True
 TAIL_FILL_IN_FORWARD = True
 
 
-def _fill_unused_slots(
-    buf: torch.Tensor, start: int, records: Optional[device_copy.UploadRecords] = None
-) -> None:
-    """buf[start:] = -1 after a write of the live slots buf[:start], skipped if ``records`` saw the same fill.
-
-    ``records`` is the owner's (see device_copy.UploadRecords.fill_tail), or None to always fill.
-    """
-    if records is not None:
-        records.fill_tail(MsaCopySite.OUT_CACHE_LOC_TAIL, buf, start, -1)
-    else:
-        device_copy.fill_tail(MsaCopySite.OUT_CACHE_LOC_TAIL, buf, start, -1)
+def _fill_unused_slots(buf: torch.Tensor, start: int) -> None:
+    """buf[start:] = -1 after a write of the live slots buf[:start]. Never skipped: CUDA graph metadata of every graph
+    key takes this buffer from one pool, and a captured forward writes live slots into it at each replay."""
+    device_copy.fill_tail(MsaCopySite.OUT_CACHE_LOC_TAIL, buf, start, -1)
 
 
 class MsaDecodeSpan(NamedTuple):
@@ -278,11 +271,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # True only with speculative decoding; otherwise on_update_kv_lens and its
     # staging are skipped and non-speculative steps run as before.
     _msa_kv_lens_dynamic: bool = False
-
-    @property
-    def _skip_records(self) -> Optional[device_copy.UploadRecords]:
-        """The upload records when unchanged uploads are skipped (skips_unchanged_uploads), else None."""
-        return self._upload_records if self.skips_unchanged_uploads else None
 
     @classmethod
     def short_long_seq_len_threshold(

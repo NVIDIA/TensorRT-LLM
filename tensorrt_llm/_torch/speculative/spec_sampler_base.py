@@ -27,10 +27,10 @@ from typing import Optional
 
 import torch
 
-from ..._device_copy import DeviceCopyBuffer
 from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
+from ..pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.runtime_hooks import SpecStepFold
@@ -347,6 +347,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             self._store_scatter = spec_step_copies.SlotScatter()
             self._slot_table_buffer = DeviceCopyBuffer(
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
+                site=CopySite.SPEC_SAMPLER_SLOT_TABLE,
                 pin_memory=prefer_pinned(),
             )
         self._slot_ids_capacity = seq_slots
@@ -373,6 +374,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     dtype=torch.long,
                     device=self.store.new_tokens.device,
                 ),
+                site=CopySite.SPEC_SAMPLER_SLOT_IDS,
                 pin_memory=prefer_pinned(),
             )
         self._slot_ids_buffer.update(torch.tensor(seq_slots, dtype=torch.long))

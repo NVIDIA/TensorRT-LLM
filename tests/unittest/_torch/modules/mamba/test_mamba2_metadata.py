@@ -21,7 +21,6 @@ import pytest
 import torch
 from _torch.helpers import triton_num_compiled
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.mamba import mamba2_metadata
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
@@ -39,6 +38,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 
 skip_no_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -239,7 +239,7 @@ class TestMamba2Metadata:
         """A decode step whose state indices (a list from the cache manager) did not change enqueues no upload: the
         device buffer keeps values the host never sent. A changed step uploads again."""
         # The test writes the buffer behind prepare() to see the skip, which the check of skipped copies reports.
-        monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", False)
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.device_copy.CHECK_MODE", False)
         manager = _StateIndexCacheManager([3, 1])
         metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
         attn_metadata = _decode_attn_metadata(manager)
@@ -277,9 +277,10 @@ class TestMamba2Metadata:
             assert metadata.state_indices[:2].tolist() == expected
 
     def test_check_of_skipped_copies_reports_a_write_behind_prepare(self, monkeypatch):
-        """With the check of skipped copies on (TLLM_DEBUG_MODE=1, or the unit-test fixture), a state index buffer
-        that something other than prepare() wrote fails the next prepare() whose indices did not change."""
-        monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", True)
+        """With check mode on (TLLM_DEVICE_COPY_CHECK=1 or TLLM_DEBUG_MODE=1, or the unit-test fixture),
+        a state index buffer that something other than prepare() wrote fails the next prepare() whose
+        indices did not change."""
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.device_copy.CHECK_MODE", True)
         manager = _StateIndexCacheManager([3, 1])
         metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
         attn_metadata = _decode_attn_metadata(manager)
@@ -287,14 +288,18 @@ class TestMamba2Metadata:
         metadata.prepare(attn_metadata)
         metadata.prepare(attn_metadata)
         metadata.state_indices[:2].copy_(torch.tensor([5, 6], dtype=torch.int32))
-        with pytest.raises(AssertionError, match="holds \\[5, 6\\] instead of \\[3, 1\\]"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"CopySite\.MAMBA2_METADATA_STATE_INDICES was passed unchanged=True, but its destination",
+        ):
             metadata.prepare(attn_metadata)
 
     def test_prepare_alias_keeps_one_owner_across_manager_and_metadata_writes(self, monkeypatch):
         class CacheManager:
             def __init__(self):
                 self._state_indices_buffer = DeviceCopyBuffer(
-                    torch.zeros(2, dtype=torch.int32, device="cuda")
+                    torch.zeros(2, dtype=torch.int32, device="cuda"),
+                    site=CopySite.MAMBA_STATE_INDICES,
                 )
                 self.alias = True
                 self.values = [9, 2]

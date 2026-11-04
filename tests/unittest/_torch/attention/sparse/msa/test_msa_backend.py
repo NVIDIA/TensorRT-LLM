@@ -64,7 +64,7 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
     monkeypatch.setattr(msa_backend, "TAIL_FILL_IN_FORWARD", tail_in_forward)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
-    metadata._ensure_upload_records()
+    metadata._ensure_upload_buffers()
     metadata._msa_buffers_ready = True
     metadata.request_ids = [0]
     metadata.kv_cache_manager = SimpleNamespace(

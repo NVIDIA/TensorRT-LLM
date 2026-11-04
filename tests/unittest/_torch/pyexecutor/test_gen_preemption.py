@@ -380,7 +380,7 @@ def drafter(kind, num_slots=4):
 
     import torch
 
-    from tensorrt_llm._device_copy import DeviceCopyBuffer
+    from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
     from tensorrt_llm._torch.speculative import dflash, dspark
 
     rows = num_slots + 1
@@ -388,7 +388,9 @@ def drafter(kind, num_slots=4):
         worker = object.__new__(dflash.DFlashWorker)
         worker._ctx_buf_inited, worker._req_ctx_pos, worker._dummy_slot = True, {}, num_slots
         worker._ctx_len_host = [0] * rows
-        worker._batch_to_slot_buffer = DeviceCopyBuffer(torch.full((num_slots,), num_slots))
+        worker._batch_to_slot_buffer = DeviceCopyBuffer(
+            torch.full((num_slots,), num_slots), site=CopySite.DFLASH_BATCH_TO_SLOT
+        )
 
         worker._ctx_base_host = [0] * rows
         worker._ctx_base_pages = torch.zeros(rows, dtype=torch.long)
@@ -397,7 +399,9 @@ def drafter(kind, num_slots=4):
         worker._assign_slot = partial(dflash.DFlashWorker._assign_slot, worker)
         worker._seed_generation_slot = partial(dflash.DFlashWorker._seed_generation_slot, worker)
         meta = object.__new__(dflash.DFlashSpecMetadata)
-        meta._batch_indices_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.int))
+        meta._batch_indices_buffer = DeviceCopyBuffer(
+            torch.zeros(num_slots, dtype=torch.int), site=CopySite.DFLASH_BATCH_INDICES
+        )
         meta.batch_indices_cuda = meta._batch_indices_buffer.tensor
         meta._dflash_worker = worker
         meta.host_position_ids = torch.zeros(num_slots, dtype=torch.long)

@@ -19,7 +19,15 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler import (
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-# A host-to-device site the plan merges; its buffer owner skips unchanged uploads (device_copy.UploadRecords).
+
+@pytest.fixture(autouse=True)
+def _copiers_without_check_mode(monkeypatch):
+    """These tests read merged destinations after a discarded step; check mode would leave its poison there (the
+    unit-test conftest turns it on everywhere)."""
+    monkeypatch.setattr(device_copy, "CHECK_MODE", False)
+
+
+# A host-to-device site the plan merges; its buffer owner skips unchanged uploads (device_copy.DeviceCopyBuffer).
 _SITE = CopySite.ATTN_PROMPT_LENS
 _PLAN = CopyPlan(merge={_SITE})
 
@@ -53,8 +61,8 @@ def _host(values):
 
 def test_forward_activates_the_runner_copier_for_the_step_only():
     copier = _copier()
-    records = device_copy.UploadRecords()
     dst = torch.zeros(3, dtype=torch.int32, device="cuda")
+    records = device_copy.DeviceCopyBuffer(dst, site=_SITE)
     values = _host([1, 2, 3])
     seen = {}
 
@@ -62,7 +70,7 @@ def test_forward_activates_the_runner_copier_for_the_step_only():
         seen["copier"] = device_copy.current() is copier
         device_copy.begin()
         seen["pack_open"] = device_copy.is_open()
-        seen["copies"] = [records.copy(_SITE, dst, values) for _ in range(2)]
+        seen["copies"] = [records.update(values) for _ in range(2)]
         seen["staged"] = len(copier._pack.staged)
         device_copy.flush()
         return "outputs"
@@ -77,7 +85,7 @@ def test_forward_activates_the_runner_copier_for_the_step_only():
     torch.cuda.synchronize()
     assert dst.tolist() == [1, 2, 3]
     # The owner's record outlives the step.
-    assert records.copy(_SITE, dst, values) is False
+    assert records.update(values) is False
 
 
 def test_forward_without_a_plan_activates_nothing():
@@ -113,13 +121,13 @@ def test_forward_hides_an_outer_context_copier():
 
 def test_a_failed_step_discards_its_pack_and_the_owners_records_of_it():
     copier = _copier()
-    records = device_copy.UploadRecords()
     dst = torch.zeros(3, dtype=torch.int32, device="cuda")
+    records = device_copy.DeviceCopyBuffer(dst, site=_SITE)
     values = _host([7, 8, 9])
 
     def failing_step(inputs, resource_manager, is_dummy=False):
         device_copy.begin()
-        assert records.copy(_SITE, dst, values) is True
+        assert records.update(values) is True
         assert copier._pack.staged
         raise _StepFailed("forward failed after staging its inputs")
 
@@ -137,7 +145,7 @@ def test_a_failed_step_discards_its_pack_and_the_owners_records_of_it():
     # The merged copy's on_drop dropped the owner's record: the next step re-sends the values.
     def next_step(inputs, resource_manager, is_dummy=False):
         device_copy.begin()
-        sent = records.copy(_SITE, dst, values)
+        sent = records.update(values)
         device_copy.flush()
         return sent
 
