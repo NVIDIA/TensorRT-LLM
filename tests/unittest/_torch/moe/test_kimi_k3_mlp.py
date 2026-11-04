@@ -250,7 +250,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
             super().__init__()
             self.mapping = mapping
 
-        def mnnvl_runs_fusion(self, fusion_op):
+        def mnnvl_runs_fusion(self, fusion_op, hidden_size):
             return False
 
     class _FakeMoE(ConfigurableMoE):

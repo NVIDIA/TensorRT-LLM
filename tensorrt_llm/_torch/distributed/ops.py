@@ -203,9 +203,9 @@ class MnnvlOwnWorkspace:
 
     Its calls neither wait for nor order against the group's other all-reduces, and run the
     one-shot kernel up to ``one_shot_max_bytes`` (all ranks' input) rather than the global
-    threshold; the workspace is created at that size, for a call site that sends only one-shot
-    sizes (``prescale_workspace`` leaves it). Modules built with the same ``name`` and mapping
-    share it.
+    threshold; the workspace is created at that size and never grows (``prescale_workspace``
+    leaves it): a larger call falls back to the strategies after MNNVL. Modules built with the
+    same ``name`` and mapping share it.
 
     ``early_state``: the one-shot kernel reads the workspace's state and re-arms the previous
     call's buffer before its grid dependency wait. Only for a call site whose previous call on
@@ -1430,6 +1430,10 @@ class MNNVLAllReduce(nn.Module):
             return fused
 
         _, workspace_size_bytes = self._transport(num_tokens, hidden_dim)
+        if (self.own_workspace is not None and workspace_size_bytes
+                > self.own_workspace.one_shot_max_bytes):
+            # An own workspace serves only its one-shot sizes; never grow it.
+            return None
 
         # We use uint32_t to store workspace size related info. Safeguard against overflow.
         if workspace_size_bytes >= 2**32 - 1:
@@ -1593,7 +1597,8 @@ class MNNVLAllReduce(nn.Module):
             one_shot, consumer_finishes = True, True
             need = mnnvl_pushed_allreduce.all_gather_call_bytes(
                 num_tokens, hidden_dim, world)
-        if need >= 2**32 - 1:
+        if need >= 2**32 - 1 or (self.own_workspace is not None and need
+                                 > self.own_workspace.one_shot_max_bytes):
             return None
         workspace = self._workspace(need)
         # Only the two-shot transport leaves its result in the workspace.
@@ -1888,12 +1893,16 @@ class AllReduce(nn.Module):
                                                 in_place, consumer_finishes,
                                                 all_gather, norm_params)
 
-    def mnnvl_runs_fusion(self, fusion_op: AllReduceFusionOp) -> bool:
-        """Whether ``forward`` runs ``fusion_op`` on the MNNVL kernels, the only strategy that
-        offers the fusions without a residual (``RMS_NORM_QUANT_*``)."""
+    def mnnvl_runs_fusion(self, fusion_op: AllReduceFusionOp,
+                          hidden_size: int) -> bool:
+        """Whether ``forward`` runs ``fusion_op`` of rows of ``hidden_size`` on the MNNVL kernels,
+        the only strategy that offers the fusions without a residual (``RMS_NORM_QUANT_*``);
+        ``RMS_NORM_QUANT_MXFP8`` takes a multiple of 256."""
         return (self.mapping.tp_size > 1 and self.mnnvl_allreduce is not None
                 and not self._torch_distributed
-                and fusion_op in MNNVLAllReduce.SUPPORTED_FUSION_OPS)
+                and fusion_op in MNNVLAllReduce.SUPPORTED_FUSION_OPS
+                and (fusion_op != AllReduceFusionOp.RMS_NORM_QUANT_MXFP8
+                     or hidden_size % 256 == 0))
 
     @staticmethod
     def push_input(target: MnnvlPushTarget,

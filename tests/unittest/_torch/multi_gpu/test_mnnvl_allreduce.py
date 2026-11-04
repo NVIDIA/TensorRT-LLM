@@ -997,7 +997,9 @@ def run_rms_norm_mxfp8_single_rank(tensor_parallel_size, seq_len, hidden_size):
                               strategy=AllReduceStrategy.MNNVL,
                               dtype=torch.bfloat16)
         assert allreduce.mnnvl_runs_fusion(
-            AllReduceFusionOp.RMS_NORM_QUANT_MXFP8)
+            AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, hidden_size)
+        assert not allreduce.mnnvl_runs_fusion(
+            AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, hidden_size + 128)
         gen = torch.Generator(device="cuda").manual_seed(rank + 3)
         x = (torch.randn(seq_len, hidden_size, device="cuda", generator=gen) *
              0.5).to(torch.bfloat16)
@@ -1144,6 +1146,12 @@ def run_own_workspace_single_rank(tensor_parallel_size, hidden_size,
                              eps=eps))
             ref_q, _ = low_m.mxfp8_quantize_reference(out_own)
             assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+        # A two-shot size falls back to the strategies after MNNVL; the own workspace keeps its
+        # size.
+        x = (torch.randn(big + 1, hidden_size, device="cuda") * 0.5).to(
+            torch.bfloat16)
+        torch.testing.assert_close(own(x), shared(x), rtol=0.02, atol=0.05)
+        assert own.mnnvl_allreduce._workspace()["buffer_size_bytes"] == limit
         torch.cuda.synchronize()
     except Exception:
         traceback.print_exc()

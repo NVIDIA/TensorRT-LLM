@@ -2288,7 +2288,7 @@ class KimiK3MoERuntime(nn.Module):
         if (
             self._reduce_routed_output
             and not self._defer_shared_allreduce
-            and routed_ar.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM)
+            and routed_ar.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM, self.moe_hidden_size)
         ):
             own = AllReduce(
                 routed_ar.mapping,
@@ -2296,7 +2296,7 @@ class KimiK3MoERuntime(nn.Module):
                 dtype=dtype,
                 mnnvl_own_workspace=_LATENT_ALL_REDUCE_WORKSPACE,
             )
-            if own.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM):
+            if own.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM, self.moe_hidden_size):
                 self._own_latent_all_reduce = own
         # Stock fused RMSNorm (flashinfer kernel; the no-flashinfer
         # fallback is the same fp32-variance eager math as KimiK3RMSNorm).
@@ -2345,7 +2345,9 @@ class KimiK3MoERuntime(nn.Module):
             or shared_ar.mnnvl_allreduce is None
             or shared_ar.symm_mem_allreduce is not None
             or shared_ar.mapping.tp_group != routed_ar.mapping.tp_group
-            or not routed_ar.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM_QUANT_MXFP8)
+            or not routed_ar.mnnvl_runs_fusion(
+                AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, self.moe_hidden_size
+            )
         ):
             return False
         one_shot, _ = mnnvl_allreduce_transport(
@@ -2431,7 +2433,7 @@ class KimiK3MoERuntime(nn.Module):
             and self.routed_expert_norm.weight.dtype == torch.bfloat16
             and up.takes_prequantized_input(routed_latent.shape[0])
             and self.routed_experts.all_reduce.mnnvl_runs_fusion(
-                AllReduceFusionOp.RMS_NORM_QUANT_MXFP8
+                AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, routed_latent.shape[-1]
             )
         )
 
