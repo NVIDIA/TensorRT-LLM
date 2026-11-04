@@ -151,7 +151,7 @@ def initialize_node_discovery(executor) -> None:
         ),
         "source_owners": source_owners,
     }
-    executor._openengine_discovery = {"node": metadata, "sources": sources}
+    executor.set_openengine_discovery({"node": metadata, "sources": sources})
     info = server_pb2.ServerInfo(
         engine_name="tensorrt_llm",
         engine_version=__version__,
@@ -190,4 +190,4 @@ def initialize_node_discovery(executor) -> None:
         if server is not None:
             server.close()
         raise RuntimeError(f"OpenEngine node discovery startup failed: {errors}")
-    executor._openengine_node_server = server
+    executor.set_openengine_node_server(server)

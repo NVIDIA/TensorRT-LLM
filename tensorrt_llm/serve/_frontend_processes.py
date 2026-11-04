@@ -92,17 +92,9 @@ def _spawn_attached_frontends(
     bound for it (_frontend_affinity_sockets). Each child inherits its own
     socket; the launcher closes its copy and removes it from the dict.
     """
-    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-
-    executor = getattr(llm, "_executor", None)
-    if (
-        not isinstance(executor, GenerationExecutorProxy)
-        or (attach_info := executor.multi_frontend_attach_info()) is None
-    ):
-        raise ValueError(
-            "num_serve_frontends > 1 requires the classic IPC executor "
-            f"proxy in multi-frontend mode, got {type(executor).__name__}"
-        )
+    # Raises the startup ValueError when the executor is not the classic IPC
+    # proxy in multi-frontend mode.
+    attach_info = llm.multi_frontend_attach_info()
     # Carries the executor HMAC keys; the child deletes it from its env
     # once consumed (GenerationExecutor.create).
     attach_env = json.dumps(attach_info)

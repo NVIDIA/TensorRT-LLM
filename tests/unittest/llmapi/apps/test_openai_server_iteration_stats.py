@@ -51,7 +51,7 @@ class _FakeGenerator:
             enable_iter_perf_stats=enable_iter_perf_stats,
             return_perf_metrics=False,
         )
-        self._executor = SimpleNamespace(resource_governor_queue=None)
+        self.resource_governor_queue = None
         self._stat_batches = deque(stat_batches)
         self._stats_gate = stats_gate
         self._stats_error = stats_error

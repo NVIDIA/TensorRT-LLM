@@ -25,7 +25,12 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from starlette.routing import Match
+from test_common.serve.routes import effective_routes
 
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
+from tensorrt_llm.serve.api.openai.tokenize.serving import TokenizeServing
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.multi_frontend import FORWARDED_ROUTES
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -65,7 +70,7 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     server = object.__new__(OpenAIServer)
     server.app = FastAPI()
     server.generator = SimpleNamespace(
-        _executor=SimpleNamespace(resource_governor_queue=None),
+        resource_governor_queue=None,
         args=SimpleNamespace(return_perf_metrics=False),
     )
     server.use_harmony = False
@@ -73,10 +78,23 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     server._enable_rl_control_endpoints = True
     server._enable_runtime_control_endpoints = True
     server.resource_governor = None
+    # As OpenAIServer.__init__ does: the serving objects the routers read go on
+    # app.state, the role's own table is registered, then the routers of the role
+    # (the system router with /health, /version and /v1/models, and the tokenize
+    # router) are attached.
+    server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
+    setattr(
+        server.app.state,
+        tokenize_router.APP_STATE_KEY,
+        TokenizeServing(model="m", tokenizer=None),
+    )
     server.register_routes()
+    attach_routers(server.app, ServerCapabilities.for_role(None))
+    # effective_routes walks included routers, which FastAPI 0.139 keeps as
+    # objects without .path or .methods in app.routes.
     return sorted(
-        (method, route.path)
-        for route in server.app.routes
+        (method, path)
+        for path, route in effective_routes(server.app)
         if getattr(route, "methods", None)
         for method in route.methods
         if method != "HEAD"

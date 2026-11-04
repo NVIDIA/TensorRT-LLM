@@ -35,7 +35,11 @@ from starlette.routing import Match
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
+from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
+from tensorrt_llm.serve.api.openai.tokenize.serving import TokenizeServing
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
     AttachedFrontendWatchdog,
@@ -103,7 +107,7 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
     server.app = FastAPI(lifespan=lifespan)
     server.generator = SimpleNamespace(
-        _executor=SimpleNamespace(resource_governor_queue=None),
+        resource_governor_queue=None,
         args=SimpleNamespace(return_perf_metrics=False),
     )
     server.use_harmony = False
@@ -111,9 +115,19 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server._enable_runtime_control_endpoints = False
     server.resource_governor = None
     server._launcher_forwarder = forwarder
-    # The order OpenAIServer.__init__ registers them in.
+    # The order OpenAIServer.__init__ registers them in: the launcher forwarding
+    # routes, then the local table, then the routers of the role (the system
+    # router with /health, /version and /v1/models, and the tokenize router),
+    # which read their serving objects from app.state.
+    server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
+    setattr(
+        server.app.state,
+        tokenize_router.APP_STATE_KEY,
+        TokenizeServing(model="m", tokenizer=None),
+    )
     server._register_launcher_forwarding_routes()
     server.register_routes()
+    attach_routers(server.app, ServerCapabilities.for_role(None))
     return server
 
 
@@ -241,12 +255,25 @@ def test_launcher_logs_an_attached_frontend_that_dies(monkeypatch) -> None:
     assert "frontend 1 " in errors[0] and "signal 9" in errors[0] and "2 of 3" in errors[0]
 
 
-@pytest.mark.parametrize("doing_shutdown", [False, True])
-def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, doing_shutdown: bool) -> None:
-    fatal_errors = []
-    executor = SimpleNamespace(doing_shutdown=doing_shutdown, _set_fatal_error=fatal_errors.append)
+class _FatalErrorRecorder:
+    """Generator double for the public fatal-error recording surface."""
+
+    def __init__(self, shutdown_started: bool, has_executor: bool = True) -> None:
+        self.shutdown_started = shutdown_started
+        self._has_executor = has_executor
+        self.fatal_errors = []
+
+    def record_fatal_error(self, error: BaseException) -> bool:
+        if not self._has_executor:
+            return False
+        self.fatal_errors.append(error)
+        return True
+
+
+@pytest.mark.parametrize("shutdown_started", [False, True])
+def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, shutdown_started: bool) -> None:
     server = object.__new__(OpenAIServer)
-    server.generator = SimpleNamespace(_executor=executor)
+    server.generator = _FatalErrorRecorder(shutdown_started)
     signals, terminations = [], []
     monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
     monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
@@ -254,10 +281,27 @@ def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, doing_shutdown
     error = RuntimeError("attached frontend lost its engine: test")
     server._on_launcher_lost(error)
 
-    assert fatal_errors == [error]
+    assert server.generator.fatal_errors == [error]
     # A shutdown already under way gets no second SIGINT (which would force-quit it).
-    assert signals == ([] if doing_shutdown else [signal.SIGINT])
-    assert terminations == ([] if doing_shutdown else [server.generator])
+    assert signals == ([] if shutdown_started else [signal.SIGINT])
+    assert terminations == ([] if shutdown_started else [server.generator])
+
+
+def test_on_launcher_lost_is_a_no_op_after_llm_shutdown(monkeypatch) -> None:
+    """record_fatal_error returning False means the LLM already shut down."""
+    # The production method on a stand-in: _on_launcher_lost reads only self.generator.
+    server = SimpleNamespace(
+        generator=_FatalErrorRecorder(shutdown_started=False, has_executor=False)
+    )
+    signals, terminations = [], []
+    monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
+    monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
+
+    OpenAIServer._on_launcher_lost(server, RuntimeError("attached frontend lost its engine: test"))
+
+    assert server.generator.fatal_errors == []
+    assert signals == []
+    assert terminations == []
 
 
 def test_shared_clock_offset_publish_and_poll(tmp_path) -> None:

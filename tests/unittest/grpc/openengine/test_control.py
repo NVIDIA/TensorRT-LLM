@@ -104,6 +104,7 @@ def _llm(**overrides):
         guided_decoding_backend="xgrammar",
         max_beam_width=1,
         reasoning_parser=None,
+        encode_only=False,
         kv_cache_config=SimpleNamespace(tokens_per_block=32),
         _enable_routing_load=overrides.get("_enable_routing_load", "_kv_load" in overrides),
     )
@@ -113,13 +114,6 @@ def _llm(**overrides):
         setattr(args, key, value)
     shutdown = overrides.get("_executor_shutdown", False)
     unhealthy = overrides.get("_executor_unhealthy", False)
-    executor = SimpleNamespace(
-        is_shutdown=lambda: shutdown,
-        check_health=lambda: not (shutdown or unhealthy),
-        get_kv_cache_capacity=lambda: overrides.get("_kv_capacity", {}),
-        get_openengine_discovery=lambda: overrides.get("_openengine_discovery", {}),
-        get_kv_cache_load=lambda: overrides.get("_kv_load", {}),
-    )
     return SimpleNamespace(
         args=args,
         llm_id="instance-1",
@@ -127,8 +121,10 @@ def _llm(**overrides):
         input_processor=SimpleNamespace(
             supports_token_ids_input=overrides.get("_supports_token_ids_input", True)
         ),
-        _executor=executor,
-        _check_health=lambda: executor.check_health(),
+        check_health=lambda: not (shutdown or unhealthy),
+        get_kv_cache_capacity=lambda: overrides.get("_kv_capacity", {}),
+        get_openengine_discovery=lambda: overrides.get("_openengine_discovery", {}),
+        get_kv_cache_load=lambda: overrides.get("_kv_load", {}),
     )
 
 
@@ -610,7 +606,7 @@ async def test_health_reports_not_ready_for_a_crashed_engine_that_is_not_shut_do
 async def test_health_survives_a_raising_health_check(error_type):
     """A probe reports state; it must not turn an engine fault into an RPC error."""
     llm = _llm()
-    llm._check_health = lambda: (_ for _ in ()).throw(error_type("engine gone"))
+    llm.check_health = lambda: (_ for _ in ()).throw(error_type("engine gone"))
     servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
 
     response = await servicer.Health(lifecycle_pb2.HealthRequest(), FakeServicerContext())

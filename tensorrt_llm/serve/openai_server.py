@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import array
 import asyncio
 import base64
 import functools
@@ -25,7 +24,6 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, Dict, List, Optional, Tuple, Union)
 
-import msgspec
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -43,8 +41,6 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
-from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
@@ -67,6 +63,10 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve._base.serving import (BaseServing, GenerateBaseServing,
+                                              _record_generator_termination)
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -81,6 +81,12 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.openai.embeddings.batcher import EncodeBatcher
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
+from tensorrt_llm.serve.api.visual_gen.protocol import (ImageEditRequest,
+                                                        ImageGenerationRequest,
+                                                        ImageGenerationResponse,
+                                                        ImageObject)
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -90,8 +96,6 @@ from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request,
     validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
-from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
-                                               QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                AttachedFrontendWatchdog,
@@ -101,16 +105,11 @@ from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                follow_clock_offset)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatCompletionToolsParam, ChatMessage, CompletionRequest,
-    CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
-    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
-    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse,
-    RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
+    ChatCompletionResponse, ChatCompletionToolsParam, CompletionRequest,
+    CompletionResponse, CompletionResponseChoice, MemoryUpdateRequest,
+    PromptTokensDetails, ResponseFormat, ResponsesRequest, ResponsesResponse,
+    RuntimeMemoryUpdateRequest, StartProfileRequest, UpdateWeightsRequest,
+    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
@@ -149,7 +148,6 @@ from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
 from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
                                                  parse_visual_gen_params)
-from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import (AdjustedSteadyClock,
@@ -157,7 +155,6 @@ from .._utils import (AdjustedSteadyClock,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
-from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
@@ -178,33 +175,6 @@ def _is_visual_gen_instance(obj) -> bool:
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
-
-_msgpack_decoder = msgspec.msgpack.Decoder()
-
-
-class _MsgspecRequest(KvHintsRequest):
-    """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
-
-    async def json(self):
-        if not hasattr(self, "_json_body"):
-            body = await self.body()
-            if not body:
-                self._json_body = {}
-            elif self.headers.get("x-trtllm-msgpack") == "1":
-                try:
-                    self._json_body = _msgpack_decoder.decode(body)
-                except msgspec.DecodeError as e:
-                    raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
-            else:
-                self._json_body = json.loads(body)
-        return self.filter_kv_hints(self._json_body)
-
-
-class _MsgspecRoute(KvHintsRoute):
-    """Parse msgpack/JSON and apply hint trust policy before model validation."""
-
-    request_type = _MsgspecRequest
-
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -289,31 +259,6 @@ def _configure_parser_special_token_decoding(
         # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
         # changes the protocol and prevents the K3 parsers from matching it.
         sampling_params.spaces_between_special_tokens = False
-
-
-def _record_generator_termination(generator) -> None:
-    """Classify a fatal generator error without exposing exception details."""
-    component = "llm"
-    reporting_source = "self"
-    termination_kind = "exception"
-    try:
-        from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-
-        if isinstance(getattr(generator, "_executor", None),
-                      GenerationExecutorProxy):
-            component = "engine_worker"
-            reporting_source = "executor_proxy"
-            termination_kind = "worker_failure"
-    except Exception:
-        pass
-    record_termination_observation(
-        TerminalOutcome(
-            termination_kind=termination_kind,
-            component=component,
-            reporting_source=reporting_source,
-            exit_code_known=False
-            if termination_kind == "worker_failure" else None,
-        ))
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -779,6 +724,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_visual_gen()
         else:
             self._init_llm(chat_template)
+            # Built once and injected into serving objects.
+            self._render_resources = RenderResources.from_server(self)
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -907,6 +854,12 @@ class OpenAIServer(_VideoRoutesMixin):
                     len(detail) - 4096)
             return JSONResponse(status_code=400, content={"error": detail})
 
+        # /health, /version and /v1/models for every role. The health
+        # probe stays here, with its private accesses, until the public
+        # health API exists.
+        self.app.state.ops_serving_system = SystemServing(
+            model=self.model, health_probe=self._health_probe)
+
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
@@ -915,16 +868,50 @@ class OpenAIServer(_VideoRoutesMixin):
             assert isinstance(
                 self.generator, MultimodalEncoder
             ), "generator must be a MultimodalEncoder for multimodal encoder"
+            from tensorrt_llm.serve.api.openai.mm_encoder import \
+                api_router as mm_encoder_router
+            from tensorrt_llm.serve.api.openai.mm_encoder.serving import \
+                MMEncoderServing
+            setattr(
+                self.app.state, mm_encoder_router.APP_STATE_KEY,
+                MMEncoderServing(
+                    render_resources=self._render_resources,
+                    multimodal_server_config=self.multimodal_server_config,
+                    allow_request_chat_template=self.
+                    allow_request_chat_template,
+                    **self._generate_serving_kwargs()))
             self.register_mm_encoder_routes()
         elif self.server_role is ServerRole.EMBEDDING:
             assert getattr(self.generator.args, "encode_only", False), (
                 "generator must be an encode_only=True LLM for the embedding "
                 "server")
-            self._init_embedding_batcher()
-            self.register_embedding_routes()
+            from tensorrt_llm.serve.api.openai.embeddings import \
+                api_router as embeddings_router
+            from tensorrt_llm.serve.api.openai.embeddings.serving import \
+                EmbeddingServing
+            embedding_serving = EmbeddingServing(
+                model=self.model,
+                generator=self.generator,
+                embedding_max_queue_delay=self._embedding_max_queue_delay,
+                embedding_max_queue_size=self._embedding_max_queue_size)
+            # The lifespan starts and stops the batcher and the health probe
+            # reports it; both read it here.
+            self.embedding_batcher = embedding_serving.embedding_batcher
+            setattr(self.app.state, embeddings_router.APP_STATE_KEY,
+                    embedding_serving)
         else:
+            from tensorrt_llm.serve.api.openai.tokenize import \
+                api_router as tokenize_router
+            from tensorrt_llm.serve.api.openai.tokenize.serving import \
+                TokenizeServing
+            setattr(self.app.state, tokenize_router.APP_STATE_KEY,
+                    TokenizeServing(model=self.model, tokenizer=self.tokenizer))
             self._register_launcher_forwarding_routes()
             self.register_routes()
+
+        # Attach routers after the role switch: every attach_router checks
+        # that its serving objects are on app.state.
+        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
 
         if self._collect_perf_metrics:
             self.app.add_middleware(PerfMetricsMiddleware,
@@ -961,11 +948,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
-        hf_tokenizer_path = self.generator._hf_model_dir
-        if not hf_tokenizer_path:
-            hf_tokenizer_path = getattr(
-                self.tokenizer.tokenizer, "name_or_path", None) or getattr(
-                    self.tokenizer, "name_or_path", None)
+        hf_tokenizer_path = self.generator.hf_model_dir
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
@@ -1093,41 +1076,10 @@ class OpenAIServer(_VideoRoutesMixin):
         return (cache_transceiver_config is not None and getattr(
             cache_transceiver_config, "backend", None) is not None)
 
-    @staticmethod
-    def _attach_multimodal_data(
-            prompt: Dict[str, Any],
-            request: Any,
-            mm_data: Any,
-            mm_item_order: Optional[List[Any]] = None) -> None:
-        """Attach decoded media to the prompt dict handed to the engine.
+    _attach_multimodal_data = staticmethod(
+        GenerateBaseServing._attach_multimodal_data)
 
-        When the request carried no ``prompt_token_ids``, ``prompt`` is the
-        chat template's output with one placeholder per media item already in
-        it, so ``chat_template_applied`` tells the input processor to use it
-        verbatim instead of rendering the template a second time.
-        """
-        prompt["multi_modal_data"] = mm_data
-        if request.prompt_token_ids is None:
-            prompt["chat_template_applied"] = True
-        if mm_item_order:
-            prompt["mm_item_order"] = mm_item_order
-
-    async def await_disconnected(self, raw_request: Request, promise):
-        if raw_request is None:
-            return
-        # A batched request is synthesised without a client socket, so
-        # is_disconnected() can never become true and this poll would run at
-        # 1Hz for the life of the process, holding the Request and its
-        # RequestOutput -- one leaked task per batched request.
-        if getattr(raw_request.state, "no_client_connection", False):
-            return
-        while not await raw_request.is_disconnected():
-            await asyncio.sleep(1)
-        if not promise.finished:
-            promise.abort()
-            logger.info(
-                f"{raw_request.client} is disconnected, abort {promise.request_id}"
-            )
+    await_disconnected = GenerateBaseServing.await_disconnected
 
     @functools.cached_property
     def _is_visual_gen(self) -> bool:
@@ -1143,22 +1095,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
-    @staticmethod
-    def create_error_response(
-            message: str,
-            err_type: str = "BadRequestError",
-            status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts are detected from the message text because they
-        # cross the executor IPC boundary as plain strings (RequestError), so
-        # no exception type survives to here.
-        code: Union[int, str] = status_code.value
-        if is_context_length_exceeded_message(message):
-            code = CONTEXT_LENGTH_EXCEEDED_CODE
-        error_response = ErrorResponse(message=message,
-                                       type=err_type,
-                                       code=code)
-        return JSONResponse(content=error_response.model_dump(),
-                            status_code=status_code.value)
+    create_error_response = staticmethod(BaseServing.create_error_response)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -1211,6 +1148,13 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         )
 
+    def _generate_serving_kwargs(self) -> Dict[str, Any]:
+        """Constructor arguments of every GenerateBaseServing, read once."""
+        return dict(model=self.model,
+                    generator=self.generator,
+                    tokenizer=self.tokenizer,
+                    model_config=self.model_config)
+
     def _check_health(self) -> bool:
         # An embedding server's requests flow through the batcher worker; if it
         # has exited the engine is up but every /v1/embeddings request hangs, so
@@ -1218,17 +1162,16 @@ class OpenAIServer(_VideoRoutesMixin):
         batcher = self.embedding_batcher
         if batcher is not None and not batcher.is_alive():
             return False
-        if hasattr(self.generator, '_check_health'):
-            return self.generator._check_health()
-        return True
+        if self._is_visual_gen:
+            # VisualGen has no check_health(), so its /health always
+            # answers 200.
+            return True
+        return self.generator.check_health()
 
     def register_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate",
                                self.health_generate,
                                methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/data_transceiver_state",
                                self.data_transceiver_state,
                                methods=["GET"])
@@ -1250,7 +1193,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
-        resource_governor_queue = self.generator._executor.resource_governor_queue
+        resource_governor_queue = self.generator.resource_governor_queue
         if resource_governor_queue is not None:
             from .resource_governor import ResourceGovernor
             self.resource_governor = ResourceGovernor(
@@ -1326,9 +1269,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route('/v1/responses/{response_id}',
                                self.openai_responses_delete_response,
                                methods=["DELETE"])
-        self.app.add_api_route("/_internal/tokenize",
-                               self.tokenize,
-                               methods=["POST"])
 
         # Profiling endpoints (PyTorch backend only)
         self.app.add_api_route("/start_profile",
@@ -1373,16 +1313,10 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.routes.append(metrics_route)
 
     def register_mm_encoder_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
-        self.app.add_api_route("/v1/chat/completions",
-                               self.openai_mm_encoder,
-                               methods=["POST"])
 
     async def _require_rl_control_auth(self, raw_request: Request) -> None:
         body = await raw_request.body()
@@ -1450,147 +1384,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["POST"],
                                dependencies=dependencies)
 
-    def _init_embedding_batcher(self):
-        """Create the encode dynamic batcher for the embedding server.
-
-        The batcher coalesces concurrent /v1/embeddings requests into a single
-        `llm.encode()` call. `encode()` is synchronous; the batcher runs it in
-        the default executor so the event loop stays responsive.
-        """
-
-        def encode_fn(token_ids_batch):
-            # token_ids_batch: list of pre-tokenized token-id lists. encode()
-            # returns one EncoderOutput per item, in input order.
-            return self.generator.encode(token_ids_batch)
-
-        # Source the batch limits from the resolved encoder engine — the same
-        # attributes encode() validates against (llm.py: engine.max_seq_len /
-        # max_num_tokens / batch_size). LlmArgs.max_seq_len/max_num_tokens default
-        # to None and are not written back to args, so reading them from args
-        # would leave the batcher's seq-len/token-budget guards inert (typed 400s
-        # would never fire) and could let it form a batch encode() then rejects.
-        engine = self.generator._encoder_executor.model_engine
-        self.embedding_batcher = EncodeBatcher(
-            encode_fn,
-            max_batch_size=engine.batch_size,
-            max_queue_delay=self._embedding_max_queue_delay,
-            max_queue_size=self._embedding_max_queue_size,
-            max_num_tokens=engine.max_num_tokens,
-            max_seq_len=engine.max_seq_len,
-        )
-
-    def register_embedding_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        self.app.add_api_route("/v1/embeddings",
-                               self.openai_embedding,
-                               methods=["POST"])
-
-    @staticmethod
-    def _normalize_embedding_input(inp):
-        """Normalize EmbeddingRequest.input into a list of items.
-
-        Each item is either a string (to tokenize) or a pre-tokenized token-id
-        list. Mirrors the four OpenAI input forms: str | list[str] | list[int] |
-        list[list[int]].
-        """
-        if isinstance(inp, str):
-            return [inp]
-        if isinstance(inp, list):
-            if len(inp) == 0:
-                return []
-            if isinstance(inp[0], int):
-                return [inp]  # a single pre-tokenized input
-            return list(inp)  # list of strings or list of token-id lists
-        raise TypeError(f"Unsupported embedding input type: {type(inp)}")
-
-    async def openai_embedding(self, request: EmbeddingRequest,
-                               raw_request: Request) -> Response:
-        try:
-            # `dimensions` is a Matryoshka-embedding knob (truncate-then-renormalize
-            # a sentence-embedding vector), matching vLLM, which rejects it for
-            # non-Matryoshka models. None of the models served here are
-            # Matryoshka-trained: BERT classifiers / reward models emit raw
-            # [num_labels] / [seq_len, num_labels] tensors, and Qwen3-Embedding emits
-            # a fixed-width pooled vector with no nested sub-dimensions. Truncating
-            # any of these is meaningless, so reject. (Honoring `dimensions` for a
-            # genuinely Matryoshka model would be a fast-follow.)
-            if request.dimensions is not None:
-                return self.create_error_response(
-                    "`dimensions` is only supported by Matryoshka-trained "
-                    "text-embedding models; none of the models served by this "
-                    "endpoint are Matryoshka-trained.",
-                    status_code=HTTPStatus.BAD_REQUEST)
-
-            items = self._normalize_embedding_input(request.input)
-            if not items:
-                return self.create_error_response("`input` must not be empty.")
-
-            # Tokenize strings via the same input processor used by /v1/completions,
-            # honoring add_special_tokens. Pre-tokenized inputs are used as-is.
-            sampling_params = SamplingParams(
-                add_special_tokens=request.add_special_tokens)
-            token_ids_list = []
-            for item in items:
-                if isinstance(item, str):
-                    token_ids, _ = await asyncio.to_thread(
-                        self.generator.input_processor, prompt_inputs(item),
-                        sampling_params)
-                else:
-                    token_ids = item
-                token_ids_list.append(token_ids)
-
-            try:
-                # Validate every input's length up front so an oversize item fails
-                # the whole request before any item is enqueued — otherwise gather()
-                # cancels the awaiters but their already-queued inputs still run
-                # encode() (wasted GPU work).
-                for token_ids in token_ids_list:
-                    self.embedding_batcher.validate_input(token_ids)
-                results = await asyncio.gather(*[
-                    self.embedding_batcher.submit(token_ids)
-                    for token_ids in token_ids_list
-                ])
-            except InputTooLongError as e:
-                return self.create_error_response(
-                    str(e), status_code=HTTPStatus.BAD_REQUEST)
-            except QueueFullError as e:
-                return self.create_error_response(
-                    str(e), status_code=HTTPStatus.TOO_MANY_REQUESTS)
-
-            data = []
-            for idx, encoder_output in enumerate(results):
-                # Model-agnostic: serialize whatever per-request tensor encode()
-                # emits (classification logits, reward score, pooled vector, ...).
-                embedding = encoder_output.logits.flatten().tolist()
-                if request.encoding_format == "base64":
-                    embedding = base64.b64encode(
-                        array.array("f", embedding).tobytes()).decode("utf-8")
-                data.append(
-                    EmbeddingResponseData(index=idx, embedding=embedding))
-
-            num_prompt_tokens = sum(len(t) for t in token_ids_list)
-            usage = EmbeddingUsageInfo(prompt_tokens=num_prompt_tokens,
-                                       total_tokens=num_prompt_tokens)
-            response = EmbeddingResponse(model=request.model,
-                                         data=data,
-                                         usage=usage)
-            return JSONResponse(content=response.model_dump())
-        except Exception as e:
-            # Unexpected fault (not a client error): surface as 500, not 400.
-            logger.error(traceback.format_exc())
-            return self.create_error_response(
-                str(e),
-                err_type="InternalServerError",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""
-        # Health and info endpoints
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
@@ -1699,17 +1494,17 @@ class OpenAIServer(_VideoRoutesMixin):
 
         Mirrors the fatal-error branch of ``health``.
         """
-        executor = self.generator._executor
-        if executor is None:  # the LLM already shut down
+        # record_fatal_error keeps only the first error; False means the LLM
+        # already shut down.
+        if not self.generator.record_fatal_error(error):
             return
-        executor._set_fatal_error(error)  # keeps only the first error
-        if not executor.doing_shutdown:
+        if not self.generator.shutdown_started:
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
-    async def health(self) -> Response:
+    def _health_probe(self) -> bool:
         if self._check_health():
-            return Response(status_code=200)
+            return True
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
@@ -1718,20 +1513,15 @@ class OpenAIServer(_VideoRoutesMixin):
             # its graceful shutdown sequence.  The doing_shutdown guard
             # ensures we only send SIGINT once — repeated health probes
             # won't stack signals during an in-progress teardown.
-            executor = getattr(self.generator, '_executor', None)
-            if executor is not None and getattr(executor, '_fatal_error',
-                                                None) is not None:
-                if not getattr(executor, 'doing_shutdown', True):
-                    logger.error(
-                        "Health check detected fatal engine error, initiating "
-                        f"server shutdown: {executor._fatal_error}")
-                    _record_generator_termination(self.generator)
-                    signal.raise_signal(signal.SIGINT)
-            return Response(
-                status_code=503,
-                content=
-                "LLM is unavailable. Please check the server logs for more details."
-            )
+            fatal_error = (None if self._is_visual_gen else
+                           self.generator.fatal_error)
+            if fatal_error is not None and not self.generator.shutdown_started:
+                logger.error(
+                    "Health check detected fatal engine error, initiating "
+                    f"server shutdown: {fatal_error}")
+                _record_generator_termination(self.generator)
+                signal.raise_signal(signal.SIGINT)
+            return False
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
@@ -1781,14 +1571,6 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(f"Health generate check encountered exception: {e}")
             return Response(status_code=500,
                             content=f"Generation health check failed: {str(e)}")
-
-    async def version(self) -> JSONResponse:
-        ver = {"version": VERSION}
-        return JSONResponse(content=ver)
-
-    async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
-        return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
         # Visual-gen deployments use a separate iteration-stats producer
@@ -2825,122 +2607,6 @@ class OpenAIServer(_VideoRoutesMixin):
             f"Message Batch {batch_id} not found. Batches are stored in memory "
             "and do not survive a server restart.", "not_found_error", 404)
 
-    async def openai_mm_encoder(self, request: ChatCompletionRequest,
-                                raw_request: Request) -> Response:
-
-        async def create_mm_embedding_response(promise: RequestOutput):
-            await promise.aresult()
-            # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
-            mm_embedding_handles = (
-                promise.disaggregated_params.multimodal_embedding_handles
-                if promise.disaggregated_params else None)
-            if not mm_embedding_handles:
-                return self.create_error_response(
-                    message="Multimodal embedding handle missing in response",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-            if any("tensor_size" not in h for h in mm_embedding_handles):
-                return self.create_error_response(
-                    message="Multimodal embedding handle missing tensor_size",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-            mm_embedding_handle = (mm_embedding_handles[0]
-                                   if len(mm_embedding_handles) == 1 else
-                                   mm_embedding_handles)
-            num_tokens = sum(
-                int(h["tensor_size"][0]) for h in mm_embedding_handles)
-            return ChatCompletionResponse(
-                id=str(promise.request_id),
-                model=self.model,
-                choices=[
-                    ChatCompletionResponseChoice(
-                        index=0,
-                        message=ChatMessage(role="assistant", content="dummy"),
-                        mm_embedding_handle=mm_embedding_handle,
-                        finish_reason="length",
-                    )
-                ],
-                usage=UsageInfo(
-                    prompt_tokens=num_tokens,
-                    completion_tokens=1,
-                    total_tokens=num_tokens + 1,
-                ),
-            )
-
-        try:
-            ensure_request_chat_template_allowed(
-                request, self.allow_request_chat_template)
-            conversation: List[ConversationMessage] = []
-            # Same pipeline as the chat route: the server template and the
-            # model extension's tool serialization apply here too.
-            render_resources = RenderResources.from_server(self)
-            tool_dicts = None if request.tools is None else [
-                render_resources.extension.serialize_tool(tool)
-                for tool in request.tools
-            ]
-
-            try:
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
-                    request.messages,
-                    self.model_config,
-                    self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs,
-                )
-            except ValidationError:
-                # ValidatorIterator rejects extra fields; fall back to raw JSON.
-                raw_body = await raw_request.json()
-                raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
-                    raw_messages,
-                    self.model_config,
-                    self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs,
-                )
-
-            if request.prompt_token_ids is not None:
-                prompt = request.prompt_token_ids
-            else:
-                render_task = render_conversation(
-                    render_resources,
-                    conversation=conversation,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    add_generation_prompt=request.add_generation_prompt,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                )
-                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
-                prompt = (rendered.text
-                          if rendered.text is not None else rendered.token_ids)
-            prompt = prompt_inputs(prompt)
-
-            if request.prompt_token_ids is not None:
-                mm_data, mm_embeddings = await mm_coroutines
-            if mm_embeddings:
-                raise ValueError("Cannot use multimodal embeddings as input")
-            if mm_data is not None:
-                self._attach_multimodal_data(prompt, request, mm_data,
-                                             mm_item_order)
-
-            promise = self.generator.generate_async(inputs=prompt, )
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
-
-            response = await create_mm_embedding_response(promise)
-            return JSONResponse(content=response.model_dump())
-
-        except CppExecutorError:
-            logger.error(traceback.format_exc())
-            # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
-
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
 
@@ -3629,17 +3295,6 @@ class OpenAIServer(_VideoRoutesMixin):
             "object": "response",
             "deleted": True
         })
-
-    async def tokenize(self, request: TokenizeRequest) -> JSONResponse:
-        try:
-            token_ids = self.tokenizer.encode(request.prompt)
-            response = TokenizeResponse(count=len(token_ids), tokens=token_ids)
-            return JSONResponse(content=response.model_dump())
-        except Exception as e:
-            return self.create_error_response(
-                message=str(e),
-                err_type="InvalidRequestError",
-                status_code=HTTPStatus.BAD_REQUEST)
 
     async def start_profile(
             self,

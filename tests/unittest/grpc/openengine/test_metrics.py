@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
+from starlette.routing import Match
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
@@ -151,7 +152,7 @@ async def _serving() -> None:
     llm = _FakeLlm([])
     llm.args = _args()
     llm.llm_id = "test-engine"
-    llm._check_health = lambda: True
+    llm.check_health = lambda: True
     reads = []
 
     def get_stats(timeout):
@@ -607,23 +608,31 @@ def _http_enablement() -> None:
 
     with pytest.MonkeyPatch.context() as patch:
         # Exercise the real constructor and route registration without loading a model.
-        patch.setattr(
-            OpenAIServer, "_init_llm", lambda self, _: setattr(self, "use_harmony", False)
-        )
+        # The constructor reads these after _init_llm: use_harmony for the chat routes
+        # and tokenizer for the tokenize serving object it builds for the LLM role.
+        def init_llm(self, _):
+            self.use_harmony = False
+            self.tokenizer = None
+
+        patch.setattr(OpenAIServer, "_init_llm", init_llm)
         for requested, output_dir in [(False, None), (True, None), (False, "unused-jsonl")]:
             args = _args()
             args.return_perf_metrics = requested
             args.perf_metrics_output_dir = output_dir
-            generator = SimpleNamespace(
-                args=args, _executor=SimpleNamespace(resource_governor_queue=None)
-            )
+            generator = SimpleNamespace(args=args, resource_governor_queue=None)
             server = OpenAIServer(generator, "test-model", None, None, None)
             try:
                 enabled = requested or output_dir is not None
-                assert (
-                    any(route.path == "/prometheus/metrics" for route in server.app.routes)
-                    == enabled
-                )
+                # Match a request instead of reading .path off app.routes: FastAPI
+                # 0.139 keeps included routers there as objects without a path.
+                scope = {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/prometheus/metrics",
+                    "path_params": {},
+                }
+                exposed = any(route.matches(scope)[0] == Match.FULL for route in server.app.routes)
+                assert exposed == enabled
                 assert server._expose_perf_metrics is requested
                 assert server._collect_perf_metrics is enabled
                 assert args.return_perf_metrics is enabled

@@ -11,6 +11,7 @@ from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
+    registered_model_type,
 )
 
 from .kv_events import events_config
@@ -67,7 +68,7 @@ def supported_guides(backend: str | None) -> frozenset[str]:
 def _loaded_model_type(llm: Any) -> str:
     """Return the top-level model type for the loaded input processor."""
     input_processor = getattr(llm, "input_processor", None)
-    config = getattr(input_processor, "config", None) or getattr(llm, "_hf_model_config", None)
+    config = getattr(input_processor, "config", None) or getattr(llm, "hf_model_config", None)
     if config is None:
         return ""
     return resolve_top_level_model_type(config)
@@ -102,8 +103,7 @@ def resolve_media_capabilities(
     if not model_type:
         return MediaCapabilities({})
     if not isinstance(input_processor, BaseMultimodalInputProcessor):
-        registered_model_type = getattr(type(input_processor), "_registered_model_type", None)
-        if registered_model_type != model_type:
+        if registered_model_type(type(input_processor)) != model_type:
             return MediaCapabilities({})
         if not callable(input_processor):
             return MediaCapabilities({})

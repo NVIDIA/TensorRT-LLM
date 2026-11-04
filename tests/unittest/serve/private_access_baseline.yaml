@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Cross-package private accesses from tensorrt_llm/serve (without serve/scripts/),
+# tensorrt_llm/commands and tensorrt_llm/grpc, checked by test_private_access_lint.py.
+# This list only shrinks. When you remove an access, lower `count` (delete the entry
+# at 0) and lower MAX_TOTAL in the test. Never add an entry: add a public accessor on
+# the class that owns the member. A pure move changes `path` and `scope` only.
+# `owner` and `replacement` are for readers; the test uses path, scope, member, count.
+version: 1
+entries:
+- {path: tensorrt_llm/grpc/openengine/control.py, scope: OpenEngineControlServicer.GetServerInfo, member: _openengine_discovery, count: 1, owner: llmapi/llm_args.py BaseLlmArgs, replacement: BaseLlmArgs.openengine_discovery}
+- {path: tensorrt_llm/grpc/openengine/control.py, scope: OpenEngineControlServicer.__init__, member: _enable_routing_load, count: 1, owner: llmapi/llm_args.py BaseLlmArgs, replacement: BaseLlmArgs.enable_routing_load}
+- {path: tensorrt_llm/grpc/openengine/node.py, scope: initialize_node_discovery, member: _openengine_discovery, count: 1, owner: llmapi/llm_args.py BaseLlmArgs, replacement: BaseLlmArgs.openengine_discovery}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer._create_chat_response, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.chat_harmony.create_streaming_generator, member: _postprocess_result, count: 2, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_chat.chat_stream_generator, member: _postprocess_result, count: 2, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_completion.completion_generator, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_completion.completion_response, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_image_generation, member: _save_bytes, count: 1, owner: visual_gen/output.py, replacement: public VisualGen output encoder}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_responses.create_response, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_responses.create_streaming_generator, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: chat_harmony_streaming_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: chat_stream_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: completion_stream_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: responses_api_streaming_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/responses_utils.py, scope: ResponsesStreamingProcessor.process_single_output, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/router_utils.py, scope: BlockHashMixin._compute_block_hashes, member: _hash_cache_salt, count: 1, owner: runtime/kv_cache_manager_v2 KVCacheEventManager (nanobind), replacement: public hash_cache_salt binding}

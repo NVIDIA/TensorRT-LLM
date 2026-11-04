@@ -26,6 +26,16 @@ def mock_mm_data_tracker():
     return MagicMock()
 
 
+def test_multimodal_server_config_property():
+    """Chat parsing reads the tracker's media settings through this property."""
+    config = MultimodalServerConfig()
+    assert MultimodalDataTracker("llava", config).multimodal_server_config is config
+    # Without an explicit config the tracker builds a default one.
+    assert isinstance(
+        MultimodalDataTracker("llava").multimodal_server_config, MultimodalServerConfig
+    )
+
+
 class TestParseAssistantMessages:
     """Test suite for assistant role messages."""
 

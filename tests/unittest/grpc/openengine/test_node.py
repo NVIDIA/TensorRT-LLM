@@ -21,6 +21,18 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
 pytestmark = pytest.mark.cpu_only
 
 
+def _fake_node_executor(**kwargs):
+    """A PyExecutor double whose discovery setters store into the read attributes."""
+    executor = SimpleNamespace(**kwargs)
+    executor.set_openengine_discovery = lambda discovery: setattr(
+        executor, "_openengine_discovery", discovery
+    )
+    executor.set_openengine_node_server = lambda server: setattr(
+        executor, "_openengine_node_server", server
+    )
+    return executor
+
+
 def _source(rank, host):
     return {
         "transport": "zmq",
@@ -100,7 +112,7 @@ def test_startup_owns_actual_local_sources_once(monkeypatch):
                 [None, None, None],
             ]
         )
-        executor = SimpleNamespace(
+        executor = _fake_node_executor(
             llm_args=SimpleNamespace(
                 _openengine_discovery={
                     "engine_id": "incarnation",
@@ -127,7 +139,7 @@ def test_startup_owns_actual_local_sources_once(monkeypatch):
 def test_startup_rejects_missing_attention_dp_publisher(monkeypatch):
     monkeypatch.setattr(node.socket, "getfqdn", lambda: "follower")
     rows = [(0, "leader", _source(0, "leader"), None), (1, "follower", None, None)]
-    executor = SimpleNamespace(
+    executor = _fake_node_executor(
         llm_args=SimpleNamespace(
             _openengine_discovery={"engine_id": "incarnation", "host": "127.0.0.1", "port": 15051},
             kv_cache_config=SimpleNamespace(kv_events_config=None),
@@ -162,7 +174,7 @@ def test_bind_failure_rolls_back_successful_node(monkeypatch):
             [None, "another node could not bind"],
         ]
     )
-    executor = SimpleNamespace(
+    executor = _fake_node_executor(
         llm_args=SimpleNamespace(
             _openengine_discovery={"engine_id": "incarnation", "host": "127.0.0.1", "port": 15051},
             kv_cache_config=SimpleNamespace(kv_events_config=None),
@@ -190,7 +202,7 @@ def test_unexpected_listener_error_reaches_the_error_collective(monkeypatch):
         gathered.append(value)
         return placements if len(gathered) == 1 else [None, value]
 
-    executor = SimpleNamespace(
+    executor = _fake_node_executor(
         llm_args=SimpleNamespace(
             _openengine_discovery={"engine_id": "incarnation", "port": 15051},
             kv_cache_config=SimpleNamespace(kv_events_config=None),

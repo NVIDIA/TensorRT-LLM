@@ -515,6 +515,14 @@ methods:
     parameters: {}
     return_annotation: dict
     status: beta
+  get_kv_cache_load:
+    parameters: {}
+    return_annotation: dict
+    status: prototype
+  get_openengine_discovery:
+    parameters: {}
+    return_annotation: dict
+    status: prototype
   get_kv_cache_events_async:
     parameters:
       timeout:
@@ -536,6 +544,21 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
+  check_health:
+    parameters: {}
+    return_annotation: bool
+    status: prototype
+  record_fatal_error:
+    parameters:
+      error:
+        annotation: BaseException
+        default: inspect._empty
+    return_annotation: bool
+    status: prototype
+  multi_frontend_attach_info:
+    parameters: {}
+    return_annotation: dict
+    status: prototype
   get_data_transceiver_state:
     parameters: {}
     return_annotation: bytes
@@ -592,3 +615,30 @@ properties:
   startup_metrics:
     annotation: dict
     default: None
+  fatal_error:
+    annotation: Optional[BaseException]
+    default: inspect._empty
+  shutdown_started:
+    annotation: bool
+    default: inspect._empty
+  engine_dead:
+    annotation: bool
+    default: inspect._empty
+  encode_limits:
+    annotation: Optional[tensorrt_llm.llmapi.llm.EncodeLimits]
+    default: inspect._empty
+  engine_in_worker_process:
+    annotation: bool
+    default: inspect._empty
+  hf_model_config:
+    annotation: Optional[transformers.PretrainedConfig]
+    default: inspect._empty
+  hf_model_dir:
+    annotation: Union[str, pathlib.Path]
+    default: inspect._empty
+  multi_frontend_ipc_dir:
+    annotation: Optional[str]
+    default: inspect._empty
+  resource_governor_queue:
+    annotation: Optional[Any]
+    default: inspect._empty
