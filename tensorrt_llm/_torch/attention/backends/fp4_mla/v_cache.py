@@ -366,6 +366,8 @@ def _update_triton_v_packed_cache(
         _v_packed_shape(kv_cache, v_head_dim, page_size, block_v),
         dtype=torch.uint8,
         device=kv_cache.device,
+        # validated by this state's v_packed_cache_tags: never alias another metadata's copy
+        shared=False,
     )
     fp4_mla_repack_v_cache(
         v_packed,

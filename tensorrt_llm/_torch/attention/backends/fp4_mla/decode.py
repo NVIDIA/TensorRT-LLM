@@ -39,6 +39,7 @@ from .layout import (
     _get_fp4_mla_kv_cache_tensors,
     _get_fp4_mla_q_global_scale,
     _get_fp4_mla_swizzled_scale_size,
+    _max_sequences,
     _validate_fp4_mla_attention_q_shape,
     _validate_fp4_mla_cache_shape,
     _validate_fp4_mla_kv_storage_shape,
@@ -412,12 +413,15 @@ def _run_triton_attention_decode(
     else:
         group_pages = _ceil_div(max_pages, num_reduce_groups)
         num_reduce_groups = _ceil_div(max_pages, group_pages)
+        # shared scratch: bound by the engine's sequence capacity and the 64-group clamp above
+        stats_capacity = _max_sequences(metadata) * query_len_per_seq * 64 * num_heads
         group_max = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_group_max_buf",
             (num_queries, num_reduce_groups, num_heads),
             dtype=torch.float32,
             device=q_fp4.device,
+            capacity_numel=stats_capacity,
         )
         group_sum = _ensure_workspace_tensor(
             metadata,
@@ -425,6 +429,7 @@ def _run_triton_attention_decode(
             (num_queries, num_reduce_groups, num_heads),
             dtype=torch.float32,
             device=q_fp4.device,
+            capacity_numel=stats_capacity,
         )
         _attn_group_reduce_stats_kernel[(num_queries, num_head_blocks, num_reduce_groups)](
             group_max,
@@ -859,12 +864,16 @@ def _run_cutedsl_packed_decode(
     # generation lengths; a stale key means this call plans on other bounds.
     if metadata.fp4_mla_state.packed_plan_key != plan_geometry.key:
         _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
+    # Process-wide scratch (layout._ensure_workspace_tensor): one block per name, sized for the largest batch any
+    # bucket can bring (plan_geometry.task_bound slots), shared by every graph bucket and the eager path.
+    task_bound = max(plan_geometry.task_bound, task_capacity)
     partial = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_split_partial",
         (task_capacity, physical_m, 512),
         dtype=torch.float32,
         device=device,
+        capacity_numel=task_bound * physical_m * 512,
     )[:tasks]
     maxima = _ensure_workspace_tensor(
         metadata,
@@ -872,6 +881,7 @@ def _run_cutedsl_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
+        capacity_numel=task_bound * physical_m,
     )[:tasks]
     sums = _ensure_workspace_tensor(
         metadata,
@@ -879,6 +889,7 @@ def _run_cutedsl_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
+        capacity_numel=task_bound * physical_m,
     )[:tasks]
     module.run_trtllm_fp4_mla_decode_packed(
         q_fp4,
@@ -1425,6 +1436,7 @@ def run_fp4_mla_attention_decode(
                 (2, num_queries, physical_heads),
                 dtype=torch.float32,
                 device=output.device,
+                capacity_numel=2 * _max_sequences(metadata) * query_len_per_seq * physical_heads,
             )
         if num_heads < physical_heads and not direct_split_output:
             kernel_output = _ensure_workspace_tensor(

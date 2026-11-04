@@ -17,7 +17,7 @@ import torch
 
 from .config import FP4_MLA_CUTEDSL_4X_ENV as FP4_MLA_CUTEDSL_4X_ENV
 from .config import _fp4_mla_cutedsl_4x_enabled as _fp4_mla_cutedsl_4x_enabled
-from .layout import _ensure_workspace_tensor
+from .layout import _ensure_workspace_tensor, _max_sequences
 from .packed_plan import _get_sm_count
 
 # Dispatch recorder for end-to-end validation (``TRTLLM_FP4_MLA_4X_STATS_DIR=<dir>``): every 4x dispatch
@@ -113,17 +113,29 @@ def _fp4_mla_4x_split_buffers(
     corrected KV lengths, captured like any other node under CUDA graphs. Buffers live on the metadata like the
     2x packed path's (``_ensure_workspace_tensor``: grow-only, never during capture).
     """
-    from .fp4_mla_cutedsl_4x_plan import launch_4x_plan, plan_4x_length, plan_4x_task_capacity
+    from .fp4_mla_cutedsl_4x_plan import (
+        launch_4x_plan,
+        plan_4x_length,
+        plan_4x_task_capacity,
+        plan_4x_task_capacity_bound,
+    )
 
     rows = num_heads * query_len
     pairs_per_request = rows // 256
     task_capacity = plan_4x_task_capacity(num_requests, pairs_per_request)
+    # The workspaces are process-wide (layout._ensure_workspace_tensor); size them once for the largest batch any
+    # graph bucket or eager call can bring, so no bucket ever allocates its own copy.
+    max_requests = max(_max_sequences(metadata), num_requests)
+    capacity_bound = max(
+        plan_4x_task_capacity_bound(max_requests, pairs_per_request), task_capacity
+    )
     plan = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_4x_plan",
         (plan_4x_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
+        capacity_numel=plan_4x_length(max_requests, capacity_bound),
     )
     # flat, grow-only workspaces viewed per call (a leading slice of a flat buffer is always contiguous)
     partial = _ensure_workspace_tensor(
@@ -132,6 +144,7 @@ def _fp4_mla_4x_split_buffers(
         (task_capacity * rows * 512,),
         dtype=torch.float32,
         device=device,
+        capacity_numel=capacity_bound * rows * 512,
     ).view(task_capacity, rows, 512)
     maxima = _ensure_workspace_tensor(
         metadata,
@@ -139,6 +152,7 @@ def _fp4_mla_4x_split_buffers(
         (task_capacity * rows,),
         dtype=torch.float32,
         device=device,
+        capacity_numel=capacity_bound * rows,
     ).view(task_capacity, rows)
     sums = _ensure_workspace_tensor(
         metadata,
@@ -146,6 +160,7 @@ def _fp4_mla_4x_split_buffers(
         (task_capacity * rows,),
         dtype=torch.float32,
         device=device,
+        capacity_numel=capacity_bound * rows,
     ).view(task_capacity, rows)
     key = (
         num_requests,

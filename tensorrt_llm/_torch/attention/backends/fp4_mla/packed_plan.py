@@ -17,7 +17,7 @@ from .config import (
     _fp4_mla_packed_rows_per_seq,
     _fp4_mla_packed_wave_plan_enabled,
 )
-from .layout import _ensure_workspace_tensor
+from .layout import _ensure_workspace_tensor, _max_sequences
 
 _SM_COUNT_CACHE: dict[int, int] = {}
 
@@ -71,6 +71,31 @@ def _select_packed_split_count(
     return splits
 
 
+_SPLIT_TASK_BOUND_CACHE: dict[tuple[int, int], int] = {}
+
+
+def packed_split_task_bound(max_requests: int, m_tiles: int, device: torch.device) -> int:
+    """Largest ``splits * requests`` any batch up to ``max_requests`` can ask for: the capacity of the shared
+    split-KV scratch (``layout._ensure_workspace_tensor``). The graph rule bounds the eager rule (eager only caps
+    the splits further by the KV length) and the eager floor of 32 slots is kept."""
+    override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
+    if override != "auto":
+        splits = max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
+        return max(32, splits * max(1, int(max_requests)))
+    wave_tasks = _packed_wave_tasks(device, m_tiles)
+    key = (wave_tasks, max(1, int(max_requests)))
+    bound = _SPLIT_TASK_BOUND_CACHE.get(key)
+    if bound is None:
+        bound = 32
+        for requests in range(1, key[1] + 1):
+            splits = max(
+                2, min(_FP4_MLA_PACKED_MAX_SPLITS, _ceil_div(2 * wave_tasks, requests) + 1)
+            )
+            bound = max(bound, splits * requests)
+        _SPLIT_TASK_BOUND_CACHE[key] = bound
+    return bound
+
+
 class _PackedPlanGeometry(NamedTuple):
     """Per-step launch geometry of the packed split-KV decode."""
 
@@ -84,6 +109,8 @@ class _PackedPlanGeometry(NamedTuple):
     helix_kv_bounds: torch.Tensor | None
     plan: torch.Tensor | None
     key: tuple | None
+    # capacity of the shared split-KV scratch in task slots (0 = single task per request, no scratch)
+    task_bound: int = 0
 
 
 def _fp4_mla_packed_plan_geometry(
@@ -155,14 +182,18 @@ def _fp4_mla_packed_plan_geometry(
     from .fp4_mla_packed_reduce import packed_plan_length
 
     tasks = splits * num_requests
-    # Graph buckets hold exactly their tasks; eager metadata grows on demand.
+    # Graph buckets hold exactly their tasks; eager metadata grows on demand. The buffers themselves are
+    # process-wide (layout._ensure_workspace_tensor), sized once for the largest batch any bucket can bring.
     task_capacity = tasks if is_cuda_graph else max(tasks, 32)
+    max_requests = max(_max_sequences(metadata), num_requests)
+    task_bound = max(packed_split_task_bound(max_requests, m_tiles, device), task_capacity)
     plan = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_plan",
         (packed_plan_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
+        capacity_numel=packed_plan_length(max_requests, task_bound),
     )
     kv_lens = metadata.fp4_mla_state.generation_kv_lens
     key = (
@@ -187,6 +218,7 @@ def _fp4_mla_packed_plan_geometry(
         helix_kv_bounds,
         plan,
         key,
+        task_bound,
     )
 
 
