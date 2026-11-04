@@ -5,16 +5,17 @@
 for block-causal rollouts."""
 
 from .base import CacheAccelerator
-from .block_causal_kv_cache import BlockCausalKVCacheManager
 from .cache_dit_accelerator import CacheDiTAccelerator
+from .paged_rollout_kv_cache import PagedKVTables, PagedRolloutKVCache
 from .rollout_kv_cache_interface import ForwardPlan, RolloutKVCacheInterface, RolloutSpec
 from .teacache_accelerator import TeaCacheAccelerator
 
 __all__ = [
     "CacheAccelerator",
     "CacheDiTAccelerator",
-    "BlockCausalKVCacheManager",
     "ForwardPlan",
+    "PagedKVTables",
+    "PagedRolloutKVCache",
     "RolloutKVCacheInterface",
     "RolloutSpec",
     "TeaCacheAccelerator",
