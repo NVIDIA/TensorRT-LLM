@@ -158,6 +158,52 @@ def test_perf_sanity_definition_keeps_perfsanity_required(tmp_path: Path) -> Non
     assert result.perfsanity_relevant is True
 
 
+@pytest.mark.parametrize(
+    "helper", ["pytorch_model_config.py", "sampler_options_config.py", "new_config.py"]
+)
+def test_qa_only_helper_selects_cpu_harness(tmp_path: Path, helper: str) -> None:
+    _write_defs_file(tmp_path, f"perf/{helper}", "VALUE = 1\n")
+    _write_defs_file(tmp_path, "perf/test_perf.py", f"from .{Path(helper).stem} import VALUE\n")
+    _write_defs_file(tmp_path, "perf/test_perf_sanity.py", "VALUE = 2\n")
+    result = _make_perf_rule(tmp_path).apply(
+        PRInputs(changed_files=[f"tests/integration/defs/perf/{helper}"], diffs={})
+    )
+    assert result is not None
+    assert result.affected_stages == {"CPU-Generic-x86-1"}
+    assert set(result.block_filters) == {("l0_cpu", 0)}
+    assert result.perfsanity_relevant is False
+
+
+@pytest.mark.parametrize("helper", ["_model_paths.py", "warmup_pass.py"])
+def test_shared_perf_helper_keeps_cpu_and_gpu_coverage(tmp_path: Path, helper: str) -> None:
+    _write_defs_file(tmp_path, f"perf/{helper}", "VALUE = 1\n")
+    for consumer in ["test_perf.py", "test_perf_sanity.py", "utils.py"]:
+        _write_defs_file(tmp_path, f"perf/{consumer}", f"from .{Path(helper).stem} import VALUE\n")
+    result = _make_perf_rule(tmp_path).apply(
+        PRInputs(changed_files=[f"tests/integration/defs/perf/{helper}"], diffs={})
+    )
+    assert result is not None
+    assert result.affected_stages == {
+        "CPU-Generic-x86-1",
+        "DGX_B200-PyTorch-1",
+        "GB200-4_GPUs-PyTorch-PerfSanity-1",
+    }
+    assert result.perfsanity_relevant is True
+
+
+def test_qa_helper_without_cpu_coverage_falls_back(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "perf/pytorch_model_config.py", "VALUE = 1\n")
+    _write_defs_file(tmp_path, "perf/test_perf.py", "from .pytorch_model_config import VALUE\n")
+    assert (
+        _make_rule(tmp_path).apply(
+            PRInputs(
+                changed_files=["tests/integration/defs/perf/pytorch_model_config.py"], diffs={}
+            )
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("source", ["test_perf.py", "utils.py"])
 def test_qa_perf_harness_changes_select_cpu_functional_test(tmp_path: Path, source: str) -> None:
     result = _make_perf_rule(tmp_path).apply(

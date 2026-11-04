@@ -74,6 +74,8 @@ def test_dynamic_qa_cases_inherit_fixtures(
 ) -> None:
     perf_test, _ = perf_modules
     executed = []
+    # The nested session only needs core pytest; CI plugins can start persistent workers.
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
 
     def run_case(perf_case_name: str, qa_fixture: str) -> None:
         assert qa_fixture == "fixture visible"
@@ -224,7 +226,9 @@ def test_qa_benchmark_results_and_failures(
         }.issubset(commands[1])
 
 
-@pytest.mark.parametrize("failure", [None, "startup", "client", "missing_metric"])
+@pytest.mark.parametrize(
+    "failure", [None, "startup", "client", "missing_metric", "cleanup_timeout"]
+)
 def test_qa_serve_results_and_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -236,6 +240,8 @@ def test_qa_serve_results_and_cleanup(
     clock, venv, writer, output = qa_environment
     case = CASE.replace("-bench-", "-serve-")
     process = MagicMock()
+    if failure == "cleanup_timeout":
+        process.wait.side_effect = [subprocess.TimeoutExpired("trtllm-serve", 1), None]
     server_commands = []
     client_commands = []
     # Exercise measured traffic separately from the optional warmup pass.
@@ -310,7 +316,12 @@ def test_qa_serve_results_and_cleanup(
         assert "--port" in client_commands[0] and "12345" in client_commands[0]
     process.terminate.assert_called()
     cleanup_calls = [call[0] for call in process.method_calls]
-    assert "wait" in cleanup_calls[cleanup_calls.index("terminate") + 1 :]
-    for args, kwargs in process.wait.call_args_list:
-        timeout = kwargs.get("timeout", args[0] if args else None)
-        assert timeout is not None and 0 < timeout < float("inf")
+    first_wait_index = cleanup_calls.index("wait")
+    assert cleanup_calls.index("terminate") < first_wait_index
+    args, kwargs = process.wait.call_args_list[0]
+    timeout = kwargs.get("timeout", args[0] if args else None)
+    assert timeout is not None and 0 < timeout < float("inf")
+    if failure == "cleanup_timeout":
+        kill_index = cleanup_calls.index("kill")
+        assert first_wait_index < kill_index
+        assert "wait" in cleanup_calls[kill_index + 1 :]

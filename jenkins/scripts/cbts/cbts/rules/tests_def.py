@@ -294,6 +294,13 @@ class TestsDefRule(Rule):
             git_path,
             self._reference_index,
         )
+        if import_consumers is not None:
+            import_consumers = [
+                QA_PERF_FUNCTIONAL_TEST
+                if f"{DEFS_GIT_PREFIX}{consumer}" in QA_PERF_HARNESS_SOURCES
+                else consumer
+                for consumer in import_consumers
+            ]
         if (
             import_consumers is not None
             and lookup_paths_into_block_filters(self.yaml_index, import_consumers)[0]
@@ -491,6 +498,21 @@ class TestsDefRule(Rule):
         for git_path in candidates:
             yaml_path = self.yaml_index.git_path_to_yaml_key(git_path)
             qa_perf = git_path in QA_PERF_HARNESS_SOURCES
+            basename = PurePosixPath(git_path).name
+            if (
+                not qa_perf
+                and git_path.startswith(DEFS_GIT_PREFIX)
+                and git_path.endswith(".py")
+                and not basename.startswith("test_")
+                and basename not in {"__init__.py", "conftest.py"}
+            ):
+                importers = self._reference_index.direct_importers(
+                    git_path.removeprefix(DEFS_GIT_PREFIX)
+                )
+                qa_perf = any(
+                    f"{DEFS_GIT_PREFIX}{consumer}" in QA_PERF_HARNESS_SOURCES
+                    for consumer in importers.paths
+                )
             if qa_perf:
                 qa_blocks, _ = lookup_paths_into_block_filters(
                     self.yaml_index, [QA_PERF_FUNCTIONAL_TEST]

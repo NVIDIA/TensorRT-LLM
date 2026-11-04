@@ -81,10 +81,12 @@ Outcomes:
 
 ## TestsDefRule
 
-Changes to `tests/integration/defs/perf/test_perf.py` or its shared `utils.py`
-also select `unittest/others/test_perf_qa_functional.py` in the CPU test list.
+Changes to `tests/integration/defs/perf/test_perf.py`, its shared `utils.py`,
+or their statically discovered imported helpers also select
+`unittest/others/test_perf_qa_functional.py` in the CPU test list.
 This protects the QA harness without scheduling a GPU benchmark. Existing
-PerfSanity matches are retained; missing CPU coverage forces fallback.
+PerfSanity matches are retained for shared helpers; helpers imported only by
+the QA test select its CPU coverage. Missing CPU coverage forces fallback.
 
 For each file under `tests/` in the diff:
 
