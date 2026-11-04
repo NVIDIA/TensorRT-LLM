@@ -9,7 +9,8 @@ float64 gather-and-scale. Beyond the cells: the `query_start_loc` length guard,
 graph capture, and the host table's huge-page advice.
 """
 
-import os
+import errno
+import mmap
 import zlib
 
 import pytest
@@ -37,6 +38,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.weights import (  # noqa: E501
     _host_resident_empty,
 )
+from tensorrt_llm.logger import logger
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
@@ -181,10 +183,19 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert not torch.equal(args[1], pool_before)
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/sys/kernel/mm/transparent_hugepage/enabled"),
-    reason="the kernel has no transparent huge pages",
-)
+def _huge_page_advice_accepted() -> bool:
+    """Whether this kernel takes MADV_HUGEPAGE (it has transparent huge pages)."""
+    probe = mmap.mmap(-1, mmap.PAGESIZE)
+    try:
+        probe.madvise(mmap.MADV_HUGEPAGE)
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+@pytest.mark.skipif(not _huge_page_advice_accepted(), reason="the kernel refuses MADV_HUGEPAGE")
 def test_host_table_is_advised_transparent_huge_pages() -> None:
     # The host-resident table is a mapping of its own, advised MADV_HUGEPAGE
     # before it is faulted in, whatever torch's CPU allocator does with huge pages.
@@ -201,3 +212,19 @@ def test_host_table_is_advised_transparent_huge_pages() -> None:
                 break
     assert flags is not None and "hg" in flags, flags
     assert table.shape == (1 << 16, CKPT_HEAD_DIM)
+
+
+def test_host_table_loads_when_huge_page_advice_is_refused(monkeypatch) -> None:
+    # A kernel without transparent huge pages refuses the advice: the table is
+    # still allocated and registered, on base pages, with a warning.
+    class _Refused(mmap.mmap):
+        def madvise(self, *args):
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+    warnings = []
+    monkeypatch.setattr(mmap, "mmap", _Refused)
+    monkeypatch.setattr(logger, "warning", warnings.append)
+    table, host = _host_resident_empty(1 << 16, CKPT_HEAD_DIM, FP8, torch.device(DEV))
+    assert isinstance(host._mapping, _Refused) and host.pointer
+    assert table.shape == (1 << 16, CKPT_HEAD_DIM)
+    assert len(warnings) == 1 and "MADV_HUGEPAGE" in warnings[0], warnings
