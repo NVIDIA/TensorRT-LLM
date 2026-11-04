@@ -115,8 +115,13 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 enum_types.add("array")
             elif isinstance(value, dict):
                 enum_types.add("object")
-        if len(enum_types) == 1:
-            return enum_types.pop()
+        non_null_types = enum_types - {"null"}
+        if len(non_null_types) == 1:
+            return non_null_types.pop()
+        if non_null_types == {"integer", "number"}:
+            return "number"
+        if enum_types == {"null"}:
+            return "null"
         return "string"
 
     if "allOf" in schema and isinstance(schema["allOf"], list):
