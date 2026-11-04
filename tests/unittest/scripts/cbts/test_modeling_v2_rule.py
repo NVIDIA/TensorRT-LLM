@@ -250,7 +250,7 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                 assert name not in collective_tests
                 continue
             multi = name in collective_tests
-            assert block.yaml_stem == ("l0_gb300" if multi else "l0_b300")
+            assert block.yaml_stem == ("l0_gb300_multi_gpus" if multi else "l0_b300")
             count = 4 if multi else 1
             assert block.condition["ranges"]["system_gpu_count"] == {"gte": count, "lte": count}
             assert block.condition["terms"]["stage"] == "pre_merge"
