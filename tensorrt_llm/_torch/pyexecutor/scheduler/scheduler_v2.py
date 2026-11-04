@@ -969,14 +969,36 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Long-prefill demotion ----
 
+    def _refresh_uncached_estimate(self, req: LlmRequest) -> None:
+        """Replace the router's estimate of a request's uncached prompt, when it is
+        missing or above the threshold, by a read-only radix probe: at most once per
+        request (a whole-prompt walk), and not for a started request or one holding
+        its cache, which :meth:`_is_long_context` judges by its exact remainder."""
+        if (
+            req.state_value == self._encoder_init_state_value
+            or req.py_uncached_prefill_probed
+            or req.context_current_position > 0
+            or self._holds_context_cache(req)
+        ):
+            return
+        estimate = req.py_uncached_prefill_tokens
+        if estimate is not None and estimate <= self._ctx_demote_uncached_tokens:
+            return
+        req.py_uncached_prefill_probed = True
+        reused = self.kv_cache_manager.probe_context_reuse(req)
+        if reused is not None:
+            estimate = max(req.prompt_len - reused, 0)
+        elif estimate is None:
+            estimate = req.context_remaining_length
+        req.py_uncached_prefill_tokens = estimate
+
     def _is_long_context(self, req: LlmRequest) -> bool:
         """Whether more than the threshold of the request's prompt is uncached.
 
         A started request, or one holding its cache, is judged by its exact
-        remainder. Otherwise the router's estimate decides; an estimate above the
-        threshold, or a missing one, is first replaced by a read-only radix probe,
-        at most once per request (a whole-prompt walk). A request the aging bound
-        let through has no estimate and is marked probed, so it is never long.
+        remainder; otherwise the estimate (after :meth:`_refresh_uncached_estimate`)
+        decides. A request the aging bound let through has no estimate and is
+        marked probed, so it is never long.
         """
         if req.state_value == self._encoder_init_state_value:
             return False
@@ -986,14 +1008,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         if req.context_current_position > 0 or self._holds_context_cache(req):
             return req.context_remaining_length > threshold
-        if (estimate is None or estimate > threshold) and not req.py_uncached_prefill_probed:
-            req.py_uncached_prefill_probed = True
-            reused = self.kv_cache_manager.probe_context_reuse(req)
-            if reused is not None:
-                estimate = max(req.prompt_len - reused, 0)
-            elif estimate is None:
-                estimate = req.context_remaining_length
-            req.py_uncached_prefill_tokens = estimate
         return estimate is not None and estimate > threshold
 
     def _defer_long_context(self, pending_ctx: RequestList) -> tuple[RequestList, set[int]]:
@@ -1006,6 +1020,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         deferred: RequestList = []
         self._ctx_unverified_short = set()
         for req in pending_ctx:
+            self._refresh_uncached_estimate(req)
             if self._is_long_context(req):
                 aged_out = (
                     self._ctx_demote_max_iters > 0
