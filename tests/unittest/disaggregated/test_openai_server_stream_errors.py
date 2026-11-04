@@ -33,8 +33,9 @@ from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import ErrorResponse
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.openai_protocol import CompletionRequest
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.postprocess_handlers import select_postproc_strategy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -81,24 +82,32 @@ class _FailingEngine:
         return RequestOutput._from_generation_result(result)
 
 
-def _bare_server(engine: _FailingEngine) -> OpenAIServer:
-    server = object.__new__(OpenAIServer)
-    server.generator = engine
-    server.tokenizer = engine.tokenizer
-    server.model = "test-model"
-    server.model_config = None
-    server._internal_disagg_auth_key = None
-    server._adjusted_steady_clock = AdjustedSteadyClock(time_source=time.monotonic)
-    return server
+def _serving(engine: _FailingEngine) -> CompletionServing:
+    return CompletionServing(
+        model="test-model",
+        generator=engine,
+        tokenizer=engine.tokenizer,
+        model_config=None,
+        collect_perf_metrics=False,
+        metrics_collector=None,
+        adjusted_steady_clock=AdjustedSteadyClock(time_source=time.monotonic),
+        iteration_stats_wakeup_event=asyncio.Event(),
+        iteration_stats_collector_task=lambda: None,
+        internal_disagg_auth_key=None,
+        per_request_spec_decode_stats=False,
+        spec_decode_num_spec_tokens=None,
+        input_proc_executor=None,  # the prompt is token ids: no input processing
+        postproc=select_postproc_strategy(postproc_worker_enabled=False),
+    )
 
 
 @pytest.mark.asyncio
 async def test_a_failed_request_ends_the_completion_stream_with_an_error_event():
-    server = _bare_server(_FailingEngine(_KV_ERROR))
+    serving = _serving(_FailingEngine(_KV_ERROR))
     raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
     request = CompletionRequest(model="test-model", prompt=[1, 2, 3], max_tokens=4, stream=True)
 
-    response = await server.openai_completion(request, raw_request)
+    response = await serving.openai_completion(request, raw_request)
 
     assert isinstance(response, StreamingResponse), getattr(response, "body", response)
     chunks = [chunk async for chunk in response.body_iterator]

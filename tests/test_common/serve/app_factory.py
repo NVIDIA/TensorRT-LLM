@@ -112,6 +112,12 @@ class AggConfig:
     # Attached frontend of a multi-frontend server: registers the launcher
     # forwarding routes ahead of the local handlers, which they shadow.
     multi_frontend_attached: bool = False
+    # OpenAIServer(internal_disagg_auth_key=...): the key a disaggregated
+    # worker requires on requests that carry protected fields.
+    internal_disagg_auth_key: Optional[str] = None
+    # args.cache_transceiver_config gets this backend; None leaves it unset,
+    # so protected disaggregated fields are rejected outright.
+    cache_transceiver_backend: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +215,11 @@ class ServeTestEnv:
             encode_only=config.role is ServerRole.EMBEDDING,
             reasoning_parser=config.reasoning_parser,
             num_postprocess_workers=config.num_postprocess_workers,
+            cache_transceiver_config=(
+                SimpleNamespace(backend=config.cache_transceiver_backend)
+                if config.cache_transceiver_backend is not None
+                else None
+            ),
         )
         executor = FakeExecutor(resource_governor_queue=object() if config.governor_queue else None)
         if config.role is ServerRole.VISUAL_GEN:
@@ -249,6 +260,7 @@ class ServeTestEnv:
             enable_runtime_control_endpoints=config.runtime_control,
             runtime_control_api_key="test-key" if config.runtime_control else None,
             multi_frontend_serving=multi_frontend_serving,
+            internal_disagg_auth_key=config.internal_disagg_auth_key,
         )
         self._servers.append(server)
         return server

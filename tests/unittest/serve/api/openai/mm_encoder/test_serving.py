@@ -8,16 +8,20 @@ composition root: the embedding handle in the response, the injected
 request-template gate, the msgpack route class and the error shape.
 """
 
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from test_common.serve.app_factory import AggConfig
 from test_common.serve.fakes import FakeLlmArgs, FakeMultimodalEncoder, ScriptedOutput
 
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.api.openai.mm_encoder import api_router
 from tensorrt_llm.serve.api.openai.mm_encoder.serving import MMEncoderServing
 from tensorrt_llm.serve.openai_client import MSGPACK_HEADERS, _msgpack_encoder
+from tensorrt_llm.serve.postprocess_handlers import select_postproc_strategy
 from tensorrt_llm.serve.render import RenderResources
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
@@ -30,6 +34,16 @@ REQUIRED = (
     "generator",
     "tokenizer",
     "model_config",
+    "collect_perf_metrics",
+    "metrics_collector",
+    "adjusted_steady_clock",
+    "iteration_stats_wakeup_event",
+    "iteration_stats_collector_task",
+    "internal_disagg_auth_key",
+    "per_request_spec_decode_stats",
+    "spec_decode_num_spec_tokens",
+    "input_proc_executor",
+    "postproc",
 )
 CHAT_BODY = {"model": "fake-model", "messages": [{"role": "user", "content": "hi"}]}
 # Distinct from the fake tokenizer's own template, so the rendered prompt tells
@@ -49,6 +63,16 @@ def _dependencies(tmp_path):
         "generator": generator,
         "tokenizer": generator.tokenizer,
         "model_config": None,
+        "collect_perf_metrics": False,
+        "metrics_collector": None,
+        "adjusted_steady_clock": AdjustedSteadyClock(),
+        "iteration_stats_wakeup_event": asyncio.Event(),
+        "iteration_stats_collector_task": lambda: None,
+        "internal_disagg_auth_key": None,
+        "per_request_spec_decode_stats": False,
+        "spec_decode_num_spec_tokens": None,
+        "input_proc_executor": None,
+        "postproc": select_postproc_strategy(postproc_worker_enabled=False),
     }
 
 

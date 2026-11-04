@@ -647,8 +647,28 @@ def test_http_handlers_forward_hints(request_kind: str, with_hints: bool) -> Non
     )
     hints = _hints() if with_hints else None
     if request_kind == "completion":
+        from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
+        from tensorrt_llm.serve.postprocess_handlers import select_postproc_strategy
+
         request = CompletionRequest(model="test", prompt=[1, 2], max_tokens=4, kv_hints=hints)
-        handler = server.openai_completion
+        # Completions are served by CompletionServing, built here from the same
+        # stubs the composition root would hand it.
+        handler = CompletionServing(
+            model=server.model,
+            generator=server.generator,
+            tokenizer=server.tokenizer,
+            model_config=server.model_config,
+            collect_perf_metrics=False,
+            metrics_collector=None,
+            adjusted_steady_clock=None,
+            iteration_stats_wakeup_event=None,
+            iteration_stats_collector_task=lambda: None,
+            internal_disagg_auth_key=None,
+            per_request_spec_decode_stats=False,
+            spec_decode_num_spec_tokens=None,
+            input_proc_executor=None,
+            postproc=select_postproc_strategy(postproc_worker_enabled=False),
+        ).openai_completion
     elif request_kind == "responses":
         request = ResponsesRequest(model="test", input="hi", max_output_tokens=4, kv_hints=hints)
         handler = server.openai_responses

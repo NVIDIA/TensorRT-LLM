@@ -53,7 +53,6 @@ BASELINE = {
     "tests/unittest/disaggregated/test_disagg_internal_auth.py": [
         "test_aggregated_worker_ignores_affinity_header OpenAIServer",
         "test_worker_affinity_survives_wire_roundtrip OpenAIServer",
-        "test_worker_rejects_protected_fields_without_cache_transceiver_config OpenAIServer",
     ],
     "tests/unittest/disaggregated/test_disagg_openai_client.py": [
         "test_worker_clock_calibration_uses_global_clock OpenAIServer",
@@ -74,9 +73,6 @@ BASELINE = {
     "tests/unittest/disaggregated/test_openai_server_info.py": [
         "_make_server OpenAIServer",
     ],
-    "tests/unittest/disaggregated/test_openai_server_stream_errors.py": [
-        "_bare_server OpenAIServer",
-    ],
     "tests/unittest/disaggregated/test_paired_request_cancellation.py": [
         "test_http_failure_reaches_paired_worker_abort OpenAIDisaggServer",
         "test_http_failure_reaches_paired_worker_abort OpenAIServer",
@@ -84,9 +80,6 @@ BASELINE = {
     "tests/unittest/disaggregated/test_router.py": [
         "test_chat_harmony_preserves_original_tool_conversion_error OpenAIServer",
         "test_gpt_oss_router_tokens_match_chat_harmony_server_input OpenAIServer",
-    ],
-    "tests/unittest/executor/test_spec_decode_stats_payload.py": [
-        "TestServerOptIn._server OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/_test_trtllm_serve_profile.py": [
         "server_with_mock_generator OpenAIServer",
@@ -132,7 +125,6 @@ BASELINE = {
         "test_http_handlers_forward_hints OpenAIServer",
     ],
     "tests/unittest/llmapi/test_llm.py": [
-        "test_openai_completion_list_prompt_stream_reuses_stream_metadata.run_request OpenAIServer",
         "test_startup_metrics_by_server_info OpenAIServer",
     ],
     "tests/unittest/llmapi/test_rl_control_auth.py": [

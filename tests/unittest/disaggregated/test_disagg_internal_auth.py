@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.conversation_id import SUBAGENT_AFFINITY_HEADER
 from tensorrt_llm.serve.disagg_auth import (
     INTERNAL_DISAGG_AUTH_HEADER,
@@ -35,6 +36,7 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.postprocess_handlers import select_postproc_strategy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -196,24 +198,26 @@ def test_protected_fields_reject_missing_auth_header():
 
 def test_worker_rejects_protected_fields_without_cache_transceiver_config():
     request = _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000")
-    server = object.__new__(OpenAIServer)
-    server.generator = type(
-        "Generator",
-        (),
-        {
-            "args": type(
-                "Args",
-                (),
-                {
-                    "cache_transceiver_config": None,
-                },
-            )(),
-        },
-    )()
-    server._internal_disagg_auth_key = "secret"
+    # A worker with the auth key but no cache transceiver configured.
+    serving = CompletionServing(
+        model="test-model",
+        generator=SimpleNamespace(args=SimpleNamespace(cache_transceiver_config=None)),
+        tokenizer=None,
+        model_config=None,
+        collect_perf_metrics=False,
+        metrics_collector=None,
+        adjusted_steady_clock=None,
+        iteration_stats_wakeup_event=None,
+        iteration_stats_collector_task=lambda: None,
+        internal_disagg_auth_key="secret",
+        per_request_spec_decode_stats=False,
+        spec_decode_num_spec_tokens=None,
+        input_proc_executor=None,
+        postproc=select_postproc_strategy(postproc_worker_enabled=False),
+    )
 
     with pytest.raises(ValueError, match="cache_transceiver_config"):
-        server._validate_internal_disagg_request(request, raw_request=None)
+        serving._validate_internal_disagg_request(request, raw_request=None)
 
 
 def _make_affinity_request(role: ServerRole) -> ChatCompletionRequest:

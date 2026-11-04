@@ -43,7 +43,8 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.pyexecutor.llm_request import MAX_SPEC_DECODE_POSITIONS
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor.result import GenerationResultBase
-from tensorrt_llm.serve.openai_server import OpenAIServer, resolve_spec_decode_num_spec_tokens
+from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
+from tensorrt_llm.serve.openai_server import resolve_spec_decode_num_spec_tokens
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs,
     CompletionPostprocArgs,
@@ -52,6 +53,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor,
     completion_response_post_processor,
     completion_stream_post_processor,
+    select_postproc_strategy,
 )
 
 
@@ -212,11 +214,25 @@ class TestServerOptIn:
     """
 
     @staticmethod
-    def _server(enabled, num_spec_tokens=4):
-        server = object.__new__(OpenAIServer)
-        server._per_request_spec_decode_stats = enabled
-        server._spec_decode_num_spec_tokens = num_spec_tokens
-        return server
+    def _serving(enabled, num_spec_tokens=4):
+        # The serving object receives the server's opt-in and bound at
+        # construction; the other dependencies play no part here.
+        return CompletionServing(
+            model="test-model",
+            generator=None,
+            tokenizer=None,
+            model_config=None,
+            collect_perf_metrics=False,
+            metrics_collector=None,
+            adjusted_steady_clock=None,
+            iteration_stats_wakeup_event=None,
+            iteration_stats_collector_task=lambda: None,
+            internal_disagg_auth_key=None,
+            per_request_spec_decode_stats=enabled,
+            spec_decode_num_spec_tokens=num_spec_tokens,
+            input_proc_executor=None,
+            postproc=select_postproc_strategy(postproc_worker_enabled=False),
+        )
 
     @staticmethod
     def _args():
@@ -224,19 +240,19 @@ class TestServerOptIn:
 
     def test_disabled_server_leaves_args_untouched(self):
         args = self._args()
-        OpenAIServer._apply_spec_decode_stats_opt_in(self._server(False), args)
+        self._serving(False)._apply_spec_decode_stats_opt_in(args)
         assert args.return_spec_decode_stats is False
         assert args.spec_decode_num_spec_tokens is None
 
     def test_enabled_server_propagates_fixed_bound(self):
         args = self._args()
-        OpenAIServer._apply_spec_decode_stats_opt_in(self._server(True), args)
+        self._serving(True)._apply_spec_decode_stats_opt_in(args)
         assert args.return_spec_decode_stats is True
         assert args.spec_decode_num_spec_tokens == 4
 
     def test_enabled_server_propagates_adaptive_bound(self):
         args = self._args()
-        OpenAIServer._apply_spec_decode_stats_opt_in(self._server(True, num_spec_tokens=None), args)
+        self._serving(True, num_spec_tokens=None)._apply_spec_decode_stats_opt_in(args)
         assert args.return_spec_decode_stats is True
         assert args.spec_decode_num_spec_tokens is None
 

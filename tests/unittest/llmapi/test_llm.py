@@ -39,10 +39,12 @@ from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
+from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
-                                                     chat_stream_post_processor)
+                                                     chat_stream_post_processor,
+                                                     select_postproc_strategy)
 
 # isort: off
 from gc_utils import assert_resource_freed
@@ -1492,20 +1494,26 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
 
     async def run_request():
         generator = _FakeCompletionGenerator()
-        server = object.__new__(OpenAIServer)
-        server.generator = generator
-        server.model = "test-model"
-        server.model_config = _FakeModelConfig()
-        server.tokenizer = None
-        server.metrics_collector = None
-        server._collect_perf_metrics = False
-        server._input_proc_executor = None
-        server._adjusted_steady_clock = AdjustedSteadyClock()
+        serving = CompletionServing(
+            model="test-model",
+            generator=generator,
+            tokenizer=None,
+            model_config=_FakeModelConfig(),
+            collect_perf_metrics=False,
+            metrics_collector=None,
+            adjusted_steady_clock=AdjustedSteadyClock(),
+            iteration_stats_wakeup_event=asyncio.Event(),
+            iteration_stats_collector_task=lambda: None,
+            internal_disagg_auth_key=None,
+            per_request_spec_decode_stats=False,
+            spec_decode_num_spec_tokens=None,
+            input_proc_executor=None,
+            postproc=select_postproc_strategy(postproc_worker_enabled=False))
 
         request = CompletionRequest(model="test-model",
                                     prompt=["A", "B"],
                                     stream=True)
-        response = await server.openai_completion(request, _FakeRawRequest())
+        response = await serving.openai_completion(request, _FakeRawRequest())
         chunks = [chunk async for chunk in response.body_iterator]
         return generator, _stream_payloads_from_chunks(chunks)
 

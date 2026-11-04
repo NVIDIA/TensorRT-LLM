@@ -22,6 +22,12 @@ BORROWED = {
     "create_error_response": BaseServing,
     "await_disconnected": GenerateBaseServing,
     "_attach_multimodal_data": GenerateBaseServing,
+    "postproc_worker_enabled": GenerateBaseServing,
+    "_extract_metrics": GenerateBaseServing,
+    "_logit_bias_vocab_size": GenerateBaseServing,
+    "_validate_internal_disagg_request": GenerateBaseServing,
+    "_has_cache_transceiver_config": GenerateBaseServing,
+    "_apply_spec_decode_stats_opt_in": GenerateBaseServing,
 }
 
 
@@ -41,3 +47,14 @@ def test_static_helpers_survived_aliasing():
     prompt = {}
     OpenAIServer._attach_multimodal_data(prompt, SimpleNamespace(prompt_token_ids=None), "media")
     assert prompt == {"multi_modal_data": "media", "chat_template_applied": True}
+
+
+def test_postproc_worker_enabled_is_still_a_property():
+    # The composition root evaluates it while building the server (_init_llm),
+    # so the alias must be the property object, not a plain function.
+    assert isinstance(OpenAIServer.__dict__["postproc_worker_enabled"], property)
+    server = SimpleNamespace(
+        _is_visual_gen=False,
+        generator=SimpleNamespace(args=SimpleNamespace(num_postprocess_workers=2)),
+    )
+    assert OpenAIServer.__dict__["postproc_worker_enabled"].fget(server) is True
