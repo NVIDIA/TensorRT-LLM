@@ -645,8 +645,32 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
+    {
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+            routed_scaling_factor, routing_method_type, do_finalize, moeConfigIndex, topk_weights, topk_ids, output,
+            nullptr, -1, torch::nullopt, {});
+    }
+
+    // run() with caller-built routing tables for the tiles in routing_table_tiles (layout in runImpl).
+    [[nodiscard]] std::vector<torch::Tensor> runRoutingTables(torch::optional<torch::Tensor> const& routing_logits,
+        torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
+        torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
+        int64_t const local_expert_offset, int64_t const local_num_experts,
+        std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
+        std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
         torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output,
-        torch::optional<torch::Tensor> const& routing_tables, std::vector<int64_t> const& routing_table_tiles)
+        torch::Tensor const& routing_tables, std::vector<int64_t> const& routing_table_tiles)
     {
         return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
             gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
@@ -896,6 +920,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def(torch::init<int64_t>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::run)
+        .def("run_moe_routing_tables", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runRoutingTables)
         .def("run_moe_prerouted", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runPrerouted);
     m.class_<tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())

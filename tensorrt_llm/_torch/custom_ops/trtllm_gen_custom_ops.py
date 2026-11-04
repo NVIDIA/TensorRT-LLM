@@ -539,19 +539,22 @@ class FP4BlockScaleMoERunner(TunableRunner):
             else:
                 # Routing in the runner needs the global numbering.
                 routing_tables = None
-        return kernel_runner.run_moe(
-            args.routing_logits, args.routing_bias, args.hidden_states,
-            args.hidden_states_scale, args.gemm1_weights,
-            args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
-            args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
-            args.gemm2_weights_scale, args.gemm2_bias,
-            args.output1_scale_scalar, args.output1_scale_gate_scalar,
-            args.output2_scale_scalar, num_experts, self.top_k, self.n_group,
-            self.topk_group, self.intermediate_size, local_expert_offset,
-            self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, self.do_finalize, tactic,
-            args.topk_weights, args.topk_ids, output, routing_tables,
-            list(routing_tiles))
+        run_args = (args.routing_logits, args.routing_bias, args.hidden_states,
+                    args.hidden_states_scale, args.gemm1_weights,
+                    args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
+                    args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
+                    args.gemm2_weights_scale, args.gemm2_bias,
+                    args.output1_scale_scalar, args.output1_scale_gate_scalar,
+                    args.output2_scale_scalar, num_experts, self.top_k,
+                    self.n_group, self.topk_group, self.intermediate_size,
+                    local_expert_offset, self.local_num_experts,
+                    self.routed_scaling_factor, self.routing_method_type,
+                    self.do_finalize, tactic, args.topk_weights, args.topk_ids,
+                    output)
+        if routing_tables is None:
+            return kernel_runner.run_moe(*run_args)
+        return kernel_runner.run_moe_routing_tables(*run_args, routing_tables,
+                                                    list(routing_tiles))
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
