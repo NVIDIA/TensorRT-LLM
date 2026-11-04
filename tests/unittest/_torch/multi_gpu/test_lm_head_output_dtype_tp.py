@@ -14,16 +14,13 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
-from tensorrt_llm._torch.modules.context_logits import (
-    ContextLogitsPlan,
-    context_logits_heads,
-    context_logits_scope,
-)
+from tensorrt_llm._torch.modules.context_logits import context_logits_heads, context_logits_scope
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
-from tensorrt_llm.executor.result import compute_prompt_logprobs
+from tensorrt_llm.executor.result import compute_prompt_logprobs, prompt_logprobs_from_reduced
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -89,21 +86,24 @@ def _check_bounded_context(lm_head: LMHead, hidden: torch.Tensor, rank: int) -> 
                 raise torch.OutOfMemoryError("injected rank-local storage OOM")
             return empty(shape, *args, **kwargs)
 
-        def record_projection(head, rows, buffers):
+        def record_projection(head, rows, buffers, **kwargs):
             projected_rows.append(rows.shape[0])
-            return project(head, rows, buffers)
+            return project(head, rows, buffers, **kwargs)
 
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(workspace, "_allocate", allocate_output)
             patch.setattr(torch, "empty", allocate_storage)
             patch.setattr(workspace, "project", record_projection)
             batch = SimpleNamespace(context_requests=requests, all_requests=lambda: requests)
-            plan = ContextLogitsPlan.for_batch(model, lm_head.mapping, batch, is_spec_decode=False)
+            heads = context_logits_heads(model, lm_head.mapping, is_spec_decode=False)
+            plan = ContextLogitsPlan.for_batch(heads, batch, is_spec_decode=False)
             assert plan is not None
             with context_logits_scope(plan):
                 sampling = model.logits_processor(hidden, lm_head, None, return_context_logits=True)
             assert plan.handled
-        assert projected_rows == ([32, 32, 6, 70, 1, 2] if host_storage else [35, 35] * 2 + [1, 2])
+        # The last row of the context without requested logits is projected
+        # together with the two generation rows.
+        assert projected_rows == ([32, 32, 6, 70, 3] if host_storage else [35, 35] * 2 + [3])
         assert [buffer.data_ptr() for buffer in workspace.resident] == pointers
         # Both returned outputs must survive reuse of the resident collective buffers.
         for buffer in workspace.resident:
@@ -115,7 +115,10 @@ def _check_bounded_context(lm_head: LMHead, hidden: torch.Tensor, rank: int) -> 
         compact = requests[1].py_result
         assert compact.context_logits is None
         expected = compute_prompt_logprobs(0, reference[70:139].cpu(), list(range(1, 70)), True)
-        assert compact.context_prompt_logprobs == pytest.approx(expected.prompt, abs=1e-5)
+        actual = prompt_logprobs_from_reduced(
+            torch.cat(compact.context_prompt_logprob_rows), list(range(1, 70)), 0, True
+        )
+        assert actual == pytest.approx(expected.prompt, abs=1e-5)
         torch.testing.assert_close(compact.context_prompt_last_logits, reference[139:140].cpu())
 
 

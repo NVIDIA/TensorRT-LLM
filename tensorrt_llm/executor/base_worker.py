@@ -24,7 +24,7 @@ import weakref
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 
@@ -53,7 +53,8 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_prompt_logprobs, get_metrics_dict)
+                     compute_prompt_logprobs, get_metrics_dict,
+                     prompt_logprobs_from_reduced)
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
@@ -145,6 +146,9 @@ class BaseWorker(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
+        # Requests already answered with an error by _maybe_wrap_response and
+        # aborted; their remaining engine responses are dropped.
+        self._refused_client_ids: Set[int] = set()
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
@@ -1583,9 +1587,12 @@ class AwaitResponseHelper:
         async_queues = []
         for response in responses:
             assert response is not None
+            is_error = isinstance(response, ErrorResponse)
+            if not is_error and _drop_refused_response(self.worker, response):
+                continue
             queue = self.worker.return_queue(response.client_id)
 
-            if not response.has_error():
+            if not is_error and not response.has_error():
                 response = _maybe_wrap_response(self.worker, response)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
@@ -1599,7 +1606,8 @@ class AwaitResponseHelper:
             else:
                 queue.put(response)
 
-            if response.has_error() or response.result.is_final:
+            if (isinstance(response, ErrorResponse) or response.has_error()
+                    or response.result.is_final):
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
@@ -1622,6 +1630,8 @@ class AwaitResponseHelper:
 
             if isinstance(response, ErrorResponse):
                 pass  # send ErrorResponse directly
+            elif _drop_refused_response(self.worker, response):
+                continue
             elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
@@ -1664,6 +1674,10 @@ def _get_params_for_first_rsp(
     return None, None, None
 
 
+class IncompleteContextLogitsError(RuntimeError):
+    """Context logits do not cover the whole prompt, so prompt logprobs cannot be aligned."""
+
+
 def _compute_pytorch_prompt_logprobs(
         generation_result: GenerationResult,
         response: LlmResponse) -> Optional[LogProbsResult]:
@@ -1692,10 +1706,21 @@ def _compute_pytorch_prompt_logprobs(
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
 
-    compact = response.result.context_prompt_logprobs
-    if compact is not None:
+    compact_rows = response.result.context_prompt_logprob_rows
+    if compact_rows is not None:
+        rows = torch.cat(compact_rows)
+        if rows.shape[0] + 1 != len(prompt_token_ids):
+            # Row t scores prompt token t + 1; a reused KV cache prefix produces
+            # no rows, so the remaining rows cannot be aligned with the prompt.
+            raise IncompleteContextLogitsError(
+                f"prompt logprobs need context logits for all "
+                f"{len(prompt_token_ids)} prompt tokens, got {rows.shape[0] + 1} "
+                "(a reused KV cache prefix is not rescored)")
         tail = response.result.context_prompt_last_logits
         assert tail is not None, "Completed prompt must retain its last prediction row"
+        compact = prompt_logprobs_from_reduced(
+            rows, prompt_token_ids[:-1], logprob_params.prompt_logprobs,
+            logprob_params.prompt_logprobs_simple_format)
         tail_result = compute_prompt_logprobs(
             logprob_params.prompt_logprobs,
             tail,
@@ -1821,10 +1846,33 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
-def _maybe_wrap_response(
-        worker, response: LlmResponse) -> Union[LlmResponse, ResponseWrapper]:
+def _drop_refused_response(worker, response: LlmResponse) -> bool:
+    """Whether ``response`` belongs to a request already answered with an error.
 
-    logprobs_result = _get_logprobs(worker, response)
+    Such a request was aborted, so the engine may still emit steps that were in
+    flight and a final cancellation; the client must see none of them.
+    """
+    if response.client_id not in worker._refused_client_ids:
+        return False
+    if response.has_error() or response.result.is_final:
+        worker._refused_client_ids.discard(response.client_id)
+    return True
+
+
+def _maybe_wrap_response(
+    worker, response: LlmResponse
+) -> Union[LlmResponse, ResponseWrapper, ErrorResponse]:
+
+    try:
+        logprobs_result = _get_logprobs(worker, response)
+    except IncompleteContextLogitsError as error:
+        # Fail only this request, and stop the engine generating for a client
+        # that has already been answered.
+        if not response.result.is_final:
+            worker._refused_client_ids.add(response.client_id)
+            worker.abort_request(response.client_id)
+        return ErrorResponse(response.client_id, str(error),
+                             response.request_id)
     req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)

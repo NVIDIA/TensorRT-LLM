@@ -32,8 +32,9 @@ logits processor, decoder warmup reserves and initializes a 32-row projection
 workspace before KV capacity estimation. Both single-rank heads and uniformly
 vocabulary-sharded tensor-parallel heads with gathered outputs are supported.
 The context-output path prepares request storage before projecting hidden states. It first attempts GPU
-storage and falls back to CPU storage if that allocation raises a CUDA OOM.
-Consequently, callers must support either device for returned context logits.
+storage and falls back to CPU storage if that allocation raises a CUDA OOM,
+logging a warning once. Consequently, callers must support either device for
+returned context logits.
 CPU storage still requires enough host memory for the full result.
 
 When GPU result storage succeeds, projection attempts a larger temporary output
@@ -41,7 +42,8 @@ and halves its row count after allocation failure, with a bounded number of
 attempts. It then falls back to the resident workspace. CPU result storage uses
 the resident workspace directly. Copies from reusable GPU scratch to CPU storage
 complete before that scratch is overwritten. Mixed batches project all context
-rows only for requests that need them; other requests retain their final row.
+rows only for requests that need them; the final rows of other context requests
+are projected together with the generation rows.
 
 For tensor parallelism, each rank reserves local projection, all-gather receive,
 and full-vocabulary FP32 conversion buffers. All ranks agree on the smallest
@@ -49,19 +51,23 @@ successful chunk capacity before projecting, so allocation failure or CPU result
 storage on one rank cannot change the collective sequence independently. The
 all-gather writes directly into the reserved receive buffer; vocabulary assembly
 and padding removal copy into the conversion buffer without allocating a second
-gathered output. Allocation failures for required sampling rows and GEMM failures
-are reported on all TP ranks before the next logits collective. These failures
+gathered output. Allocation failures for required sampling rows, CPU result
+storage and GEMM failures, as well as failures storing or reducing a chunk, are
+reported on all TP ranks before the next logits collective. These failures
 abort the operation; they do not trigger an independent per-rank retry. TP
 capacity and failure agreement introduces additional synchronization.
 
 Requests that only specify `prompt_logprobs` retain the requested probabilities
 and token IDs rather than a full context-logits tensor. Projection chunks are
-reduced as they are produced. The legacy projection path uses the same probability
+reduced on the device as they are produced, with one small host copy per chunk;
+the executor worker builds the returned per-token values. The legacy projection path uses the same probability
 accumulation, so changing batch composition between prefill chunks does not change
 the result format or lose positions. One final vocabulary row is retained on the CPU
 until the first generated token is known. Context probability postprocessing is
 also chunked when consuming complete CPU or GPU logits; a GPU reduction allocation
-failure falls back to CPU for that chunk.
+failure falls back to CPU for that chunk. With KV cache reuse, the reused prefix
+produces no context logits, so prompt log probabilities cannot be aligned with
+the prompt; such a request fails with an error instead of returning shifted values.
 
 The bounded projection path does not apply to context/attention-data parallel
 execution, ROW-parallel or unevenly sharded LM heads, speculative decoding,

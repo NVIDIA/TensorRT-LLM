@@ -18,6 +18,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
+from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import LogprobMode
 
 from .request_inputs import ExecutorRequest
@@ -149,6 +150,10 @@ class LogitsStorage:
             except torch.OutOfMemoryError:
                 if not cpu_fallback:
                     raise
+                logger.warning_once(
+                    "Not enough GPU memory for complete context logits; storing them "
+                    "in host memory, so RequestOutput.context_logits is a CPU tensor.",
+                    key="context_logits_host_fallback")
                 # Large complete outputs need not consume pinned host memory.
                 storage = torch.empty(shape, dtype=dtype, device="cpu")
         else:
@@ -334,7 +339,7 @@ class PyResult:
         exclude_last_generation_logits: bool | None = None
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
         context_logits_on_cpu: bool = False
-        prompt_logprobs: TokenLogprobs | SimpleTokenLogprobs | None = None
+        prompt_logprob_rows: list[torch.Tensor] = field(default_factory=list)
         prompt_last_logits: torch.Tensor | None = None
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
@@ -371,7 +376,9 @@ class PyResult:
 
         # Note that in C++ implemnetation both context logits and generation logits are stored on host memory.
         # Here we only use host memory for generation logits if in chunked model.
-        self.context_prompt_logprobs: TokenLogprobs | SimpleTokenLogprobs | None = None
+        # Prompt logprobs reduced on the executor (``reduce_prompt_logprobs``
+        # rows); the worker builds the user-facing values from them.
+        self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
         self.context_prompt_last_logits: torch.Tensor | None = None
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
@@ -416,10 +423,10 @@ class PyResult:
         return self.diff
 
     def apply_diff(self, diff: Diff):
-        if diff.prompt_logprobs is not None:
-            if self.context_prompt_logprobs is None:
-                self.context_prompt_logprobs = []
-            self.context_prompt_logprobs.extend(diff.prompt_logprobs)
+        if diff.prompt_logprob_rows:
+            if self.context_prompt_logprob_rows is None:
+                self.context_prompt_logprob_rows = []
+            self.context_prompt_logprob_rows.extend(diff.prompt_logprob_rows)
         if diff.prompt_last_logits is not None:
             self.context_prompt_last_logits = diff.prompt_last_logits
         if diff.exclude_last_generation_logits is not None:
@@ -466,6 +473,13 @@ class PyResult:
 
     def prepare_context_logits(self, vocab_size: int,
                                device: torch.device) -> None:
+        """Allocate the complete FP32 context-logits storage before projection.
+
+        Args:
+            vocab_size: Full (gathered) vocabulary size of each stored row.
+            device: Preferred device; GPU allocation failure falls back to
+                host memory.
+        """
         assert self._context_logits is not None
         self._context_logits.prepare(vocab_size,
                                      torch.float32,
@@ -477,16 +491,28 @@ class PyResult:
         assert self._context_logits is not None and self._context_logits._storage is not None
         return self._context_logits._storage.device.type == "cpu"
 
-    def append_prompt_logprobs(
-            self, values: TokenLogprobs | SimpleTokenLogprobs) -> None:
-        if self.context_prompt_logprobs is None:
-            self.context_prompt_logprobs = []
-        if self.diff.prompt_logprobs is None:
-            self.diff.prompt_logprobs = []
-        self.context_prompt_logprobs.extend(values)
-        self.diff.prompt_logprobs.extend(values)
+    def append_prompt_logprobs(self, rows: torch.Tensor) -> None:
+        """Record reduced prompt logprobs of consecutive prompt tokens.
+
+        Args:
+            rows: ``[tokens, columns]`` FP64 host tensor from
+                ``reduce_prompt_logprobs``; row ``t`` scores the prompt token
+                that follows the ``t``-th consumed context position.
+        """
+        if self.context_prompt_logprob_rows is None:
+            self.context_prompt_logprob_rows = []
+        self.context_prompt_logprob_rows.append(rows)
+        self.diff.prompt_logprob_rows.append(rows)
 
     def set_prompt_last_logits(self, logits: torch.Tensor) -> None:
+        """Retain the last prompt position's logits.
+
+        The worker scores the first generated token with this row once it is
+        known.
+
+        Args:
+            logits: ``[1, vocab]`` FP32 host tensor.
+        """
         self.context_prompt_last_logits = logits
         self.diff.prompt_last_logits = logits
 
@@ -700,7 +726,7 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'context_prompt_logprobs',
+        ('context_logits', 'context_prompt_logprob_rows',
          'context_prompt_last_logits', 'generation_logits', 'log_probs',
          'cum_log_probs', 'first_gen_log_probs', 'mm_embedding_handles',
          'additional_context_outputs', 'additional_generation_outputs',
