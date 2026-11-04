@@ -2158,10 +2158,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Release one started request's KV cache so another can allocate.
 
         The fallback for a pool that suspension cannot drain; see
-        `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
-        suspension is cheaper and keeps the pages, so this waits for the
-        generation path to suspend a decode request; under helix it falls back
-        to preemption once no decode request holds GPU pages.
+        `KVCacheManagerV2.preempt_request`. With a cache tier below GPU, this
+        waits while an active decode request holds GPU pages; under helix it
+        falls back to preemption once none does.
 
         The victim leaves on `recompute_paused`, the same channel the
         generation side uses, because a re-prefill needs more teardown than the
@@ -2174,10 +2173,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
             # Wait while an active generation request holds GPU pages: they
-            # come back when it finishes, or if the generation path suspends
-            # it. Under helix, once no active generation request is left, every
-            # started request is mid-prefill or suspended, and none gives its
-            # pages back on its own, so fall through to recompute-pause.
+            # come back when it finishes, or if a failing generation request
+            # suspends it; a blocked context request never triggers that
+            # suspend. Under helix, once no active generation request is left,
+            # every started request is mid-prefill or suspended, and none gives
+            # its pages back on its own, so fall through to recompute-pause.
             if not self.has_cp_helix or any(
                 r.is_generation_in_progress_state
                 and self.kv_cache_manager.is_request_active(r.py_request_id)
