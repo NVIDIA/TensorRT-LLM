@@ -379,11 +379,11 @@ def test_http_request_repr_omits_hints_without_changing_transport(
 @pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize("container_kind", ["dict", "list"])
 @pytest.mark.parametrize("location", ["payload", "envelope_extra", "action_extra"])
-@pytest.mark.parametrize(("depth", "accepted"), [(32, True), (200, False)])
-def test_admission_requires_decodable_nested_json(
-    typed: bool, container_kind: str, location: str, depth: int, accepted: bool
+@pytest.mark.parametrize("depth", [32, 200])
+def test_admission_accepts_nested_metadata_supported_by_msgspec(
+    typed: bool, container_kind: str, location: str, depth: int
 ) -> None:
-    """Python-valid metadata must also fit the snapshot's JSON decoder."""
+    """Valid metadata need not pass an unused JSON decoder before binary transport."""
     nested: JsonValue = "leaf"
     for _ in range(depth):
         nested = {"child": nested} if container_kind == "dict" else [nested]
@@ -399,31 +399,27 @@ def test_admission_requires_decodable_nested_json(
     assert len(wire_json) < MAX_KV_HINTS_BYTES
     hints = envelope if typed else wire
 
-    if not accepted:
-        with pytest.raises(ValidationError, match="recursion limit exceeded"):
-            KvHintsEnvelope.model_validate_json(wire_json)
-
-    with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
+    with (
+        patch.object(
+            KvHintsEnvelope,
+            "model_validate_json",
+            side_effect=AssertionError("admission must not decode JSON"),
+        ),
+        patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count,
+    ):
         admitted = admit_kv_hints(hints)
-        if accepted:
-            assert admitted is not None
-            assert admitted.model_dump() == wire
-            count.assert_not_called()
-        else:
-            assert admitted is None
-            count.assert_called_once_with("malformed")
-
-    with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
+        assert admitted is not None
+        assert admitted.model_dump() == wire
         request = _request(hints)
         assert request.prompt_token_ids == [1, 2, 3]
-        if accepted:
-            assert request.kv_hints is not None
-            assert request.kv_hints.wire_json == wire_json
-            assert request.kv_hints.envelope().model_dump() == wire
-            count.assert_not_called()
-        else:
-            assert request.kv_hints is None
-            count.assert_called_once_with("malformed")
+        assert request.kv_hints is not None
+        assert request.kv_hints.wire_json == wire_json
+        transported = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(request.kv_hints), type=KvHintsSnapshot
+        )
+        assert transported.envelope().model_dump() == wire
+        assert pickle.loads(pickle.dumps(request)).kv_hints == request.kv_hints
+        count.assert_not_called()
 
 
 def test_invalid_request_input_is_not_hidden_by_ignored_hints() -> None:

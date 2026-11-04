@@ -92,9 +92,9 @@ policy. Admission does not salvage individual actions from an invalid envelope.
 Accepted envelopes must also fit the proxy's MessagePack transport. Admission
 discards an envelope if any integer in its payload or extra metadata is outside
 the range `-2**63` through `2**64 - 1`, inclusive, and counts it as `malformed`.
-Admission also checks the serialized envelope with the snapshot's JSON decoder.
-Envelopes that exceed the decoder's nesting limit are discarded as `malformed`,
-even when they fit the byte limit. Snapshots retain the checked JSON bytes.
+Admission checks the validated model and its MessagePack encoding without an
+extra JSON decoding pass. Nested metadata that fits the schema, byte budget
+and transport checks remains usable by the admitted msgspec envelope.
 This policy applies only to optional hints; invalid request bodies, other
 request fields and required P/D handoff parameters retain their validation.
 Direct construction of a typed envelope still validates its fields and can

@@ -155,12 +155,11 @@ def admit_kv_hints(hints: KvHintsInput | None) -> KvHintsEnvelope | None:
         or malformed hint. Unsupported raw versions need not follow the supported
         schema. Direct construction of a typed envelope still validates its fields.
     """
-    admitted = _admit_kv_hints(hints)
-    return None if admitted is None else admitted[0]
+    return _admit_kv_hints(hints)
 
 
-def _admit_kv_hints(hints: KvHintsInput | None) -> tuple[KvHintsEnvelope, bytes] | None:
-    """Return the admitted model and its checked, decodable JSON encoding."""
+def _admit_kv_hints(hints: KvHintsInput | None) -> KvHintsEnvelope | None:
+    """Return the model after schema, wire-size and transport checks."""
     if hints is None:
         return None
     if isinstance(hints, KvHintsEnvelope):
@@ -196,12 +195,11 @@ def _admit_kv_hints(hints: KvHintsInput | None) -> tuple[KvHintsEnvelope, bytes]
         count_ignored_kv_hints("oversized")
         return None
     try:
-        validated = KvHintsEnvelope.model_validate_json(wire_json)
         msgspec.msgpack.encode(validated.model_dump(mode="json"))
     except (OverflowError, TypeError, ValueError, RecursionError):
         count_ignored_kv_hints("malformed")
         return None
-    return validated, wire_json
+    return validated
 
 
 def snapshot_kv_hints(hints: KvHintsInput | None) -> KvHintsSnapshot | None:
@@ -214,10 +212,9 @@ def snapshot_kv_hints(hints: KvHintsInput | None) -> KvHintsSnapshot | None:
         A msgspec envelope, or None for absent or ignored hints. Malformed
         metadata is counted and discarded before the request is queued.
     """
-    admitted = _admit_kv_hints(hints)
-    if admitted is None:
+    envelope = _admit_kv_hints(hints)
+    if envelope is None:
         return None
-    envelope, _ = admitted
     return KvHintsSnapshot(
         protocol_version=envelope.protocol_version,
         message_id=envelope.message_id,
