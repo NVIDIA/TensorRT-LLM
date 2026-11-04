@@ -31,6 +31,7 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.config import TelemetryField
 from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+from tensorrt_llm.watermark import WatermarkConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -216,6 +217,22 @@ def test_collect_llm_api_config_is_deterministic_for_effective_torch_args():
     assert meta["args_class"] == "TorchLlmArgs"
     assert meta["schema_digest"]
     assert meta["capture_manifest_digest"]
+
+
+def test_collect_llm_api_config_excludes_the_watermark_key():
+    key = 987654321012345
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        watermark_config=WatermarkConfig(key=key, context_width=6),
+    )
+
+    config_json, meta_json = collect_llm_api_config_payloads(args)
+    config = json.loads(config_json)
+
+    assert config["watermark_config.context_width"] == 6
+    assert "watermark_config.key" not in config
+    assert str(key) not in config_json + meta_json
 
 
 def test_collect_llm_api_config_captures_nvfp4_kv_cache_dtype():
