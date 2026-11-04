@@ -558,7 +558,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
         _unlinkPagesOfFailedRemoteLevels();
         reuseMatch = mRadixTree->match(reuseScope, inputTokens,
             textOnly.value_or(this->textOnly()) || inputKnownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff,
-            /*collectOptionalMatches=*/true);
+            /*collectOptionalMatches=*/true, mConfig.reuseMatchAlignment);
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), localityDomainId, std::move(reuseMatch),
@@ -658,7 +658,8 @@ BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
     KVCM2_REJECT_IF_POISONED();
-    return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
+    return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff,
+        /*collectOptionalMatches=*/false, mConfig.reuseMatchAlignment);
 }
 
 int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
