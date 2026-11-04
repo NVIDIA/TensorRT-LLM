@@ -325,6 +325,56 @@ def test_failed_cached_tactic_prime_is_retried(monkeypatch) -> None:
     assert JitGemmRunner.calls == [((3, 64), 0)]
 
 
+def test_exclude_from_cache_op_reuses_profiles_within_window(
+        monkeypatch) -> None:
+    """Profile an exclude_from_cache op once per autotune() window and prepare
+    inputs only for profiles that miss the cache."""
+    x = torch.randn(3, 64)
+    w = torch.randn(64, 128)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=(3, 4, 5),
+        map_to_tuning_buckets=lambda value: value), ),
+                                 exclude_from_cache=True)
+    op = "test_exclude_from_cache_op_reuses_profiles_within_window"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    prepared, profiled = [], []
+    prepare = tuner._prepare_input_tensors
+    optimization_profiles = tuner._optimization_profiles
+    monkeypatch.setattr(
+        tuner, "_prepare_input_tensors",
+        lambda p, inputs: prepared.append(p.get_opt_shapes()) or prepare(
+            p, inputs))
+    monkeypatch.setattr(
+        tuner, "_optimization_profiles",
+        lambda config, inputs: profiled.append(op) or optimization_profiles(
+            config, inputs))
+
+    with autotune():
+        _, tactic = tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
+        assert (len(profiled), len(prepared)) == (1, 3)
+        # Same op and shapes in the same window: served from the cache.
+        assert tuner.choose_one(op, [GemmRunner()], tuning_config,
+                                [x, w])[1] == tactic
+        assert (len(profiled), len(prepared)) == (1, 3)
+
+    # A new window walks the profiles again, but every profile is cached,
+    # so no input is prepared.
+    with autotune():
+        assert tuner.choose_one(op, [GemmRunner()], tuning_config,
+                                [x, w])[1] == tactic
+    assert (len(profiled), len(prepared)) == (2, 3)
+
+    # A nested context's record does not leak into the enclosing one.
+    with autotune():
+        with autotune(skip_dynamic_tuning_buckets=True):
+            tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
+        tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
+    assert (len(profiled), len(prepared)) == (4, 3)
+
+
 @torch.library.custom_op("autotuner_test::get_best_gemm_tactic",
                          mutates_args=())
 def get_best_gemm_tactic(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
