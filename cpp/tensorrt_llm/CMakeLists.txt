@@ -313,38 +313,38 @@ endif()
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 set(TLLM_FACADE_COMPONENT_TARGETS
+    ipc_nvls_memory_src
+    tllm_batch_request_info
+    tllm_batch_scheduler
+    tllm_common_cuda
+    tllm_common_environment
     tllm_common_error
     tllm_common_logging
     tllm_common_profiler
-    tllm_common_cuda
-    tllm_executor_types
-    tllm_executor_serialization
-    tllm_runtime_memory
-    tllm_runtime_buffers
-    tllm_runtime_distributed
-    tllm_runtime_topology
-    tllm_runtime_worker_pool
-    tllm_runtime_host_accessible_memory
-    tllm_runtime_utils
-    tllm_runtime_lora_cache
-    tllm_runtime_lora
-    ipc_nvls_memory_src
-    tllm_runtime_locality
-    tllm_runtime_numpy
-    tllm_runtime_gdr
-    tllm_common_environment
-    tllm_executor_values
-    tllm_executor_transfer_agent
-    tllm_batch_request_info
+    tllm_context_transfer_consensus
     tllm_executor_agent_name
     tllm_executor_memory_desc
-    tllm_kv_cache_host_memory
-    tllm_kv_cache
-    tllm_kv_cache_legacy
-    tllm_batch_scheduler
-    tllm_context_transfer_consensus
-    tllm_peft_cache
+    tllm_executor_serialization
+    tllm_executor_transfer_agent
+    tllm_executor_types
+    tllm_executor_values
     tllm_kernel_kv_cache_copy
+    tllm_kv_cache
+    tllm_kv_cache_host_memory
+    tllm_kv_cache_legacy
+    tllm_peft_cache
+    tllm_runtime_buffers
+    tllm_runtime_distributed
+    tllm_runtime_gdr
+    tllm_runtime_host_accessible_memory
+    tllm_runtime_locality
+    tllm_runtime_lora
+    tllm_runtime_lora_cache
+    tllm_runtime_memory
+    tllm_runtime_numpy
+    tllm_runtime_topology
+    tllm_runtime_utils
+    tllm_runtime_worker_pool
     userbuffers_src)
 
 foreach(
