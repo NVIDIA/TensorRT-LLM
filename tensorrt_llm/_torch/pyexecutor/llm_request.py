@@ -20,7 +20,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.sampling_params import LogprobMode
 
-from .request_inputs import ExecutorRequest, PythonRequestInputs
+from .request_inputs import ExecutorRequest
 
 SamplingConfig = tllm_executor.SamplingConfig
 
@@ -1231,21 +1231,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 or self.py_mm_encoder_event is not None):
             raise RuntimeError(
                 "Child requests must be created before MM encoder admission")
-        inputs = PythonRequestInputs(
-            logits_post_processors=self.py_logits_post_processors,
-            multimodal_data=self.py_multimodal_data,
-            num_logprobs=self.py_num_logprobs,
-            disaggregated_params=self.py_disaggregated_params,
-            lora_path=self.py_lora_path,
-            lora_ckpt_source=self.py_lora_ckpt_source,
-            logprobs_mode=self.py_logprobs_mode,
-            logprobs_simple_format=self.py_logprobs_simple_format,
-            return_routed_experts=self.py_return_routed_experts,
-            original_end_id=self.py_original_end_id,
-            conversation_params=self.py_conversation_params,
-            kv_hints=self.py_kv_hints,
-            uncached_prefill_tokens=self.py_uncached_prefill_tokens,
-        ).copy_for_child()
         child = LlmRequest(
             parent_request=self,
             child_id=child_id,
@@ -1272,16 +1257,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             end_id=self.py_end_id,
             py_lora_path=self.py_lora_path,
             py_lora_ckpt_source=self.py_lora_ckpt_source,
-            py_logits_post_processors=inputs.logits_post_processors,
-            py_multimodal_data=inputs.multimodal_data,
+            py_logits_post_processors=(self.py_logits_post_processors.copy()
+                                       if self.py_logits_post_processors
+                                       is not None else None),
+            py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
         child.py_original_end_id = self.py_original_end_id
-        child.py_disaggregated_params = inputs.disaggregated_params
-        child.py_conversation_params = inputs.conversation_params
-        child.py_kv_hints = inputs.kv_hints
+        child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
+        child.py_conversation_params = deepcopy(self.py_conversation_params)
+        child.py_kv_hints = self.py_kv_hints
         child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy

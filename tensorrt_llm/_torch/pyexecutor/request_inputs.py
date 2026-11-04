@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Internal Python request inputs and their transport/child ownership policies."""
+"""Internal Python request inputs and their transport envelope."""
 
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,30 +62,6 @@ class PythonRequestInputs:
             conversation_params=getattr(request, "py_conversation_params", None),
             uncached_prefill_tokens=getattr(request, "py_uncached_prefill_tokens", None),
             kv_hints=getattr(request, "py_kv_hints", None),
-        )
-
-    def copy_for_child(self) -> "PythonRequestInputs":
-        """Copy mutable inputs; preserve user-owned processor callable identity."""
-        return PythonRequestInputs(
-            logits_post_processors=(
-                self.logits_post_processors.copy()
-                if self.logits_post_processors is not None
-                else None
-            ),
-            multimodal_data=deepcopy(self.multimodal_data),
-            scheduling_params=deepcopy(self.scheduling_params),
-            num_logprobs=self.num_logprobs,
-            disaggregated_params=deepcopy(self.disaggregated_params),
-            lora_path=self.lora_path,
-            lora_ckpt_source=self.lora_ckpt_source,
-            logprobs_mode=self.logprobs_mode,
-            logprobs_simple_format=self.logprobs_simple_format,
-            return_routed_experts=self.return_routed_experts,
-            arrival_time=self.arrival_time,
-            original_end_id=self.original_end_id,
-            conversation_params=deepcopy(self.conversation_params),
-            uncached_prefill_tokens=self.uncached_prefill_tokens,
-            kv_hints=self.kv_hints,
         )
 
 
