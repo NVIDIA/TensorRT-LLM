@@ -113,10 +113,62 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_PS_STEP_COMMIT_PDL": "nothing: the step commit launch has no PDL variant",
         "MUSESPARK_OPEN_HEAD_INBOX_POLL_SCOPE": "nothing: the inbox polls are system-scope",
         "MUSESPARK_OPEN_HEAD_INBOX_RESET_SCOPE": "nothing: the inbox resets are system-scope",
-        "TRTLLM_MUSESPARK_SWA_BLOCKS_PER_PROGRAM": "nothing: this build has no such switch",
-        "TRTLLM_MUSESPARK_TEP_WIDE_FULL_FOLD": "nothing: this build has no such switch",
-        "TRTLLM_MUSESPARK_TEP_WIDE_QKV_PREFETCH": "nothing: this build has no such switch",
-        "TRTLLM_MUSESPARK_TEP_WIDE_CAPTURE_FOLD": "nothing: this build has no such switch",
+        "TRTLLM_MUSESPARK_SWA_BLOCKS_PER_PROGRAM": PREFIX + "SWA_BLOCKS_PER_PROGRAM",
+        "TRTLLM_MUSESPARK_TEP_WIDE_FULL_FOLD": PREFIX + "WIDE_FULL_ATTENTION_FOLD",
+        "TRTLLM_MUSESPARK_TEP_WIDE_QKV_PREFETCH": PREFIX + "WIDE_QKV_PREFETCH",
+        "TRTLLM_MUSESPARK_TEP_WIDE_CAPTURE_FOLD": PREFIX + "WIDE_CAPTURE_FOLD",
+        "MUSESPARK_OPEN_SM107_FMK_CONTEXT_FMHA": PREFIX + "FMK_CONTEXT_FMHA",
+        "MUSESPARK_OPEN_CTX_KV_LATE_JOIN": PREFIX + "CONTEXT_KV_LATE_JOIN",
+        "MUSESPARK_OPEN_HOP_CLUSTER": PREFIX + "HOP_CLUSTER_SPLIT" + SEP + "CLUSTER",
+        "MUSESPARK_OPEN_HOP_CLUSTER_ROWS": PREFIX + "HOP_CLUSTER_SPLIT" + SEP + "ROWS",
+        "MUSESPARK_OPEN_FC_INBOX_MAX_ROWS": PREFIX + "DRAFTER_FC_INBOX_WIDE" + SEP + "MAX_ROWS",
+        "MUSESPARK_OPEN_FC_INBOX_PROGRAMS": PREFIX + "DRAFTER_FC_INBOX_WIDE" + SEP + "PROGRAMS",
+        "MUSESPARK_OPEN_L061_TILE32_PIN": PREFIX + "L061_TILE32_PIN",
+        "MUSESPARK_OPEN_ROUTER_STAGED_EPILOGUE": PREFIX + "ROUTER_STAGED_EPILOGUE",
+        "MUSESPARK_OPEN_DECODE_QKV_MXFP8": PREFIX + "DECODE_QKV_MXFP8",
+        "MUSESPARK_OPEN_CTX_SP_SM107_ROUTER_INPUT": (
+            "nothing: sm107 context sequence parallelism always joins the router input"
+        ),
+        "MUSESPARK_OPEN_CTX_KV_FORK_POINT": "nothing: the fork point is the LM head's GEMM",
+        "MUSESPARK_OPEN_HOP_PAYLOAD": "nothing: the wide hop moves BF16",
+        "MUSESPARK_OPEN_FINALIZE_PAYLOAD": "nothing: the expert finalize moves BF16",
+        "MUSESPARK_OPEN_ROUTER_WEIGHT_PROLOGUE": "nothing: this build has no such switch",
+        "MUSESPARK_OPEN_POOL_FORK_AFTER_ROUTER": "nothing: this build has no such switch",
+        "MUSESPARK_OPEN_SM107_UNPOOL_TGV": "nothing: this build has no such switch",
+        "MUSESPARK_OPEN_SM107_VOCAB_PARALLEL_HEAD": "nothing: this build has no such switch",
+        "MUSESPARK_OPEN_DECODE_ROUTE_RECORD_DIR": "nothing: this build has no such switch",
+        # The single-request decode schedule's switches (sm107 TEP8).
+        "MUSESPARK_OPEN_MEGAKERNEL": PREFIX + "MEGAKERNEL",
+        "MUSESPARK_OPEN_MEGAKERNEL_NB": PREFIX + "MEGAKERNEL_ONE_EXCHANGE_BOUNDARIES",
+        "MUSESPARK_OPEN_MEGAKERNEL_BH": PREFIX + "MEGAKERNEL_TWO_TERM_POOL",
+        "MUSESPARK_OPEN_MEGAKERNEL_RL": PREFIX + "MEGAKERNEL_ROUTER_BY_LINEARITY",
+        "MUSESPARK_OPEN_MEGAKERNEL_FZ": PREFIX + "MEGAKERNEL_ZERO_EXCHANGE_BOUNDARY",
+        "MUSESPARK_OPEN_TQ_TARGET_L0": PREFIX + "LAYER0_QKV_TABLE",
+        "MUSESPARK_OPEN_PF_FUSED_PRE": "nothing: model_boundary builds layer 0's attention input",
+        "MUSESPARK_OPEN_OB_PRE_VARIANT": "nothing: the fused pre has one variant",
+        "MUSESPARK_OPEN_PV_L0_INPUT_MK": "nothing: model_boundary builds layer 0's attention input",
+        "MUSESPARK_OPEN_PF_BF16_FRONT": PREFIX + "EDGE_BF16_MOE_FRONT",
+        "MUSESPARK_OPEN_OB_BF16_DIRECT": PREFIX + "EDGE_BF16_MOE_FRONT",
+        "MUSESPARK_OPEN_OB_BF16_MOE_PDL": "nothing: this build has no such switch",
+        "MUSESPARK_OPEN_G2_L61_BOUNDARY": PREFIX + "LAST_LAYER_BOUNDARY",
+        "MUSESPARK_OPEN_PV_GLUE_FUSED": PREFIX + "LAST_LAYER_BOUNDARY",
+        "MUSESPARK_OPEN_PF_SIDE_FORK": PREFIX + "CONTEXT_KV_FORK_LAST_LAYER",
+        "MUSESPARK_OPEN_PV_EARLY_FC_AFTER_HOP1": PREFIX + "CONTEXT_KV_FORK_LAST_LAYER",
+        "MUSESPARK_OPEN_S2_SAMPLER": PREFIX + "DISTRIBUTED_HEAD_SAMPLER",
+        "MUSESPARK_OPEN_PV_LOGITS_ONESHOT": PREFIX + "DISTRIBUTED_HEAD_SAMPLER",
+        "MUSESPARK_OPEN_PV_LOGITS_POLL": "nothing: the one-shot logits gather polls one way",
+        "MUSESPARK_OPEN_PT_VERIFY_PDL": PREFIX + "DISTRIBUTED_HEAD_SAMPLER",
+        "MUSESPARK_OPEN_OX_DEJ": PREFIX + "DRAFTER_PREAMBLE_LATE_JOIN",
+        "MUSESPARK_OPEN_DR3_CONV_FOLD": PREFIX + "DRAFTER_FOLDS",
+        "MUSESPARK_OPEN_DR3_SILU_FOLD": PREFIX + "DRAFTER_FOLDS",
+        "MUSESPARK_OPEN_SP_CF_V2": PREFIX + "DRAFTER_FOLDS",
+        "MUSESPARK_OPEN_DG_SF_TACTIC": "nothing: the folded GEMV's tactic is fixed per architecture",
+        "MUSESPARK_OPEN_OX_DE": PREFIX + "DRAFTER_FOLDS",
+        "MUSESPARK_OPEN_PT_ATTN_PDL": PREFIX + "DRAFTER_FOLDS",
+        "MUSESPARK_OPEN_TT_DRAFTER_L0": PREFIX + "DRAFTER_FOLDS",
+        "MUSESPARK_OPEN_DR_DRAFT_TAIL": PREFIX + "DRAFT_HEAD_TAIL",
+        "MUSESPARK_OPEN_GR_INLINE_COMMIT": PREFIX + "STEP_LOOP_INLINE_COMMITS",
+        "MUSESPARK_OPEN_IA_FOLD": PREFIX + "STEP_LOOP_INLINE_COMMITS",
     }
 )
 #: Name prefixes only retired switches carry; any other name under them raises too.
@@ -125,6 +177,9 @@ RETIRED_PREFIXES: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_PS_": "the " + PREFIX + "* knobs",
         "TRTLLM_MUSESPARK_TEP_WIDE_": "the " + PREFIX + "WIDE_* knobs",
         "MUSESPARK_OPEN_HEAD_INBOX_": "nothing: the inbox scopes are system-scope",
+        "MUSESPARK_OPEN_MEGAKERNEL_": (
+            "nothing: the megakernel's build options are fixed in its served build"
+        ),
     }
 )
 
@@ -205,6 +260,9 @@ class Deployment:
     arena: Arena
     facts: Facts = Facts()
     rows_per_request: int = ROWS_PER_REQUEST
+    #: Whether the drafter declares a logit transform (``DFlashForCausalLM.logit_multiplier`` /
+    #: ``logit_softcap``); None when there is no drafter to read it from.
+    draft_logit_transform: Optional[bool] = None
 
     def decodes(self) -> bool:
         """Whether this server runs decode steps (an unknown role counts as one that does)."""
@@ -216,14 +274,19 @@ class Deployment:
         return self.max_batch_size is None or self.max_batch_size * self.rows_per_request >= rows
 
     def describe(self) -> str:
+        transform = (
+            ""
+            if self.draft_logit_transform is None
+            else f", drafter logit transform {'declared' if self.draft_logit_transform else 'none'}"
+        )
         return (
             f"sm{self.sm} tep{self.tp}, {self.role.value} ({self.role_source}), max_batch_size "
             f"{_count(self.max_batch_size)}, max_num_tokens {_count(self.max_num_tokens)}, "
-            f"{self.arena.value} arena"
+            f"{self.arena.value} arena{transform}"
         )
 
     def as_dict(self) -> dict:
-        return {
+        out = {
             "sm": self.sm,
             "tp": self.tp,
             "max_batch_size": self.max_batch_size,
@@ -232,6 +295,9 @@ class Deployment:
             "role_source": self.role_source,
             "arena": self.arena.value,
         }
+        if self.draft_logit_transform is not None:
+            out["draft_logit_transform"] = self.draft_logit_transform
+        return out
 
 
 def _count(value: Optional[int]) -> str:
@@ -242,8 +308,10 @@ def _count(value: Optional[int]) -> str:
 class Param:
     """A heuristic threshold a lever declares, overridable by ``<LEVER>__<KEY>``.
 
-    An integer in ``low..high``, or, with ``choices``, a non-empty subset of ``choices``
-    (comma-separated, kept in ``choices`` order). A lossy lever's range is a subset of
+    An integer in ``low..high``; with ``choices``, a non-empty subset of ``choices``
+    (comma-separated, kept in ``choices`` order); with ``ranges``, a non-empty list of
+    inclusive integer ranges in ``low..high`` (``"lo-hi,lo-hi,n"``, as sorted
+    ``(lo, hi)`` pairs). A lossy lever's range is a subset of
     the values its accuracy gate covered. ``default_for``, when set, gives the default
     per deployment; the knob still wins over it.
     """
@@ -254,6 +322,7 @@ class Param:
     high: int = 1 << 30
     choices: Tuple[str, ...] = ()
     default_for: Optional[Callable[["Deployment"], object]] = None
+    ranges: bool = False
 
     def default_of(self, deployment: "Deployment") -> object:
         return self.default if self.default_for is None else self.default_for(deployment)
@@ -274,6 +343,8 @@ class Param:
                     f"{raw!r}"
                 )
             return tuple(choice for choice in self.choices if choice in names)
+        if self.ranges:
+            return self._parse_ranges(raw, text)
         try:
             value = int(text, 10)
         except ValueError:
@@ -283,6 +354,25 @@ class Param:
         if not self.low <= value <= self.high:
             raise ValueError(f"expected an integer in {self.low}..{self.high}, got {value}")
         return value
+
+    def _parse_ranges(self, raw: str, text: str) -> Tuple[Tuple[int, int], ...]:
+        pairs = []
+        for item in (part.strip() for part in text.split(",")):
+            if not item:
+                continue
+            lo_text, _, hi_text = item.partition("-")
+            try:
+                lo, hi = int(lo_text, 10), int(hi_text or lo_text, 10)
+            except ValueError:
+                raise ValueError(
+                    f"expected ranges lo-hi,... in {self.low}..{self.high}, got {raw!r}"
+                ) from None
+            if not self.low <= lo <= hi <= self.high:
+                raise ValueError(f"range {item!r} is outside {self.low}..{self.high} or descending")
+            pairs.append((lo, hi))
+        if not pairs:
+            raise ValueError(f"expected ranges lo-hi,... in {self.low}..{self.high}, got {raw!r}")
+        return tuple(sorted(pairs))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -520,6 +610,144 @@ def _router_gate(role: Role, scope: str) -> Gate:
     return Gate(holds, scope)
 
 
+#: The smallest ``max_batch_size`` the HC levers were measured at on aggregated sm107 TEP4
+#: servers; below it they resolve off.
+HC_LEVERS_MIN_BATCH = 4
+
+_AGG_TEP4 = f"aggregated sm107 tep4 servers of max_batch_size {HC_LEVERS_MIN_BATCH} and up"
+
+
+def _agg_sm107_tep4(d: Deployment) -> bool:
+    """Whether ``d`` is an aggregated sm107 TEP4 server of a known ``max_batch_size`` of at
+    least ``HC_LEVERS_MIN_BATCH`` (where the HC levers were measured)."""
+    return (
+        d.sm == 107
+        and d.tp == 4
+        and d.role is Role.AGG
+        and d.max_batch_size is not None
+        and d.max_batch_size >= HC_LEVERS_MIN_BATCH
+    )
+
+
+def _on_agg_tep4(what: str, min_rows: int = 0) -> RuleFn:
+    """A rule on for ``what`` on aggregated sm107 TEP4 servers (``_agg_sm107_tep4``) whose
+    decode steps can reach ``min_rows`` rows (``Deployment.reaches``), off elsewhere."""
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if not _agg_sm107_tep4(d):
+            if d.sm == 107 and d.tp == 4 and d.role is Role.AGG:
+                return False, (
+                    f"measured at max_batch_size {HC_LEVERS_MIN_BATCH} and up; max_batch_size "
+                    f"is {'unknown' if d.max_batch_size is None else d.max_batch_size}"
+                )
+            return False, f"measured on {_AGG_TEP4} only; this is a {d.role.value} server"
+        if min_rows and not d.reaches(min_rows):
+            return False, f"no decode step reaches {min_rows} rows"
+        return True, f"{what} on {_AGG_TEP4}"
+
+    return rule
+
+
+#: The accuracy gate of the lossless-numeric HC levers.
+_AGG_TEP4_GATE = Gate(_agg_sm107_tep4, _AGG_TEP4)
+
+#: The ``max_batch_size`` band of sm107 TEP4 generation servers where the levers of
+#: 2..4-request decode steps (``_two_to_four_request_steps``) were measured.
+WIDE_GEN_BATCH = (2, 4)
+#: The largest ``max_batch_size`` of the aggregated sm107 TEP4 servers those levers extend
+#: to: such a server runs the same 2..4-request decode steps (16..32 rows), and each of these
+#: levers writes the bytes of the path it replaces, chosen by the step's shape alone.
+WIDE_AGG_MAX_BATCH = 8
+
+
+def _two_to_four_request_steps(what: str) -> RuleFn:
+    """A rule for a bitwise lever of the 2..4-request decode steps: on for sm107 TEP4
+    generation servers of ``max_batch_size`` in ``WIDE_GEN_BATCH`` and aggregated ones of
+    ``max_batch_size`` 2..``WIDE_AGG_MAX_BATCH``, off elsewhere (TEP8, one-request servers,
+    context servers, an unknown role and the mid- and high-concurrency selections)."""
+    low, gen_high = WIDE_GEN_BATCH
+    highs = {Role.GEN: gen_high, Role.AGG: WIDE_AGG_MAX_BATCH}
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if d.sm != 107 or d.tp != 4:
+            return False, f"for sm107 tep4 servers only; this is sm{d.sm} tep{d.tp}"
+        high = highs.get(d.role)
+        if high is None:
+            return False, (
+                "for generation and aggregated servers only; this is a "
+                f"{d.role.value} server ({d.role_source})"
+            )
+        if d.max_batch_size is None:
+            return False, "max_batch_size is unknown"
+        if not low <= d.max_batch_size <= high:
+            return False, (
+                f"for {d.role.value} servers of max_batch_size {low}..{high}; max_batch_size is "
+                f"{d.max_batch_size}"
+            )
+        return True, f"{what} on {d.role.value} servers of max_batch_size {low}..{high}"
+
+    return rule
+
+
+def _decode_qkv_excluded(d: Deployment, t: Resolving) -> Optional[str]:
+    if "qkv" not in t.param("context_fp8_dense", "PROJECTIONS"):
+        return "it reads context_fp8_dense's QKV copies, which context_fp8_dense__PROJECTIONS leaves out"
+    return None
+
+
+#: The deployment the single-request decode schedule of sm107 TEP8 was measured on.
+_SINGLE_REQUEST = (
+    "aggregated sm107 tep8 servers of max_batch_size 1 over a dense drafter context arena"
+)
+
+
+def _single_request_tep8(d: Deployment) -> bool:
+    """Whether ``d`` is the deployment the single-request decode schedule was measured on."""
+    return (
+        d.sm == 107
+        and d.tp == 8
+        and d.role is Role.AGG
+        and d.max_batch_size == 1
+        and d.arena is Arena.DENSE
+    )
+
+
+def _on_single_request(what: str) -> RuleFn:
+    """A rule on for ``what`` on ``_single_request_tep8`` deployments, off elsewhere."""
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if _single_request_tep8(d):
+            return True, f"{what} on {_SINGLE_REQUEST}"
+        if not d.decodes():
+            return False, _NO_DECODE
+        if d.role is not Role.AGG:
+            return False, f"measured on {_SINGLE_REQUEST} only; this is a {d.role.value} server"
+        if d.max_batch_size != 1:
+            return False, (
+                f"measured on {_SINGLE_REQUEST} only; max_batch_size is {_count(d.max_batch_size)}"
+            )
+        return False, f"measured on {_SINGLE_REQUEST} only; this is a {d.arena.value} arena"
+
+    return rule
+
+
+#: The accuracy gate of the megakernel's numerics-budget levers.
+_SINGLE_REQUEST_GATE = Gate(_single_request_tep8, _SINGLE_REQUEST)
+
+#: The megakernel's numerics-budget levers: the served build carries all three, and no build
+#: of it without one exists, so ``megakernel`` requires them (turning one off runs the stock
+#: layers, which is how the numerics budget is opted out of).
+MEGAKERNEL_NUMERICS = (
+    "megakernel_one_exchange_boundaries",
+    "megakernel_two_term_pool",
+    "megakernel_router_by_linearity",
+)
+
+
+def _megakernel_variant_excluded(d: Deployment, t: Resolving) -> Optional[str]:
+    return "no build of the served megakernel carries it"
+
+
 #: Every lever whose rule is not the default; every other served lever is on under ``auto``
 #: and ``baseline``.
 RULES: Mapping[str, Rule] = types.MappingProxyType(
@@ -630,6 +858,146 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         ),
         "prefill_cutedsl_experts": Rule(
             "upstream", Kind.COMPOSITION, _always("expert calls of 4096..8192 rows")
+        ),
+        "step_window_compact": Rule(
+            "HC", Kind.BITWISE, _on_agg_tep4("the windowed arena compaction of mixed steps")
+        ),
+        "fmk_context_fmha": Rule(
+            "HC",
+            Kind.NUMERIC,
+            _on_agg_tep4("the context rows of mixed steps"),
+            gates=(_AGG_TEP4_GATE,),
+        ),
+        "context_kv_late_join": Rule(
+            "HC", Kind.BITWISE, _on_agg_tep4("windowed block decodes after a forked commit")
+        ),
+        "hop_cluster_split": Rule(
+            "HC",
+            Kind.BITWISE,
+            _on_agg_tep4("wide post-attention hops of the ROWS row counts"),
+            params=(
+                Param("CLUSTER", 2, 1, 2),
+                Param("ROWS", ((192, 208), (248, 264)), 9, 1024, ranges=True),
+            ),
+        ),
+        "drafter_fc_inbox_wide": Rule(
+            "HC",
+            Kind.BITWISE,
+            _on_agg_tep4("drafter fc gathers of up to MAX_ROWS rows", min_rows=129),
+            params=(Param("MAX_ROWS", 384, 128, 512), Param("PROGRAMS", 128, 1, 256)),
+        ),
+        "l061_tile32_pin": Rule(
+            "HC",
+            Kind.NUMERIC,
+            _on_agg_tep4("layer 0 / 61 owner-window expert calls of 256..384 rows"),
+            gates=(_AGG_TEP4_GATE,),
+        ),
+        "router_staged_epilogue": Rule(
+            "HC", Kind.BITWISE, _on_agg_tep4("router GEMM calls of 9..512 rows")
+        ),
+        "split_kv_deep_ring": Rule(
+            "HC", Kind.BITWISE, _on_agg_tep4("a 20-page ring in the E4M3-query split-KV decode")
+        ),
+        "context_prep_rows_vec": Rule(
+            "HC",
+            Kind.BITWISE,
+            _on_agg_tep4("context steps' prep on the vectorized rows kernel"),
+        ),
+        "context_embedding_replicated": Rule(
+            "HC",
+            Kind.BITWISE,
+            _on_agg_tep4("context steps' token embedding from the replicated table"),
+        ),
+        "context_sp_router_input": Rule(
+            "HC",
+            Kind.BITWISE,
+            _on_agg_tep4("the router's FP32 input from the sequence-parallel residual join"),
+        ),
+        "decode_qkv_mxfp8": Rule(
+            "HC", Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_decode_qkv_excluded
+        ),
+        "swa_blocks_per_program": Rule(
+            "midc",
+            Kind.BITWISE,
+            _two_to_four_request_steps("sliding-window split programs over 2..4 key blocks"),
+        ),
+        "wide_full_attention_fold": Rule(
+            "midc",
+            Kind.BITWISE,
+            _two_to_four_request_steps("the multi-sequence full-attention prep fold"),
+        ),
+        "wide_qkv_prefetch": Rule(
+            "midc",
+            Kind.BITWISE,
+            _two_to_four_request_steps("the 9..32-row next-QKV prefetch after the experts"),
+        ),
+        "wide_capture_fold": Rule(
+            "midc",
+            Kind.BITWISE,
+            _two_to_four_request_steps("the wide direct boundary's DFlash capture"),
+        ),
+        "megakernel": Rule(
+            "LL",
+            Kind.BITWISE,
+            _on_single_request("one-sequence 8-row decode steps"),
+            requires=MEGAKERNEL_NUMERICS,
+        ),
+        "megakernel_one_exchange_boundaries": Rule(
+            "LL",
+            Kind.NUMERIC,
+            _on_single_request("the megakernel's MoE boundaries"),
+            gates=(_SINGLE_REQUEST_GATE,),
+        ),
+        "megakernel_two_term_pool": Rule(
+            "LL",
+            Kind.NUMERIC,
+            _on_single_request("the megakernel's pool and router GEMVs"),
+            gates=(_SINGLE_REQUEST_GATE,),
+            requires=("megakernel_one_exchange_boundaries",),
+        ),
+        "megakernel_router_by_linearity": Rule(
+            "LL",
+            Kind.NUMERIC,
+            _on_single_request("the megakernel's router logits"),
+            gates=(_SINGLE_REQUEST_GATE,),
+        ),
+        "megakernel_zero_exchange_boundary": Rule(
+            "LL",
+            Kind.BITWISE,
+            _always("the megakernel's post-attention boundaries"),
+            requires=("megakernel_one_exchange_boundaries",),
+            excluded=_megakernel_variant_excluded,
+        ),
+        "layer0_qkv_table": Rule(
+            "LL", Kind.BITWISE, _on_single_request("8-row decode steps' layer-0 QKV rows")
+        ),
+        "edge_bf16_moe_front": Rule(
+            "LL", Kind.BITWISE, _on_single_request("the BF16 expert layers' 8-row MoE fronts")
+        ),
+        "last_layer_boundary": Rule(
+            "LL", Kind.BITWISE, _on_single_request("the last layer's 1..8-row boundaries")
+        ),
+        "context_kv_fork_last_layer": Rule(
+            "LL", Kind.BITWISE, _on_single_request("forked side-chain steps")
+        ),
+        "distributed_head_sampler": Rule(
+            "LL",
+            Kind.BITWISE,
+            _on_single_request("8-row verify heads"),
+            requires=("step_loop_on_execution_stream",),
+            conflicts=("lm_head_inbox",),
+        ),
+        "drafter_preamble_late_join": Rule(
+            "LL", Kind.BITWISE, _on_single_request("folded steps with a commit-written preamble")
+        ),
+        "drafter_folds": Rule(
+            "LL", Kind.BITWISE, _on_single_request("one-request 8-row drafter block decodes")
+        ),
+        "draft_head_tail": Rule(
+            "LL", Kind.BITWISE, _on_single_request("one-request 7-position draft steps")
+        ),
+        "step_loop_inline_commits": Rule(
+            "LL", Kind.BITWISE, _on_single_request("the one-stream step loop's commits")
         ),
     }
 )
@@ -864,14 +1232,33 @@ def role_of(snapshot: Mapping[str, str], disaggregated: Optional[bool]) -> Tuple
     return Role.AGG, "no cache transceiver"
 
 
+def draft_logit_transform_of(draft_model) -> Optional[bool]:
+    """Whether ``draft_model`` declares a logit transform, or None without a drafter.
+
+    ``DFlashForCausalLM`` resolves the transform its config declares into
+    ``logit_multiplier`` (1.0: none) and ``logit_softcap`` (None: none) at construction.
+    A drafter without those attributes declares none.
+    """
+    if draft_model is None:
+        return None
+    multiplier = getattr(draft_model, "logit_multiplier", 1.0)
+    softcap = getattr(draft_model, "logit_softcap", None)
+    return bool(float(multiplier) != 1.0 or softcap is not None)
+
+
 def deployment_of(
-    model_config, compute_capability, arena: Arena, engine_facts, snapshot: Mapping[str, str]
+    model_config,
+    compute_capability,
+    arena: Arena,
+    engine_facts,
+    snapshot: Mapping[str, str],
+    draft_logit_transform: Optional[bool] = None,
 ) -> Deployment:
     """The ``Deployment`` of a model: its config's mapping, the device, the arena and the engine.
 
     ``engine_facts`` carries ``max_batch_size``, ``max_num_tokens`` and ``disaggregated``
     (``_router_index.DeploymentFacts``), or is None when the target class was built without
-    them.
+    them. ``draft_logit_transform`` is ``draft_logit_transform_of`` the drafter.
 
     Raises:
         ValueError: as ``role_of``.
@@ -887,6 +1274,7 @@ def deployment_of(
         role_source=source,
         arena=arena,
         facts=facts_of(snapshot),
+        draft_logit_transform=draft_logit_transform,
     )
 
 

@@ -44,7 +44,8 @@ or none (``dispatch.NO_PATHS``) when the deployment has no composition, and the
 target then runs only the built-in modules as described above. A missing public
 precondition of a planned fast path is an error, whatever the mode. Over a
 full-length or paged drafter context the fast paths written for a windowed arena
-are left out of the plan (``dispatch.WINDOWED_CONTEXT_ARENA_PATHS``); over a
+are left out of the plan (``dispatch.WINDOWED_CONTEXT_ARENA_PATHS``,
+``dispatch.WINDOWED_STEP_PATHS``); over a
 windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``) the paths that write the
 arena by column (``dispatch.FULL_CONTEXT_ARENA_PATHS``: the context-K/V fork and
 the verify fold) stay where the composition serves the window compaction too
@@ -382,21 +383,28 @@ order:
 * ``drafter_window_compact`` last, on the worker the others left (and after
   the head paths below): its ``_compact_ctx_window`` -- the windowed drafter
   arena's per-step left shift of each generation slot's window -- runs
-  ``ops/spec/ctx_window_compact`` in place, with the built-in's arena bytes.
+  ``ops/spec/ctx_window_compact`` in place, with the built-in's arena bytes;
+  or, on sm107 where the context-K/V fork's windowed commit compacts the decode
+  steps it takes, ``step_window_compact`` in its place: the same in-place
+  compaction for the steps that still reach ``_compact_ctx_window`` (the
+  mixed steps' generation rows in the built-in prepare).
 
 As with the target paths, a drafter path of the plan that cannot be installed
 raises (``ValueError``) instead of leaving the built-in path to run under its
 name; the installs run from every load hook and are logged only by the call
 that changed something.
 
-The executor paths (``deferred_input_prep``, ``sampler_store``) change neither
-the model nor the drafter: ``runtime.py`` stages the work between two decode
-CUDA graphs, and the shell declares it to the executor as its
-``runtime_hooks`` (``tensorrt_llm/_torch/pyexecutor/runtime_hooks.py``), both
-the step-input stager and the sampler store writer. The shell's constructor
-builds the hooks right after the composition is decided and before the text
-model is adopted (``runtime.make_runtime_hooks``) whenever the composition is
-not empty; ``runtime`` is imported only then.
+The executor paths (``deferred_input_prep``, ``sampler_store`` and their levers
+``step_loop_on_execution_stream``, ``incremental_block_offsets`` and
+``step_loop_inline_commits``) change neither the model nor the drafter:
+``runtime.py`` stages the work between two decode CUDA graphs, and the shell
+declares it to the executor as its ``runtime_hooks``
+(``tensorrt_llm/_torch/pyexecutor/runtime_hooks.py``), both the step-input
+stager and the sampler store writer, with the levers also the step loop on the
+execution stream and the overlap offsets applier. The shell's
+constructor builds the hooks right after the composition is decided and before
+the text model is adopted (``runtime.make_runtime_hooks``) whenever the
+composition is not empty; ``runtime`` is imported only then.
 
 The head paths (``split_sampler``, ``lm_head_inbox``) are installed from the
 same hooks, after the drafter paths: ``split_sampler/target_head.py``
@@ -596,7 +604,9 @@ class PrefillTarget:
         if core._plan.enabled("context_sequence_parallel"):
             from .kernels.context_sequence_parallel import forward as _context_sp
 
-            self.sequence_parallel = _context_sp.install(core, sm)
+            self.sequence_parallel = _context_sp.install(
+                core, sm, router_input=core._plan.enabled("context_sp_router_input")
+            )
 
     def forward(
         self,
@@ -638,6 +648,119 @@ class PrefillTarget:
         return hidden_states
 
 
+# ---- the single-request decode schedule of sm107 TEP8 (``dispatch.SM107_TEP8_ONLY``) ----
+#: ``context_kv_fork_last_layer`` with the megakernel: where the side chain's early part
+#: (``fork.fire_early``, ``drafter_fc_early_fork``) fires when the megakernel runs the layer at
+#: which it would fire (every launch holds all SMs, so the side stream's ``fc`` GEMM can only
+#: run after the last launch, beside the last layer's attention): ``1`` at the start of the last
+#: decoder layer's MoE, i.e. right after its post-attention hop; ``2`` not at all (the side
+#: chain then projects at its fork point); ``0`` at its layer index. Reached only on a step the
+#: megakernel runs. Value-identical: only the order of independent work changes.
+PV_EARLY_FC_AFTER_HOP1 = "1"
+#: ``last_layer_boundary``: the last decoder layer's unpool gather, post-FFN gated residual and
+#: the final model norm as one launch (``ops/comm/unpool_final_boundary``), with
+#: ``projection_gathers``' unpool inbox. ``1``: route 1, the built-in chain's operations in its
+#: order (value-identical; the op's 8-rank test holds it to the built-in bits). ``2``: route 2,
+#: the final norm's variance summed in the kernel's own order (not value-identical). ``0``: the
+#: built-in three launches. ``G2_TRIGGER`` (``exit``, ``after_wait``, ``entry``) places the
+#: kernel's PDL trigger; ``G2_PREWAIT`` lets it read the load-time constant operands before its
+#: dependency wait. Neither changes a value.
+G2_L61_BOUNDARY = "1"
+G2_TRIGGER = "exit"
+G2_PREWAIT = False
+#: ``context_kv_fork_last_layer``: where the DFlash context-K/V side chain forks on a decode
+#: step (``kernels/context_kv_fork``). Without the lever it forks at the LM-head point, i.e. its
+#: side stream waits for the head GEMM, which holds nearly every SM, so the chain's first kernel
+#: (the drafter fc's projection gather) starts only when the GEMM drains and the chain can end
+#: after the sampler's verify fold. ``1``: fork on the last decoder layer, right after its expert
+#: call (the side stream then waits for the FC2 GEMM): the chain runs beside the latency-bound
+#: finalize, unpool, glue and final norm. ``2``: fork at the start of the last decoder layer's
+#: MoE (right after its post-attention hop). ``3``: fork at the end of ``DecodeTarget.forward``
+#: (after the final norm), so the chain runs beside the LM-head GEMM instead of after it. ``0``:
+#: the LM-head point. Only the start of independent work on another stream moves: the chain
+#: reads the captured rows and its own early part, writes the context arena the drafter reads
+#: after the join, and its projection gather has a workspace of its own; every value is
+#: unchanged.
+PF_SIDE_FORK = "1"
+
+
+@contextlib.contextmanager
+def _pv_removing(handle):
+    """Remove a hook handle (or nothing) when the layer loop ends, also when it raises."""
+    try:
+        yield
+    finally:
+        if handle is not None:
+            handle.remove()
+
+
+class _PvFireBeforeMoe:
+    """A one-shot forward pre-hook on the last layer's MoE that fires the side chain's early part
+    there (``PV_EARLY_FC_AFTER_HOP1``)."""
+
+    def __init__(self, fork) -> None:
+        self.fork = fork
+        self.fired = False
+
+    def __call__(self, module, args) -> None:
+        if not self.fired:
+            self.fired = True
+            self.fork.fire_early()
+
+
+class _PfFireSideChain:
+    """``PF_SIDE_FORK``: a one-shot module hook that forks the armed step's side chain
+    (``fork.fire``)."""
+
+    def __init__(self, fork) -> None:
+        self.fork = fork
+        self.fired = False
+
+    def __call__(self, module, *args) -> None:
+        if not self.fired:
+            self.fired = True
+            self.fork.fire(self.fork.point)
+
+
+def _layer0_table_applies(core, input_ids, inputs_embeds) -> bool:
+    """Whether ``DecodeTarget`` can take layer 0's QKV rows from the table (``layer0_qkv_table``).
+
+    A step of token ids (no ``inputs_embeds``) the fused pre (``kernels/pf_pre``) takes, whose
+    norms it reproduces (``kernels/pf_pre/pre.unsupported_reason``), on a model whose layer 0
+    reads ``pre_qkv_proj_norm`` of the BF16 embedding (``_layer0_input_core_ok``). Rank-uniform.
+    """
+    if inputs_embeds is not None:
+        return False
+    from .kernels.pf_pre import pre as _pf_pre
+
+    return (
+        _pf_pre.takes(input_ids)
+        and _layer0_input_core_ok(core)
+        and _pf_pre.unsupported_reason(core) is None
+    )
+
+
+def _layer0_input_core_ok(core) -> bool:
+    """Whether layer 0 reads ``pre_qkv_proj_norm(hidden_states.to(bf16))`` of a BF16 embedding.
+
+    Not with an installed megakernel that runs the edge layers (it makes layer 0's attention
+    input itself); one that leaves them stock (the served configuration) keeps layer 0 stock.
+    """
+    first = core.layers[0]
+    add_attn = getattr(first, "add_attn", None)
+    megakernel = getattr(core, "_megakernel", None)
+    return (
+        (megakernel is None or not getattr(megakernel, "edges", True))
+        and core.dtype == torch.bfloat16
+        and add_attn is not None
+        and getattr(add_attn, "_preqkv_norm_fp32", None) is False
+        and getattr(first, "pre_qkv_proj_norm", None) is not None
+    )
+
+
+# ---- end of the single-request decode schedule's helpers ----
+
+
 def _early_fc_index(fork, spec_metadata, num_layers: int) -> int:
     """The decoder-layer index at whose start ``fork.fire_early()`` runs, or -1.
 
@@ -652,6 +775,84 @@ def _early_fc_index(fork, spec_metadata, num_layers: int) -> int:
         return -1
     index = max(capture) + 1
     return index if 0 < index < num_layers else -1
+
+
+# ---- last_layer_boundary: the last layer's boundary with the final norm ------------------
+_G2_REFUSALS: set = set()
+
+
+def _g2_refusal(core, layers, layer_kwargs: dict, megakernel, spec_metadata, rows: int):
+    """Why the last layer's join cannot hand its slice and the final norm to ``unpool_final_boundary``
+    on this forward, or None. Host facts only (flags, classes, shapes), alike on every rank."""
+    from .kernels.projection_gathers.gathers import MuseSparkOpenTepGatedResidual
+
+    last = len(layers) - 1
+    join = getattr(layers[last], "add_ffn", None)
+    norm = getattr(core, "norm", None)
+    if not layer_kwargs.get("fused_unpool_gather"):
+        return "projection_gathers' unpool site is not fused"
+    if not isinstance(join, MuseSparkOpenTepGatedResidual) or join._gather_inbox is None:
+        return "the last layer's join is not projection_gathers' join with an inbox"
+    if norm is None or norm.use_gemma or getattr(norm, "use_cuda_tile", False):
+        return "the final norm is not the weighted flashinfer RMSNorm"
+    if megakernel is not None and (megakernel.final_norm_done or megakernel.replaces(last)):
+        return "the megakernel runs the last layer or the final norm"
+    if not 1 <= rows <= 8:
+        return f"{rows} rows"
+    if spec_metadata is not None and spec_metadata.is_layer_capture(last):
+        return "the last layer is a DFlash capture layer"
+    if not _g2_flashinfer_cute_norm(norm.weight.device):
+        return "flashinfer's norm is not its CuTe-DSL RMSNormKernel on this device"
+    return None
+
+
+def _g2_flashinfer_cute_norm(device: torch.device) -> bool:
+    """Whether the final ``RMSNorm`` reaches flashinfer's CuTe-DSL ``RMSNormKernel`` (route 1's model)."""
+    try:
+        from flashinfer import norm as _fi_norm
+
+        from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+    except ImportError:
+        return False
+    use_cuda = getattr(_fi_norm, "_use_cuda_norm", None)
+    return bool(IS_FLASHINFER_AVAILABLE) and use_cuda is not None and not use_cuda(device)
+
+
+def _g2_arm(core, layers, layer_kwargs: dict, megakernel, spec_metadata, rows: int):
+    """The final norm to pass as the last layer's ``next_layer_norm``, or None.
+
+    The norm is returned when the boundary is armed (``last_layer_boundary``).
+    """
+    if G2_L61_BOUNDARY not in ("1", "2"):
+        return None
+    reason = _g2_refusal(core, layers, layer_kwargs, megakernel, spec_metadata, rows)
+    if reason is not None:
+        if reason not in _G2_REFUSALS:
+            _G2_REFUSALS.add(reason)
+            from tensorrt_llm.logger import logger
+
+            logger.warning(f"[musespark_open] last_layer_boundary not taken: {reason}")
+        return None
+    last = layers[-1]
+    join = last.add_ffn
+    norm = getattr(last, "post_ffn_norm", None)
+    cached = getattr(norm, "_weight_plus_one", None)
+    join.arm_g2(
+        core.norm,
+        int(G2_L61_BOUNDARY),
+        G2_TRIGGER,
+        G2_PREWAIT,
+        cached if getattr(norm, "_cache_enabled", False) else None,
+    )
+    if "armed" not in _G2_REFUSALS:
+        _G2_REFUSALS.add("armed")
+        from tensorrt_llm.logger import logger
+
+        logger.info(
+            f"[musespark_open] last_layer_boundary armed: route {join._g2_route}, trigger "
+            f"{G2_TRIGGER}, prewait {G2_PREWAIT and join._g2_const_gain is not None}"
+        )
+    return core.norm
 
 
 class DecodeTarget:
@@ -744,6 +945,15 @@ class DecodeTarget:
     rows, the sliding-window layers' multi-request preps issue the L2 prefetch of
     their o_proj weight up to 64 rows, and the attention norm-gates run as PDL
     kernels up to 64 and above 128 rows.
+
+    The single-request decode schedule of sm107 TEP8 (``dispatch.SM107_TEP8_ONLY``), each read
+    from the plan once, here: with ``layer0_qkv_table`` layer 0's QKV rows come from the table
+    ``kernels/tt_table/target_l0`` installs, the residual's input chain forked beside the
+    gather (else ``model_boundary`` or the built-in chain makes layer 0's input); with
+    ``megakernel`` an 8-row one-sequence step runs layers 1 to 60 as whole-layer launches
+    (``kernels/megakernel/serving.py``); with ``last_layer_boundary`` the last layer's join
+    applies the final norm (``G2_L61_BOUNDARY``); with ``context_kv_fork_last_layer`` the
+    context-K/V fork's side chain forks on the last decoder layer (``PF_SIDE_FORK``).
     """
 
     def __init__(self, core: MuseSparkOpenTepModelingV2) -> None:
@@ -751,6 +961,9 @@ class DecodeTarget:
         self.preattn_prep: Optional[PreattnPrep] = (
             preattn_prep if core._plan.enabled("preattn_prep") else None
         )
+        self.layer0_qkv_table: bool = core._plan.enabled("layer0_qkv_table")
+        self.last_layer_boundary: bool = core._plan.enabled("last_layer_boundary")
+        self.context_kv_fork_last_layer: bool = core._plan.enabled("context_kv_fork_last_layer")
         self.layer_kwargs = dict(core._layer_kwargs)
         self.post_attn_hop: Optional[PostAttnHopCall] = getattr(core, "_post_attn_hop", None)
         self.decode_attention: Optional[DecodeAttentionPlan] = getattr(
@@ -787,10 +1000,23 @@ class DecodeTarget:
             self.qkv_prefetch.graph_start(
                 int((input_ids if input_ids is not None else inputs_embeds).shape[0])
             )
+        first_attn_input = None
+        tq_front = None
+        if (
+            self.layer0_qkv_table
+            and "_tq_target_l0" in core.__dict__
+            and _layer0_table_applies(core, input_ids, inputs_embeds)
+        ):
+            # layer0_qkv_table: layer 0's QKV(G) rows from the table; the fused pre writes the
+            # residual (and the attention input) on a fork beside the gather.
+            from .kernels.tt_table import target_l0 as _tq_target_l0
+
+            tq_front = _tq_target_l0.front(core, input_ids, pdl=True)
         # Installed at weight load, after this target was built.
         model_boundary = getattr(core, "_model_boundary", None)
-        first_attn_input = None
-        if model_boundary is not None and model_boundary.takes(input_ids, inputs_embeds):
+        if tq_front is not None:
+            first_attn_input, hidden_states = tq_front
+        elif model_boundary is not None and model_boundary.takes(input_ids, inputs_embeds):
             hidden_states, first_attn_input = model_boundary.input(input_ids)
         else:
             if inputs_embeds is None:
@@ -824,11 +1050,29 @@ class DecodeTarget:
         # drafter_fc_early_fork: the layer before which the side chain's local part forks.
         early_index = _early_fc_index(fork, kwargs.get("spec_metadata"), len(core.layers))
 
+        # ---- the megakernel (the megakernel fast path, kernels/megakernel/serving.py) ----
+        # All routed layers as whole-layer launches, or none; the unpool / pool direct transports stay unarmed then.
+        megakernel = getattr(core, "_megakernel", None)
+        if megakernel is not None and not megakernel.begin(
+            hidden_states, position_ids, attn_metadata, kwargs.get("spec_metadata")
+        ):
+            megakernel = None
+        # ---- end megakernel ----
         direct = self.unpool_direct
         rows = hidden_states.shape[0]
-        direct_armed = direct is not None and direct.takes(rows)
+        direct_armed = megakernel is None and direct is not None and direct.takes(rows)
         pool = self.pool_direct
-        pool_armed = pool is not None and pool.takes(rows)
+        pool_armed = megakernel is None and pool is not None and pool.takes(rows)
+        # Under the megakernel, the direct pool sites of the layers outside it (the BF16-expert
+        # layers 0 and 61, sites with the edge_bf16_moe_front lever) are armed alone.
+        pool_skip = None
+        if (
+            megakernel is not None
+            and pool is not None
+            and pool.takes(rows)
+            and pool.arms_outside(megakernel.replaces)
+        ):
+            pool_armed, pool_skip = True, megakernel.replaces
         router = self.router_gemm
         router_armed = router is not None and router.takes(rows)
         kv_splits = self.kv_splits
@@ -848,6 +1092,41 @@ class DecodeTarget:
         batch_armed = batch is not None and batch.takes(rows)
 
         layers = core.layers
+        # With the megakernel running the layer the side chain's early part would fire at, move
+        # or drop it (PV_EARLY_FC_AFTER_HOP1).
+        pv_fc_hook = None
+        if (
+            early_index >= 0
+            and megakernel is not None
+            and megakernel.replaces(early_index)
+            and PV_EARLY_FC_AFTER_HOP1 in ("1", "2")
+        ):
+            if PV_EARLY_FC_AFTER_HOP1 == "1" and not megakernel.replaces(len(layers) - 1):
+                pv_fc_hook = layers[-1].feed_forward.register_forward_pre_hook(
+                    _PvFireBeforeMoe(fork)
+                )
+            early_index = -1
+        # context_kv_fork_last_layer: fork the side chain on the last decoder layer instead of at
+        # the LM head (PF_SIDE_FORK).
+        pf_fork_hook = None
+        if (
+            fork is not None
+            and self.context_kv_fork_last_layer
+            and PF_SIDE_FORK in ("1", "2")
+            and not (megakernel is not None and megakernel.replaces(len(layers) - 1))
+        ):
+            moe = layers[-1].feed_forward
+            if PF_SIDE_FORK == "1":
+                pf_fork_hook = moe.experts.register_forward_hook(_PfFireSideChain(fork))
+            else:
+                pf_fork_hook = moe.register_forward_pre_hook(_PfFireSideChain(fork))
+        # last_layer_boundary: the last layer's join and the final norm as one launch on its
+        # unpool slice.
+        g2_norm = (
+            _g2_arm(core, layers, self.layer_kwargs, megakernel, kwargs.get("spec_metadata"), rows)
+            if self.last_layer_boundary
+            else None
+        )
         precomputed_attn_input = first_attn_input
         if hop_armed:
             arming = hop.armed(hidden_states.shape[0], hidden_states)
@@ -858,7 +1137,7 @@ class DecodeTarget:
         with (
             arming,
             direct.armed(rows) if direct_armed else contextlib.nullcontext(),
-            pool.armed(rows) if pool_armed else contextlib.nullcontext(),
+            pool.armed(rows, pool_skip) if pool_armed else contextlib.nullcontext(),
             router.armed() if router_armed else contextlib.nullcontext(),
             kv_splits.armed() if kv_splits_armed else contextlib.nullcontext(),
             wide_ar.armed() if wide_ar_armed else contextlib.nullcontext(),
@@ -868,11 +1147,24 @@ class DecodeTarget:
             hot.armed() if hot_armed else contextlib.nullcontext(),
             batch.armed() if batch_armed else contextlib.nullcontext(),
             model_boundary.armed() if model_boundary is not None else contextlib.nullcontext(),
+            megakernel.scope() if megakernel is not None else contextlib.nullcontext(),
+            _pv_removing(pv_fc_hook),
+            _pv_removing(pf_fork_hook),
         ):
             for index, decoder_layer in enumerate(layers):
                 if index == early_index:
                     fork.fire_early()
-                next_norm = layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else None
+                # ---- the megakernel ----
+                if megakernel is not None and megakernel.replaces(index):
+                    if index == megakernel.first:
+                        hidden_states, precomputed_attn_input = megakernel.run(
+                            core, hidden_states, precomputed_attn_input
+                        )
+                    continue
+                # ---- end megakernel ----
+                next_norm = (
+                    layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else g2_norm
+                )
                 result = decoder_layer(
                     position_ids=position_ids,
                     hidden_states=hidden_states,
@@ -886,7 +1178,19 @@ class DecodeTarget:
                     hidden_states = result
                 else:
                     hidden_states, precomputed_attn_input = result
-        hidden_states = core.norm(hidden_states.to(core.dtype))
+        # ---- the megakernel: with the edge layers, its last launch applied the final norm ----
+        if megakernel is not None and megakernel.final_norm_done:
+            hidden_states = precomputed_attn_input
+        elif g2_norm is not None:
+            # last_layer_boundary: the last layer's join already applied the final norm.
+            hidden_states = precomputed_attn_input
+        else:
+            hidden_states = core.norm(hidden_states.to(core.dtype))
+        # ---- end megakernel ----
+        # context_kv_fork_last_layer (PF_SIDE_FORK 3): fork the side chain before the LM-head GEMM
+        # is launched.
+        if fork is not None and self.context_kv_fork_last_layer and PF_SIDE_FORK == "3":
+            fork.fire(fork.point)
         _join_prefetch(core)
         return hidden_states
 
@@ -1175,11 +1479,30 @@ _SM107_TEP8_LEVERS = frozenset(
         "head_multimem_gather",
     }
 )
+#: The levers of the single-request decode schedule sm107 TEP8 also serves
+#: (``dispatch.SM107_TEP8_ONLY``): the whole-layer decode megakernel of layers 1 to 60 and its
+#: numerics-budget levers, layer 0's QKV rows from a per-token table, the BF16 expert layers'
+#: MoE front, the last layer's boundary with the final norm, the context-K/V side chain forked
+#: on the last decoder layer, the distributed verify head sampler, the preamble's join inside the
+#: drafter forward, the drafter folds and the draft head's tail, and the one-stream loop's inline
+#: commits. Their rules (``levers.RULES``) turn them on only where they were measured.
+_SM107_TEP8_SINGLE_REQUEST_LEVERS = _dispatch.SM107_TEP8_ONLY
 #: The levers sm107 TEP4 adds, on its TP4 paths: the multi-request prep append's packed
 #: kernel, the 16..32-row steps' direct transports, per-row router shard and o_proj
 #: publication, the lossy MXFP8 dense projections of large context calls and the MXFP8
 #: gather of the sequence-parallel attention input, and the NVFP4 experts of large prefill
-#: calls on the Rubin CuTe DSL GEMMs.
+#: calls on the Rubin CuTe DSL GEMMs; and the levers measured on aggregated TP4 servers: the
+#: windowed drafter arena's compaction in place on the steps the context-K/V fork's windowed
+#: commit leaves (on sm103 ``drafter_window_compact`` serves every step), the
+#: multi-instance context FMHA of mixed steps, the late join of the context-K/V side chain,
+#: the wide hop's row split, the wider drafter fc inbox, the layer 0 / 61 expert tile pin,
+#: the router GEMM's staged epilogue, the lossy MXFP8 QKV of published decode steps, the
+#: E4M3-query split-KV decode's 20-page ring, context steps' prep on the vectorized rows
+#: kernel and their token embedding from the replicated table, and the sequence-parallel
+#: residual join's router FP32 input; and on the 2..4-request decode steps: the
+#: sliding-window split programs over several key blocks, the full-attention prep folded
+#: into the multi-sequence split-KV FMHA, the next QKV weight's prefetch forked after the
+#: experts and the DFlash capture written by the wide direct boundary.
 _SM107_TEP4_LEVERS = frozenset(
     {
         "packed_prep_append",
@@ -1189,6 +1512,22 @@ _SM107_TEP4_LEVERS = frozenset(
         "context_fp8_dense",
         "context_fp8_attn_gather",
         "prefill_cutedsl_experts",
+        "step_window_compact",
+        "fmk_context_fmha",
+        "context_kv_late_join",
+        "hop_cluster_split",
+        "drafter_fc_inbox_wide",
+        "l061_tile32_pin",
+        "router_staged_epilogue",
+        "decode_qkv_mxfp8",
+        "split_kv_deep_ring",
+        "context_prep_rows_vec",
+        "context_embedding_replicated",
+        "context_sp_router_input",
+        "swa_blocks_per_program",
+        "wide_full_attention_fold",
+        "wide_qkv_prefetch",
+        "wide_capture_fold",
     }
 )
 
@@ -1202,7 +1541,13 @@ TARGET_PATHS = {
         served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
     ),
     (107, 8): _dispatch.TargetPaths(
-        served=_TEP8_PATHS | _PREFETCH_LEVERS | _SM107_LEVERS | _SM107_TEP8_LEVERS,
+        served=(
+            _TEP8_PATHS
+            | _PREFETCH_LEVERS
+            | _SM107_LEVERS
+            | _SM107_TEP8_LEVERS
+            | _SM107_TEP8_SINGLE_REQUEST_LEVERS
+        ),
         topology=_dispatch.TWO_TRAYS_OF_4,
         preconditions=(_dispatch.SM107_FUSED_KERNELS,),
     ),
@@ -1391,10 +1736,76 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         nothing. Under ``NO_PATHS`` this does nothing.
         """
         self._install_draft_features()
+        self._install_single_request()
+        self._log_installed_table()
 
     def cache_derived_state(self) -> None:
         """``post_load_weights`` for the loader paths whose walk calls only this stage."""
         self._install_draft_features()
+        self._install_single_request()
+        self._log_installed_table()
+
+    def _install_single_request(self) -> None:
+        """The target installs of the single-request decode schedule of sm107 TEP8, once the
+        drafter paths are in, before the KV cache is sized. Each is rank-local and idempotent,
+        imports its module only when the plan has it, and reports its outcome to the plan once.
+
+        * ``megakernel`` (``kernels/megakernel/serving.install``, collective): the served build,
+          whose numerics-budget levers it requires (``levers.MEGAKERNEL_NUMERICS``);
+        * ``layer0_qkv_table``: the fused pre's library (the table's live chain and the
+          residual's fork), then layer 0's QKV(G) table (``kernels/tt_table/target_l0``), after
+          the megakernel, which it checks does not run layer 0;
+        * ``last_layer_boundary``: the identity row select before the LM head
+          (``kernels/pv_glue``); the boundary itself is armed per step by ``DecodeTarget``.
+        """
+        plan = self._plan
+        reported = self.__dict__.setdefault("_single_request_reported", set())
+
+        def report(name: str, ok: bool, why: str = "") -> None:
+            if name not in reported:
+                reported.add(name)
+                plan.installed(name, ok, why)
+
+        if plan.enabled("megakernel"):
+            from . import levers as _levers
+            from .kernels.megakernel import serving as _megakernel
+
+            core = self.llm.model
+            if getattr(core, "_megakernel", None) is None:
+                _megakernel.install(core, self._mapping)
+            installed = getattr(core, "_megakernel", None) is not None
+            why = "" if installed else "the megakernel's install declined (see its log)"
+            report("megakernel", installed, why)
+            for name in _levers.MEGAKERNEL_NUMERICS:
+                report(name, installed, why)
+        if plan.enabled("layer0_qkv_table"):
+            from .kernels.pf_pre import pre as _pf_pre
+            from .kernels.tt_table import target_l0 as _tq_target_l0
+
+            _pf_pre.load_library()
+            core = self.llm.model
+            table = _tq_target_l0.install(core)
+            report(
+                "layer0_qkv_table",
+                table is not None,
+                "" if table is not None else str(_tq_target_l0.unsupported_reason(core)),
+            )
+        if plan.enabled("last_layer_boundary"):
+            from .kernels.pv_glue import glue as _pv_glue
+
+            selected = _pv_glue.install_row_select(self.llm)
+            report(
+                "last_layer_boundary",
+                True,
+                "" if selected else "installed without the identity row select",
+            )
+
+    def _log_installed_table(self) -> None:
+        """Log the table every lever was installed with, once, on TP rank 0."""
+        plan = self._plan
+        if plan.levers is not None and plan.rank0 and not self.__dict__.get("_table_logged"):
+            self._table_logged = True
+            logger.info(f"{_dispatch.TAG} lever table json (installed): {plan.report()}")
 
     def _install_draft_features(self) -> None:
         """The drafter fast paths of the plan, in install order (``drafter.adopt_drafter``).
@@ -1421,18 +1832,23 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         its hops run inside the drafter's block decode.
         ``drafter_pdl_chain`` goes after it: its entry triggers are checked
         against the ``drafter_fixed_gemms`` GEMM methods and the hops.
+        ``drafter_folds`` installs its parts around those: the layer-0 input
+        norm's entry release after ``drafter_hops``; the QK norm + RoPE PDL
+        copy and the GEMV folds after ``drafter_pdl_chain`` (and
+        ``draft_head_tail`` after them); and the drafter's layer-0 table after
+        the head paths, since it is built by running the layer-0 modules as
+        every other install left them.
         The head paths (``split_sampler``, ``lm_head_inbox``) go after those: they
         re-class the worker as a class derived from the one the others left, and
         with the context-K/V fork's head fork point the head fires it itself.
-        ``drafter_window_compact`` goes last: it re-classes the worker as a class
-        derived from the one every other path left, and on a repeated call sees
-        its own class through ``isinstance``.
+        ``distributed_head_sampler`` rides on them: the verify fold is installed
+        to load before its wait behind the sampler's early release, and the
+        interleaved LM-head copy and the sampler-state exchange attach to the
+        head after ``split_sampler``.
+        ``drafter_window_compact`` (or ``step_window_compact``) goes last: it
+        re-classes the worker as a class derived from the one every other path
+        left, and on a repeated call sees its own class through ``isinstance``.
         """
         from . import drafter as _drafter
 
-        plan = self._plan
-        _drafter.adopt_drafter(self, plan)
-        if plan.levers is not None and plan.rank0 and not self.__dict__.get("_table_logged"):
-            # Once the drafter installs reported: the table every lever was installed with.
-            self._table_logged = True
-            logger.info(f"{_dispatch.TAG} lever table json (installed): {plan.report()}")
+        _drafter.adopt_drafter(self, self._plan)
