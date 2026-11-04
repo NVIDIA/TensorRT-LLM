@@ -296,6 +296,17 @@ class MiniMaxM2ToolParser(BaseToolParser):
             logger.error(f"Error in MiniMaxM2 parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release trailing text while keeping unfinished tool calls hidden."""
+        tool_start = self._buffer.find(self.bot_token)
+        if tool_start >= 0:
+            normal_text = self._buffer[:tool_start]
+            self._buffer = self._buffer[tool_start:]
+        else:
+            normal_text = self._buffer
+            self._buffer = ""
+        return StreamingParseResult(normal_text=normal_text)
+
     def supports_structural_tag(self) -> bool:
         """Return whether this parser supports structural tag guided decoding."""
         return False
