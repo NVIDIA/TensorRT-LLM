@@ -405,7 +405,7 @@ SINGLE = {
 }
 SINGLE_TAIL = {"draft_head_tail"}
 #: The fused rejection sampler, on in that deployment only where the speculative config asks for
-#: rejection sampling (forced acceptance leaves it inert) and the draft head's tail is on.
+#: rejection sampling (forced acceptance leaves it inert), whatever the drafter's logit transform.
 SINGLE_RS = {"rejection_sampler"}
 
 #: The low-latency levers that stand down where one of ``WIDE_STEPS`` is on (by band on
@@ -963,8 +963,8 @@ def rs_table(key=(107, 8), mbs=1, role="agg", arena="dense", knob_set=None, **fa
         (False, True, SINGLE_TAIL | SINGLE_RS),
         (False, False, SINGLE_TAIL),
         (False, None, SINGLE_TAIL),
-        (True, True, set()),
-        (None, True, set()),
+        (True, True, SINGLE_RS),
+        (None, True, SINGLE_RS),
         (True, False, set()),
     ],
     ids=[
@@ -976,18 +976,11 @@ def rs_table(key=(107, 8), mbs=1, role="agg", arena="dense", knob_set=None, **fa
         "both-off",
     ],
 )
-def test_the_rejection_sampler_needs_rejection_sampling_and_the_tail(
-    transform, rejection_sampling, expected
-):
+def test_the_rejection_sampler_needs_rejection_sampling(transform, rejection_sampling, expected):
     lever_table = rs_table(draft_logit_transform=transform, rejection_sampling=rejection_sampling)
     assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | VR_SINGLE | expected
     decision = lever_table.decisions["rejection_sampler"]
-    if rejection_sampling is not True:
-        assert decision.source == "structural"
-    elif transform is not False:
-        assert decision.source == "dependency"
-    else:
-        assert decision.source == "auto"
+    assert decision.source == ("auto" if rejection_sampling is True else "structural")
 
 
 def test_the_rejection_sampler_is_the_only_difference_rejection_sampling_makes():
@@ -1034,8 +1027,10 @@ def test_the_rejection_sampler_follows_its_knob():
     assert rule_levers_on(off) == LL | DENSE | SINGLE | VR_SINGLE | SINGLE_TAIL
     assert off.decisions["rejection_sampler"].source == "knob"
     off_tail = rs_table(knob_set=knobs(draft_head_tail="off"))
-    assert rule_levers_on(off_tail) == LL | DENSE | SINGLE | VR_SINGLE
-    assert off_tail.decisions["rejection_sampler"].source == "dependency"
+    assert rule_levers_on(off_tail) == LL | DENSE | SINGLE | VR_SINGLE | SINGLE_RS
+    assert off_tail.decisions["rejection_sampler"].source == "auto"
+    off_folds = rs_table(knob_set=knobs(drafter_folds="off"))
+    assert off_folds.decisions["rejection_sampler"].source == "dependency"
     with pytest.raises(ValueError, match="builds on distributed_head_sampler, which is off"):
         rs_table(mbs=2, knob_set=knobs(rejection_sampler="on"))
     baseline = rs_table(knob_set={**BASELINE})
@@ -1047,9 +1042,8 @@ def test_the_rejection_sampler_follows_its_knob():
     [
         ({"rejection_sampling": False}, "forced acceptance"),
         ({"rejection_sampling": None}, "is not known"),
-        ({"draft_logit_transform": True}, "builds on draft_head_tail, which is off"),
     ],
-    ids=["forced-or-not-asked", "unknown", "declared-transform"],
+    ids=["forced-or-not-asked", "unknown"],
 )
 def test_the_rejection_sampler_on_raises_where_it_cannot_be_on(facts, message):
     with pytest.raises(ValueError, match=re.escape(message)):
@@ -1057,7 +1051,7 @@ def test_the_rejection_sampler_on_raises_where_it_cannot_be_on(facts, message):
 
 
 def test_the_rejection_sampler_beside_the_single_request_yields():
-    lever_table = rs_table()
+    lever_table = rs_table(draft_logit_transform=True)
     assert lever_table.on("rejection_sampler")
     assert not rule_levers_on(lever_table) & VR_YIELD_SINGLE
     # The vocabulary-parallel head conflicts with the distributed sampler RS builds on.

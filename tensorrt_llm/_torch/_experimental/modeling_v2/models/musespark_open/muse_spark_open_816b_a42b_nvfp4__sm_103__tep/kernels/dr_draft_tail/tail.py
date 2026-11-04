@@ -183,6 +183,10 @@ def rs_q_transform(
 class DrDraftTail:
     """This rank's draft-head tail: the key areas, the epoch counters, the three launches."""
 
+    #: Installed for rejection sampling only (``install(rs_only=True)``): the draft head runs no
+    #: greedy step on it (``draft_head.selector_draft_tokens``).
+    rs_only = False
+
     def __init__(
         self,
         mapping,
@@ -467,12 +471,13 @@ def installed(llm) -> bool:
     return isinstance(getattr(worker, "__dict__", {}).get("_dr_draft_tail"), DrDraftTail)
 
 
-def install(llm, mapping) -> None:
+def install(llm, mapping, rs_only: bool = False) -> None:
     """Build the tail on ``llm``'s draft-head worker (``drafter_folds``). Collective.
 
     Needs the ``draft_head`` fast path (the worker's sharded selector) and a gathered column-parallel
     draft LM head; the refusal is agreed over the TP group before the collective construction.
-    Idempotent.
+    Idempotent. ``rs_only`` (``rejection_sampler`` without ``draft_head_tail``): the tail takes
+    rejection-sampled steps only (``DrDraftTail.rs_only``).
     """
     if installed(llm):
         return
@@ -500,6 +505,7 @@ def install(llm, mapping) -> None:
         raise ValueError(reason)
     device = draft_model.candidate_selector.predecessor_codebook.device
     tail = DrDraftTail(mapping, int(draft_model.lm_head.out_features), device)
+    tail.rs_only = bool(rs_only)
     worker.__dict__["_dr_draft_tail"] = tail
     logger.info(
         "[musespark_open] dr draft tail: select + one-shot key publish, merge, walk + tail as CUDA "

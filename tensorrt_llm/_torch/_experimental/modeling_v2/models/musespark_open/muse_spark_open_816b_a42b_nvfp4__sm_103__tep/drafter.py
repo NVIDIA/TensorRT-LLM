@@ -145,6 +145,12 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         from .kernels.dr_draft_tail import tail as _dr_draft_tail
 
         _dr_draft_tail.install(shell.llm, shell._mapping)
+    elif plan.enabled("rejection_sampler"):
+        # rejection_sampler without draft_head_tail (a drafter that declares a logit transform, or
+        # the tail's knob off): the tail for the rejection-sampled steps only. Collective.
+        from .kernels.dr_draft_tail import tail as _dr_draft_tail
+
+        _dr_draft_tail.install(shell.llm, shell._mapping, rs_only=True)
     # After draft_head / fused_accept: the head features re-class the worker as a class
     # derived from whatever class those left it with.
     if plan.enabled("split_sampler"):

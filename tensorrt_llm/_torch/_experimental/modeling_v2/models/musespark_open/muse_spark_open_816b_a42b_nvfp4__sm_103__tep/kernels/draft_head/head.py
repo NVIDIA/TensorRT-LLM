@@ -111,6 +111,8 @@ TRANSFORM_METHOD = "apply_draft_logit_transform"
 STALE_TABLES = "the drafter's logit_multiplier or logit_softcap differs from the install's"
 #: Why a step takes the built-in path: its bf16 logits are not the shard the transform deferred.
 NOT_DEFERRED = "the draft logits are not the shard the deferring transform handed back"
+#: Why the sharded selector does not take a step: its drafts are sampled (rejection sampling).
+SAMPLED_DRAFTS = "sampled drafts"
 
 #: Largest shard the 16-bit column field of a shard key holds.
 MAX_SHARD = 65536
@@ -231,14 +233,18 @@ def selector_draft_tokens(
     shard GEMM as its own launches when it ``takes`` the call and ``transform`` is None (it
     ranks the untransformed keys), with the same results; ``tail_walk`` (``accepted,
     num_accepted, batch_indices, kv_lens, rewind``) then stands in for the
-    ``path_walk_tail`` walk.
+    ``path_walk_tail`` walk. A tail installed for rejection sampling only
+    (``DrDraftTail.rs_only``) takes no greedy step.
     ``rs`` (rejection sampling, ``RsWalkArgs``) is passed to the tail, whose walk then
     draws the drafts from q and writes their q records; only the tail can, so ``rs``
-    with a tail that does not take the call raises.
+    with a tail that does not take the call raises. With ``rs`` the tail also takes a
+    step of a drafter that declares a logit transform: the walk applies that transform
+    to q itself (``RsWalkArgs.transform``), and its candidates are the top keys of the
+    untransformed shard, which the monotone transform ranks alike up to ties.
     """
     if (
         tail is not None
-        and transform is None
+        and (rs is not None or (transform is None and not getattr(tail, "rs_only", False)))
         and tail.takes(local_logits, block_hidden_states, selector)
     ):
         if rs is not None:
@@ -475,7 +481,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
         ):
             return "draft logits outside the [B, K, shard] layout"
         if spec_metadata.wants_advanced_draft_sampling:
-            return "sampled drafts"
+            return SAMPLED_DRAFTS
         if self._d2t is not None:
             return "a d2t draft vocab map"
         return None
@@ -529,6 +535,11 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
                 reason = NOT_DEFERRED
             if reason is None:
                 reason = self._shard_reason(gen_logits, spec_metadata, full_vocab)
+                if reason == SAMPLED_DRAFTS and self.__dict__.get("_rs") is not None:
+                    # rejection_sampler: a sampled step stays untransformed; the fused walk
+                    # applies the transform to its q, the fallback before the built-in sampler
+                    # (``verify_fold.fold.SpecLoopFoldDFlashWorker._sample_dflash2_block``).
+                    reason = None
             if reason is None and not transform.matches(draft_model):
                 reason = STALE_TABLES
             if reason is None:

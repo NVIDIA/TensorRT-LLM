@@ -501,7 +501,17 @@ class RsState:
 
 
 def _drafter_dflash_config(draft_model) -> dict:
-    """The drafter's parsed ``config.json`` ``dflash_config`` (read only)."""
+    """The q transform's constants as a ``dflash_config``: the logit transform the drafter declares
+    (``DFlashForCausalLM.logit_multiplier`` / ``logit_softcap``, no softcap being a cap of 0), else its
+    parsed ``config.json`` ``dflash_config`` (read only)."""
+    if hasattr(draft_model, "logit_multiplier"):
+        softcap = getattr(draft_model, "logit_softcap", None)
+        return {
+            "dflash_config": {
+                "output_multiplier": float(draft_model.logit_multiplier),
+                "final_logit_softcapping": float(softcap) if softcap else 0.0,
+            }
+        }
     config = getattr(draft_model, "config", None)
     dflash = getattr(config, "dflash_config", None) or {}
     return {"dflash_config": dict(dflash)}
@@ -545,7 +555,7 @@ def unsupported_reason(llm, mapping, knobs: Knobs) -> Optional[str]:
         return "verify_fold and path_walk_tail are not both on"
     tail = worker.__dict__.get("_dr_draft_tail")
     if not isinstance(tail, _tail.DrDraftTail):
-        return "the dr draft tail is not installed (drafter_folds)"
+        return "the dr draft tail is not installed (draft_head_tail, or rejection_sampler's own)"
     if tail.variant != 3:
         return f"the dr draft tail is variant {tail.variant}, not 3"
     if getattr(worker, "_d2t", None) is not None or (

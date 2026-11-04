@@ -805,7 +805,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         dr draft tail's walk, which draws the drafts from q and writes the slot's q record
         (``_rs_draft``). Every other step takes the built-in sampler, which fills the dense
         ``draft_probs`` rows; its slots' q records stay consumed, so a fused verify of those
-        drafts takes strict rows.
+        drafts takes strict rows. A drafter's logit transform that the draft head deferred
+        for the fused walk is applied before the built-in sampler.
         """
         rs = self.__dict__.get("_rs")
         if rs is not None:
@@ -836,6 +837,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                     spec_metadata,
                 )
                 return tokens.to(torch.int32), full_vocab
+            gen_logits = self._draft_head_transformed(draft_model, gen_logits)
         return super()._sample_dflash2_block(
             draft_model,
             gen_logits,

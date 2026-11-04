@@ -935,13 +935,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "rejection sampling of a one-request decode step fused into the draft-head tail's walk "
         "and the distributed verify sampler, when the speculative config asks for it",
         "draft",
-        (
-            "distributed_head_sampler",
-            "drafter_folds",
-            "verify_fold",
-            "path_walk_tail",
-            "draft_head_tail",
-        ),
+        ("distributed_head_sampler", "drafter_folds", "verify_fold", "path_walk_tail"),
     ),
 )
 
