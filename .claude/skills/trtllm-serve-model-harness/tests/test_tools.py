@@ -247,6 +247,37 @@ def test_a_trial_build_takes_its_paths_from_the_caller(tmp_path, branch, prov_ar
     assert "item feat feat head=" in provenance and f"result {branch} head=" in provenance
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_a_trial_build_applies_a_binary_change(tmp_path):
+    """An item that changes a binary file is applied, not reported as a conflict."""
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")  # fmt: skip
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    (repo / "blob.bin").write_bytes(b"\x00\x01\x02")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    git("checkout", "-q", "-b", "feat")
+    (repo / "blob.bin").write_bytes(b"\x00\xff\xfe\xfd")
+    git("commit", "-q", "-am", "feat")
+    git("checkout", "-q", "main")
+
+    result = subprocess.run(
+        ["bash", os.path.join(SCRIPTS, "compose_trial_build.sh"), "-m", "main", "-p", "prov.txt",
+         "trial", "trial-br", "main", "feat=feat"],
+        cwd=repo, env=env, capture_output=True, text=True)  # fmt: skip
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / "trial" / "blob.bin").read_bytes() == b"\x00\xff\xfe\xfd"
+    assert "CONFLICT" not in (repo / "prov.txt").read_text()
+
+
 # --------------------------------------------------------------------------- mutation gate
 
 

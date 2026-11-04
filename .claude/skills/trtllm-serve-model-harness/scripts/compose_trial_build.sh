@@ -88,7 +88,7 @@ for item in "$@"; do
     continue
   fi
   msg="[None][test] trial build: apply $label (${sha:0:10})"
-  if ! git diff "$mb" "$sha" | git apply -3 --index 2> "$prov.apply.err"; then
+  if ! git diff --binary "$mb" "$sha" | git apply -3 --index 2> "$prov.apply.err"; then
     echo "CONFLICT applying $label ($source ${sha:0:10}); unmerged paths:"
     git diff --name-only --diff-filter=U
     echo "resolve, then: git commit -s -m \"$msg\"; rerun with -k and the remaining items"
