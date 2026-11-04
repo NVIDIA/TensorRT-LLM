@@ -48,3 +48,39 @@ def test_mamba_hybrid_quota_to_tokens_under_helix(cp_size: int) -> None:
     assert tokens == 7 * phys * cp_size
     assert mgr._get_quota_from_max_tokens(tokens) <= quota
     assert mgr._get_quota_from_max_tokens(tokens + 1) > quota
+
+
+def test_block_reuse_rejected_for_recurrent_state_under_helix() -> None:
+    """Recurrent-state snapshot points are not aligned to ledger blocks, so a
+    reused prefix could restore the state of a later token."""
+    import torch
+
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    with pytest.raises(ValueError, match="recurrent state layers under helix"):
+        MambaHybridCacheManagerV2(
+            mamba_d_state=128,
+            mamba_d_conv=4,
+            mamba_num_heads=2,
+            mamba_n_groups=2,
+            mamba_head_dim=64,
+            mamba_num_layers=1,
+            mamba_layer_mask=[True, False],
+            mamba_cache_dtype=torch.bfloat16,
+            mamba_ssm_cache_dtype=torch.float32,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            kv_cache_type=CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=576,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+            dtype=DataType.HALF,
+            layer_mask=[False, True],
+            is_disagg=False,
+        )
