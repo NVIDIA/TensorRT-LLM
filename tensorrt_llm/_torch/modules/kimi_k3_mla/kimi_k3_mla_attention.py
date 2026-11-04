@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -126,6 +127,26 @@ def _install_identity_rope_table(backend: TrtllmAttention) -> None:
     backend._ensure_rope_table_size = _identity_preserving_resize
 
 
+@dataclass
+class _ForwardStep:
+    """What :meth:`KimiK3MLAAttention.forward` decided for one forward, read by the methods the
+    base MLA (or its registered custom op, which takes tensors only) calls on the way."""
+
+    # The generation tokens take the fused FP4 decode query (_forward_generation_fused_query).
+    fused_query: bool = False
+    # The generation tokens' Helix tail runs as one kernel (helix_tail).
+    fused_tail: bool = False
+    # Fused-tail batch without context tokens: the output gate, forked when the forward starts
+    # (beside q_a / q_b, or behind the fused query's KV half) and joined before the tail, and
+    # whether it is still to join.
+    gate: Optional[torch.Tensor] = None
+    gate_pending: bool = False
+    # The fused query's KV half forks the gate (set by forward, filled by the fused query).
+    gate_behind_kv: bool = False
+    # The MXFP8 form of the gated rows the tail stores for o_proj (PrequantizedInputProjection).
+    operand: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+
+
 # ---------------------------------------------------------------------------
 # KimiK3MLAAttention.
 # ---------------------------------------------------------------------------
@@ -153,18 +174,11 @@ class KimiK3MLAAttention(MLA):
     _q_b_block_exponents: Optional[torch.Tensor] = None
     # Largest generation batch whose Helix tail runs as one kernel (helix_tail); 0: never.
     _helix_tail_max_tokens: int = 0
-    # Set for one generation-only forward of a fused-tail batch: the output gate, forked when the
-    # forward starts (beside q_a / q_b) and joined before the tail, and whether it is still to join.
-    _helix_tail_gate: Optional[torch.Tensor] = None
-    _helix_tail_gate_pending: bool = False
-    # Set for one such forward that takes the fused decode query, which forks the gate behind
-    # its KV half on the aux stream instead (_forward_generation_fused_query).
-    _helix_tail_gate_behind_kv: bool = False
     # Whether o_proj takes a prequantized input (PrequantizedInputProjection); set in
-    # cache_derived_state. The tail then hands it the MXFP8 form of the gated rows, set for one
-    # forward in _helix_tail_operand.
+    # cache_derived_state. The fused tail then hands it the MXFP8 form of the gated rows.
     _o_proj_takes_prequantized: bool = False
-    _helix_tail_operand: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    # The decisions of the forward in flight (forward); None outside it.
+    _step: Optional[_ForwardStep] = None
 
     def __init__(
         self,
@@ -436,7 +450,7 @@ class KimiK3MLAAttention(MLA):
         latent_cache_gen: Optional[torch.Tensor] = None,
         prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
-        if self._takes_fused_decode_query(hidden_states, attn_metadata, latent_cache_gen):
+        if self._step is not None and self._step.fused_query:
             self._forward_generation_fused_query(
                 hidden_states, attn_metadata, output, prequantized_input
             )
@@ -502,13 +516,14 @@ class KimiK3MLAAttention(MLA):
             self.mqa.fp4_mla_kv_append_generation(latent_cache, md, heads)
             if kv_stream is not None:
                 kv_ready.record()
-            if self._helix_tail_gate_behind_kv:
+            step = self._step
+            if step is not None and step.gate_behind_kv:
                 # The fused Helix tail's gate, beside the fused query; the decode joins only the
                 # KV half, the tail joins the gate.
-                self._helix_tail_gate = self._gate(hidden_states)
+                step.gate = self._gate(hidden_states)
                 if kv_stream is not None:
                     self._gate_ready.record()
-                    self._helix_tail_gate_pending = True
+                    step.gate_pending = True
         norm = None
         if self._fused_decode_query_norm and k3_mla_q_fused.input_supported(q):
             norm = (self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
@@ -634,22 +649,26 @@ class KimiK3MLAAttention(MLA):
         latent_cache_gen: Optional[torch.Tensor] = None,
         prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        if (
-            self.use_output_gate
-            and 1 <= attn_metadata.num_tokens <= self._helix_tail_max_tokens
-            and attn_metadata.num_contexts == 0
-            and not torch.compiler.is_compiling()
-        ):
+        num_gen_tokens = attn_metadata.num_tokens - attn_metadata.num_ctx_tokens
+        step = _ForwardStep(
+            fused_query=self._takes_fused_decode_query(
+                hidden_states, attn_metadata, latent_cache_gen
+            ),
+            fused_tail=1 <= num_gen_tokens <= self._helix_tail_max_tokens
+            and not torch.compiler.is_compiling(),
+        )
+        if step.fused_tail and self.use_output_gate and attn_metadata.num_contexts == 0:
             # A fused-tail batch: the decode can hold every SM, so the gate GEMM runs beside the
             # q_a / q_b GEMMs rather than after the decode.
-            if self._takes_fused_decode_query(hidden_states, attn_metadata, latent_cache_gen):
-                self._helix_tail_gate_behind_kv = True
+            if step.fused_query:
+                step.gate_behind_kv = True
             elif self._gate_on_aux_stream():
                 self._tail_gate_fork.record()
-                self._helix_tail_gate = self._fork_gate(hidden_states, self._tail_gate_fork)
-                self._helix_tail_gate_pending = True
+                step.gate = self._fork_gate(hidden_states, self._tail_gate_fork)
+                step.gate_pending = True
             else:
-                self._helix_tail_gate = self._gate(hidden_states)
+                step.gate = self._gate(hidden_states)
+        self._step = step
         try:
             return super().forward(
                 position_ids,
@@ -660,15 +679,12 @@ class KimiK3MLAAttention(MLA):
                 prequantized_input=prequantized_input,
             )
         finally:
-            self._helix_tail_gate = None
-            self._helix_tail_gate_pending = False
-            self._helix_tail_gate_behind_kv = False
-            self._helix_tail_operand = None
+            self._step = None
 
-    def _join_tail_gate(self) -> None:
-        if self._helix_tail_gate_pending:
-            self._join_gate(self._helix_tail_gate)
-            self._helix_tail_gate_pending = False
+    def _join_tail_gate(self, step: _ForwardStep) -> None:
+        if step.gate_pending:
+            self._join_gate(step.gate)
+            step.gate_pending = False
 
     def _attn_forward_gen(
         self,
@@ -682,19 +698,17 @@ class KimiK3MLAAttention(MLA):
         helix_output: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """``MLA._attn_forward_gen``; a Helix batch of at most ``_helix_tail_max_tokens`` tokens
-        with the V up-projection before the exchange runs the decode with its split reduction
+        """``MLA._attn_forward_gen``; a fused-tail batch (``_ForwardStep.fused_tail``: at most
+        ``_helix_tail_max_tokens`` generation tokens, the V up-projection before the exchange)
+        runs the decode with its split reduction
         left to one tail kernel (fold, V up-projection, exchange, combine; ``helix_tail``) instead
         of the reduction, the BMM, the all-to-all and the combine. The output gate of such a
         batch (forked in :meth:`forward`) is joined before the tail, so o_proj only depends on
         the tail; where o_proj takes a prequantized input, the tail also stores the MXFP8 form of
         the gated rows for it."""
         num_tokens = q.shape[0]
-        if not (
-            helix_v_up
-            and 1 <= num_tokens <= self._helix_tail_max_tokens
-            and not torch.compiler.is_compiling()
-        ):
+        step = self._step
+        if not (helix_v_up and step is not None and step.fused_tail):
             return super()._attn_forward_gen(
                 attn_backend,
                 q,
@@ -715,8 +729,8 @@ class KimiK3MLAAttention(MLA):
         partial_o = attn_backend.forward(q, k, v, attn_metadata, forward_args=forward_args)
         assert partial_o.shape[-1] == self.num_heads_tp * self.kv_lora_rank
         zero_kv_mask = _helix_gen_zero_kv_mask(attn_metadata, num_tokens)
-        gate = self._helix_tail_gate
-        self._join_tail_gate()
+        gate = step.gate
+        self._join_tail_gate(step)
         if gate is None and self.helix_exchange_event is not None:
             # The gate of this forward is forked at the exchange (_output_gate).
             self.helix_exchange_event.record()
@@ -732,7 +746,7 @@ class KimiK3MLAAttention(MLA):
                 ((num_tokens + 127) // 128 * 128 * width // 32,), dtype=torch.uint8, device=q.device
             )
             mx_out = (gate, xq, xs)
-            self._helix_tail_operand = (xq, xs)
+            step.operand = (xq, xs)
         out = helix_output
         if out is None:
             out = partial_o.new_empty((num_tokens, width))
@@ -761,12 +775,14 @@ class KimiK3MLAAttention(MLA):
             return super()._gate_and_project_output(
                 hidden_states, attn_output, position_ids, attn_metadata, all_reduce_params
             )
-        if self._helix_tail_operand is not None:
-            return self.o_proj.forward_prequantized(*self._helix_tail_operand)
-        gate = self._helix_tail_gate
+        step = self._step
+        if step is not None and step.operand is not None:
+            return self.o_proj.forward_prequantized(*step.operand)
+        gate = None if step is None else step.gate
         if gate is None:
             gate = self._output_gate(hidden_states, attn_metadata)
-        self._join_tail_gate()
+        elif step.gate_pending:
+            self._join_tail_gate(step)
         if self._fused_output_gate:
             return self.o_proj.forward_gated(attn_output[0], gate)
         attn_output[0] = attn_output[0] * gate

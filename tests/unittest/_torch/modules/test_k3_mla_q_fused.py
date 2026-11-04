@@ -588,6 +588,7 @@ def test_forward_generation_fused_query_matches_default_chain(n, gate_behind_kv)
     from flashinfer.norm import rmsnorm
 
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as lowm
+    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     w = _weights()
@@ -619,20 +620,19 @@ def test_forward_generation_fused_query_matches_default_chain(n, gate_behind_kv)
             p.copy_(p0)
 
         out = torch.empty(num_tokens, H * LORA, device="cuda", dtype=torch.bfloat16)
-        mla._helix_tail_gate_behind_kv = gate_behind_kv
+        step = k3._ForwardStep(fused_query=True, gate_behind_kv=gate_behind_kv)
+        mla._step = step
         try:
             with with_multi_stream(True):
                 mla._forward_generation_fused_query(hidden, md, out, None)
             torch.cuda.synchronize()
             if gate_behind_kv:
-                assert mla._helix_tail_gate_pending
-                assert torch.equal(mla._helix_tail_gate, mla.g_proj(hidden).sigmoid())
+                assert step.gate_pending
+                assert torch.equal(step.gate, mla.g_proj(hidden).sigmoid())
             else:
-                assert mla._helix_tail_gate is None
+                assert step.gate is None
         finally:
-            mla._helix_tail_gate = None
-            mla._helix_tail_gate_pending = False
-            mla._helix_tail_gate_behind_kv = False
+            mla._step = None
         for p, ref in zip(_pools(mgr), ref_pools):
             assert torch.equal(p, ref)
         rel = float((out.float() - ref_out.float()).norm() / ref_out.float().norm())

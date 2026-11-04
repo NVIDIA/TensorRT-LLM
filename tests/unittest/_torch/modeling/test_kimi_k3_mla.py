@@ -569,6 +569,7 @@ def test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface(
 def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
     """The output gate fused into g_proj / o_proj (sigmoid and gated low-M GEMMs), also on
     the aux stream from the Helix exchange event, equals sigmoid, multiply and o_proj."""
+    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     _, _, _, runtime = _build_k3_mla(fp8=True, gate=True)
@@ -618,15 +619,18 @@ def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
     try:
         with with_multi_stream(True):
             mixer._tail_gate_fork.record()
-            mixer._helix_tail_gate = mixer._fork_gate(hidden, mixer._tail_gate_fork)
-            mixer._helix_tail_gate_pending = True
+            step = kimi_k3_mla_attention._ForwardStep(
+                fused_tail=True,
+                gate=mixer._fork_gate(hidden, mixer._tail_gate_fork),
+                gate_pending=True,
+            )
+            mixer._step = step
             first = project()
-            assert not mixer._helix_tail_gate_pending
+            assert not step.gate_pending
         torch.cuda.synchronize()
     finally:
         mixer.helix_exchange_event = None
-        mixer._helix_tail_gate = None
-        mixer._helix_tail_gate_pending = False
+        mixer._step = None
     assert torch.equal(first, expected)
 
 
