@@ -22,6 +22,7 @@ import itertools
 import json
 import os
 import time
+import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -523,13 +524,25 @@ class AutoTunerProfilingCache:
             [is_cache_hit, runner_id, tactic, stored_profile]
             runner_id is the index in the current runners list
         """
+        # Under PARALLEL each rank of the tuning group times a share of the
+        # (runner, tactic) pairs and records its own fastest, so after the
+        # merge a shape can hold one entry per runner: the winner is the
+        # fastest of them, not the first runner in the list.
+        parallel = (tuning_config.distributed_tuning_strategy ==
+                    DistributedTuningStrategy.PARALLEL)
+        found = None
         for idx, r in enumerate(runners):
             if (cache_key := self.get_cache_key(
                     custom_op, r, input_shapes, tuning_config,
                     apply_map_to_tuning_buckets)) in self.cache:
                 # Return the current index in runners list, not the cached runner_id
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
-                return True, idx, tactic, min_time
+                if not parallel:
+                    return True, idx, tactic, min_time
+                if found is None or min_time < found[3]:
+                    found = (True, idx, tactic, min_time)
+        if found is not None:
+            return found
 
         return False, *self.fallback_entry()
 
@@ -743,7 +756,15 @@ class AutoTunerProfilingCache:
             self._deserialize_metadata(
                 current_cache_contents.get("metadata", {}))
 
-            # Start with empty cache and independent ops set
+            # Start with empty cache and independent ops set. Entries of ops
+            # excluded from the file are never on disk, so keep the ones this
+            # process recorded: dropping them makes the next tuning call of
+            # such an op redo its whole sweep.
+            excluded_entries = {
+                key: value
+                for key, value in self.cache.items()
+                if key[0] in self.excluded_op
+            }
             self.cache = {}
             self.independent_op = set()
 
@@ -768,6 +789,7 @@ class AutoTunerProfilingCache:
                 logger.debug(
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
+            self.cache.update(excluded_entries)
 
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
@@ -944,6 +966,9 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
+        # Sweep keys (_excluded_sweep_key) of the cache-excluded ops this
+        # process has swept in tuning mode; see choose_one.
+        self._swept_excluded: set[tuple] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1156,11 +1181,21 @@ class AutoTuner:
         # mark them in the cache so save_cache filters them out, and
         # — in tuning mode — force the full profile path so the JIT
         # warmup actually runs even if a stale on-disk entry was loaded.
+        # The forced path runs once per sweep key in this process (see
+        # _excluded_sweep_key): a clean sweep records every bucket in the
+        # in-process cache, so later calls with the same key (every layer,
+        # every later warmup forward) look it up instead of walking the same
+        # buckets again. A sweep with a failed profile is not recorded, so
+        # the next call walks again.
         # In inference mode we still consult the in-process cache, which
         # was populated by this process's own warmup.
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
+        sweep_key = None
         if tuning_config.exclude_from_cache and self.is_tuning_mode:
+            sweep_key = self._excluded_sweep_key(custom_op, runners,
+                                                 tuning_config, input_shapes)
+        if sweep_key is not None and sweep_key not in self._swept_excluded:
             is_cache_hit = False
             best_runner_id, best_tactic, min_time = (
                 self.profiling_cache.fallback_entry())
@@ -1261,12 +1296,45 @@ class AutoTuner:
         # If no valid tactic is found, the fallback runner and tactic will be used
         _, runner_id, tactic, _ = self.profiling_cache.search_cache(
             custom_op, runners, input_shapes, tuning_config)
+        if sweep_key is not None and not new_tuning_failure_occurred:
+            self._swept_excluded.add(sweep_key)
 
         tuning_end_time = time.perf_counter()
         self.stats.tuned_op_time_cost[
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    def _excluded_sweep_key(self, custom_op: str, runners: List[TunableRunner],
+                            tuning_config: TuningConfig,
+                            input_shapes: Tuple) -> tuple:
+        """What decides the forced sweep of a cache-excluded op.
+
+        The buckets it visits come from the input shapes, the tuning config's
+        dynamic specs and token limit, and whether this tuning pass sweeps
+        every bucket or only the input's own (skip_dynamic_tuning_buckets);
+        the kernels each bucket builds come from the runners, whose unique
+        ids carry their variant. A call that matches all of them would only
+        revisit what an earlier sweep with this key built. Constraint specs
+        are not in the key: the cache key does not hold the dimensions they
+        set (see _find_nearest_profile), so a sweep under other constraint
+        specs finds the same buckets cached.
+        """
+
+        def buckets_key(b):
+            if isinstance(b, (list, tuple)):
+                return tuple(b)
+            return (getattr(b, "__module__", None),
+                    getattr(b, "__qualname__", None)) if callable(b) else b
+
+        specs = tuple(
+            (spec.input_idx, spec.dim_idx, buckets_key(spec.gen_tuning_buckets),
+             buckets_key(spec.map_to_tuning_buckets))
+            for spec in tuning_config.dynamic_tensor_specs)
+        return (custom_op,
+                tuple((type(r).__name__, str(r.unique_id())) for r in runners),
+                input_shapes, specs, tuning_config.tune_max_num_tokens,
+                self.skip_dynamic_tuning_buckets)
 
     def _prime_cached_tactics(
         self,
@@ -1439,10 +1507,20 @@ class AutoTuner:
                 f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
             )
         else:
+            # PARALLEL deals the (runner, tactic) pairs of all runners round
+            # robin, so every rank of the group gets an even share even when
+            # one runner has many tactics and the others few. The deal starts
+            # at a rank taken from the op and the shape, the same on every
+            # rank, so a runner's costly tactics do not fall on the same ranks
+            # at every shape.
+            pair_offset = self._parallel_deal_start(
+                custom_op, profile, tuning_config.distributed_tuning_strategy)
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
                     all_valid_tactics,
-                    tuning_config.distributed_tuning_strategy)
+                    tuning_config.distributed_tuning_strategy,
+                    offset=pair_offset)
+                pair_offset += len(all_valid_tactics)
                 if "do_preparation" in runner_arg_names and len(
                         valid_tactics) > 0:
                     runner(
@@ -1992,6 +2070,7 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        self._swept_excluded.clear()
         if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
             torch.ops.trtllm.clear_allreduce_tactic_cache()
 
@@ -2171,10 +2250,28 @@ class AutoTuner:
         """Check if we're in a distributed environment."""
         return self._dist is not None and self._tuning_group()[0] > 1
 
-    def _maybe_parallelize_tactics(
-            self, all_valid_tactics: List[Any],
-            strategy: DistributedTuningStrategy) -> List[Any]:
-        """Split tactics across the tuning group if strategy is PARALLEL."""
+    def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
+                             strategy: DistributedTuningStrategy) -> int:
+        """Where a PARALLEL deal of ``profile``'s (runner, tactic) pairs starts.
+
+        Derived from the op and the shapes with a stable hash (not ``hash``,
+        which differs between processes), so every rank deals the same way.
+        """
+        if strategy != DistributedTuningStrategy.PARALLEL or not self._is_distributed(
+        ):
+            return 0
+        key = repr((custom_op, profile.get_opt_shapes())).encode()
+        return zlib.crc32(key) % self._tuning_group()[0]
+
+    def _maybe_parallelize_tactics(self,
+                                   all_valid_tactics: List[Any],
+                                   strategy: DistributedTuningStrategy,
+                                   offset: int = 0) -> List[Any]:
+        """Split tactics across the tuning group if strategy is PARALLEL.
+
+        ``offset`` is where this runner's pairs start in the profile's deal:
+        the deal's start plus the pairs of the runners before this one.
+        """
         if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
         ):
             # Each rank of the tuning group only tunes its share of tactics;
@@ -2182,7 +2279,7 @@ class AutoTuner:
             group_size, group_index = self._tuning_group()
             return [
                 tactic for idx, tactic in enumerate(all_valid_tactics)
-                if idx % group_size == group_index
+                if (offset + idx) % group_size == group_index
             ]
         else:
             return all_valid_tactics

@@ -2087,3 +2087,230 @@ def test_failed_profiling_capture_moves_to_a_fresh_graph_pool(monkeypatch):
     assert len(set(after)) == 1 and after[0] != failed_pool, captures
     assert events["release"] == captures[:failed_at] + after
     assert tuner._profile_graph_pool is None
+
+
+def test_excluded_op_sweeps_once_per_shape(monkeypatch, tmp_path):
+    """A cache-excluded op is swept once per input shape in a process.
+
+    Tuning mode forces its full profile path, so the JIT warmup it drives
+    runs even after a stale cache file was loaded. Later calls of the same
+    shape (every layer of a forward, every later tuning forward) reuse the
+    entries that sweep recorded, also after ``load_cache``.
+    """
+    sweeps: List[int] = []
+    build_profiles = AutoTuner._optimization_profiles
+
+    def _count(self, tuning_config, inputs):
+        profiles = build_profiles(self, tuning_config, inputs)
+        sweeps.append(len(profiles))
+        return profiles
+
+    monkeypatch.setattr(AutoTuner, "_optimization_profiles", _count)
+    forwards: List[int] = []
+
+    class SingleTacticRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            forwards.append(inputs[0].shape[0])
+            x, w = inputs
+            return x @ w
+
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (8, 16, 32)), ),
+                          exclude_from_cache=True)
+    op = "autotuner_test::excluded_sweep_once"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    w = torch.randn(64, 128, device="cuda")
+
+    def call(m):
+        tuner.choose_one(op, [SingleTacticRunner()], config,
+                         [torch.randn(m, 64, device="cuda"), w])
+
+    with autotune():
+        for _ in range(3):
+            call(32)
+    assert sweeps == [3], f"one sweep over the 3 buckets; got {sweeps}"
+    assert sorted(forwards) == [
+        8, 16, 32
+    ], (f"each bucket's forward runs once; got {forwards}")
+
+    # A new shape is swept once; its buckets are already recorded.
+    with autotune():
+        call(16)
+        call(16)
+    assert sweeps == [3, 3] and sorted(forwards) == [8, 16, 32]
+
+    # Excluded entries never reach the file, and loading it keeps them.
+    cache_path = str(tmp_path / "autotuner_cache.json")
+    tuner.profiling_cache.save_cache(cache_path, rank=0)
+    with autotune(cache_path=cache_path):
+        call(32)
+    assert sweeps == [3, 3], f"no sweep after load_cache; got {sweeps}"
+
+    # A cleared cache (a new process) sweeps again.
+    tuner.clear_cache()
+    with autotune():
+        call(32)
+    assert sweeps == [3, 3, 3] and len(forwards) == 6
+
+
+def _excluded_sweep_fixture(monkeypatch, fail_bucket=None):
+    """A cache-excluded single-tactic op over buckets 8 / 16 / 32.
+
+    Returns (call, sweeps, forwards): ``sweeps`` gets the profile count of
+    every sweep, ``forwards`` the M of every forward; with ``fail_bucket``
+    the first forward at that M raises.
+    """
+    sweeps: List[int] = []
+    forwards: List[int] = []
+    build_profiles = AutoTuner._optimization_profiles
+
+    def _count(self, tuning_config, inputs):
+        profiles = build_profiles(self, tuning_config, inputs)
+        sweeps.append(len(profiles))
+        return profiles
+
+    monkeypatch.setattr(AutoTuner, "_optimization_profiles", _count)
+    failed = []
+
+    class SingleTacticRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            m = inputs[0].shape[0]
+            forwards.append(m)
+            if m == fail_bucket and not failed:
+                failed.append(m)
+                raise RuntimeError("injected bucket failure")
+            x, w = inputs
+            return x @ w
+
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (8, 16, 32)), ),
+                          exclude_from_cache=True)
+    op = "autotuner_test::excluded_sweep_key"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    w = torch.randn(64, 128, device="cuda")
+
+    def call(m):
+        tuner.choose_one(op, [SingleTacticRunner()], config,
+                         [torch.randn(m, 64, device="cuda"), w])
+
+    return call, sweeps, forwards
+
+
+def test_excluded_op_full_sweep_after_skip_bucket_sweep(monkeypatch):
+    """A sweep that skipped the buckets does not stand in for a full one."""
+    call, sweeps, forwards = _excluded_sweep_fixture(monkeypatch)
+    with autotune(skip_dynamic_tuning_buckets=True):
+        call(32)
+    assert sweeps == [1], f"only the input's own bucket; got {sweeps}"
+    with autotune():
+        call(32)
+    assert sweeps == [1, 3], f"the full sweep still runs; got {sweeps}"
+    assert set(forwards) == {8, 16, 32}
+
+
+def test_excluded_op_sweep_with_failure_is_repeated(monkeypatch):
+    """A sweep whose profile failed is walked again by the next call."""
+    call, sweeps, forwards = _excluded_sweep_fixture(monkeypatch,
+                                                     fail_bucket=16)
+    with autotune():
+        call(32)
+        call(32)
+        call(32)
+    assert sweeps == [3, 3], f"retried once, then recorded; got {sweeps}"
+    assert forwards.count(16) == 2
+
+
+def test_parallel_split_deals_pairs_across_runners():
+    """PARALLEL shares the (runner, tactic) pairs of all runners evenly.
+
+    Splitting each runner's tactics on its own would put the first tactic of
+    every runner on group rank 0, so ranks with low indices would build and
+    time most of the candidates while the others wait at the merge.
+    """
+    group_size = 4
+    runner_tactics = [["cublas"], [f"direct{i}" for i in range(7)],
+                      [f"splitk{i}" for i in range(3)]]
+    shares = []
+    for rank in range(group_size):
+        tuner = autotuner.AutoTuner()
+        tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                              rank=rank,
+                                              tp_size=group_size),
+                                      dist=object())
+        share, offset = [], 0
+        for tactics in runner_tactics:
+            share += tuner._maybe_parallelize_tactics(
+                tactics, DistributedTuningStrategy.PARALLEL, offset=offset)
+            offset += len(tactics)
+        shares.append(share)
+    # Every pair is tuned on exactly one rank, and the shares differ by at most one.
+    assert sorted(t for share in shares
+                  for t in share) == sorted(t for tactics in runner_tactics
+                                            for t in tactics)
+    assert max(map(len, shares)) - min(map(len, shares)) <= 1, shares
+
+
+def test_parallel_search_cache_picks_fastest_runner():
+    """After a PARALLEL merge a shape can hold one entry per runner.
+
+    The lookup must return the fastest of them; other strategies keep one
+    entry per shape and return the first runner found.
+    """
+    runners = [
+        GemmRunner(),
+        GemmRunnerWithAttributes(block_size=128, num_warps=4)
+    ]
+    shapes = (torch.Size([M, 64]), torch.Size([64, 128]))
+    for strategy, expected in ((DistributedTuningStrategy.PARALLEL, 1),
+                               (DistributedTuningStrategy.INDEPENDENT, 0)):
+        config = TuningConfig(distributed_tuning_strategy=strategy)
+        cache = autotuner.AutoTunerProfilingCache()
+        for runner, tactic, ms in ((runners[0], 0, 2.0), (runners[1], 1, 1.0)):
+            cache[cache.get_cache_key("autotuner_test::parallel_lookup", runner,
+                                      shapes, config)] = (0, tactic, ms)
+        hit, runner_id, tactic, _ = cache.search_cache(
+            "autotuner_test::parallel_lookup", runners, shapes, config)
+        assert hit and runner_id == expected, (strategy, runner_id)
+
+
+def test_parallel_deal_start_is_stable_and_spread():
+    """Each profile's PARALLEL deal starts at a rank derived from the op and
+    the shapes: the same on every rank and in every process, and spread over
+    the group so a runner's costly tactics do not land on the same ranks."""
+    group_size = 16
+    starts = []
+    for m in range(1, 129):
+        profile = autotuner.OptimizationProfile(
+            [[autotuner.StaticDim(m),
+              autotuner.StaticDim(7168)],
+             [autotuner.StaticDim(7168),
+              autotuner.StaticDim(2048)]])
+        per_rank = set()
+        for rank in range(group_size):
+            tuner = autotuner.AutoTuner()
+            tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                                  rank=rank,
+                                                  tp_size=group_size),
+                                          dist=object())
+            per_rank.add(
+                tuner._parallel_deal_start("autotuner_test::deal", profile,
+                                           DistributedTuningStrategy.PARALLEL))
+        assert len(per_rank) == 1, (m, per_rank)
+        starts.append(per_rank.pop())
+    assert set(starts) == set(range(group_size)), sorted(set(starts))
