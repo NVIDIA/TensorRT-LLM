@@ -45,7 +45,7 @@ separate sub-iteration scope.
 | `trtllm::update_requests` | `PyExecutor._update_requests`: sampled request-state updates |
 | `trtllm::handle_responses` | `PyExecutor._handle_responses`: response construction, enqueueing, and finalization |
 | `trtllm::prepare_inputs` | `DecoderInputPreparer.prepare_inputs`: scheduled input and attention-metadata preparation |
-| `trtllm::model_forward` | `DecoderRunner.model_forward`: current model-call boundary |
+| `trtllm::model_forward` | `DecoderRunner._model_forward`: current model-call boundary |
 | `trtllm::cuda_graph_capture` | Decoder `CUDAGraphRunner.capture` and `EncoderCUDAGraphRunner.capture`: warmup and capture |
 | `trtllm::cuda_graph_replay` | Both graph runners' `replay`: static-input staging and graph submission |
 
@@ -84,7 +84,7 @@ the model engine adds any further graph-padding requests, not graph occupancy.
 | --- | --- |
 | `workflow.executor.iteration` | Existing `iter_counter`; rank-local executor iteration, not a globally synchronized step ID |
 | `workflow.executor.microbatch_slot` | Actual PP ring `microbatch_id`, propagated by both intermediate and last-stage forward paths; reused across iterations, not a globally unique batch ID; `0` for known PP=1; omitted if unavailable |
-| `workflow.executor.is_warmup` | Existing model-engine warmup flag, or the decoder runner's `is_dummy` flag at the model call |
+| `workflow.executor.is_warmup` | Existing executor `is_warmup` property, or the decoder runner's `is_dummy` flag at the model call |
 | `workflow.attention_dp_enabled` | Existing executor `enable_attention_dp` host bool, when available; TP size alone does not identify attention-DP layout |
 | `workflow.rank`, `workflow.world_size` | Existing `dist.mapping` model rank and world size |
 | `workflow.tp_rank`, `workflow.tp_size`, `workflow.pp_rank`, `workflow.pp_size`, `workflow.cp_rank`, `workflow.cp_size` | Existing Mapping coordinates/sizes for TP, PP and CP |

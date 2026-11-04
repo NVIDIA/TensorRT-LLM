@@ -37,6 +37,7 @@ pytestmark = pytest.mark.cpu_only
 
 @contextmanager
 def _execution_trace_observer(path: Path) -> Iterator[torch.profiler.ExecutionTraceObserver]:
+    """Register a real observer and always release its process-wide callback."""
     observer = torch.profiler.ExecutionTraceObserver()
     try:
         observer.register_callback(str(path))
@@ -46,6 +47,7 @@ def _execution_trace_observer(path: Path) -> Iterator[torch.profiler.ExecutionTr
 
 
 def _request(**values: object) -> SimpleNamespace:
+    """Construct the host dummy flags consumed by workflow metadata."""
     fields = dict(is_attention_dp_dummy=False, is_cuda_graph_dummy=False, is_dummy_request=False)
     fields.update(values)
     fields.setdefault(
@@ -192,6 +194,7 @@ def test_none_selection_suppresses_real_trace(monkeypatch: pytest.MonkeyPatch) -
     ],
 )
 @pytest.mark.parametrize("active,selected", [(True, True), (False, True), (True, False)])
+@pytest.mark.parametrize("is_warmup", [False, True])
 def test_executor_forward_preserves_replay_and_diagnostic_order(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -201,6 +204,7 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
     fails: bool,
     active: bool,
     selected: bool,
+    is_warmup: bool,
 ) -> None:
     """Execute the current forward owner with only CUDA/model operations replaced."""
     monkeypatch.setattr(
@@ -247,10 +251,11 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
 
     resources = object()
     cache_indirection = object()
-    executor = SimpleNamespace(
+    executor = py_executor.PyExecutor.__new__(py_executor.PyExecutor)
+    executor.is_warmup = is_warmup
+    vars(executor).update(
         iter_counter=7,
-        is_warmup=False,
-        model_engine=SimpleNamespace(route_capture=route_capture, is_warmup=False, forward=forward),
+        model_engine=SimpleNamespace(route_capture=route_capture, forward=forward),
         enable_kv_cache_reuse=False,
         enable_spec_decode=False,
         runtime_draft_len=0,
@@ -288,13 +293,15 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
             node = next(node for node in nodes if node["name"] == name)
             fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
             assert fields["workflow.executor.iteration"] == 7
-            assert fields["workflow.executor.is_warmup"] is False
+            assert fields["workflow.executor.is_warmup"] is is_warmup
             assert (
                 fields["workflow.batch.live_requests"]
                 == int(context_tokens > 0) + generation_requests
             )
             assert fields["workflow.batch.scheduled_context_tokens"] == context_tokens
-        names = {event.name for event in trace.events()}
+        chrome_path = tmp_path / "forward-chrome.json"
+        trace.export_chrome_trace(str(chrome_path))
+        names = {event.get("name") for event in json.loads(chrome_path.read_text())["traceEvents"]}
         assert {"trtllm::forward", phase} <= names
         phase_event = next(event for event in trace.events() if event.name == phase)
         assert phase_event.cpu_parent is not None
@@ -303,7 +310,10 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
         assert not any(event.name.startswith("trtllm::") for event in trace.events())
     assert executor._iter_adp_dummy_ctx_tokens == 3
     assert executor._iter_adp_dummy_gen_tokens == 2
-    prefix = ["forward_call", "route_iter", "route_prepare", "execution_wait", "attach", "model"]
+    prefix = ["forward_call", "route_iter"]
+    if not is_warmup:
+        prefix.append("route_prepare")
+    prefix.extend(["execution_wait", "attach", "model"])
     if fails:
         assert actual is None
         assert events == [*prefix, "forward_error", "route_abort", "model failed"]
@@ -392,7 +402,7 @@ def test_batch_dummy_counts_mapping_and_microbatch_metadata(
     owner = SimpleNamespace(
         iter_counter=19,
         dist=SimpleNamespace(mapping=mapping),
-        model_engine=SimpleNamespace(is_warmup=True),
+        is_warmup=True,
         enable_attention_dp=True,
     )
     batch = SimpleNamespace(
@@ -427,6 +437,7 @@ def test_batch_dummy_counts_mapping_and_microbatch_metadata(
     fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
     assert fields["workflow.executor.microbatch_slot"] == 2
     assert fields["workflow.attention_dp_enabled"] is True
+    assert fields["workflow.executor.is_warmup"] is True
     assert fields["workflow.rank"] == 3 and fields["workflow.moe_ep_rank"] == 1
     assert fields["workflow.batch.scheduled_context_requests"] == 3
     assert fields["workflow.batch.scheduled_generation_requests"] == 2
@@ -501,7 +512,7 @@ def test_decoder_capture_and_replay_named_capacity(
                 )
                 executor = SimpleNamespace(
                     iter_counter=live_count,
-                    model_engine=SimpleNamespace(is_warmup=False),
+                    is_warmup=False,
                     enable_attention_dp=False,
                     dist=SimpleNamespace(mapping=Mapping()),
                 )
@@ -716,7 +727,8 @@ def test_pp_loop_call_propagates_actual_slot(
         enable_attention_dp=False,
         dist=SimpleNamespace(mapping=Mapping(world_size=4, pp_size=4)),
         runtime_draft_len=0,
-        model_engine=SimpleNamespace(is_warmup=False, runtime_draft_len=0),
+        is_warmup=False,
+        model_engine=SimpleNamespace(runtime_draft_len=0),
         perf_manager=SimpleNamespace(record_perf_events=lambda *args: nullcontext()),
         _update_request_states=lambda batch: None,
         sampler=SimpleNamespace(SampleState=lambda **kwargs: None),
@@ -786,7 +798,7 @@ def test_microbatch_slot_unknown_is_not_a_numeric_sentinel(
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
     owner = SimpleNamespace(
         iter_counter=1,
-        model_engine=SimpleNamespace(is_warmup=False),
+        is_warmup=False,
         enable_attention_dp=False,
         dist=SimpleNamespace(mapping=Mapping(world_size=pp_size, pp_size=pp_size)),
     )
@@ -928,7 +940,7 @@ def test_annotations_stay_at_current_owner_boundaries(
 def test_live_workflow_counts_use_request_dummy_contract() -> None:
     owner = SimpleNamespace(
         iter_counter=1,
-        model_engine=SimpleNamespace(is_warmup=False),
+        is_warmup=False,
         enable_attention_dp=False,
         dist=SimpleNamespace(mapping=Mapping()),
     )
