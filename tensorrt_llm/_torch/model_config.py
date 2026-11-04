@@ -1484,14 +1484,6 @@ class ModelConfig(Generic[TConfig]):
             dense_quant_config.kv_cache_quant_algo = quant_config.kv_cache_quant_algo
             quant_config = dense_quant_config
 
-        # Mistral-Large-4 states its FP8 latent cache as `fp8_kv_cache` rather
-        # than as a kv_cache_quant_algo. It is read as one: kv_cache_config.dtype
-        # 'auto' keeps it and an explicit dtype overrides it.
-        if (architecture == "MistralLarge4ForCausalLM"
-                and getattr(pretrained_config, "fp8_kv_cache", False)
-                and quant_config.kv_cache_quant_algo is None):
-            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-
         kwargs['moe_backend'] = cls.resolve_moe_backend(
             requested_moe_backend,
             architecture,

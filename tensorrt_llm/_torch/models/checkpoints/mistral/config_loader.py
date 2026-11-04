@@ -208,6 +208,8 @@ def _adapt_mistral_large4_config(config: dict) -> MistralLarge4Config:
         index_sharing=dsa["sharing"].split(","),
         fp8_kv_cache=dsa["fp8_kv_cache"],
     )
+    if dsa["fp8_kv_cache"] and config.get("quantization_config"):
+        config["quantization_config"].setdefault("kv_cache_quant_algo", "FP8")
     num_layers = config["num_hidden_layers"]
     pattern = config.pop("nope").split(",")
     if set(pattern) - {"rope", "nope"} or num_layers % len(pattern):
