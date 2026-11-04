@@ -213,6 +213,7 @@ def _decoder_capture_workflow_metadata(
         enable_spec_decode: bool = False,
         postprocess_fn: Callable | None = None,
         **_kwargs: object) -> dict[str, MetadataValue]:
+    """Describe decoder capture capacity and distinguish warmup-only work."""
     return _decoder_graph_workflow_metadata(
         runner, key, initial_inputs,
         "warmup_only" if runner.is_warmup_only else "capture")
@@ -1943,6 +1944,17 @@ def _encoder_graph_workflow_metadata(
     features = inputs.get("input_features")
     if isinstance(features, torch.Tensor):
         fields["workflow.graph.input_feature_shape"] = list(features.shape)
+    elif isinstance(features, list) and features:
+        first = features[0]
+        if isinstance(first, torch.Tensor) and first.ndim > 0 and all(
+                isinstance(feature, torch.Tensor) and feature.ndim == first.ndim
+                and all(type(extent) is int
+                        for extent in feature.shape) and feature.shape[1:] ==
+                first.shape[1:] and feature.dtype == first.dtype
+                for feature in features):
+            fields["workflow.graph.input_feature_shape"] = [
+                sum(feature.shape[0] for feature in features), *first.shape[1:]
+            ]
     source_lengths = inputs.get(_ENCODER_SOURCE_SEQ_LENS)
     if isinstance(source_lengths, list) and all(
             type(length) is int for length in source_lengths):
@@ -1957,6 +1969,7 @@ def _encoder_capture_workflow_metadata(
         runner: "EncoderCUDAGraphRunner", key: EncoderKeyType,
         forward_fn: Callable, inputs: dict[str, Any],
         **_kwargs: object) -> dict[str, MetadataValue]:
+    """Describe encoder capture buckets and available source lengths."""
     return _encoder_graph_workflow_metadata(
         runner, key, inputs,
         "warmup_only" if runner.is_warmup_only else "capture")

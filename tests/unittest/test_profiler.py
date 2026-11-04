@@ -117,6 +117,7 @@ def test_selection_is_cached_at_module_initialization() -> None:
 
 
 def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
+    """Verify invalid startup configuration warns and enables defaults."""
     env = os.environ.copy()
     env["TLLM_PROFILE_CUSTOM_REGIONS"] = "workflow,unknown"
     completed = subprocess.run(
@@ -339,6 +340,7 @@ def test_inactive_workflow_decorator_bypasses_scope_construction(
 
     @profiler.record_function_with_metadata("inactive_workflow")
     def wrapped(value: object, *, fails: bool = False) -> object:
+        """Return the supplied object or raise the original body exception."""
         if fails:
             raise original
         return value
@@ -378,6 +380,7 @@ def test_startup_disabled_workflow_decorator_returns_original_function(
         raise AssertionError("disabled decorator evaluated metadata")
 
     def operation(value: object, *, fails: bool = False) -> object:
+        """Preserve object identity and the selected body exception."""
         if fails:
             raise original
         return value
@@ -409,6 +412,7 @@ def test_workflow_decorator_tracks_live_selection_and_profiler_state(
         return {"label": label}
 
     def operation(value: object, *, label: str = "positional") -> object:
+        """Return the sentinel or raise the original error for its failure label."""
         if label == "failure":
             raise original
         return value

@@ -903,6 +903,7 @@ class DecoderRunner(ScheduledModelRunner):
         "trtllm::model_forward", metadata_factory=_model_forward_workflow_metadata
     )
     def _model_forward(self, *, is_dummy: bool, **kwargs: Any) -> Any:
+        """Invoke the model within the configured workspace reclamation scopes."""
         assert self._model_caller is not None
         reclaimer = self._eager_workspace_reclaimer
         metadata = kwargs["attn_metadata"]
