@@ -394,8 +394,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gentp2_deepseek_v3_lite_attention_dp_gen_only.yaml",
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml",
-        "deepseek_v3_lite_fp8_attention_dp_overlap_gen_init_cap":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_gen_init_cap.yaml",
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml",
         "deepseek_v3_lite_fp8_overlap_cuda_graph":
@@ -2158,60 +2156,46 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
+    """Attention DP with the overlap scheduler and the servers' scheduling fields.
 
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp_8_attention_dp_overlap",
-                           num_iters=1,
-                           env=llm_venv._new_env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=1200)
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_gen_init_cap(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        deepseek_v3_model_root):
-    """Run the scheduling fields of the delivered disaggregated servers.
-
-    The generation server admits at most one generation-init request per
-    pass, does client I/O during the GPU wait and receives only the prompt
-    tail of a long generation-only request; the context server places new
-    conversations by pending prefill.
+    A long prompt reaches the generation workers trimmed to its tail and must still be answered.
     """
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
 
-    def long_prompt(server_url):
+    def trimmed_prompt_answer(server_url):
         import requests
 
         with open(
                 f"{disaggregated_example_root}/clients/long_prompts.json") as f:
             prompt = json.load(f)[0]
+        # Longer than gen_prompt_tail_tokens: the generation workers get only its tail.
+        prompt += ("\n\nQuestion: What is the capital of Germany?\n"
+                   "Answer: The capital of Germany is")
         response = requests.post(f"{server_url}/v1/completions",
                                  json={
                                      "model": "DeepSeek-V3-Lite/fp8",
                                      "prompt": prompt,
-                                     "max_tokens": 4
+                                     "max_tokens": 8,
+                                     "temperature": 0
                                  },
                                  timeout=600)
-        assert response.status_code == 200 and response.json()["choices"], (
-            response.text)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["usage"]["prompt_tokens"] > 256, result["usage"]
+        text = result["choices"][0]["text"]
+        assert "berlin" in text.lower(), text
 
     run_disaggregated_test(
         disaggregated_example_root,
-        "deepseek_v3_lite_fp8_attention_dp_overlap_gen_init_cap",
+        "deepseek_v3_lite_fp_8_attention_dp_overlap",
         num_iters=1,
         env=llm_venv._new_env,
         gen_env={"TLLM_LOG_LEVEL": "INFO"},
         model_path=deepseek_v3_model_root,
         cwd=llm_venv.get_working_directory(),
         server_start_timeout=1200,
-        post_client_test=long_prompt,
+        post_client_test=trimmed_prompt_answer,
         assert_gen_log_contains=(
             "max_gen_init_admissions_per_pass=1",
             "prompt tail trimming: first trimmed request sends 256"))
