@@ -480,7 +480,15 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 
 ### Post-merge Run Frequency
 
-The post-merge `Disagg-PerfSanity` stages (disaggregated `e2e` and `gen_only` tests) run once every 2 post-merge builds: split `k` runs on the post-merge builds whose `BUILD_NUMBER % 2 == (k - 1) % 2`, so `...-Post-Merge-1` runs on even builds and `...-Post-Merge-2` on odd builds. All other perf-sanity stages run on every build. The intervals are set by `POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy`.
+The official post-merge pipeline runs every perf-sanity stage once every N builds:
+
+| Cases | N |
+|-------|---|
+| Qwen3-235B FP4 and GLM-5 FP4 (all modes) | 8 |
+| DeepSeek-V4-Pro FP4 disaggregated `e2e` | 4 |
+| Every other perf-sanity case | 2 |
+
+`POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy` sets `N` (or `[N, offset]`) per stage: split `k` runs on the post-merge builds whose `BUILD_NUMBER % N == (offset + k - 1) % N`, and the offsets spread the stages so that every build carries a similar load. Because the frequency is per stage, a test list holds cases of one frequency only; a case that runs at a different frequency than its list goes into its own list and stage (the `_glm5` / `-GLM5-` and `_e2e` / `-E2E-` ones). Add a new case to a list of its own frequency, and give a new list an entry if it is not every 2 builds.
 
 A PR's `/bot run --post-merge` runs no post-merge perf-sanity stage (a stage whose name contains both `PerfSanity` and `Post-Merge`); only the official post-merge pipeline runs them. The pre-merge perf-sanity stages run as in a plain `/bot run`. To run a post-merge perf-sanity stage on a PR, name it with `--stage-list` or `--extra-stage`.
 

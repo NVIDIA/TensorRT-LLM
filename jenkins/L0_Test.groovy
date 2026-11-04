@@ -3624,9 +3624,13 @@ def stageMatchesAnyPattern(String key, List patterns) {
 // Fail on a non-positive POST_MERGE_STAGE_BUILD_INTERVALS value and warn about a pattern
 // that matches none of the declared stages.
 def checkPostMergeStageBuildIntervals(Collection stageNames) {
-    POST_MERGE_STAGE_BUILD_INTERVALS.each { pattern, interval ->
-        if (!(interval.toString() ==~ /\d+/) || interval.toString().toInteger() < 1) {
-            error "POST_MERGE_STAGE_BUILD_INTERVALS['${pattern}'] must be a positive integer, got '${interval}'."
+    POST_MERGE_STAGE_BUILD_INTERVALS.each { pattern, value ->
+        def parts = (value instanceof List) ? value : [value, 0]
+        boolean valid = parts.size() == 2 && parts.every { it.toString() ==~ /\d+/ } &&
+            parts[0].toString().toInteger() >= 1 &&
+            parts[1].toString().toInteger() < parts[0].toString().toInteger()
+        if (!valid) {
+            error "POST_MERGE_STAGE_BUILD_INTERVALS['${pattern}'] must be N or [N, offset] with N >= 1 and 0 <= offset < N, got '${value}'."
         }
         if (!stageNames.any { stageName -> stageMatchesPattern(stageName.toString(), pattern) }) {
             echo "WARNING: POST_MERGE_STAGE_BUILD_INTERVALS pattern '${pattern}' matches no declared stage."
@@ -3634,22 +3638,25 @@ def checkPostMergeStageBuildIntervals(Collection stageNames) {
     }
 }
 
-// Return N for a stage that runs once every N post-merge builds; 1 means every build.
-int getPostMergeStageBuildInterval(String stageName) {
+// Return [N, offset] from the first POST_MERGE_STAGE_BUILD_INTERVALS pattern the stage matches;
+// [1, 0] (every build) when it matches none.
+List getPostMergeStageSchedule(String stageName) {
     for (pattern in POST_MERGE_STAGE_BUILD_INTERVALS.keySet()) {
         if (stageMatchesPattern(stageName, pattern)) {
-            return POST_MERGE_STAGE_BUILD_INTERVALS[pattern].toString().toInteger()
+            def value = POST_MERGE_STAGE_BUILD_INTERVALS[pattern]
+            def parts = (value instanceof List) ? value : [value, 0]
+            return [parts[0].toString().toInteger(), parts[1].toString().toInteger()]
         }
     }
-    return 1
+    return [1, 0]
 }
 
 // Return the BUILD_NUMBER % interval value of the post-merge builds that run this stage:
-// (k - 1) % interval for split k (the trailing "-k" of the stage name).
-int getPostMergeStageBuildPhase(String stageName, int interval) {
+// (offset + k - 1) % interval for split k (the trailing "-k" of the stage name).
+int getPostMergeStageBuildPhase(String stageName, int interval, int offset) {
     def lastToken = stageName.tokenize('-')[-1]
     int splitId = (lastToken ==~ /\d+/) ? lastToken.toInteger() : 1
-    return (splitId - 1) % interval
+    return (offset + splitId - 1) % interval
 }
 
 // Return the --stage-list and --extra-stage patterns: the stages they name are never dropped by
@@ -3672,15 +3679,18 @@ def filterPostMergeStagesByBuildInterval(Map selectedJobs, Map testFilter, def p
     int buildNumber = postMergeBuildNumber.toString().toInteger()
     def explicitStagePatterns = getExplicitStagePatterns(testFilter)
     def notDueJobs = selectedJobs.findAll { key, _ ->
-        int interval = getPostMergeStageBuildInterval(key)
+        def schedule = getPostMergeStageSchedule(key)
+        int interval = schedule[0]
         return interval > 1 &&
             !stageMatchesAnyPattern(key, explicitStagePatterns) &&
-            buildNumber % interval != getPostMergeStageBuildPhase(key, interval)
+            buildNumber % interval != getPostMergeStageBuildPhase(key, interval, schedule[1])
     }
     if (notDueJobs) {
         def details = notDueJobs.keySet().collect { key ->
-            int interval = getPostMergeStageBuildInterval(key)
-            int buildsUntilDue = (getPostMergeStageBuildPhase(key, interval) - buildNumber % interval + interval) % interval
+            def schedule = getPostMergeStageSchedule(key)
+            int interval = schedule[0]
+            int phase = getPostMergeStageBuildPhase(key, interval, schedule[1])
+            int buildsUntilDue = (phase - buildNumber % interval + interval) % interval
             "  ${key}: runs every ${interval} builds, next on build #${buildNumber + buildsUntilDue}"
         }
         echo "Post-merge build #${buildNumber} skips ${notDueJobs.size()} stage(s) that are not due:\n${details.join('\n')}"
@@ -3786,17 +3796,49 @@ def MULTI_GPU_RUN_WITH_SINGLE = [
 
 // Stages that the official post-merge pipeline runs once every N builds instead of on
 // every build. Key: stage-name pattern (exact name, or '*' wildcard as in --stage-list);
-// value: N. A build is identified by the post-merge pipeline's BUILD_NUMBER, which all of
-// its L0_Test jobs share. Split k of a matching stage runs on the builds whose
-// BUILD_NUMBER % N == (k - 1) % N, so the splits of a stage take turns and each build
-// carries a similar share of the load. The first matching pattern applies; stages that
-// match no pattern run on every build. Pre-merge and other pipelines, and stages selected
-// explicitly with --stage-list / --extra-stage, are not affected.
+// value: N, or [N, offset] (offset defaults to 0). A build is identified by the post-merge
+// pipeline's BUILD_NUMBER, which all of its L0_Test jobs share. Split k of a matching stage
+// runs on the builds whose BUILD_NUMBER % N == (offset + k - 1) % N: the splits of a stage
+// take turns, and the offsets spread the stages over the N builds so that every build
+// carries a similar load. The first matching pattern applies; stages that match no pattern
+// run on every build. Pre-merge and other pipelines, and stages selected explicitly with
+// --stage-list / --extra-stage, are not affected.
+//
+// The frequency is per stage, so a perf-sanity test list holds tests of one frequency only;
+// a case that needs a different frequency gets its own list and stage (the "-GLM5-" and
+// "-E2E-" lists).
 @Field
 def POST_MERGE_STAGE_BUILD_INTERVALS = [
-    // Multi-node disaggregated perf-sanity stages: the disagg e2e and gen_only tests. The
-    // *-PerfSanity-GEN1-* stages hold aggregated gen_only_no_context tests and run every build.
-    "*-Disagg-PerfSanity-*-Post-Merge-*": 2,
+    // Qwen3-235B FP4 and GLM-5 FP4: every 8 builds.
+    "DGX_B200-8_GPUs-PyTorch-PerfSanity-GLM5-Post-Merge-*": [8, 1],
+    "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-*": [8, 4],
+    "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge-*": [8, 2],
+    "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge-*": [8, 7],
+    "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge-*": [8, 5],
+    "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge-*": [8, 0],
+    "GB300-4_GPUs-PyTorch-PerfSanity-GLM5-Post-Merge-*": [8, 6],
+    "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-GLM5-Post-Merge-*": [8, 6],
+    "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-GLM5-Post-Merge-*": [8, 2],
+    "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge-*": [8, 2],
+    "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE8-GPU32-Post-Merge-*": [8, 6],
+    // DeepSeek-V4-Pro FP4 disagg e2e: every 4 builds, on builds that also run the same
+    // config's gen_only stage (same offset parity as its entry below or the [2, 0] default).
+    "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-E2E-Post-Merge-*": [4, 2],
+    "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-E2E-Post-Merge-*": [4, 3],
+    "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-E2E-Post-Merge-*": [4, 1],
+    "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-E2E-Post-Merge-*": [4, 0],
+    // Every other perf-sanity stage: every 2 builds. The entries with offset 1 run on odd
+    // builds; the catch-all runs the rest on even builds.
+    "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-*": [2, 1],
+    "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-*": [2, 1],
+    "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge-*": [2, 1],
+    "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge-*": [2, 1],
+    "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge-*": [2, 1],
+    "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge-*": [2, 1],
+    "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge-*": [2, 1],
+    "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge-*": [2, 1],
+    "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge-*": [2, 1],
+    "*PerfSanity*-Post-Merge-*": 2,
 ]
 
 @Field
@@ -7265,6 +7307,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-GLM5-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity_glm5", 1, 1, 8, 1, true],
         "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
     ]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
@@ -7332,6 +7375,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 7, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 7, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 7, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-GLM5-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity_glm5", 1, 1, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -7408,12 +7452,22 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         36,
         9
     )
+    // DeepSeek-V4-Pro: the gen_only test of each topology stays in the topology's list and the
+    // e2e test has its own "-E2E-" list, because the two run at different frequencies.
     // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
-        2,
+        1,
+        36,
+        9
+    )
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-E2E-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8_e2e",
+        1,
         36,
         9
     )
@@ -7422,7 +7476,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16",
-        2,
+        1,
+        40,
+        10
+    )
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-E2E-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16_e2e",
+        1,
         40,
         10
     )
@@ -7431,7 +7493,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
-        2,
+        1,
+        44,
+        11
+    )
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-E2E-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32_e2e",
+        1,
         44,
         11
     )
@@ -7440,16 +7510,33 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8",
-        2,
+        1,
         56,
         14
     )
-    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-E2E-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8_e2e",
+        1,
+        56,
+        14
+    )
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs. The GLM-5 cases have
+    // their own "-GLM5-" list, because they run less often than the other cases.
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        6,
+        4,
+        8,
+        2
+    )
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-GLM5-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_glm5",
+        2,
         8,
         2
     )
@@ -7462,12 +7549,20 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         16,
         4
     )
-    // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
+    // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs; GLM-5 in its own list
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32",
-        2,
+        1,
+        32,
+        8
+    )
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-GLM5-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32_glm5",
+        1,
         32,
         8
     )
