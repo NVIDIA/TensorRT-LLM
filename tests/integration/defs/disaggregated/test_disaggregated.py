@@ -801,7 +801,7 @@ def setup_disagg_cluster(
     log_output_dir: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
-    """Load config, launch the disagg server and then the workers, wait for ready.
+    """Load config, launch the workers and the disagg server, wait for ready.
 
     Args:
         config_file: Path to disaggregated server config YAML
@@ -915,8 +915,6 @@ def setup_disagg_cluster(
     num_gpus = torch.cuda.device_count()
 
     try:
-        # Launch the server first: the workers register with it, so they need
-        # its address.
         server_config = {
             "hostname":
             server_host,
@@ -945,14 +943,16 @@ def setup_disagg_cluster(
         }
         if schedule_style:
             server_config["schedule_style"] = schedule_style
-        disagg_server = run_disagg_server(server_config,
-                                          work_dir,
-                                          server_port,
-                                          save_log=save_log,
-                                          env=server_env,
-                                          cwd=cwd,
-                                          report_addr=report_addr)
+        server_launch_kwargs = dict(save_log=save_log, env=server_env, cwd=cwd)
         if report_addr is not None:
+            # The workers register with the server, so a server on a
+            # kernel-assigned port starts first and they get the port it
+            # reports.
+            disagg_server = run_disagg_server(server_config,
+                                              work_dir,
+                                              server_port,
+                                              report_addr=report_addr,
+                                              **server_launch_kwargs)
             _, server_port = wait_for_reported_addr(report_addr,
                                                     server_start_timeout,
                                                     disagg_server.process)
@@ -1010,6 +1010,13 @@ def setup_disagg_cluster(
                 f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}, pid={w.process.pid}{log_suffix}"
             )
             next_device += gpus_per_gen
+
+        if disagg_server is None:
+            # A fleet's public and coordinator ports are picked above, so its
+            # server starts after the workers.
+            disagg_server = run_disagg_server(server_config, work_dir,
+                                              server_port,
+                                              **server_launch_kwargs)
 
         all_workers = ctx_workers + gen_workers
 
