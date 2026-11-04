@@ -265,8 +265,10 @@ def fp8_block_scaling_bmm_out(
 
 
 class MLA(nn.Module):
-    # Whether the cached-KV context paths hand the attention op FP8 Q / K / V;
-    # resolved once in create_weights().
+    # A model's opt-in: the cached-KV context paths may hand the attention op
+    # FP8 Q / K / V (see _supports_fp8_cached_kv_context).
+    fp8_cached_kv_context_opt_in: bool = False
+    # Whether they do; resolved once in create_weights().
     _fp8_cached_kv_context: bool = False
 
     def __init__(
@@ -2209,13 +2211,15 @@ class MLA(nn.Module):
         The op's FP8 context MLA FMHA (``TrtllmAttention.has_fp8_context_mla``)
         otherwise copies its BF16 Q, K and V to FP8 on every call, i.e. once per
         cached-KV partition, after a BF16 concat of k_nope and k_pe. Requires
-        dense attention without Helix CP and the 128 / 64 / 128 head dimensions
-        of the op's FP8 copy kernel. The FP8 Q / K / V written here are plain
+        the model's opt-in (``fp8_cached_kv_context_opt_in``), dense attention
+        without Helix CP and the 128 / 64 / 128 head dimensions of the op's FP8
+        copy kernel. The FP8 Q / K / V written here are plain
         conversions: ``TrtllmAttention`` keeps its KV quantization scale at 1.
         """
         mha = self.mha
         return (
-            isinstance(mha, TrtllmAttention)
+            self.fp8_cached_kv_context_opt_in
+            and isinstance(mha, TrtllmAttention)
             and mha.has_fp8_context_mla
             and mha.sparse_params is None
             and not self.mapping.has_cp_helix()

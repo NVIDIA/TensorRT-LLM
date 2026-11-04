@@ -139,6 +139,7 @@ class KimiK3MLAAttention(MLA):
     and gated output projection.
     """
 
+    fp8_cached_kv_context_opt_in = True
     # Whether generation-only Helix steps of up to k3_mla_q_fused.MAX_TOKENS tokens take
     # the fused FP4 decode query (_forward_generation_fused_query); set in
     # cache_derived_state, as are the two flags below.

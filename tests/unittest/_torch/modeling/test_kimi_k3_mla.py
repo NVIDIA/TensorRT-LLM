@@ -630,6 +630,15 @@ def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
     assert torch.equal(first, expected)
 
 
+def test_fp8_cached_kv_context_is_a_model_opt_in() -> None:
+    """Only a model that opts in hands the attention op FP8 Q / K / V on the cached-KV context
+    paths; every other MLA keeps the op's own FP8 copy."""
+    from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import KimiK3MLAAttention
+
+    assert not MLA.fp8_cached_kv_context_opt_in
+    assert KimiK3MLAAttention.fp8_cached_kv_context_opt_in
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
