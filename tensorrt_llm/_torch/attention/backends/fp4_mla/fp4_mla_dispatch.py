@@ -23,9 +23,24 @@ Graph-replay medians throughout (the 2x kernel's first replays at 8K are faster,
 sense in which 2x "wins" there); on the main tree's slower 2x packed kernel (#20576) the 8K row reads 190 / 191 /
 192 and 4K 106 / 107 / 107.
 
-Below ``TRTLLM_FP4_MLA_4X_MIN_KV`` (default 12 K tokens) the 2x packed kernel keeps the call: the 4x kernel pays
-~13 us of fixed cost per 256-row item (task identity, barrier init, exposed Q load, pipeline fill and drain) that
-only amortizes over long KV.  Above it the static 4x envelope (``fp4_mla_cutedsl_4x_host.envelope_reason_static``:
+Below the batch's KV floor (``four_x_floor_kv``) the 2x packed kernel keeps the call: the 4x kernel pays ~13 us of
+fixed cost per 256-row item (task identity, barrier init, exposed Q load, pipeline fill and drain) and every wave
+beyond the first adds a task per item, so the KV it needs to win grows with the batch's 4x wave count.  Graph-replay
+matrix of 2026-11-03 (q4, H128, uniform KV, main tree; ratio = 2x / 4x-or-two-stream):
+
+=========================  ======  ======  ======  ======  ======  ======  ==========
+batch (4x waves)           1K      2K      4K      8K      12K     16K     floor
+=========================  ======  ======  ======  ======  ======  ======  ==========
+B16 (0.7, one wave)        1.23x   2.51x   2.23x   1.93x   1.83x   1.73x   0
+B32 (1.4)                  0.95x   1.03x   1.13x   1.22x   1.33x   1.41x   2K
+B48 (2.1, two-stream r2=2) 0.90x   0.91x   1.03x   1.10x   1.17x   1.27x   4K
+B64 (2.8)                  0.90x   1.01x   1.08x   1.17x   1.25x   1.27x   4K
+B96 (4.2)                  0.86x   0.87x   0.92x   1.06x   1.18x   1.18x   8K
+B128 (5.6)                 0.86x   0.88x   0.95x   1.02x   1.14x   1.15x   8K
+B256 (11.1)                        0.88x   0.95x   1.09x           1.19x   8K
+=========================  ======  ======  ======  ======  ======  ======  ==========
+
+Above the floor the static 4x envelope (``fp4_mla_cutedsl_4x_host.envelope_reason_static``:
 small-batch rules, Helix / softmax-stats / packed-V requirements, split-mode bounds) decides whether the 4x kernel
 may run, and the two-stream planner (``fp4_mla_twostream``) decides whether handing the last requests to the 2x
 kernel on a concurrent stream drops a whole 4x wave.
@@ -40,28 +55,38 @@ Environment:
 ``TRTLLM_FP4_MLA_DECODE_PATH``      ``auto`` (default) | ``2x`` | ``4x`` | ``twostream``: force a path (a forced 4x or
                                     two-stream path still needs the static envelope; ``twostream`` falls back to ``4x``
                                     when the planner finds no useful split).
-``TRTLLM_FP4_MLA_4X_MIN_KV``        KV length (tokens) below which the call stays on ``2x`` (default 12288).
+``TRTLLM_FP4_MLA_4X_MIN_KV``        one flat KV length (tokens) below which every call stays on ``2x``, replacing
+                                    the per-batch floor of ``four_x_floor_kv`` (0 / 2048 / 4096 / 8192 by 4x waves).
+``TRTLLM_FP4_MLA_KV_REGIME_GRID``   extra KV regime ceilings (tokens, comma-separated) a graph runner keys its
+                                    decode graphs by between a batch's floor and the capacity (default none: one 2x
+                                    regime under the floor and one 4x-eligible regime up to the capacity): see
+                                    ``kv_regimes_for_batch``.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional, Sequence
 
-from .fp4_mla_twostream import TwoStreamPlan, plan_two_stream
+from .fp4_mla_twostream import LANES_4X, ROWS_PER_4X_ITEM, TwoStreamPlan, plan_two_stream
 
 DECODE_PATH_ENV = "TRTLLM_FP4_MLA_DECODE_PATH"
 MIN_KV_4X_ENV = "TRTLLM_FP4_MLA_4X_MIN_KV"
-DEFAULT_MIN_KV_4X = 12288
+# KV floor (tokens) of the 4x paths by the batch's 4x wave count (``four_x_waves``): (waves at most, floor) in
+# ascending order, ``FLOOR_KV_4X_MANY_WAVES`` beyond the last bound.  From the matrix in the module docstring.
+FLOOR_KV_4X_BY_WAVES = ((1.0, 0), (1.5, 2048), (3.0, 4096))
+FLOOR_KV_4X_MANY_WAVES = 8192
 
 PATH_2X = "2x"
 PATH_4X = "4x"
 PATH_TWO_STREAM = "twostream"
 PATHS = (PATH_2X, PATH_4X, PATH_TWO_STREAM)
 
-# KV regime ceilings a graph runner can key its decode graphs by (tokens).  ``kv_regime_ceiling`` maps a step's
-# longest live KV to the smallest ceiling that covers it; the capacity itself is the last regime.
-KV_REGIME_CEILINGS = (4096, 8192, 12288, 16384, 32768, 65536)
+# KV regimes a graph runner can key its decode graphs by (tokens): ``kv_regimes_for_batch`` lists the regimes worth
+# a graph for one batch shape, ``kv_regime_for_step`` maps a step's longest live KV onto them; the page-table
+# capacity itself is always the last regime, the grid adds optional points between a batch's floor and the capacity.
+KV_REGIME_GRID_ENV = "TRTLLM_FP4_MLA_KV_REGIME_GRID"
+DEFAULT_KV_REGIME_GRID: tuple[int, ...] = ()
 
 
 class DecodeStrategy(NamedTuple):
@@ -92,22 +117,102 @@ def _env_path() -> str:
     return value if value in PATHS else "auto"
 
 
-def min_kv_4x() -> int:
+def min_kv_4x() -> Optional[int]:
+    """Flat KV floor from ``TRTLLM_FP4_MLA_4X_MIN_KV``; None (the default) grades the floor by the batch."""
     value = os.getenv(MIN_KV_4X_ENV)
     if value is None or value.strip() == "":
-        return DEFAULT_MIN_KV_4X
+        return None
     try:
         return max(0, int(value))
     except ValueError:
-        return DEFAULT_MIN_KV_4X
+        return None
 
 
-def kv_regime_ceiling(max_kv_len: int, capacity: int) -> int:
-    """Smallest regime ceiling covering ``max_kv_len`` (never above ``capacity``)."""
-    for ceiling in KV_REGIME_CEILINGS:
-        if max_kv_len <= ceiling and ceiling <= capacity:
-            return ceiling
-    return int(capacity)
+def four_x_waves(num_requests: int, rows_per_seq: int, sm_count: int) -> float:
+    """4x waves of one call: its 256-row pair tasks over the four-CTA clusters the part hosts at once."""
+    del sm_count  # the resident cluster count is a property of the part the kernel is tuned for
+    pairs = max(0, int(num_requests)) * max(0, int(rows_per_seq)) // ROWS_PER_4X_ITEM
+    return pairs / LANES_4X
+
+
+def four_x_floor_kv(num_requests: int, rows_per_seq: int, sm_count: int) -> int:
+    """KV length (tokens) from which the 4x paths may take a call of this shape; shorter steps stay on 2x.
+
+    Graded by the call's 4x wave count (``FLOOR_KV_4X_BY_WAVES``, measured table in the module docstring): one wave
+    wins at every KV, each further wave adds a fixed-cost task per item that only longer KV amortizes.
+    ``TRTLLM_FP4_MLA_4X_MIN_KV`` replaces the grading by one flat floor.
+    """
+    flat = min_kv_4x()
+    if flat is not None:
+        return flat
+    waves = four_x_waves(num_requests, rows_per_seq, sm_count)
+    for bound, floor in FLOOR_KV_4X_BY_WAVES:
+        if waves <= bound:
+            return floor
+    return FLOOR_KV_4X_MANY_WAVES
+
+
+def kv_regime_grid() -> tuple[int, ...]:
+    """Extra regime ceilings between a shape's floor and the capacity (``TRTLLM_FP4_MLA_KV_REGIME_GRID``; default none)."""
+    value = os.getenv(KV_REGIME_GRID_ENV)
+    if value is None or value.strip() == "":
+        return DEFAULT_KV_REGIME_GRID
+    try:
+        ceilings = sorted({int(item) for item in value.split(",") if item.strip() != ""})
+    except ValueError:
+        return DEFAULT_KV_REGIME_GRID
+    return tuple(ceiling for ceiling in ceilings if ceiling > 0)
+
+
+def kv_regimes_for_batch(
+    *,
+    num_requests: int,
+    query_len: int,
+    num_heads: int,
+    rows_per_seq: int,
+    kv_capacity: int,
+    sm_count: int,
+    envelope_reason: Callable[..., Optional[str]],
+) -> tuple[int, ...]:
+    """Ceilings of the KV regimes a graph runner captures one decode graph of this batch shape for.
+
+    Ascending, the page-table capacity last.  Only regimes whose graphs would decide differently earn one: a shape
+    the 4x paths can never take (a forced ``2x`` / ``4x`` path, a shape outside the static envelope on the capacity,
+    among them every ``query_len`` whose rows are no multiple of 256 and every batch over the split-mode pair bound)
+    or always may (floor 0) has the single regime of the capacity; otherwise the 2x regime ends right under the
+    shape's KV floor, ``kv_regime_grid`` adds points between the floor and the capacity (the two-stream plan is taken
+    on the regime ceiling), and the capacity closes the list.  ``envelope_reason`` as in ``choose_decode_strategy``.
+    """
+    capacity = int(kv_capacity)
+    if _env_path() in (PATH_2X, PATH_4X):
+        return (capacity,)
+    reason = envelope_reason(
+        num_heads=num_heads,
+        query_len=query_len,
+        num_requests=num_requests,
+        max_kv_len=capacity,
+        sm_count=sm_count,
+    )
+    if reason is not None:
+        return (capacity,)
+    floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
+    if floor <= 1 or capacity < floor:
+        return (capacity,)
+    ceilings = [floor - 1]
+    ceilings += [ceiling for ceiling in kv_regime_grid() if floor < ceiling < capacity]
+    return tuple(ceilings) + (capacity,)
+
+
+def kv_regime_for_step(max_kv_len: int, ceilings: Sequence[int]) -> int:
+    """Regime of a step whose longest live KV is ``max_kv_len``: the smallest ceiling covering it.
+
+    Shorter steps share the first regime; a step beyond the list (never, when ``ceilings`` ends with the
+    capacity) gets the last one, the graph of the capacity.
+    """
+    for ceiling in ceilings:
+        if max_kv_len <= ceiling:
+            return int(ceiling)
+    return int(ceilings[-1])
 
 
 def choose_decode_strategy(
@@ -147,9 +252,11 @@ def choose_decode_strategy(
         return DecodeStrategy(
             PATH_2X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None
         )
-    if forced == "auto" and kv_decision < min_kv_4x():
+    floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
+    if forced == "auto" and kv_decision < floor:
         return two_x(
-            f"KV {kv_decision} < {min_kv_4x()}: the 2x packed kernel has the lower fixed cost ({MIN_KV_4X_ENV})"
+            f"KV {kv_decision} < {floor} (floor of {four_x_waves(num_requests, rows_per_seq, sm_count):.1f} 4x "
+            f"waves): the 2x packed kernel has the lower fixed cost ({MIN_KV_4X_ENV} overrides)"
         )
     reason = envelope_reason(
         num_heads=num_heads,
