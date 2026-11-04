@@ -610,14 +610,12 @@ class AttentionPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
-    def should_send(self, peer_ri: RankInfo, self_pv: PoolView, peer_pv: PoolView) -> "bool | None":
-        """Attention uses head-duplication routing for one matched view pair.
+    def should_send(self, peer_ri: RankInfo, self_pv: PoolView, peer_pv: PoolView) -> bool:
+        """Whether this rank sends one matched head-sharded view pair.
 
-        REPLICATED views (index-key side caches) hold identical bytes on every
-        TP rank, so they return None to defer to fan-in election instead.
+        Of the local ranks that hold the same heads for the peer rank, the one
+        picked by the peer's DP rank sends.
         """
-        if self_pv.mapper_kind == MapperKind.REPLICATED:
-            return None
         dup = self.duplicate_head_factor(peer_ri, self_pv, peer_pv)
         if dup <= 1:
             return True
@@ -625,8 +623,7 @@ class AttentionPolicy:
         return (peer_ri.dp_rank % dup) == (tp_rank % dup)
 
     def duplicate_head_factor(self, peer_ri: RankInfo, self_pv: PoolView, peer_pv: PoolView) -> int:
-        """How many of the local ranks feeding one peer rank hold the same heads of
-        this view; ``should_send`` lets one of them send."""
+        """Number of local ranks that feed one peer rank the same heads of this view."""
         self_head_slots = self_pv.num_kv_heads * self._ri.tp_size_per_dp_group
         peer_head_slots = peer_pv.num_kv_heads * peer_ri.tp_size_per_dp_group
         return max(1, self_head_slots // peer_head_slots)
@@ -731,15 +728,12 @@ class AttentionPolicy:
         self,
         *,
         peer_ri: RankInfo,
-        mapper_kind: MapperKind,
         self_layer_offsets: "Sequence[int] | np.ndarray",
         peer_layer_offsets: "Sequence[int] | np.ndarray",
         self_bytes_per_layer: int,
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int = 1,
         peer_buffers_per_layer: int = 1,
-        self_lg=None,
-        peer_lg=None,
         self_pv: PoolView,
         peer_pv: PoolView,
     ) -> RegionMapperBase:
@@ -748,10 +742,12 @@ class AttentionPolicy:
         Every view is entries-driven: layer selection always uses explicit
         slot-relative per-layer byte offsets, never positional arithmetic
         (other role classes may interleave between this class's layers).
-        The kind only decides the two irreducible semantic differences:
+        The view's mapper kind only decides the two irreducible semantic
+        differences:
 
         - REPLICATED skips head matching entirely (bytes are identical on
-          every TP rank; fan-in ownership is decided by ``should_send``).
+          every TP rank; ``PeerRegistrar.should_send_pool`` elects the
+          sender).
         - Under head mismatch, HND (INDEXED) slices one contiguous head
           range per K/V buffer, while NHD must slice inside every token.
 
@@ -759,6 +755,7 @@ class AttentionPolicy:
         whose run merging degrades to a single whole-region copy per block
         when the selected layers are contiguous on both sides.
         """
+        mapper_kind = self_pv.mapper_kind
         self_ring = self_pv.ring_slot_bytes
         peer_ring = peer_pv.ring_slot_bytes
         if mapper_kind == MapperKind.REPLICATED and (self_ring or peer_ring):

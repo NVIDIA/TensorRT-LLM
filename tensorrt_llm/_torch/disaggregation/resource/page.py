@@ -59,14 +59,12 @@ class MapperKind(IntEnum):
     A physical pool may hold roles of different kinds: V2 storage coalesces
     buffers purely by ``(life_cycle, buffer size)``, so e.g. MiniMax M3's
     replicated index-K shares the K/V pool at TP degrees where their
-    per-block sizes coincide. The page-table builder therefore emits one
-    PoolView per ``(physical pool, mapper kind, manager partition, KV-head
-    count)`` — a view covers exactly the bytes of one role class, and its
+    per-block sizes coincide. Each PoolView is still kind-homogeneous; its
     per-layer byte ranges come from ``buffer_entries`` (offsets are per layer
     because another class may interleave between layers; only the per-layer
-    size is uniform, recorded in ``bytes_per_layer``). View count per layer
-    group is bounded by the number of role classes and head geometries,
-    never by layer count.
+    size is uniform, recorded in ``bytes_per_layer``). The page-table
+    builder's ``_build_pool_views_for_variant`` defines how a pool is split
+    into views.
 
     Mamba state pools use SECTIONED for convolution state, INDEXED for SSM
     state, and REPLICATED for auxiliary recurrent state. The policy is chosen

@@ -111,7 +111,21 @@ class RankInfo:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
+        """Decode a peer's RankInfo.
+
+        Raises:
+            ValueError: The payload does not follow this build's RankInfo schema.
+        """
         unpacked = msgpack.unpackb(data, strict_map_key=False)
+        try:
+            return cls._from_unpacked(unpacked)
+        except (AttributeError, KeyError, TypeError) as e:
+            raise ValueError(
+                f"peer RankInfo does not match this build's schema ({type(e).__name__}: {e})"
+            ) from e
+
+    @classmethod
+    def _from_unpacked(cls, unpacked: object) -> "RankInfo":
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:

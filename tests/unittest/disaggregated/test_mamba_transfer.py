@@ -413,16 +413,15 @@ def test_mamba_policy_rejects_incompatible_replicated_side_state():
 
     # REPLICATED state under the STATE life cycle uses the per-layer-pointer
     # head-match mapper and requires equal per-layer sizes.
-    state_lg = pt_with_side.layer_groups[0]
+    replicated_view = pt_with_side.layer_groups[0].pool_views[2]
     common = dict(
         peer_ri=rank_info,
-        mapper_kind=peer.MapperKind.REPLICATED,
         self_layer_offsets=np.array([0], dtype=np.int64),
         peer_layer_offsets=np.array([0], dtype=np.int64),
         src_layer_off=0,
         dst_layer_off=0,
-        self_lg=state_lg,
-        peer_lg=state_lg,
+        self_pv=replicated_view,
+        peer_pv=replicated_view,
     )
     with pytest.raises(ValueError, match="Replicated state size differs"):
         peer.MambaPolicy(rank_info).build_mapper(

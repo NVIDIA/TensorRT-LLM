@@ -197,8 +197,9 @@ class PeerRegistrar:
     def validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
         """Require matching head geometry for every head-sharded view pair.
 
-        A head must cover whole bytes (sub-byte dtypes) and as many bytes as
-        the peer's (same head_dim and dtype). Raises ``ValueError``.
+        Both views must publish a positive ``num_kv_heads``, and a head must
+        cover whole bytes (sub-byte dtypes) and as many bytes as the peer's
+        (same head_dim and dtype). Raises ``ValueError``.
         """
         self_page_table = self._self_ext_cache.page_table
         peer_page_table = peer_ri.page_table
@@ -213,7 +214,7 @@ class PeerRegistrar:
                 ("local", self_lg, self_pi, self_pv),
                 ("peer", peer_lg, peer_pi, peer_pv),
             ):
-                heads = pool_view.num_kv_heads
+                heads = self._published_kv_heads(side, pool_view)
                 buffers = self._get_buffers_per_layer(pool_view, layer_group_id=lg_idx, pool_idx=pi)
                 layer_bytes = get_layer_byte_ranges(pool_view)[1]
                 if layer_bytes % (buffers * heads) != 0:
@@ -229,6 +230,17 @@ class PeerRegistrar:
                     f"{sorted(self_pv.pool_role)} (local={bytes_per_head[0]}, "
                     f"peer={bytes_per_head[1]})"
                 )
+
+    @staticmethod
+    def _published_kv_heads(side: str, pool_view: PoolView) -> int:
+        """Return the view's ``num_kv_heads``, which must be positive."""
+        heads = pool_view.num_kv_heads
+        if heads is None or heads <= 0:
+            raise ValueError(
+                f"PeerRegistrar: the {side} view {sorted(pool_view.pool_role)} must publish a "
+                f"positive num_kv_heads, got {heads!r}"
+            )
+        return heads
 
     def get_pool_mapping(self, peer_ri: RankInfo) -> Dict[LGPoolKey, LGPoolKey]:
         """Get mapping from (self_lg_idx, self_pool_idx) -> (peer_lg_idx, peer_pool_idx).
@@ -280,11 +292,9 @@ class PeerRegistrar:
             if self_lg.kind not in (CacheKind.PAGED, CacheKind.STATE):
                 continue
             for self_pi, self_pv in enumerate(self_lg.pool_views):
-                # Every view carries buffer_entries, so a view's exact layer
-                # set always comes from its entries (a view may cover a
-                # subset of the LG when V2 splits an LG into multiple pools
-                # by buffer-size class, or when a role class exists only on
-                # some layers, e.g. sparse-layer index-K).
+                # A view may hold only part of the layer group (see
+                # _build_pool_views_for_variant), so its layer set comes from
+                # its entries.
                 pv_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
                 if not pv_global_ids:
                     continue
@@ -318,10 +328,10 @@ class PeerRegistrar:
                 peer_lg = peer_pt.layer_groups[peer_lg_idx]
 
                 # Step 2: the peer view with the same pool_role whose layers
-                # overlap self's. pool_role alone is not unique: V2 may split one
-                # role over several views (buffer-size classes, target/draft
-                # owners, KV-head counts). Both sides must split the same way,
-                # so exactly one peer view may match and it must not hold
+                # overlap self's. pool_role alone is not unique: the page-table
+                # builder may split one role over several views (see
+                # _build_pool_views_for_variant). Both sides must split the same
+                # way, so exactly one peer view may match and it must not hold
                 # layers this rank keeps in another view of the role.
                 self_layer_set = set(pv_global_ids)
                 candidates = []
@@ -488,15 +498,12 @@ class PeerRegistrar:
 
         mapper = policy.build_mapper(
             peer_ri=peer_ri,
-            mapper_kind=self_pv.mapper_kind,
             self_layer_offsets=self_layer_offsets,
             peer_layer_offsets=peer_layer_offsets,
             self_bytes_per_layer=self_bytes_per_layer,
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
-            self_lg=self_lg,
-            peer_lg=peer_lg,
             self_pv=self_pv,
             peer_pv=peer_pv,
             **extra_kwargs,
@@ -630,22 +637,18 @@ class PeerRegistrar:
         """Return whether this rank owns the transfer of one view pair.
 
         The keys are the ``(layer group, pool view)`` indices of a pair from
-        ``get_pool_mapping``. Each view is kind-homogeneous, so ownership is
-        a single per-view decision: replicated views use one sender per
-        fan-in group (the policy returns None for them), sharded views retain
-        head-duplication routing.
-
-        For mamba layer groups, ownership is based on mamba's own TP routing
-        (independent of attention's duplicate-head logic):
-        - If mamba_tp == 1 (attention_dp enabled): fan-in election (one sender)
-        - Otherwise: always send (each rank owns unique TP-sharded state)
+        ``get_pool_mapping``. Replicated views hold identical bytes on every
+        TP rank, so one sender per fan-in group sends them; attention
+        views use head-duplication routing (``AttentionPolicy.should_send``).
+        Recurrent state follows ``MambaPolicy.should_send``.
         """
         self_lg_idx, self_pi = self_pool_key
         peer_lg_idx, peer_pi = peer_pool_key
         layer_group = self._self_ext_cache.page_table.layer_groups[self_lg_idx]
         self_pv = layer_group.pool_views[self_pi]
+        if self_pv.mapper_kind == MapperKind.REPLICATED:
+            return self._owns_tp_fan_in(peer_ri)
         peer_pv = peer_ri.page_table.layer_groups[peer_lg_idx].pool_views[peer_pi]
-        # Delegate to the policy's should_send. None means fan-in election.
         result = self._get_policy(layer_group.kind).should_send(peer_ri, self_pv, peer_pv)
         return self._owns_tp_fan_in(peer_ri) if result is None else result
 

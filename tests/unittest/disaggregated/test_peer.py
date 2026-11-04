@@ -372,6 +372,15 @@ def test_multiple_overlap():
     assert overlap == expected_overlap
 
 
+def test_peer_overlap_cache_is_keyed_by_peer_dp_rank():
+    """Each attention-DP rank of one peer instance gets the overlap of its own DP group."""
+    reg = _make_peer_registrar(make_rankinfo(tp_size=1))
+    peer_ri = make_rankinfo(instance_name="peer", tp_size=2, dp_size=2, enable_attention_dp=True)
+
+    assert reg.get_peer_overlap(peer_ri, peer_dp_rank=0).ranks == [0]
+    assert reg.get_peer_overlap(peer_ri, peer_dp_rank=1).ranks == [1]
+
+
 def _make_peer_registrar(self_rankinfo):
     pt = self_rankinfo.page_table or make_page_table()
     real_kv_extractor = KVRegionExtractorV1(pt)
@@ -527,7 +536,7 @@ def test_per_view_head_duplication_elects_senders_independently():
             page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
         )
         reg = _make_peer_registrar(self_ri)
-        policy = reg._get_policy(CacheKind.PAGED)
+        policy = AttentionPolicy(self_ri)
         for view, expected_dup in enumerate((1, 2)):
             self_pv = self_ri.page_table.layer_groups[0].pool_views[view]
             peer_pv = peer_ri.page_table.layer_groups[0].pool_views[view]
@@ -535,6 +544,178 @@ def test_per_view_head_duplication_elects_senders_independently():
             ownership[view].append(reg.should_send_pool(peer_ri, (0, view), (0, view)))
 
     assert ownership == [[True, True, True, True], [True, False, True, False]]
+
+
+def test_view_ownership_uses_the_peer_view_of_the_mapped_pair():
+    """The peer lists its views in reverse, so each pair crosses view indices.
+
+    Layer 0 (2 heads x TP4 vs 8 heads x TP1) is sent by every rank; layer 1
+    (1 head x TP4 vs 2 heads x TP1) duplicates each head on two ranks. The
+    peer view at the other index has the other layer's head count.
+    """
+    peer_page_table = _make_per_view_page_table([8, 2], MapperKind.INDEXED)
+    peer_page_table.layer_groups[0].pool_views.reverse()
+    peer_ri = make_rankinfo(
+        instance_name="peer", tp_size=1, tokens_per_block=2, page_table=peer_page_table
+    )
+    ownership = {(0, 0): [], (0, 1): []}
+    for rank in range(4):
+        self_ri = make_rankinfo(
+            tp_size=4,
+            tp_rank=rank,
+            tokens_per_block=2,
+            page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+        )
+        reg = _make_peer_registrar(self_ri)
+        mapping = reg.get_pool_mapping(peer_ri)
+        assert mapping == {(0, 0): (0, 1), (0, 1): (0, 0)}
+        for self_key, peer_key in mapping.items():
+            ownership[self_key].append(reg.should_send_pool(peer_ri, self_key, peer_key))
+
+    assert ownership == {(0, 0): [True, True, True, True], (0, 1): [True, False, True, False]}
+
+
+@pytest.mark.parametrize(("peer_dp_rank", "expected_senders"), [(0, [0, 2]), (1, [1, 3])])
+def test_head_duplication_elects_sender_by_peer_dp_rank(
+    peer_dp_rank: int, expected_senders: list[int]
+) -> None:
+    """TP4 ranks hold one of 2 KV heads; each attention-DP peer rank holds both.
+
+    Ranks 0-1 hold head 0 and ranks 2-3 head 1. The peer has one TP rank per
+    DP group, so the factor is 1 x 4 // (2 x 1) = 2, and of each pair the rank
+    whose TP rank matches the peer's DP rank modulo 2 sends.
+    """
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=2,
+        tp_rank=peer_dp_rank,
+        dp_size=2,
+        dp_rank=peer_dp_rank,
+        enable_attention_dp=True,
+        tokens_per_block=2,
+        page_table=_make_per_view_page_table([2], MapperKind.INDEXED),
+    )
+    senders = []
+    for rank in range(4):
+        self_ri = make_rankinfo(
+            tp_size=4,
+            tp_rank=rank,
+            tokens_per_block=2,
+            page_table=_make_per_view_page_table([1], MapperKind.INDEXED),
+        )
+        if _make_peer_registrar(self_ri).should_send_pool(peer_ri, (0, 0), (0, 0)):
+            senders.append(rank)
+
+    assert senders == expected_senders
+
+
+def test_attention_dp_ranks_each_send_their_own_heads() -> None:
+    """Each local TP4 attention-DP rank holds all 4 KV heads, as does the peer rank.
+
+    A local DP group has one TP rank, so no two local ranks feed the peer the
+    same heads and every rank sends. A factor above 1 would elect only ranks
+    whose in-group TP rank (always 0) matches the peer's DP rank 1: none.
+    """
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=2,
+        tp_rank=1,
+        dp_size=2,
+        dp_rank=1,
+        enable_attention_dp=True,
+        tokens_per_block=2,
+        page_table=_make_per_view_page_table([4], MapperKind.INDEXED),
+    )
+    senders = []
+    for rank in range(4):
+        self_ri = make_rankinfo(
+            tp_size=4,
+            tp_rank=rank,
+            dp_size=4,
+            dp_rank=rank,
+            enable_attention_dp=True,
+            tokens_per_block=2,
+            page_table=_make_per_view_page_table([4], MapperKind.INDEXED),
+        )
+        if _make_peer_registrar(self_ri).should_send_pool(peer_ri, (0, 0), (0, 0)):
+            senders.append(rank)
+
+    assert senders == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+@pytest.mark.parametrize("invalid_heads", [None, 0, -1])
+@pytest.mark.parametrize("invalid_sides", [("local",), ("peer",), ("local", "peer")])
+def test_per_view_rejects_missing_or_invalid_head_counts(
+    mapper_kind: MapperKind, invalid_heads: int | None, invalid_sides: tuple[str, ...]
+) -> None:
+    self_ri = make_rankinfo(
+        tp_size=1,
+        tokens_per_block=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        tokens_per_block=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    for side, ri in (("local", self_ri), ("peer", peer_ri)):
+        if side in invalid_sides:
+            ri.page_table.layer_groups[0].pool_views[0].num_kv_heads = invalid_heads
+    reg = _make_peer_registrar(self_ri)
+
+    with pytest.raises(
+        ValueError, match=f"the {invalid_sides[0]} view .* must publish a positive num_kv_heads"
+    ):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_registration_accepts_replicated_view_without_head_count() -> None:
+    """A K/V view beside a REPLICATED index-K view without num_kv_heads, as V2 builds them."""
+    self_pt, peer_pt = (
+        make_page_table(pool_ptrs=[0x1000, 0x2000], block_bytes=[1024, 512]) for _ in range(2)
+    )
+    for page_table in (self_pt, peer_pt):
+        index_key = page_table.layer_groups[0].pool_views[1]
+        index_key.pool_role = frozenset({"index_key"})
+        index_key.mapper_kind = MapperKind.REPLICATED
+        index_key.num_kv_heads = None
+    reg = _make_peer_registrar(make_rankinfo(page_table=self_pt))
+    peer_ri = make_rankinfo(instance_name="peer", page_table=peer_pt)
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    assert reg.get_pool_mapping(peer_ri)[(0, 1)] == (0, 1)
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+def test_view_validation_rejects_unequal_bytes_per_head(mapper_kind: MapperKind) -> None:
+    local_ri, peer_ri = [
+        make_rankinfo(
+            instance_name=name,
+            tp_size=1,
+            tokens_per_block=2,
+            page_table=_make_per_view_page_table([2, 1], mapper_kind),
+        )
+        for name in ("local", "peer")
+    ]
+    # Same bytes split over twice the heads: half the head_dim.
+    peer_ri.page_table.layer_groups[0].pool_views[1].num_kv_heads = 2
+    registrar = _make_peer_registrar(local_ri)
+
+    with pytest.raises(ValueError, match=r"bytes per KV head differ .* \(local=8, peer=4\)"):
+        registrar.validate_view_head_geometry(peer_ri)
+
+
+def test_registration_rejects_equal_heads_with_different_head_bytes() -> None:
+    """Both sides hold 2 KV heads per rank; the peer's heads are twice as wide."""
+    self_ri = make_rankinfo(page_table=make_page_table(block_bytes=[1024]))
+    peer_ri = make_rankinfo(instance_name="peer", page_table=make_page_table(block_bytes=[2048]))
+    reg = _make_peer_registrar(self_ri)
+
+    with pytest.raises(ValueError, match=r"bytes per KV head differ .* \(local=128, peer=256\)"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
 def _make_receiver_for_view_validation(
@@ -575,6 +756,7 @@ def _make_receiver_for_view_validation(
         ("pool_roles", "has no peer view with the same roles"),
         ("extra_field", "unexpected keyword argument 'kv_heads_per_rank'"),
         ("missing_field", "missing 1 required positional argument"),
+        ("missing_key", "KeyError: 'pool_group_idx'"),
     ],
 )
 def test_receiver_rejects_view_mismatch_before_registration(
@@ -610,13 +792,15 @@ def test_receiver_rejects_view_mismatch_before_registration(
     bad_ri.sender_endpoints = ["tcp://bad-sender"]
     good_ri.sender_endpoints = ["tcp://good-sender"]
     bad_payload = bad_ri.to_bytes()
-    if mismatch in ("extra_field", "missing_field"):
+    if mismatch in ("extra_field", "missing_field", "missing_key"):
         # A peer on another build serializes RankInfo with other fields.
         data = msgpack.unpackb(bad_payload, strict_map_key=False)
         if mismatch == "extra_field":
             data["attention"]["kv_heads_per_rank"] = 2
-        else:
+        elif mismatch == "missing_field":
             del data["attention"]["element_bytes"]
+        else:
+            del data["page_table"]["layer_groups"][0]["pool_group_idx"]
         bad_payload = msgpack.packb(data)
     bad_endpoint = "tcp://bad-info"
     good_endpoint = "tcp://good-info"
@@ -845,7 +1029,7 @@ def _register_gemma4_31b_ctx_ranks(ctx_tp: int, gen_ri: RankInfo) -> tuple[dict,
         registrars[ctx_tp_rank] = reg
         targets = reg.get_peer_overlap(gen_ri, gen_ri.dp_rank).ranks
         for lg in (0, 1):
-            dup[lg] = reg._get_policy(CacheKind.PAGED).duplicate_head_factor(
+            dup[lg] = AttentionPolicy(ctx_ri).duplicate_head_factor(
                 gen_ri,
                 ctx_ri.page_table.layer_groups[lg].pool_views[0],
                 gen_ri.page_table.layer_groups[lg].pool_views[0],
@@ -876,9 +1060,6 @@ def test_gemma4_31b_ctx_tp4_to_gen_tp8_maps_each_layer_group_by_its_heads(gen_tp
     global_layer_bytes = 2 * (2 * 512 * 2)  # K and V of one head
     first_sliding_head = gen_tp_rank * sliding_gen_heads
     expected_sender = first_sliding_head // sliding_ctx_heads
-    # The global head of this gen rank lives on the same ctx rank.
-    global_head = gen_tp_rank * 4 // gen_tp
-    assert global_head // (4 // ctx_tp) == expected_sender
     src_head_off = (first_sliding_head % sliding_ctx_heads) * sliding_head_bytes
 
     gen_ri = make_rankinfo(
@@ -1382,6 +1563,7 @@ def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     page_table = make_page_table(global_layer_ids=[0])
     view = page_table.layer_groups[0].pool_views[0]
     view.mapper_kind = MapperKind.REPLICATED
+    view.num_kv_heads = None
 
     peer_ri = make_rankinfo(
         instance_name="peer",
@@ -1672,9 +1854,11 @@ def test_non_uniform_view_geometry_rejected_for_all_kinds():
 
 
 def test_peer_registrar_allows_byte_aligned_subbyte_head_mismatch():
-    """Byte-aligned sub-byte head slicing is allowed on the HND path.
+    """Registration accepts a 0.5-byte-element head mismatch whose heads cover whole bytes.
 
-    Per-head bytes are integral here: tpb=16 x dims=8 x 0.5B = 64B.
+    Each K/V buffer holds 2 heads in 256 bytes locally and 4 heads in 512
+    bytes on the peer: 128 bytes per head (16 tokens x 16 dims x 0.5 bytes),
+    so the HND path slices whole heads.
     """
     self_ri = make_rankinfo(
         element_bytes=0.5,
@@ -1717,6 +1901,28 @@ def test_peer_registrar_rejects_misaligned_subbyte_head_mismatch():
     reg = _make_peer_registrar(self_ri)
 
     with pytest.raises(ValueError, match="not a multiple of 2 buffers x 2 KV heads"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_registration_rejects_misaligned_heads_on_peer_side_only():
+    """Only the peer's heads split mid-byte: 1.5 bytes each, versus 1 byte locally.
+
+    Floor division would report 1 byte per head on both sides.
+    """
+    self_ri = make_rankinfo(
+        element_bytes=0.5, tp_size=2, page_table=make_page_table(block_bytes=[8])
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        element_bytes=0.5,
+        tp_size=1,
+        page_table=make_page_table(block_bytes=[24], mamba_tp=1, kv_heads=4),
+    )
+    reg = _make_peer_registrar(self_ri)
+
+    with pytest.raises(
+        ValueError, match="the peer view .* not a multiple of 2 buffers x 4 KV heads"
+    ):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
@@ -1773,12 +1979,13 @@ def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):
     assert key == "native-nhd-head-mismatch-2-4-4"
 
 
-def test_peer_registrar_nhd_head_match_uses_intact_mapper():
+def test_peer_registrar_nhd_head_match_uses_intact_mapper(monkeypatch):
     """NHD + equal heads takes the merged-run fast path, not per-token slicing.
 
-    With a dedicated (non-interleaved) K/V pool the run merge collapses the
-    whole class region into a single fragment per block — the fragment-count
-    budget for separate layouts.
+    Registration emits no NHD fragment warning. With a dedicated
+    (non-interleaved) K/V pool the run merge collapses the whole class region
+    into a single fragment per block — the fragment-count budget for separate
+    layouts.
     """
     self_pt = make_page_table()
     peer_pt = make_page_table()
@@ -1786,8 +1993,15 @@ def test_peer_registrar_nhd_head_match_uses_intact_mapper():
     peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     self_ri = make_rankinfo(page_table=self_pt)
     peer_ri = make_rankinfo(instance_name="peer", instance_rank=9, page_table=peer_pt)
+    warnings = []
+    monkeypatch.setattr(
+        peer_module.logger,
+        "warning_once",
+        lambda *message, key: warnings.append((" ".join(map(str, message)), key)),
+    )
     reg = _make_peer_registrar(self_ri)
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert warnings == []
 
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
     assert isinstance(mapper, IntactMapper)
@@ -1802,6 +2016,33 @@ def test_peer_registrar_nhd_head_match_uses_intact_mapper():
     assert pair.src.memory.ptrs.tolist() == [1000, 5000]
     assert pair.dst.memory.ptrs.tolist() == [2000, 6000]
     assert pair.src.memory.bytes_per_region == 1024
+
+
+def test_nhd_equal_heads_at_different_tp_does_not_warn(monkeypatch):
+    """A 4-head layer at TP4 and TP8 leaves one KV head per rank on both sides: no slicing."""
+    self_ri = make_rankinfo(
+        tp_size=4,
+        tp_rank=1,
+        tokens_per_block=2,
+        page_table=_make_per_view_page_table([1], MapperKind.NHD),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=8,
+        tp_rank=2,
+        tokens_per_block=2,
+        page_table=_make_per_view_page_table([1], MapperKind.NHD),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        peer_module.logger,
+        "warning_once",
+        lambda *message, key: warnings.append((" ".join(map(str, message)), key)),
+    )
+
+    _make_peer_registrar(self_ri).register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    assert warnings == []
 
 
 def test_indexed_head_mismatch_subbyte_geometry_is_entries_derived():

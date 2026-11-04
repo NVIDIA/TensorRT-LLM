@@ -612,8 +612,82 @@ def test_v2_builder_splits_layers_whose_heads_only_match_per_rank() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("head_counts", [(0, 1), (-1, 1), (1,)])
-def test_v2_builder_rejects_unresolved_or_nonpositive_heads(head_counts: tuple[int, ...]) -> None:
+def test_v2_builder_reads_unsharded_heads_of_the_pp_stage_layers() -> None:
+    from types import SimpleNamespace
+
+    # A PP stage holding model layers 2 and 3, which have 4 and 2 KV heads
+    # (one per rank at TP4); model layers 0 and 1 both have 4.
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.pp_layers = [2, 3]
+    manager.layer_offsets = {2: 0, 3: 1}
+    manager.num_kv_heads = [4, 4, 4, 2]
+    manager.num_kv_heads_per_layer = [1, 1]
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    assert [layer.global_layer_id for layer in layer_group.local_layers] == [2, 3]
+    assert [view.num_kv_heads for view in layer_group.pool_views] == [1, 1]
+    assert [get_unique_layers(view) for view in layer_group.pool_views] == [{0}, {1}]
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_takes_layer_heads_from_layer_specs_only() -> None:
+    from types import SimpleNamespace
+
+    # The manager ignores its num_kv_heads argument when given layer specs,
+    # so unsharded counts there must not split layers of one owner whose
+    # specs give the same per-rank count.
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.layer_specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=layer,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=DataType.HALF,
+            num_kv_heads=1,
+            head_dim=4,
+            buffer_roles=(Role.KEY, Role.VALUE),
+        )
+        for layer in range(2)
+    )
+    manager.num_kv_heads = [4, 2]
+    manager.num_kv_heads_per_layer = [1, 1]
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+
+    assert len(views) == 1
+    assert views[0].num_kv_heads == 1
+    assert get_unique_layers(views[0]) == {0, 1}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("head_counts", "internal_layer", "reason"),
+    [
+        ((0, 1), 0, "per-rank KV-head count must be positive, got 0"),
+        ((-1, 1), 0, "per-rank KV-head count must be positive, got -1"),
+        ((1,), 1, "local layer 1 is outside the per-layer head list"),
+    ],
+)
+def test_v2_builder_rejects_unresolved_or_nonpositive_heads(
+    head_counts: tuple[int, ...], internal_layer: int, reason: str
+) -> None:
     from types import SimpleNamespace
 
     attrs = {
@@ -626,13 +700,21 @@ def test_v2_builder_rejects_unresolved_or_nonpositive_heads(head_counts: tuple[i
     manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
     manager.num_kv_heads_per_layer = list(head_counts)
 
-    with pytest.raises(ValueError, match="KV-head count"):
+    with pytest.raises(
+        ValueError,
+        match=f"Cannot resolve KV-head count for internal layer {internal_layer}: {reason}",
+    ):
         build_page_table_from_manager(manager)
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("missing_owner", [False, True])
-def test_v2_builder_rejects_unresolved_virtual_layer_heads(missing_owner: bool) -> None:
+@pytest.mark.parametrize(
+    ("missing_owner", "reason"),
+    [(False, "model layer 20 is not local to this rank"), (True, "no owning model layer")],
+)
+def test_v2_builder_rejects_unresolved_virtual_layer_heads(
+    missing_owner: bool, reason: str
+) -> None:
     from enum import IntEnum
     from types import SimpleNamespace
 
@@ -649,7 +731,9 @@ def test_v2_builder_rejects_unresolved_virtual_layer_heads(missing_owner: bool) 
     manager._layer_attn_to_layer_id = {} if missing_owner else {(20, AttentionKind.PRIMARY): 0}
     manager.layer_offsets = {}
 
-    with pytest.raises(ValueError, match="Cannot resolve KV-head count for internal layer 0"):
+    with pytest.raises(
+        ValueError, match=f"Cannot resolve KV-head count for internal layer 0: {reason}"
+    ):
         build_page_table_from_manager(manager)
 
 

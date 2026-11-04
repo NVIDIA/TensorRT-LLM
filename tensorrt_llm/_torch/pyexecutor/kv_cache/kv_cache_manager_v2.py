@@ -4267,15 +4267,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return frozenset()
 
     def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole) -> Hashable | None:
-        """Opaque bucket key that keeps buffers in separate transfer views.
+        """Transfer-view split key of one buffer; None adds no split.
 
-        With explicit layer specs (target and draft layers in one manager),
-        each owner gets views of its own. The specs carry per-rank KV-head
-        counts only, and a target and a draft layer class can share a per-rank
-        count at one TP size but not at another; splitting by owner keeps both
-        peers' view splits identical. Without layer specs this returns None
-        and legacy draft layers share target views; the page-table builder
-        splits head-sharded views by KV-head counts either way.
+        Layer specs carry per-rank KV-head counts only, so target and draft
+        layers get separate keys in case their heads shard differently at
+        another TP size.
         """
         if self.layer_specs is None:
             return None

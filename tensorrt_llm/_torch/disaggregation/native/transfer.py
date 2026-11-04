@@ -2968,16 +2968,12 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
-            # Peer compatibility gates on the receiver side.
-            # The sender-side check (PeerRegistrar.register) runs in the
-            # sender's listener thread, where exceptions are only logged, so
-            # reject here — before REGISTER_RANK_INFO is even sent, so no
-            # dealers are connected and no partial registration happens for
-            # the bad peer. The failure is converted to PeerIncompatibleError
-            # (handled in dispatch_task) so only requests targeting this peer
-            # fail, and cached so later requests fail fast. A peer from another
-            # build usually fails earlier, while its RankInfo is decoded
-            # (TypeError/KeyError).
+            # Decode and validate the context peer on the receiver side, before
+            # REGISTER_RANK_INFO is sent: the sender-side check
+            # (PeerRegistrar.register) runs in the sender's listener thread,
+            # where exceptions are only logged. A failure becomes a cached
+            # PeerIncompatibleError (handled in dispatch_task), so only
+            # requests to this peer fail, and later ones fail fast.
             try:
                 sender_info = RankInfo.from_bytes(message[0])
                 self._registrar.validate_bounded_replay_compatible(sender_info)
@@ -2992,10 +2988,9 @@ class Receiver(ReceiverBase):
                     sender_info.page_table,
                 )
                 self._registrar.validate_view_head_geometry(sender_info)
-            except (KeyError, TypeError, ValueError) as e:
+            except ValueError as e:
                 msg = (
-                    f"context peer at '{info_endpoint}' is incompatible: "
-                    f"{type(e).__name__}: {e} "
+                    f"context peer at '{info_endpoint}' is incompatible: {e} "
                     "(cached: all further requests to this context peer fail "
                     "fast; restart this generation worker to re-validate, "
                     "e.g. after redeploying a compatible server on the same "

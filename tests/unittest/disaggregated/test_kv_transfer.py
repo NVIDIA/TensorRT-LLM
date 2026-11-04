@@ -2248,6 +2248,57 @@ def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
         _shutdown_transfer_worker_setup(healthy)
 
 
+@pytest.mark.cpu_only
+def test_sender_asks_ownership_with_the_mapped_peer_view():
+    peer_ri = SimpleNamespace(
+        cp_size=1,
+        dp_rank=0,
+        device_id=0,
+        instance_name="gen",
+        instance_rank=0,
+        self_endpoint="gen-endpoint",
+    )
+    should_send_pool = MagicMock(return_value=False)
+    registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(cp_size=1),
+        self_extractor=None,
+        get_peer_rank_info=lambda name, rank: peer_ri,
+        get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
+        peer_extractor=lambda name, rank: None,
+        get_pool_mapping=lambda ri: {(0, 0): (1, 1), (0, 1): (0, 0)},
+        should_send_pool=should_send_pool,
+    )
+    task = SimpleNamespace(
+        _chunk=SimpleNamespace(
+            token_range=SimpleNamespace(start=0, end=4),
+            block_ids_per_layer_groups={},
+            excluded_pool_views=(),
+            is_last=True,
+        ),
+        _prompt_len=4,
+        _perf_timer=None,
+        _unique_rid=1,
+        slice_id=0,
+    )
+    req_info = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups={},
+        dst_start_token=None,
+        slice_id=0,
+    )
+
+    meta = transfer_mod.Sender._build_kv_write_meta(
+        SimpleNamespace(_registrar=registrar), task, req_info
+    )
+
+    assert [pool_call.args for pool_call in should_send_pool.call_args_list] == [
+        (peer_ri, (0, 0), (1, 1)),
+        (peer_ri, (0, 1), (0, 0)),
+    ]
+    assert meta.src_ptrs.size == 0
+
+
 def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, prompt_len, tpb):
     """Run Sender._build_kv_write_meta for one Helix receiver; return (src, dst) block pairs.
 
