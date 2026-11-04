@@ -525,12 +525,14 @@ def test_grouped_gemm_backend_keeps_every_sm():
 @pytest.mark.skipif(not _fc12_available(), reason="CUTEDSL_FC12 needs SM107 and CuTe DSL internal")
 @pytest.mark.parametrize("m", [8, 64])
 def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
-    """Beside the fused FC12 grid the shared expert never leads: its GEMMs keep to the SMs FC12
-    leaves free (torch's SM carveout, set only while it is issued on the side stream) and FC12
-    launches with that SM reserve. The routed output equals the unreserved kernel's."""
+    """Beside the routed grid the shared expert never leads: its GEMMs keep to the SMs the routed
+    kernel leaves free (torch's SM carveout, set only while it is issued on the side stream) and
+    the routed kernel (fused FC12; the small-batch kernel up to its token limit) launches with
+    that SM reserve. The routed output equals the unreserved kernel's."""
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_small_batch_moe_custom_op as small_batch
 
     shared_sms = modeling_kimi_linear._SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID
     logits, bias = _logits(m, seed=97 + m)
@@ -554,6 +556,13 @@ def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
         return real_reserved(full, cluster_size, reserve)
 
     monkeypatch.setattr(cute_dsl_custom_ops, "reserved_max_active_clusters", recording_reserved)
+    real_small_batch_ctas = small_batch._persistent_ctas
+
+    def recording_small_batch_ctas(device_index, reserve):
+        reserves.append(reserve)
+        return real_small_batch_ctas(device_index, reserve)
+
+    monkeypatch.setattr(small_batch, "_persistent_ctas", recording_small_batch_ctas)
     carveouts = []
     real_shared = runtime.shared_experts.forward
 
