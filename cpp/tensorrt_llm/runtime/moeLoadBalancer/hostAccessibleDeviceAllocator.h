@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -88,6 +88,9 @@ public:
     void memcpyToDevice(void* dst, void const* src, size_t size);
 
 private:
+    // Label under which an allocation is reported to the native memory ledger, by backing.
+    char const* nativeMemoryLabel(bool gdr) const;
+
     struct AllocationInfo
     {
         size_t size;

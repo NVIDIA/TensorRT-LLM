@@ -49,6 +49,11 @@ from ..attention.backends.sparse.params import \
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
+from ..memory.monitor import startup as _monitor_startup
+from ..memory.monitor.providers import \
+    register_provider as _monitor_register_provider
+from ..memory.monitor.providers.kv_cache import \
+    KvCacheProvider as _MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -139,6 +144,22 @@ def _has_variable_kv_cache_geometry(model_config: ModelConfig) -> bool:
     layer_specs = _get_kv_cache_layer_specs(model_config)
     return bool(layer_specs) and len({(spec.head_dim, spec.num_kv_heads)
                                       for spec in layer_specs}) > 1
+
+
+def _register_kv_cache_monitor_providers(main, draft, cross) -> None:
+    """Hand each distinct KV cache pool to the memory monitor."""
+    seen = []
+    for role, manager in (("main", main), ("draft", draft), ("cross", cross)):
+        if manager is None or any(manager is other for other in seen):
+            continue
+        seen.append(manager)
+        try:
+            _monitor_register_provider(_MonitorKvCacheProvider(manager, role))
+        except Exception as exc:  # noqa: BLE001
+            # A diagnostic must never be the reason an executor fails to
+            # come up.
+            logger.debug(f"memory monitor: could not register the {role} KV "
+                         f"cache provider ({type(exc).__name__}: {exc})")
 
 
 def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
@@ -2001,6 +2022,8 @@ class KvCacheCreator:
                 "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
+        # The memory monitor compares later usage against this plan.
+        _monitor_startup.record_memory_plan(peak_memory, activation_bytes)
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
@@ -3479,6 +3502,16 @@ class KvCacheCreator:
                 cross_kv_cache_config, estimating_kv_cache,
                 original_max_seq_len)
 
+        # Each pool is a separate allocation, usually the largest in the
+        # process, and nothing outside this function has a handle on its
+        # manager, so register them here rather than leaving them to be
+        # rediscovered. A draft model that shares the target's manager is
+        # skipped so the pool is not counted twice. Providers hold the
+        # managers weakly.
+        _register_kv_cache_monitor_providers(kv_cache_manager,
+                                             draft_kv_cache_manager,
+                                             cross_kv_cache_manager)
+
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
@@ -4746,9 +4779,12 @@ def create_py_executor_resources(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
-    kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+    # Disaggregated serving's KV transfer buffers are allocated in C++ with
+    # no size exposed to Python; the memory monitor names them by measuring.
+    with _monitor_startup.region("KV cache transfer buffers"):
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            mapping, dist, kv_cache_manager, attention_type,
+            cache_transceiver_config, mamba_cache_manager)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

@@ -30,11 +30,22 @@ def log_mem_snapshot(tag: str) -> None:
 
     Derived quantities the reader may need:
 
-    - ``used      = total - free`` — whole-process GPU consumption
-    - ``slack     = reserved - alloc`` — Torch caching allocator free blocks
+    - ``used      = total - free`` — **device-wide** consumption. This is not
+      this process's usage: TensorRT-LLM supports colocated processes (Ray
+      fractional GPUs, GMS weight sharing, RLHF alongside a trainer,
+      disaggregated ctx+gen on one device), whose memory is included here.
+      Set ``TLLM_MEM_MONITOR=1`` to get the NVML per-process split.
+    - ``slack     = reserved - alloc`` — reserved but not handed out. Besides
+      fragmented space this covers blocks already requested for release that
+      are waiting on other streams, so it is not all immediately reusable.
     - ``non_torch = used - reserved`` — bytes outside Torch (KV pool C++
-      cudaMalloc, NCCL buffers, cuBLAS workspace, CUDA driver context,
-      CUDA graph mempool, etc.)
+      ``cuMemCreate``, NCCL buffers, cuBLAS workspace, CUDA driver context,
+      lazily loaded module code, etc.). CUDA-graph pools are **not** in here:
+      they use the native allocator and are already inside ``reserved``.
+
+    With ``TLLM_MEM_MONITOR=1`` an additional memory monitor report is
+    emitted that decomposes ``non_torch`` rather than leaving it as one
+    opaque number.
     """
     if os.environ.get("TLLM_LOG_MEM_PROFILE", "") != "1":
         return
@@ -51,6 +62,24 @@ def log_mem_snapshot(tag: str) -> None:
         f"torch_reserved_peak={reserved_peak / _GIB:.2f}GiB "
         f"free={free / _GIB:.2f}GiB total={total / _GIB:.2f}GiB"
     )
+    _maybe_log_monitor_report(tag)
+
+
+def _maybe_log_monitor_report(tag: str) -> None:
+    """Emit the full memory monitor report when ``TLLM_MEM_MONITOR=1``.
+
+    Imported lazily so that the monitor package is not pulled in for the
+    common case where it is switched off. The import is not guarded: the
+    package is part of this tree, so failing to import it is a bug to
+    surface, not an optional dependency to skip. Building the report is
+    guarded by ``report_now``: these calls sit inside warmup, which a
+    diagnostic must not break.
+    """
+    from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+    report = report_now(tag=tag)
+    if report is not None:
+        logger.info("\n" + report)
 
 
 def log_tensor_size(tag: str, tensor: torch.Tensor, **extra) -> None:

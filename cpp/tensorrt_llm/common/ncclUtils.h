@@ -305,6 +305,17 @@ public:
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm) const;
 
+    // Buffers held on one device across all communicators. Sizes are as requested; ncclMemAlloc
+    // rounds each allocation up to its granularity.
+    struct DeviceUsage
+    {
+        size_t bufferCount{0};
+        size_t totalBytes{0};
+        size_t inUseBytes{0};
+    };
+
+    DeviceUsage getDeviceUsage(int device) const;
+
     // Check if a communicator is valid (non-null)
     // Note: We don't track cleaned-up comms because NCCL can reuse memory addresses.
     // All non-null comms are considered valid and will be registered when first used.

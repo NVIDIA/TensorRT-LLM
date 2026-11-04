@@ -11,6 +11,9 @@ from tensorrt_llm.bindings.internal.runtime import (
     get_virtual_memory_manager, pop_virtual_memory_allocator,
     push_virtual_memory_allocator)
 
+from .memory.monitor.pools import (mark_materialized, mark_released,
+                                   register_pool)
+
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
     "materialize_with_tag"
@@ -49,6 +52,9 @@ class _MultiPoolProxy:
 
 _pool_stack: list[tuple[contextlib.AbstractContextManager,
                         _MultiPoolProxy]] = []
+# Tags of the scopes in _pool_stack, so a resumed parent scope's new pool
+# is registered under the parent's tag.
+_tag_stack: list[str] = []
 
 
 def _scope(
@@ -79,15 +85,19 @@ def _scope(
         proxy = _MultiPoolProxy()
         pool = torch.cuda.MemPool(
             _get_torch_pluggable_virtual_memory_allocator())
+        # Lets the memory monitor name this pool and track its release.
+        register_pool(pool.id, f"sleep: {tag}", sleep_tag=tag)
         pool_ctx = torch.cuda.use_mem_pool(pool)
         pool_ctx.__enter__()
         proxy._add(pool)
         _pool_stack.append((pool_ctx, proxy))
+        _tag_stack.append(tag)
         child_pushed = True
         yield proxy
     finally:
         if child_pushed:
             current_ctx, _ = _pool_stack.pop()
+            _tag_stack.pop()
             current_ctx.__exit__(None, None, None)
         if pushed_allocator:
             pop_virtual_memory_allocator()
@@ -95,6 +105,10 @@ def _scope(
         if _pool_stack:
             new_pool = torch.cuda.MemPool(
                 _get_torch_pluggable_virtual_memory_allocator())
+            parent_tag = _tag_stack[-1]
+            register_pool(new_pool.id,
+                          f"sleep: {parent_tag}",
+                          sleep_tag=parent_tag)
             new_ctx = torch.cuda.use_mem_pool(new_pool)
             new_ctx.__enter__()
             _, parent_proxy = _pool_stack[-1]
@@ -125,6 +139,7 @@ def release_with_tag(*tags: str) -> int:
     """
     manager = get_virtual_memory_manager()
     released_blobs = sum(manager.release_with_tag(tag) for tag in tags)
+    mark_released(tags)
     return released_blobs
 
 
@@ -136,4 +151,5 @@ def materialize_with_tag(*tags: str) -> int:
     """
     manager = get_virtual_memory_manager()
     materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
+    mark_materialized(tags)
     return materialized_blobs
