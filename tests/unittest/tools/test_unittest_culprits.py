@@ -252,6 +252,7 @@ def test_mpi_profiler_requires_a_passing_report_from_each_rank(
     launcher_calls = []
 
     def launch(venv: object, mpi_cmd: list[str], python_cmd: list[str], **kwargs: object) -> None:
+        """Write scripted per-rank JUnit reports for MPI launcher validation."""
         launcher_calls.append((mpi_cmd, python_cmd))
         for rank in range(2):
             result = rank1_result if rank == 1 else None

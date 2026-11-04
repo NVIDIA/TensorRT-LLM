@@ -789,6 +789,9 @@ class MPIDist(Distributed):
     def _profile_group(
             self, communicator: Literal["world", "tp", "pp",
                                         "cp"]) -> list[int]:
+        """Resolve members in the active MPI parent without creating a
+        subgroup.
+        """
         parent = mpi_comm()
         if communicator == "world":
             return list(range(parent.Get_size()))
@@ -827,6 +830,9 @@ class MPIDist(Distributed):
                     direction: MpiDirection | None = None,
                     payload: object = _MISSING,
                     **fields: MetadataValue) -> AbstractContextManager[None]:
+        """Create a lazy MPI metadata scope only while the selected profiler
+        is active.
+        """
         if not custom_region_enabled(
                 "mpi") or not torch.autograd._profiler_enabled():
             return _INACTIVE_MPI_SCOPE
@@ -978,6 +984,17 @@ class MPIDist(Distributed):
                      chunk_size: int = 4 * 1024 * 1024,
                      *,
                      small_payload: bool = False) -> object:
+        """Gather objects across the CP group using native or chunked transport.
+
+        Args:
+            obj: Local object to gather from each group member.
+            chunk_size: Maximum serialized bytes per chunk.
+            small_payload: Use native allgather when every rank has a small
+                payload.
+
+        Returns:
+            Gathered objects in communicator rank order.
+        """
         with self._record_mpi("cp_allgather",
                               "cp",
                               payload=obj,
@@ -1007,6 +1024,17 @@ class MPIDist(Distributed):
                      chunk_size: int = 4 * 1024 * 1024,
                      *,
                      small_payload: bool = False) -> object:
+        """Gather objects across the TP group using native or chunked transport.
+
+        Args:
+            obj: Local object to gather from each group member.
+            chunk_size: Maximum serialized bytes per chunk.
+            small_payload: Use native allgather when every rank has a small
+                payload.
+
+        Returns:
+            Gathered objects in communicator rank order.
+        """
         with self._record_mpi("tp_allgather",
                               "tp",
                               payload=obj,
@@ -1113,6 +1141,16 @@ class MPIDist(Distributed):
     def tp_cp_broadcast_int64(self,
                               values: ArrayLike,
                               root: int = 0) -> np.ndarray:
+        """Broadcast a flat int64 buffer through TP and then CP communicators.
+
+        Args:
+            values: Values flattened and converted to an int64 array of shape
+                [N].
+            root: Source rank within each participating communicator.
+
+        Returns:
+            The broadcast int64 array of shape [N].
+        """
         buf = np.asarray(values, dtype=np.int64).reshape(-1)
         if self.tp_size > 1:
             with self._record_mpi("tp_broadcast_int64",
