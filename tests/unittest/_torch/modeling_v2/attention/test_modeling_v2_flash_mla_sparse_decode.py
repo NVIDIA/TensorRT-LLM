@@ -38,8 +38,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import b
 from tensorrt_llm.flash_mla import get_mla_metadata
 
 __extra_import_path__ = [".."]
-from _ds_mla_pool import ds_mla_rows  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — needs the path declared above
+
+from ._ds_mla_pool import ds_mla_rows  # noqa: E402
 
 assert torch.cuda.is_available(), "flash_mla_sparse_decode requires a CUDA device"
 
