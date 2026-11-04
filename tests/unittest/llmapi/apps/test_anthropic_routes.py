@@ -31,6 +31,7 @@ import pytest
 from fastapi.responses import StreamingResponse
 from test_common.serve.app_factory import AggConfig, DisaggConfig, isolated_serve_env
 from test_common.serve.routes import effective_routes
+from test_common.serve.serving_stubs import make_chat_serving
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve._base import sse as sse_module
@@ -50,7 +51,6 @@ from tensorrt_llm.serve.openai_protocol import (
     ToolCall,
     UsageInfo,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.render import RenderResources
 from tensorrt_llm.serve.render import chat as render_chat_module
 
@@ -151,7 +151,7 @@ def _route_client(env, server_kind, result):
     core = AsyncMock(return_value=result)
     if server_kind == "standard":
         server = env.build_openai_server(AggConfig(model_name=MODEL))
-        server.create_chat_completion = core
+        server._chat_serving.create_chat_completion = core
         return env.client(server.app), core
     server = env.build_disagg_server(DisaggConfig())
     server._perf_metrics_collector = _counters()
@@ -358,36 +358,30 @@ class _ModelConfig:
 async def _chat_stream(monkeypatch, generation):
     """The body of a streamed /v1/chat/completions response, and the server.
 
-    The real ``openai_chat`` handler runs on a server built with
-    ``object.__new__``; prompt rendering and the engine are stubbed, and the
-    engine's output is already post-processed into SSE frames.
+    The real ``openai_chat`` handler runs on a ``ChatServing`` built from
+    stubs; prompt rendering and the engine are stubbed, and the engine's output
+    is already post-processed into SSE frames.
     """
 
     async def render(**kwargs):
         return "rendered prompt"
 
     monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render)
-    server = object.__new__(OpenAIServer)
-    server.model = MODEL
-    server.allow_request_chat_template = False
-    server.model_config = _ModelConfig()
-    server.processor = None
-    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1024))
-    server.chat_template = None
-    server.tool_parser = None
-    server.tool_call_id_type = "random"
-    server.multimodal_server_config = None
-    server._is_visual_gen = False
-    server._adjusted_steady_clock = SimpleNamespace(now=time.monotonic)
-    server.generator = SimpleNamespace(
-        args=SimpleNamespace(
-            gather_generation_logits=False,
-            reasoning_parser=None,
-            backend="pytorch",
-            guided_decoding_backend=None,
-            num_postprocess_workers=1,
+    server = make_chat_serving(
+        model=MODEL,
+        model_config=_ModelConfig(),
+        tokenizer=SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1024)),
+        adjusted_steady_clock=SimpleNamespace(now=time.monotonic),
+        generator=SimpleNamespace(
+            args=SimpleNamespace(
+                gather_generation_logits=False,
+                reasoning_parser=None,
+                backend="pytorch",
+                guided_decoding_backend=None,
+                num_postprocess_workers=1,
+            ),
+            generate_async=Mock(return_value=generation),
         ),
-        generate_async=Mock(return_value=generation),
     )
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()

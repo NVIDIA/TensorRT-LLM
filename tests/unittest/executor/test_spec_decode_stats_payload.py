@@ -228,6 +228,7 @@ class TestServerOptIn:
             iteration_stats_wakeup_event=None,
             iteration_stats_collector_task_getter=lambda: None,
             internal_disagg_auth_key=None,
+            server_role=None,
             per_request_spec_decode_stats=enabled,
             spec_decode_num_spec_tokens=num_spec_tokens,
             input_proc_executor=None,

@@ -29,13 +29,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tensorrt_llm.serve._base.serving import GenerateBaseServing
+from tensorrt_llm.serve.api.openai.chat import api_router as chat_api_router
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
     UsageInfo,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer
 
 from .openai_server_stub import make_stub_openai_server
 
@@ -45,7 +46,9 @@ pytestmark = pytest.mark.cpu_only
 def test_rendered_prompt_is_marked_as_templated():
     prompt = {"prompt": "<image> describe"}
     media = {"image": [object()]}
-    OpenAIServer._attach_multimodal_data(prompt, SimpleNamespace(prompt_token_ids=None), media)
+    GenerateBaseServing._attach_multimodal_data(
+        prompt, SimpleNamespace(prompt_token_ids=None), media
+    )
     assert prompt == {
         "prompt": "<image> describe",
         "multi_modal_data": media,
@@ -56,7 +59,7 @@ def test_rendered_prompt_is_marked_as_templated():
 def test_pre_tokenized_prompt_is_not_marked():
     prompt = {"prompt_token_ids": [7, 11, 13]}
     media = {"image": [object()]}
-    OpenAIServer._attach_multimodal_data(
+    GenerateBaseServing._attach_multimodal_data(
         prompt, SimpleNamespace(prompt_token_ids=[7, 11, 13]), media
     )
     assert prompt == {"prompt_token_ids": [7, 11, 13], "multi_modal_data": media}
@@ -65,12 +68,12 @@ def test_pre_tokenized_prompt_is_not_marked():
 def test_item_order_is_attached_only_when_given():
     order = [{"modality": "image", "index": 0, "placeholder": "<image>"}]
     prompt = {"prompt": "<image> describe"}
-    OpenAIServer._attach_multimodal_data(
+    GenerateBaseServing._attach_multimodal_data(
         prompt, SimpleNamespace(prompt_token_ids=None), {"image": [object()]}, order
     )
     assert prompt["mm_item_order"] == order
     prompt = {"prompt": "describe"}
-    OpenAIServer._attach_multimodal_data(
+    GenerateBaseServing._attach_multimodal_data(
         prompt, SimpleNamespace(prompt_token_ids=None), {"image": [object()]}, []
     )
     assert "mm_item_order" not in prompt
@@ -117,10 +120,11 @@ def test_rendered_image_request_reaches_the_engine_marked_templated(tmp_path):
     server = make_stub_openai_server(
         tmp_path, "test-vlm", _StubModelConfig(), generate_async, tokenizer=tokenizer
     )
-    server.await_disconnected = AsyncMock()
+    serving = server._chat_serving
+    serving.await_disconnected = AsyncMock()
     # The chat handler serializes a ChatCompletionResponse and streams anything
     # else, so the stubbed response is a real one.
-    server._create_chat_response = AsyncMock(
+    serving._create_chat_response = AsyncMock(
         return_value=ChatCompletionResponse(
             model="test-vlm",
             choices=[
@@ -134,7 +138,8 @@ def test_rendered_image_request_reaches_the_engine_marked_templated(tmp_path):
         )
     )
     app = FastAPI()
-    app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+    setattr(app.state, chat_api_router.APP_STATE_KEY, serving)
+    chat_api_router.attach_router(app)
 
     with io.BytesIO() as buf:
         Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="PNG")

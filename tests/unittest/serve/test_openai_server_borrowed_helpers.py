@@ -21,13 +21,11 @@ pytestmark = pytest.mark.cpu_only
 BORROWED = {
     "create_error_response": BaseServing,
     "await_disconnected": GenerateBaseServing,
-    "_attach_multimodal_data": GenerateBaseServing,
     "postproc_worker_enabled": GenerateBaseServing,
     "_extract_metrics": GenerateBaseServing,
-    "_logit_bias_vocab_size": GenerateBaseServing,
+    # Still called by the Responses handler on OpenAIServer (the second through the first).
     "_validate_internal_disagg_request": GenerateBaseServing,
     "_has_cache_transceiver_config": GenerateBaseServing,
-    "_apply_spec_decode_stats_opt_in": GenerateBaseServing,
 }
 
 
@@ -44,9 +42,29 @@ def test_openai_server_borrows_the_moved_helper(name):
 def test_static_helpers_survived_aliasing():
     # A bare `Base.helper` alias would bind the server as the first argument.
     assert OpenAIServer.create_error_response("x").status_code == 400
-    prompt = {}
-    OpenAIServer._attach_multimodal_data(prompt, SimpleNamespace(prompt_token_ids=None), "media")
-    assert prompt == {"multi_modal_data": "media", "chat_template_applied": True}
+
+
+# Moved with their last OpenAIServer caller: the chat handlers to ChatServing,
+# the helpers below them to GenerateBaseServing, where the serving classes
+# inherit them. No alias stays, so nothing on the class can drift from them.
+MOVED_OUT = (
+    "openai_chat",
+    "create_chat_completion",
+    "_create_chat_response",
+    "chat_harmony",
+    "_get_scheduling_params",
+    "_logit_bias_vocab_size",
+    "_apply_spec_decode_stats_opt_in",
+    "_attach_multimodal_data",
+)
+
+
+@pytest.mark.parametrize("name", MOVED_OUT)
+def test_the_chat_path_left_openai_server(name):
+    assert name not in vars(OpenAIServer), (
+        f"OpenAIServer.{name} left with the chat handlers (ChatServing, GenerateBaseServing); "
+        "do not add it or an alias of it back: the serving classes inherit the moved helper"
+    )
 
 
 def test_postproc_worker_enabled_is_still_a_property():

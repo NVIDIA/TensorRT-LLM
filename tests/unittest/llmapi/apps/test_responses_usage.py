@@ -31,6 +31,7 @@ import pytest
 from tensorrt_llm.executor.result import CompletionOutput
 from tensorrt_llm.inputs.tokenization import tokenize_prompt
 from tensorrt_llm.serve.api.anthropic.api_router import anthropic_messages
+from tensorrt_llm.serve.api.openai.chat import api_router as chat_api_router
 from tensorrt_llm.serve.openai_disagg_service import _ctx_usage_info
 from tensorrt_llm.serve.openai_protocol import (
     PromptTokensDetails,
@@ -372,15 +373,27 @@ def _serve(
         return _FinishedGeneration(ids, disaggregated_params, cached_tokens=cached)
 
     model_config = type("ModelConfig", (), {"model_type": model_type, "vocab_size": 1024})()
+    # The template settings are constructor arguments: the chat serving object
+    # and the render resources are built from them.
     server = make_stub_openai_server(
-        tmp_path, "test-model", model_config, generate_async, tokenizer=tokenizer
+        tmp_path,
+        "test-model",
+        model_config,
+        generate_async,
+        tokenizer=tokenizer,
+        chat_template=chat_template,
+        allow_request_chat_template=allow_request_chat_template,
     )
-    server.chat_template = chat_template
-    server.allow_request_chat_template = allow_request_chat_template
-    server.await_disconnected = AsyncMock()
-    server._extract_metrics = AsyncMock()
+    # The chat handlers run on the serving object; the Responses handler still
+    # runs on the server. Both read these.
+    for handler_owner in (server, server._chat_serving):
+        handler_owner.await_disconnected = AsyncMock()
+        handler_owner._extract_metrics = AsyncMock()
     app = FastAPI()
-    app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+    # The chat route comes from its router, which reads the serving object the
+    # server built from app.state.
+    setattr(app.state, chat_api_router.APP_STATE_KEY, server._chat_serving)
+    chat_api_router.attach_router(app)
     # The Messages route function reads its serving object from app.state; the
     # server's constructor built it over the same chat core the chat route runs.
     app.state.anthropic_serving_messages = server.app.state.anthropic_serving_messages

@@ -294,10 +294,9 @@ class TestOpenAIChatIntegration:
 
     The dispatch tests above call ``apply_model_chat_extensions`` directly, so
     they would still pass if ``openai_chat`` dropped the call or moved it past
-    ``async_apply_chat_template``. This drives the real handler on a server
-    built with ``object.__new__`` (the pattern in
-    ``test_openai_chat_disagg_multimodal.py``), with the renderer and engine
-    stubbed.
+    ``async_apply_chat_template``. This drives the real handler on a
+    ``ChatServing`` built from stubs behind the chat router, with the renderer
+    and engine stubbed.
     """
 
     MODEL_KEY = "serving-extensions-chat-model"
@@ -324,88 +323,109 @@ class TestOpenAIChatIntegration:
             serving_extensions._BY_MODEL_TYPE.pop(self.MODEL_KEY, None)
 
     @pytest.fixture
-    def chat_client(self, monkeypatch, ordering_extension):
-        """``openai_chat`` on a bare app; returns (client, events, rendered)."""
+    def chat_client_factory(self, monkeypatch, ordering_extension):
+        """Builds ``ChatServing`` on a bare app behind the chat router.
+
+        Returns a builder; each call gives ``(client, serving, events,
+        rendered)``. The serving object and its render resources are built from
+        the model type and parsers the builder is given, as the composition
+        root builds them from the server's: a test that needs another
+        configuration builds another client instead of changing the stubs
+        afterwards, which a built serving object would not see.
+        """
         from unittest.mock import AsyncMock
 
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+        from test_common.serve.serving_stubs import make_chat_serving
 
+        from tensorrt_llm.serve.api.openai.chat import api_router as chat_api_router
         from tensorrt_llm.serve.openai_protocol import (
             ChatCompletionResponse,
             ChatCompletionResponseChoice,
             ChatMessage,
             UsageInfo,
         )
-        from tensorrt_llm.serve.openai_server import OpenAIServer
         from tensorrt_llm.serve.render import chat as render_chat_module
 
         events = ordering_extension
-        rendered: dict = {}
 
-        class _StubModelConfig:
-            # Class attribute: resolve_top_level_model_type reads the type.
-            model_type = TestOpenAIChatIntegration.MODEL_KEY
-            vocab_size = 1024
+        def build(
+            *,
+            model_type=self.MODEL_KEY,
+            tool_parser=None,
+            reasoning_parser=None,
+            guided_decoding_backend=None,
+            num_postprocess_workers=0,
+        ):
+            rendered: dict = {}
 
-        async def fake_apply_chat_template(**kwargs) -> str:
-            events.append("render")
-            rendered.update(kwargs)
-            return "rendered prompt"
+            class _StubModelConfig:
+                # Class attribute: resolve_top_level_model_type reads the type.
+                vocab_size = 1024
 
-        monkeypatch.setattr(
-            render_chat_module, "async_apply_chat_template", fake_apply_chat_template
-        )
+            _StubModelConfig.model_type = model_type
 
-        def generate_async(*, inputs, **kwargs):
-            rendered["generation"] = kwargs
-            return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+            async def fake_apply_chat_template(**kwargs) -> str:
+                events.append("render")
+                rendered.update(kwargs)
+                return "rendered prompt"
 
-        server = object.__new__(OpenAIServer)
-        server.model = "test-model"
-        server.allow_request_chat_template = False
-        server.model_config = _StubModelConfig()
-        server.processor = None
-        server.tokenizer = SimpleNamespace(
-            tokenizer=SimpleNamespace(vocab_size=_StubModelConfig.vocab_size)
-        )
-        server.chat_template = None
-        server.tool_parser = None
-        server.tool_call_id_type = "random"
-        server.multimodal_server_config = None
-        server._input_proc_executor = None
-        server.generator = SimpleNamespace(
-            args=SimpleNamespace(
-                gather_generation_logits=False,
-                reasoning_parser=None,
-                backend="pytorch",
-                guided_decoding_backend=None,
-                num_postprocess_workers=0,
-            ),
-            generate_async=generate_async,
-        )
-        server.await_disconnected = AsyncMock()
-        server._create_chat_response = AsyncMock(
-            return_value=ChatCompletionResponse(
-                id="chatcmpl-serving-extensions-test",
-                model="test-model",
-                choices=[
-                    ChatCompletionResponseChoice(
-                        index=0,
-                        message=ChatMessage(role="assistant", content="ok"),
-                        finish_reason="stop",
-                    )
-                ],
-                usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+            monkeypatch.setattr(
+                render_chat_module, "async_apply_chat_template", fake_apply_chat_template
             )
-        )
 
-        rendered["create_chat_response"] = server._create_chat_response
+            def generate_async(*, inputs, **kwargs):
+                rendered["generation"] = kwargs
+                return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
 
-        app = FastAPI()
-        app.state.server = server
-        app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
-        return TestClient(app), events, rendered
+            serving = make_chat_serving(
+                model="test-model",
+                tool_parser=tool_parser,
+                model_config=_StubModelConfig(),
+                tokenizer=SimpleNamespace(
+                    tokenizer=SimpleNamespace(vocab_size=_StubModelConfig.vocab_size)
+                ),
+                generator=SimpleNamespace(
+                    args=SimpleNamespace(
+                        gather_generation_logits=False,
+                        reasoning_parser=reasoning_parser,
+                        backend="pytorch",
+                        guided_decoding_backend=guided_decoding_backend,
+                        num_postprocess_workers=num_postprocess_workers,
+                    ),
+                    generate_async=generate_async,
+                ),
+            )
+            serving.await_disconnected = AsyncMock()
+            serving._create_chat_response = AsyncMock(
+                return_value=ChatCompletionResponse(
+                    id="chatcmpl-serving-extensions-test",
+                    model="test-model",
+                    choices=[
+                        ChatCompletionResponseChoice(
+                            index=0,
+                            message=ChatMessage(role="assistant", content="ok"),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+                )
+            )
+            rendered["create_chat_response"] = serving._create_chat_response
+
+            app = FastAPI()
+            setattr(app.state, chat_api_router.APP_STATE_KEY, serving)
+            chat_api_router.attach_router(app)
+            return TestClient(app), serving, events, rendered
+
+        return build
+
+    @pytest.fixture
+    def chat_client(self, chat_client_factory):
+        """The default configuration: the ordering extension's model type, no parsers."""
+        client, _serving, events, rendered = chat_client_factory()
+        return client, events, rendered
 
     def test_extension_runs_before_prompt_rendering(self, chat_client) -> None:
         client, events, rendered = chat_client
@@ -446,8 +466,7 @@ class TestOpenAIChatIntegration:
         assert response.status_code == 400, response.text
         assert "tool_choice='required' is not supported" in response.text
 
-    def test_extension_hooks_drive_tools_and_the_usage_offset(self, chat_client) -> None:
-        client, _events, rendered = chat_client
+    def test_extension_hooks_drive_tools_and_the_usage_offset(self, chat_client_factory) -> None:
         asked = []
 
         class HookExtension(ServingExtension):
@@ -461,7 +480,10 @@ class TestOpenAIChatIntegration:
                 asked.append(facts)
                 return 5
 
+        # Registered before the serving object is built: the extension is
+        # resolved once, when the render resources are built.
         serving_extensions._BY_MODEL_TYPE[self.MODEL_KEY] = HookExtension()
+        client, _serving, _events, rendered = chat_client_factory()
 
         response = client.post(
             "/v1/chat/completions",
@@ -485,22 +507,39 @@ class TestOpenAIChatIntegration:
         ]
 
     @pytest.fixture(params=["nemotron_h_omni", "nemotron_h"])
-    def required_chat_client(self, chat_client, monkeypatch, request):
+    def required_chat_client(self, chat_client_factory, monkeypatch, request):
+        """Builds a client for the required-tool tests; each call gives (client, serving, rendered).
+
+        Defaults: the parametrized Nemotron model type, the qwen3_coder tool
+        parser, the nemotron-v3 reasoning parser and the xgrammar backend; a
+        test with another configuration passes it to the builder.
+        """
         from tensorrt_llm.serve.render import chat as render_chat_module
 
-        client, events, rendered = chat_client
-        server = client.app.state.server
-        type(server.model_config).model_type = request.param
-        server.tool_parser = "qwen3_coder"
-        server.generator.args.reasoning_parser = "nemotron-v3"
-        server.generator.args.guided_decoding_backend = "xgrammar"
+        def build(
+            *,
+            model_type=request.param,
+            tool_parser="qwen3_coder",
+            reasoning_parser="nemotron-v3",
+            guided_decoding_backend="xgrammar",
+            num_postprocess_workers=0,
+        ):
+            client, serving, _events, rendered = chat_client_factory(
+                model_type=model_type,
+                tool_parser=tool_parser,
+                reasoning_parser=reasoning_parser,
+                guided_decoding_backend=guided_decoding_backend,
+                num_postprocess_workers=num_postprocess_workers,
+            )
 
-        async def render_prompt(**kwargs):
-            thinking = rendered.get("thinking", True)
-            return "<|im_start|>assistant\n<think>" + ("\n" if thinking else "</think>")
+            async def render_prompt(**kwargs):
+                thinking = rendered.get("thinking", True)
+                return "<|im_start|>assistant\n<think>" + ("\n" if thinking else "</think>")
 
-        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
-        return client, server, rendered
+            monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
+            return client, serving, rendered
+
+        return build
 
     @staticmethod
     def required_body():
@@ -512,19 +551,19 @@ class TestOpenAIChatIntegration:
             "max_tokens": 64,
         }
 
-    def test_required_template_mode_uses_kimi_extension(self, chat_client, monkeypatch):
+    def test_required_template_mode_uses_kimi_extension(self, chat_client_factory, monkeypatch):
         from tensorrt_llm.serve import chat_utils
 
         # Keep text-only routing independent of multimodal model initialization.
         monkeypatch.setattr(
             chat_utils.MULTIMODAL_PLACEHOLDER_REGISTRY, "get_content_format", lambda _: None
         )
-        client, _, rendered = chat_client
-        server = client.app.state.server
-        type(server.model_config).model_type = "kimi_k3"
-        server.tool_parser = "kimi_k3"
-        server.generator.args.reasoning_parser = "kimi_k3"
-        server.generator.args.guided_decoding_backend = None
+        client, server, _events, rendered = chat_client_factory(
+            model_type="kimi_k3",
+            tool_parser="kimi_k3",
+            reasoning_parser="kimi_k3",
+            guided_decoding_backend=None,
+        )
 
         response = client.post("/v1/chat/completions", json=self.required_body())
 
@@ -535,9 +574,7 @@ class TestOpenAIChatIntegration:
         assert postproc.tool_parser_grammar_constrained is False
 
     def test_required_grammar_admission_uses_extension_hook(self, required_chat_client):
-        client, server, rendered = required_chat_client
         model_type = "required-grammar-test-model"
-        type(server.model_config).model_type = model_type
 
         @register_serving_extension(model_types=(model_type,))
         class RequiredGrammarExtension(ServingExtension):
@@ -545,6 +582,7 @@ class TestOpenAIChatIntegration:
                 return "grammar"
 
         try:
+            client, server, rendered = required_chat_client(model_type=model_type)
             response = client.post("/v1/chat/completions", json=self.required_body())
         finally:
             serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
@@ -557,9 +595,8 @@ class TestOpenAIChatIntegration:
     def test_required_attaches_mandatory_grammar(self, required_chat_client, thinking, workers):
         import xgrammar
 
-        client, server, rendered = required_chat_client
+        client, server, rendered = required_chat_client(num_postprocess_workers=workers)
         rendered["thinking"] = thinking
-        server.generator.args.num_postprocess_workers = workers
         body = self.required_body()
         body["chat_template_kwargs"] = {"enable_thinking": not thinking}
         response = client.post("/v1/chat/completions", json=body)
@@ -594,7 +631,7 @@ class TestOpenAIChatIntegration:
         ],
     )
     def test_required_rejects_conflicting_requests(self, required_chat_client, change):
-        client, server, rendered = required_chat_client
+        client, server, rendered = required_chat_client()
         response = client.post("/v1/chat/completions", json={**self.required_body(), **change})
         # The bare app uses FastAPI's 422 for request-schema errors.
         expected_status = 422 if change.get("tools") == [] else 400
@@ -616,10 +653,9 @@ class TestOpenAIChatIntegration:
     def test_required_rejects_unsupported_configuration(
         self, required_chat_client, model_type, parser, backend
     ):
-        client, server, rendered = required_chat_client
-        type(server.model_config).model_type = model_type
-        server.tool_parser = parser
-        server.generator.args.guided_decoding_backend = backend
+        client, server, rendered = required_chat_client(
+            model_type=model_type, tool_parser=parser, guided_decoding_backend=backend
+        )
         response = client.post("/v1/chat/completions", json=self.required_body())
         assert response.status_code == 400, response.text
         assert "generation" not in rendered
@@ -633,7 +669,7 @@ class TestOpenAIChatIntegration:
         ],
     )
     def test_required_schema_errors_are_client_errors(self, required_chat_client, schema):
-        client, server, rendered = required_chat_client
+        client, server, rendered = required_chat_client()
         body = self.required_body()
         body["tools"][0]["function"]["parameters"] = schema
         response = client.post("/v1/chat/completions", json=body)
@@ -652,10 +688,10 @@ class TestOpenAIChatIntegration:
         from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import Qwen3CoderToolParser
         from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 
-        client, server, rendered = required_chat_client
         monkeypatch.setitem(ToolParserFactory.parsers, "custom_xml", Qwen3CoderToolParser)
-        server.tool_parser = "CUSTOM_XML"
-        server.generator.args.reasoning_parser = reasoning_parser
+        client, server, rendered = required_chat_client(
+            tool_parser="CUSTOM_XML", reasoning_parser=reasoning_parser
+        )
 
         async def render_prompt(**kwargs):
             return "<assistant></think>\n"
@@ -675,8 +711,7 @@ class TestOpenAIChatIntegration:
 
         from tensorrt_llm.serve.render import chat as render_chat_module
 
-        client, server, rendered = required_chat_client
-        server.generator.args.reasoning_parser = reasoning_parser
+        client, server, rendered = required_chat_client(reasoning_parser=reasoning_parser)
         render_prompt = AsyncMock()
         monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
 
@@ -693,7 +728,7 @@ class TestOpenAIChatIntegration:
 
         from tensorrt_llm.serve.render import chat as render_chat_module
 
-        client, server, rendered = required_chat_client
+        client, server, rendered = required_chat_client()
         monkeypatch.setattr(
             render_chat_module, "async_apply_chat_template", AsyncMock(return_value="assistant:")
         )
@@ -709,15 +744,16 @@ class TestOpenAIChatIntegration:
     @pytest.mark.parametrize("thinking", [False, True])
     @pytest.mark.parametrize("tool_choice", [None, "auto"])
     def test_non_required_chat_resolves_mode_from_prompt(
-        self, chat_client, monkeypatch, reasoning_parser, thinking, tool_choice
+        self, chat_client_factory, monkeypatch, reasoning_parser, thinking, tool_choice
     ):
         from unittest.mock import AsyncMock
 
         from tensorrt_llm.serve.render import chat as render_chat_module
 
-        client, _, rendered = chat_client
-        server = client.app.state.server
-        server.generator.args.reasoning_parser = reasoning_parser
+        client, server, _events, rendered = chat_client_factory(
+            reasoning_parser=reasoning_parser,
+            tool_parser="qwen3_coder" if tool_choice is not None else None,
+        )
         prompt = "<|im_start|>assistant\n<think>" + ("\n" if thinking else "</think>")
         monkeypatch.setattr(
             render_chat_module, "async_apply_chat_template", AsyncMock(return_value=prompt)
@@ -729,7 +765,6 @@ class TestOpenAIChatIntegration:
         }
         if tool_choice is not None:
             body.update(tools=self.required_body()["tools"], tool_choice=tool_choice)
-            server.tool_parser = "qwen3_coder"
 
         response = client.post("/v1/chat/completions", json=body)
 
@@ -741,7 +776,7 @@ class TestOpenAIChatIntegration:
         assert postproc.tool_parser_grammar_constrained is False
 
     def test_auto_does_not_attach_required_grammar(self, required_chat_client):
-        client, server, rendered = required_chat_client
+        client, server, rendered = required_chat_client()
         response = client.post(
             "/v1/chat/completions", json={**self.required_body(), "tool_choice": "auto"}
         )

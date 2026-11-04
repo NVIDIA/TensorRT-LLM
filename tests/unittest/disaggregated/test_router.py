@@ -2513,10 +2513,11 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """KV-cache routing must hash the same Harmony tokens used by the server."""
     use_harmony_vocab(monkeypatch)
+    from test_common.serve.serving_stubs import make_chat_serving
+
     from tensorrt_llm.serve.chat_tokenization import \
         tokenize_harmony_chat_request
     from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
-    from tensorrt_llm.serve.openai_server import OpenAIServer
 
     router = KvCacheAwareRouter(server_role=None,
                                 servers=["server1"],
@@ -2548,17 +2549,17 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input(
     server_request = copy.deepcopy(request)
     harmony_tokens = tokenize_harmony_chat_request(copy.deepcopy(request))
 
-    server = OpenAIServer.__new__(OpenAIServer)
-    server.allow_request_chat_template = False
-    server.await_disconnected = mock.AsyncMock()
-    server.generator = SimpleNamespace(
-        args=SimpleNamespace(num_postprocess_workers=0),
-        generate_async=mock.MagicMock(return_value=promise),
+    server = make_chat_serving(
+        generator=SimpleNamespace(
+            args=SimpleNamespace(num_postprocess_workers=0),
+            generate_async=mock.MagicMock(return_value=promise),
+        ),
+        use_harmony=True,
+        harmony_adapter=harmony_adapter,
+        model_config=SimpleNamespace(vocab_size=1000),
+        tokenizer=SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1000)),
     )
-    server.harmony_adapter = harmony_adapter
-    server.model_config = SimpleNamespace(vocab_size=1000)
-    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
-        vocab_size=1000))
+    server.await_disconnected = mock.AsyncMock()
 
     with mock.patch.object(router,
                            "_get_tokenizer",
@@ -2627,7 +2628,7 @@ def test_gpt_oss_router_respects_disable_harmony_adapter(
 @pytest.mark.asyncio
 async def test_chat_harmony_preserves_original_tool_conversion_error() -> None:
     """Harmony diagnostics must not rerun the conversion that already failed."""
-    from tensorrt_llm.serve.openai_server import OpenAIServer
+    from test_common.serve.serving_stubs import make_chat_serving
 
     original_error = RuntimeError("original tool conversion failure")
     diagnostic_error = RuntimeError("diagnostic tool conversion failure")
@@ -2653,9 +2654,8 @@ async def test_chat_harmony_preserves_original_tool_conversion_error() -> None:
     )
     object.__setattr__(request, "tools", [failing_tool])
 
-    server = OpenAIServer.__new__(OpenAIServer)
-    server.allow_request_chat_template = False
-    server.harmony_adapter = mock.MagicMock()
+    server = make_chat_serving(use_harmony=True,
+                               harmony_adapter=mock.MagicMock())
     server.create_error_response = mock.MagicMock(
         return_value=str(original_error))
 

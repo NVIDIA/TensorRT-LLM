@@ -609,13 +609,16 @@ def _http_enablement() -> None:
 
     with pytest.MonkeyPatch.context() as patch:
         # Exercise the real constructor and route registration without loading a model.
-        # The constructor reads these after _init_llm: use_harmony for the chat routes,
-        # and tokenizer and model_config for the serving objects it builds for the
-        # LLM role (tokenize and completions).
+        # The constructor reads these after _init_llm: use_harmony for the chat
+        # endpoint, and tokenizer, model_config, tool_call_id_type and
+        # harmony_adapter for the serving objects it builds for the LLM role
+        # (tokenize, completions and chat).
         def init_llm(self, _):
             self.use_harmony = False
             self.tokenizer = None
             self.model_config = None
+            self.tool_call_id_type = "random"
+            self.harmony_adapter = None
 
         patch.setattr(OpenAIServer, "_init_llm", init_llm)
         for requested, output_dir in [(False, None), (True, None), (False, "unused-jsonl")]:

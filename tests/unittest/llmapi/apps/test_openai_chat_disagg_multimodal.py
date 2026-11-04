@@ -34,6 +34,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tensorrt_llm.serve.api.openai.chat import api_router as chat_api_router
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -141,10 +142,10 @@ def _stub_response() -> ChatCompletionResponse:
 
 @pytest.fixture
 def route_client(tmp_path):
-    """`openai_chat` on a bare app, with everything past prompt-building cut.
+    """The chat route on a bare app, with everything past prompt-building cut.
 
     The engine is a stub behind the real server constructor, so the handler
-    runs for real and the engine never does.
+    (on the server's ``ChatServing``) runs for real and the engine never does.
     """
     captured = {}
 
@@ -153,11 +154,13 @@ def route_client(tmp_path):
         return SimpleNamespace(prompt_token_ids=RELAYED_TOKEN_IDS, finished=True)
 
     server = make_stub_openai_server(tmp_path, MODEL, _StubModelConfig(), generate_async)
-    server.await_disconnected = AsyncMock()
-    server._create_chat_response = AsyncMock(return_value=_stub_response())
+    serving = server._chat_serving
+    serving.await_disconnected = AsyncMock()
+    serving._create_chat_response = AsyncMock(return_value=_stub_response())
 
     app = FastAPI()
-    app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+    setattr(app.state, chat_api_router.APP_STATE_KEY, serving)
+    chat_api_router.attach_router(app)
     return TestClient(app), captured
 
 

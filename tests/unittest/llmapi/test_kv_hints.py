@@ -664,6 +664,7 @@ def test_http_handlers_forward_hints(request_kind: str, with_hints: bool) -> Non
             iteration_stats_wakeup_event=None,
             iteration_stats_collector_task_getter=lambda: None,
             internal_disagg_auth_key=None,
+            server_role=None,
             per_request_spec_decode_stats=False,
             spec_decode_num_spec_tokens=None,
             input_proc_executor=None,
@@ -673,6 +674,8 @@ def test_http_handlers_forward_hints(request_kind: str, with_hints: bool) -> Non
         request = ResponsesRequest(model="test", input="hi", max_output_tokens=4, kv_hints=hints)
         handler = server.openai_responses
     else:
+        from test_common.serve.serving_stubs import make_chat_serving
+
         request = ChatCompletionRequest(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
@@ -680,7 +683,17 @@ def test_http_handlers_forward_hints(request_kind: str, with_hints: bool) -> Non
             max_tokens=4,
             kv_hints=hints,
         )
-        handler = server.chat_harmony if request_kind == "harmony" else server.openai_chat
+        # Chat is served by ChatServing, built here from the same stubs the
+        # composition root would hand it.
+        serving = make_chat_serving(
+            model=server.model,
+            generator=server.generator,
+            tokenizer=server.tokenizer,
+            model_config=server.model_config,
+            use_harmony=request_kind == "harmony",
+            harmony_adapter=server.harmony_adapter,
+        )
+        handler = serving.chat_harmony if request_kind == "harmony" else serving.openai_chat
 
     # The request FastAPI would pass, reduced to what the handlers read before
     # the engine boundary. The chat handler wraps it in a RequestContext, which

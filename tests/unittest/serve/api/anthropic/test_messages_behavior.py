@@ -42,8 +42,8 @@ import aiohttp
 import pytest
 from test_common.serve.app_factory import AggConfig, DisaggConfig
 
+import tensorrt_llm.serve.api.openai.chat.serving as chat_serving_module
 import tensorrt_llm.serve.openai_disagg_server as disagg_server_module
-import tensorrt_llm.serve.openai_server as openai_server_module
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
@@ -216,9 +216,9 @@ def _aggregated_server(env, *, generate_async, chat_response=None) -> OpenAIServ
     server = env.build_openai_server(AggConfig(model_name=SERVER_MODEL, num_postprocess_workers=1))
     server.generator.preprocess = None
     server.generator.generate_async = generate_async
-    server.await_disconnected = AsyncMock()
+    server._chat_serving.await_disconnected = AsyncMock()
     if chat_response is not None:
-        server._create_chat_response = AsyncMock(return_value=chat_response)
+        server._chat_serving._create_chat_response = AsyncMock(return_value=chat_response)
     return server
 
 
@@ -303,7 +303,7 @@ def engine_failure(monkeypatch):
     """
     recorded = SimpleNamespace(signals=[], aggregated=Mock(), disaggregated=Mock())
     monkeypatch.setattr(signal, "raise_signal", recorded.signals.append)
-    monkeypatch.setattr(openai_server_module, "_record_generator_termination", recorded.aggregated)
+    monkeypatch.setattr(chat_serving_module, "_record_generator_termination", recorded.aggregated)
     monkeypatch.setattr(
         disagg_server_module, "record_termination_observation", recorded.disaggregated
     )

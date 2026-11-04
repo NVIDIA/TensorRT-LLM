@@ -50,10 +50,6 @@ BASELINE = {
         "test_coordinator_keep_alive_timeout_is_passed_to_uvicorn CoordinatorServer",
         "test_coordinator_tcp_listener_uses_the_prebound_socket CoordinatorServer",
     ],
-    "tests/unittest/disaggregated/test_disagg_internal_auth.py": [
-        "test_aggregated_worker_ignores_affinity_header OpenAIServer",
-        "test_worker_affinity_survives_wire_roundtrip OpenAIServer",
-    ],
     "tests/unittest/disaggregated/test_disagg_openai_client.py": [
         "test_worker_clock_calibration_uses_global_clock OpenAIServer",
     ],
@@ -66,10 +62,6 @@ BASELINE = {
         "test_http_cluster_storage_request_is_proxied_to_coordinator OpenAIDisaggServer",
         "test_server_keep_alive_timeout_is_passed_to_uvicorn OpenAIDisaggServer",
     ],
-    "tests/unittest/disaggregated/test_openai_disagg_service.py": [
-        "test_create_chat_response_sets_prompt_token_ids_for_context_only OpenAIServer",
-        "test_subagent_affinity_http_worker_adp_placement.make_worker OpenAIServer",
-    ],
     "tests/unittest/disaggregated/test_openai_server_info.py": [
         "_make_server OpenAIServer",
     ],
@@ -77,15 +69,10 @@ BASELINE = {
         "test_http_failure_reaches_paired_worker_abort OpenAIDisaggServer",
         "test_http_failure_reaches_paired_worker_abort OpenAIServer",
     ],
-    "tests/unittest/disaggregated/test_router.py": [
-        "test_chat_harmony_preserves_original_tool_conversion_error OpenAIServer",
-        "test_gpt_oss_router_tokens_match_chat_harmony_server_input OpenAIServer",
-    ],
     "tests/unittest/llmapi/apps/_test_trtllm_serve_profile.py": [
         "server_with_mock_generator OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_anthropic_routes.py": [
-        "_chat_stream OpenAIServer",
         "_handle OpenAIDisaggServer",
     ],
     "tests/unittest/llmapi/apps/test_context_length_error.py": [
@@ -102,9 +89,6 @@ BASELINE = {
     ],
     "tests/unittest/llmapi/apps/test_responses_streaming_events.py": [
         "_server_streaming OpenAIServer",
-    ],
-    "tests/unittest/llmapi/apps/test_serving_extensions.py": [
-        "TestOpenAIChatIntegration.chat_client OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_tool_parsers.py": [
         "TestConfigureParserSpecialTokenDecoding.test_the_responses_route_applies_it OpenAIServer",

@@ -14,15 +14,17 @@
 # limitations under the License.
 """The chat completion handler's answers, pinned through the production code.
 
-The HTTP-level tests here run on ``OpenAIServer.openai_chat`` before and after
-it is split into a typed core and an HTTP wrapper, so the split can show that
-it changed no answer: a rejected request keeps its 400 body byte for byte, an
+The HTTP-level tests here run on the chat completion handler through the real
+app, before and after it was split into a typed core and an HTTP wrapper and
+then moved to ``ChatServing`` (``server._chat_serving``), so each step can show
+that it changed no answer: a rejected request keeps its 400 body byte for byte, an
 engine failure keeps today's HTTP 200 with body ``null`` (and
 ``/health_generate`` keeps turning that into a 500), a response that cannot be
 JSON-encoded keeps its 400, and a stream keeps its frames and media type.
 
 Servers are built through the real constructor with the fake generator from
-``tests/test_common/serve/``; only instance attributes are stubbed.
+``tests/test_common/serve/``; only instance attributes are stubbed, on the
+serving object that holds the chat handlers.
 """
 
 import asyncio
@@ -40,9 +42,9 @@ from test_common.serve.fakes import ScriptedOutput
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve import openai_server
 from tensorrt_llm.serve._base.errors import EngineFatalError, ServingError
 from tensorrt_llm.serve._base.request_context import RequestContext
+from tensorrt_llm.serve.api.openai.chat import serving as chat_serving
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -148,16 +150,14 @@ def engine_failure_recorder(monkeypatch):
     """Record the two side effects of an engine failure instead of running them."""
     recorder = SimpleNamespace(signals=[], terminations=[])
     monkeypatch.setattr(signal, "raise_signal", recorder.signals.append)
-    monkeypatch.setattr(
-        openai_server, "_record_generator_termination", recorder.terminations.append
-    )
+    monkeypatch.setattr(chat_serving, "_record_generator_termination", recorder.terminations.append)
     return recorder
 
 
 def _build(serve_env, config=None) -> OpenAIServer:
     server = serve_env.build_openai_server(config or AggConfig())
     # The disconnect poll needs a client socket; none of these tests has one.
-    server.await_disconnected = AsyncMock()
+    server._chat_serving.await_disconnected = AsyncMock()
     return server
 
 
@@ -190,7 +190,7 @@ def test_http_wrapper_keeps_every_answer(serve_env, engine_failure_recorder):
 
     # A non-streaming success: the typed response, serialized.
     chat_response = _chat_response()
-    server._create_chat_response = AsyncMock(return_value=chat_response)
+    server._chat_serving._create_chat_response = AsyncMock(return_value=chat_response)
     response = client.post("/v1/chat/completions", json=_chat_body())
     assert response.status_code == 200, f"non-streaming success: {KEEP}"
     assert response.json() == chat_response.model_dump(), f"non-streaming success: {KEEP}"
@@ -209,7 +209,7 @@ def test_http_wrapper_keeps_every_answer(serve_env, engine_failure_recorder):
 
 def test_unencodable_response_is_still_a_400(serve_env, error_records):
     server = _build(serve_env)
-    server._create_chat_response = AsyncMock(
+    server._chat_serving._create_chat_response = AsyncMock(
         return_value=_chat_response(avg_decoded_tokens_per_iter=float("nan"))
     )
     response = serve_env.client(server.app).post("/v1/chat/completions", json=_chat_body())
@@ -230,7 +230,7 @@ def test_health_generate_still_fails_with_500_on_engine_failure(serve_env, engin
     assert response.status_code == 500, f"/health_generate on an engine failure: {KEEP}"
     assert engine_failure_recorder.signals == [signal.SIGINT]
 
-    server._create_chat_response = AsyncMock(return_value=_chat_response())
+    server._chat_serving._create_chat_response = AsyncMock(return_value=_chat_response())
     response = asyncio.run(server.health_generate(_raw_request()))
     assert response.status_code == 200, f"/health_generate on a success: {KEEP}"
     assert response.body == b"Generation health check OK"
@@ -269,14 +269,16 @@ def _request(**overrides) -> ChatCompletionRequest:
 
 def _run_core(server, request):
     return asyncio.run(
-        server.create_chat_completion(request, RequestContext.from_http(_raw_request()))
+        server._chat_serving.create_chat_completion(
+            request, RequestContext.from_http(_raw_request())
+        )
     )
 
 
 def test_typed_result_for_a_non_streaming_request(serve_env):
     server = _build(serve_env)
     chat_response = _chat_response()
-    server._create_chat_response = AsyncMock(return_value=chat_response)
+    server._chat_serving._create_chat_response = AsyncMock(return_value=chat_response)
 
     result = _run_core(server, _request())
 
@@ -291,7 +293,7 @@ def test_stream_is_returned_as_sse_strings(serve_env):
     )
 
     async def run():
-        result = await server.create_chat_completion(
+        result = await server._chat_serving.create_chat_completion(
             _request(stream=True), RequestContext.from_http(_raw_request())
         )
         assert not isinstance(result, Response)

@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
+from test_common.serve.serving_stubs import generate_serving_kwargs
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
@@ -35,7 +36,6 @@ from tensorrt_llm.serve.openai_protocol import (
     ConversationParams,
     DisaggregatedParams,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import select_postproc_strategy
 
 pytestmark = pytest.mark.cpu_only
@@ -210,6 +210,7 @@ def test_worker_rejects_protected_fields_without_cache_transceiver_config():
         iteration_stats_wakeup_event=None,
         iteration_stats_collector_task_getter=lambda: None,
         internal_disagg_auth_key="secret",
+        server_role=None,
         per_request_spec_decode_stats=False,
         spec_decode_num_spec_tokens=None,
         input_proc_executor=None,
@@ -234,6 +235,13 @@ def _make_affinity_request(role: ServerRole) -> ChatCompletionRequest:
     )
 
 
+def _worker_serving(server_role, key) -> CompletionServing:
+    """A generate serving object with the role and auth key the scheduling helper reads."""
+    return CompletionServing(
+        **generate_serving_kwargs(server_role=server_role, internal_disagg_auth_key=key)
+    )
+
+
 @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
 @pytest.mark.parametrize("configured_role", [False, True])
 def test_worker_affinity_survives_wire_roundtrip(role: ServerRole, configured_role: bool) -> None:
@@ -243,11 +251,9 @@ def test_worker_affinity_survives_wire_roundtrip(role: ServerRole, configured_ro
         request.model_dump_json(exclude_unset=True)
     )
     assert wire_request.conversation_params.subagent_affinity_id is None
-    server = object.__new__(OpenAIServer)
-    server.server_role = role if configured_role else None
-    server._internal_disagg_auth_key = "secret"
+    serving = _worker_serving(role if configured_role else None, "secret")
 
-    scheduling = server._get_scheduling_params(wire_request, SimpleNamespace(headers=headers))
+    scheduling = serving._get_scheduling_params(wire_request, SimpleNamespace(headers=headers))
 
     assert scheduling.subagent_affinity_id == "parent"
     assert wire_request.conversation_params.conversation_id == "child"
@@ -258,11 +264,9 @@ def test_aggregated_worker_ignores_affinity_header(key: str | None) -> None:
     request = _make_affinity_request(ServerRole.CONTEXT)
     headers = build_subagent_affinity_headers("secret", request, ServerRole.CONTEXT)
     request.disaggregated_params = None
-    server = object.__new__(OpenAIServer)
-    server.server_role = None
-    server._internal_disagg_auth_key = key
+    serving = _worker_serving(None, key)
 
-    scheduling = server._get_scheduling_params(request, SimpleNamespace(headers=headers))
+    scheduling = serving._get_scheduling_params(request, SimpleNamespace(headers=headers))
 
     assert scheduling.subagent_affinity_id is None
     assert request.conversation_params.conversation_id == "child"

@@ -1,11 +1,11 @@
 {
-  ".github/scripts/label_community_user.py": {
-    "D212": 1
-  },
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
     "total_violations": 2089,
     "total_files": 221
+  },
+  ".github/scripts/label_community_user.py": {
+    "D212": 1
   },
   "cpp/kernels/fmha_v2/setup.py": {
     "E712": 27,
@@ -164,12 +164,12 @@
   "tensorrt_llm/_torch/compilation/piecewise_optimizer.py": {
     "E711": 2
   },
+  "tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
+    "E741": 3
+  },
   "tensorrt_llm/_torch/distributed/ops.py": {
     "E712": 1,
     "E731": 1
-  },
-  "tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
-    "E741": 3
   },
   "tensorrt_llm/_torch/models/checkpoints/auto_mapper.py": {
     "F821": 1
@@ -529,9 +529,6 @@
     "F821": 1
   },
   "tensorrt_llm/serve/_base/sse.py": {
-    "F821": 1
-  },
-  "tensorrt_llm/serve/api/openai/chat/serving.py": {
     "F821": 1
   },
   "tensorrt_llm/serve/api/openai/completions/_merge.py": {

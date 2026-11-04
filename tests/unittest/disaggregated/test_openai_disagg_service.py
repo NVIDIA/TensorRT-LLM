@@ -29,6 +29,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from openai.types.responses import ResponseErrorEvent, ResponseFailedEvent, ResponseStatus
 from starlette.requests import Request
+from test_common.serve.serving_stubs import make_chat_serving
 
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ConversationAwareADPRouter,
@@ -71,7 +72,6 @@ from tensorrt_llm.serve.openai_protocol import (
     _serialize_first_gen_logits,
     to_llm_disaggregated_params,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs,
     CompletionPostprocArgs,
@@ -546,7 +546,7 @@ async def test_subagent_affinity_http_worker_adp_placement(
         return None, None
 
     monkeypatch.setattr(
-        "tensorrt_llm.serve.openai_server.parse_chat_messages_coroutines",
+        "tensorrt_llm.serve.api.openai.chat.serving.parse_chat_messages_coroutines",
         lambda *args, **kwargs: ([], no_media(), {}, []),
     )
     service = _make_service(schedule_style)
@@ -582,28 +582,28 @@ async def test_subagent_affinity_http_worker_adp_placement(
             )
             return SimpleNamespace(prompt_token_ids=[1, 2, 3])
 
-        server = object.__new__(OpenAIServer)
-        server.server_role = role if configured_role else None
-        server._internal_disagg_auth_key = auth_key
-        server.allow_request_chat_template = False
-        server.generator = SimpleNamespace(
-            args=SimpleNamespace(
-                num_postprocess_workers=0,
-                gather_generation_logits=False,
-                reasoning_parser=None,
-                backend="pytorch",
-                cache_transceiver_config={"backend": "UCX"},
+        harmony_adapter = mock.Mock()
+        harmony_adapter.get_stop_tokens.return_value = [999]
+        # The worker's chat handlers run on a ChatServing built from the same
+        # stubs the composition root would hand it.
+        server = make_chat_serving(
+            server_role=role if configured_role else None,
+            internal_disagg_auth_key=auth_key,
+            generator=SimpleNamespace(
+                args=SimpleNamespace(
+                    num_postprocess_workers=0,
+                    gather_generation_logits=False,
+                    reasoning_parser=None,
+                    backend="pytorch",
+                    cache_transceiver_config={"backend": "UCX"},
+                ),
+                generate_async=generate,
             ),
-            generate_async=generate,
+            model_config=SimpleNamespace(model_type="llama", vocab_size=1000),
+            tokenizer=SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1000)),
+            use_harmony=handler_name == "chat_harmony",
+            harmony_adapter=harmony_adapter,
         )
-        server.model_config = SimpleNamespace(model_type="llama", vocab_size=1000)
-        server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1000))
-        server.multimodal_server_config = None
-        server.tool_parser = None
-        server.tool_call_id_type = "random"
-        server.chat_template = None
-        server.harmony_adapter = mock.Mock()
-        server.harmony_adapter.get_stop_tokens.return_value = [999]
         server.await_disconnected = AsyncMock()
 
         async def postprocess(promise, postproc_params, raw_request, disaggregated_params):
@@ -689,8 +689,6 @@ async def test_subagent_affinity_http_worker_adp_placement(
 
 @pytest.mark.asyncio
 async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
-    from tensorrt_llm.serve.openai_server import OpenAIServer
-
     prompt_token_ids = [101, 102, 103]
 
     class FakePromise:
@@ -702,9 +700,9 @@ async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
         async def aresult(self):
             return self
 
-    server = OpenAIServer.__new__(OpenAIServer)
-    server.generator = mock.MagicMock()
-    server.generator.args.num_postprocess_workers = 0
+    generator = mock.MagicMock()
+    generator.args.num_postprocess_workers = 0
+    server = make_chat_serving(generator=generator)
     server._extract_metrics = mock.AsyncMock()
 
     post_processor = mock.Mock(

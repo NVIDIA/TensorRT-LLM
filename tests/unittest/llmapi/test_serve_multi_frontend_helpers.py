@@ -31,6 +31,7 @@ from aiohttp import web
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import Match
+from test_common.serve.serving_stubs import make_chat_serving
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
@@ -42,6 +43,7 @@ from tensorrt_llm.serve.api.anthropic.serving import (
     AnthropicCountTokensServing,
     AnthropicMessagesServing,
 )
+from tensorrt_llm.serve.api.openai.chat import api_router as chat_router
 from tensorrt_llm.serve.api.openai.completions import api_router as completions_router
 from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
@@ -126,7 +128,7 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     # The order OpenAIServer.__init__ registers them in: the launcher forwarding
     # routes, then the local table, then the routers of the role (the system
     # router with /health, /version and /v1/models, the tokenize router, the
-    # completions router and the Anthropic router), which read their serving
+    # completions router, the chat router and the Anthropic router), which read their serving
     # objects from app.state. The routes are enumerated and forwarded, never
     # served locally, so the serving objects get placeholder collaborators.
     server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
@@ -150,12 +152,14 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
             iteration_stats_wakeup_event=None,
             iteration_stats_collector_task_getter=lambda: None,
             internal_disagg_auth_key=None,
+            server_role=None,
             per_request_spec_decode_stats=False,
             spec_decode_num_spec_tokens=None,
             input_proc_executor=None,
             postproc=select_postproc_strategy(postproc_worker_enabled=False),
         ),
     )
+    setattr(server.app.state, chat_router.APP_STATE_KEY, make_chat_serving(model="m"))
     server.app.state.anthropic_serving_messages = AnthropicMessagesServing(backend=None)
     server.app.state.anthropic_serving_count_tokens = AnthropicCountTokensServing(
         render_resources=lambda: None

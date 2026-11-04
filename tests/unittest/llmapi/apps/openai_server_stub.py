@@ -15,22 +15,33 @@
 """An ``OpenAIServer`` for in-process route tests: real constructor, stub engine."""
 
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Optional
+from unittest import mock
 
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 
 def make_stub_openai_server(
-    tmp_path, model: str, model_config: Any, generate_async: Callable, tokenizer: Any = None
+    tmp_path,
+    model: str,
+    model_config: Any,
+    generate_async: Callable,
+    tokenizer: Any = None,
+    *,
+    chat_template: Optional[str] = None,
+    allow_request_chat_template: bool = False,
 ) -> OpenAIServer:
     """Build the server through ``OpenAIServer.__init__`` on an engine stub.
 
     The generator stands in for ``LLM``: it carries the ``args`` the server
     reads, a tokenizer (a vocab-size stub unless one is given), and
     ``generate_async`` recording what reaches the engine. ``tmp_path`` is the
-    empty model directory, so the constructor loads no HF processor or config
-    and ``model_config`` is set to the given stub.
+    empty model directory, so the constructor loads no HF processor; the model
+    config loader answers the given stub, so the constructor sees it while it
+    builds the serving objects and the render resources (the chat handlers run
+    on ``server._chat_serving``). ``chat_template`` and
+    ``allow_request_chat_template`` are the constructor's own arguments.
     """
     if tokenizer is None:
         tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=model_config.vocab_size))
@@ -60,14 +71,20 @@ def make_stub_openai_server(
         generate_async=generate_async,
     )
     previous_media_executor = BaseMediaIO._executor
-    server = OpenAIServer(
-        generator=generator,
-        model=model,
-        tool_parser=None,
-        server_role=None,
-        metadata_server_cfg=None,
-    )
-    server.model_config = model_config
+    with mock.patch(
+        "tensorrt_llm._torch.pyexecutor.config_utils.load_pretrained_config",
+        return_value=model_config,
+    ):
+        server = OpenAIServer(
+            generator=generator,
+            model=model,
+            tool_parser=None,
+            server_role=None,
+            metadata_server_cfg=None,
+            chat_template=chat_template,
+            allow_request_chat_template=allow_request_chat_template,
+        )
+    assert server.model_config is model_config
     # The constructor publishes a media-decode pool process-wide. In-process
     # tests decode on the event loop's default executor instead, so put the
     # previous pool back and retire the server's unused pools before they

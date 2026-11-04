@@ -73,7 +73,7 @@ failed_prs: []
 - **Detection signal:** gen-server host time before the first forward step
   grows with prompt length (tokenizer + block-key construction spans in a
   py-spy/nsys host profile); verify the guard exists with
-  `grep -n "prompt_token_ids is not None" tensorrt_llm/serve/openai_server.py`
+  `grep -n "prompt_token_ids is not None" tensorrt_llm/serve/api/openai/chat/serving.py`
   and compare ctx-vs-gen TTFT via the server's `/perf_metrics` endpoint
   (requires `TRTLLM_KVCACHE_TIME_OUTPUT_PATH` to be set on this path).
 - **Prevention/guard:** the PR adds
