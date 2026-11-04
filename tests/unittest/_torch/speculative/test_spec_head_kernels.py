@@ -232,6 +232,7 @@ def test_head_matches_native_preprocess_inputs(num_ctx, num_gen, num_chunked, he
         ),
         mapping=mapping,
         get_runtime_tokens_per_gen_step=lambda d: d + 1,
+        spec_decode_kv_range=DecoderInputPreparer.spec_decode_kv_range,
     )
     ref = DecoderInputPreparer.preprocess_inputs(
         native, step(11), enable_spec_decode=True, runtime_draft_len=draft_len
