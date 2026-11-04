@@ -1,0 +1,5 @@
+# Placeholders a sandboxed agent session leaves in its working directory.
+# Nothing in this package is configuration for a session that runs here: a run
+# materializes its skills into its own workspace.
+.mcp.json
+.claude/
