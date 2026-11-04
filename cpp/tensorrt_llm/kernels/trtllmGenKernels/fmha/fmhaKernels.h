@@ -1306,6 +1306,11 @@ private:
     {
         // Basic dimensions
         options.mBatchSize = params.mBatchSize;
+        // Existing dispatchers zero-initialize this carrier with memset.
+        if (params.mMaxNumCtasPerSeqKv > 0)
+        {
+            options.mMaxNumCtasPerSeqKv = params.mMaxNumCtasPerSeqKv;
+        }
         options.mMaxSeqLenQ = params.mMaxSeqLenQ;
         options.mMinSeqLenQ = params.mMaxSeqLenQ;
         // For context self-attention without prior KV cache, TRT-LLM passes

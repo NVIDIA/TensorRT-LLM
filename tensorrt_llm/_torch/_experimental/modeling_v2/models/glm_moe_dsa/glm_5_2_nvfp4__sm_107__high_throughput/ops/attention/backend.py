@@ -162,6 +162,7 @@ class RubinDSATrtllmAttention(TrtllmAttention):
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run the DSA indexer and convert its local TopK to paged indices."""
+        forward_args.sparse_runtime_params.max_num_ctas_per_seq_kv = None
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         sparse_backend_args = forward_args.sparse_backend_args
         phase_start = metadata.num_ctx_tokens if is_generation else 0
@@ -261,6 +262,16 @@ class RubinDSATrtllmAttention(TrtllmAttention):
             if scratch is None or compact_indices is None:
                 raise RuntimeError("NVFP4 MLA scratch buffers were not allocated")
             num_rows = topk_indices_global.shape[0]
+            # These verified decode shapes benefit from splitting V rather
+            # than KV, which avoids the separate partial-output reduction.
+            if (
+                is_generation
+                and self.num_heads == 64
+                and self.head_dim == 576
+                and topk_indices_global.shape[1] == 2048
+                and (num_rows, metadata.gen_token_stride) in ((56, 8), (60, 6), (96, 6))
+            ):
+                forward_args.sparse_runtime_params.max_num_ctas_per_seq_kv = 1
             if num_rows > scratch.shape[0] or num_rows > compact_indices.shape[0]:
                 raise RuntimeError(
                     "NVFP4 MLA generation rows exceed the allocated MTP "
