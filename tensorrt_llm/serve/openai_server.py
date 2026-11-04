@@ -2164,6 +2164,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
+            # TRTLLM_KVCACHE_TIME_OUTPUT_PATH also turns on per-request engine
+            # perf metrics, as it does for completions and Responses.
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             # Resolve a named tool_choice (OpenAI spec / Azure compat):
             #   tool_choice = {"type": "function", "function": {"name": "X"}}
             # forces the model to call exactly function X. We honor this by
