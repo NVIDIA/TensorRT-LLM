@@ -1833,10 +1833,9 @@ class TestQwen3CoderStreamEnd:
             ("<tool_call>\n<function=f>\n</function>", {}),
             # max_tokens reached inside the call.
             ("<tool_call>\n<function=f>\n", {}),
-            ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n",
-             {
-                 "x": "abc"
-             }),
+            ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n", {
+                "x": "abc"
+            }),
             # EOS after </function> with the last parameter left unclosed.
             ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</function>", {
                 "x": "abc"
@@ -1844,10 +1843,9 @@ class TestQwen3CoderStreamEnd:
             ("<tool_call><function=f><parameter=x>abc</function>", {
                 "x": "abc"
             }),
-            ("<tool_call>\n<function=f>\n<parameter=scale>\n42\n</function>",
-             {
-                 "scale": 42
-             }),
+            ("<tool_call>\n<function=f>\n<parameter=scale>\n42\n</function>", {
+                "scale": 42
+            }),
             # Cut off partway through </tool_call>, after </function>.
             ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</function>\n"
              "</tool", {
@@ -1869,8 +1867,8 @@ class TestQwen3CoderStreamEnd:
                  "x": "abc"
              }),
         ])
-    def test_stream_ending_inside_call_closes_arguments(
-            self, tools, chunk_size, text, expected):
+    def test_stream_ending_inside_call_closes_arguments(self, tools, chunk_size,
+                                                        text, expected):
         calls = self._stream(Qwen3CoderToolParser(), tools, text, chunk_size)
         assert [(item["name"], json.loads(item["arguments"]))
                 for item in calls] == [("f", expected)]
