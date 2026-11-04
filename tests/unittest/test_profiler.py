@@ -15,43 +15,20 @@
 """CPU contract tests for the shared profiler primitives."""
 
 import builtins
-
-
 import json
-
-
 import logging
-
-
 import os
-
-
 import subprocess
-
-
 import sys
-
-
 from pathlib import Path
-
-
 from types import TracebackType
-
-
 from typing import cast
 
-
 import pytest
-
-
 import torch
-
-
 from profiler_test_utils import decode_profiler_metadata
 
-
 from tensorrt_llm import _profiler as profiler
-
 
 pytestmark = pytest.mark.cpu_only
 
