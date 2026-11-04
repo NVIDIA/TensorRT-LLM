@@ -22,6 +22,8 @@ H, E, TOP_K = 6144, 128, 4
 
 @pytest.fixture(scope="module")
 def data():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
     g = torch.Generator(device="cuda").manual_seed(11)
     x = torch.randn(16384, H, device="cuda", generator=g).to(torch.bfloat16)
     w = (torch.randn(E, H, device="cuda", generator=g) / H**0.5).float().contiguous()

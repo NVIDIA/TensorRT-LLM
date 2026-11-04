@@ -19,8 +19,8 @@ HIDDEN = 6144
 EPS = 1e-6
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() < 100,
-    reason="MXFP8 quantization needs an SM100-family GPU",
+    not torch.cuda.is_available(),
+    reason="CUDA required",
 )
 
 
@@ -62,6 +62,10 @@ def test_ctx_residual_rmsnorm_mxfp8_matches_the_unfused_ops(rows: int, fp4: bool
         assert q4.numel() == 0 and sf4.numel() == 0
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() < 100,
+    reason="MXFP8 quantization needs an SM100-family GPU",
+)
 @pytest.mark.parametrize("rows", [8192, 8197])
 @pytest.mark.parametrize("d", [1536, 6144])
 @pytest.mark.parametrize(
@@ -103,4 +107,15 @@ def test_ctx_residual_rmsnorm_rejects_zero_hidden() -> None:
     with pytest.raises(RuntimeError, match="hidden must be positive"):
         torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
             inter, torch.empty_like(inter), inter.reshape(-1), EPS, True
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() >= 100, reason="requires a pre-SM100 GPU"
+)
+def test_ctx_residual_rmsnorm_rejects_unsupported_architecture() -> None:
+    inter = torch.zeros((1, 256), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="requires an SM100-family GPU"):
+        torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+            inter, torch.zeros_like(inter), inter.reshape(-1), EPS, True
         )

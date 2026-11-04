@@ -5241,6 +5241,17 @@ class TestAppendReserveShortestFirst:
         assert ids(out.context_requests) == [0]
         assert head.context_chunk_size == 8192
 
+    def test_reserve_leaves_room_for_a_chunk_unit(self):
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=8192),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 8192),
+        )
+        requests = [make_ctx_request(i, context_remaining_length=20000) for i in range(2)]
+        out = scheduler.schedule_request(requests, set())
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 8192
+
     def test_reserve_released_for_indivisible_multimodal_block(self):
         requests = [
             TestMultimodalAwareChunkingV2()._make_mm_req(i, 10000, [(0, 7000)]) for i in range(2)

@@ -1570,13 +1570,19 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
         full = budget.max_num_tokens
         budget.max_num_tokens = full - reserve
+        if not self._has_context_chunk_budget(budget):
+            budget.max_num_tokens = full
         try:
             result = self._try_schedule_context_chunked_impl(
                 req, budget, preempt_for_pages, token_cap, full_token_budget=full
             )
         finally:
             budget.max_num_tokens = full
-        if self._ctx_append_reserve_logged < 3 and result[0] is ScheduleAction.SCHEDULED:
+        if (
+            self._ctx_append_reserve_logged < 3
+            and result[0] is ScheduleAction.SCHEDULED
+            and result[1] <= full - reserve
+        ):
             self._ctx_append_reserve_logged += 1
             logger.info(
                 f"[ctx-reserve] taken: first ctx chunk {result[1]} tokens "

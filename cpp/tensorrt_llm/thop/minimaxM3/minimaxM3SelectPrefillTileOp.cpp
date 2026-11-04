@@ -52,6 +52,7 @@ void minimaxM3SelectPrefillTile(torch::Tensor const& scores, torch::Tensor const
             && out.size(1) == numKvHeads && out.size(2) == 16 && out.stride(2) == 1,
         "minimax_m3_select_prefill_tile: out must be int32 [total_q, num_kv_heads, 16] with unit last-dim stride");
 
+    TORCH_CHECK(out.is_non_overlapping_and_dense(), "out must have a non-overlapping dense layout");
     TORCH_CHECK(out.device() == scores.device(), "out must use the scores device");
 
     c10::cuda::CUDAGuard const deviceGuard{scores.device()};

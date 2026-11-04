@@ -5609,7 +5609,7 @@ index b9e6bbb..fa18fab 100644
  ):
      """K2: merge sparse forward split partials into the final output.
  
-@@ -1245,7 +1335,28 @@ def combine(
+@@ -1245,7 +1335,34 @@ def combine(
              provided, the final O accumulator is multiplied once before store.
          use_pdl: When True, wait on PDL dependencies from the producer K1
              kernel. When False, launch without PDL waits.
@@ -5629,6 +5629,12 @@ index b9e6bbb..fa18fab 100644
 +            raise ValueError("the MXFP8 combine epilogue supports the varlen use_pdl path only")
 +        if o_out.dtype != torch.bfloat16 or o_partial_fake.shape[-1] != 128:
 +            raise ValueError("the MXFP8 combine epilogue needs a bf16 output and head_dim 128")
++        if o_fp8.device != o_out.device or sf_out.device != o_out.device:
++            raise ValueError("MXFP8 destinations must use the o_out device")
++        if sf_out.ndim != 1 or not sf_out.is_contiguous():
++            raise ValueError("sf_out must be a contiguous one-dimensional buffer")
++        if o_fp8.dtype not in (torch.uint8, torch.float8_e4m3fn):
++            raise ValueError("o_fp8 must be uint8 or float8_e4m3fn")
 +        o_fp8 = o_fp8.view(torch.uint8)
 +        if o_fp8.shape != (o_out.shape[0], o_out.shape[1] * o_out.shape[2]) or not o_fp8.is_contiguous():
 +            raise ValueError(f"o_fp8 must be contiguous [total_q, head_q * dim], got {tuple(o_fp8.shape)}")
@@ -5638,7 +5644,7 @@ index b9e6bbb..fa18fab 100644
      D = o_partial_fake.shape[-1]
      num_splits = o_partial_fake.shape[0]
      return_temperature_lse = (
-@@ -1352,6 +1463,8 @@ def combine(
+@@ -1352,6 +1469,8 @@ def combine(
          has_output_scale,
          use_pdl,
          min_blocks_per_mp,
@@ -5647,7 +5653,7 @@ index b9e6bbb..fa18fab 100644
      )
      if key not in _combine_compile_cache:
          from src.common.aot_cache import try_load_aot, save_aot
-@@ -1371,6 +1484,7 @@ def combine(
+@@ -1371,6 +1490,7 @@ def combine(
                  topk=num_splits,
                  use_pdl=use_pdl,
                  min_blocks_per_mp=min_blocks_per_mp,
@@ -5655,7 +5661,7 @@ index b9e6bbb..fa18fab 100644
                  # stages=2 halves per-block SMEM (168 KB -> 103 KB) -> 2 blocks/SM,
                  # theoretical occupancy 12.5% -> 25%. NCU DRAM throughput 76.35%
                  # -> 88.64%. Runtime latency within noise (kernel already at HBM
-@@ -1452,6 +1566,16 @@ def combine(
+@@ -1452,6 +1572,16 @@ def combine(
                  if has_output_scale
                  else None
              )
@@ -5672,7 +5678,7 @@ index b9e6bbb..fa18fab 100644
              stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
  
              _combine_compile_cache[key] = cute.compile(
-@@ -1474,6 +1598,8 @@ def combine(
+@@ -1474,6 +1604,8 @@ def combine(
                  mSplitCounts,
                  mOutputScale,
                  Int32(qheadperkv),
@@ -5681,7 +5687,7 @@ index b9e6bbb..fa18fab 100644
                  stream,
                  options="--enable-tvm-ffi",
              )
-@@ -1495,4 +1621,6 @@ def combine(
+@@ -1495,4 +1627,6 @@ def combine(
              split_counts,
              output_scale,
              qheadperkv,

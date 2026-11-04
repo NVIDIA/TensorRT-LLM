@@ -22,11 +22,13 @@ host C++). SM100 / SM103 keep the stock fmha_sm100. The jit.py / aot_cache.py ce
 stand-in torch, and the k2q cell reads the installed source, so they run without a GPU.
 """
 
+import ast
 import importlib.util
 import inspect
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -170,3 +172,52 @@ def test_deferred_split_read_engages_on_sm107_only(api):
         in src
     )
     assert '"TLLM_FMHA_PLAN_DEFER_READ", "1"' in src
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case,error",
+    [
+        ("cpu_scales", "destinations must use"),
+        ("cpu_values", "destinations must use"),
+        ("strided_scales", "contiguous one-dimensional"),
+        ("matrix_scales", "contiguous one-dimensional"),
+        ("short_scales", "padded 128x4"),
+        ("wrong_value_dtype", "uint8 or float8_e4m3fn"),
+    ],
+)
+def test_combine_rejects_invalid_mxfp8_destinations(case: str, error: str) -> None:
+    # Follow the installed-source tests above: run the real host entry point
+    # with meta buffers so bad destinations must fail before any CuTe/CUDA work.
+    source = Path(_fmha_sm100_dir()) / "cute/src/sm100/fwd/combine.py"
+    tree = ast.parse(source.read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "combine")
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {"torch": torch}
+    exec(compile(module, str(source), "exec"), namespace)
+    out = torch.empty((4, 2, 128), dtype=torch.bfloat16, device="meta")
+    values = torch.empty((4, 256), dtype=torch.uint8, device="meta")
+    scales = torch.empty(1024, dtype=torch.uint8, device="meta")
+    if case == "cpu_scales":
+        scales = torch.empty(1024, dtype=torch.uint8)
+    elif case == "cpu_values":
+        values = torch.empty((4, 256), dtype=torch.uint8)
+    elif case == "strided_scales":
+        scales = torch.empty(2048, dtype=torch.uint8, device="meta")[::2]
+    elif case == "matrix_scales":
+        scales = scales.view(128, 8)
+    elif case == "short_scales":
+        scales = scales[:1]
+    else:
+        values = values.float()
+    with pytest.raises(ValueError, match=error):
+        namespace["combine"](
+            torch.empty((1, 4, 2, 128), device="meta"),
+            None,
+            out,
+            None,
+            cu_seqlens=torch.empty(2, dtype=torch.int32, device="meta"),
+            use_pdl=True,
+            o_fp8=values,
+            sf_out=scales,
+        )

@@ -219,3 +219,15 @@ def test_tile_select_rejects_mismatched_device(operand: str) -> None:
         out = out.to("cuda:1")
     with pytest.raises(RuntimeError, match=f"{operand} must use the scores device"):
         torch.ops.trtllm.minimax_m3_select_prefill_tile(scores, n_valid, out, 0, 1)
+
+
+@sm107
+@pytest.mark.parametrize("expanded_dim", [0, 1])
+def test_tile_select_rejects_overlapping_output(expanded_dim: int) -> None:
+    scores = torch.zeros((2, 32, 4), device="cuda")
+    n_valid = torch.full((4,), 32, dtype=torch.int32, device="cuda")
+    shape = [4, 2, 16]
+    shape[expanded_dim] = 1
+    out = torch.empty(shape, dtype=torch.int32, device="cuda").expand(4, 2, 16)
+    with pytest.raises(RuntimeError, match="non-overlapping dense layout"):
+        torch.ops.trtllm.minimax_m3_select_prefill_tile(scores, n_valid, out, 0, 1)

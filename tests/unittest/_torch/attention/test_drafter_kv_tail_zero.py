@@ -35,6 +35,7 @@ def _pool_and_tables(kv_lens, seed=0):
     "kv_lens",
     [[16390], [16], [32, 128, 129], [1, 255, 256, 257], [16384, 6]],
 )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_only_the_partial_last_pages_tails_are_zeroed(kv_lens):
     pool, tables = _pool_and_tables(kv_lens)
     before = pool.view(torch.uint8).clone()
@@ -55,6 +56,7 @@ def test_only_the_partial_last_pages_tails_are_zeroed(kv_lens):
                 assert int(((tail & 0x7F) == 0x7F).sum()) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_rows_past_batch_are_untouched():
     pool, tables = _pool_and_tables([100, 200])
     before = pool.view(torch.uint8).clone()
@@ -99,6 +101,7 @@ def _zero_if_allowed(lib, manager, pool, tables, lens):
         drafter_last_row._zero_kv_tails(pool, tables, lens, lens.shape[0])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_a_shared_partial_page_declines_and_changes_no_byte(monkeypatch):
     # Block and partial reuse on, no copy on partial reuse: the partial last page may belong to another request.
     shared = types.SimpleNamespace(enable_block_reuse=True, enable_partial_reuse=True)
@@ -111,6 +114,7 @@ def test_a_shared_partial_page_declines_and_changes_no_byte(monkeypatch):
     assert torch.equal(pool.view(torch.uint8), before)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_the_kill_switch_changes_no_byte(monkeypatch):
     private = types.SimpleNamespace(enable_block_reuse=False, enable_partial_reuse=False)
     lib = _library(monkeypatch, enabled=False)
@@ -122,6 +126,7 @@ def test_the_kill_switch_changes_no_byte(monkeypatch):
     assert torch.equal(pool.view(torch.uint8), before)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_a_private_cache_zeroes_through_the_gate(monkeypatch):
     private = types.SimpleNamespace(enable_block_reuse=False, enable_partial_reuse=False)
     lib = _library(monkeypatch)

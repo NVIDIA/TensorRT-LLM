@@ -52,12 +52,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     TORCH_CHECK(weight.is_contiguous() && weight.scalar_type() == at::kBFloat16 && weight.numel() == hidden);
     TORCH_CHECK(weight.device() == inter.device(), "weight must use the inter device");
     TORCH_CHECK(hidden % 256 == 0 && hidden / 8 <= 1024, "hidden must be a multiple of 256 and at most 8192");
-    at::cuda::CUDAGuard const guard(inter.device());
-    auto const opts = inter.options();
-    torch::Tensor normOut = writeNorm ? torch::empty_like(inter) : torch::empty({0}, opts);
-    torch::Tensor qOut = torch::empty(inter.sizes(), opts.dtype(at::ScalarType::Float8_e4m3fn));
-    int64_t const sfSize = (rows + 127) / 128 * 128 * ((hidden / 32 + 3) / 4 * 4);
-    torch::Tensor sfOut = torch::empty({sfSize}, opts.dtype(at::ScalarType::Byte));
     bool const fp4 = fp4GlobalScale.has_value();
     if (fp4)
     {
@@ -65,6 +59,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         TORCH_CHECK(
             fp4GlobalScale->is_cuda() && fp4GlobalScale->scalar_type() == at::kFloat && fp4GlobalScale->numel() == 1);
     }
+    at::cuda::CUDAGuard const guard(inter.device());
+    TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major >= 10,
+        "minimax_m3_ctx_residual_rmsnorm_mxfp8 requires an SM100-family GPU");
+    auto const opts = inter.options();
+    torch::Tensor normOut = writeNorm ? torch::empty_like(inter) : torch::empty({0}, opts);
+    torch::Tensor qOut = torch::empty(inter.sizes(), opts.dtype(at::ScalarType::Float8_e4m3fn));
+    int64_t const sfSize = (rows + 127) / 128 * 128 * ((hidden / 32 + 3) / 4 * 4);
+    torch::Tensor sfOut = torch::empty({sfSize}, opts.dtype(at::ScalarType::Byte));
     std::vector<int64_t> fp4Shape(inter.sizes().begin(), inter.sizes().end());
     fp4Shape.back() = hidden / 2;
     torch::Tensor fp4Out = fp4 ? torch::empty(fp4Shape, opts.dtype(at::ScalarType::Byte)) : torch::empty({0}, opts);
