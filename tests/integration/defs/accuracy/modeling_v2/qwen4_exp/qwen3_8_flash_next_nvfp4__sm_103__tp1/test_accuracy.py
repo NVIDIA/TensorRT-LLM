@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the qwen4_exp modeling_v2 target.
+"""Whole-model gates for the qwen4_exp modeling_v2 target qwen3_8_flash_next_nvfp4__sm_103__tp1.
 
 Every test passes ``modeling_v2="require"``: under ``"auto"`` a configuration
 that missed the target's routing would fall back to the built-in model, pass,
@@ -51,15 +51,15 @@ from tensorrt_llm.llmapi import (
     SamplingParams,
 )
 
-from ...conftest import llm_models_root
-from ..accuracy_core import (
+from .....conftest import llm_models_root
+from ....accuracy_core import (
     GSM8K,
     MMMU,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length,
     compute_acceptance_length,
 )
-from ._env import scoped_env_overrides
+from ..._env import scoped_env_overrides
 
 # The target is certified on sm_103 only.
 skip_not_sm103 = pytest.mark.skipif(

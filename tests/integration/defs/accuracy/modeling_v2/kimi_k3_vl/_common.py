@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Full-GSM8K gates for the two MXFP4 Kimi K3 targets on SM100.
+"""Shared GSM8K runner for the two MXFP4 Kimi K3 targets on SM100.
 
 Both layouts require 16 GB200 GPUs in one NVLink domain. Requiring modeling_v2
 prevents an unsupported deployment from silently testing the built-in model.
+The targets differ only in the MoE TP/EP split passed to ``_run_gsm8k``.
 """
 
 import pytest
@@ -25,9 +26,9 @@ from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_E
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 
-from ...conftest import check_device_contain, llm_models_root
-from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
-from ._env import scoped_env_overrides
+from ....conftest import check_device_contain, llm_models_root
+from ...accuracy_core import GSM8K
+from .._env import scoped_env_overrides
 
 _MODEL_NAME = "moonshotai/Kimi-K3"
 _MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
@@ -69,29 +70,3 @@ def _run_gsm8k(model_path: str, moe_tp_size: int, moe_ep_size: int) -> None:
         ) as llm,
     ):
         GSM8K(_MODEL_NAME).evaluate(llm)
-
-
-@_GB200_ONLY
-@pytest.mark.skip_less_mpi_world_size(16)
-@pytest.mark.timeout(10800)
-class TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(LlmapiAccuracyTestHarness):
-    """Attention TP16 with routed experts split over TP4 and EP4."""
-
-    MODEL_NAME = _MODEL_NAME
-    MODEL_PATH = _MODEL_PATH
-
-    def test_gsm8k(self) -> None:
-        _run_gsm8k(self.MODEL_PATH, moe_tp_size=4, moe_ep_size=4)
-
-
-@_GB200_ONLY
-@pytest.mark.skip_less_mpi_world_size(16)
-@pytest.mark.timeout(10800)
-class TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(LlmapiAccuracyTestHarness):
-    """Attention TP16 with an explicitly selected MoE TP16 and EP1 layout."""
-
-    MODEL_NAME = _MODEL_NAME
-    MODEL_PATH = _MODEL_PATH
-
-    def test_gsm8k(self) -> None:
-        _run_gsm8k(self.MODEL_PATH, moe_tp_size=16, moe_ep_size=1)

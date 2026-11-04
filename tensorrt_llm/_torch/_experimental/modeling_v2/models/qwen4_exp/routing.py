@@ -201,13 +201,9 @@ def route(
         and mapping.world_size == 1
         and mtp_eagle_or_none
     ):
-        # One line on purpose: the claims suite reads the routed targets off
-        # `from .<target>.modeling import <Class>` lines.
-        # fmt: off
-        # isort: off
-        from .qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling import ModelingV2Qwen38FlashNextNvfp4Sm103Tp1
-        # isort: on
-        # fmt: on
+        from .qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling import (
+            ModelingV2Qwen38FlashNextNvfp4Sm103Tp1,
+        )
 
         _check_engine(spec_config, kv_cache_quant_algo, engine_choices(model_config, llm_args))
         return ModelingV2Qwen38FlashNextNvfp4Sm103Tp1

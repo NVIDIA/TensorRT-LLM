@@ -12,17 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gate for the MiniMax-M3 modeling_v2 targets.
+"""Shared harness for the MiniMax-M3 modeling_v2 accuracy targets.
 
-Every test here passes ``modeling_v2="require"`` to ``LLM``: under ``"auto"`` a configuration that missed a target's
-criteria would quietly fall back to the built-in implementation, pass, and report the built-in's numbers as the
-target's.
+Every test of these targets passes ``modeling_v2="require"`` to ``LLM``: under ``"auto"`` a configuration that missed
+a target's criteria would quietly fall back to the built-in implementation, pass, and report the built-in's numbers as
+the target's.
 
 The deployment is the one the targets route (``models/minimax_m3/routing.py``): the NVFP4 checkpoint on sm_103,
 tensor-parallel attention and experts on 4 or 8 ranks, the MiniMax-M3 MSA sparse attention with the fused five-way
-QKV/index projection, an FP8 indexer and an NVFP4 KV cache. Each target runs GSM8K without speculation and with
-one-model Eagle3, where a chat-GSM8K acceptance probe also guards the drafter (accuracy alone does not notice a
-corrupted draft KV).
+QKV/index projection, an FP8 indexer and an NVFP4 KV cache. ``_MiniMaxM3Target`` runs GSM8K without speculation and
+with one-model Eagle3, where a chat-GSM8K acceptance probe also guards the drafter (accuracy alone does not notice a
+corrupted draft KV). Each target subclass sets only its TP size.
 """
 
 import json
@@ -42,8 +42,8 @@ from tensorrt_llm.llmapi import (
 )
 from tensorrt_llm.quantization import QuantAlgo
 
-from ...conftest import llm_models_root
-from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ....conftest import llm_models_root
+from ...accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 
 # The targets assert their own SM at construction: certification is per GPU architecture.
 skip_not_sm103 = pytest.mark.skipif(
@@ -134,35 +134,3 @@ class _MiniMaxM3Target(LlmapiAccuracyTestHarness):
             assert length > MIN_ACCEPTANCE_LENGTH, (
                 f"acceptance length {length:.3f} <= {MIN_ACCEPTANCE_LENGTH}"
             )
-
-
-class TestModelingV2MiniMaxM3Nvfp4Sm103Tp4(_MiniMaxM3Target):
-    """MiniMax-M3 NVFP4 / sm_103 / tp4: four GB300s."""
-
-    TP = 4
-
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k(self):
-        self._gsm8k(eagle3=False)
-
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_eagle3_gsm8k_and_acceptance(self):
-        self._gsm8k(eagle3=True)
-
-
-class TestModelingV2MiniMaxM3Nvfp4Sm103Tp8(_MiniMaxM3Target):
-    """MiniMax-M3 NVFP4 / sm_103 / tp8: eight GB300s over two trays (an 8-rank MPI world across the two nodes)."""
-
-    TP = 8
-
-    @skip_not_sm103
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k(self):
-        self._gsm8k(eagle3=False)
-
-    @skip_not_sm103
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_eagle3_gsm8k_and_acceptance(self):
-        self._gsm8k(eagle3=True)

@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the deepseek-v3 modeling_v2 targets.
+"""Whole-model gates for the deepseek-v3 modeling_v2 target r1_0528_nvfp4__sm_10x__default.
 
-One file per model family, beside the other accuracy suites rather than inside
+One directory per target under accuracy/modeling_v2/, rather than inside
 test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
 next to the built-in model's tests would invite treating one as a variant of
 the other.
@@ -26,7 +26,7 @@ built-in's numbers as the target's, which is the one failure this whole
 system exists to prevent. The one exception is the stock leg of the acceptance
 gate, which asks for ``"off"`` on purpose.
 
-These targets are multi-rank, and the mode has to hold on every rank rather
+This target is multi-rank, and the mode has to hold on every rank rather
 than only on the one running the test body. The switch is an LLM API argument,
 so it reaches the ranks the way the rest of the arguments do.
 """
@@ -38,14 +38,14 @@ from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_E
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 
-from ...conftest import llm_models_root
-from ..accuracy_core import (
+from .....conftest import llm_models_root
+from ....accuracy_core import (
     GSM8K,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length,
     compute_acceptance_length,
 )
-from ._env import scoped_env_overrides
+from ..._env import scoped_env_overrides
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.

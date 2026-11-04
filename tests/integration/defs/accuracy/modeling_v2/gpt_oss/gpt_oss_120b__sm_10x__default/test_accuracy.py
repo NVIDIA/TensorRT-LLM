@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gate for the gpt-oss modeling_v2 targets.
+"""Whole-model gate for the gpt-oss modeling_v2 target gpt_oss_120b__sm_10x__default.
 
-One file per model family, beside the other accuracy suites rather than inside
+One directory per target under accuracy/modeling_v2/, rather than inside
 test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
 next to the built-in model's tests would invite treating one as a variant of
 the other.
@@ -33,9 +33,9 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 
-from ...conftest import llm_models_root
-from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
-from ._env import scoped_env_overrides
+from .....conftest import llm_models_root
+from ....accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ..._env import scoped_env_overrides
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
