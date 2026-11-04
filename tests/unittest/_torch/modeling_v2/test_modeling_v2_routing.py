@@ -1152,7 +1152,7 @@ def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
 
-_QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling."
+_QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.modeling."
 
 
 @pytest.fixture
@@ -1270,7 +1270,7 @@ def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
         _model_config(_qwen4_exp_config()), _llm_args("auto")
     )
     with pytest.raises(NoTarget, match="KV cache"):
-        qwen4_exp_routing._check_engine(None, algo, choices)
+        qwen4_exp_routing._check_engine(None, algo, choices, "tp1")
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
@@ -1319,10 +1319,10 @@ def test_qwen4_exp_runtime_draft_length_falls_back(spec_kwargs):
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
-@pytest.mark.parametrize("max_draft_len", [4, 7])
-def test_qwen4_exp_draft_beyond_three_needs_the_cached_replay(monkeypatch, max_draft_len):
-    """The legacy per-step recurrent states are certified at up to three drafted tokens and
-    hold one fp32 state per verify row."""
+@pytest.mark.parametrize("max_draft_len", [1, 3, 7])
+def test_qwen4_exp_mtp_needs_the_cached_replay(monkeypatch, max_draft_len):
+    """The target verifies on the GDN cached replay only, never on the legacy per-step
+    recurrent states."""
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
     config = _model_config(
         _qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=max_draft_len)
@@ -1331,13 +1331,6 @@ def test_qwen4_exp_draft_beyond_three_needs_the_cached_replay(monkeypatch, max_d
     _declined(config, dict(kv_cache_config=kv_cache_config), match="TRTLLM_USE_GDN_REPLAY=0")
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
     _claimed(config, dict(kv_cache_config=kv_cache_config))
-
-
-@pytest.mark.usefixtures("_qwen4_exp_sm")
-def test_qwen4_exp_legacy_verify_matches_up_to_three_drafted_tokens(monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
-    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
-    _claimed(config, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32")))
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
@@ -1396,10 +1389,9 @@ def test_qwen4_exp_mtp_on_a_float16_state_cache_declines_with_replay_off(monkeyp
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
-def test_qwen4_exp_mtp_on_a_bf16_state_cache_matches_with_replay_off(monkeypatch):
+def test_qwen4_exp_without_speculation_matches_with_replay_off(monkeypatch):
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
-    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
-    _claimed(config)
+    _claimed(_model_config(_qwen4_exp_config()))
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
