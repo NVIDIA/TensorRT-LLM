@@ -43,6 +43,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....autotuner import AutoTuner
+from ....distributed.ops import LamportWorkspaceView
 from ....locality_domain.placement import sm_locality_domains, split_domain_copy
 from ....locality_domain_utils import is_locality_domain_enabled
 from ....model_config import ModelConfig
@@ -110,8 +111,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     _supports_non_divisible_ep: bool = True
     # Set by allow_die_major_weights (a model's opt-in at construction).
     _die_major_allowed: bool = False
-    # The all-reduce the next small-batch call pushes its output into (``push_output_into``).
-    _pending_output_push = None
 
     descriptor = MoEImplDescriptor(
         identity=MoEImplId(PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL, KERNEL_FUSED_FC12, "nvfp4"),
@@ -261,8 +260,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self._small_batch_counters: torch.Tensor | None = None
         # Set by post_load_weights.
         self.weights_die_major = False
-        # The all-reduce the next small-batch call pushes its output into (push_output_into).
-        self._pending_output_push = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -331,13 +328,10 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         if self.small_batch_max_tokens and self._small_batch_counters is None:
             self._small_batch_counters = new_small_batch_moe_counters(self.w3_w1_weight.device)
 
-    def push_output_into(self, view: object, num_tokens: int) -> bool:
-        """The small-batch kernel pushes its output rows (slice combine) where it serves
-        ``num_tokens`` tokens."""
-        if not 1 <= num_tokens <= self.small_batch_max_tokens:
-            return False
-        self._pending_output_push = view
-        return True
+    def output_push_max_tokens(self) -> int:
+        """The small-batch kernel pushes its output rows (slice combine) at the token counts it
+        serves."""
+        return self.small_batch_max_tokens
 
     def published_routing_word(self, num_tokens: int) -> torch.Tensor | None:
         """The small-batch kernel's routing word where it serves ``num_tokens`` tokens in the
@@ -429,6 +423,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             weight_view=self._build_local_weight_view(),
             sort_tables=ctx.sort_tables,
             x_ready_event=ctx.x_ready_event,
+            output_push=ctx.output_push,
         )
 
     # Fused-kernel dispatch, with its own autotuner key and outer runner so
@@ -444,6 +439,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         weight_view: NvFp4WeightView | None = None,
         sort_tables: MoESortTables | None = None,
         x_ready_event: torch.cuda.Event | None = None,
+        output_push: LamportWorkspaceView | None = None,
     ) -> torch.Tensor:
         assert self.has_nvfp4
         assert weight_view is not None
@@ -457,6 +453,14 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             assert moe_output.size() == (token_final_scales.size(0), self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        num_tokens = token_selected_experts.size(0)
+        small_batch = num_tokens <= self.small_batch_max_tokens and not enable_alltoall
+        if output_push is not None and not (num_tokens >= 1 and small_batch):
+            raise RuntimeError(
+                f"an output push needs the small-batch kernel, not {num_tokens} tokens"
+                f"{' with all-to-all' if enable_alltoall else ''}"
+            )
+
         # Join before the fused kernel reads x, or before returning an empty batch.
         self._pending_x_ready_event = x_ready_event
 
@@ -469,7 +473,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         if sort_tables is not None and sort_tables.published:
             assert token_selected_experts.size(0) <= self.small_batch_max_tokens
             assert not enable_alltoall and self.tp_size > 1
-        if token_selected_experts.size(0) <= self.small_batch_max_tokens and not enable_alltoall:
+        if small_batch:
             return self._run_small_batch(
                 x,
                 token_selected_experts,
@@ -478,6 +482,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
                 moe_output,
                 weight_view,
                 sort_tables,
+                output_push,
             )
 
         effective_top_k = token_selected_experts.size(-1)
@@ -539,9 +544,10 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         moe_output: torch.Tensor,
         weight_view: NvFp4WeightView,
         sort_tables: MoESortTables | None = None,
+        push: LamportWorkspaceView | None = None,
     ) -> torch.Tensor:
-        """The small-batch kernel; it writes every element of ``moe_output``."""
-        push, self._pending_output_push = self._pending_output_push, None
+        """The small-batch kernel; it writes every element of ``moe_output`` (and pushes it into
+        ``push``)."""
         published = sort_tables is not None and sort_tables.published
         if published:
             # the kernel builds the tables from the published ids; nothing reads these

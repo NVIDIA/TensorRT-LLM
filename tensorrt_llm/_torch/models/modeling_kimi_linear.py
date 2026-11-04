@@ -2495,8 +2495,8 @@ class KimiK3MoERuntime(nn.Module):
         )
 
     def _min_latency_tail_targets(self, num_tokens: int):
-        """``(all-gather call, latent all-reduce)`` push targets of a one-kernel MoE tail, with the
-        routed experts asked to push their output into the latent all-reduce, or None."""
+        """``(all-gather call, latent all-reduce)`` push targets of a one-kernel MoE tail, where
+        the routed experts can push their output into the latent all-reduce, or None."""
         from ..kernels.blackwell import kimi_k3_moe_tail
 
         if not self._min_latency_tail_applies(num_tokens):
@@ -2513,7 +2513,7 @@ class KimiK3MoERuntime(nn.Module):
             or not latent.one_shot
             or latent.view.world != ag.view.world
             or not kimi_k3_moe_tail.can_run(num_tokens, latent.view.world, self.latent_up_rows[1])
-            or not self.routed_experts.backend.push_output_into(latent.view, num_tokens)
+            or not self.routed_experts.pushes_output(num_tokens)
         ):
             return None
         return ag, latent
@@ -3147,6 +3147,8 @@ class KimiK3MoERuntime(nn.Module):
                 routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             if isinstance(routed_in, Fp4QuantizedTensor):
                 moe_kwargs["output_dtype"] = hidden_states.dtype
+            if tail_targets is not None:
+                moe_kwargs["output_push"] = tail_targets[1].view
             y = self.routed_experts(
                 routed_in,
                 router_logits,

@@ -30,7 +30,7 @@ Design Principles:
 import copy
 import functools
 from contextlib import contextmanager
-from typing import Callable, Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Type, Union
 
 import torch
 
@@ -54,6 +54,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.ops import LamportWorkspaceView
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
 # layer_idx + load balancer) and must be mirrored onto the backend after
@@ -497,6 +500,12 @@ class ConfigurableMoE(MoE):
             torch.device("cuda"),
         )
 
+    def pushes_output(self, num_tokens: int) -> bool:
+        """Whether a forward of ``num_tokens`` tokens takes ``output_push``: the
+        backend pushes that many rows (``output_push_max_tokens``) and the routed
+        output reaches no communication strategy."""
+        return self.comm is None and 1 <= num_tokens <= self.backend.output_push_max_tokens()
+
     def nvfp4_input_scale(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Global scale of an NVFP4 input that a forward of ``num_tokens``
         tokens takes as is (``Fp4QuantizedTensor`` with linear scale factors,
@@ -741,6 +750,7 @@ class ConfigurableMoE(MoE):
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
         sorted_routing: Optional[SortedRouting] = None,
+        output_push: Optional["LamportWorkspaceView"] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -765,6 +775,10 @@ class ConfigurableMoE(MoE):
         ``sorted_routing``: the tokens' routing with this rank's ``moe_sort``
         tables, computed by the caller where ``sort_routing_applies`` (one
         chunk, no communication); used instead of routing ``router_logits``.
+
+        ``output_push``: a one-shot MNNVL all-reduce the caller finishes; the
+        backend also pushes its output rows into it, where
+        :meth:`pushes_output` holds.
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -775,6 +789,10 @@ class ConfigurableMoE(MoE):
 
         if sorted_routing is not None and not self.sort_routing_applies:
             raise ValueError("sorted routing needs a backend that runs on moe_sort tables")
+        if output_push is not None and not self.pushes_output(router_logits.shape[0]):
+            raise ValueError(
+                f"the backend does not push the output of {router_logits.shape[0]} tokens"
+            )
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -801,6 +819,7 @@ class ConfigurableMoE(MoE):
             input_ready_event=input_ready_event,
             prerouted=prerouted,
             sorted_routing=sorted_routing,
+            output_push=output_push,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

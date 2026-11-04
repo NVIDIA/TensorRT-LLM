@@ -386,6 +386,60 @@ def test_nvfp4_input_scale_only_where_the_forward_takes_the_input_as_is(blocker)
     assert ConfigurableMoE.nvfp4_input_scale(moe, 8) is expected
 
 
+@pytest.mark.parametrize(
+    "num_tokens, comm, max_tokens, expected",
+    [
+        (8, None, 32, True),
+        (32, None, 32, True),
+        (33, None, 32, False),
+        (0, None, 32, False),
+        (8, "comm", 32, False),
+        (8, None, 0, False),
+    ],
+)
+def test_pushes_output_where_the_backend_pushes_and_no_comm(num_tokens, comm, max_tokens, expected):
+    """``ConfigurableMoE.pushes_output`` takes an output push only at the token counts the backend
+    declares (``output_push_max_tokens``, 0 by default) and without a comm strategy."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+
+    assert MoEImplBase.output_push_max_tokens(object()) == 0
+    moe = SimpleNamespace(
+        comm=comm, backend=SimpleNamespace(output_push_max_tokens=lambda: max_tokens)
+    )
+    assert ConfigurableMoE.pushes_output(moe, num_tokens) is expected
+
+
+@pytest.mark.parametrize("blocker", ["comm", "chunked"])
+def test_scheduler_rejects_output_push_it_cannot_honour(blocker):
+    """The scheduler raises instead of dropping an output push on a forward with more than one
+    chunk or a comm strategy."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+
+    moe = SimpleNamespace(
+        comm=object() if blocker == "comm" else None,
+        use_dp=False,
+        calculate_num_chunks=lambda _: 2 if blocker == "chunked" else 1,
+        backend=SimpleNamespace(capabilities=SimpleNamespace(supports_moe_lora=False)),
+        determine_communication_method=lambda *_: None,
+    )
+    scheduler = ExternalCommMoEScheduler(moe)
+    with pytest.raises(ValueError, match="output push"):
+        scheduler.forward(
+            torch.zeros(4, 8),
+            torch.zeros(4, 16),
+            do_finalize=True,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=[4],
+            use_dp_padding=False,
+            output_push=object(),
+        )
+
+
 @cute_dsl
 @pytest.mark.parametrize("m", [1, 8, 16])
 def test_latent_down_nvfp4_output_feeds_routed_experts(monkeypatch, m):

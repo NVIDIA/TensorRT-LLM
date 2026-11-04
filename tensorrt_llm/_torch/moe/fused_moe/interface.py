@@ -938,6 +938,10 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 raise NotImplementedError(
                     "the `trtllm::moe_custom_op` graph path cannot carry prerouted routing"
                 )
+            if kwargs.get("output_push") is not None:
+                raise NotImplementedError(
+                    "the `trtllm::moe_custom_op` graph path cannot carry an output push"
+                )
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
             x_sf = x.scaling_factor if isinstance(x,

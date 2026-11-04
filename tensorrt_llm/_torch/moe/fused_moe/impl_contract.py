@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 import torch
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.ops import LamportWorkspaceView
     from tensorrt_llm._torch.utils import ActivationType
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -818,6 +819,10 @@ class MoERunContext:
     # produced by routing when the impl's ``try_route_with_sort`` routed this
     # forward: the ``moe_sort`` tables of ``token_selected_experts``.
     sort_tables: Optional[MoESortTables] = None
+    # produced by a caller that finishes a one-shot MNNVL all-reduce of the
+    # output: the impl also pushes its output rows into slot ``(token,
+    # view.rank)`` of it (``MoEImplBase.output_push_max_tokens``).
+    output_push: Optional["LamportWorkspaceView"] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:

@@ -346,14 +346,13 @@ class MoEImplBase(
         """
         return None
 
-    def push_output_into(self, view: object, num_tokens: int) -> bool:
-        """Ask the next ``run_moe`` (of ``num_tokens`` tokens, before any other) to also push its
-        output rows into slot ``(token, view.rank)`` of the one-shot MNNVL all-reduce on ``view``
-        (a ``distributed.ops.LamportWorkspaceView``) for a consumer that finishes it; returns
-        whether it will. Declining (False) is the default; overriding this is how a backend
-        opts in.
+    def output_push_max_tokens(self) -> int:
+        """The most tokens of a forward whose ``run_moe`` takes ``MoERunContext.output_push``:
+        it then also pushes its output rows into slot ``(token, view.rank)`` of that one-shot
+        MNNVL all-reduce, for a consumer that finishes it. Fixed at construction; declining
+        (0) is the default, overriding this is how a backend opts in.
         """
-        return False
+        return 0
 
     def try_route_with_sort(
         self, router_logits: "torch.Tensor"
