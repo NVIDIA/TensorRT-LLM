@@ -124,6 +124,20 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import mnnvl_pushed_allreduce as pushed_ar
+from .raw_ptx import asm as _asm
+from .raw_ptx import asm_pure as _asm_pure
+from .raw_ptx import bf16x2_to_f32x2 as _bf16x2_to_f32x2
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import lds_v4 as _lds_v4_b32
+from .raw_ptx import lds_v4_f32 as _lds_v4_f32
+from .raw_ptx import min_s32 as _min_s32
+from .raw_ptx import rcp_approx_ftz as _rcp_approx_ftz
+from .raw_ptx import st_u16 as _stg_u16
+from .raw_ptx import st_v4 as _stg_v4_b32
+from .raw_ptx import sts_v2 as _sts_v2_b32
+from .raw_ptx import sts_v4 as _sts_v4_b32
+from .raw_ptx import sts_v4_f32 as _sts_v4_f32
 from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 if TYPE_CHECKING:
@@ -281,97 +295,6 @@ def push_stages_fit(n: int, k: int, tactic: LowMTactic) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _asm(res, operands, text, constraints, *, loc=None, ip=None):
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _asm_pure(res, operands, text, constraints, *, loc=None, ip=None):
-    """Inline PTX without side effects (arithmetic the compiler may schedule freely)."""
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _iv(value, *, loc=None, ip=None):
-    return Int32(value).ir_value(loc=loc, ip=ip)
-
-
-def _fv(value, *, loc=None, ip=None):
-    return cutlass.Float32(value).ir_value(loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _lds_v4_b32(addr, *, loc=None, ip=None):
-    """Load 16 bytes from shared memory as four 32-bit words."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
-
-
-@dsl_user_op
-def _lds_v4_f32(addr, *, loc=None, ip=None):
-    """Load four FP32 values from shared memory."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
-        "=f,=f,=f,=f,r",
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        cutlass.Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)
-    )
-
-
-@dsl_user_op
-def _sts_v2_b32(addr, v0, v1, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _iv(v0, loc=loc, ip=ip), _iv(v1, loc=loc, ip=ip)],
-        "st.shared.v2.b32 [$0], {$1, $2};",
-        "r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _sts_v4_b32(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(x, loc=loc, ip=ip) for x in (addr, v0, v1, v2, v3)],
-        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
-        "r,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
 @dsl_user_op
 def _abs_max_bf16x32(words, *, loc=None, ip=None):
     """|x| max of 32 BF16 values (16 packed words) as two packed BF16 magnitudes.
@@ -490,7 +413,7 @@ def quant_bf16x8_to_e4m3(w0, w1, w2, w3, inv_scale, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _gate_mul_bf16x8(x0, x1, x2, x3, g0, g1, g2, g3, *, loc=None, ip=None):
+def gate_mul_bf16x8(x0, x1, x2, x3, g0, g1, g2, g3, *, loc=None, ip=None):
     """Eight BF16 products ``bf16(float(x) * float(g))`` as four packed words.
 
     The same arithmetic as PyTorch's BF16 ``x * g`` (FP32 multiply, round to nearest even),
@@ -567,21 +490,6 @@ def _sts_scale(addr, act_exp, w_exp, *, loc=None, ip=None):
         "st.shared.u8 [$0], v;\n"
         "}",
         "r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _sts_v4_f32(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [
-            _iv(addr, loc=loc, ip=ip),
-            *(cutlass.Float32(v).ir_value(loc=loc, ip=ip) for v in (v0, v1, v2, v3)),
-        ],
-        "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
-        "r,f,f,f,f",
         loc=loc,
         ip=ip,
     )
@@ -720,50 +628,7 @@ def mxfp8_quantize_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
 
 
 @dsl_user_op
-def _stg_u16(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [Int64(addr).ir_value(loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "st.global.u16 [$0], $1;",
-        "l,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _rcp_approx_ftz(x, *, loc=None, ip=None):
-    return cutlass.Float32(
-        _asm_pure(
-            T.f32(), [_fv(x, loc=loc, ip=ip)], "rcp.approx.ftz.f32 $0, $1;", "=f,f", loc=loc, ip=ip
-        )
-    )
-
-
-@dsl_user_op
-def _bf16x2_to_f32x2(word, *, loc=None, ip=None):
-    """The two BF16 halves of ``word`` (low half first) widened to FP32 (exact)."""
-    res = _asm_pure(
-        llvm.StructType.get_literal([T.f32()] * 2),
-        [_iv(word, loc=loc, ip=ip)],
-        "{\n"
-        ".reg .b32 lo, hi;\n"
-        "shl.b32 lo, $2, 16;\n"
-        "and.b32 hi, $2, 0xffff0000;\n"
-        "mov.b32 $0, lo;\n"
-        "mov.b32 $1, hi;\n"
-        "}",
-        "=f,=f,r",
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        cutlass.Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(2)
-    )
-
-
-@dsl_user_op
-def _abs_max_f32x16(vals, *, loc=None, ip=None):
+def abs_max_f32x16(vals, *, loc=None, ip=None):
     """``max |v|`` of 16 FP32 values."""
     body = "".join(f"abs.f32 t{i}, ${i + 1};\n" for i in range(16))
     for step in (8, 4, 2, 1):
@@ -782,7 +647,7 @@ def _abs_max_f32x16(vals, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6, *, loc=None, ip=None):
+def nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6, *, loc=None, ip=None):
     """E4M3 scales and output scales of two 16-element groups with maxima ``amax0``/``amax1``.
 
     Returns the two scale bytes packed in 16 bits (group 0 in the low byte) and the two output
@@ -826,7 +691,7 @@ def _nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _e2m1x8(vals, scale, *, loc=None, ip=None):
+def e2m1x8(vals, scale, *, loc=None, ip=None):
     """Scale eight FP32 values (``mul.rn``) and pack them as E2M1 into 32 bits, element 0 in
     the lowest nibble."""
     body = "".join(f"mul.rn.f32 t{i}, ${i + 1}, $9;\n" for i in range(8))
@@ -900,16 +765,16 @@ class _Nvfp4OutputMixin:
                     for i in cutlass.range_constexpr(4):
                         lo, hi = _bf16x2_to_f32x2(words[i])
                         vals.extend((lo, hi))
-                amax0 = _abs_max_f32x16(vals[:16])
-                amax1 = _abs_max_f32x16(vals[16:])
-                sf2, os0, os1 = _nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6)
+                amax0 = abs_max_f32x16(vals[:16])
+                amax1 = abs_max_f32x16(vals[16:])
+                sf2, os0, os1 = nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6)
                 col = col0 + g * 32
                 _stg_v4_b32(
                     codes_base + Int64(t) * (n // 2) + Int64(col // 2),
-                    _e2m1x8(vals[0:8], os0),
-                    _e2m1x8(vals[8:16], os0),
-                    _e2m1x8(vals[16:24], os1),
-                    _e2m1x8(vals[24:32], os1),
+                    e2m1x8(vals[0:8], os0),
+                    e2m1x8(vals[8:16], os0),
+                    e2m1x8(vals[16:24], os1),
+                    e2m1x8(vals[24:32], os1),
                 )
                 _stg_u16(sf_base + Int64(t) * (n // 16) + Int64(col // 16), sf2)
 
@@ -1744,7 +1609,7 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
                 if cutlass.const_expr(self.gated):
                     grow = g_base + x_stage * self.x_stage_bytes + r * (CTA_K * 2) + g * 64
                     for v in cutlass.range_constexpr(4):
-                        ws[v] = _gate_mul_bf16x8(*ws[v], *_lds_v4_b32(grow + ((v + rot) & 3) * 16))
+                        ws[v] = gate_mul_bf16x8(*ws[v], *_lds_v4_b32(grow + ((v + rot) & 3) * 16))
                 amax = _abs_max_bf16x32([w for quad in ws for w in quad])
                 e_a = ue8m0_of_amax(amax)
                 inv = bf16x2_inv_scale(e_a)
@@ -2075,18 +1940,6 @@ def _ldg_v4_b32(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _stg_v4_b32(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [Int64(addr).ir_value(loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
-        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _stg_u8(addr, value, *, loc=None, ip=None):
     _asm(
         None,
@@ -2160,20 +2013,6 @@ def _f32_to_bf16_bits(value, *, loc=None, ip=None):
             [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
             "{\n.reg .b16 h;\ncvt.rn.bf16.f32 h, $1;\ncvt.u32.u16 $0, h;\n}",
             "=r,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _min_s32(a, b, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
-            "min.s32 $0, $1, $2;",
-            "=r,r,r",
             loc=loc,
             ip=ip,
         )
@@ -3644,7 +3483,7 @@ def _device_capability(device_index: int) -> tuple:
     return torch.cuda.get_device_capability(device_index)
 
 
-def _is_supported_device(device_index: int) -> bool:
+def is_supported_device(device_index: int) -> bool:
     """SM100 / SM103; SM107 only with a Rubin-capable CuTe DSL."""
     from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
@@ -3679,7 +3518,7 @@ def max_m_for(n: int, k: int) -> int:
     shape without a measured limit whose weight tiles do not fit in one wave. Such shapes whose
     mid-M K slices are longer than ``_MID_M_MAX_K_TILES`` are selected for the low-M kernel only.
     """
-    if not _is_supported_device(torch.cuda.current_device()) or n % N_ALIGN or k % CTA_K:
+    if not is_supported_device(torch.cuda.current_device()) or n % N_ALIGN or k % CTA_K:
         return 0
     tables = _tables()
     max_m = tables.max_m.get((_tile_n(n), k))
@@ -3718,7 +3557,7 @@ def kernel_max_m_for(n: int, k: int) -> int:
 
 
 def _nvfp4_out_route(n: int, k: int) -> tuple:
-    if not _is_supported_device(torch.cuda.current_device()) or n % MMA_M or k % CTA_K:
+    if not is_supported_device(torch.cuda.current_device()) or n % MMA_M or k % CTA_K:
         return ()
     return _tables().nvfp4_out_route.get((n, k), ())
 
@@ -4341,7 +4180,7 @@ def can_run_nvfp4(
     (non-raising): a supported device, valid GEMM operands, ``1 <= M <= MAX_M``, whole 128-row
     weight tiles and a one-element FP32 ``global_sf`` on the same device. Where callers select
     the NVFP4 output is :func:`nvfp4_out_max_m_for`."""
-    if not x.is_cuda or not _is_supported_device(x.device.index):
+    if not x.is_cuda or not is_supported_device(x.device.index):
         return False
     try:
         check_inputs(x, w, w_scale)
@@ -4668,4 +4507,9 @@ __all__ = [
     "ue8m0_of_amax",
     "validate_nvfp4_out_tactic",
     "weights_on_chip",
+    "abs_max_f32x16",
+    "nvfp4_scales_x2",
+    "e2m1x8",
+    "gate_mul_bf16x8",
+    "is_supported_device",
 ]

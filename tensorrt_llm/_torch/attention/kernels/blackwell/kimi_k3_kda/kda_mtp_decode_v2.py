@@ -57,6 +57,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .....kernels.blackwell.raw_ptx import ldsm_x4 as ldmatrix_x4
+from .....kernels.blackwell.raw_ptx import mma_bf16 as mma_bf16_16816
+from .....kernels.blackwell.utils import griddepcontrol_wait
 from .kda_mtp_decode import (
     NUM_THREADS,
     SCRATCH_FLOATS,
@@ -187,48 +190,11 @@ def st_shared_f32x4(addr, a, b, c, d):
 
 
 @dsl_user_op
-def griddepcontrol_wait(*, loc=None, ip=None):
-    st_asm("griddepcontrol.wait;", "", [], loc=loc, ip=ip)
-
-
-@dsl_user_op
-def ldmatrix_x4(addr: cutlass.Int32, *, loc=None, ip=None):
-    """Four 8x8 b16 matrices from shared memory (``ldmatrix.sync.aligned.m8n8.x4``)."""
-    return asm_words(
-        4,
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def ld_global_b32(addr: Int64, *, loc=None, ip=None):
     """One 32-bit word (4-byte aligned) from global memory, unconverted."""
     return asm_words(
         1, "ld.global.b32 $0, [$1];", "=r,l", [Int64(addr).ir_value(loc=loc, ip=ip)], loc=loc, ip=ip
     )[0]
-
-
-@dsl_user_op
-def mma_bf16_16816(a, b0, b1, c, *, loc=None, ip=None):
-    """``d[16x8] = a[16x16] @ b[16x8] + c`` (``mma.sync`` m16n8k16, BF16 inputs, FP32 accumulate)."""
-    res = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [cutlass.Int32(x).ir_value(loc=loc, ip=ip) for x in (*a, b0, b1)]
-        + [cutlass.Float32(x).ir_value(loc=loc, ip=ip) for x in c],
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return [cutlass.Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
 
 
 def round_bf16(x: cutlass.Float32) -> cutlass.Float32:

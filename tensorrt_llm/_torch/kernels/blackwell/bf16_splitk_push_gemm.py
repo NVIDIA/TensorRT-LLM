@@ -62,16 +62,13 @@ from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
     validate_tactic,
 )
 
-from .mnnvl_pushed_allreduce import (
-    _asm,
-    _iv,
-    _ld_nc_u64,
-    _multimem_st_v4,
-    _sanitize_bf16x2,
-    _unpack,
-    ld_volatile_v4,
-    st_v4,
-)
+from .raw_ptx import asm as _asm
+from .raw_ptx import iv as _iv
+from .raw_ptx import ld_nc_u64 as _ld_nc_u64
+from .raw_ptx import ld_volatile_v4, st_v4
+from .raw_ptx import multimem_st_v4 as _multimem_st_v4
+from .raw_ptx import sanitize_bf16x2 as _sanitize_bf16x2
+from .raw_ptx import unpack as _unpack
 
 if TYPE_CHECKING:
     from ...distributed.ops import LamportWorkspaceView

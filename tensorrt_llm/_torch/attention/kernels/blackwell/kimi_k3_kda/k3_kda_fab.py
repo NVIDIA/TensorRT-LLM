@@ -72,6 +72,29 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .....kernels.blackwell.raw_ptx import asm as _asm
+from .....kernels.blackwell.raw_ptx import atom_add_u64 as _atom_add_u64
+from .....kernels.blackwell.raw_ptx import fence_proxy_async as _fence_proxy_async_shared
+from .....kernels.blackwell.raw_ptx import fv as _fv
+from .....kernels.blackwell.raw_ptx import iv as _iv
+from .....kernels.blackwell.raw_ptx import lds_b32 as _lds_b32
+from .....kernels.blackwell.raw_ptx import lds_b64 as _lds_b64
+from .....kernels.blackwell.raw_ptx import lds_v4_f32 as _lds_v4_f32
+from .....kernels.blackwell.raw_ptx import ldsm_x4 as _ldsm_x4
+from .....kernels.blackwell.raw_ptx import lv as _lv
+from .....kernels.blackwell.raw_ptx import min_s32 as _min_s32
+from .....kernels.blackwell.raw_ptx import mma_bf16 as _mma_bf16
+from .....kernels.blackwell.raw_ptx import st_sentinel_v4 as _st_sentinel_v4
+from .....kernels.blackwell.raw_ptx import sts_b64 as _sts_b64
+from .....kernels.blackwell.raw_ptx import sts_bf16 as _sts_bf16
+from .....kernels.blackwell.raw_ptx import sts_f32 as _sts_f32
+from .....kernels.blackwell.raw_ptx import sts_v4_f32 as _sts_v4_f32
+from .....kernels.blackwell.raw_ptx import unpack as _unpack
+from .....kernels.blackwell.utils import (
+    griddepcontrol_launch_dependents as _griddepcontrol_launch_dependents,
+)
+from .....kernels.blackwell.utils import griddepcontrol_wait as _griddepcontrol_wait
+
 #: Width of ``f_a`` (the ``W_fb`` reduction size).
 FA_DIM = 128
 #: Largest token count.
@@ -149,101 +172,6 @@ class FabConfig:
 # ---------------------------------------------------------------------------
 
 
-def _asm(res, operands, text, constraints, *, loc=None, ip=None):
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _iv(value, *, loc=None, ip=None):
-    return Int32(value).ir_value(loc=loc, ip=ip)
-
-
-def _lv(value, *, loc=None, ip=None):
-    return Int64(value).ir_value(loc=loc, ip=ip)
-
-
-def _fv(value, *, loc=None, ip=None):
-    return Float32(value).ir_value(loc=loc, ip=ip)
-
-
-def _unpack(res, ty, cls, n, *, loc=None, ip=None):
-    return tuple(cls(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(n))
-
-
-@dsl_user_op
-def _ldsm_x4(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _mma_bf16(a, b0, b1, c, *, loc=None, ip=None):
-    """``d[16x8] = a[16x16] @ b[16x8] + c`` (BF16 inputs, FP32 accumulate)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(x, loc=loc, ip=ip) for x in (*a, b0, b1)] + [_fv(x, loc=loc, ip=ip) for x in c],
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _sts_f32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
-        "st.shared.f32 [$0], $1;",
-        "r,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _lds_v4_f32(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
-        "=f,=f,=f,=f,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _sts_v4_f32(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)] + [_fv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
-        "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
-        "r,f,f,f,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
 @dsl_user_op
 def _sts_bf16x4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
     """Round four FP32 values to BF16 (nearest even) and store them as 8 bytes."""
@@ -255,27 +183,6 @@ def _sts_bf16x4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
         "r,f,f,f,f",
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def _sts_b64(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
-        "st.shared.b64 [$0], $1;",
-        "r,l",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _lds_b64(addr, *, loc=None, ip=None):
-    return Int64(
-        _asm(
-            T.i64(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.b64 $0, [$1];", "=l,r", loc=loc, ip=ip
-        )
     )
 
 
@@ -319,20 +226,6 @@ def _st_global_bf16x4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _atom_add_u64(addr, value, *, loc=None, ip=None):
-    return Int64(
-        _asm(
-            T.i64(),
-            [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
-            "atom.relaxed.gpu.global.add.u64 $0, [$1], $2;",
-            "=l,l,l",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def _red_add_u64(addr, value, *, loc=None, ip=None):
     _asm(
         None,
@@ -363,18 +256,6 @@ def _st_relaxed_v4_f32(addr, v0, v1, v2, v3, *, loc=None, ip=None):
         [_lv(addr, loc=loc, ip=ip)] + [_fv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
         "st.relaxed.gpu.global.v4.f32 [$0], {$1, $2, $3, $4};",
         "l,f,f,f,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _st_sentinel_v4(addr, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip)],
-        "{\n.reg .b32 t;\nmov.b32 t, -1;\nst.global.v4.b32 [$0], {t, t, t, t};\n}",
-        "l",
         loc=loc,
         ip=ip,
     )
@@ -415,43 +296,12 @@ def _ld_relaxed_u64(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _min_s32(a, b, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
-            "min.s32 $0, $1, $2;",
-            "=r,r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _fence_proxy_async_shared(*, loc=None, ip=None):
-    _asm(None, [], "fence.proxy.async.shared::cta;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _prefetch_l2(addr, nbytes, *, loc=None, ip=None):
     _asm(
         None,
         [_lv(addr, loc=loc, ip=ip), _iv(nbytes, loc=loc, ip=ip)],
         "cp.async.bulk.prefetch.L2.global [$0], $1;",
         "l,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _sts_bf16(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
-        "{\n.reg .b16 h;\ncvt.rn.bf16.f32 h, $1;\nst.shared.b16 [$0], h;\n}",
-        "r,f",
         loc=loc,
         ip=ip,
     )
@@ -468,25 +318,6 @@ def _copy_s2g_16(dst, src, *, loc=None, ip=None):
         "l,r",
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def _griddepcontrol_wait(*, loc=None, ip=None):
-    _asm(None, [], "griddepcontrol.wait;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _griddepcontrol_launch_dependents(*, loc=None, ip=None):
-    _asm(None, [], "griddepcontrol.launch_dependents;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _lds_b32(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.b32 $0, [$1];", "=r,r", loc=loc, ip=ip
-        )
     )
 
 

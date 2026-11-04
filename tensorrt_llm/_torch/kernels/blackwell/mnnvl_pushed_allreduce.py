@@ -77,9 +77,23 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
-from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .raw_ptx import acc_bf16x2 as _acc_bf16x2
+from .raw_ptx import add_f32 as _add_f32
+from .raw_ptx import asm as _asm
+from .raw_ptx import atom_add_acq_rel_u32 as _atom_add_acq_rel_u32
+from .raw_ptx import iv as _iv
+from .raw_ptx import ld_acquire_u32 as _ld_acquire_u32
+from .raw_ptx import ld_nc_u64 as _ld_nc_u64
+from .raw_ptx import ld_v4 as _ld_v4
+from .raw_ptx import ld_volatile_v4, st_v4
+from .raw_ptx import lv as _lv
+from .raw_ptx import multimem_st_v4 as _multimem_st_v4
+from .raw_ptx import pack_bf16x2 as _pack_bf16x2
+from .raw_ptx import red_release_add as _red_release_add
+from .raw_ptx import sanitize_bf16x2 as _sanitize_bf16x2
+from .raw_ptx import st_u32 as _st_u32
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 if TYPE_CHECKING:
@@ -93,7 +107,7 @@ NUM_BUFFERS = 3
 WORLD_SIZES = (2, 4, 8, 16, 32, 64)
 #: Word of the CTA arrival counter in the workspace's state flags (uint32 [9]: current buffer,
 #: dirty buffer, bytes per buffer, dirty stages, bytes to clear per stage x4, arrivals).
-_FLAG_ARRIVALS = 8
+FLAG_ARRIVALS = 8
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -103,105 +117,6 @@ def _ceil_div(a: int, b: int) -> int:
 # ---------------------------------------------------------------------------
 # Inline PTX helpers
 # ---------------------------------------------------------------------------
-
-
-def _asm(res, operands, text, constraints, *, loc=None, ip=None):
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _iv(value, *, loc=None, ip=None):
-    return Int32(value).ir_value(loc=loc, ip=ip)
-
-
-def _lv(value, *, loc=None, ip=None):
-    return Int64(value).ir_value(loc=loc, ip=ip)
-
-
-def _fv(value, *, loc=None, ip=None):
-    return cutlass.Float32(value).ir_value(loc=loc, ip=ip)
-
-
-def _unpack(res, ty, cls, n, *, loc=None, ip=None):
-    return tuple(cls(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(n))
-
-
-@dsl_user_op
-def ld_volatile_v4(addr, *, loc=None, ip=None):
-    """16 bytes of a Lamport buffer (or the state flags), read past L1."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _ld_v4(addr, *, loc=None, ip=None):
-    """16 bytes of a tensor an earlier grid wrote."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _ld_nc_u64(addr, *, loc=None, ip=None):
-    """A 64-bit word of a tensor no kernel writes (the peer pointer table)."""
-    return Int64(
-        _asm(
-            T.i64(),
-            [_lv(addr, loc=loc, ip=ip)],
-            "ld.global.nc.u64 $0, [$1];",
-            "=l,l",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def st_v4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    """16-byte store to local memory or to a peer's unicast mapping."""
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
-        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _multimem_st_v4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    """16-byte store to the address in every rank's buffer (multicast mapping)."""
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
-        "multimem.st.relaxed.sys.global.v4.f32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op
@@ -234,123 +149,6 @@ def arrived_v4(w0, w1, w2, w3, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _sanitize_bf16x2(word, *, loc=None, ip=None):
-    """Replace each ``-0`` half (0x8000) of a BF16 pair by ``+0``."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(word, loc=loc, ip=ip)],
-            "{\n.reg .pred p, q;\n.reg .b32 l, h;\n"
-            "and.b32 l, $1, 0xffff;\nsetp.eq.b32 p, l, 0x8000;\nselp.b32 l, 0, l, p;\n"
-            "and.b32 h, $1, 0xffff0000;\nsetp.eq.b32 q, h, 0x80000000;\nselp.b32 h, 0, h, q;\n"
-            "or.b32 $0, l, h;\n}",
-            "=r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _acc_bf16x2(word, acc_lo, acc_hi, *, loc=None, ip=None):
-    """``(acc_lo + lo, acc_hi + hi)`` in FP32 (round to nearest) for the BF16 pair ``word``."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 2),
-        [_iv(word, loc=loc, ip=ip), _fv(acc_lo, loc=loc, ip=ip), _fv(acc_hi, loc=loc, ip=ip)],
-        "{\n.reg .b32 l, h;\n.reg .f32 fl, fh;\n"
-        "shl.b32 l, $2, 16;\nand.b32 h, $2, 0xffff0000;\n"
-        "mov.b32 fl, l;\nmov.b32 fh, h;\n"
-        "add.rn.f32 $0, $3, fl;\nadd.rn.f32 $1, $4, fh;\n}",
-        "=f,=f,r,f,f",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), cutlass.Float32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _add_f32(a, b, *, loc=None, ip=None):
-    return cutlass.Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "add.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _pack_bf16x2(lo, hi, *, loc=None, ip=None):
-    """Round two FP32 values to BF16 (nearest even), ``lo`` in the low half."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [_fv(lo, loc=loc, ip=ip), _fv(hi, loc=loc, ip=ip)],
-            "cvt.rn.bf16x2.f32 $0, $2, $1;",
-            "=r,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _red_release_add(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "red.release.gpu.global.add.u32 [$0], $1;",
-        "l,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _atom_add_acq_rel_u32(addr, value, *, loc=None, ip=None):
-    """``atomicAdd`` (acquire-release, GPU scope); returns the old value."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
-            "=r,l,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _ld_acquire_u32(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_lv(addr, loc=loc, ip=ip)],
-            "ld.acquire.gpu.global.u32 $0, [$1];",
-            "=r,l",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _st_u32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "st.global.u32 [$0], $1;",
-        "l,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Device functions for producers and consumers
 # ---------------------------------------------------------------------------
@@ -366,7 +164,7 @@ def lamport_state(flags_addr: Int64):
 
 
 @cute.jit
-def _stage_addr(base: Int64, index: Int32, stage: Int32, num_stages: int, bytes_per_buffer: Int32):
+def stage_addr(base: Int64, index: Int32, stage: Int32, num_stages: int, bytes_per_buffer: Int32):
     """Address of ``stage`` of Lamport buffer ``index`` (``LamportBufferLayout::getStagePtr``)."""
     stage_bytes = Int64(bytes_per_buffer // num_stages)
     return base + Int64(index * num_stages + stage) * stage_bytes
@@ -400,13 +198,11 @@ def push_slot(
     row_bytes = hidden * 2
     addr = Int64(0)
     if cutlass.const_expr(one_shot):
-        addr = (
-            _stage_addr(mc_base, cur, Int32(0), 1, nbytes) + Int64(tok * world + rank) * row_bytes
-        )
+        addr = stage_addr(mc_base, cur, Int32(0), 1, nbytes) + Int64(tok * world + rank) * row_bytes
     else:
         owner = _ld_nc_u64(peer_ptrs + Int64(tok % world) * 8)
         addr = (
-            _stage_addr(owner, cur, Int32(0), 2, nbytes)
+            stage_addr(owner, cur, Int32(0), 2, nbytes)
             + Int64((tok // world) * world + rank) * row_bytes
         )
     return addr + Int64(elem) * 2
@@ -432,7 +228,7 @@ def poll_result_v4(uc_local: Int64, flags: Int64, tok: Int32, byte_off: Int32, h
     all-reduce on the workspace re-arms it, so only a kernel ordered before that call may read
     it."""
     f = ld_volatile_v4(flags)
-    row = _stage_addr(uc_local, f[1], Int32(1), 2, f[2]) + Int64(tok * hidden) * 2
+    row = stage_addr(uc_local, f[1], Int32(1), 2, f[2]) + Int64(tok * hidden) * 2
     w = ld_volatile_v4(row + Int64(byte_off))
     while arrived_v4(*w) == 0:
         w = ld_volatile_v4(row + Int64(byte_off))
@@ -480,7 +276,7 @@ def all_gather_row(
 ):
     """Address of token ``tok``'s all-gather row in buffer ``cur`` of an all-gather call of ``m``
     rows (after the ``m * world`` one-shot slots); ``base``: unicast or multicast base."""
-    return _stage_addr(base, cur, Int32(0), 1, nbytes) + Int64(m * world + tok) * (hidden * 2)
+    return stage_addr(base, cur, Int32(0), 1, nbytes) + Int64(m * world + tok) * (hidden * 2)
 
 
 @cute.jit
@@ -517,7 +313,7 @@ def round_sum_v4(acc, sanitize: bool):
 def one_shot_slots(uc_local: Int64, cur: Int32, nbytes: Int32, tok: Int32, world: int, hidden: int):
     """Address of rank 0's slot of token ``tok`` in buffer ``cur`` of a one-shot call (the slots
     of the other ranks follow, ``hidden * 2`` bytes apart)."""
-    return _stage_addr(uc_local, cur, Int32(0), 1, nbytes) + Int64(tok * world) * (hidden * 2)
+    return stage_addr(uc_local, cur, Int32(0), 1, nbytes) + Int64(tok * world) * (hidden * 2)
 
 
 @cute.jit
@@ -587,7 +383,7 @@ def arrive_finish(
     thread per CTA, once every thread of the CTA has read the state and the call's producer has
     completed); the last CTA writes the next call's state and resets the counter, as
     :class:`PushedAllReduceFinishKernel`'s updater does."""
-    arrivals = flags + Int64(_FLAG_ARRIVALS * 4)
+    arrivals = flags + Int64(FLAG_ARRIVALS * 4)
     old = _atom_add_acq_rel_u32(arrivals, Int32(1))
     if old == total - 1:
         _write_next_state(flags, cur, nbytes, m, world, hidden, one_shot, all_gather)
@@ -617,7 +413,7 @@ def finish_two_shot_v4(
     w2 = Int32(0)
     w3 = Int32(0)
     if tok % world == rank:
-        scatter = _stage_addr(uc_local, cur, Int32(0), 2, nbytes)
+        scatter = stage_addr(uc_local, cur, Int32(0), 2, nbytes)
         acc = reduce_slots_v4(
             scatter + Int64((tok // world) * world * hidden) * 2 + Int64(byte_off),
             hidden * 2,
@@ -629,10 +425,10 @@ def finish_two_shot_v4(
         w2 = _sanitize_bf16x2(_pack_bf16x2(acc[4], acc[5]))
         w3 = _sanitize_bf16x2(_pack_bf16x2(acc[6], acc[7]))
         if store != 0:
-            bcast_mc = _stage_addr(mc_base, cur, Int32(1), 2, nbytes)
+            bcast_mc = stage_addr(mc_base, cur, Int32(1), 2, nbytes)
             _multimem_st_v4(bcast_mc + Int64(tok * hidden) * 2 + Int64(byte_off), w0, w1, w2, w3)
     else:
-        src = _stage_addr(uc_local, cur, Int32(1), 2, nbytes) + Int64(tok * hidden) * 2
+        src = stage_addr(uc_local, cur, Int32(1), 2, nbytes) + Int64(tok * hidden) * 2
         w = ld_volatile_v4(src + Int64(byte_off))
         while arrived_v4(*w) == 0:
             w = ld_volatile_v4(src + Int64(byte_off))
@@ -749,7 +545,7 @@ class PushedAllReduceFinishKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         workers = m * self.cols
-        arrivals = flags + Int64(_FLAG_ARRIVALS * 4)
+        arrivals = flags + Int64(FLAG_ARRIVALS * 4)
         if bidx == workers:
             # Updater: the next call's state, once the producer is done with this call's.
             if cutlass.const_expr(self.use_pdl):
@@ -776,7 +572,7 @@ class PushedAllReduceFinishKernel:
             row_bytes = H * 2
             out_v = out + Int64(tok * H + v * 8) * 2
             if cutlass.const_expr(self.one_shot):
-                buf = _stage_addr(uc_local, cur, Int32(0), 1, nbytes)
+                buf = stage_addr(uc_local, cur, Int32(0), 1, nbytes)
                 if v < self.vecs:
                     acc = reduce_slots_v4(
                         buf + Int64(tok * W * H + v * 8) * 2, row_bytes, W, self.chunk
@@ -791,7 +587,7 @@ class PushedAllReduceFinishKernel:
             else:
                 if v < self.vecs:
                     if tok % W == rank:
-                        scatter = _stage_addr(uc_local, cur, Int32(0), 2, nbytes)
+                        scatter = stage_addr(uc_local, cur, Int32(0), 2, nbytes)
                         acc = reduce_slots_v4(
                             scatter + Int64((tok // W) * W * H + v * 8) * 2,
                             row_bytes,
@@ -802,7 +598,7 @@ class PushedAllReduceFinishKernel:
                             _sanitize_bf16x2(_pack_bf16x2(acc[2 * q], acc[2 * q + 1]))
                             for q in range(4)
                         ]
-                        bcast_mc = _stage_addr(mc_base, cur, Int32(1), 2, nbytes)
+                        bcast_mc = stage_addr(mc_base, cur, Int32(1), 2, nbytes)
                         _multimem_st_v4(bcast_mc + Int64(tok * H + v * 8) * 2, *o)
             # Re-arm the previous call's buffer (every stage it used) while the rows travel.
             clear_dirty_stages(
@@ -820,7 +616,7 @@ class PushedAllReduceFinishKernel:
             if cutlass.const_expr(not self.one_shot and self.gather):
                 if v < self.vecs:
                     src = (
-                        _stage_addr(uc_local, cur, Int32(1), 2, nbytes) + Int64(tok * H + v * 8) * 2
+                        stage_addr(uc_local, cur, Int32(1), 2, nbytes) + Int64(tok * H + v * 8) * 2
                     )
                     w = ld_volatile_v4(src)
                     while arrived_v4(*w) == 0:

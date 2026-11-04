@@ -74,22 +74,41 @@ from . import fp8_block_scale_low_m_gemm as low_m_gemm
 
 # The MXFP8 activation quantization uses the low-M GEMM's own helpers, so the
 # q_b operand is bitwise the one that GEMM quantizes.
-from .fp8_block_scale_low_m_gemm import (
-    _asm,
-    _fv,
-    _iv,
-    _lds_v4_b32,
-    _lds_v4_f32,
-    _sts_v2_b32,
-    _sts_v4_b32,
-    _sts_v4_f32,
-)
 from .fp8_block_scale_low_m_gemm import amax_bf16x8 as _amax_bf16x8_words
 from .fp8_block_scale_low_m_gemm import amax_pair as _amax_pair
 from .fp8_block_scale_low_m_gemm import bf16x2_inv_scale as _bf16x2_inv_scale
 from .fp8_block_scale_low_m_gemm import quant_bf16x8_to_e4m3 as _quant_bf16x8_to_e4m3
 from .fp8_block_scale_low_m_gemm import ue8m0_of_amax as _ue8m0_of_amax
-from .mnnvl_pushed_allreduce import _lv, _unpack
+from .raw_ptx import add_f32 as _add_rn
+from .raw_ptx import asm as _asm
+from .raw_ptx import bf16x2_to_f32x2 as _bf16x2_to_f32x2
+from .raw_ptx import cluster_sync as _cluster_sync
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import ld_nc_u8 as _ldg_u8
+from .raw_ptx import ld_v4 as _ldg_v4
+from .raw_ptx import lds_b32 as _lds_b32
+from .raw_ptx import lds_v4 as _lds_v4_b32
+from .raw_ptx import lds_v4_f32 as _lds_v4_f32
+from .raw_ptx import ldsm_x4 as _ldsm_x4
+from .raw_ptx import lv as _lv
+from .raw_ptx import mbar_arrive as _mbar_arrive
+from .raw_ptx import mbar_expect_tx as _mbar_expect_tx
+from .raw_ptx import mbar_init_fenced as _mbar_init
+from .raw_ptx import mbar_try_wait as _mbar_try_wait
+from .raw_ptx import mma_bf16 as _mma_bf16
+from .raw_ptx import mul_f32 as _mul_rn
+from .raw_ptx import shfl_bfly_b32 as _shfl_bfly_b32
+from .raw_ptx import st_u8 as _stg_u8
+from .raw_ptx import st_v2 as _stg_v2
+from .raw_ptx import st_v4 as _stg_v4
+from .raw_ptx import sts_b32 as _sts_b32
+from .raw_ptx import sts_bf16 as _sts_bf16
+from .raw_ptx import sts_f32 as _sts_f32
+from .raw_ptx import sts_v2 as _sts_v2_b32
+from .raw_ptx import sts_v4 as _sts_v4_b32
+from .raw_ptx import sts_v4_f32 as _sts_v4_f32
+from .raw_ptx import unpack as _unpack
 from .utils import griddepcontrol_launch_dependents as _griddepcontrol_launch_dependents
 from .utils import griddepcontrol_wait as _griddepcontrol_wait
 
@@ -160,76 +179,6 @@ _FIXED_BYTES = 256
 _Q_SCALE_FLOOR = 0x3B000000
 
 
-@dsl_user_op
-def _mbar_expect_tx(addr, nbytes: int, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], {nbytes};",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mbar_init(addr, count: int, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.init.shared::cta.b64 [$0], {count};\nfence.mbarrier_init.release.cluster;",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mbar_try_wait(addr, phase, *, loc=None, ip=None):
-    """1 once phase ``phase`` of the shared mbarrier at ``addr`` has completed, else 0."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(addr, loc=loc, ip=ip), _iv(phase, loc=loc, ip=ip)],
-            "{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n"
-            "selp.u32 $0, 1, 0, p;\n}",
-            "=r,r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _mma_bf16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """``d[16x8] = a[16x16] @ b[16x8] + c`` (BF16 inputs, FP32 accumulation)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(x, loc=loc, ip=ip) for x in (a0, a1, a2, a3, b0, b1)]
-        + [_fv(x, loc=loc, ip=ip) for x in (c0, c1, c2, c3)],
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _shfl_bfly_b32(value, offset: int, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(value, loc=loc, ip=ip)],
-            f"shfl.sync.bfly.b32 $0, $1, {offset}, 31, -1;",
-            "=r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
 def _qb_split_k(t_pad: int) -> int:
     """Split-K of the low-M GEMM's default q_b tactic at ``t_pad`` tokens on this device."""
     return low_m_gemm.default_tactic(t_pad, NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK).split_k
@@ -259,20 +208,6 @@ def smem_bytes(t_pad: int) -> int:
 # ---------------------------------------------------------------------------
 # Inline PTX helpers
 # ---------------------------------------------------------------------------
-
-
-@dsl_user_op
-def _ldsm_x4(addr, *, loc=None, ip=None):
-    """``ldmatrix`` of four 8x8 b16 matrices (lane ``l`` addresses a row of matrix ``l // 8``)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -340,20 +275,6 @@ def _lds_v2_f32(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _add_rn(a, b, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "add.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def _fma_rn(a, b, c, *, loc=None, ip=None):
     return Float32(
         _asm(
@@ -364,39 +285,6 @@ def _fma_rn(a, b, c, *, loc=None, ip=None):
             loc=loc,
             ip=ip,
         )
-    )
-
-
-@dsl_user_op
-def _lds_b32(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.b32 $0, [$1];", "=r,r", loc=loc, ip=ip
-        )
-    )
-
-
-@dsl_user_op
-def _sts_b32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "st.shared.b32 [$0], $1;",
-        "r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _sts_f32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
-        "st.shared.f32 [$0], $1;",
-        "r,f",
-        loc=loc,
-        ip=ip,
     )
 
 
@@ -420,19 +308,6 @@ def _sts_u8(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _sts_bf16(addr, value, *, loc=None, ip=None):
-    """Store ``value`` rounded to BF16 (nearest even) at shared ``addr``."""
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
-        "{\n.reg .b16 h;\ncvt.rn.bf16.f32 h, $1;\nst.shared.b16 [$0], h;\n}",
-        "r,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _sts_bf16_both(addr, peer, value, *, loc=None, ip=None):
     """Store ``value`` rounded to BF16 at shared ``addr`` of this CTA and of cluster rank
     ``peer`` (same offset)."""
@@ -444,20 +319,6 @@ def _sts_bf16_both(addr, peer, value, *, loc=None, ip=None):
         "r,r,f",
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def _ldg_u8(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_lv(addr, loc=loc, ip=ip)],
-            "ld.global.nc.u8 $0, [$1];",
-            "=r,l",
-            loc=loc,
-            ip=ip,
-        )
     )
 
 
@@ -480,19 +341,6 @@ def _ldg_f32(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ldg_v4(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _ldg_v4_pred(addr, pred, *, loc=None, ip=None):
     """16 bytes at ``addr`` if ``pred > 0``, else zeros (no load)."""
     res = _asm(
@@ -505,42 +353,6 @@ def _ldg_v4_pred(addr, pred, *, loc=None, ip=None):
         ip=ip,
     )
     return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _stg_v2(addr, v0, v1, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip), _iv(v0, loc=loc, ip=ip), _iv(v1, loc=loc, ip=ip)],
-        "st.global.v2.b32 [$0], {$1, $2};",
-        "l,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _stg_v4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
-        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _stg_u8(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "st.global.u8 [$0], $1;",
-        "l,r",
-        loc=loc,
-        ip=ip,
-    )
 
 
 @cute.jit
@@ -597,18 +409,6 @@ def _swz(row, chunk):
 
 
 @dsl_user_op
-def _mbar_arrive(addr, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        "mbarrier.arrive.shared::cta.b64 _, [$0];",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _bar_sync(bar_id, count: int, *, loc=None, ip=None):
     """``bar.sync bar_id, count`` (named CTA barrier)."""
     _asm(None, [_iv(bar_id, loc=loc, ip=ip)], f"bar.sync $0, {count};", "r", loc=loc, ip=ip)
@@ -621,50 +421,8 @@ def _bar_arrive(bar_id, count: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _cluster_sync(*, loc=None, ip=None):
-    """All threads of the cluster: release this CTA's shared stores, acquire the peers'."""
-    _asm(
-        None,
-        [],
-        "barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;",
-        "",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _cluster_ctarank(*, loc=None, ip=None):
     return Int32(_asm(T.i32(), [], "mov.u32 $0, %cluster_ctarank;", "=r", loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _bf16x2_to_f32x2(word, *, loc=None, ip=None):
-    """The two BF16 halves of ``word`` (low half first) as FP32 (exact)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 2),
-        [_iv(word, loc=loc, ip=ip)],
-        "{\n.reg .b32 lo, hi;\nshl.b32 lo, $2, 16;\nand.b32 hi, $2, 0xffff0000;\n"
-        "mov.b32 $0, lo;\nmov.b32 $1, hi;\n}",
-        "=f,=f,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _mul_rn(a, b, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "mul.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
 
 
 @dsl_user_op
@@ -1296,9 +1054,7 @@ class K3MlaQFusedKernel:
             for mm in cutlass.range_constexpr(2):
                 a = a_mm[mm]
                 for n in cutlass.range_constexpr(nt):
-                    accs[mm][n] = list(
-                        _mma_bf16(a[0], a[1], a[2], a[3], bs[n][0], bs[n][1], *accs[mm][n])
-                    )
+                    accs[mm][n] = list(_mma_bf16(a, bs[n][0], bs[n][1], accs[mm][n]))
         for mm in cutlass.range_constexpr(2):
             m = warp * Int32(2) + Int32(mm)
             acc = accs[mm]

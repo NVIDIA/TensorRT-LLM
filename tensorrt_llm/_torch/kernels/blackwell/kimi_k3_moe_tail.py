@@ -65,22 +65,37 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import mnnvl_pushed_allreduce as pushed_ar
-from .mnnvl_pushed_allreduce import _acc_bf16x2 as acc_bf16x2
-from .mnnvl_pushed_allreduce import _add_f32 as add_f32
-from .mnnvl_pushed_allreduce import (
-    _asm,
-    _fv,
-    _iv,
-    _lv,
-    _unpack,
-    clear_dirty_stages,
+from .mnnvl_pushed_allreduce import arrived_v4 as clean4
+from .mnnvl_pushed_allreduce import clear_dirty_stages
+from .raw_ptx import (
+    acc_bf16x2,
+    add_f32,
     ld_volatile_v4,
+    multimem_st_v4,
+    pack_bf16x2,
+    sanitize_bf16x2,
     st_v4,
 )
-from .mnnvl_pushed_allreduce import _multimem_st_v4 as multimem_st_v4
-from .mnnvl_pushed_allreduce import _pack_bf16x2 as pack_bf16x2
-from .mnnvl_pushed_allreduce import _sanitize_bf16x2 as sanitize_bf16x2
-from .mnnvl_pushed_allreduce import arrived_v4 as clean4
+from .raw_ptx import asm as _asm
+from .raw_ptx import bar_sync as _bar_sync
+from .raw_ptx import bf16x2_to_f32x2 as _bf16x2_f32
+from .raw_ptx import cluster_arrive_relaxed as _cluster_arrive_relaxed
+from .raw_ptx import fence_mbar_init as _fence_mbar_init
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import ld_nc_u8 as _ld_nc_u8
+from .raw_ptx import ld_nc_v2 as _ld_nc_v2
+from .raw_ptx import ld_nc_v4 as _ld_nc_v4
+from .raw_ptx import lds_f32 as _lds_f32
+from .raw_ptx import lds_v4_f32 as _lds_v4_f32
+from .raw_ptx import mbar_expect_tx as _mbar_expect_tx
+from .raw_ptx import mbar_init as _mbar_init
+from .raw_ptx import mma_bf16 as _mma_bf16
+from .raw_ptx import mul_f32 as _fmul
+from .raw_ptx import shfl_bfly_f32 as _shfl_bfly_f32
+from .raw_ptx import sts_f32 as _sts_f32
+from .raw_ptx import sts_v4 as _sts_v4
+from .raw_ptx import unpack as _unpack
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 __all__ = [
@@ -137,46 +152,6 @@ assert KS % 8 == 0 and KS == 224 and 56 * 4 == KS
 
 
 @dsl_user_op
-def _ld_nc_v2(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 2),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.global.nc.v2.b32 {$0, $1}, [$2];",
-        "=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _ld_nc_u8(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_lv(addr, loc=loc, ip=ip)],
-            "ld.global.nc.u8 $0, [$1];",
-            "=r,l",
-            loc=loc,
-            ip=ip,
-        )  # fmt: skip
-    )
-
-
-@dsl_user_op
-def _ld_nc_v4(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _deq_bf16x2(word, scale, high: bool, *, loc=None, ip=None):
     """Two E4M3 codes (the low or high 16 bits of ``word``, low byte first) times ``scale`` (a power
     of two) as a BF16 pair, low value in the low half. Exact for latent_up's weights: E4M3 -> F16 ->
@@ -216,21 +191,6 @@ def _exp2_of_ue8m0(e, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _bf16x2_f32(word, *, loc=None, ip=None):
-    """(low, high) BF16 of a pair as FP32."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 2),
-        [_iv(word, loc=loc, ip=ip)],
-        "{\n.reg .b32 lo, hi;\nshl.b32 lo, $2, 16;\nand.b32 hi, $2, 0xffff0000;\n"
-        "mov.b32 $0, lo;\nmov.b32 $1, hi;\n}",
-        "=f,=f,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _fma(a, b, c, *, loc=None, ip=None):
     return Float32(
         _asm(
@@ -238,20 +198,6 @@ def _fma(a, b, c, *, loc=None, ip=None):
             [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip), _fv(c, loc=loc, ip=ip)],
             "fma.rn.f32 $0, $1, $2, $3;",
             "=f,f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _fmul(a, b, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "mul.rn.f32 $0, $1, $2;",
-            "=f,f,f",
             loc=loc,
             ip=ip,
         )
@@ -275,36 +221,6 @@ def _rms_scale(total, eps, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _shfl_bfly_f32(value, offset: int, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(value, loc=loc, ip=ip)],
-            f"shfl.sync.bfly.b32 $0, $1, {offset}, 31, -1;",
-            "=f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _mma_bf16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """``d[16x8] = a[16x16] @ b[16x8] + c`` (BF16 inputs, FP32 accumulation)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(x, loc=loc, ip=ip) for x in (a0, a1, a2, a3, b0, b1)]
-        + [_fv(x, loc=loc, ip=ip) for x in (c0, c1, c2, c3)],
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _lds_v2(addr, *, loc=None, ip=None):
     res = _asm(
         llvm.StructType.get_literal([T.i32()] * 2),
@@ -315,112 +231,6 @@ def _lds_v2(addr, *, loc=None, ip=None):
         ip=ip,
     )
     return _unpack(res, T.i32(), Int32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _lds_v4_f32(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
-        "=f,=f,=f,=f,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _lds_f32(addr, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_iv(addr, loc=loc, ip=ip)],
-            "ld.shared.f32 $0, [$1];",
-            "=f,r",
-            loc=loc,
-            ip=ip,
-        )  # fmt: skip
-    )
-
-
-@dsl_user_op
-def _lds_b32(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(addr, loc=loc, ip=ip)],
-            "ld.shared.b32 $0, [$1];",
-            "=r,r",
-            loc=loc,
-            ip=ip,
-        )  # fmt: skip
-    )
-
-
-@dsl_user_op
-def _sts_b32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "st.shared.b32 [$0], $1;",
-        "r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _sts_f32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
-        "st.shared.f32 [$0], $1;",
-        "r,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _sts_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)] + [_iv(w, loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
-        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
-        "r,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mbar_init(addr, count: int, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.init.shared::cta.b64 [$0], {count};",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mbar_expect_tx(addr, nbytes: int, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], {nbytes};",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _fence_mbar_init(*, loc=None, ip=None):
-    _asm(None, [], "fence.mbarrier_init.release.cluster;", "", loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -481,45 +291,8 @@ def _st_async_v4_f32(local_addr, peer, local_mbar, v0, v1, v2, v3, *, loc=None, 
 
 
 @dsl_user_op
-def _bulk_g2s(dst, src, nbytes: int, mbar, *, loc=None, ip=None):
-    """Bulk copy of ``nbytes`` from global ``src`` to shared ``dst``, completing on ``mbar``."""
-    _asm(
-        None,
-        [_iv(dst, loc=loc, ip=ip), _lv(src, loc=loc, ip=ip), _iv(mbar, loc=loc, ip=ip)],
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
-        f"[$0], [$1], {nbytes}, [$2];",
-        "r,l,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _lds_v4(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _cluster_arrive_relaxed(*, loc=None, ip=None):
-    _asm(None, [], "barrier.cluster.arrive.relaxed.aligned;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _cluster_wait(*, loc=None, ip=None):
     _asm(None, [], "barrier.cluster.wait.aligned;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _bar_sync(barrier_id: int, count: int, *, loc=None, ip=None):
-    _asm(None, [], f"bar.sync {barrier_id}, {count};", "", loc=loc, ip=ip)
 
 
 class KimiK3MoeTailKernel:
@@ -799,8 +572,8 @@ class KimiK3MoeTailKernel:
                     base = (s * KJ + j) * 4
                     ch = acc2[j % 2]
                     acc2[j % 2] = list(_mma_bf16(
-                        afr[base], afr[base + 1], afr[base + 2], afr[base + 3],
-                        bfr[2 * j], bfr[2 * j + 1], ch[0], ch[1], ch[2], ch[3],
+                        (afr[base], afr[base + 1], afr[base + 2], afr[base + 3]),
+                        bfr[2 * j], bfr[2 * j + 1], ch,
                     ))  # fmt: skip
                 d0 = add_f32(acc2[0][0], acc2[1][0])
                 d1 = add_f32(acc2[0][1], acc2[1][1])

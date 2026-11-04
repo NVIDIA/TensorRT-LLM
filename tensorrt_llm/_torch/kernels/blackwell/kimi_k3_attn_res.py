@@ -94,6 +94,16 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import fp8_block_scale_low_m_gemm as low_m_gemm
 from . import mnnvl_pushed_allreduce as pushed_ar
+from .raw_ptx import asm as _asm_se
+from .raw_ptx import asm_pure as _asm
+from .raw_ptx import cluster_arrive_relaxed as _cluster_arrive_relaxed
+from .raw_ptx import fence_mbar_init as _fence_mbar_init
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import lds_f32 as _lds_f32
+from .raw_ptx import lv as _lv
+from .raw_ptx import mbar_expect_tx as _mbar_arrive_expect_tx
+from .raw_ptx import mbar_init as _mbar_init
 from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: Candidate counts (snapshots + the layer row) the kernel is instantiated for.
@@ -118,46 +128,6 @@ def _f32_immediate(value: float) -> str:
 # ---------------------------------------------------------------------------
 # Inline PTX helpers (the fast-math instructions of the C++ attention-residual kernels)
 # ---------------------------------------------------------------------------
-
-
-def _asm(res, operands, text, constraints, *, loc=None, ip=None):
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _asm_se(res, operands, text, constraints, *, loc=None, ip=None):
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _iv(value, *, loc=None, ip=None):
-    return Int32(value).ir_value(loc=loc, ip=ip)
-
-
-def _lv(value, *, loc=None, ip=None):
-    return Int64(value).ir_value(loc=loc, ip=ip)
-
-
-def _fv(value, *, loc=None, ip=None):
-    return Float32(value).ir_value(loc=loc, ip=ip)
 
 
 def _f32_op(text, *args, loc=None, ip=None):
@@ -243,44 +213,6 @@ def _shfl_idx(value, lane: int, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _lds_f32(addr, *, loc=None, ip=None):
-    return Float32(
-        _asm_se(
-            T.f32(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.f32 $0, [$1];", "=f,r", loc=loc, ip=ip
-        )
-    )
-
-
-@dsl_user_op
-def _mbar_init(addr, count: int, *, loc=None, ip=None):
-    _asm_se(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.init.shared::cta.b64 [$0], {count};",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _fence_mbar_init(*, loc=None, ip=None):
-    _asm_se(None, [], "fence.mbarrier_init.release.cluster;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _mbar_arrive_expect_tx(addr, nbytes: int, *, loc=None, ip=None):
-    _asm_se(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], {nbytes};",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
 # Unique PTX labels of the spin loops in :func:`_mbar_wait_cluster`.
 _wait_labels = itertools.count(1)
 
@@ -319,11 +251,6 @@ def _st_async_b32(local_addr, rank, local_mbar, a, *, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
-
-
-@dsl_user_op
-def _cluster_arrive_relaxed(*, loc=None, ip=None):
-    _asm_se(None, [], "barrier.cluster.arrive.relaxed.aligned;", "", loc=loc, ip=ip)
 
 
 @dsl_user_op

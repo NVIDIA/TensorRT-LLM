@@ -74,6 +74,38 @@ from ...attention.backends.fp4_mla.fp4_mla_packed_reduce import (
     _reduce_packed_row,
 )
 from . import fp8_block_scale_low_m_gemm as low_m_gemm
+from .raw_ptx import add_f32 as _fadd
+from .raw_ptx import asm as _asm
+from .raw_ptx import atom_add_u64 as _atom_add_u64
+from .raw_ptx import bulk_g2s as _bulk_g2s
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import ld_nc_u8 as _ld_nc_u8
+from .raw_ptx import ld_nc_v2 as _ld_nc_v2
+from .raw_ptx import ld_nc_v4 as _ld_nc_v4
+from .raw_ptx import ld_volatile_v4 as _ld_vol_v4
+from .raw_ptx import lds_b32 as _lds_b32
+from .raw_ptx import lds_b64 as _lds_b64
+from .raw_ptx import lds_v4 as _lds_v4
+from .raw_ptx import lv as _lv
+from .raw_ptx import mbar_expect_tx as _mbar_expect_tx
+from .raw_ptx import mbar_init_fenced as _mbar_init
+from .raw_ptx import mbar_try_wait as _mbar_try_wait
+from .raw_ptx import mma_bf16 as _mma_bf16
+from .raw_ptx import mul_f32 as _fmul
+from .raw_ptx import pack_bf16x2 as _pack_bf16x2
+from .raw_ptx import shfl_bfly_b32 as _shfl_bfly_b32
+from .raw_ptx import shfl_bfly_f32 as _shfl_bfly
+from .raw_ptx import st_sentinel_v4 as _st_sentinel_v4
+from .raw_ptx import st_u8 as _st_u8
+from .raw_ptx import st_v2 as _st_v2
+from .raw_ptx import st_v4 as _st_v4
+from .raw_ptx import sts_b32 as _sts_b32
+from .raw_ptx import sts_b64 as _sts_b64
+from .raw_ptx import sts_v4 as _sts_v4
+from .raw_ptx import unpack as _unpack
+from .utils import griddepcontrol_launch_dependents as _griddepcontrol_launch_dependents
+from .utils import griddepcontrol_wait as _griddepcontrol_wait
 
 __all__ = [
     "LATENT_DIM",
@@ -122,99 +154,6 @@ def _ceil_div(a: int, b: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _asm(res, operands, text, constraints, *, loc=None, ip=None):
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _iv(value, *, loc=None, ip=None):
-    return Int32(value).ir_value(loc=loc, ip=ip)
-
-
-def _lv(value, *, loc=None, ip=None):
-    return Int64(value).ir_value(loc=loc, ip=ip)
-
-
-def _fv(value, *, loc=None, ip=None):
-    return Float32(value).ir_value(loc=loc, ip=ip)
-
-
-def _unpack(res, ty, cls, n, *, loc=None, ip=None):
-    return tuple(cls(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(n))
-
-
-@dsl_user_op
-def _atom_add_u64(addr, value, *, loc=None, ip=None):
-    return Int64(
-        _asm(
-            T.i64(),
-            [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
-            "atom.relaxed.gpu.global.add.u64 $0, [$1], $2;",
-            "=l,l,l",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _sts_b64(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
-        "st.shared.b64 [$0], $1;",
-        "r,l",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _lds_b64(addr, *, loc=None, ip=None):
-    return Int64(
-        _asm(
-            T.i64(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.b64 $0, [$1];", "=l,r", loc=loc, ip=ip
-        )
-    )
-
-
-@dsl_user_op
-def _ld_nc_v4(addr, *, loc=None, ip=None):
-    """16 bytes of a tensor the kernel does not write."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _ld_vol_v4(addr, *, loc=None, ip=None):
-    """16 bytes of the receive buffer, read past L1 (peers write it over NVLink)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
 @dsl_user_op
 def _ld_vol_v2(addr, *, loc=None, ip=None):
     res = _asm(
@@ -226,44 +165,6 @@ def _ld_vol_v2(addr, *, loc=None, ip=None):
         ip=ip,
     )
     return _unpack(res, T.i32(), Int32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _ld_nc_u8(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_lv(addr, loc=loc, ip=ip)],
-            "ld.global.nc.u8 $0, [$1];",
-            "=r,l",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _st_sentinel_v4(addr, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip)],
-        "{\n.reg .b32 t;\nmov.b32 t, -1;\nst.global.v4.b32 [$0], {t, t, t, t};\n}",
-        "l",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _st_v4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
-        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op
@@ -355,34 +256,6 @@ def _fmax(a, b, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _fadd(a, b, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "add.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _fmul(a, b, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "mul.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def _rcp(a, *, loc=None, ip=None):
     """IEEE reciprocal (what ``1.F / x`` compiles to without fast math)."""
     return Float32(
@@ -410,20 +283,6 @@ def _corrected_exp(mx, gmax, total, *, loc=None, ip=None):
             "mul.rn.f32 e, s, e;\n"
             "mul.rn.f32 $0, e, $3;\n}",
             "=f,f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _shfl_bfly(value, offset: int, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(value, loc=loc, ip=ip)],
-            f"shfl.sync.bfly.b32 $0, $1, {offset}, 31, -1;",
-            "=f,f",
             loc=loc,
             ip=ip,
         )
@@ -467,202 +326,11 @@ def _bf16x2_fma(word, scale, acc_lo, acc_hi, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _pack_bf16x2(lo, hi, *, loc=None, ip=None):
-    """Round two FP32 values to BF16 (nearest even), ``lo`` in the low half."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [_fv(lo, loc=loc, ip=ip), _fv(hi, loc=loc, ip=ip)],
-            "cvt.rn.bf16x2.f32 $0, $2, $1;",
-            "=r,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _sts_v4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
-        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
-        "r,r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _griddepcontrol_wait(*, loc=None, ip=None):
-    _asm(None, [], "griddepcontrol.wait;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _griddepcontrol_launch_dependents(*, loc=None, ip=None):
-    _asm(None, [], "griddepcontrol.launch_dependents;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _lds_v4(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _lds_b32(addr, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.b32 $0, [$1];", "=r,r", loc=loc, ip=ip
-        )
-    )
-
-
-@dsl_user_op
-def _sts_b32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "st.shared.b32 [$0], $1;",
-        "r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _ld_nc_v2(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 2),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.global.nc.v2.b32 {$0, $1}, [$2];",
-        "=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _st_v2(addr, v0, v1, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip), _iv(v0, loc=loc, ip=ip), _iv(v1, loc=loc, ip=ip)],
-        "st.global.v2.b32 [$0], {$1, $2};",
-        "l,r,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mbar_init(addr, count: int, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.init.shared::cta.b64 [$0], {count};\nfence.mbarrier_init.release.cluster;",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mbar_expect_tx(addr, nbytes: int, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        f"mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], {nbytes};",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _bulk_g2s(dst, src, nbytes: int, mbar, *, loc=None, ip=None):
-    """Bulk copy of ``nbytes`` from global ``src`` to shared ``dst``, completing on ``mbar``."""
-    _asm(
-        None,
-        [_iv(dst, loc=loc, ip=ip), _lv(src, loc=loc, ip=ip), _iv(mbar, loc=loc, ip=ip)],
-        f"cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], {nbytes}, [$2];",
-        "r,l,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mbar_try_wait(addr, phase, *, loc=None, ip=None):
-    """1 once phase ``phase`` of the shared mbarrier at ``addr`` has completed, else 0."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(addr, loc=loc, ip=ip), _iv(phase, loc=loc, ip=ip)],
-            "{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n"
-            "selp.u32 $0, 1, 0, p;\n}",
-            "=r,r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def _opaque_f32(value, *, loc=None, ip=None):
     """``value`` through an opaque move: the compiler cannot merge expressions on it with
     expressions on ``value``."""
     return Float32(
         _asm(T.f32(), [_fv(value, loc=loc, ip=ip)], "mov.b32 $0, $1;", "=f,f", loc=loc, ip=ip)
-    )
-
-
-@dsl_user_op
-def _mma_bf16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """``d[16x8] = a[16x16] @ b[16x8] + c`` (BF16 inputs, FP32 accumulation)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(x, loc=loc, ip=ip) for x in (a0, a1, a2, a3, b0, b1)]
-        + [_fv(x, loc=loc, ip=ip) for x in (c0, c1, c2, c3)],
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _shfl_bfly_b32(value, offset: int, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(value, loc=loc, ip=ip)],
-            f"shfl.sync.bfly.b32 $0, $1, {offset}, 31, -1;",
-            "=r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _st_u8(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
-        "st.global.u8 [$0], $1;",
-        "l,r",
-        loc=loc,
-        ip=ip,
     )
 
 
@@ -1152,13 +820,10 @@ class K3HelixTailKernel:
             for v in cutlass.range_constexpr(2):
                 accs[v] = list(
                     _mma_bf16(
-                        a_lo[2 * v],
-                        a_hi[2 * v],
-                        a_lo[2 * v + 1],
-                        a_hi[2 * v + 1],
+                        (a_lo[2 * v], a_hi[2 * v], a_lo[2 * v + 1], a_hi[2 * v + 1]),
                         b[2 * v],
                         b[2 * v + 1],
-                        *accs[v],
+                        accs[v],
                     )
                 )
         acc = [accs[0][c] + accs[1][c] for c in range(4)]
@@ -1296,7 +961,7 @@ class K3HelixTailKernel:
         warp runs the shuffles; groups are either all valid or all invalid (``DV`` is a multiple
         of 16)."""
         K = self.DV * 8
-        xg = low_m_gemm._gate_mul_bf16x8(o[0], o[1], o[2], o[3], g[0], g[1], g[2], g[3])
+        xg = low_m_gemm.gate_mul_bf16x8(o[0], o[1], o[2], o[3], g[0], g[1], g[2], g[3])
         amax = low_m_gemm.amax_bf16x8(xg[0], xg[1], xg[2], xg[3])
         amax = low_m_gemm.amax_pair(amax, _shfl_bfly_b32(amax, 1))
         amax = low_m_gemm.amax_pair(amax, _shfl_bfly_b32(amax, 2))

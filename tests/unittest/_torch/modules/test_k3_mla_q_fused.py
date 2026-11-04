@@ -44,6 +44,7 @@ import torch
 from cutlass import Int32, Int64
 
 from tensorrt_llm._torch.kernels.blackwell import k3_mla_q_fused as fused_mod
+from tensorrt_llm._torch.kernels.blackwell import raw_ptx
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
@@ -315,9 +316,9 @@ class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
             if item < Int32(vectors):
                 t = item // Int32(16)
                 v = item - t * Int32(16)
-                words = fused_mod._lds_v4_b32(qn_s + t * Int32(fused_mod._QN_PITCH) + v * Int32(16))
+                words = raw_ptx.lds_v4(qn_s + t * Int32(fused_mod._QN_PITCH) + v * Int32(16))
                 dst = Int64(self.qb_addr) + (Int64(t) * (H * 192) + Int64(head) * 192) * 2
-                fused_mod._stg_v4(dst + Int64(v) * 16, *words)
+                raw_ptx.st_v4(dst + Int64(v) * 16, *words)
 
     @cute.jit
     def store_prefix_group(self, t, grp, rank, head, gs, ob_s, qfp4_addr, qsf_addr, gen_len,
@@ -328,8 +329,8 @@ class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
         src = ob_s + t * Int32(fused_mod._OB_PITCH) + grp * Int32(32)
         col = rank * Int32(16) + grp
         dst = Int64(self.ob_addr) + ((Int64(t) * H + Int64(head)) * LORA + Int64(col) * 16) * 2
-        fused_mod._stg_v4(dst, *fused_mod._lds_v4_b32(src))
-        fused_mod._stg_v4(dst + Int64(16), *fused_mod._lds_v4_b32(src + Int32(16)))
+        raw_ptx.st_v4(dst, *raw_ptx.lds_v4(src))
+        raw_ptx.st_v4(dst + Int64(16), *raw_ptx.lds_v4(src + Int32(16)))
 
     @cute.jit
     def store_rope_group(self, t, rg, head, gs, qpe_s, cs_s, qfp4_addr, qsf_addr, gen_len,
@@ -341,8 +342,8 @@ class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
         dst = Int64(self.qb_addr) + (
             (Int64(t) * (H * 192) + Int64(head) * 192 + 128 + Int64(rg) * 16) * 2
         )
-        fused_mod._stg_v4(dst, *fused_mod._lds_v4_b32(src))
-        fused_mod._stg_v4(dst + Int64(16), *fused_mod._lds_v4_b32(src + Int32(16)))
+        raw_ptx.st_v4(dst, *raw_ptx.lds_v4(src))
+        raw_ptx.st_v4(dst + Int64(16), *raw_ptx.lds_v4(src + Int32(16)))
 
 
 def _run_probed(md, w, x, rot):

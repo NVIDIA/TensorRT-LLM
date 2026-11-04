@@ -54,25 +54,33 @@ import torch
 from cutlass import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .kimi_k3_moe_tail import (
-    _bar_sync,
-    _bulk_g2s,
-    _fence_mbar_init,
-    _lds_b32,
-    _lds_f32,
-    _lds_v4,
-    _lds_v4_f32,
-    _mbar_expect_tx,
-    _mbar_init,
-    _mma_bf16,
-    _sts_f32,
-    _sts_v4,
+from .raw_ptx import asm as _asm
+from .raw_ptx import (
+    atom_add_acq_rel_u32,
+    ld_acquire_u32,
+    ld_volatile_v4,
+    pack_bf16x2,
+    st_u32,
+    st_v4,
 )
-from .mnnvl_pushed_allreduce import _asm, _fv, _iv, _lv, ld_volatile_v4, st_v4
-from .mnnvl_pushed_allreduce import _atom_add_acq_rel_u32 as atom_add_acq_rel_u32
-from .mnnvl_pushed_allreduce import _ld_acquire_u32 as ld_acquire_u32
-from .mnnvl_pushed_allreduce import _pack_bf16x2 as pack_bf16x2
-from .mnnvl_pushed_allreduce import _st_u32 as st_u32
+from .raw_ptx import bar_sync as _bar_sync
+from .raw_ptx import bulk_g2s as _bulk_g2s
+from .raw_ptx import fence_mbar_init as _fence_mbar_init
+from .raw_ptx import fence_proxy_async as _fence_proxy_async
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import lds_b32 as _lds_b32
+from .raw_ptx import lds_f32 as _lds_f32
+from .raw_ptx import lds_v4 as _lds_v4
+from .raw_ptx import lds_v4_f32 as _lds_v4_f32
+from .raw_ptx import lv as _lv
+from .raw_ptx import mbar_arrive as _mbar_arrive
+from .raw_ptx import mbar_expect_tx as _mbar_expect_tx
+from .raw_ptx import mbar_init as _mbar_init
+from .raw_ptx import mma_bf16 as _mma_bf16
+from .raw_ptx import mul_f32 as _mul
+from .raw_ptx import sts_f32 as _sts_f32
+from .raw_ptx import sts_v4 as _sts_v4
 
 __all__ = [
     "HIDDEN",
@@ -103,23 +111,6 @@ SMEM_BUDGET = 220 * 1024
 RED_PITCH = 16
 #: FP32 words per token row of a warp's staged down tile (16 rows + padding).
 STAGE_PITCH = 20
-
-
-@dsl_user_op
-def _fence_proxy_async(*, loc=None, ip=None):
-    _asm(None, [], "fence.proxy.async.shared::cta;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _mbar_arrive(addr, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip)],
-        "mbarrier.arrive.shared::cta.b64 _, [$0];",
-        "r",
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op
@@ -218,20 +209,6 @@ def _div(a, b, *, loc=None, ip=None):
             T.f32(),
             [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
             "div.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _mul(a, b, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "mul.rn.f32 $0, $1, $2;",
             "=f,f,f",
             loc=loc,
             ip=ip,
@@ -410,10 +387,7 @@ class KimiK3SharedExpertKernel:
                 for mt in cutlass.range_constexpr(p.gt):
                     a4 = _lds_v4(base + ((mt * WARPS + warp) * 32 + lane) * 16)
                     c = acc[mt]
-                    acc[mt] = list(_mma_bf16(
-                        a4[0], a4[1], a4[2], a4[3], xb[2 * j], xb[2 * j + 1],
-                        c[0], c[1], c[2], c[3],
-                    ))  # fmt: skip
+                    acc[mt] = list(_mma_bf16(a4, xb[2 * j], xb[2 * j + 1], c))
                 cute.arch.sync_warp()
                 if lane == 0:
                     _mbar_arrive(empty + 8 * slot)
@@ -503,9 +477,7 @@ class KimiK3SharedExpertKernel:
                         b0 = _lds_b32(arow + (16 * k + 2 * tq) * 2)
                         b1 = _lds_b32(arow + (16 * k + 2 * tq + 8) * 2)
                         c = acc2[k % 2]
-                        acc2[k % 2] = list(_mma_bf16(
-                            a4[0], a4[1], a4[2], a4[3], b0, b1, c[0], c[1], c[2], c[3],
-                        ))  # fmt: skip
+                        acc2[k % 2] = list(_mma_bf16(a4, b0, b1, c))
                     cute.arch.sync_warp()
                     if lane == 0:
                         _mbar_arrive(empty + 8 * slot)

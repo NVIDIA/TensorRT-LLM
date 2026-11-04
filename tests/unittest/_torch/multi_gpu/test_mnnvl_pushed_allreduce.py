@@ -719,7 +719,7 @@ def test_lamport_state_layout(monkeypatch):
     nbytes = 1 << 20
     workspace = {
         "uc_buffer": torch.empty(16),
-        "buffer_flags": torch.zeros(pushed._FLAG_ARRIVALS + 1, dtype=torch.uint32),
+        "buffer_flags": torch.zeros(pushed.FLAG_ARRIVALS + 1, dtype=torch.uint32),
         "buffer_size_bytes": nbytes,
         "comm": None,
     }

@@ -50,31 +50,34 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
 from cutlass import Float32, Int32, Int64
-from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .mnnvl_pushed_allreduce import (
-    _FLAG_ARRIVALS,
+    FLAG_ARRIVALS,
     NUM_BUFFERS,
     WORLD_SIZES,
-    _add_f32,
-    _asm,
-    _fv,
-    _iv,
-    _ld_acquire_u32,
-    _lv,
-    _pack_bf16x2,
-    _red_release_add,
-    _st_u32,
-    _stage_addr,
-    _unpack,
     clear_dirty_stages,
     finish_two_shot_v4,
     lamport_state,
     reduce_chunk,
     reduce_slots_v4,
     st_v4,
+    stage_addr,
 )
+from .raw_ptx import add_f32 as _add_f32
+from .raw_ptx import asm as _asm
+from .raw_ptx import bf16x2_to_f32x2 as _bf16x2_f32
+from .raw_ptx import cluster_sync as _cluster_sync_release_acquire
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import ld_acquire_u32 as _ld_acquire_u32
+from .raw_ptx import ld_v4 as _ld_v4
+from .raw_ptx import lds_f32 as _lds_f32
+from .raw_ptx import mul_f32 as _fmul
+from .raw_ptx import pack_bf16x2 as _pack_bf16x2
+from .raw_ptx import red_release_add as _red_release_add
+from .raw_ptx import st_u32 as _st_u32
+from .raw_ptx import sts_f32 as _sts_f32
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 if TYPE_CHECKING:
@@ -117,20 +120,6 @@ def grid_config(num_tokens: int, hidden: int, sm_count: int) -> tuple[int, int]:
 
 
 @dsl_user_op
-def _ld_v4(addr, *, loc=None, ip=None):
-    """16 bytes of a tensor an earlier grid wrote."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip)],
-        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _add_bf16x2(a, b, *, loc=None, ip=None):
     """Elementwise BF16 sum of two pairs, rounded to nearest (``__hadd2``)."""
     return Int32(
@@ -154,35 +143,6 @@ def _sq_bf16x2(word, *, loc=None, ip=None):
             [_iv(word, loc=loc, ip=ip)],
             "mul.rn.bf16x2 $0, $1, $1;",
             "=r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _bf16x2_f32(word, *, loc=None, ip=None):
-    """(low, high) BF16 of a pair as FP32."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 2),
-        [_iv(word, loc=loc, ip=ip)],
-        "{\n.reg .b32 lo, hi;\nshl.b32 lo, $2, 16;\nand.b32 hi, $2, 0xffff0000;\n"
-        "mov.b32 $0, lo;\nmov.b32 $1, hi;\n}",
-        "=f,=f,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _fmul(a, b, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(),
-            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
-            "mul.rn.f32 $0, $1, $2;",
-            "=f,f,f",
             loc=loc,
             ip=ip,
         )
@@ -227,27 +187,6 @@ def _rms_scale(total, eps, hidden_hex: str, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _sts_f32(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
-        "st.shared.f32 [$0], $1;",
-        "r,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _lds_f32(addr, *, loc=None, ip=None):
-    return Float32(
-        _asm(
-            T.f32(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.f32 $0, [$1];", "=f,r", loc=loc, ip=ip
-        )
-    )
-
-
-@dsl_user_op
 def _st_cluster_f32(local_addr, peer, value, *, loc=None, ip=None):
     """Store ``value`` at ``local_addr`` of cluster CTA ``peer``'s shared memory."""
     _asm(
@@ -256,18 +195,6 @@ def _st_cluster_f32(local_addr, peer, value, *, loc=None, ip=None):
         "{\n.reg .b32 ra;\nmapa.shared::cluster.u32 ra, $0, $1;\n"
         "st.shared::cluster.f32 [ra], $2;\n}",
         "r,r,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _cluster_sync_release_acquire(*, loc=None, ip=None):
-    _asm(
-        None,
-        [],
-        "barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;",
-        "",
         loc=loc,
         ip=ip,
     )
@@ -354,7 +281,7 @@ class PushedAllReduceNormFinishKernel:
         warp_sum = storage.warp_sum.data_ptr().toint()
         block_sum = storage.block_sum.data_ptr().toint()
         cta_sum = storage.cta_sum.data_ptr().toint()
-        arrivals = flags + Int64(_FLAG_ARRIVALS * 4)
+        arrivals = flags + Int64(FLAG_ARRIVALS * 4)
 
         if cutlass.const_expr(self.use_pdl):
             griddepcontrol_launch_dependents()
@@ -385,7 +312,7 @@ class PushedAllReduceNormFinishKernel:
 
         red = [Int32(0)] * 4
         if cutlass.const_expr(self.one_shot):
-            buf = _stage_addr(uc_local, cur, Int32(0), 1, nbytes)
+            buf = stage_addr(uc_local, cur, Int32(0), 1, nbytes)
             acc = reduce_slots_v4(buf + Int64(tok * W * H + col) * 2, H * 2, W, self.chunk)
             red = [_pack_bf16x2(acc[2 * j], acc[2 * j + 1]) for j in range(4)]
         else:

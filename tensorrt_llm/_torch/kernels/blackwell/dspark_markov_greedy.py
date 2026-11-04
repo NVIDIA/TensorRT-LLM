@@ -54,6 +54,14 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .raw_ptx import asm as _asm
+from .raw_ptx import fv as _fv
+from .raw_ptx import iv as _iv
+from .raw_ptx import ldsm_x4 as _ldsm_x4
+from .raw_ptx import lv as _lv
+from .raw_ptx import mma_bf16 as _mma_bf16
+from .raw_ptx import unpack as _unpack
+
 #: Shard rows per CTA: 16 warps x one 16-row MMA tile.
 ROWS = 256
 THREADS = 512
@@ -84,36 +92,6 @@ def width_for(num_reqs: int) -> int:
 # ---------------------------------------------------------------------------
 # Inline PTX helpers
 # ---------------------------------------------------------------------------
-
-
-def _asm(res, operands, text, constraints, *, loc=None, ip=None):
-    return llvm.inline_asm(
-        res,
-        operands,
-        text,
-        constraints,
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _iv(value, *, loc=None, ip=None):
-    return Int32(value).ir_value(loc=loc, ip=ip)
-
-
-def _lv(value, *, loc=None, ip=None):
-    return Int64(value).ir_value(loc=loc, ip=ip)
-
-
-def _fv(value, *, loc=None, ip=None):
-    return Float32(value).ir_value(loc=loc, ip=ip)
-
-
-def _unpack(res, ty, cls, n, *, loc=None, ip=None):
-    return tuple(cls(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(n))
 
 
 @dsl_user_op
@@ -239,34 +217,6 @@ def _st_shared_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
-
-
-@dsl_user_op
-def _ldsm_x4(addr, *, loc=None, ip=None):
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_iv(addr, loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _mma_bf16(a, b0, b1, c, *, loc=None, ip=None):
-    """``d[16x8] = a[16x16] @ b[16x8] + c`` (BF16 inputs, FP32 accumulate)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_iv(x, loc=loc, ip=ip) for x in (*a, b0, b1)] + [_fv(x, loc=loc, ip=ip) for x in c],
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
 
 
 @dsl_user_op

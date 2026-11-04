@@ -70,8 +70,16 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ....kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 from ....kernels.blackwell import mnnvl_pushed_allreduce as pushed_ar
+from ....kernels.blackwell.raw_ptx import (
+    bf16x2_to_f32x2,
+    ld_volatile_v4,
+    rcp_approx_ftz,
+    st_u16,
+    st_v4,
+)
+from ....kernels.blackwell.raw_ptx import mma_bf16 as _mma_bf16
 from . import raw_ptx as ptx
-from .kimi_k3_router_logits import _ldg_v4_b32_if, _mma_bf16, _st_async_v4_f32
+from .kimi_k3_router_logits import _ldg_v4_b32_if, _st_async_v4_f32
 from .kimi_k3_routing import (
     _MAX_TOKENS_PER_CTA,
     _SMALL_LOCAL_CAP,
@@ -285,7 +293,7 @@ def _poll_vectors(base: Int64, step: int, n: int):
     while ready == 0:
         ready = Int32(1)
         for i in cutlass.range_constexpr(n):
-            w = pushed_ar.ld_volatile_v4(base + Int64(i * step))
+            w = ld_volatile_v4(base + Int64(i * step))
             for j in cutlass.range_constexpr(4):
                 words[4 * i + j] = w[j]
             ready = ready & pushed_ar.arrived_v4(*w)
@@ -680,7 +688,7 @@ class KimiK3MoEFrontHeadKernel:
                     w = ptx.ld_shared_v4_b32(stage_base + (row * (8 * self.rt) + v * 4) * 4)
                     off = Int64((row * NUM_EXPERTS + local) * 4)
                     rel = Int64(cur) * Int64(nbytes) + Int64(self.logits_off) + off
-                    pushed_ar.st_v4(
+                    st_v4(
                         own + rel,
                         _sanitize_f32_bits(w[0]),
                         _sanitize_f32_bits(w[1]),
@@ -1045,8 +1053,8 @@ class KimiK3MoEFrontRouteKernel(NoauxTcRouteSortKernel):
         nthreads = GATHER_CLUSTERS * self.num_ctas * self.threads
         gtid = gidx * self.threads + tidx
         gsf = ptx.ld_global_f32(gsf_addr)
-        rgsf = low_m._rcp_approx_ftz(gsf)
-        rcp6 = low_m._rcp_approx_ftz(Float32(6.0))
+        rgsf = rcp_approx_ftz(gsf)
+        rcp6 = rcp_approx_ftz(Float32(6.0))
         items_per_row = LATENT // _ITEM_COLS
         big = self.tiles_base + 1
         split = self.tiles_rem * big
@@ -1067,19 +1075,19 @@ class KimiK3MoEFrontRouteKernel(NoauxTcRouteSortKernel):
             words = _poll_vectors(src, 16, 4)
             vals = []
             for i in cutlass.range_constexpr(16):
-                lo_f, hi_f = low_m._bf16x2_to_f32x2(words[i])
+                lo_f, hi_f = bf16x2_to_f32x2(words[i])
                 vals.extend((lo_f, hi_f))
-            amax0 = low_m._abs_max_f32x16(vals[:16])
-            amax1 = low_m._abs_max_f32x16(vals[16:])
-            sf2, os0, os1 = low_m._nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6)
-            low_m._stg_v4_b32(
+            amax0 = low_m.abs_max_f32x16(vals[:16])
+            amax1 = low_m.abs_max_f32x16(vals[16:])
+            sf2, os0, os1 = low_m.nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6)
+            st_v4(
                 codes_addr + Int64(t) * (LATENT // 2) + Int64(j * (_ITEM_COLS // 2)),
-                low_m._e2m1x8(vals[0:8], os0),
-                low_m._e2m1x8(vals[8:16], os0),
-                low_m._e2m1x8(vals[16:24], os1),
-                low_m._e2m1x8(vals[24:32], os1),
+                low_m.e2m1x8(vals[0:8], os0),
+                low_m.e2m1x8(vals[8:16], os0),
+                low_m.e2m1x8(vals[16:24], os1),
+                low_m.e2m1x8(vals[24:32], os1),
             )
-            low_m._stg_u16(
+            st_u16(
                 sf_addr + Int64(t) * (LATENT // _FP4_VEC) + Int64(j * (_ITEM_COLS // _FP4_VEC)),
                 sf2,
             )
@@ -1322,7 +1330,7 @@ def can_run(x: torch.Tensor, plan: MoEFrontPlan, global_sf: torch.Tensor) -> boo
     M_MAX``) with ``plan`` and the FP32 one-element NVFP4 global scale ``global_sf``."""
     return (
         x.is_cuda
-        and low_m._is_supported_device(x.device.index)
+        and low_m.is_supported_device(x.device.index)
         and x.dtype == torch.bfloat16
         and x.dim() == 2
         and x.is_contiguous()
