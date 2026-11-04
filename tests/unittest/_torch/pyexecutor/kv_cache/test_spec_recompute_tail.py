@@ -216,10 +216,18 @@ class _ConnectorReq:
             self.context_current_position = value
 
 
-def _reserve(req, *, local_end, offered_end, tail, tokens_per_block=4):
+def _reserve(
+    req: _ConnectorReq,
+    *,
+    local_end: int,
+    offered_end: int,
+    tail: int,
+    tokens_per_block: int = 4,
+) -> Mock:
     connector = Mock()
     connector.should_add_sequence.return_value = True
     connector.reserve_prefix.return_value = SimpleNamespace(end=offered_end)
+    connector.get_prefix_reservation.return_value = None
     connector.trim_prefix_reservation.side_effect = lambda req, start, end: SimpleNamespace(end=end)
     mgr = Mock()
     mgr._connector_reservations_enabled.return_value = True
@@ -227,6 +235,8 @@ def _reserve(req, *, local_end, offered_end, tail, tokens_per_block=4):
     mgr.kv_connector_manager = connector
     mgr.kv_cache_map = {req.py_request_id: SimpleNamespace(num_committed_tokens=local_end)}
     mgr.tokens_per_block = tokens_per_block
+    mgr.reuse_match_backoff = 0
+    mgr._connector_safe_prefix_end = KVCacheManagerV2._connector_safe_prefix_end.__get__(mgr)
     mgr._spec_recompute_tail = tail
     mgr.is_draft = False
     KVCacheManagerV2._prepare_connector_prefix_reservation(mgr, req)

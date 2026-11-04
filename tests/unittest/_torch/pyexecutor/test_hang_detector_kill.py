@@ -271,6 +271,7 @@ def test_status_provider_errors_are_logged(monkeypatch):
 def test_control_request_wait_pauses_detector(with_dwdp, monkeypatch: pytest.MonkeyPatch):
     fired = []
     executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor.control_requests = [SimpleNamespace(control_requires_drain=False, control_id=None)]
     executor.active_requests = []
     executor.waiting_queue = []
@@ -287,7 +288,7 @@ def test_control_request_wait_pauses_detector(with_dwdp, monkeypatch: pytest.Mon
     async def stop_after_poll(_delay: float) -> None:
         raise asyncio.CancelledError
 
-    def complete_control_action():
+    def complete_control_action() -> None:
         nonlocal now
         assert executor.control_request_barrier.is_set()
         now += 2 * executor.hang_detector.timeout

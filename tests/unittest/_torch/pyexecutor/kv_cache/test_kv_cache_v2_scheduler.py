@@ -45,7 +45,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 pytestmark = pytest.mark.cpu_only
 
 
-def _manager_for_release(request_id: int, is_draft: bool = False):
+def _manager_for_release(request_id: int, is_draft: bool = False) -> tuple[KVCacheManagerV2, Mock]:
     """A manager whose `free_resources` runs for real on one mock KvCache."""
     manager = object.__new__(KVCacheManagerV2)
     cache = Mock(beam_width=1)
@@ -62,6 +62,7 @@ def _manager_for_release(request_id: int, is_draft: bool = False):
     manager._pending_preemption = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
+    manager._retained_generation_allocations = {}
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._disagg_receive_ready = {}
@@ -5459,6 +5460,7 @@ def test_connector_credit_admits_another_request(chunked: bool) -> None:
         mgr.is_draft = False
         connector = Mock(prefix_reservations_enabled=True, capacity_only=False)
         connector.should_add_sequence.return_value = True
+        connector.get_prefix_reservation.return_value = None
         connector.reserve_prefix.side_effect = lambda req, local_end: (
             SimpleNamespace(start=local_end, end=local_end + offered_tokens)
             if offered_tokens
@@ -5472,6 +5474,7 @@ def test_connector_credit_admits_another_request(chunked: bool) -> None:
             "_connector_reservations_enabled",
             "_connector_may_serve",
             "_prepare_connector_prefix_reservation",
+            "_connector_safe_prefix_end",
         ):
             setattr(mgr, name, getattr(KVCacheManagerV2, name).__get__(mgr))
         mgr.prepare_context.side_effect = KVCacheManagerV2.prepare_context.__get__(mgr)

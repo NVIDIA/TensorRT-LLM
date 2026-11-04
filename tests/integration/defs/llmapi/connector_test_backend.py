@@ -5,6 +5,8 @@
 
 import json
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -15,7 +17,11 @@ from llm_kv_cache_connector_adp import (
 )
 
 from tensorrt_llm import mpi_rank
-from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import SchedulerOutput
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
+    KvCacheConnectorScheduler,
+    KvCacheConnectorWorker,
+    SchedulerOutput,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import KvCacheLayout
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -163,3 +169,136 @@ def _run_timeout_consumer() -> None:
 
 if __name__ == "__main__":
     _run_timeout_consumer()
+
+
+@dataclass
+class FailedLoadMetadata:
+    """Allocation owners and save intents for injected prefix-load failures."""
+
+    loads: dict[int, list[int]] = field(default_factory=dict)
+    saves: set[int] = field(default_factory=set)
+
+
+class FailedLoadConnectorScheduler(KvCacheConnectorScheduler):
+    """Offer one block, then honor the runtime's lifetime failure marker."""
+
+    supports_attention_dp = True
+
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
+        super().__init__(llm_args)
+        self._block_size = llm_args.kv_cache_config.tokens_per_block
+        self._offered: set[int] = set()
+        self._loads: dict[int, list[int]] = {}
+
+    def get_num_new_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        if request.py_connector_load_failed:
+            _record("declined_after_failure", 1)
+            return 0, False
+        if os.environ.get("TRTLLM_TEST_CONNECTOR_FAIL") != "1" or mpi_rank() != 0:
+            return 0, False
+        assert num_computed_tokens == 0
+        assert request.prompt_len > self._block_size
+        self._offered.add(request.request_id)
+        return self._block_size, os.environ.get("TRTLLM_TEST_CONNECTOR_ASYNC") == "1"
+
+    def update_state_after_alloc(self, request: LlmRequest, block_ids: list[int]) -> None:
+        if request.request_id in self._offered:
+            self._offered.remove(request.request_id)
+            self._loads[request.request_id] = block_ids[:1]
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> FailedLoadMetadata:
+        # Async requests are parked outside the compute batch, so retain their
+        # allocation feedback as well as this pass's synchronous save intents.
+        loads, self._loads = self._loads, {}
+        saves = {req.request_id for req in scheduler_output.new_requests}
+        saves.update(loads)
+        return FailedLoadMetadata(loads, saves)
+
+    def request_finished(self, request: LlmRequest, cache_block_ids: list[int]) -> bool:
+        return False
+
+    def request_reset(self, request: LlmRequest) -> None:
+        self._offered.discard(request.request_id)
+        self._loads.pop(request.request_id, None)
+        _record("reset", 1)
+
+
+class FailedLoadConnectorWorker(KvCacheConnectorWorker):
+    """Poison a prefix page and report failure only after the write is drained.
+
+    This injects a failed transfer into a real model/allocator execution. It
+    does not emulate network transport or claim RDMA completion coverage.
+    """
+
+    supports_attention_dp = True
+    reports_failed_loads = True
+    requires_block_aligned_reuse = True
+
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
+        super().__init__(llm_args)
+        self._failed: set[int] = set()
+        self._async_failed: set[int] = set()
+        self._pending: set[int] = set()
+        self._invalid_saves: set[int] = set()
+
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor) -> None:
+        self._kv = kv_cache_tensor
+
+    def start_load_kv(self, stream: torch.cuda.Stream) -> None:
+        metadata = self.get_connector_meta()
+        assert isinstance(metadata, FailedLoadMetadata)
+        with torch.cuda.stream(stream):
+            for pages in metadata.loads.values():
+                for page in pages:
+                    self._kv[page].fill_(float("nan"))
+        stream.synchronize()
+        failed = set(metadata.loads)
+        self._invalid_saves.update(failed)
+        if os.environ.get("TRTLLM_TEST_CONNECTOR_ASYNC") == "1":
+            self._async_failed.update(failed)
+        else:
+            self._failed.update(failed)
+        if failed:
+            _record("poisoned_load", len(failed))
+
+    def take_failed_load_requests(self) -> set[int]:
+        failed, self._failed = self._failed, set()
+        return failed
+
+    def get_finished(
+        self, finished_gen_req_ids: list[int], started_loading_req_ids: list[int]
+    ) -> tuple[list[int], list[int]]:
+        finished = list(self._pending)
+        self._pending = set(started_loading_req_ids)
+        self._finished = set(finished)
+        return [], finished
+
+    def take_failed_async_load_requests(self) -> set[int]:
+        failed = self._async_failed.intersection(self._finished)
+        self._async_failed.difference_update(failed)
+        if failed:
+            _record("async_failed", len(failed))
+        return failed
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> None:
+        metadata = self.get_connector_meta()
+        assert isinstance(metadata, FailedLoadMetadata)
+        ids = set(request_ids)
+        metadata.saves.difference_update(ids)
+        self._invalid_saves.difference_update(ids)
+        _record("dropped_saves", len(ids))
+
+    def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
+        pass
+
+    def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
+        pass
+
+    def wait_for_save(self, stream: torch.cuda.Stream) -> None:
+        metadata = self.get_connector_meta()
+        assert isinstance(metadata, FailedLoadMetadata)
+        # Async requests are not computed yet; their save intents are not
+        # publishable until their completion/recovery poll has run.
+        assert not (metadata.saves & self._invalid_saves - self._async_failed)

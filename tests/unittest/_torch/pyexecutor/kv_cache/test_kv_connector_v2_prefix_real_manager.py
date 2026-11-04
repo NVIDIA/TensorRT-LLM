@@ -20,20 +20,33 @@ These tests allocate device memory pools.
 """
 
 import gc
+from collections.abc import Iterable
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
+    KvCacheConnectorManager,
+    KvCacheConnectorScheduler,
+    KvCacheConnectorWorker,
+    SchedulerOutput,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import valid_page_slots
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
+    SamplingConfig,
+    rewind_context_after_cache_drop,
+)
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, AttnLifeCycle
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, AttnLifeCycle, ReuseScope
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -53,7 +66,10 @@ OFFER_TOKENS = 32
 class FakeConnectorManager:
     """Records what the prefix path tells the connector, in order."""
 
-    def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
+    requires_block_aligned_reuse = False
+    reports_failed_loads = False
+
+    def __init__(self, num_matched: int = OFFER_TOKENS, load_async: bool = False) -> None:
         self.prefix_reservations_enabled = False
         self.capacity_only = False
         self.reservations = {}
@@ -173,7 +189,7 @@ def make_manager(connector, **overrides):
     return KVCacheManagerV2(**kwargs)
 
 
-def make_request(request_id=1, prompt_len=PROMPT_LEN):
+def make_request(request_id: int = 1, prompt_len: int = PROMPT_LEN) -> LlmRequest:
     return LlmRequest(
         request_id=request_id,
         max_new_tokens=4,
@@ -183,7 +199,7 @@ def make_request(request_id=1, prompt_len=PROMPT_LEN):
     )
 
 
-def schedule(manager, request, num_tokens=None):
+def schedule(manager: KVCacheManagerV2, request: LlmRequest, num_tokens: int | None = None) -> bool:
     """One scheduling pass: prepare the cache and size it for the chunk."""
     assert manager.prepare_context(request)
     if num_tokens is None:
@@ -376,6 +392,117 @@ def test_freeing_the_allocation_makes_the_request_askable_again(manager, connect
     run(manager, request)
 
     assert len(connector.queries) == 2
+
+
+def test_a_dropped_context_allocation_commits_nothing_and_is_asked_again(
+    manager: KVCacheManagerV2, connector: FakeConnectorManager
+) -> None:
+    """A restart after a failed connector load leaves no trace of the lost prefix.
+
+    The served range was skipped, never computed. Dropping the allocation must
+    neither publish it to the radix tree, where every later request would reuse
+    unfilled pages, nor keep the ask memo, which would leave the restarted
+    request without a connector query.
+    """
+    request = make_request()
+    assert schedule(manager, request)
+    run(manager, request)
+    assert request.context_current_position == OFFER_TOKENS
+
+    manager.drop_context_allocation(request)
+
+    assert request.py_request_id not in manager.kv_cache_map
+    assert connector.forgotten == [request.py_request_id]
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == PROMPT_LEN
+    assert not request.py_connector_allocation_reported
+    assert request.py_served_prefix_end == 0
+
+    # The same prompt finds nothing to reuse locally.
+    twin = make_request(request_id=2)
+    assert manager.probe_context_reuse(twin) == 0
+    assert manager.probe_context_reuse(request) == 0
+
+    assert schedule(manager, request)
+    run(manager, request)
+
+    assert request.context_current_position == OFFER_TOKENS
+    assert [query for query in connector.queries if query[0] == request.py_request_id] == [
+        (request.py_request_id, 0),
+        (request.py_request_id, 0),
+    ]
+    assert connector.commits == [
+        (request.py_request_id, OFFER_TOKENS, False),
+        (request.py_request_id, OFFER_TOKENS, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("requires", "expected_local_end", "expected_backoff"),
+    [
+        # A one-token backoff leaves a match of four whole blocks one short.
+        (False, 4 * TOKENS_PER_BLOCK - 1, 1),
+        # Aligned down: the connector serves the trimmed block and the rest.
+        (True, 3 * TOKENS_PER_BLOCK, 1),
+    ],
+    ids=["no_declaration", "align"],
+)
+def test_whole_block_connector_is_queried_from_a_block_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    requires: bool,
+    expected_local_end: int,
+    expected_backoff: int,
+) -> None:
+    """The local match a whole-block connector is asked from, against the real tree.
+
+    A one-model draft's lookahead backoff is stood in for by patching the
+    lookahead the manager reads at construction; the connector offers nothing,
+    so the query records the local match alone.
+    """
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.draft_prompt_lookahead", lambda _spec_config: 1
+    )
+    torch.cuda.init()
+    gc.collect()
+    torch.cuda.empty_cache()
+    connector = FakeConnectorManager(num_matched=0)
+    connector.requires_block_aligned_reuse = requires
+    manager = make_manager(
+        connector,
+        # The connector declaration must override the default partial reuse.
+        kv_cache_config=KvCacheConfig(
+            max_tokens=2048, enable_block_reuse=True, enable_partial_reuse=True
+        ),
+    )
+    try:
+        assert manager.reuse_match_backoff == expected_backoff
+        if requires:
+            assert not manager.enable_partial_reuse
+            assert not manager.kv_cache_manager_py_config.enable_partial_reuse
+
+        # Seed four whole blocks under the scope the manager derives for
+        # `make_request`, which carries no LoRA task and no cache salt.
+        seed = manager.impl.create_kv_cache(
+            ReuseScope(lora_id=None, salt=manager._derive_reuse_salt(None))
+        )
+        assert seed.resume(manager._stream.cuda_stream)
+        assert seed.resize(4 * TOKENS_PER_BLOCK)
+        seed.commit(list(range(4 * TOKENS_PER_BLOCK)))
+        seed.close()
+
+        request = make_request(prompt_len=6 * TOKENS_PER_BLOCK)
+        assert manager.probe_context_reuse(request) == expected_local_end
+
+        # The connector is asked in `prepare_resources`, not while scheduling.
+        assert schedule(manager, request)
+        assert connector.queries == []
+        run(manager, request)
+        assert connector.queries[-1] == (request.py_request_id, expected_local_end)
+    finally:
+        manager.shutdown()
+        del manager
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -783,8 +910,6 @@ def test_token_budget_rejection_releases_real_cache(
 def test_reserved_prefix_tracks_range_and_allocation(
     manager: KVCacheManagerV2, connector: FakeConnectorManager
 ) -> None:
-    from tensorrt_llm._torch.pyexecutor.llm_request import rewind_context_after_cache_drop
-
     connector.prefix_reservations_enabled = True
     connector.num_matched = PROMPT_LEN
     request = make_request()
@@ -889,4 +1014,294 @@ def test_real_kv_pressure_rejects_reserved_prefix_without_transmission() -> None
     finally:
         if blocker is not None:
             blocker.close()
+        manager.shutdown()
+
+
+# -- disaggregated completion reservation -----------------------------------------
+
+
+class _FailedLoadScheduler(KvCacheConnectorScheduler):
+    def __init__(self, load_async: bool) -> None:
+        super().__init__(None)
+        self.load_async = load_async
+        self.queries: list[tuple[int, bool]] = []
+        self.resets: list[int] = []
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
+        return scheduler_output
+
+    def get_num_new_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        self.queries.append((num_computed_tokens, request.py_connector_load_failed))
+        # Deliberately keep offering the missing prefix after failure: the runtime
+        # must enforce recompute even if a backend's lookup remains stale.
+        return OFFER_TOKENS, self.load_async and not request.py_connector_load_failed
+
+    def update_state_after_alloc(self, request: LlmRequest, block_ids: list[int]) -> None:
+        pass
+
+    def request_finished(self, request: LlmRequest, cache_block_ids: list[int]) -> bool:
+        return False
+
+    def request_reset(self, request: LlmRequest) -> None:
+        self.resets.append(request.request_id)
+
+
+class _FailedLoadWorker(KvCacheConnectorWorker):
+    reports_failed_loads = True
+
+    def __init__(self, load_async: bool) -> None:
+        super().__init__(None)
+        self.load_async = load_async
+        self.failed: set[int] = set()
+        self.dropped: list[int] = []
+
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor) -> None:
+        pass
+
+    def start_load_kv(self, stream: torch.cuda.Stream) -> None:
+        metadata: SchedulerOutput = self.get_connector_meta()
+        self.failed = {req.request_id for req in metadata.new_requests}
+
+    def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
+        pass
+
+    def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
+        pass
+
+    def wait_for_save(self, stream: torch.cuda.Stream) -> None:
+        pass
+
+    def get_finished(
+        self, finished_gen_req_ids: list[int], started_loading_req_ids: list[int]
+    ) -> tuple[list[int], list[int]]:
+        if self.load_async:
+            self.failed.update(started_loading_req_ids)
+        return [], started_loading_req_ids
+
+    def take_failed_load_requests(self) -> set[int]:
+        return set() if self.load_async else set(self.failed)
+
+    def take_failed_async_load_requests(self) -> set[int]:
+        return set(self.failed) if self.load_async else set()
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> None:
+        ids = list(request_ids)
+        self.dropped.extend(ids)
+        self.failed.difference_update(ids)
+
+
+@pytest.mark.parametrize("load_async", [False, True])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_real_connector_failed_load_restarts_with_no_external_prefix(
+    monkeypatch: pytest.MonkeyPatch, load_async: bool, chunked: bool
+) -> None:
+    """The real connector and allocator retire pages, saves and prefix state together."""
+    from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector as connector_module
+
+    monkeypatch.setattr(connector_module, "mpi_rank", lambda: 0)
+    monkeypatch.setattr(connector_module, "mpi_world_size", lambda: 1)
+    monkeypatch.setattr(connector_module, "mpi_broadcast", lambda value, root: value)
+    monkeypatch.setattr(connector_module, "mpi_allgather", lambda value: [value])
+    worker = _FailedLoadWorker(load_async)
+    scheduler = _FailedLoadScheduler(load_async)
+    connector = KvCacheConnectorManager(worker, scheduler)
+    manager = make_manager(connector)
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = connector
+    executor.kv_cache_manager = manager
+    executor.execution_stream = torch.cuda.current_stream()
+    executor.resource_manager = Mock()
+    executor.resource_manager.get_resource_manager.return_value = None
+    executor.enable_attention_dp = False
+    try:
+        request = make_request()
+        chunk_size = TOKENS_PER_BLOCK if chunked else PROMPT_LEN
+        assert schedule(manager, request, chunk_size)
+        request.context_chunk_size = chunk_size
+        batch = run(manager, request)
+        assert request.context_current_position == OFFER_TOKENS
+        if chunked:
+            assert batch.context_requests_chunking == [request]
+        manager.report_batch_to_connector(batch)
+        connector.take_scheduled_requests_pending_load(batch)
+        executor._kv_connector_start_loads(batch)
+        if load_async:
+            assert connector.has_pending_load(request)
+            connector.get_finished()
+            executor._recover_failed_async_loads()
+        assert not batch.context_requests
+        assert worker.dropped == [request.request_id]
+        assert scheduler.resets == [request.request_id]
+        assert request.py_connector_load_failed
+        assert request.context_current_position == 0
+        assert request.request_id not in manager.kv_cache_map
+        assert not connector.has_pending_load(request)
+
+        assert schedule(manager, request, chunk_size)
+        request.context_chunk_size = chunk_size
+        run(manager, request)
+        assert scheduler.queries == [(0, False), (0, True)]
+        assert request.context_current_position == 0
+        assert request.py_num_connector_matched_tokens == 0
+        assert not connector.has_pending_load(request)
+        assert manager.kv_cache_map[request.request_id].num_committed_tokens == 0
+        manager.free_resources(request)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("skip_count", [1, 32])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_skipped_generation_retains_pages_and_mooncake_save_ownership(
+    monkeypatch: pytest.MonkeyPatch, skip_count: int, overlap: bool
+) -> None:
+    """Skipped ADP forwards preserve published pages, token deltas and save pins."""
+    from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector as connector_module
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+        MooncakeStoreConnectorConfig,
+    )
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import ReuseScope
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
+        MooncakeStoreConnectorScheduler,
+    )
+    from tensorrt_llm.bindings import LlmRequestState
+
+    monkeypatch.setattr(connector_module, "mpi_rank", lambda: 0)
+    monkeypatch.setattr(connector_module, "mpi_broadcast", lambda value, root: value)
+    connector = KvCacheConnectorManager(_FailedLoadWorker(False), _FailedLoadScheduler(False))
+    manager = make_manager(connector)
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = connector
+    executor.kv_cache_manager = manager
+    executor._is_kv_manager_v2 = True
+    executor._num_skipped_forward_ctx_chunks = 0
+    executor._num_reverted_ctx_tokens = 0
+    executor.enable_joint_kv_cache_reuse = False
+    request = make_request(prompt_len=TOKENS_PER_BLOCK)
+    # Exercise the production scheduler's page/token and save-ownership logic
+    # without provisioning an external store or starting background transfers.
+    store_scheduler = object.__new__(MooncakeStoreConnectorScheduler)
+    store_scheduler._config = MooncakeStoreConnectorConfig(master_server_address="unused:1")
+    store_scheduler._tokens_per_block = TOKENS_PER_BLOCK
+    store_scheduler._requests = {}
+    state = store_scheduler._state_for(request, request.get_tokens(0), ReuseScope())
+    reset = Mock(wraps=store_scheduler.request_reset)
+    monkeypatch.setattr(connector.scheduler, "request_reset", reset)
+    try:
+        assert manager.prepare_context(request)
+        cache = manager.kv_cache_map[request.request_id]
+        assert cache.resize(TOKENS_PER_BLOCK)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        assert manager.try_allocate_generation(request)
+        if overlap:
+            assert manager.try_allocate_generation(request)
+        expected_capacity = TOKENS_PER_BLOCK + 1 + int(overlap)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+        connector.build_scheduler_output(batch, manager)
+        connector.handle_metadata()
+        before: SchedulerOutput = connector.worker.get_connector_meta()
+        saves = store_scheduler.build_connector_meta(before)
+        assert saves.saves
+        assert state.emitted_saves
+        pages = manager.get_page_indices_by_layer_group(request)
+        tokens = list(state.tokens)
+        published = connector.scheduler_output_manager.requests[request.request_id]
+        for _ in range(skip_count):
+            executor._revert_unexecuted_alloc(batch)
+            assert cache.capacity == expected_capacity
+            if overlap:
+                # Reconcile an older completed forward while this step waits.
+                assert manager._inflight_draft_lens[request.request_id] == [0]
+                manager.update_resources(batch)
+                overlap = False
+            assert manager._inflight_draft_lens == {}
+            assert connector.scheduler_output_manager.requests[request.request_id] is published
+            reset.assert_not_called()
+            # A lifecycle reset would erase this state and lose the save pin.
+            assert store_scheduler._requests[request.request_id] is state
+            assert manager.try_allocate_generation(request)
+            assert manager._inflight_draft_lens[request.request_id] == [0]
+            assert manager.get_page_indices_by_layer_group(request) == pages
+            connector.build_scheduler_output(batch, manager)
+            connector.handle_metadata()
+            after: SchedulerOutput = connector.worker.get_connector_meta()
+            assert after.cached_requests[0].new_tokens == []
+            assert all(not group for group in after.cached_requests[0].new_block_ids_by_layer_group)
+            assert not store_scheduler.build_connector_meta(after).saves
+            assert state.tokens == tokens
+            assert state.pages == dict(enumerate(pages))
+        assert store_scheduler.request_finished(request, [])
+        # Cancellation before retry also retires the retained allocation marker.
+        executor._revert_unexecuted_alloc(batch)
+        manager.free_resources(request)
+        assert not manager._retained_generation_allocations
+    finally:
+        manager.shutdown()
+
+
+def test_retained_generation_grows_across_page_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wider retry preserves published pages and adds its required capacity."""
+    from tensorrt_llm.bindings import LlmRequestState
+
+    manager = make_manager(None)
+    request = make_request(prompt_len=TOKENS_PER_BLOCK)
+    try:
+        assert manager.prepare_context(request)
+        cache = manager.kv_cache_map[request.request_id]
+        assert cache.resize(TOKENS_PER_BLOCK)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        assert manager.try_allocate_generation(request)
+        original = manager.get_page_indices_by_layer_group(request)
+        manager._retain_generation_allocation(request)
+        monkeypatch.setattr(manager, "_generation_draft_slots", lambda req: TOKENS_PER_BLOCK)
+        assert manager.try_allocate_generation(request)
+        assert cache.capacity == 2 * TOKENS_PER_BLOCK + 1
+        enlarged = manager.get_page_indices_by_layer_group(request)
+        for before, after in zip(original, enlarged):
+            assert after[: len(before)] == before
+            assert len(after) > len(before)
+        assert manager._inflight_draft_lens[request.request_id] == [TOKENS_PER_BLOCK]
+        assert request.request_id not in manager._retained_generation_allocations
+        manager.free_resources(request)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("reservations", [False, True])
+@pytest.mark.parametrize("offered_blocks, expected_blocks", [(1, 0), (2, 1)])
+def test_external_prefix_backoff_recomputes_unsafe_block(
+    reservations: bool, offered_blocks: int, expected_blocks: int
+) -> None:
+    """Both external-offer paths leave draft lookahead in a recomputed tail."""
+    connector = FakeConnectorManager(num_matched=offered_blocks * TOKENS_PER_BLOCK)
+    connector.prefix_reservations_enabled = reservations
+    manager = make_manager(connector)
+    request = make_request()
+    try:
+        # Isolate external matching: no local prefix exists in this fresh pool.
+        manager.reuse_match_backoff = 1
+        assert schedule(manager, request)
+        run(manager, request)
+        assert request.context_current_position == expected_blocks * TOKENS_PER_BLOCK
+        if reservations:
+            reserved = connector.get_prefix_reservation(request)
+            if expected_blocks:
+                assert reserved.end == expected_blocks * TOKENS_PER_BLOCK
+                manager._prepare_connector_prefix_reservation(request)
+                assert connector.get_prefix_reservation(request) is reserved
+                assert reserved.end == expected_blocks * TOKENS_PER_BLOCK
+                assert len(connector.queries) == 1
+            else:
+                assert reserved is None
+        else:
+            assert connector.commits == [
+                (request.request_id, expected_blocks * TOKENS_PER_BLOCK, False)
+            ]
+        manager.free_resources(request)
+    finally:
         manager.shutdown()

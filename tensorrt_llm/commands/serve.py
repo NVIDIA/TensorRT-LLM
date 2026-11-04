@@ -45,7 +45,9 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._errors import ConfigInputError
-from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
+from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import normalize_disagg_role as _serving_role
+from tensorrt_llm._utils import set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      ConfigOverrideError,
@@ -687,21 +689,6 @@ _DENSE_DWDP_FOR_CONTEXT_ONLY = (
     "dwdp_config.enable_dense is for context servers only: dense DWDP gathers "
     "the dense weights of every covered layer in every forward, decode steps "
     "included.")
-
-
-def _serving_role(role: Optional[str]) -> Optional[str]:
-    """``"context"`` or ``"generation"`` for a ``TRTLLM_DISAGG_ROLE`` value.
-
-    Matched as the usage telemetry matches it: case-insensitive, with the
-    compatible legacy values that start with ``ctx`` or ``gen`` (``ctx0``,
-    ``gen0``). None for any other value.
-    """
-    normalized = (role or "").lower()
-    if normalized == "context" or normalized.startswith("ctx"):
-        return "context"
-    if normalized.startswith("gen"):
-        return "generation"
-    return None
 
 
 def _check_context_only_settings(llm_args: dict, *, warn: bool) -> None:

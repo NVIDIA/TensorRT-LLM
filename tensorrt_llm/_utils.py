@@ -1616,3 +1616,18 @@ class EnergyMonitor:
     @property
     def total_energy(self):
         return self._total_energy
+
+
+def normalize_disagg_role(role: Optional[str]) -> Optional[str]:
+    """``"context"`` or ``"generation"`` for a ``TRTLLM_DISAGG_ROLE`` value.
+
+    Matched as the usage telemetry matches it: case-insensitive, with the
+    compatible legacy values that start with ``ctx`` or ``gen`` (``ctx0``,
+    ``gen0``). None for any other value.
+    """
+    normalized = (role or "").lower()
+    if normalized == "context" or normalized.startswith("ctx"):
+        return "context"
+    if normalized.startswith("gen"):
+        return "generation"
+    return None

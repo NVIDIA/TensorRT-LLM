@@ -328,9 +328,10 @@ def test_executor_loop_failed_forward_keeps_response_gather_parity(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _error_executor():
+def _error_executor() -> PyExecutor:
     """Executor shell exposing only what the non-ADP _handle_errors path touches."""
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor._error_budget = Mock()
     executor._fatal_error = None
     executor.enable_attention_dp = False
