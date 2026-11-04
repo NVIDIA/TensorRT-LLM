@@ -10299,7 +10299,8 @@ class PyExecutor:
                 # returns no logits; no request of such a batch asks for them.
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
-                               batch_outputs.get("logits"), beam_width,
+                               batch_outputs.get("logits"),
+                               beam_width,
                                num_context_logits_prefix_sum,
                                self.sampler.is_generation_model(),
                                context_logits_handled=context_logits_handled)
