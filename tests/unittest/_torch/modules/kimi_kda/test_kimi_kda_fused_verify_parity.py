@@ -196,16 +196,31 @@ def _promote_sequential(layer_cache, conv_pool, ssm_pool, accept):
     ssm_pool.copy_(layer_cache.intermediate_ssm[rows, accept])
 
 
+def _fused_fb_call(kwargs):
+    """The kwargs of a ``mtp_verify_fused_fb`` launch (the f_a-mode verify, which computes the
+    forget gate from ``f_a``) with the ``mtp_verify`` flags that op implies: packed rows, fused
+    output norm, BF16 output."""
+    return dict(
+        kwargs, packed_token_layout=True, cu_seqlens=None, fuse_output_norm=True, mxfp8_output=False
+    )
+
+
 def _capture_mtp_verify(runtime):
-    """Record the kwargs of every fused verify launch, then run it."""
+    """Record the kwargs of every fused verify launch (either op), then run it."""
     calls = []
     mtp_verify = runtime._dispatch.mtp_verify
+    mtp_verify_fused_fb = runtime._dispatch.mtp_verify_fused_fb
 
     def _capturing_mtp_verify(**kwargs):
         calls.append(kwargs)
         return mtp_verify(**kwargs)
 
+    def _capturing_mtp_verify_fused_fb(**kwargs):
+        calls.append(_fused_fb_call(kwargs))
+        return mtp_verify_fused_fb(**kwargs)
+
     runtime._dispatch.mtp_verify = _capturing_mtp_verify
+    runtime._dispatch.mtp_verify_fused_fb = _capturing_mtp_verify_fused_fb
     return calls
 
 
@@ -595,7 +610,11 @@ def test_fused_verify_mxfp8_output_gating(allow, with_output):
             return activation, torch.zeros(128 * H * 4, dtype=torch.uint8, device="cuda")
         return torch.zeros(1, rows, H, K, dtype=torch.bfloat16, device="cuda")
 
+    def _fake_mtp_verify_fused_fb(**kwargs):
+        return _fake_mtp_verify(**_fused_fb_call(kwargs))
+
     runtime._dispatch.mtp_verify = _fake_mtp_verify
+    runtime._dispatch.mtp_verify_fused_fb = _fake_mtp_verify_fused_fb
     x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
     output = x.new_empty(rows, H, K) if with_output else None
     core = _run_one_verify_round(
