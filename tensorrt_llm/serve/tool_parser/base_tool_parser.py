@@ -223,6 +223,32 @@ class BaseToolParser(ABC):
         """
         return StreamingParseResult()
 
+    # Upper bound on the extra steps `_flush_buffered_steps` runs.
+    _MAX_FLUSH_STEPS = 256
+
+    def _flush_buffered_steps(self, tools: List[Tool]) -> StreamingParseResult:
+        """Run the `parse_streaming_increment` steps a single chunk left pending.
+
+        These parsers advance one step per call: the tool name first, then its
+        arguments, then the next tool call. The serving layer makes one call per
+        chunk, so a chunk that carries complete tool calls (a speculative-decoding
+        step, `stream_interval` > 1, or a short call in the last chunk) leaves the
+        arguments, and any further calls, in the buffer. Replay the buffer with no
+        new text until the parser stops making progress.
+        """
+        normal_text = ""
+        calls: List[ToolCallItem] = []
+        for _ in range(self._MAX_FLUSH_STEPS):
+            state = (self._buffer, self.current_tool_id,
+                     self.current_tool_name_sent)
+            result = self.parse_streaming_increment("", tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+            if (self._buffer, self.current_tool_id,
+                    self.current_tool_name_sent) == state:
+                break
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
         """
