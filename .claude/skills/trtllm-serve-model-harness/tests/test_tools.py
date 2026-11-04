@@ -208,7 +208,13 @@ def test_the_replay_output_is_readable_by_its_owner_only(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-def test_a_trial_build_takes_its_paths_from_the_caller(tmp_path):
+@pytest.mark.parametrize(
+    "branch, prov_args, prov",
+    [("trial-br", ["-p", "prov.txt"], "prov.txt"),
+     ("user/trial", [], "trial.user_trial.provenance.txt")],
+    ids=["given", "default_for_a_branch_with_a_slash"],
+)  # fmt: skip
+def test_a_trial_build_takes_its_paths_from_the_caller(tmp_path, branch, prov_args, prov):
     """Relative worktree and provenance paths name what they name from where the script ran."""
     env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
@@ -230,15 +236,15 @@ def test_a_trial_build_takes_its_paths_from_the_caller(tmp_path):
     git("checkout", "-q", "main")
 
     result = subprocess.run(
-        ["bash", os.path.join(SCRIPTS, "compose_trial_build.sh"), "-m", "main", "-p", "prov.txt",
-         "trial", "trial-br", "main", "feat=feat"],
+        ["bash", os.path.join(SCRIPTS, "compose_trial_build.sh"), "-m", "main", *prov_args,
+         "trial", branch, "main", "feat=feat"],
         cwd=sub, env=env, capture_output=True, text=True)  # fmt: skip
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert (sub / "trial" / "sub" / "a.txt").read_text() == "b\n"
     assert not (repo / "trial").exists()
-    provenance = (sub / "prov.txt").read_text()
-    assert "item feat feat head=" in provenance and "result trial-br head=" in provenance
+    provenance = (sub / prov).read_text()
+    assert "item feat feat head=" in provenance and f"result {branch} head=" in provenance
 
 
 # --------------------------------------------------------------------------- mutation gate

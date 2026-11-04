@@ -28,7 +28,9 @@ record_requests.py output) and reports the wire surface the harness uses:
                     tool-output shapes (string vs content parts)
   metadata          client_metadata keys (and keys of JSON-encoded values inside it)
   headers           header names; values only for an allowlist (user-agent, originator,
-                    openai-beta, x-stainless-*), never auth
+                    openai-beta, accept, content-type, version, x-stainless-*, and the
+                    identity headers session_id and x-client-request-id, whose values show
+                    whether they name a session or a request), never auth
   responses         HTTP statuses, reply kinds, terminal events, error codes and the
                     most common SSE event-type sequences (repeated deltas collapsed)
 

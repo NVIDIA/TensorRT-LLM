@@ -174,12 +174,15 @@ def _canonical(value: Any) -> Any:
     """A form in which equal JSON values compare equal and types never mix.
 
     Booleans never equal numbers (Python's ``True == 1`` would), key order is
-    irrelevant, list order matters, and 1 equals 1.0.
+    irrelevant, list order matters, and 1 equals 1.0. Integers stay exact: no float
+    holds every integer, and some JSON integers are too large for any float.
     """
     if isinstance(value, bool):
         return ["b", value]
+    if isinstance(value, float) and value.is_integer():
+        return ["n", int(value)]
     if isinstance(value, (int, float)):
-        return ["n", float(value)]
+        return ["n", value]
     if isinstance(value, str):
         return ["s", value]
     if value is None:

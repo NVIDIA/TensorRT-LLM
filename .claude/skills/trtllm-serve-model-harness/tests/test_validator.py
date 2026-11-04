@@ -164,6 +164,18 @@ def test_payload_digest_is_typed_and_order_free():
         '{"a": [2, 1]}', "function"
     )
     assert payload_digest("echo hi", "custom") != payload_digest("echo  hi", "custom")
+    assert payload_digest('{"a": 1}', "function") == payload_digest('{"a": 1.0}', "function")
+
+
+def test_payload_digest_keeps_integers_exact():
+    """No float holds 2**53 + 1, and none holds a 400-digit integer a model may write."""
+    assert payload_digest('{"n": 9007199254740993}', "function") != payload_digest(
+        '{"n": 9007199254740992}', "function"
+    )
+    big = "1" + "0" * 400
+    assert payload_digest('{"n": %s}' % big, "function") != payload_digest(
+        '{"n": %s1}' % big, "function"
+    )
 
 
 def test_wilson_bounds_follow_the_rule_of_three():

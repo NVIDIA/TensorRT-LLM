@@ -122,7 +122,7 @@ what stands in for each skipped stage, and what nothing covers:
 
 | Stage | Stands in | Not covered |
 |---|---|---|
-| S1 | The full tier's raw view of every reply. C-13 reads it two ways, one of them the checkpoint's encoder re-rendering the delivered output byte for byte. Prompt fidelity: the served render equals the encoder's, and its token count equals the billed input | Shapes the traffic did not produce: the parser fault matrix, stop rules on rare tokens |
+| S1 | The full tier's raw view of every reply: C-13 compares what was delivered with what the model wrote, read in its own format by a reader qualified on the checkpoint encoder's renders. USG-07: the billed input equals the server's own prompt count | Prompt fidelity: no check compares the served prompt render with the encoder's (S3's render-level A/B does). Shapes the traffic did not produce: the parser fault matrix, stop rules on rare tokens |
 | S2 | Each PR's own tests and CI | The other models a shared layer serves (a parser base class, the chat route, a shared serializer). When a PR changes such a layer, run S2 for them |
 | S3 | Nothing: the first real traffic is S4 or S5 | A render-level A/B on identical requests, one turn at a time |
 

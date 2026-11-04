@@ -41,7 +41,7 @@ shift $((OPTIND - 1))
 # provenance file is written from inside it.
 absolute() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$1" ;; esac; }
 wt=$(absolute "$1"); branch=$2; base=$3; shift 3
-[ -n "$prov" ] || prov="$wt.$branch.provenance.txt"
+[ -n "$prov" ] || prov="$wt.${branch//\//_}.provenance.txt"  # a branch's / is not a directory
 prov=$(absolute "$prov")
 
 repo=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "run this inside a TensorRT-LLM checkout"; exit 64; }
