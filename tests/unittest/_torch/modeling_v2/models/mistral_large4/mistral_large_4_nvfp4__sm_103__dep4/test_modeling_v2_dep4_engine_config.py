@@ -783,10 +783,11 @@ def test_boot_command_and_core_yaml_build_one_deployment(dep8, dep8_gate):
 def test_quantization_is_the_anchor_key(world, engines):
     """At dep4 and dep8 as at tep4: MIXED_PRECISION with the FP8 KV cache, the GSM8K anchor row's
     key, and the router handed params.json's quantization_config with its 475 quantized_layers
-    intact, on the world's mapping -- at eight ranks from core.yaml and from the boot gate's
-    command alike."""
+    intact plus the FP8 KV-cache algorithm the native loader records from fp8_kv_cache, on the
+    world's mapping -- at eight ranks from core.yaml and from the boot gate's command alike."""
     on_disk = json.loads((engines[0].path / "params.json").read_text())["quantization_config"]
     assert len(on_disk["quantized_layers"]) == 475
+    routed = dict(on_disk, kv_cache_quant_algo="FP8")
     for resolved in engines:
         assert resolved.prequantized is True
         for quant in (resolved.llm_args.quant_config, resolved.model_config.quant_config):
@@ -798,8 +799,8 @@ def test_quantization_is_the_anchor_key(world, engines):
 
         assert len(resolved.routed) == 1
         seen = resolved.routed[0]
-        assert seen.quantization_config == on_disk
-        assert resolved.model_config.pretrained_config.quantization_config == on_disk
+        assert seen.quantization_config == routed
+        assert resolved.model_config.pretrained_config.quantization_config == routed
         assert seen.pretrained_config is resolved.model_config.pretrained_config
         assert resolved.model_config.modeling_v2_target is _Routed
         assert seen.compute_capability == _SM103 and seen.spec_config is None
@@ -966,6 +967,8 @@ def test_an_idle_rank_steps_with_a_one_token_generation_dummy(world, dep):
         """The executor state `_pad_attention_dp_dummy_request` reads, with its own helpers."""
         executor = SimpleNamespace(
             enable_attention_dp=mapping.enable_attention_dp,
+            # The attention-DP group: a single-rank group skips dummy padding.
+            dist=SimpleNamespace(tp_size=mapping.tp_size),
             _enable_remote_tail_adp=False,
             # No speculative decoding: no draft KV cache joins the target's reuse.
             enable_joint_kv_cache_reuse=False,
