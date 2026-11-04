@@ -21,13 +21,23 @@ what the model is trained to emit; ``native.read`` must recover the message from
 it. For DeepSeek V4.1 the vendor's own completion parser is run as well and its
 reading is recorded beside the expected one.
 
-    native_goldens.py --kimi-k3 <ckpt dir> --glm <ckpt dir> --deepseek-v41 <ckpt dir> \
-        --out tests/fixtures/native_goldens.json
+    native_goldens.py --glm <ckpt dir> --check
+
+reads every render of the checkpoint you serve back with its model profile's own reader, and
+compares it with the shipped goldens (``tests/fixtures/native_goldens.json``). It writes nothing,
+prints each encoder file's ``template_sha256`` (the first 16 hex digits of its SHA-256, as model
+profiles record it), and exits 1 when a render does not read back exactly. Run it before trusting
+C-13 on a checkpoint whose ``template_sha256`` the profile does not list.
+
+    native_goldens.py --kimi-k3 <ckpt dir> --glm <ckpt dir> --deepseek-v41 <ckpt dir> --out <file>
+
+writes the goldens. Regenerate the shipped fixture with it only when a reader changes.
 
 Only the synthetic cases below are rendered; nothing is read from traces.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -146,22 +156,86 @@ def deepseek_v41(ckpt):
     return out
 
 
+SKILL = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SHIPPED = os.path.join(SKILL, "tests", "fixtures", "native_goldens.json")
+PROFILES = os.path.join(SKILL, "profiles", "model")
+# The encoder each checkpoint renders with, as its model profile names it.
+ENCODER_FILES = {"kimi_k3": "encoding_k3.py", "glm": "chat_template.jinja",
+                 "deepseek_v41": os.path.join("encoding", "encoding.py")}  # fmt: skip
+
+
+def template_sha256(path):
+    """The first 16 hex digits of a file's SHA-256: a model profile's ``template_sha256``."""
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:16]
+
+
+def read_back(golden, profile):
+    """Why ``golden`` does not read back exactly with the profile's own reader, or None."""
+    import native
+    import profiles
+
+    turn = native.read(profiles.native_card(profile), golden["text"])
+    got = {"reasoning": turn.reasoning, "content": turn.content,
+           "calls": [{"name": c.name, "args": [list(a) for a in c.args]} for c in turn.calls]}  # fmt: skip
+    if turn.anomalies:
+        return "anomalies: " + ", ".join(turn.anomalies)
+    if got != golden["expected"]:
+        return "reads back as another message"
+    if "vendor" in golden:  # the vendor's own parser must read the render the same way
+        calls = [{"name": c.name, "arguments": {k: v if t == "string" else json.loads(v)
+                                                for k, v, t in c.args}} for c in turn.calls]  # fmt: skip
+        if calls != golden["vendor"]["calls"] or turn.content != golden["vendor"]["content"]:
+            return "the vendor's parser reads it differently"
+    return None
+
+
+def check(goldens, shipped_path=SHIPPED, profile_dir=PROFILES):
+    """Print, per model, how many renders read back and equal the shipped ones; 1 on any failure."""
+    import profiles
+
+    with open(shipped_path) as fh:
+        shipped = {(g["model"], g["case"]): g["text"] for g in json.load(fh)["goldens"]}
+    failures = 0
+    for model in sorted({g["model"] for g in goldens}):
+        profile = profiles.load_profile(os.path.join(profile_dir, model + ".yaml"))
+        renders = [g for g in goldens if g["model"] == model]
+        problems = [(g["case"], read_back(g, profile)) for g in renders]
+        problems = [(case, why) for case, why in problems if why]
+        same = sum(shipped.get((model, g["case"])) == g["text"] for g in renders)
+        print(f"{model}: {len(renders)} renders, {len(renders) - len(problems)} read back exactly, "
+              f"{same} equal to the shipped goldens")  # fmt: skip
+        for case, why in problems:
+            print(f"  FAIL {case}: {why}")
+        failures += len(problems)
+    return 1 if failures else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)  # fmt: skip
     ap.add_argument("--kimi-k3")
     ap.add_argument("--glm")
     ap.add_argument("--deepseek-v41")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", help="write the goldens to this file")
+    ap.add_argument("--check", action="store_true",
+                    help="write nothing: read every render back and compare it with the shipped goldens")  # fmt: skip
     args = ap.parse_args(argv)
+    if bool(args.out) == args.check:
+        ap.error("give exactly one of --out and --check")
     goldens = []
+    sources = {}
     for flag, fn in (("kimi_k3", kimi_k3), ("glm", glm), ("deepseek_v41", deepseek_v41)):
-        if getattr(args, flag):
-            goldens += fn(getattr(args, flag))
+        ckpt = getattr(args, flag)
+        if ckpt:
+            print(f"{flag}: {ENCODER_FILES[flag]} template_sha256 "
+                  f"{template_sha256(os.path.join(ckpt, ENCODER_FILES[flag]))}")  # fmt: skip
+            goldens += fn(ckpt)
+            sources[flag] = os.path.basename(os.path.normpath(ckpt))
+    if args.check:
+        return check(goldens)
     with open(args.out, "w") as fh:
-        json.dump({"schema": "trtllm-serve-model-harness/native-goldens@1",
-                   "sources": {k: os.path.basename(os.path.normpath(v)) for k, v in vars(args).items()
-                               if v and k != "out"},
+        json.dump({"schema": "trtllm-serve-model-harness/native-goldens@1", "sources": sources,
                    "goldens": goldens}, fh, indent=1, ensure_ascii=False)  # fmt: skip
         fh.write("\n")
     print(f"{len(goldens)} goldens -> {args.out}")

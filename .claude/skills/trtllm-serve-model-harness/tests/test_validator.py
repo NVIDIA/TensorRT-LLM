@@ -21,6 +21,7 @@ The fast tests cover the parts every verdict depends on; the control matrix
     MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -33,6 +34,7 @@ sys.path.insert(0, VALIDATE)
 
 import controls  # noqa: E402
 import native  # noqa: E402
+import native_goldens  # noqa: E402
 import pipeline  # noqa: E402
 import profiles  # noqa: E402
 import proto_anthropic  # noqa: E402
@@ -345,6 +347,34 @@ def test_native_goldens_read_back():
             assert (
                 calls == golden["vendor"]["calls"] and turn.content == golden["vendor"]["content"]
             )
+
+
+def test_native_goldens_check_reads_the_served_checkpoints_renders_back(
+    tmp_path, monkeypatch, capsys
+):
+    """--check passes renders the reader reads back, names one it cannot, and writes nothing."""
+    skill = os.path.dirname(os.path.dirname(VALIDATE))
+    with open(os.path.join(skill, "tests", "fixtures", "native_goldens.json")) as fh:
+        renders = [g for g in json.load(fh)["goldens"] if g["model"] == "glm-5"]
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "chat_template.jinja").write_text("{{ messages }}")
+    monkeypatch.setattr(native_goldens, "glm", lambda path: renders)
+
+    assert native_goldens.main(["--glm", str(ckpt), "--check"]) == 0
+    first = capsys.readouterr().out
+    # A render whose call is never closed: the reader must not read it back as the message.
+    case = next(i for i, g in enumerate(renders) if "</tool_call>" in g["text"])
+    renders[case] = dict(renders[case], text=renders[case]["text"].replace("</tool_call>", "", 1))
+    assert native_goldens.main(["--glm", str(ckpt), "--check"]) == 1
+    second = capsys.readouterr().out
+
+    sha = hashlib.sha256(b"{{ messages }}").hexdigest()[:16]
+    assert f"glm: chat_template.jinja template_sha256 {sha}" in first
+    assert "glm-5: 5 renders, 5 read back exactly, 5 equal to the shipped goldens" in first
+    assert "glm-5: 5 renders, 4 read back exactly, 4 equal to the shipped goldens" in second
+    assert f"FAIL {renders[case]['case']}:" in second
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt"]
 
 
 def test_native_reader_flags_the_models_slips():

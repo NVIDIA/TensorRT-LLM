@@ -14,17 +14,17 @@
 # limitations under the License.
 """Readers shared by the conformance checks.
 
-The checks read the request-trace layout that trtllm-serve writes when
-``TRTLLM_REQUEST_TRACE_DIR`` is set (``tensorrt_llm/serve/request_trace.py``):
+The checks read the request-trace layout: two kinds of shards, requests and responses,
 
-    <hour>/requests-<pid>.jsonl    {"event": "request", "trace_id", "route", "body", "headers", ...}
-    <hour>/responses-<pid>.jsonl   {"event": "response", "trace_id", "status",
-                                    "response": {"kind": "sse_text" | "json" | "text", "body": ...}, ...}
+    requests-*.jsonl     {"event": "request", "trace_id", "route", "body", "headers", ...}
+    responses-*.jsonl    {"event": "response", "trace_id", "status",
+                          "response": {"kind": "sse_text" | "json" | "text", "body": ...}, ...}
 
-Shards may be plain, ``.zst`` or ``.gz``. The replay tool (``../replay_requests.py``)
-writes the same two shapes, so every check
-runs unchanged on recorded traffic and on replayed traffic. A shard that cannot
-be read to its end raises ``ShardError``: a damaged shard never reads as a short one.
+as the recorder (``../record_requests.py``) and the replay tool (``../replay_requests.py``) write
+them, so every check runs unchanged on recorded and on replayed traffic. A server-side trace
+writer that is not on main (``TRTLLM_REQUEST_TRACE_DIR``) writes the same shapes in UTC-hour
+directories. Shards may be plain, ``.zst`` or ``.gz``. A shard that cannot be read to its end
+raises ``ShardError``: a damaged shard never reads as a short one.
 
 Nothing here prints record content. Locators are (file, 1-based line, trace_id).
 """
