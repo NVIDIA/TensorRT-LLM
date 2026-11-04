@@ -78,6 +78,7 @@ import zlib
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from profiles import DEFAULT_DEGENERATE, DEFAULT_MARKERS  # noqa: E402
 from tracelib import (  # noqa: E402
     CALL_TYPES,
     ShardError,
@@ -103,16 +104,6 @@ NESTED_HEADER = re.compile(r"^### `([A-Za-z0-9_.-]+)`", re.M)
 # name with whitespace or markup in it is the model's mangled text, which the
 # server must not "recover" (resolve_tool_name refuses prose), so it is undeclared.
 QUALIFIED_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$")
-DEFAULT_MARKERS = (
-    r"</?tool_call>",
-    r"</?think>",
-    r"</?arg_(?:key|value)>",
-    r"<\|[a-z_]{2,24}\|>",
-    r"<｜DSML｜",
-    r"<｜tool▁",
-    r"\[TOOL_CALLS\]",
-)
-DEFAULT_DEGENERATE = (r"(?:\[PAD\]){20,}",)
 QUOTES = "`'\""
 SERVING_SHAPE = ("type_mismatch", "namespace_mismatch", "prefixed_name_of_declared")
 MODEL_CLASSES = ("undeclared", "nested_tool_called_directly", "payload_invalid")

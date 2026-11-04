@@ -185,6 +185,25 @@ def test_check_tool_calls_reads_a_name_that_is_not_a_string_as_malformed(name):
     assert check_tool_calls.check_call(dict(call, name="exec"), decl)["class"] == "valid"
 
 
+def test_check_tool_calls_screens_a_closing_dsml_tag(tmp_path):
+    """The reference screen reads the verdict's markers: a lone closing DSML tag is markup too."""
+    import subprocess
+
+    content = [{"type": "output_text", "text": "done</｜DSML｜function_calls>"}]
+    final = {"id": "resp_1", "object": "response", "status": "completed",
+             "output": [{"type": "message", "role": "assistant", "content": content}]}  # fmt: skip
+    request = {"event": "request", "trace_id": "t1", "route": "/v1/responses",
+               "body": {"model": "m", "input": "go"}}  # fmt: skip
+    response = {"event": "response", "trace_id": "t1", "response": {"kind": "json", "body": final}}
+    (tmp_path / "requests-1.jsonl").write_text(json.dumps(request) + "\n")
+    (tmp_path / "responses-1.jsonl").write_text(json.dumps(response) + "\n")
+    out = tmp_path / "report.json"
+    result = subprocess.run([sys.executable, os.path.join(VALIDATE, "check_tool_calls.py"),
+                             "--out", str(out), str(tmp_path)], capture_output=True, text=True)  # fmt: skip
+    assert result.returncode == 0, result.stderr
+    assert json.loads(out.read_text())["counts"].get("screen:markup_in_message:bare") == 1
+
+
 def test_harness_signals_refuses_a_file_it_cannot_read(tmp_path):
     """A shard's name says which side it holds: a file named otherwise is an error, not a crash."""
     import harness_signals
