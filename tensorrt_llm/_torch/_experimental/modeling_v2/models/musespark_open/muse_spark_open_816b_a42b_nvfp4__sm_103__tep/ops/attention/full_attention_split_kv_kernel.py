@@ -41,6 +41,10 @@ one PTX operation per step), and the two warps the op's build leaves idle append
 into the FP8 cache, in the CTA whose pages hold them, before that CTA's loader streams those
 pages. Every one of its threads executes ``griddepcontrol.wait`` before it exits. Its
 fold-only code sits under ``const_expr`` in the shared roles, so the op's build is unchanged.
+Its multi-sequence build (``reqs`` 2..4, ``full_attention_prep_fold_multi``) is the fold on the
+multi-sequence build's partition: each CTA offsets the projection, the table and the partials
+to its sequence (``request_of``) before any role runs, so every role computes the one-sequence
+fold's work for that sequence over that sequence's splits.
 """
 
 import copy
@@ -1612,7 +1616,9 @@ class FullAttnSplitKvFoldKernel(FullAttnSplitKvKernel):
     not the op's build's: it is audited as a kernel that waits before it exits, which the op's
     build is not. ``app_wait=False`` (the loader does not wait for the append) is a negative
     control for the tests only; ``rescale_log2`` other than 4 (the base class's rescale
-    threshold) exists for the tests only too.
+    threshold) exists for the tests only too. ``reqs`` above 1 is the multi-sequence build
+    (``full_attention_prep_fold_multi``): the base class's multi-sequence partition, with the
+    fold in every CTA on its own sequence's rows, pages and table.
     """
 
     def __init__(
@@ -1629,6 +1635,7 @@ class FullAttnSplitKvFoldKernel(FullAttnSplitKvKernel):
         rescale_log2: float = 4.0,
         kv_heads: int = HKV,
         max_cta_pages: int = MAX_CTA_PAGES,
+        reqs: int = 1,
     ):
         super().__init__(
             enable_pdl=enable_pdl,
@@ -1640,6 +1647,7 @@ class FullAttnSplitKvFoldKernel(FullAttnSplitKvKernel):
             rescale_log2=rescale_log2,
             kv_heads=kv_heads,
             max_cta_pages=max_cta_pages,
+            reqs=reqs,
         )
         self.fold = (float(eps), float(q_scale), bool(permuted))
         self.app_wait = app_wait

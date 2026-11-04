@@ -247,7 +247,8 @@ def _compiled_kernel(
     control. ``min_pages`` other than ``MIN_PAGES`` (fewer pages per split, so that the step's
     two pages can sit in two CTAs) exists for that op's tests too; the ops build neither.
     ``kv_heads`` is the rank's KV heads (``RANK_KV_HEADS``: 2 at tep8, 4 at tep4); ``reqs``
-    above 1 is the multi-sequence build (``full_attention_split_kv_multi``)."""
+    above 1 is the multi-sequence build (``full_attention_split_kv_multi``, and with ``fold``
+    ``full_attention_prep_fold_multi``)."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -280,7 +281,7 @@ def _compiled_kernel(
             **({"reqs": reqs} if reqs > 1 else {}),
         )
     else:
-        assert not prefetch and k_tile and p_split and reqs == 1, (prefetch, k_tile, p_split, reqs)
+        assert not prefetch and k_tile and p_split, (prefetch, k_tile, p_split)
         eps, q_scale, permuted = fold
         kernel = fk.FullAttnSplitKvFoldKernel(
             enable_pdl=enable_pdl,
@@ -294,7 +295,8 @@ def _compiled_kernel(
             rescale_cols=rescale_cols,
             rescale_log2=rescale_log2,
             kv_heads=kv_heads,
-            max_cta_pages=cta_pages(kv_heads),
+            max_cta_pages=cta_pages(kv_heads) * (MULTI_CTA_PAGES_FACTOR if reqs > 1 else 1),
+            **({"reqs": reqs} if reqs > 1 else {}),
         )
     dtypes = (
         cutlass.BFloat16,  # qkv
