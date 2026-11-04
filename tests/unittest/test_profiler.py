@@ -214,6 +214,45 @@ def test_real_execution_trace_receives_metadata(
     )
 
 
+@pytest.mark.skipif(
+    not hasattr(torch.profiler, "ExecutionTraceObserver"), reason="requires ExecutionTraceObserver"
+)
+def test_real_execution_trace_preserves_preencoded_metadata_and_body_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    payload = "TRTLLM18:workflow{'rank':-7,'ids':[],'label':'preencoded'}"
+    result = object()
+    effects: list[str] = []
+
+    @profiler.record_function_metadata_scope("preencoded", "workflow", lambda: payload)
+    def operation() -> object:
+        effects.append("body")
+        torch.ones(1)
+        return result
+
+    trace_file = tmp_path / "preencoded-execution.json"
+    observer = torch.profiler.ExecutionTraceObserver().register_callback(str(trace_file))
+    try:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ):
+            assert operation() is result
+    finally:
+        observer.unregister_callback()
+    assert effects == ["body"]
+    nodes = [
+        node for node in json.loads(trace_file.read_text())["nodes"] if node["name"] == "preencoded"
+    ]
+    assert len(nodes) == 1
+    recorded = nodes[0]["inputs"]["values"][0]
+    assert recorded == payload
+    assert decode_profiler_metadata(recorded) == (
+        "workflow",
+        {"rank": -7, "ids": [], "label": "preencoded"},
+    )
+
+
 def test_contextmanager_decorator_preserves_arguments_and_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
