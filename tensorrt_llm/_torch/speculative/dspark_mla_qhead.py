@@ -17,7 +17,7 @@
 q_a_layernorm folds into the q_b GEMM (``W_qb * w`` on the un-normalized q_a,
 :func:`fold_rmsnorm_weight`), and :func:`draft_qhead` applies the inverse RMS
 and does the block RoPE, the latent RMSNorm, the (owner-masked) FP8 pool store,
-the absorption ``q_nope @ W_UK`` and the FP8 query: five launches -> two.
+the absorption ``q_nope @ W_UK`` and the FP8 query.
 Drafter rounding: the norm's scale after the GEMM, FP32 reductions in other
 orders than cuBLAS.
 """

@@ -26,7 +26,7 @@ from ..flashinfer_utils import get_env_enable_pdl
 if TYPE_CHECKING:
     from ..attention.backends.fp4_mla.fp4_mla_packed_reduce import PackedSplitPartials
 
-# Receive buffer per rank (two halves): a helix8 rank with 96 heads fits 331 tokens per launch.
+# Receive buffer per rank, in two halves; max_tokens derives the tokens one launch fits.
 _RECV_BUFFER_BYTES = 16 << 20
 _HALF_BYTES = _RECV_BUFFER_BYTES // 2 // 16 * 16
 

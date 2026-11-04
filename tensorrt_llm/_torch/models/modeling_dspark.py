@@ -3512,7 +3512,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     ``VANILLA``  the eager torch reference; where the other two land unpaged.
 
     ``context_kv_dtype="fp8"`` stores the latents as FP8 E4M3 at a unit
-    per-tensor scale (``to_draft_fp8``), 2880 instead of 5760 B/token/rank, and
+    per-tensor scale (``to_draft_fp8``), half the BF16 bytes per token, and
     the CUTEDSL decode reads them with an FP8 query through the FP8 MLA decode;
     the other two backends read BF16 only.
 
