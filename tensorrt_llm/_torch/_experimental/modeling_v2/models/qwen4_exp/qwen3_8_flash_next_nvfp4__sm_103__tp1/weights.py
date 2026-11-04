@@ -56,6 +56,7 @@ from torch import nn
 
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.llmapi.utils import get_numa_aware_cpu_affinity
+from tensorrt_llm.logger import logger
 
 #: `layers=ALL_LAYERS` is the common case and the default. A sentinel rather
 #: than a lambda so the table reads as data, and rather than `True` so the
@@ -184,7 +185,13 @@ class _RegisteredHostBuffer:
             os.sched_setaffinity(0, local)
         try:
             self._mapping = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-            self._mapping.madvise(mmap.MADV_HUGEPAGE)
+            try:
+                self._mapping.madvise(mmap.MADV_HUGEPAGE)
+            except OSError as error:  # a kernel without transparent huge pages
+                logger.warning(
+                    f"madvise(MADV_HUGEPAGE) failed for the host-resident PLE table ({error}); "
+                    "the device's row gathers from its base pages run several times slower"
+                )
             # Shares the mapping's pages, and keeps the mapping alive while it lives.
             self._storage = torch.frombuffer(self._mapping, dtype=torch.uint8)
             self.pointer = self._storage.data_ptr()

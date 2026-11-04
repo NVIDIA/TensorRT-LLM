@@ -9,6 +9,7 @@ float64 gather-and-scale. Beyond the cells: the `query_start_loc` length guard,
 graph capture, and the host table's huge-page advice.
 """
 
+import os
 import zlib
 
 import pytest
@@ -180,6 +181,10 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert not torch.equal(args[1], pool_before)
 
 
+@pytest.mark.skipif(
+    not os.path.exists("/sys/kernel/mm/transparent_hugepage/enabled"),
+    reason="the kernel has no transparent huge pages",
+)
 def test_host_table_is_advised_transparent_huge_pages() -> None:
     # The host-resident table is a mapping of its own, advised MADV_HUGEPAGE
     # before it is faulted in, whatever torch's CPU allocator does with huge pages.
