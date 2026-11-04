@@ -767,6 +767,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._shutdown_once()
 
     def _shutdown_once(self) -> None:
+        """Drain and close owners, leaving failed teardown retryable until
+        completion.
+        """
         if getattr(self, "_shutdown_complete", False):
             return
         self._close_sessions_for_shutdown()
@@ -1205,6 +1208,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         failed: list[int],
         mark_retired: bool = False,
     ) -> None:
+        """Close failed sessions before removing requests or recording send
+        retirement.
+        """
         for rid in failed:
             session = sessions.get(rid)
             if session is None:
@@ -1280,6 +1286,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return outcomes.get(rid) if outcomes is not None and rid is not None else None
 
     def _record_send_terminal_outcome(self, rid: int, outcome: SendTerminalOutcome) -> None:
+        """Retain a send outcome only while its request has an opted-in
+        observer.
+        """
         outcomes: dict[int, SendTerminalOutcome] | None = getattr(
             self, "_profile_send_outcomes", None
         )

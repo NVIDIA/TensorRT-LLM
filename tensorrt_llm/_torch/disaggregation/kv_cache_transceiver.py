@@ -124,6 +124,20 @@ def create_kv_cache_transceiver(
     cache_transceiver_config: CacheTransceiverConfig,
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None
 ) -> Optional["KvCacheTransceiver"]:
+    """Construct the configured KV resource owner and optional profiling
+    wrapper.
+
+    Args:
+        mapping: Rank and parallelism layout for the transceiver.
+        dist: Distributed operations used during setup and transfers.
+        kv_cache_manager: KV cache pools whose blocks are transferred.
+        attention_type: Attention implementation used by the cache manager.
+        cache_transceiver_config: Runtime, transport, and transfer settings.
+        mamba_cache_manager: Optional state-cache manager for hybrid models.
+
+    Returns:
+        The selected transceiver, or None when transfers are disabled.
+    """
     resolve_cache_transceiver_config(cache_transceiver_config)
     lifecycle_policy = getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
     bypasses_python = (cache_transceiver_config is None
@@ -242,6 +256,9 @@ def create_kv_cache_transceiver(
 def _maybe_profile_kv_cache_transceiver(
         transceiver: "KvCacheTransceiver", backend: str,
         mapping: Mapping) -> "KvCacheTransceiver":
+    """Wrap the resource owner only when KV profiling was selected at
+    startup.
+    """
     from tensorrt_llm._profiler import custom_region_enabled
 
     if not custom_region_enabled("kv"):
