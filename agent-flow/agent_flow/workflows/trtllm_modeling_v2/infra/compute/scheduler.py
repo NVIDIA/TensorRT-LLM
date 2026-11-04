@@ -25,6 +25,9 @@ A reader that sees ``done/<name>.rc`` may trust the log and the JSON beside it. 
 what it needs in header lines among its first :data:`HEADER_SCAN_LINES` lines, for example
 ``#spool: gpus=2 wall=2h priority=0 owner=r014 token=<uuid> tree=<checkout>``.
 
+A ``tree`` that is a node-local commit tree (``localtree.py``) the node does not hold yet is made
+there before the job starts, from the checkout ``source=`` names (default: ``MV2FLOW_REPO``).
+
 ``gpus`` is a device count or ``all`` (the whole node, exclusively). Without it a ``free-`` name
 holds nothing and any other name holds the whole node.
 
@@ -130,10 +133,12 @@ from typing import Any, Callable, Iterable, Mapping
 
 try:
     from ..files import read_json, write_json_atomic, write_text_atomic
+    from . import localtree as _localtree
     from . import provenance as _provenance
     from . import rebuild as _rebuild
 except ImportError:  # run by path: the sibling modules are on sys.path[0]
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import localtree as _localtree  # type: ignore[no-redef]
     import provenance as _provenance  # type: ignore[no-redef]
     import rebuild as _rebuild  # type: ignore[no-redef]
     from files import read_json, write_json_atomic, write_text_atomic
@@ -311,6 +316,7 @@ HEADER_KEYS: dict[str, tuple[str, Callable[[str], object]]] = {
     "owner": ("owner", _parse_word),
     "token": ("token", _parse_word),
     "tree": ("tree", _parse_tree),
+    "source": ("source", _parse_tree),
 }
 
 
@@ -330,6 +336,9 @@ class JobSpec:
     token: str = ""
     #: The checkout the job runs against: its working directory and first PYTHONPATH entry.
     tree: str = ""
+    #: The checkout a node-local commit ``tree`` is made from on the node that runs the job
+    #: (``localtree.py``); unset, the session's ``MV2FLOW_REPO``.
+    source: str = ""
     #: When the job was submitted (the pending file's mtime).
     submitted: float = 0.0
     #: Times the job has run again after lost allocations (its ``#spool-rerun:`` line).
@@ -983,7 +992,14 @@ class Scheduler:
         if spec.wall_s is None:
             spec.wall_s = self.config.default_wall_s if spec.holds_gpus else 0.0
         if spec.tree and not Path(spec.tree).is_dir():
-            spec.errors.append(f"tree {spec.tree} is not a directory this watcher can see")
+            if not _localtree.is_commit_tree(spec.tree):
+                spec.errors.append(f"tree {spec.tree} is not a directory this watcher can see")
+            elif not self._tree_source(spec):
+                spec.errors.append(
+                    f"tree {spec.tree} is a node-local commit tree this node does not hold, "
+                    f"and neither the job (source=) nor the session (MV2FLOW_REPO) names the "
+                    f"checkout to make it from"
+                )
         if spec.gang and spec.gpus is not None:
             spec.errors.append(
                 f"asks for {spec.nodes} nodes and {spec.gpus} GPU(s): a multi-node job holds "
@@ -1194,10 +1210,20 @@ class Scheduler:
                 )
         return None
 
+    def _tree_source(self, spec: JobSpec) -> str:
+        """The checkout a node-local commit tree of ``spec`` is made from."""
+        return spec.source or self.environ.get(_localtree.REPO_ENV, "")
+
     def _native_locations(self, tree: str) -> list[str]:
-        """Where ``tree``'s native build really is, resolved once a pass."""
+        """Where ``tree``'s native build really is, resolved once a pass.
+
+        A node-local commit tree not made yet will link its source's.
+        """
         if tree not in self._native_seen:
-            self._native_seen[tree] = _rebuild.native_locations(tree)
+            where = tree
+            if _localtree.is_commit_tree(tree) and not Path(tree).is_dir():
+                where = self.environ.get(_localtree.REPO_ENV, "") or tree
+            self._native_seen[tree] = _rebuild.native_locations(where)
         return self._native_seen[tree]
 
     # -------------------------------------------------------------- hand-over
@@ -1548,17 +1574,23 @@ class Scheduler:
             )
         if spec.tree:
             header += f"=== tree {spec.tree} (working directory and first PYTHONPATH entry) ===\n"
+        argv, cwd = ["bash", str(running)], spec.tree or None
+        if spec.tree and _localtree.is_commit_tree(spec.tree) and not _localtree.ready(spec.tree):
+            # Made on this node first, outside the scheduler's loop, then entered.
+            argv = _localtree.ensure_command(spec.tree, self._tree_source(spec) or None, argv)
+            cwd = None
+            header += f"=== tree made on this node from {self._tree_source(spec)} first ===\n"
         try:
             with log_path.open("w", encoding="utf-8") as log:
                 log.write(header + "\n")
             log = log_path.open("ab")
             try:
                 proc = subprocess.Popen(
-                    ["bash", str(running)],
+                    argv,
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
-                    cwd=spec.tree or None,
+                    cwd=cwd,
                     env=env,
                     start_new_session=True,
                     preexec_fn=_disable_core_dumps,

@@ -134,6 +134,32 @@ must change before that.
    validation uses a same-host control; cross-host summary deltas are descriptive.
    `tune/stage.py` and `tune/campaign.py` describe the policy.
 
+### Node-local trees
+
+A run makes many checkouts: a sparse worktree per task, a snapshot per checked commit, a worktree
+per tune candidate and a tree per measured commit. On a shared filesystem with an inode quota and
+costly per-file metadata (Lustre), set `environment.local_trees` to a directory on each node's own
+disk and those trees live there instead (`infra/compute/localtree.py`):
+
+| Tree | Where | What a job on another node runs |
+|---|---|---|
+| Snapshot of a commit | `<root>/snapshots/<commit>` | its own copy, made from the path |
+| Measured commit (tune) | `<root>/commits/<commit>` | its own copy, made from the path |
+| Sparse task worktree | `<root>/worktrees/<task>` | a commit of what it held at submission |
+| Tune candidate, `best` | `<root>/tune/<campaign>/<slug>` | a commit of what it held at submission |
+| Whole-tree task (native code) | `<workspace>/worktrees/<task>` | the worktree itself, as before |
+
+`<root>` is `<local_trees>/mv2flow-trees-<user>/<workspace name>-<digest>`, the same path on every
+node. A commit tree is a standalone checkout that borrows the checkout's objects, read-only, with
+the checkout's native build linked in; its sparse cone is recorded beside the checkout's git
+directory, so the spool scheduler on any node makes it from the path alone (`#spool: tree=<path>
+source=<checkout>`) before the job starts, and drops copies unused for a day. Submitting against
+a mutable tree (`spoolctl.py submit --tree`, a gate's `--tree`, the executor) freezes it: its HEAD,
+or a commit of its uncommitted edits on top kept under `refs/mv2flow/wip/<kind>-<name>`. Task
+worktrees stay registered in the shared git directory, locked against `git worktree prune` from
+other nodes; one whose node was lost is made again from its branch with its last frozen edits put
+back. What a check's processes read is still written under the workspace's `snapshots/.reads`.
+
 ## Code map
 
 | Location | Responsibility |

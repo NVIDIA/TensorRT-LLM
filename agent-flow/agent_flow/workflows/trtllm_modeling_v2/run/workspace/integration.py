@@ -34,10 +34,22 @@ worktree would first turn on per-worktree config in the config every worktree
 of the repository shares, and fails where that file is read-only or locked.
 
 An ``investigate`` task gets a scratch worktree that is never integrated.
+
+With node-local trees (``environment.local_trees``), a sparse task worktree's
+files are on the orchestrator's node, at ``<local root>/worktrees/<task>``
+(``infra/compute/localtree.py``); its registration, branch and commits stay in
+the checkout's shared git directory, the registration locked so a ``git
+worktree prune`` elsewhere keeps it. A job its worker submits runs a commit of
+what the worktree holds then, uncommitted edits included, kept under
+``refs/mv2flow/wip/worktrees-<task>``; a worktree whose files are gone (the
+node was lost) is made again from its branch with those edits put back. A
+whole-tree task (one that touches native code, whose rebuild other nodes must
+see) keeps its worktree in the workspace.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import posixpath
@@ -50,6 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping
 
+from ...infra.compute import localtree
 from ...infra.git import (
     CommitPolicy,
     audit_commits,
@@ -132,6 +145,9 @@ class Integration:
     ) -> None:
         self.repo = Path(repo)
         self.root = Path(workspace) / WORKTREES_DIRNAME
+        #: Where sparse worktrees go when the run keeps its trees node-local; else ``None``.
+        local = localtree.local_root()
+        self.local_root = local / "worktrees" if local else None
         self.prefix = prefix
         #: Identity for the rebase's committer; the author of each commit is kept.
         self.env = env or {}
@@ -146,7 +162,21 @@ class Integration:
         return f"{self.prefix}/{task_id}"
 
     def tree(self, task_id: str) -> Path:
-        return self.root / task_id
+        """The task's worktree: in the workspace when one is there, else node-local when the run is."""
+        shared = self.root / task_id
+        if self.local_root is None or shared.exists():
+            return shared
+        return self.local_root / task_id
+
+    def _place(self, task_id: str, dirs: tuple[str, ...] | None) -> Path:
+        """Where a task's worktree is made: a whole tree always in the workspace."""
+        tree = self.tree(task_id)
+        if dirs is None and self.local_root is not None and not tree.exists():
+            return self.root / task_id
+        return tree
+
+    def _local(self, tree: Path) -> bool:
+        return self.local_root is not None and tree.parent == self.local_root
 
     def _git(self, cwd: Path, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -167,7 +197,8 @@ class Integration:
         nothing the integration head lacks starts again at that head
         (:meth:`_caught_up`), so a retry sees what other tasks landed since.
         """
-        tree, dirs = self.tree(task_id), cone(touches, full)
+        dirs = cone(touches, full)
+        tree = self._place(task_id, dirs)
         if _checked_out(tree):
             self._widen(tree, dirs)
             self._catch_up(task_id, tree)
@@ -258,9 +289,12 @@ class Integration:
         """
         if tree.exists():
             self._discard(tree)
-        self.root.mkdir(parents=True, exist_ok=True)
+        tree.parent.mkdir(parents=True, exist_ok=True)
         branch = self.branch(task_id)
         with repo_lock(self.repo):
+            if self._local(tree):
+                # Registered, locked, by a copy on a node that is gone.
+                localtree.forget_worktree(self.repo, tree)
             for attempt in (1, 2):
                 exists = git_checked(
                     self.repo, "rev-parse", "--verify", "--quiet", branch, check=False
@@ -291,6 +325,11 @@ class Integration:
                 error = _last_line(made.stderr)
                 how = f"worktree made whole: git could not make it sparse ({error})"
         git_checked(tree, *_CHECKOUT, *sparse, "reset", "--hard", "-q")
+        if self._local(tree):
+            localtree.lock_worktree(self.repo, tree)
+            how += f", node-local at {tree}"
+            with contextlib.suppress(localtree.LocalTreeError):
+                localtree.restore_wip(tree, log=self.log)
         self.log(f"{task_id}: {how}")
 
     def _discard(self, tree: Path) -> None:
@@ -421,7 +460,19 @@ class Integration:
         """Remove an integrated task's worktree; its branch stays as the record."""
         tree = self.tree(task_id)
         if tree.exists():
-            git_checked(self.repo, "worktree", "remove", "--force", str(tree), check=False)
+            # Twice: a node-local worktree is locked.
+            git_checked(
+                self.repo, "worktree", "remove", "--force", "--force", str(tree), check=False
+            )
+        if self._local(tree):
+            localtree.forget_worktree(self.repo, tree)
+            git_checked(
+                self.repo,
+                "update-ref",
+                "-d",
+                localtree.wip_ref(f"worktrees-{task_id}"),
+                check=False,
+            )
 
 
 def _under(path: str, root: str) -> bool:

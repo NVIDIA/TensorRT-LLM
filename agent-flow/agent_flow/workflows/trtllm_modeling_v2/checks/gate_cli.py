@@ -28,6 +28,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
+from ..infra.compute import localtree
 from ..infra.compute.environment import RunEnvironment, resolve_environment, scheduler_owns_devices
 from ..infra.compute.executor import FEATURE, select_command_executor, shell_runner_for
 from ..infra.git import resolve_commit
@@ -218,6 +219,10 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         unit_environment = replace(unit_environment, python=args.python)
     with _snapshot(args, task_data) as pin:
         tree = pin.tree if pin is not None else args.tree
+        if tree is not None and pin is None and scheduler_owns_devices(environment.kind):
+            # A node-local worktree is only on this node: the jobs run a commit of what it
+            # holds now, made on the node that runs each one.
+            tree = Path(localtree.job_tree(tree.resolve()) or tree)
         if pin is not None:
             tracked = pin.snapshots.tracked(pin.commit)
             task_data, declared = pin.spec(task_data, tracked), pin.spec(declared, tracked)

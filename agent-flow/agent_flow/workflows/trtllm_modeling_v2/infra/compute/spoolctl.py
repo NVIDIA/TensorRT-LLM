@@ -32,10 +32,12 @@ from typing import Mapping
 
 try:
     from .. import files as _files
+    from . import localtree as _localtree
     from . import scheduler as _sched
 except ImportError:  # run by path: the sibling module is on sys.path[0]
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import files as _files
+    import localtree as _localtree  # type: ignore[no-redef]
     import scheduler as _sched  # type: ignore[no-redef]
 
 #: Exit code when the session is not there to run the job.
@@ -307,7 +309,8 @@ def _add_job_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tree",
         help="checkout to run against: working directory AND first PYTHONPATH entry; the "
-        "receipt is refused if any process imported tensorrt_llm from elsewhere",
+        "receipt is refused if any process imported tensorrt_llm from elsewhere. A node-local "
+        "worktree runs as a commit of what it holds at submission, uncommitted edits included",
     )
     parser.add_argument(
         "--session-wait",
@@ -342,6 +345,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def tree_fields(tree: str | Path) -> dict[str, str]:
+    """The ``#spool:`` fields of a job run against ``tree``.
+
+    A node-local worktree only its own node holds is frozen into a commit tree
+    (``localtree.freeze``), which the node that runs the job makes from the
+    checkout ``source`` names.
+    """
+    path = os.path.abspath(str(tree))
+    frozen = _localtree.job_tree(path) or path
+    if frozen == path and not _localtree.is_commit_tree(path):
+        return {"tree": path}
+    source = _localtree.source_of(path)
+    return {"tree": frozen, **({"source": source} if source else {})}
+
+
 def job_header(args: argparse.Namespace, owner: str | None, token: str) -> dict[str, object]:
     """The ``#spool:`` fields one submission's options ask for."""
     header: dict[str, object] = {}
@@ -356,7 +374,7 @@ def job_header(args: argparse.Namespace, owner: str | None, token: str) -> dict[
     if owner:
         header["owner"] = owner
     if args.tree:
-        header["tree"] = os.path.abspath(args.tree)
+        header.update(tree_fields(args.tree))
     header["token"] = token
     return header
 
@@ -370,12 +388,9 @@ def _submit(args: argparse.Namespace, *, wait: bool) -> int:
     token = uuid.uuid4().hex
     if args.tree and not os.path.isdir(args.tree):
         raise SpoolError(f"--tree {args.tree} is not a directory")
-    cwd = (
-        (os.path.abspath(args.tree) if args.tree else None)
-        or os.environ.get("MV2FLOW_REPO")
-        or os.getcwd()
-    )
-    script = render_job(command, header=job_header(args, owner, token), cwd=cwd)
+    header = job_header(args, owner, token)
+    cwd = header.get("tree") or os.environ.get("MV2FLOW_REPO") or os.getcwd()
+    script = render_job(command, header=header, cwd=str(cwd))
     queue_job(spool, args.name, script, owner=owner)
     paths = _sched.SpoolPaths(spool)
     if not wait:

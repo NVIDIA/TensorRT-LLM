@@ -157,6 +157,12 @@ environment:
   # How long a gate lost to its session waits for one to heart-beat again before the check is left
   # without a verdict, to run again later: seconds, 90m, 2h or HH:MM:SS. Default 1h.
   # session_wait: 1h
+  # A directory on each node's own disk (`/tmp`, `$TMPDIR`; `$VARS` expand when the run starts).
+  # Set, the run keeps its snapshots, sparse task worktrees and tune trees there instead of in the
+  # workspace, sparing a shared filesystem's inodes and metadata; each job against one of those
+  # trees makes its own copy on its node first (infra/compute/localtree.py). Commits stay in the
+  # checkout's shared git directory. Set it when the run starts, not mid-run.
+  # local_trees: /tmp
 
 # ---------------------------------------------------------------- accuracy
 # REQUIRED. The release criterion: measured >= reference - k x SE (see `floor`). The anchor comes

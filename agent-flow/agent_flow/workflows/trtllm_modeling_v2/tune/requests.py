@@ -23,7 +23,7 @@ from .attempts import ATTEMPTS_FILE
 from .records import Measurement
 from .sol_consensus import METHODS
 from .spec import TuneSpec
-from .worktree import measured_tree
+from .worktree import measured_tree, trees_root
 
 PACKAGE = Path(__file__).resolve().parent.parent
 
@@ -388,7 +388,7 @@ class TuneRequests:
         """Pin profiling jobs to the current best commit even if their turn returns early."""
         from ..infra.git import git_checked
 
-        root = self.spec.workdir / "worktrees"
+        root = trees_root(self.spec.workdir)
         commit = git_checked(root / "best", "rev-parse", "HEAD")
         return measured_tree(self.spec.repo, root, commit)
 
