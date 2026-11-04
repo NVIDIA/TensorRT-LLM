@@ -556,82 +556,41 @@ class KimiK3AttnResKernel:
     """A cluster of ``c`` CTAs per token, one 16-byte vector per thread.
 
     Each CTA owns ``hidden / c`` contiguous elements and each thread eight of them (one 16-byte
-    load per row). ``in_place_addend`` (``ADD_PREFIX``): the addend is the in-place result of a
-    pushed MNNVL all-reduce, ``add_addr`` / ``add2_addr`` the workspace's local buffer and state
-    flags. ``finish_world > 0`` (with ``in_place_addend``): the addend is the pushed call over
-    that many ranks, which the kernel finishes (``finish_two_shot``: two-shot transport;
-    ``mc_addr`` / ``ar_rank``: the workspace's multicast base and this rank); ``early_poll``
-    (one-shot) does so before the grid wait; ``finish_chunk`` / ``finish_sanitize``: the slot
-    sums in the order of another C++ transport. ``finish_all_gather`` (``ADD_MOE``): the call
-    is an all-gather call, ``routed`` its all-gather row and ``shared`` its slot sum.
+    load per row). With ``in_place_addend`` the addend is the in-place result of a pushed MNNVL
+    all-reduce, ``add_addr`` / ``add2_addr`` the workspace's local buffer and state flags; with
+    ``finish`` the kernel finishes that pushed call (``mc_addr`` / ``ar_rank``: the workspace's
+    multicast base and this rank), see :class:`AttnResVariant`.
 
     Args:
-        num_candidates: ``N``, the snapshot rows plus the layer row, in
-            ``[MIN_CANDIDATES, MAX_CANDIDATES]``.
-        add_mode: Inputs of the layer row: ``ADD_NONE``, ``ADD_PREFIX`` or ``ADD_MOE``.
-        cluster: CTAs per token, one of ``CLUSTER_SIZES`` (see :func:`cluster_size`).
-        hidden: Hidden size ``H`` (:func:`supports_hidden_size`).
-        mxfp8: Also store the MXFP8 form of the normalized output.
-        entry_trigger: Release the dependent grid at kernel entry (module docstring).
-        snapshots_after_wait: Load the snapshot rows after ``griddepcontrol.wait`` instead of
-            in the prologue, for a snapshot bank written by the immediately preceding kernel
-            (see the module's PDL contract).
+        variant: The compiled variant (:class:`AttnResVariant`).
         use_pdl: Launch with programmatic dependent launch (``griddepcontrol`` wait and
             release); without it the kernel waits for the previous grid like any launch.
     """
 
-    def __init__(
-        self,
-        num_candidates: int,
-        add_mode: int,
-        cluster: int,
-        hidden: int,
-        mxfp8: bool = False,
-        in_place_addend: bool = False,
-        finish_world: int = 0,
-        finish_two_shot: bool = False,
-        early_poll: bool = False,
-        finish_chunk: int = 0,
-        finish_sanitize: bool = False,
-        finish_all_gather: bool = False,
-        entry_trigger: bool = False,
-        snapshots_after_wait: bool = False,
-        use_pdl: bool = TRTLLM_ENABLE_PDL,
-    ):
-        if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
-            raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
-        if add_mode not in (ADD_NONE, ADD_PREFIX, ADD_MOE) or cluster not in CLUSTER_SIZES:
-            raise ValueError(f"add_mode={add_mode} cluster={cluster}")
-        if not supports_hidden_size(hidden):
-            raise ValueError(f"hidden={hidden} is not supported")
-        if in_place_addend and add_mode != (ADD_MOE if finish_all_gather else ADD_PREFIX):
-            raise ValueError("an in-place addend is ADD_PREFIX, or ADD_MOE for an all-gather call")
-        if finish_world and (not in_place_addend or finish_world not in pushed_ar.WORLD_SIZES):
-            raise ValueError(f"cannot finish an in-place addend over {finish_world} ranks")
-        if (finish_two_shot or early_poll) and not finish_world:
-            raise ValueError("finish_two_shot / early_poll need finish_world")
-        if finish_two_shot and (early_poll or finish_chunk or finish_sanitize or finish_all_gather):
-            raise ValueError("early_poll, sum orders and all-gather calls are one-shot only")
-        if finish_all_gather and not finish_world:
-            raise ValueError("finish_all_gather needs finish_world")
-        self.mxfp8 = mxfp8
-        self.in_place_addend = in_place_addend
-        self.finish_world = finish_world
-        self.finish_two_shot = finish_two_shot
-        self.early_poll = early_poll
-        self.finish_chunk = finish_chunk or (
-            pushed_ar.reduce_chunk(finish_world, True) if finish_world else 0
+    def __init__(self, variant: AttnResVariant, use_pdl: bool = TRTLLM_ENABLE_PDL):
+        variant.validate()
+        finish = variant.finish
+        self.mxfp8 = variant.mxfp8
+        self.in_place_addend = variant.in_place_addend
+        self.finish_world = finish.world if finish is not None else 0
+        self.finish_two_shot = finish is not None and finish.two_shot
+        self.early_poll = finish is not None and finish.early_poll
+        self.finish_chunk = (
+            (finish.chunk or pushed_ar.reduce_chunk(finish.world, True))
+            if finish is not None
+            else 0
         )
-        self.finish_sanitize = finish_sanitize
-        self.finish_all_gather = finish_all_gather
-        self.entry_trigger = entry_trigger
-        self.snapshots_after_wait = snapshots_after_wait
+        self.finish_sanitize = finish is not None and finish.sanitize
+        self.finish_all_gather = finish is not None and finish.all_gather
+        self.entry_trigger = variant.entry_trigger
+        self.snapshots_after_wait = variant.snapshots_after_wait
         self.use_pdl = use_pdl
+        num_candidates, cluster, hidden = variant.num_candidates, variant.cluster, variant.hidden
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
         self.hidden = hidden
-        self.add_mode = add_mode
+        self.add_mode = variant.add_mode
         self.vecs = hidden // 8 // cluster  # 16-byte vectors per CTA, one per thread
         self.threads = (self.vecs + 31) // 32 * 32
         self.warps = self.threads // 32
@@ -1019,6 +978,53 @@ class AllReduceFinish(NamedTuple):
     all_gather: bool = False
 
 
+class AttnResVariant(NamedTuple):
+    """The compiled variant of :class:`KimiK3AttnResKernel` (also the key of its compile cache).
+
+    ``num_candidates``: ``N``, the snapshot rows plus the layer row, in ``[MIN_CANDIDATES,
+    MAX_CANDIDATES]``; ``add_mode``: inputs of the layer row (``ADD_NONE``, ``ADD_PREFIX``,
+    ``ADD_MOE``); ``cluster``: CTAs per token (:func:`cluster_size`); ``hidden``: ``H``
+    (:func:`supports_hidden_size`); ``mxfp8``: also store the MXFP8 form of the output;
+    ``snapshots_after_wait``: load the snapshot rows after ``griddepcontrol.wait`` (the module's
+    PDL contract); ``in_place_addend``: the addend is the in-place result of a pushed MNNVL
+    all-reduce (``ADD_PREFIX``, or ``ADD_MOE`` for an all-gather call); ``finish``: the pushed
+    call the kernel finishes (with ``in_place_addend``; ``rank`` and ``mc_base`` are launch
+    arguments and 0 here); ``entry_trigger``: release the dependent grid at kernel entry (module
+    docstring).
+    """
+
+    num_candidates: int
+    add_mode: int
+    cluster: int
+    hidden: int
+    mxfp8: bool = False
+    snapshots_after_wait: bool = False
+    in_place_addend: bool = False
+    finish: AllReduceFinish | None = None
+    entry_trigger: bool = False
+
+    def validate(self) -> None:
+        if not MIN_CANDIDATES <= self.num_candidates <= MAX_CANDIDATES:
+            raise ValueError(f"num_candidates={self.num_candidates} not in [2, 12]")
+        if (
+            self.add_mode not in (ADD_NONE, ADD_PREFIX, ADD_MOE)
+            or self.cluster not in CLUSTER_SIZES
+        ):
+            raise ValueError(f"add_mode={self.add_mode} cluster={self.cluster}")
+        if not supports_hidden_size(self.hidden):
+            raise ValueError(f"hidden={self.hidden} is not supported")
+        finish = self.finish
+        all_gather = finish is not None and finish.all_gather
+        if self.in_place_addend and self.add_mode != (ADD_MOE if all_gather else ADD_PREFIX):
+            raise ValueError("an in-place addend is ADD_PREFIX, or ADD_MOE for an all-gather call")
+        if finish is None:
+            return
+        if not self.in_place_addend or finish.world not in pushed_ar.WORLD_SIZES:
+            raise ValueError(f"cannot finish an in-place addend over {finish.world} ranks")
+        if finish.two_shot and (finish.early_poll or finish.chunk or finish.sanitize or all_gather):
+            raise ValueError("early_poll, sum orders and all-gather calls are one-shot only")
+
+
 def cluster_size(num_tokens: int, num_candidates: int) -> int:
     """CTAs per token: eight for up to 16 tokens with at least four candidates (a smaller
     per-CTA prologue), else four (eight-CTA clusters would oversubscribe the GPU)."""
@@ -1026,38 +1032,8 @@ def cluster_size(num_tokens: int, num_candidates: int) -> int:
 
 
 @functools.cache
-def _compiled(
-    num_candidates: int,
-    add_mode: int,
-    cluster: int,
-    hidden: int,
-    mxfp8: bool,
-    snapshots_after_wait: bool,
-    in_place_addend: bool = False,
-    finish_world: int = 0,
-    finish_two_shot: bool = False,
-    early_poll: bool = False,
-    finish_chunk: int = 0,
-    finish_sanitize: bool = False,
-    finish_all_gather: bool = False,
-    entry_trigger: bool = False,
-):
-    kernel = KimiK3AttnResKernel(
-        num_candidates,
-        add_mode,
-        cluster,
-        hidden,
-        mxfp8,
-        in_place_addend,
-        finish_world,
-        finish_two_shot,
-        early_poll,
-        finish_chunk,
-        finish_sanitize,
-        finish_all_gather,
-        entry_trigger,
-        snapshots_after_wait,
-    )
+def _compiled(variant: AttnResVariant):
+    kernel = KimiK3AttnResKernel(variant)
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1127,7 +1103,9 @@ def precompile(
 ) -> None:
     """JIT-compile the variant :func:`run_attn_res` launches for these parameters (``cluster``
     as :func:`cluster_size` picks it), so its first launch does not compile."""
-    _compiled(num_candidates, add_mode, cluster, hidden, mxfp8, snapshots_after_wait)
+    _compiled(
+        AttnResVariant(num_candidates, add_mode, cluster, hidden, mxfp8, snapshots_after_wait)
+    )
 
 
 def mxfp8_scale_numel(num_tokens: int, hidden: int) -> int:
@@ -1195,34 +1173,17 @@ def run_attn_res(
     num_tokens, hidden = layer.shape
     num_candidates = block.shape[0] + 1
     compiled = _compiled(
-        num_candidates,
-        add_mode,
-        cluster_size(num_tokens, num_candidates),
-        hidden,
-        mxfp8_out is not None,
-        snapshots_after_wait,
-        # Only the pushed all-reduce and entry-trigger variants pass more, so the plain ones share
-        # the cache entries :func:`precompile` fills.
-        *(
-            (
-                in_place_addend is not None,
-                *(
-                    (
-                        finish.world,
-                        finish.two_shot,
-                        finish.early_poll,
-                        finish.chunk,
-                        finish.sanitize,
-                        finish.all_gather,
-                    )
-                    if finish is not None
-                    else (0, False, False, 0, False, False)
-                ),
-                entry_trigger,
-            )
-            if in_place_addend is not None or entry_trigger
-            else ()
-        ),
+        AttnResVariant(
+            num_candidates,
+            add_mode,
+            cluster_size(num_tokens, num_candidates),
+            hidden,
+            mxfp8_out is not None,
+            snapshots_after_wait,
+            in_place_addend is not None,
+            finish._replace(rank=0, mc_base=0) if finish is not None else None,
+            entry_trigger,
+        )
     )
     if in_place_addend is not None:
         add_addr, add2_addr = in_place_addend
@@ -1253,6 +1214,7 @@ def run_attn_res(
 __all__ = [
     "ADD_MOE",
     "AllReduceFinish",
+    "AttnResVariant",
     "ADD_NONE",
     "ADD_PREFIX",
     "CLUSTER_SIZES",
