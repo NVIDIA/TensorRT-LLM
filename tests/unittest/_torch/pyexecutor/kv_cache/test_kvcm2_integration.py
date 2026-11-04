@@ -56,7 +56,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MTPDecodingConfig,
     PARDDecodingConfig,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
@@ -762,6 +762,85 @@ def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layo
             assert torch.all(key_buffer[3 * slot, 0] == 10 + ordinal)
             assert torch.all(kv_buffer[slot, 0] == 20 + ordinal)
             assert torch.all(kv_buffer[slot, 1] == 30 + ordinal)
+    finally:
+        manager.shutdown()
+
+
+def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    torch.cuda.init()
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=2,
+        head_dim=8,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    # Equal byte sizes coalesce the FP8 target and BF16 draft pages, placing
+    # the draft's K buffer at a nonzero offset within each physical slot.
+    draft = replace(
+        target,
+        global_layer_id=1,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+    )
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=target.num_kv_heads,
+        head_dim=target.head_dim,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.FP8,
+        layer_specs=[target, draft],
+    )
+    try:
+        assert manager._use_per_layer_page_tables
+        request_ids = [7, 9]
+        for request_id, num_blocks in zip(request_ids, (2, 3)):
+            cache = manager._create_kv_cache(request_id, None, None)
+            assert cache.resume(manager._stream.cuda_stream)
+            assert cache.resize(num_blocks * TOKENS_PER_BLOCK, 0)
+
+        worker = object.__new__(DFlashWorker)
+        worker._ctx_unified_cache = True
+        pool = worker._managed_ctx_pool(
+            manager, 1, draft.num_kv_heads, draft.head_dim, torch.bfloat16, 2
+        )
+        assert pool is not None
+        assert worker._init_ctx_block_tables(
+            manager, pool, len(request_ids), 1, draft.num_kv_heads, draft.head_dim, TOKENS_PER_BLOCK
+        )
+        assert worker._ctx_block_offset > 0
+
+        block_offsets = torch.empty(
+            (manager.num_attention_op_pools, len(request_ids), 2, manager.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        manager.copy_batch_block_offsets(
+            block_offsets, request_ids, beam_width=1, num_contexts=0, num_seqs=len(request_ids)
+        )
+        metadata = SimpleNamespace(kv_cache_block_offsets=block_offsets)
+        assert worker._refresh_ctx_block_tables(metadata, len(request_ids))
+
+        expected = manager.get_batch_cache_indices(request_ids, layer_idx=draft.global_layer_id)
+        for row, indices in enumerate(expected):
+            assert len(indices) == (2, 3)[row]
+            assert worker._ctx_block_tables[row, : len(indices)].tolist() == indices
     finally:
         manager.shutdown()
 
@@ -1491,6 +1570,43 @@ def test_peer_init_failure_discards_local_candidate() -> None:
         )
 
     local_impl.shutdown.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peer_failed", [False, True])
+def test_agg_helix_gpu_only_init_syncs_status_across_ranks(peer_failed: bool) -> None:
+    """Aggregated helix has no host tier but must still agree on init success.
+
+    Without the sync, a rank that failed to allocate raises alone and its peers
+    carry on into collectives that never complete.
+    """
+    local_impl = Mock()
+    helix_mapping = Mapping(
+        world_size=2,
+        rank=0,
+        cp_size=2,
+        cp_config={"cp_type": CpType.HELIX},
+    )
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+    status = _KVCacheManagerInitStatus.ABORT if peer_failed else _KVCacheManagerInitStatus.OK
+    dist = Mock()
+    dist.allreduce.side_effect = lambda value, op: value
+
+    with (
+        patch.object(Distributed, "get", return_value=dist),
+        patch(f"{module}._sync_kv_cache_manager_init_status", return_value=status) as sync,
+    ):
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20, host_cache_size=0, enable_block_reuse=False
+        )
+        if peer_failed:
+            with pytest.raises(RuntimeError, match="failed on another rank"):
+                _make_manager_for_cache_tier_test(config, [local_impl], mapping=helix_mapping)
+            local_impl.shutdown.assert_called_once_with()
+        else:
+            _make_manager_for_cache_tier_test(config, [local_impl], mapping=helix_mapping)
+
+    sync.assert_called_once_with(_KVCacheManagerInitStatus.OK, helix_mapping)
 
 
 @pytest.mark.parametrize("add_secondary_gpu_tier", [False, True])
