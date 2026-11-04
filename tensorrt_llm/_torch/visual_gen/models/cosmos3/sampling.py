@@ -33,8 +33,8 @@ schedulers as arguments.
 A request may select the sigma grid of a base checkpoint with
 ``extra_params["sigma_grid"]`` (:data:`SIGMA_GRIDS`); :func:`resolve_sampling_schedule`
 turns that selection, the request's ``flow_shift`` and the mode's own defaults
-into a :class:`SamplingSchedule`. Omitting the selector keeps the grid each
-mode has always used.
+into a :class:`SamplingSchedule`. Omitting ``sigma_grid`` selects checkpoint- and
+mode-specific defaults.
 """
 
 import json
@@ -61,9 +61,10 @@ SigmaGrid = Literal["karras", "native", "diffusers"]
 SIGMA_GRIDS: tuple[str, ...] = get_args(SigmaGrid)
 
 # Every grid a resolved schedule can name: the selectable grids, plus
-#   checkpoint_native_flow -- linear flow sigmas over (1 - 1/T, 0] for checkpoints that
-#                             declare the native flow schedule (1 - 1/T is not rounded
-#                             to float32, unlike ``native``);
+#   checkpoint_native_flow -- descending linear flow sigmas starting at 1 - 1/T, excluding
+#                             the terminal zero, for checkpoints that declare the native
+#                             flow schedule (1 - 1/T is not rounded to float32, unlike
+#                             ``native``);
 #   scheduler_config       -- the non-Karras grid of a scheduler without flow sigmas;
 #   fixed                  -- a distilled checkpoint's fixed sigmas.
 ResolvedGrid = Literal[
@@ -486,12 +487,13 @@ class Cosmos3SamplingPolicy:
             ValueError: The programmed UniPC sigmas cannot be stepped through (see
                 :func:`_validate_unipc_sigmas`), which an extreme ``flow_shift`` causes.
         """
-        if schedule.grid == "fixed" or self.is_distilled:
-            if not (schedule.grid == "fixed" and self.is_distilled):
-                raise RuntimeError(
-                    f"Cosmos3 sigma grid {schedule.grid!r} does not match a "
-                    f"{'distilled' if self.is_distilled else 'base'} checkpoint."
-                )
+        is_fixed = schedule.grid == "fixed"
+        if is_fixed != self.is_distilled:
+            raise RuntimeError(
+                f"Cosmos3 sigma grid {schedule.grid!r} does not match a "
+                f"{'distilled' if self.is_distilled else 'base'} checkpoint."
+            )
+        if is_fixed:
             scheduler.set_timesteps(sigmas=list(self.fixed_sigmas), device=device)
             return
         scheduler_karras = bool(_config_get(scheduler.config, "use_karras_sigmas", False))

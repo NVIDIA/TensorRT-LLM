@@ -521,7 +521,7 @@ class TestKarrasGrid:
 
 
 class TestOmittedSelector:
-    """Without sigma_grid every mode resolves to the grid and shift it ran before."""
+    """Without sigma_grid every mode resolves to its checkpoint- and mode-specific grid and shift."""
 
     def test_base_video_keeps_karras_and_mode_shift(self):
         policy, base = _policy()

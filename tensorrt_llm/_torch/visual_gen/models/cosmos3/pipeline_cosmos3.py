@@ -460,7 +460,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.default_use_system_prompt = False
         self.use_native_flow_schedule = False
         self.family = resolve_arch_recipe(primary_pretrained_config).name
-        # Schedulers are identified by their resolved (grid, flow_shift, karras) recipe
+        # Schedulers are identified by their resolved (grid, flow_shift, stream) recipe
         self._scheduler_cache: dict = {}
         if getattr(
             primary_pretrained_config,
