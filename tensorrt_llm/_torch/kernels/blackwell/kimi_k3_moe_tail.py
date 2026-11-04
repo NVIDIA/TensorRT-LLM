@@ -599,6 +599,8 @@ class KimiK3MoeTailKernel:
             cluster=(CLUSTER, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
+            # The largest carveout: the next kernels' CTAs may land beside this grid's.
+            preferred_smem_carveout=100,
             stream=stream,
             use_pdl=True,
         )
@@ -894,34 +896,6 @@ def can_run(m: int, world: int, rows: int = 0) -> bool:
     return 1 <= m <= MAX_M and world in pushed_ar.WORLD_SIZES and cluster_rows(rows) > 0
 
 
-def _set_kernel_attributes(compiled, device_index: int) -> None:
-    """Clusters of 16 (non-portable size) and the maximum shared-memory carveout (the next
-    kernels' CTAs may land beside this grid's) on every kernel of ``compiled``."""
-    status, cu_device = cuda.cuDeviceGet(device_index)
-    if status != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuDeviceGet: {status}")
-    with torch.cuda.device(device_index):
-        compiled.to(device_index)
-    libraries = list(getattr(getattr(compiled, "jit_module", None), "cuda_library", None) or [])
-    attr = cuda.CUfunction_attribute
-    for library in libraries:
-        handle = cuda.CUlibrary(int(library))
-        status, count = cuda.cuLibraryGetKernelCount(handle)
-        if status != cuda.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"cuLibraryGetKernelCount: {status}")
-        status, kernels = cuda.cuLibraryEnumerateKernels(count, handle)
-        if status != cuda.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"cuLibraryEnumerateKernels: {status}")
-        for kernel in kernels:
-            for a, v in (
-                (attr.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1),
-                (attr.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100),
-            ):
-                (status,) = cuda.cuKernelSetAttribute(a, v, kernel, cu_device)
-                if status != cuda.CUresult.CUDA_SUCCESS:
-                    raise RuntimeError(f"cuKernelSetAttribute({a}): {status}")
-
-
 @functools.cache
 def _compiled(world: int, rows: int, m: int, mc_out: bool, ag_follows: bool, device_index: int):
     kernel = KimiK3MoeTailKernel(world, rows, m, mc_out, ag_follows)
@@ -931,7 +905,6 @@ def _compiled(world: int, rows: int, m: int, mc_out: bool, ag_follows: bool, dev
             kernel, z, z, z, z, z, z, z, Int32(0), Float32(1e-6),
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )  # fmt: skip
-    _set_kernel_attributes(compiled, device_index)
     return compiled
 
 

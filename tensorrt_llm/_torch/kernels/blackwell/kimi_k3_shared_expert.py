@@ -65,7 +65,6 @@ from .kimi_k3_moe_tail import (
     _mbar_expect_tx,
     _mbar_init,
     _mma_bf16,
-    _set_kernel_attributes,
     _sts_f32,
     _sts_v4,
 )
@@ -334,6 +333,8 @@ class KimiK3SharedExpertKernel:
             block=(THREADS, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
+            # The largest carveout: the next kernels' CTAs may land beside this grid's.
+            preferred_smem_carveout=100,
             stream=stream,
         )
 
@@ -612,7 +613,6 @@ def _compiled(world: int, m: int, sms: int, beta: float, lbeta: Optional[float],
         compiled = cute.compile(
             kernel, z, z, z, z, z, cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         )
-    _set_kernel_attributes(compiled, dev)
     return compiled
 
 
