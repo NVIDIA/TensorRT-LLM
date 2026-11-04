@@ -385,6 +385,14 @@ moonshotai/Kimi-K3:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 95.2
+  # Same requant with FP8 KV and the Inferact DSpark drafter on aggregated
+  # Helix (TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv). Measured 96.664
+  # at TP4 x CP2 and 96.171 at TP1 x CP8 on GB300. DSpark verification is
+  # lossless, so the bar matches the non-speculative FP8 KV row.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DSpark
+    accuracy: 95.2
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8

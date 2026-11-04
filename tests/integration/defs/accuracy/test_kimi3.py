@@ -569,6 +569,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
     # Blackwell deployment precision and nothing else covers it end to end.
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3-NVFP4"
     DSPARK_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3-DSpark"
+    INFERACT_DSPARK_MODEL_PATH = f"{llm_models_root()}/Inferact-Kimi-K3-DSpark"
 
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_tep8(self):
@@ -620,4 +621,54 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length_for_llm(
                 "TestKimiK3DSpark::test_gsm8k_tep8",
                 llm,
+            )
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.parametrize("tp_size,cp_size", [(4, 2), (1, 8)], ids=["tp4cp2", "tp1cp8"])
+    def test_gsm8k_nvfp4_helix_fp8kv(self, tp_size: int, cp_size: int):
+        """GSM8K plus an acceptance-length gate on aggregated Helix with DSpark.
+
+        Block reuse is off: this isolates DSpark x aggregated Helix (context
+        phase, mixed batches, verify groups) from the reuse path. Uses the
+        MLA-shaped Inferact drafter, whose block decode AUTO resolves to CUTEDSL.
+        Generation attention runs num_heads / tp_size heads per rank (24 at
+        TP4, 96 at TP1); CuTe DSL MLA serves the multi-token Helix verify
+        group at either. FP8 KV applies to the target only, the drafter keeps
+        its pool in bf16.
+        """
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.20,
+            tokens_per_block=64,
+            use_kv_cache_manager_v2=True,
+        )
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7, speculative_model=self.INFERACT_DSPARK_MODEL_PATH
+        )
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            context_parallel_size=cp_size,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": 64},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            disable_overlap_scheduler=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=None,
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=kv_cache_config,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+            speculative_config=spec_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                f"TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp{tp_size}cp{cp_size}]", llm
             )

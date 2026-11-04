@@ -95,6 +95,13 @@ TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
 TestKimiK3DSpark::test_gsm8k_tep8:
   ref_al: 4.323
   min_al: 4.0
+# Inferact drafter on aggregated Helix, FP8 KV, GB300. min_al is 95% of ref_al.
+TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp4cp2]:
+  ref_al: 4.285
+  min_al: 4.07
+TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp1cp8]:
+  ref_al: 4.276
+  min_al: 4.06
 disagg::TestDeepSeekV3Lite::test_auto_dtype:
   ref_al: 2.581477287026551
   min_al: 2.452403422675223
