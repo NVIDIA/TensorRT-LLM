@@ -717,7 +717,8 @@ def test_llm_api_admits_a_1m_prompt(tp4, tp4_32k):
 def test_quantization_is_the_anchor_key(tp4):
     """At 1M as at 32K: MIXED_PRECISION with the fp8 KV cache (the checkpoint's fp8_kv_cache under
     the default dtype), the GSM8K anchor row's key, and the router handed params.json's
-    quantization_config with its 475 quantized_layers intact."""
+    quantization_config with its 475 quantized_layers intact plus the FP8 KV-cache algorithm the
+    native loader records from fp8_kv_cache."""
     assert tp4.prequantized is True
     for quant in (tp4.llm_args.quant_config, tp4.model_config.quant_config):
         assert quant.quant_algo == QuantAlgo.MIXED_PRECISION
@@ -726,9 +727,10 @@ def test_quantization_is_the_anchor_key(tp4):
     assert _anchor(tp4.llm_args) == 91.926
 
     on_disk = json.loads((tp4.path / "params.json").read_text())["quantization_config"]
+    assert len(on_disk["quantized_layers"]) == 475
     assert len(tp4.routed) == 1
     seen = tp4.routed[0]
-    assert seen.quantization_config == on_disk and len(on_disk["quantized_layers"]) == 475
+    assert seen.quantization_config == dict(on_disk, kv_cache_quant_algo="FP8")
     assert tp4.model_config.modeling_v2_target is _Routed
 
 

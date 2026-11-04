@@ -909,11 +909,13 @@ def test_core_yaml_and_boot_command_build_one_deployment(tp8, tp8_gate):
 def test_quantization_is_the_anchor_key(request, world):
     """At tp4 and tp8 as at tep4, dep4 and tep8: MIXED_PRECISION with the FP8 KV cache, the GSM8K
     anchor row's key, and the router handed params.json's quantization_config with its 475
-    quantized_layers intact, on the core unit's mapping -- at tp8 from core.yaml and from the boot
-    gate's command alike."""
+    quantized_layers intact plus the FP8 KV-cache algorithm the native loader records from
+    fp8_kv_cache, on the core unit's mapping -- at tp8 from core.yaml and from the boot gate's
+    command alike."""
     resolutions = _core_unit(request, world)
     on_disk = json.loads((resolutions[0].path / "params.json").read_text())["quantization_config"]
     assert len(on_disk["quantized_layers"]) == 475
+    routed = dict(on_disk, kv_cache_quant_algo="FP8")
     for resolved in resolutions:
         assert resolved.prequantized is True
         for quant in (resolved.llm_args.quant_config, resolved.model_config.quant_config):
@@ -925,8 +927,8 @@ def test_quantization_is_the_anchor_key(request, world):
 
         assert len(resolved.routed) == 1
         seen = resolved.routed[0]
-        assert seen.quantization_config == on_disk
-        assert resolved.model_config.pretrained_config.quantization_config == on_disk
+        assert seen.quantization_config == routed
+        assert resolved.model_config.pretrained_config.quantization_config == routed
         assert seen.pretrained_config is resolved.model_config.pretrained_config
         assert resolved.model_config.modeling_v2_target is _Routed
         assert seen.compute_capability == _SM103 and seen.spec_config is None
@@ -1148,8 +1150,9 @@ def test_moe_autotuner_at_128_local_experts(request, world):
     assert tp_runner.intermediate_size == width
     assert tp_runner.num_experts // tp_runner.local_num_experts == 1
     assert tep_runner.num_experts // tep_runner.local_num_experts == world
+    # The runner passes every argument of the cached builder, decode_tuning (undeclared) included.
     assert tp_runner.tuning_config is FP4BlockScaleMoERunner.get_tuning_config(
-        1, tune_max_num_tokens=32768, use_dp=False
+        1, tune_max_num_tokens=32768, use_dp=False, decode_tuning=False
     )
     swiglu = ActType_TrtllmGen.SwiGlu.value
     assert tp_runner.unique_id() == (4, width, 128, swiglu)
