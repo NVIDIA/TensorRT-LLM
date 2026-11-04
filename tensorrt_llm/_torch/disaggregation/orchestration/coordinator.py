@@ -1101,10 +1101,11 @@ class DisaggTransferCoordinator:
         return pending
 
     def forget_request(self, request_id: int) -> None:
-        """Drop per-request cancellation bookkeeping once the request is freed."""
+        """Drop per-request cancellation and receive bookkeeping once the request is freed."""
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
         self._unpublished_gen_receives.pop(request_id, None)
+        self._started_gen_receives.pop(request_id, None)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
