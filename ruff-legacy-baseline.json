@@ -528,6 +528,9 @@
   "tensorrt_llm/scaffolding/task.py": {
     "F821": 1
   },
+  "tensorrt_llm/serve/api/openai/completions/_merge.py": {
+    "F821": 1
+  },
   "tensorrt_llm/serve/disagg_auto_scaling.py": {
     "D205": 2,
     "D212": 2
