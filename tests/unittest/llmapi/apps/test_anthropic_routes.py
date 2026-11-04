@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
-from tensorrt_llm.serve import openai_server as openai_server_module
+from tensorrt_llm.serve._base import sse as sse_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -371,8 +371,9 @@ async def _chat_stream(monkeypatch, generation):
 
 @pytest.fixture
 def server_logger(monkeypatch):
+    """The logger of the chat SSE generator, which lives in serve/_base/sse.py."""
     log = Mock()
-    monkeypatch.setattr(openai_server_module, "logger", log)
+    monkeypatch.setattr(sse_module, "logger", log)
     return log
 
 
