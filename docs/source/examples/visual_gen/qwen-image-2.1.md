@@ -24,7 +24,7 @@ items declared in `design/external_component_reuse.yaml` for the run, with the
 pinned version, reason, and parity evidence recorded there.
 
 Reused components are `AutoencoderKLQwenImage21`,
-`FlowMatchEulerDiscreteScheduler`, `TimestepEmbedding` (with bias disabled),
+`FlowMatchEulerDiscreteScheduler`, `Timesteps`, `TimestepEmbedding` (with bias disabled),
 and regular `RMSNorm` for attention Q/K. The scheduler adapter preserves
 Qwen-specific defaults and local checkpoint loading. Scheduler steps use
 Diffusers' model-output dtype; the pipeline restores the latent dtype afterward.
