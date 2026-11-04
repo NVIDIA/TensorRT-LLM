@@ -40,7 +40,8 @@
   fewer of the turn's tools, and only by the UTF-8 bytes of the declarations it does not carry as
   they were, plus the tools preamble when none is left. A namespace's tools each carry its fields.
 - GLM's raw view reads an argument value back exactly when it holds none of the format's argument
-  markup, and flags the model (M-07) when it holds any.
+  markup. When it holds any, the view flags the model (M-07) or reads other arguments: markup
+  that closes the value and writes whole arguments after it is, in the text, those arguments.
 
 Run with pytest, or as a script, which is how the mutation gate (scripts/mutate.py; the method is
 references/verify-logic.md) runs it. From the repository root:
@@ -689,7 +690,7 @@ def test_glm_argument_markup_inside_a_value_is_the_models_slip(pieces):
     )
     turn = native.read(profiles.native_card(GLM), text)
     if any(markup in value for markup in ARGUMENT_MARKUP):
-        assert turn.anomalies
+        assert turn.anomalies or [c.args for c in turn.calls] != [[("k", value, None)]]
     else:
         assert turn.anomalies == [] and [c.args for c in turn.calls] == [[("k", value, None)]]
 
