@@ -800,6 +800,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
                 "not needed.")
 
+    _validate_internal_disagg_request = GenerateBaseServing._validate_internal_disagg_request
+
+    _has_cache_transceiver_config = GenerateBaseServing._has_cache_transceiver_config
+
     await_disconnected = GenerateBaseServing.await_disconnected
 
     @functools.cached_property
