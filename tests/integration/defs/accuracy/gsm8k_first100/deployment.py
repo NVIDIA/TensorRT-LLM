@@ -22,8 +22,10 @@ the target checkpoint (``TRTLLM_TEST_TARGET_RELATIVE_PATH``), the DFlash2 drafte
 digested: the checkpoints' metadata files by content, their weight files by name and size,
 and the scale table's ``target`` and ``draft`` sections against the checkpoints' layer counts.
 The curated recipe's drafter placeholder is replaced in a per-run copy; nothing else in the
-recipe is changed. ``criterion.json`` holds the regression threshold, bound to the public
-first-100 protocol and item manifest.
+recipe is changed. The job serves the graph-and-overlap recipe (``RECIPE_RELATIVE_PATH``); the
+eager recipe of the same deployment (``EAGER_RECIPE_RELATIVE_PATH``) stays the documented
+fallback. ``criterion.json`` holds the regression threshold, bound to the public first-100
+protocol and item manifest.
 """
 
 from __future__ import annotations
@@ -50,7 +52,12 @@ DRAFTER_ENV = "TRTLLM_TEST_DRAFTER_RELATIVE_PATH"
 KV_SCALES_ENV = "TRTLLM_TEST_KV_SCALES_RELATIVE_PATH"
 DATASET_RELATIVE_DIR = "datasets/openai/gsm8k"
 
-RECIPE_RELATIVE_PATH = "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml"
+#: The recipe the first-100 job serves: the aggregated deployment with native decode CUDA graphs
+#: and the overlap scheduler enabled.
+RECIPE_RELATIVE_PATH = "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml"
+#: The preserved eager recipe (graphs and overlap off) of the same deployment; the materializer
+#: accepts it unchanged for eager runs.
+EAGER_RECIPE_RELATIVE_PATH = "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml"
 DRAFTER_PLACEHOLDER = "<DRAFTER_CHECKPOINT>"
 REASONING_PARSER = "beam_harmony_text"
 #: The server environment the recipe documents; the scale table path is added per run.

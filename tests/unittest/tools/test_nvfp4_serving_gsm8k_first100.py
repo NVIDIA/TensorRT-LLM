@@ -1063,6 +1063,46 @@ def test_recipe_outside_the_qualified_deployment_is_refused(tmp_path, overrides,
         deployment.materialize_recipe(str(template), "/staged/drafter")
 
 
+#: The decode CUDA-graph keys of the graph-and-overlap recipes, up to their max_batch_size.
+GO_GRAPH_CONFIG = {"batch_sizes": [1, 2, 4, 8, 16, 32, 64], "enable_padding": True}
+
+
+@pytest.mark.parametrize(
+    "go, eager",
+    [
+        (deployment.RECIPE_RELATIVE_PATH, deployment.EAGER_RECIPE_RELATIVE_PATH),
+        (
+            "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml",
+            "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
+        ),
+    ],
+)
+def test_go_recipes_differ_from_the_eager_recipes_only_in_graphs_and_overlap(go, eager):
+    go_text, go_info = deployment.materialize_recipe(str(REPO_ROOT / go), "/staged/drafter")
+    eager_text, _ = deployment.materialize_recipe(str(REPO_ROOT / eager), "/staged/drafter")
+    go_config, eager_config = yaml.safe_load(go_text), yaml.safe_load(eager_text)
+    assert go_config.pop("cuda_graph_config") == GO_GRAPH_CONFIG
+    assert go_config.pop("disable_overlap_scheduler") is False
+    assert eager_config.pop("cuda_graph_config") is None
+    assert eager_config.pop("disable_overlap_scheduler") is True
+    assert go_config == eager_config
+    # Every generation batch the server can schedule pads to a captured key.
+    assert max(GO_GRAPH_CONFIG["batch_sizes"]) == go_info["max_batch_size"]
+
+
+def test_first100_job_serves_the_go_recipe_and_keeps_the_eager_recipe():
+    assert deployment.RECIPE_RELATIVE_PATH == (
+        "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml"
+    )
+    assert deployment.EAGER_RECIPE_RELATIVE_PATH == (
+        "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml"
+    )
+    # The CI runner materializes the selected recipe, never the eager one.
+    source = (DEFS / "accuracy" / "gsm8k_first100" / "runner.py").read_text()
+    assert "deployment.RECIPE_RELATIVE_PATH" in source
+    assert "EAGER_RECIPE_RELATIVE_PATH" not in source
+
+
 def test_server_launch_command_and_environment():
     argv = server.serve_argv(deployment.serve_command("/t", "/run/recipe.yaml"), "/run/server.addr")
     assert argv == [

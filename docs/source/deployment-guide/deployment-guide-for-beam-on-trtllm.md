@@ -64,7 +64,7 @@ The values above illustrate the format only; use the calibrated table for your c
 | Speculative decoding | DFlash2 drafter (`decoding_type: DFlash`), seven proposals per step (eight verification rows), TRTLLM draft attention, strict greedy verification |
 | KV cache | One `KVCacheManagerV2` holding the target's 52 and the drafter's 5 KV layers, FP8 E4M3 with the explicit scale table; full-block prefix reuse enabled, partial-block reuse disabled |
 | Attention backend | TRTLLM |
-| Execution | Eager: CUDA graphs, overlap scheduling and chunked prefill disabled |
+| Execution | Eager recipes: CUDA graphs and overlap scheduling disabled. Graph-and-overlap (GO) recipes: native decode CUDA graphs for generation-only steps (batch sizes 1 to 64, padded to 1, 2, 4, 8, 16, 32 or 64) and the overlap scheduler; steps that contain a context request run eagerly. Chunked prefill disabled in every recipe |
 | Disaggregated KV transfer | Python cache transceiver over NIXL, 60,000 ms transfer timeout (both workers) |
 | Server | Native OpenAI-compatible server, one frontend, text-only |
 
@@ -72,9 +72,11 @@ The recipes under `examples/configs/curated/` hold these settings:
 
 | Recipe | Role |
 |---|---|
-| [`beam-nvfp4-dflash2-fp8kv-aggregated.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml) | Aggregated server |
+| [`beam-nvfp4-dflash2-fp8kv-aggregated.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml) | Aggregated server, eager |
+| [`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml) | Aggregated server with decode CUDA graphs and overlap scheduling |
 | [`beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml) | Disaggregated context worker |
-| [`beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml) | Disaggregated generation worker |
+| [`beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml) | Disaggregated generation worker, eager |
+| [`beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml) | Disaggregated generation worker with decode CUDA graphs and overlap scheduling |
 
 Each recipe selects the Beam target and its supporting pieces by name:
 
@@ -111,7 +113,8 @@ Export these in the shell that starts each `trtllm-serve` worker. The MPI sessio
 
 ### Capacity and batching
 
-All three recipes use the same limits:
+Each GO recipe differs from its eager counterpart only in `cuda_graph_config` and
+`disable_overlap_scheduler`. All five recipes use the same limits:
 
 | Limit | Recipe value | Basis |
 |---|---|---|
@@ -201,6 +204,15 @@ Stop the server with Ctrl+C in its terminal, or send SIGTERM to the `trtllm-serv
 TP4 workers exit with it. Confirm that `nvidia-smi` lists no remaining processes on the node's
 GPUs before starting another deployment there.
 
+To serve with decode CUDA graphs and the overlap scheduler, use
+`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml` in the same command. During startup the server
+captures one graph per listed batch size for the generation-only steps (target verification of
+the eight rows per request, DFlash2 drafting and the TP all-reduces), so startup takes longer and
+each GPU holds about 1.6 GB more. Steps that contain a context (prefill) request always run
+eagerly, as does a generation-only step with more requests than the largest listed batch size
+(with the recipe's `max_batch_size` of 64, every generation-only step is captured). The eager
+recipe remains the fallback configuration.
+
 ### Python LLM API
 
 The aggregated recipe's settings, passed to `LLM()` in one process on the same node. The
@@ -261,6 +273,10 @@ llm.shutdown()
 
 Set both environment variables before constructing `LLM`, as above, or export them in the shell
 that starts Python: the worker processes it starts read them.
+
+For the GO recipe's settings, pass `disable_overlap_scheduler=False` and
+`cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8, 16, 32, 64], enable_padding=True)`
+(`from tensorrt_llm.llmapi import CudaGraphConfig`) instead of the two eager values above.
 
 ## Disaggregated serving
 
@@ -518,8 +534,12 @@ speculative decoding) does not qualify this configuration.
   sizes, between fresh and reused-cache execution, between speculative and ordinary decoding,
   and between aggregated and disaggregated serving, because the target's own numerics differ
   across these execution shapes. Exact token parity across these modes is not established.
-- Tool calling, CUDA graphs, overlap scheduling, chunked prefill, attention data parallelism,
-  other GPU architectures and other parallel layouts are not qualified by these recipes.
+- The GO recipes capture generation-only decode and speculative-verification steps; prefill
+  and piecewise CUDA graphs are not used. With overlap scheduling a request can run one more
+  step after it finishes; those tokens are discarded, never returned. Greedy outputs of the
+  eager and GO recipes can differ, and exact token parity between them is not established.
+- Tool calling, chunked prefill, attention data parallelism, other GPU architectures and other
+  parallel layouts are not qualified by these recipes.
 
 The model's implementation and generated-input regression coverage are described in the
 [Beam source README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/_experimental/modeling_v2/models/beam/README.md).
@@ -560,10 +580,12 @@ directory resumes) and `summary.json` (score, failures, timing and GPU memory).
 ## First-100 GSM8K regression
 
 The QA/LR functional list selects the first 100 GSM8K questions on one four-GB300 node,
-with a 45-minute timeout and a minimum score of 95/100. Execution errors, timeouts,
-truncations and parsing failures also fail the test. Two independent runs of the
-aggregated recipe on separate nodes scored 97/100 and 98/100 in approximately 25 and
-30 minutes, including model startup. This is a separate public
+with a 45-minute timeout and a minimum score of 95/100, served with the aggregated GO recipe
+(`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml`). Execution errors, timeouts, truncations and
+parsing failures also fail the test. Two independent runs of the eager aggregated recipe on
+separate nodes scored 97/100 and 98/100 in approximately 25 and 30 minutes, including model
+startup. On a later build, one run of this job with the GO recipe and a matched run of the
+eager recipe each scored 98/100, missing the same two questions. This is a separate public
 evaluation protocol; its score is not interchangeable with the full evaluation baseline.
 Neither this job nor full GSM8K runs in L0. Full GSM8K is excluded from all CI lists.
 

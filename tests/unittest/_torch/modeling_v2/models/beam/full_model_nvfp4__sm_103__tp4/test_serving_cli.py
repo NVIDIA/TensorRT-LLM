@@ -39,8 +39,11 @@ _ENV = weights.KV_CACHE_SCALES_ENV
 _REPO = Path(__file__).resolve().parents[7]
 _RECIPES = {
     mode: _REPO / f"examples/configs/curated/beam-nvfp4-dflash2-fp8kv-{mode}.yaml"
-    for mode in ("aggregated", "disagg-ctx", "disagg-gen")
+    for mode in ("aggregated", "aggregated-go", "disagg-ctx", "disagg-gen", "disagg-gen-go")
 }
+#: The recipes with native decode CUDA graphs and the overlap scheduler; the others are eager.
+_GO_MODES = ("aggregated-go", "disagg-gen-go")
+_GO_GRAPH_KEYS = [1, 2, 4, 8, 16, 32, 64]
 _TARGET_SCALES = {"layers": 52, "scales": {str(i): 1.0 for i in range(52)}}
 _DRAFT_SCALES = {"layers": 5, "scales": {"0": 2.0, "1": 2.0, "2": 2.0, "3": 8.0, "4": 4.0}}
 
@@ -479,21 +482,30 @@ _KV = {
 # Qualified concurrency (max_batch_size) and KV-cache capacity (max_tokens) of each recipe.
 _CAPACITY = {
     "aggregated": (64, 4456448),
+    "aggregated-go": (64, 4456448),
     "disagg-ctx": (64, 4456448),
     "disagg-gen": (64, 4456448),
+    "disagg-gen-go": (64, 4456448),
 }
 
 
 def _expected_settings(mode: str) -> dict:
     batch, max_tokens = _CAPACITY[mode]
-    return {**_COMMON, "max_batch_size": batch, "kv": {**_KV, "max_tokens": max_tokens}}
+    expected = {**_COMMON, "max_batch_size": batch, "kv": {**_KV, "max_tokens": max_tokens}}
+    if mode in _GO_MODES:
+        expected.update(disable_overlap_scheduler=False, cuda_graph_config=(_GO_GRAPH_KEYS, True))
+    return expected
 
 
 def _effective(args) -> dict:
     spec = args.speculative_config
     transceiver = args.cache_transceiver_config
+    graphs = args.cuda_graph_config
     return {
         **{name: getattr(args, name) for name in _COMMON},
+        "cuda_graph_config": None
+        if graphs is None
+        else (graphs.batch_sizes, graphs.enable_padding),
         "kv": {name: getattr(args.kv_cache_config, name) for name in _KV},
         "spec": (
             type(spec).__name__,
@@ -520,10 +532,11 @@ def test_recipe_effective_settings_through_trtllm_serve(tmp_path, cuda_shape, mo
     drafter = _drafter_dir(tmp_path / "drafter")
     config = _materialize(_RECIPES[mode], tmp_path, drafter)
     kwargs = _serve_llm_kwargs(model, config)
-    assert kwargs["cuda_graph_config"] is None and kwargs["enable_chunked_prefill"] is False
+    assert (kwargs["cuda_graph_config"] is None) is (mode not in _GO_MODES)
+    assert kwargs["enable_chunked_prefill"] is False
     args = TorchLlmArgs(**kwargs)
     assert isinstance(args.tokenizer, BeamFastTokenizer)
-    disagg = mode != "aggregated"
+    disagg = mode.startswith("disagg")
     assert _effective(args) == {
         **_expected_settings(mode),
         "spec": ("DFlashDecodingConfig", 7, drafter, "TRTLLM"),
@@ -545,7 +558,12 @@ def test_explicit_cli_flags_win_over_the_recipe(tmp_path, cuda_shape):
 
 def _documented_llm_kwargs(model: str, drafter: str, mode: str) -> dict:
     """The public ``LLM()`` arguments of the deployment guide's Python example for ``mode``."""
-    from tensorrt_llm.llmapi import CacheTransceiverConfig, DFlashDecodingConfig, KvCacheConfig
+    from tensorrt_llm.llmapi import (
+        CacheTransceiverConfig,
+        CudaGraphConfig,
+        DFlashDecodingConfig,
+        KvCacheConfig,
+    )
 
     batch, max_tokens = _CAPACITY[mode]
     kwargs = dict(
@@ -577,7 +595,12 @@ def _documented_llm_kwargs(model: str, drafter: str, mode: str) -> dict:
             max_draft_len=7, speculative_model=drafter, attention_backend="TRTLLM"
         ),
     )
-    if mode != "aggregated":
+    if mode in _GO_MODES:
+        kwargs.update(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=_GO_GRAPH_KEYS, enable_padding=True),
+        )
+    if mode.startswith("disagg"):
         kwargs["cache_transceiver_config"] = CacheTransceiverConfig(
             backend="NIXL", transceiver_runtime="PYTHON", kv_transfer_timeout_ms=60000
         )

@@ -107,6 +107,14 @@ _PINNED_DEFAULT_LEAVES = {
     f"examples/configs/curated/beam-nvfp4-dflash2-fp8kv-{mode}.yaml": _BEAM_PINNED_DEFAULTS
     for mode in ("aggregated", "disagg-ctx", "disagg-gen")
 }
+# The graph-and-overlap recipes also pin the overlap scheduler's (default) enablement.
+_PINNED_DEFAULT_LEAVES.update(
+    {
+        f"examples/configs/curated/beam-nvfp4-dflash2-fp8kv-{mode}.yaml": _BEAM_PINNED_DEFAULTS
+        + ("disable_overlap_scheduler",)
+        for mode in ("aggregated-go", "disagg-gen-go")
+    }
+)
 
 
 def _get_default_values_for_config(config_path: Path) -> dict:

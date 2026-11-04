@@ -139,6 +139,8 @@
   recipe_page: docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md
   config_paths:
     - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml
+    - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml
     - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml
     - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml
+    - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml
   gpu_compatibility: "GB300: one 4-GPU node (aggregated) or two 4-GPU nodes (disaggregated)"

@@ -301,8 +301,10 @@ class TestConfigDatabaseSync(unittest.TestCase):
             [c["config_filename"] for c in page["configs"]],
             [
                 "beam-nvfp4-dflash2-fp8kv-aggregated.yaml",
+                "beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml",
                 "beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
                 "beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
+                "beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml",
             ],
         )
         for config in page["configs"]:

@@ -18,12 +18,15 @@ implementation.
 | Attention | TRTLLM backend; 512-token sliding attention and full attention according to the checkpoint's layer schedule |
 | KV cache | BF16 by default; opt-in FP8 E4M3 for target and drafter with explicit per-layer scales; native `KVCacheManagerV2`, full-block prefix reuse |
 | Generation | Native `TorchSampler` for ordinary decoding; native DFlash worker and speculative sampler for optional DFlash2 greedy decoding |
-| Execution | Eager; CUDA graphs, overlap scheduling, and chunked prefill disabled |
+| Execution | Eager recipes: CUDA graphs and overlap scheduling disabled. Graph-and-overlap (GO) recipes: native decode CUDA graphs for generation-only steps and the overlap scheduler. Chunked prefill disabled in every recipe |
 | Serving | `trtllm-serve`: one aggregated server, or a context and a generation worker behind `trtllm-serve disaggregated`; streaming and non-streaming text |
 
-The expert provider currently dispatches selected experts in a host-driven loop.
-The GEMMs use native NVFP4 kernels, but expert dispatch and rank agreement introduce
-synchronization. This is a functional baseline, not a throughput-optimized MoE path.
+The expert provider (`full_model_nvfp4__sm_103__tp4/routed_experts.py`) stays on the
+device: each selected (token, expert) route is one row of the native CUTLASS NVFP4
+grouped GEMM (`torch.ops.trtllm.fused_moe`), and the eight route outputs of a token are
+weighted and summed in ascending expert order in FP32, as the source model combines them.
+Nothing is read back to the host, so the call can be captured in a CUDA graph. It is not
+a throughput-optimized MoE path.
 
 ## Launch and request
 
@@ -99,8 +102,7 @@ shares the target's embedding and vocabulary head. The drafter's five KV layers
 are placed in the target's `KVCacheManagerV2` after the target's 52 layers, so one
 KV-cache capacity holds both models' context. Seven proposals per step (eight
 target verification rows) is the only draft length the target serves; selection
-refuses other draft lengths, schedules, rejection sampling and the overlap
-scheduler.
+refuses other draft lengths, draft-length schedules and rejection sampling.
 
 Non-causal windowed draft block attention uses Torch SDPA over the drafter's
 paged KV layers because TRTLLM-Gen does not support that mask. Target verification
@@ -108,8 +110,23 @@ retains TRTLLM attention. Accepted proposals must match the target's greedy choi
 on the verification logits; independent ordinary and speculative runs can still
 diverge at near ties when GEMM/collective shapes change.
 
-CUDA graphs and overlap scheduling remain future work. The bounded eager timing
-measurements are not a production throughput claim.
+## Optional decode CUDA graphs and overlap scheduling
+
+The GO recipes (`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml` and
+`beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml`) differ from their eager counterparts only in
+`cuda_graph_config` (batch sizes 1, 2, 4, 8, 16, 32 and 64, with padding) and
+`disable_overlap_scheduler: false`. The executor captures one graph per batch size for
+generation-only steps: target verification of the eight rows per request, DFlash2 drafting
+and the TP all-reduces. A step that contains a context request, and a generation-only step
+with more requests than the largest listed batch size, runs eagerly. Prefill and piecewise
+CUDA graphs are not used. Capture adds start-up time and about 1.6 GB per GPU.
+
+With the overlap scheduler the host prepares a step before the previous step's acceptance is
+known; the target reads the device-corrected positions and KV lengths, and its host-side step
+check states only the step's structure. A request can run one more step after it finishes;
+those tokens are discarded, never returned. Greedy outputs of the eager and GO recipes can
+differ; exact token parity between them is not established. Timing measurements of these
+recipes are not a production throughput claim.
 
 ## Optional FP8 KV cache
 
@@ -229,7 +246,8 @@ be registered in L0, nightly or long-running CI.
   built-in component implementation. The result above belongs to the routed
   ModelingV2 target, not to that built-in model path.
 
-Other GPU architectures, parallel layouts, other speculative modes,
-CUDA graphs, overlap scheduling, chunked prefill and tool calling are not
-qualified by this implementation. Subsequent feature/performance
-work should preserve this functional and accuracy baseline in follow-up PRs.
+Other GPU architectures, parallel layouts, other speculative modes, prefill or
+piecewise CUDA graphs, chunked prefill and tool calling are not qualified by this
+implementation; decode CUDA graphs and overlap scheduling are limited to the GO recipes
+described above. Subsequent feature/performance work should preserve this functional and
+accuracy baseline in follow-up PRs.
