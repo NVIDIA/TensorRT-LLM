@@ -212,6 +212,17 @@ class BaseToolParser(ABC):
         """Inspect unfinished output without updating the streaming state."""
         return self.detect_and_parse(text, tools)
 
+    def parse_finished(self, text: str, tools: List[Tool], *,
+                       truncated: bool) -> StreamingParseResult:
+        """Parse the whole text of a generation that has finished.
+
+        ``truncated`` is set when generation was cut off (``finish_reason``
+        "length"). Parsers whose ``finish`` recovers a call the stream ended
+        inside override this so the whole-text parse recovers the same call.
+        The default is ``detect_and_parse``.
+        """
+        return self.detect_and_parse(text, tools)
+
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """Finalize a stream that ended before the format's closing markers.
 

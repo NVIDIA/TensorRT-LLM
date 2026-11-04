@@ -331,6 +331,19 @@ class Qwen3CoderToolParser(BaseToolParser):
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
 
+    def parse_finished(
+        self, text: str, tools: list[Tool], *, truncated: bool
+    ) -> StreamingParseResult:
+        """Whole-text parse of a finished generation, recovering a final unterminated call.
+
+        Unless generation was truncated, a call the output ended inside is
+        recovered with the rule ``finish`` uses for a stream, so streamed and
+        whole-text parses agree. A truncated call stays content, so a request
+        cut off by ``max_tokens`` reports no call it did not complete.
+        """
+        normal, calls = self._extract(text, tools, recover_unterminated=not truncated)
+        return StreamingParseResult(normal_text=normal, calls=calls)
+
     def parse_partial(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools, complete=False)
         return StreamingParseResult(normal_text=normal, calls=calls)
@@ -648,7 +661,12 @@ class Qwen3CoderToolParser(BaseToolParser):
             cursor = parameter_end + len("</parameter>")
 
     def _extract(
-        self, text: str, tools: list[Tool], *, complete: bool = True
+        self,
+        text: str,
+        tools: list[Tool],
+        *,
+        complete: bool = True,
+        recover_unterminated: bool = False,
     ) -> tuple[str, list[ToolCallItem]]:
         normal_parts: list[str] = []
         calls: list[ToolCallItem] = []
@@ -661,12 +679,45 @@ class Qwen3CoderToolParser(BaseToolParser):
             normal_parts.append(text[cursor:s])
             e = self._find_closing_tag(text, self.tool_call_end_token, s, complete=complete)
             if e == -1:
-                normal_parts.append(text[s:])
+                recovered = (
+                    self._parse_unterminated_call(text[s:], tools) if recover_unterminated else None
+                )
+                if recovered is None:
+                    normal_parts.append(text[s:])
+                else:
+                    calls.append(recovered)
                 break
             block = text[s : e + len(self.tool_call_end_token)]
             cursor = e + len(self.tool_call_end_token)
             calls.extend(self._parse_block(block, tools))
         return "".join(normal_parts), calls
+
+    def _parse_unterminated_call(self, block: str, tools: list[Tool]) -> ToolCallItem | None:
+        """Parse the final call of a finished output that has no ``</tool_call>``.
+
+        Mirrors ``_close_unterminated_call``: if the body ends with
+        ``</function>``, an unclosed last parameter ends at that tag; otherwise
+        only closed parameters are kept. Returns ``None`` (the block stays
+        content) when the function name is incomplete or empty, as the stream
+        then never sent a call either.
+        """
+        header = re.match(re.escape(self.tool_call_start_token) + r"\s*<function=([^<>]*)>", block)
+        if header is None or not header.group(1).strip():
+            return None
+        fname = header.group(1).strip()
+        body = self._strip_partial_suffix(block[header.end() :].rstrip(), self.tool_call_end_token)
+        body = body.rstrip()
+        function_closed = not self.grammar_constrained and body.endswith("</function>")
+        if function_closed:
+            body = body[: -len("</function>")]
+        param_config = self._get_arguments_config(fname, tools)
+        params = {
+            pname: self._convert_param_value(pval, pname, param_config, fname)
+            for pname, pval in self._parameter_values(body, fname, final=function_closed).items()
+        }
+        return ToolCallItem(
+            tool_index=-1, name=fname, parameters=json.dumps(params, ensure_ascii=False)
+        )
 
     def _parse_block(self, block: str, tools: list[Tool]) -> list[ToolCallItem]:
         res: list[ToolCallItem] = []
