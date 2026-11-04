@@ -1512,6 +1512,17 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
+            elif (sampling_params.stop is not None
+                  or sampling_params.bad is not None):
+                # An explicit end_id skips the end_id/pad_id/EOS defaults of
+                # _setup, but the stop and bad strings still have to be
+                # tokenized before the request is built.
+                if self.tokenizer is None and (sampling_params.stop
+                                               or sampling_params.bad):
+                    raise ValueError(
+                        "tokenizer is required to tokenize the stop and bad strings of sampling_params"
+                    )
+                sampling_params._setup_word_ids(self.tokenizer)
             self._configure_bart_decoder_prefix(sampling_params)
             self._add_whisper_suppress_tokens_logits_processor(sampling_params)
             add_thinking_budget_logits_processor(
