@@ -950,6 +950,7 @@ def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
 def main(*,
          build_type: str = "Release",
          generator: str = "",
+         linker: str = "lld",
          build_root: Optional[Path] = None,
          build_dir: Optional[Path] = None,
          dist_dir: Optional[Path] = None,
@@ -1066,7 +1067,7 @@ def main(*,
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
 
-    cmake_def_args = []
+    cmake_def_args = [f"-DCMAKE_LINKER_TYPE={linker.upper()}"]
     cmake_generator = ""
 
     if on_windows:
@@ -1733,6 +1734,11 @@ def add_arguments(parser: ArgumentParser):
         "-G",
         default="",
         help="CMake generator to use (e.g., 'Ninja', 'Unix Makefiles')")
+    parser.add_argument(
+        "--linker",
+        default="lld",
+        help="Linker to use, passed to CMake as CMAKE_LINKER_TYPE "
+        "in uppercase (default: lld; e.g., bfd, gold, mold, system)")
     parser.add_argument(
         "--cuda_architectures",
         "-a",
