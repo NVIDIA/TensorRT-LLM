@@ -343,27 +343,39 @@ def test_importing_tensorrt_llm_keeps_process_thp_enabled() -> None:
     assert result.returncode == 0
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="the mimalloc default is Linux-only")
-def test_failed_torch_import_withdraws_the_mimalloc_default(tmp_path: Path) -> None:
-    # The package import fails when torch does; a process that handles the error
-    # and goes on must not keep the mimalloc default in its environment.
-    fake_torch = tmp_path / "torch"
-    fake_torch.mkdir()
-    (fake_torch / "__init__.py").write_text("raise ImportError('torch cannot be imported')\n")
+def _import_tensorrt_llm_failing_on(module: str) -> int:
+    # Imports the package in a fresh interpreter in which importing `module`
+    # raises, checks that the import failed there, and that the mimalloc default
+    # is gone afterwards, as a process that handles the error and goes on sees it.
     code = (
         "import os, sys\n"
-        f"sys.path.insert(0, {str(tmp_path)!r})\n"
+        "class _Fail:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        f"        if name == {module!r}:\n"
+        "            raise ImportError(name + ' cannot be imported')\n"
+        "sys.meta_path.insert(0, _Fail())\n"
         "try:\n"
         "    import tensorrt_llm\n"
-        "except ImportError:\n"
-        "    pass\n"
+        "except ImportError as e:\n"
+        f"    assert str(e) == {module + ' cannot be imported'!r}, e\n"
         "else:\n"
-        "    raise SystemExit('tensorrt_llm was imported without torch')\n"
+        "    raise SystemExit('tensorrt_llm was imported')\n"
         "assert 'MIMALLOC_ALLOW_THP' not in os.environ\n"
     )
     env = {k: v for k, v in os.environ.items() if k != "MIMALLOC_ALLOW_THP"}
-    result = subprocess.run([sys.executable, "-c", code], env=env, timeout=600)
-    assert result.returncode == 0
+    return subprocess.run([sys.executable, "-c", code], env=env, timeout=600).returncode
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the mimalloc default is Linux-only")
+def test_failed_torch_import_withdraws_the_mimalloc_default() -> None:
+    assert _import_tensorrt_llm_failing_on("torch") == 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the mimalloc default is Linux-only")
+def test_failed_environment_preparation_withdraws_the_mimalloc_default() -> None:
+    # Phase 1 sets the default first, and a later step of it, the vendored
+    # triton_kernels import, can still raise.
+    assert _import_tensorrt_llm_failing_on("triton_kernels") == 0
 
 
 def test_mpi_pool_environment_forwards_unified_cache_variables(
