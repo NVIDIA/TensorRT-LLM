@@ -4502,6 +4502,13 @@
           "title": "Enable Block Reuse",
           "type": "boolean"
         },
+        "enable_disagg_completion_reservation": {
+          "default": false,
+          "description": "Reserve the GPU KV cache pages each admitted request needs to finish on a disaggregated server. Applies only to KV cache manager v2 on a disaggregated server with no cache tier below GPU (host_cache_size=0 and no disk tier), beam width 1, a single pipeline stage and full attention on every layer; elsewhere it is ignored, and KV cache manager v2 logs a warning. A request is then admitted only while the completion bound of every admitted request still fits: a generation request through its output limit and, under a KV connector without source reservations, a context request the connector may serve through the end of its prompt. The bounds are logical; no page is allocated early. A KV connector can request the same through its worker's requires_completion_reservation declaration.",
+          "status": "prototype",
+          "title": "Enable Disagg Completion Reservation",
+          "type": "boolean"
+        },
         "enable_kv_pool_rebalance": {
           "default": false,
           "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
@@ -5846,6 +5853,36 @@
       "additionalProperties": false,
       "description": "How this server joins a Mooncake store pool.\n\nThe settings every participant shares come from the master named by\n`pool`; what is left here is per-server. Setting this makes\n`trtllm-serve` render the Mooncake client config and export\n`MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.",
       "properties": {
+        "async_load": {
+          "default": false,
+          "description": "Load a prefix the pool serves on background threads while the request waits outside the batch, instead of inside the executor iteration, so other requests keep computing during the transfer. A page that is gone by load time restarts only that request on a single rank or an attention-DP owner, and fails the server under tensor parallelism. Validated with disable_overlap_scheduler. Ignored unless role reads the pool ('both' or 'consumer').",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load",
+          "type": "boolean"
+        },
+        "async_load_workers": {
+          "default": 1,
+          "description": "Background load threads per rank when async_load is set. Each has its own CUDA stream and, under stage_through_host, an equal share of staging_buffer_bytes.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load Workers",
+          "type": "integer"
+        },
+        "group_blocks": {
+          "default": false,
+          "description": "Put every page of a block (all layer groups and tensor-parallel shards) into one Mooncake eviction group, so the master evicts a block whole rather than leaving pages that hold space but can never hit. Mostly matters under tensor parallelism. Ignored unless the role writes; needs Mooncake 0.3.13 or newer.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Group Blocks",
+          "type": "boolean"
+        },
         "local_hostname": {
           "anyOf": [
             {
@@ -5861,6 +5898,19 @@
             "exclude": true
           },
           "title": "Local Hostname"
+        },
+        "local_reuse_backoff": {
+          "default": "off",
+          "description": "How a local prefix match is handled under one-model speculative decoding, whose draft reads prompt tokens past each position and so backs every local reuse match off by that lookahead. 'off' drops the backoff: local hits are used whole, and the draft KV at the tail of a reused block may belong to a different next token, which can lower draft acceptance but does not change the output. 'align' keeps the backoff and aligns the match down to a block boundary, so the pool serves the trimmed block (a transfer) along with the rest of the prefix. Has no effect without one-model speculative decoding or for a role that does not read the pool.",
+          "enum": [
+            "off",
+            "align"
+          ],
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Local Reuse Backoff",
+          "type": "string"
         },
         "master_timeout": {
           "default": 60.0,
@@ -5938,14 +5988,64 @@
           "description": "Host memory each of this server's ranks contributes to the pool, as a binary size ('16GiB') or a byte count; ambiguous units such as 'GB' are refused. A node's demand is ranks_on_node x segment_size, checked against available memory at startup. Zero lends nothing, leaving the server to use only capacity its peers hold.",
           "title": "Segment Size"
         },
+        "soft_pin_ttl_ms": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Soft-pin every page this server writes for this many milliseconds, so the master evicts the pool by age instead of refilling an eviction shortfall in shard order, which punches holes into prefixes still in use. Must not exceed the master's --max_kv_soft_pin_ttl (24 h by default), or every put is refused, and the master must allow evicting soft-pinned objects (Mooncake's default). Ignored unless the role writes; needs Mooncake 0.3.13 or newer.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Soft Pin Ttl Ms"
+        },
         "stage_through_host": {
           "default": false,
-          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'.",
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'. Pinned memory per direction is staging_buffer_bytes.",
           "telemetry": {
             "exclude": true
           },
           "title": "Stage Through Host",
           "type": "boolean"
+        },
+        "staging_buffer_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "1GiB",
+          "description": "Pinned host memory per transfer direction when stage_through_host is set, as a binary size ('512MiB') or a byte count; ambiguous units such as 'GB' are refused. It bounds how many pages one store call stages, not how large a page may be. With async_load the load direction's share is split evenly across async_load_workers. Counted per rank in the node memory check. Ignored without stage_through_host.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Staging Buffer Bytes"
+        },
+        "stats_interval": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds between per-rank info-level log lines counting prefix lookups stopped by a hole the pool evicted from a prefix it otherwise still holds, and timing each phase of a prefix load. Only a role that reads the pool counts anything. None disables the counters at no cost.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Stats Interval"
         },
         "transfer_batch_size": {
           "default": 64,

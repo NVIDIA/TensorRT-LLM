@@ -33,8 +33,8 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, TypeAdapter, field_validator,
-                      model_validator)
+                      PrivateAttr, StrictInt, TypeAdapter, ValidationInfo,
+                      field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -2779,7 +2779,65 @@ class MooncakeStoreConfig(StrictBaseModel):
         description="Copy pages through a pinned host buffer instead of "
         "registering the KV pools with Mooncake. For a host whose HCA cannot "
         "pin GPU pages; costs a copy each way. Ignored when role is "
-        "'capacity'.")
+        "'capacity'. Pinned memory per direction is staging_buffer_bytes.")
+    staging_buffer_bytes: Union[int, str] = Field(
+        "1GiB",
+        telemetry=False,
+        description="Pinned host memory per transfer direction when "
+        "stage_through_host is set, as a binary size ('512MiB') or a byte "
+        "count; ambiguous units such as 'GB' are refused. It bounds how many "
+        "pages one store call stages, not how large a page may be. With "
+        "async_load the load direction's share is split evenly across "
+        "async_load_workers. Counted per rank in the node memory check. "
+        "Ignored without stage_through_host.")
+    async_load: bool = Field(
+        False,
+        telemetry=False,
+        status="prototype",
+        description="Load a prefix the pool serves on background threads "
+        "while the request waits outside the batch, instead of inside the "
+        "executor iteration, so other requests keep computing during the "
+        "transfer. A page that is gone by load time restarts only that "
+        "request on a single rank or an attention-DP owner, and fails the "
+        "server under tensor parallelism. Validated with "
+        "disable_overlap_scheduler. Ignored unless role reads the pool "
+        "('both' or 'consumer').")
+    async_load_workers: PositiveInt = Field(
+        1,
+        telemetry=False,
+        status="prototype",
+        description="Background load threads per rank when async_load is "
+        "set. Each has its own CUDA stream and, under stage_through_host, an "
+        "equal share of staging_buffer_bytes.")
+    soft_pin_ttl_ms: Optional[PositiveInt] = Field(
+        None,
+        telemetry=False,
+        description="Soft-pin every page this server writes for this many "
+        "milliseconds, so the master evicts the pool by age instead of "
+        "refilling an eviction shortfall in shard order, which punches holes "
+        "into prefixes still in use. Must not exceed the master's "
+        "--max_kv_soft_pin_ttl (24 h by default), or every put is refused, "
+        "and the master must allow evicting soft-pinned objects (Mooncake's "
+        "default). Ignored unless the role writes; needs Mooncake 0.3.13 or "
+        "newer.")
+    group_blocks: bool = Field(
+        False,
+        telemetry=False,
+        description="Put every page of a block (all layer groups and "
+        "tensor-parallel shards) into one Mooncake eviction group, so the "
+        "master evicts a block whole rather than leaving pages that hold "
+        "space but can never hit. Mostly matters under tensor parallelism. "
+        "Ignored unless the role writes; needs Mooncake 0.3.13 or newer.")
+    stats_interval: Optional[float] = Field(
+        None,
+        gt=0,
+        allow_inf_nan=False,
+        telemetry=False,
+        description="Seconds between per-rank info-level log lines counting "
+        "prefix lookups stopped by a hole the pool evicted from a prefix it "
+        "otherwise still holds, and timing each phase of a prefix load. "
+        "Only a role that reads the pool counts anything. None disables the "
+        "counters at no cost.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,
@@ -2802,20 +2860,37 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master to accept connections. Raise it when the wait spans a "
         "container start on another node. Expiring fails the server at "
         "startup.")
+    local_reuse_backoff: Literal["off", "align"] = Field(
+        "off",
+        telemetry=False,
+        description="How a local prefix match is handled under one-model "
+        "speculative decoding, whose draft reads prompt tokens past each "
+        "position and so backs every local reuse match off by that lookahead. "
+        "'off' drops the backoff: local hits are used whole, and the draft KV "
+        "at the tail of a reused block may belong to a different next token, "
+        "which can lower draft acceptance but does not change the output. "
+        "'align' keeps the backoff and aligns the match down to a block "
+        "boundary, so the pool serves the trimmed block (a transfer) along "
+        "with the rest of the prefix. Has no effect without one-model "
+        "speculative decoding or for a role that does not read the pool.")
 
-    @field_validator("segment_size", mode="after")
+    @field_validator("segment_size", "staging_buffer_bytes", mode="after")
     @classmethod
-    def _check_segment_size(cls, value):
+    def _check_sizes(cls, value, info: ValidationInfo):
         """Reject a bad size here rather than in every rank after bringup."""
         from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
             parse_size
+        name = info.field_name
         try:
             parsed = parse_size(value, strict_units=True)
         except ValueError as exc:
-            raise ValueError(f"mooncake_store.segment_size: {exc}")
-        if parsed < 0:
+            raise ValueError(f"mooncake_store.{name}: {exc}")
+        if name == "segment_size" and parsed < 0:
             raise ValueError(f"mooncake_store.segment_size: {value!r} is "
                              f"{parsed} bytes; it cannot be negative.")
+        if name == "staging_buffer_bytes" and parsed <= 0:
+            raise ValueError(f"mooncake_store.staging_buffer_bytes: {value!r} "
+                             f"is {parsed} bytes; it must be positive.")
         return value
 
 
@@ -5410,6 +5485,24 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description="KV cache manager v2 configuration for block reuse policies."
     )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_disagg_completion_reservation: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Reserve the GPU KV cache pages each admitted request needs to finish "
+        "on a disaggregated server. Applies only to KV cache manager v2 on a "
+        "disaggregated server with no cache tier below GPU (host_cache_size=0 "
+        "and no disk tier), beam width 1, a single pipeline stage and full "
+        "attention on every layer; elsewhere it is ignored, and KV cache "
+        "manager v2 logs a warning. A request is then admitted only while the "
+        "completion bound of every admitted request still fits: a generation "
+        "request through its output limit and, under a KV connector without "
+        "source reservations, a context request the connector may serve "
+        "through the end of its prompt. The bounds are logical; no page is "
+        "allocated early. A KV connector can request the same through its "
+        "worker's requires_completion_reservation declaration.")
 
     def _to_pybind(self):
         config = _KvCacheConfig(

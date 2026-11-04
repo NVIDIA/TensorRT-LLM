@@ -114,6 +114,9 @@ class KvCacheConfigV2:
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
     enable_kv_pool_rebalance: bool = False
+    # Mirrors KvCacheConfig.enable_disagg_completion_reservation in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2.__init__() reads it.
+    enable_disagg_completion_reservation: bool = False
 
 
 _THIS_DIR = Path(__file__).resolve().parent
