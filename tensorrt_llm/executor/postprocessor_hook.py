@@ -84,6 +84,10 @@ class PostProcessorHookChunk:
             detok process). Output-side observation only; do not rely on it to
             detect every upstream client cancellation.
         streaming: True for streaming requests.
+        disagg_request_id: The id the disaggregated server assigned the
+            request, or None when it carries none (serving is not
+            disaggregated). Its context and generation phases share this id,
+            while ``request_id`` is local to each worker process.
     """
 
     request_id: int
@@ -94,6 +98,7 @@ class PostProcessorHookChunk:
     is_final: bool
     aborted: bool
     streaming: bool
+    disagg_request_id: Optional[int] = None
 
 
 class PostProcessorHookAction(str, enum.Enum):
@@ -217,6 +222,8 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
     # request is the unit of cancellation. Hooks needing per-sequence state
     # should key on (request_id, output_index).
     is_final = result._done
+    disaggregated_params = getattr(result, "disaggregated_params", None)
+    disagg_request_id = getattr(disaggregated_params, "disagg_request_id", None)
     for output in result.outputs:
         chunk = PostProcessorHookChunk(
             request_id=result.id,
@@ -227,6 +234,7 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
             is_final=is_final,
             aborted=result._aborted,
             streaming=streaming,
+            disagg_request_id=disagg_request_id,
         )
         try:
             verdict = hook(chunk)

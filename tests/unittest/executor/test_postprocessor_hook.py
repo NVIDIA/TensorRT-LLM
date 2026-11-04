@@ -4,6 +4,7 @@
 
 import pytest
 
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor.postprocessor_hook import (
     PostProcessorHookChunk,
     apply_post_processor_hook,
@@ -224,6 +225,24 @@ def test_per_request_state_is_keyed_by_request_id():
     assert r1b.outputs[0].text == "ac#2"
     # State released on the final chunk.
     assert 1 not in hook.state
+
+
+def test_chunk_carries_the_disaggregated_request_id():
+    """``disagg_request_id`` comes from the result's disaggregated params, else None."""
+    seen = []
+
+    def hook(chunk):
+        seen.append(chunk.disagg_request_id)
+        return emit(chunk.text_diff)
+
+    result = _FakeResult([_make_output("x")])
+    apply_post_processor_hook(hook, result, streaming=True)
+    result.disaggregated_params = DisaggregatedParams()
+    apply_post_processor_hook(hook, result, streaming=True)
+    result.disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+    apply_post_processor_hook(hook, result, streaming=True)
+
+    assert seen == [None, None, 42]
 
 
 def test_unknown_verdict_action_rejected_at_construction():
