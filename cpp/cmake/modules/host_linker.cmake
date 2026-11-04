@@ -20,12 +20,14 @@ if(USE_LLD)
     message(FATAL_ERROR "USE_LLD requires Linux and a GCC or Clang compiler")
   endif()
 
-  include(CheckLinkerFlag)
-  check_linker_flag(CXX "-fuse-ld=lld" TRTLLM_HAS_LLD_LINKER)
-  if(NOT TRTLLM_HAS_LLD_LINKER)
+  set(CMAKE_LINKER_TYPE LLD)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles("int main() { return 0; }"
+                            TRTLLM_HAS_LLD_LINKER_TYPE)
+  if(NOT TRTLLM_HAS_LLD_LINKER_TYPE)
     message(
       FATAL_ERROR
-        "USE_LLD requires ld.lld on PATH and a compiler supporting -fuse-ld=lld"
+        "USE_LLD requires ld.lld on PATH and a compiler supporting CMAKE_LINKER_TYPE=LLD"
     )
   endif()
 
@@ -41,8 +43,5 @@ if(USE_LLD)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
   endif()
 
-  # CMake uses the host compiler for the final link of CUDA targets. Device
-  # linking and static archives use their configured tools.
-  add_link_options("$<HOST_LINK:-fuse-ld=lld>")
   message(STATUS "Using LLVM lld for host linking")
 endif()

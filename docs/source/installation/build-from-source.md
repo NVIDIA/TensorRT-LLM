@@ -94,13 +94,15 @@ built.
 | `--fast_build` | Skip compiling some kernels to speed up compilation -- for development only |
 | `--no_lld` | Disable the default LLVM lld host linker and use the toolchain's default linker |
 
-Builds use lld by default on Linux with GCC or Clang. Install it in the build
-environment (for example, `apt-get install lld` on Ubuntu). Pass `--no_lld` to
-`scripts/build_wheel.py`, or `-DUSE_LLD=OFF` to CMake, to use the toolchain's
-default linker instead. Configuration checks that the compiler can select lld
-with `-fuse-ld=lld`. The option applies to host linking for executables, shared
-libraries, and Python extension modules; CUDA device linking continues to use
-nvlink. The `--use_lld` flag remains available to explicitly enable lld.
+Builds require CMake 3.29 or newer and use lld by default on Linux with GCC or
+Clang. Install lld in the build environment (for example, `apt-get install lld`
+on Ubuntu). Pass `--no_lld` to `scripts/build_wheel.py`, or `-DUSE_LLD=OFF` to
+CMake, to use the toolchain's default linker instead. CMake selects lld with
+`CMAKE_LINKER_TYPE=LLD` and
+checks that the compiler can link with it. The option applies to host linking
+for executables, shared libraries, and Python extension modules; CUDA device
+linking continues to use nvlink. The `--use_lld` flag remains available to
+explicitly enable lld.
 
 With GCC, lld builds disable automatic link-time optimization (LTO), including
 pybind11's default LTO for release extensions, because lld cannot read GCC LTO
