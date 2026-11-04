@@ -19,7 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
-from tensorrt_llm._torch.modules.context_logits import ContextLogitsPlan, context_logits_scope
+from tensorrt_llm._torch.modules.context_logits import context_logits_heads, context_logits_scope
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -29,6 +29,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
@@ -238,6 +239,10 @@ class DecoderRunner(ScheduledModelRunner):
             )
         if self._h2d_cache is not None and self._h2d_cache.changed_span:
             logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
+        # Heads that can project context logits eagerly; the model is fixed.
+        self._context_logits_heads = context_logits_heads(
+            model, mapping, is_spec_decode=config.is_spec_decode
+        )
 
         self.forward_pass_callable = None
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
@@ -617,8 +622,7 @@ class DecoderRunner(ScheduledModelRunner):
         semantic_requests = scheduled_requests
         context_plan = (
             ContextLogitsPlan.for_batch(
-                self._model,
-                self._mapping,
+                self._context_logits_heads,
                 semantic_requests,
                 is_spec_decode=self._config.is_spec_decode or enable_spec_decode,
             )

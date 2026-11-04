@@ -6,11 +6,11 @@ from typing import List
 
 import torch
 
-from tensorrt_llm._torch.modules.context_logits import store_context_logits
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import \
+    store_context_logits
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.logger import logger
 
 
 class HandleLogits:
@@ -57,10 +57,6 @@ class HandleLogits:
             logits_end = num_context_logits_prefix_sum[batch_index + 1]
 
             if llm_req.py_return_context_logits and not context_logits_handled:
-                if llm_req.prepopulated_prompt_len > 0:
-                    logger.warning(
-                        f"Because of KV cache reuse, not all context logits could be produced for request {llm_req.request_id}."
-                    )
                 context_logits_device_view = logits[logits_begin:logits_end]
                 store_context_logits(llm_req, context_logits_device_view)
 

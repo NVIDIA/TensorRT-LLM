@@ -1,22 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded eager projection and request-owned storage of context logits."""
+"""Bounded eager projection of context logits through the LM head.
+
+The executor owns request and result bookkeeping
+(``pyexecutor.context_logits_plan``); this module only provides the projection
+buffers and the hook that lets an active plan replace the LM-head output.
+"""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Iterator, Protocol
 
 import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
-    from ..pyexecutor.llm_request import LlmRequest
-    from ..pyexecutor.scheduler import ScheduledRequests
     from .embedding import LMHead
+
+
+class ContextLogitsProjector(Protocol):
+    """An executor plan that consumes context rows during the LM-head projection."""
+
+    def project(self, hidden: torch.Tensor, head: LMHead) -> torch.Tensor: ...
 
 
 def context_logits_heads(
@@ -49,36 +58,6 @@ def context_logits_heads(
         ):
             heads.append(head)
     return tuple(heads)
-
-
-def store_context_logits(
-    request: LlmRequest, logits: torch.Tensor, *, offset: int = 0, reusable: bool = False
-) -> None:
-    """Consume context rows from either projection path using one result contract.
-
-    ``offset`` is the row offset within the current prefill chunk. Reduction
-    runs eagerly, after any model/output transforms. Reusable GPU-to-host
-    copies must complete before the projection buffer is overwritten.
-    """
-    from ...executor.result import compute_prompt_logprobs
-
-    compact = request.py_prompt_logprobs is not None
-    if request.py_context_logits_explicit or not compact:
-        request.py_result.append_context_logits(logits, reusable=reusable)
-    if not compact:
-        return
-    begin = request.context_current_position + offset + 1
-    end = min(request.py_prompt_len, begin + logits.shape[0])
-    targets = request.get_tokens(0)[begin:end]
-    values = compute_prompt_logprobs(
-        request.py_prompt_logprobs,
-        logits[: len(targets)],
-        targets,
-        request.py_prompt_logprobs_simple_format,
-    ).prompt
-    request.py_result.append_prompt_logprobs(values or [])
-    if offset + logits.shape[0] == request.context_chunk_size and request.is_last_context_chunk:
-        request.py_result.set_prompt_last_logits(logits[-1:].cpu())
 
 
 class ContextLogitsWorkspace:
@@ -132,7 +111,7 @@ class ContextLogitsWorkspace:
         return min(self._votes.cpu().tolist())
 
     def require_all(self, succeeded: bool, operation: str) -> None:
-        """Report local allocation failure on every TP rank before the next gather."""
+        """Raise on every TP rank if any rank failed, before the next gather."""
         if not self._min_capacity(int(succeeded)):
             raise torch.OutOfMemoryError(f"Insufficient memory for {operation} on a TP rank")
 
@@ -177,8 +156,27 @@ class ContextLogitsWorkspace:
         head: LMHead,
         hidden: torch.Tensor,
         buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        local_ok: bool = True,
     ) -> torch.Tensor:
-        """Gather vocabulary shards into owned scratch without allocating a full output."""
+        """Gather vocabulary shards into owned scratch without allocating a full output.
+
+        Args:
+            head: The LM head that owns this workspace.
+            hidden: ``[rows, hidden_size]`` hidden states in the head's weight
+                dtype, with ``rows`` at most the buffers' capacity.
+            buffers: ``(local, gathered, converted)`` from ``acquire``:
+                ``[capacity, local_vocab]`` GEMM output, ``[tp_size * capacity,
+                local_vocab]`` gather receive buffer (``local`` when TP is 1)
+                and ``[capacity, vocab]`` FP32 result (``local`` when it
+                already is FP32 at TP 1).
+            local_ok: False reports a local failure since the previous vote,
+                so every TP rank raises together.
+
+        Returns:
+            ``[rows, vocab]`` FP32 view of ``converted``, overwritten by the
+            next call with the same buffers.
+        """
         rows = hidden.shape[0]
         local, gathered, converted = buffers
         local = local[:rows]
@@ -190,7 +188,7 @@ class ContextLogitsWorkspace:
             succeeded = True
         except torch.OutOfMemoryError:
             pass
-        self.require_all(succeeded, "context-logits GEMM")
+        self.require_all(succeeded and local_ok, "context-logits projection or storage")
         if self.tp_size > 1:
             gathered = gathered[: self.tp_size * rows]
             self._allgather(local, gathered)
@@ -205,99 +203,13 @@ class ContextLogitsWorkspace:
         return converted
 
 
-class ContextLogitsPlan:
-    """Consume context chunks directly; return only rows needed by the sampler."""
-
-    def __init__(self, batch: ScheduledRequests) -> None:
-        self.batch = batch
-        self.handled = False
-
-    @classmethod
-    def for_batch(
-        cls,
-        model: torch.nn.Module,
-        mapping: Mapping,
-        batch: ScheduledRequests,
-        *,
-        is_spec_decode: bool,
-    ) -> ContextLogitsPlan | None:
-        """Select eager projection only when a prepared, supported head can use it."""
-        if not any(request.py_return_context_logits for request in batch.context_requests):
-            return None
-        if any(
-            getattr(request, "py_logits_post_processors", None) for request in batch.all_requests()
-        ):
-            return None
-        heads = context_logits_heads(model, mapping, is_spec_decode=is_spec_decode)
-        if not any(head.context_logits_workspace is not None for head in heads):
-            return None
-        return cls(batch)
-
-    def project(self, hidden: torch.Tensor, head: LMHead) -> torch.Tensor:
-        workspace = head.context_logits_workspace
-        assert workspace is not None
-        contexts = self.batch.context_requests
-        context_rows = sum(request.context_chunk_size for request in contexts)
-        generation_rows = hidden.shape[0] - context_rows
-        if generation_rows < 0:
-            raise ValueError("Context logits input does not match scheduled token rows")
-        # Own the sampling rows before result storage can consume the remaining
-        # headroom. No view of a reusable projection buffer escapes this call.
-        sampling = None
-        try:
-            sampling = torch.empty(
-                (len(contexts) + generation_rows, head.num_embeddings),
-                dtype=torch.float32,
-                device=hidden.device,
-            )
-        except torch.OutOfMemoryError:
-            pass
-        workspace.require_all(sampling is not None, "context-logits sampling rows")
-        assert sampling is not None
-        for request in contexts:
-            if request.py_return_context_logits and (
-                request.py_context_logits_explicit or request.py_prompt_logprobs is None
-            ):
-                request.py_result.prepare_context_logits(head.num_embeddings, hidden.device)
-
-        offset = 0
-        for index, request in enumerate(contexts):
-            count = request.context_chunk_size
-            rows = hidden[offset : offset + count]
-            wants_context = request.py_return_context_logits
-            compact = wants_context and request.py_prompt_logprobs is not None
-            keep_logits = wants_context and (request.py_context_logits_explicit or not compact)
-            host_storage = keep_logits and request.py_result.context_logits_on_cpu
-            if not wants_context:
-                rows = rows[-1:]
-            buffers = workspace.acquire(rows.shape[0], host_storage=host_storage)
-            capacity = buffers[0].shape[0]
-            for begin in range(0, rows.shape[0], capacity):
-                end = min(begin + capacity, rows.shape[0])
-                logits = workspace.project(head, rows[begin:end], buffers)
-                if wants_context:
-                    store_context_logits(request, logits, offset=begin, reusable=True)
-                if end == rows.shape[0]:
-                    sampling[index].copy_(logits[-1])
-            del logits, buffers
-            offset += count
-
-        if generation_rows:
-            buffers = workspace.acquire(generation_rows, host_storage=False)
-            capacity = buffers[0].shape[0]
-            for begin in range(0, generation_rows, capacity):
-                end = min(begin + capacity, generation_rows)
-                logits = workspace.project(head, hidden[offset + begin : offset + end], buffers)
-                sampling[len(contexts) + begin : len(contexts) + end].copy_(logits)
-        self.handled = True
-        return sampling
-
-
-_ACTIVE_PLAN: ContextVar[ContextLogitsPlan | None] = ContextVar("context_logits_plan", default=None)
+_ACTIVE_PLAN: ContextVar[ContextLogitsProjector | None] = ContextVar(
+    "context_logits_plan", default=None
+)
 
 
 @contextmanager
-def context_logits_scope(plan: ContextLogitsPlan | None) -> Iterator[None]:
+def context_logits_scope(plan: ContextLogitsProjector | None) -> Iterator[None]:
     token = _ACTIVE_PLAN.set(plan)
     try:
         yield
@@ -307,7 +219,17 @@ def context_logits_scope(plan: ContextLogitsPlan | None) -> Iterator[None]:
 
 @torch.compiler.disable
 def project_context_logits(hidden: torch.Tensor, head: LMHead) -> torch.Tensor | None:
-    """Use the executor's eager context-output plan when a supported head is prepared."""
+    """Use the executor's eager context-output plan when a supported head is prepared.
+
+    Args:
+        hidden: ``[num_tokens, hidden_size]`` hidden states of every scheduled
+            token, context chunks first.
+
+    Returns:
+        None without an active plan; otherwise ``[num_contexts +
+        generation_rows, vocab]`` FP32 rows for the sampler: the last row of
+        each context chunk followed by every generation row.
+    """
     plan = _ACTIVE_PLAN.get()
     if plan is None or head.context_logits_workspace is None:
         return None

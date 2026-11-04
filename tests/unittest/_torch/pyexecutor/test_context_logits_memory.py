@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.context_logits import ContextLogitsPlan, ContextLogitsWorkspace
+from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, context_logits_heads
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm.executor.result import compute_prompt_logprobs
 
@@ -36,6 +37,8 @@ def make_request(
 ) -> SimpleNamespace:
     tokens = [i % vocab for i in range(length)]
     return SimpleNamespace(
+        request_id=0,
+        prepopulated_prompt_len=0,
         context_chunk_size=length,
         context_current_position=0,
         py_prompt_len=length,
@@ -198,9 +201,9 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
     def fail_optional(rows):
         raise torch.OutOfMemoryError("injected optional output failure")
 
-    def record_projection(head, hidden, buffers):
+    def record_projection(head, hidden, buffers, **kwargs):
         projected_rows.append(hidden.shape[0])
-        return project(head, hidden, buffers)
+        return project(head, hidden, buffers, **kwargs)
 
     monkeypatch.setattr(workspace, "_allocate", fail_optional)
     monkeypatch.setattr(workspace, "project", record_projection)
@@ -220,7 +223,8 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
         request.is_last_context_chunk = end == 91
         legacy = legacy_first if index == 0 else not legacy_first
         peer.py_logits_post_processors = [lambda *args: None] if legacy else None
-        plan = ContextLogitsPlan.for_batch(model, mapping, batch, is_spec_decode=False)
+        heads = context_logits_heads(model, mapping, is_spec_decode=False)
+        plan = ContextLogitsPlan.for_batch(heads, batch, is_spec_decode=False)
         assert (plan is None) == legacy
         inputs = torch.cat([hidden[start:end], hidden[-1:]])
         with context_logits_scope(plan):
@@ -239,12 +243,13 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
     targets = request.get_tokens(0)[1:] + [13]
     expected = compute_prompt_logprobs(3, reference.cpu(), targets).prompt
     response = SimpleNamespace(
+        request_id=0,
         result=SimpleNamespace(
             context_logits=None,
-            context_prompt_logprobs=request.py_result.context_prompt_logprobs,
+            context_prompt_logprob_rows=request.py_result.context_prompt_logprob_rows,
             context_prompt_last_logits=request.py_result.context_prompt_last_logits,
             get_result=lambda: SimpleNamespace(output_token_ids=[[13]]),
-        )
+        ),
     )
     generation = SimpleNamespace(
         _streaming=True,
@@ -253,6 +258,10 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
     )
     actual = _compute_pytorch_prompt_logprobs(generation, response)
     assert_logprobs_equal(actual.prompt, expected)
+    # Rows that skip a reused prefix cannot be aligned with the prompt.
+    response.result.context_prompt_logprob_rows = request.py_result.context_prompt_logprob_rows[1:]
+    generation._cached_prompt_logprobs = None
+    assert _compute_pytorch_prompt_logprobs(generation, response).prompt is None
     assert request.py_result.context_logits is None
     assert request.py_result._context_logits._storage is None
 
@@ -268,10 +277,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
 
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_cohere2 import Cohere2ForCausalLM
-    from tensorrt_llm._torch.modules.context_logits import (
-        context_logits_heads,
-        context_logits_scope,
-    )
+    from tensorrt_llm._torch.modules.context_logits import context_logits_scope
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 
     model, mapping = make_model_and_mapping()
@@ -340,6 +346,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
     runner = SimpleNamespace(
         _model=model,
         _mapping=mapping,
+        _context_logits_heads=context_logits_heads(model, mapping, is_spec_decode=False),
         _config=SimpleNamespace(is_spec_decode=False, spec_config=None, use_mrope=False),
         _graphs=graphs,
         _inputs=inputs,
@@ -379,3 +386,46 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         replay.assert_called_once()
         forward.assert_not_called()
         inputs.record_promoted_iter_states.assert_called_once_with(batch)
+
+
+@pytest.mark.cpu_only
+def test_short_compact_prompt_logprobs_fail_only_their_request() -> None:
+    """Rows that skip a reused KV prefix cannot be aligned, so the request fails."""
+    from unittest.mock import Mock
+
+    from tensorrt_llm.executor.base_worker import _maybe_wrap_response
+    from tensorrt_llm.executor.utils import ErrorResponse
+
+    def response(is_final: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            client_id=7,
+            request_id=70,
+            has_error=lambda: False,
+            result=SimpleNamespace(
+                is_final=is_final,
+                context_logits=None,
+                # One row for a 4-token prompt: a 2-token prefix was reused.
+                context_prompt_logprob_rows=[torch.zeros(1, 2, dtype=torch.float64)],
+                context_prompt_last_logits=torch.zeros(1, 8),
+                get_result=lambda: SimpleNamespace(output_token_ids=[[5]]),
+            ),
+        )
+
+    generation = SimpleNamespace(
+        _streaming=False,
+        _logprob_params=SimpleNamespace(
+            prompt_logprobs=0, prompt_logprobs_simple_format=False, drop_context_logits=True
+        ),
+        _generation_request=SimpleNamespace(prompt_token_ids=[1, 2, 3, 4]),
+        clear_logprob_params=Mock(),
+    )
+    worker = SimpleNamespace(
+        _results={7: generation}, _refused_client_ids=set(), abort_request=Mock()
+    )
+
+    wrapped = _maybe_wrap_response(worker, response(is_final=False))
+
+    assert isinstance(wrapped, ErrorResponse)
+    assert "all 4 prompt tokens, got 2" in wrapped.error_msg
+    worker.abort_request.assert_called_once_with(7)
+    assert worker._refused_client_ids == {7}
