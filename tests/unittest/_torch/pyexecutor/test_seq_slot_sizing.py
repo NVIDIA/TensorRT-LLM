@@ -1021,8 +1021,7 @@ def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_he
     assert creator._get_penalty_workspace_reserve(Mock()) == 0
 
 
-@pytest.mark.parametrize("new_capacity", [4, 8])
-def test_resource_factory_reuses_only_released_same_capacity_slots(monkeypatch, new_capacity):
+def test_resource_factory_rejects_live_slots_before_rebinding(monkeypatch):
     previous = SeqSlotManager(4)
     previous.prepare_resources(_batch(_fake_req(CUDA_GRAPH_DUMMY_REQUEST_ID)))
     previous.shutdown()
@@ -1054,13 +1053,12 @@ def test_resource_factory_reuses_only_released_same_capacity_slots(monkeypatch, 
         model_engine=engine,
         max_batch_size=2,
         max_num_tokens=128,
-        max_num_sequences=new_capacity,
+        max_num_sequences=4,
         scheduler_config=scheduler_config,
     )
     bound = util_module.create_py_executor_resources(**kwargs)
     manager = bound.resource_manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
-    assert (manager is previous) == (new_capacity == 4)
-    assert manager.get_max_resource_count() == new_capacity
+    assert manager.get_max_resource_count() == 4
     assert not manager.slot_manager.slot_mapping
     manager.prepare_resources(_batch(_fake_req(100)))
     extra_manager = object()

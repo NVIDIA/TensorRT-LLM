@@ -4560,10 +4560,8 @@ def create_py_executor_resources(
         model_engine.init_cuda_graph_lora_manager(lora_config)
 
     validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
-    if (seq_slot_manager is None
-            or seq_slot_manager.get_max_resource_count() != max_num_sequences):
-        seq_slot_manager = SeqSlotManager(max_num_sequences)
-    resources[ResourceManagerType.SEQ_SLOT_MANAGER] = seq_slot_manager
+    resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
+        max_num_sequences)
 
     compression_manager = resources.get(
         ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
