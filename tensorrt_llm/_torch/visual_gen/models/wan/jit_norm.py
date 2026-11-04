@@ -549,6 +549,13 @@ def rms_norm_silu_rows(
     logical positions are written."""
     _check_rows(x=x, residual=residual, gamma=gamma, bias=bias, in_bias=in_bias, out=out)
     rows, channels = x.shape
+    if residual is not None and (
+        tuple(residual.shape) != (rows, channels) or not residual.is_contiguous()
+    ):
+        raise ValueError(f"residual must be a contiguous [{rows}, {channels}] tensor")
+    for name, t in (("gamma", gamma), ("bias", bias), ("in_bias", in_bias)):
+        if t is not None and (t.numel() != channels or not t.is_contiguous()):
+            raise ValueError(f"{name} must be a contiguous [{channels}] tensor")
     out_geometry, frames = _rows_geometry(out_geometry, out, rows, frames)
     height, width = (out_geometry.height, out_geometry.width) if out_geometry else (0, 0)
     out_rows = frames * out_geometry.frame if out_geometry is not None else rows

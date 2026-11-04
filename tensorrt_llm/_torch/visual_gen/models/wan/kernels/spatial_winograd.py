@@ -32,6 +32,7 @@ import torch
 from cutlass import BFloat16, Float16, Float32, Int32, Int64
 from cutlass.base_dsl.typing import Vector
 
+from .. import wino_tables
 from ..wino_tables import at_row, bt_row
 from .common import (
     CHANNELS_PER_VECTOR,
@@ -44,6 +45,9 @@ from .common import (
     pack2,
     pack_words,
 )
+
+# The transform coefficients are traced into the kernels, so their source keys the cache.
+_KEY_FILES = [__file__, wino_tables.__file__]
 
 STAGED_TILES = 8
 STAGED_CHANNELS = 64
@@ -558,7 +562,7 @@ def _input_kernel(device: int, m: int, fp16: bool, stacked: bool, staged: bool):
         )
 
     name = f"spatial_in[{m},{int(fp16)},{int(stacked)},{int(staged)}]"
-    return compile_cached("trtllm_wan_vae_spatial", name, compile_fn, [__file__])
+    return compile_cached("trtllm_wan_vae_spatial", name, compile_fn, _KEY_FILES)
 
 
 @functools.lru_cache(maxsize=None)
@@ -580,7 +584,7 @@ def _output_kernel(device: int, m: int, fp16: bool, has_bias: bool):
         )
 
     name = f"spatial_out[{m},{int(fp16)},{int(has_bias)}]"
-    return compile_cached("trtllm_wan_vae_spatial", name, compile_fn, [__file__])
+    return compile_cached("trtllm_wan_vae_spatial", name, compile_fn, _KEY_FILES)
 
 
 def _ceil_div(a: int, b: int) -> int:

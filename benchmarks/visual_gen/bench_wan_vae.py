@@ -965,7 +965,7 @@ def _run_shape(
         )
         reference = _fp32_reference(state_dict, op, inp, decode_chunk) if use_reference else None
         native_out: torch.Tensor | None = None
-        for backend in backends:
+        for order_index, backend in enumerate(backends):
             row, out_cpu = _run_backend(
                 backend,
                 args=args,
@@ -980,6 +980,10 @@ def _run_shape(
                 reference=reference,
                 native_out=native_out,
             )
+            # Backends run in the listed order, one timing block each; record it so a reader
+            # can see which was timed first.
+            row["run_order_index"] = order_index
+            row["run_order"] = list(backends)
             if backend == "native":
                 native_out = out_cpu
             rows.append(row)
