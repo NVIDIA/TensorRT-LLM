@@ -9,6 +9,7 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -61,7 +62,6 @@ class RequestQueueItem:
 
     def __post_init__(self) -> None:
         # Normalize bound inputs before any queue, ADP, or broadcast handoff.
-        from tensorrt_llm.bindings.executor import Request
         if isinstance(self.request, Request):
             self.request = ExecutorRequest.adapt(self.request)
 
