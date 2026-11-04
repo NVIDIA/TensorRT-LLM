@@ -29,6 +29,13 @@ bytes. The fork point: right after the target's LM-head GEMM
 (``llm.lm_head``'s ``apply_linear``, bound on the instance), before its column
 gather.
 
+With ``context_kv_late_join`` the prepare leaves the join pending on the drafter
+(``ContextKvFork.defer_join``) when the drafter runs the windowed block decode, which
+joins (``join_pending``) right before its first block attention -- its first read of
+the arena and of the lengths the commit wrote -- so the drafter's first input norm,
+convolution ``prepare``, QKV GEMM and QK-norm + RoPE run while the commit is still on
+the side stream.
+
 Over a windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``: the worker keeps
 the last ``_ctx_keep`` columns of each slot, physical column 0 holding logical
 token ``_ctx_base``) the worker's store writes the physical columns, with the
@@ -181,6 +188,24 @@ def compacts_after_join(worker) -> bool:
     return isinstance(worker, WindowCompactDFlashWorker)
 
 
+def join_pending(draft_model: nn.Module) -> None:
+    """Join the side chain a prepare left pending on ``draft_model`` (``ContextKvFork.defer_join``), if any.
+
+    The drafter's block decode calls this right before its first read of the
+    context arena or of the lengths the commit wrote (the first block attention,
+    and the lengths it is handed); its built-in fallback calls it first.
+    """
+    pending = draft_model.__dict__.pop("_kv_pending_join", None)
+    if pending is not None:
+        fork, launched = pending
+        fork.join(launched)
+
+
+def join_is_pending(draft_model: nn.Module) -> bool:
+    """Whether a prepare left a join pending on ``draft_model`` (``join_pending`` takes it)."""
+    return "_kv_pending_join" in draft_model.__dict__
+
+
 # --------------------------------------------------------------------------
 # The side chain and its controller
 # --------------------------------------------------------------------------
@@ -226,6 +251,8 @@ class ContextKvFork:
         self.early_fc_on = False
         #: ``windowed_commit_parallel``'s MIN_REQUESTS for the windowed commit, or None.
         self.parallel_min_requests: Optional[int] = None
+        #: ``context_kv_late_join``: the prepare may leave the join to the drafter (``defer_join``).
+        self.late_join_on = False
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
         self.declined: Optional[Callable[..., None]] = None
 
@@ -334,6 +361,35 @@ class ContextKvFork:
             )
         main.wait_stream(self.stream)
         self._launched = None
+
+    def defer_join(self, launched: Launched) -> bool:
+        """Leave the join of ``launched`` to the drafter's block decode; True when deferred.
+
+        Only with ``context_kv_late_join`` on, and only when nothing on the main stream
+        between the prepare's end and the drafter's first block attention reads what
+        the side stream writes: not when the worker's window compaction follows the
+        join (``compacts_after_join``: it runs on the main stream right after it), and
+        only when the drafter forward is the windowed block decode, which takes the
+        pending join before its first read. Before that attention the drafter runs its
+        first input norm, the attention convolution's ``prepare``, the QKV projection
+        and the QK-norm + RoPE of the block's own rows, none of which reads the arena,
+        ``_ctx_len``, ``_ctx_base`` or the lengths the commit returns, so they run while
+        the commit is still on the side stream.
+        """
+        if not self.late_join_on or compacts_after_join(self.worker):
+            return False
+        from ..drafter_block_decode import block_decode as _draft
+
+        drafter = self.draft_model
+        bound = drafter.__dict__.get("dflash_forward")
+        if getattr(bound, "__func__", None) is not _draft.windowed_block_decode:
+            return False
+        if "_kv_pending_join" in drafter.__dict__:
+            raise RuntimeError(
+                "[musespark_open] context_kv_fork: a deferred join of the previous step is still pending"
+            )
+        drafter._kv_pending_join = (self, launched)
+        return True
 
     def commit(self, launched: Launched, slots, num_accepted) -> Optional[torch.Tensor]:
         """Zero a dense arena's masked rows and commit the context on the side stream.
@@ -462,6 +518,9 @@ class ContextKvFork:
     def settle(self) -> None:
         """Forget an armed step and join a side chain a failed step left behind.
 
+        A join a prepare deferred to the drafter (``defer_join``) that no drafter
+        forward took is dropped here as well: the side chain is then joined below.
+
         A chain forked in another capture state is not joined (it cannot be
         waited for from here); the next fork waits for the main stream and the
         next join for the side stream, so its writes stay ordered before the
@@ -470,6 +529,8 @@ class ContextKvFork:
         launched, self._launched = self._launched, None
         self._armed = None
         self._early = None
+        if self.draft_model is not None:
+            self.draft_model.__dict__.pop("_kv_pending_join", None)
         if launched is not None and current_capture_id() == launched.capture:
             torch.cuda.current_stream().wait_stream(self.stream)
 
@@ -932,7 +993,8 @@ class ContextKvForkDFlashWorker(DFlashWorker):
         noise_embed_2d = embed_mask.expand(num_gens, block_size, -1).clone()
         noise_embed_2d[:, 0, :] = embed_bonus
 
-        fork.join(launched)
+        if num_ctx_per_req_t is None or not fork.defer_join(launched):
+            fork.join(launched)
         rows = fork.rows[:num_gens]
         if num_ctx_per_req_t is None:
             num_ctx_per_req_t = self._settle_context(slots, rows)
@@ -1050,6 +1112,7 @@ def install(
     side_chain: bool = False,
     early_fc: bool = False,
     parallel_min_requests: Optional[int] = None,
+    late_join: bool = False,
     declined: Optional[Callable[..., None]] = None,
 ) -> None:
     """Install the fork on the DFlash worker, the target core and the LM head (``POINT``).
@@ -1059,8 +1122,8 @@ def install(
     repeated install keeps the fork and its stream and takes the current
     drafter and lever settings: ``side_chain`` (``drafter_kv_side_chain``),
     ``early_fc`` (``drafter_fc_early_fork``), ``parallel_min_requests``
-    (``windowed_commit_parallel``'s MIN_REQUESTS, None for off) and ``declined``
-    (``dispatch.Plan.declined``).
+    (``windowed_commit_parallel``'s MIN_REQUESTS, None for off), ``late_join``
+    (``context_kv_late_join``) and ``declined`` (``dispatch.Plan.declined``).
 
     Raises:
         ValueError: if the fork cannot be installed (the reason), so the
@@ -1085,6 +1148,7 @@ def install(
     fork.side_chain_on = bool(side_chain)
     fork.early_fc_on = bool(side_chain and early_fc)
     fork.parallel_min_requests = parallel_min_requests
+    fork.late_join_on = bool(late_join)
     fork.declined = declined
     core._context_kv_fork = fork
     if point == "head":

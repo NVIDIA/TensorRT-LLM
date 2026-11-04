@@ -22,6 +22,15 @@ DFlash K = 7 verify width), one table per GPU:
 Row counts and windows not listed, and tuning passes, keep the autotuner. A GPU without a
 table is not supported.
 
+The lever ``l061_tile32_pin``: the owner-only 64-expert window of the NVFP4 layers
+``hot_replicas`` leaves on the built-in path (0 and 61, experts quantized at load) at 256 to
+384 rows on sm107, ``owner_tactic``. There the autotuner's 256-row profile settles on 64-token
+tiles, whose FC1 runs slow on served routings; the lever pins a 32-token tile
+(``L061_TILE32_DEFAULT``). Every expert row is
+bitwise the autotuned tactics' whose FC2 has the same MMA K; the 64-token tactic's FC2 MMA K
+can differ from the pinned tactic's, and then a rare row can round differently in its last
+place.
+
 The config index is an index into the TRTLLM-gen MoE runner's list of (FC1, FC2) kernel
 pairs for one tile N, built from the kernels the running GPU loads, so an entry is only
 meaningful for the GPU and kernel library it was measured on; ``fixed_tactic`` also
@@ -60,6 +69,34 @@ SM103_TACTICS: Dict[Tuple[int, int], Tuple[int, int]] = {
 }
 
 _TABLES = {(10, 3): SM103_TACTICS, (10, 7): SM107_TACTICS}
+
+#: The owner window the pin serves and the decode rows it pins (32 to 48 requests at K = 7).
+L061_WINDOW = 64
+L061_ROWS = frozenset(range(256, 385, 8))
+#: The pinned tactic by default: the hot path's 32-token tile (``_TILE32_DECODE``).
+L061_TILE32_DEFAULT = _TILE32_DECODE
+
+
+def owner_tactic(
+    device: torch.device,
+    pinned: Optional[Tuple[int, int]],
+    act_type: int,
+    top_k: int,
+    hidden: int,
+    intermediate: int,
+    window: int,
+    rows: int,
+) -> Optional[List[int]]:
+    """The pinned ``[tile_n, config]`` of an owner-window expert call of a layer the hot path
+    leaves, or None to leave it to the autotuner: sm107 only, the SwiGLU expert, the
+    ``L061_WINDOW`` window at ``L061_ROWS`` rows, and a valid config of the call's shape."""
+    if pinned is None or act_type != 0 or window != L061_WINDOW or rows not in L061_ROWS:
+        return None
+    if tuple(torch.cuda.get_device_capability(device)) != (10, 7):
+        return None
+    if tuple(pinned) not in _valid(act_type, top_k, hidden, intermediate, window, rows):
+        return None
+    return list(pinned)
 
 
 def table_for(capability: Tuple[int, int]) -> Dict[Tuple[int, int], Tuple[int, int]]:

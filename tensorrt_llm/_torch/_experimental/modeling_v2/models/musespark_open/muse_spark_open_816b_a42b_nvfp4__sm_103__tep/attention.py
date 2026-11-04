@@ -124,6 +124,9 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
     #: An instance attribute, not a call keyword: a replay runs the attention op from its
     #: captured arguments without running ``forward``.
     _zero_padded_rows: bool = False
+    #: Set on the instance by ``layers.adopt_model`` under ``context_prep_rows_vec``: a
+    #: ``context_prep`` call takes the op's vectorized rows kernel (``row_vec``).
+    _context_prep_row_vec: bool = False
 
     @classmethod
     def adopt(cls, attention: MuseSparkOpenAttention) -> "MuseSparkOpenTepAttention":
@@ -218,15 +221,17 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
 
     def preprocess_qkv(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]):
         op = self._preattn_prep
+        row_vec = False
         if op is not None:
             fits = self._fits_preattn_prep(qkv, position_ids)
         else:
             op = self._context_prep
             fits = op is not None and self._fits_context_prep(qkv, position_ids)
+            row_vec = self._context_prep_row_vec
         if not fits:
             return super().preprocess_qkv(qkv, position_ids)
         rope = not self.skip_rope
-        qkv_out, gate = op(
+        args = (
             qkv,
             self.rotary_emb.rotary_cos_sin if rope else None,
             position_ids if rope else None,
@@ -237,6 +242,7 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
             self._qkv_layout_inverse is not None,
             LAUNCH_PDL,
         )
+        qkv_out, gate = op(*args, row_vec=True) if row_vec else op(*args)
         return qkv_out, None, None, gate
 
     def _fits_preattn_prep(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]) -> bool:
