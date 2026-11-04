@@ -1352,10 +1352,11 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
     assert manager.provides_cold_page_codec
     assert not manager.uses_iteration_lifecycle
     assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
+    # The estimation KVCM gets the provider too: it reads the window and builds no codec.
     _, estimation_creator = build(estimating=True)
-    assert (
-        estimation_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
-        is None
+    assert isinstance(
+        estimation_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"],
+        Nvfp4ColdPageQuantizationCompression,
     )
     _, skip_est_creator = build(estimating=True, skip_est=True)
     assert isinstance(
@@ -1371,17 +1372,6 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         active_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"] is None
     )
     log.assert_called_once()
-
-
-def test_mixed_precision_high_window_keeps_the_cold_manager_during_estimation(monkeypatch) -> None:
-    """The estimation KVCM needs the window to build the mixed-precision high layer group."""
-    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
-    config = ColdPageQuantizationCompressionConfig(mixed_precision_last_n=64)
-    _, creator = _build_cold_creator(config, estimating=True)
-    provider = creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
-    assert isinstance(provider, Nvfp4ColdPageQuantizationCompression)
-    assert provider.mixed_precision_high_window == (0, 64)
-    assert not provider.uses_iteration_lifecycle
 
 
 def test_mixed_precision_high_window_comes_from_the_config() -> None:

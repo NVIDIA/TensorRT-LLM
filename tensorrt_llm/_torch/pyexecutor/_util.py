@@ -3450,7 +3450,6 @@ class KvCacheCreator:
             compression_config,
             model_engine=self._model_engine,
             kv_cache_config=self_kv_cache_config,
-            estimating_kv_cache=estimating_kv_cache and not self._skip_est,
         )
         cold_page_codec_provider = (
             compression_manager if compression_manager is not None
@@ -4184,7 +4183,6 @@ def create_kv_cache_compression_manager(
     *,
     model_engine: ModelEngine,
     kv_cache_config: KvCacheConfig,
-    estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
     """Validate, select, and construct the configured manager before KVCM."""
     if config is None:
@@ -4198,10 +4196,6 @@ def create_kv_cache_compression_manager(
         if config.quant != "nvfp4":
             raise NotImplementedError(
                 f"Unsupported cold-page quantization format {config.quant!r}")
-        # The estimation run needs the window: the high layer group and its staging
-        # copy must be part of the measured memory.
-        if estimating_kv_cache and config.mixed_precision_high_window is None:
-            return None
         quant_config = model_engine.model.model_config.quant_config
         if (quant_config is not None and getattr(
                 quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4):
