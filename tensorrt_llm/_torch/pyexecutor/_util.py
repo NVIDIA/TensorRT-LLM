@@ -5117,12 +5117,6 @@ def instantiate_sampler(
         if isinstance(sampler, SpecSampler):
             if runtime_hooks.spec_step_fold is not None:
                 sampler.bind_spec_step_fold(runtime_hooks.spec_step_fold)
-            sampler.d2h_side_stream_copies = runtime_hooks.sampler_d2h_side_stream
-            sampler.static_slot_ids = runtime_hooks.spec_small_h2d
-            if runtime_hooks.sampler_d2h_side_stream:
-                logger.info(
-                    "[M3 host] spec sampler store copies on the D2H side stream"
-                )
         return sampler
 
     if mm_encoder_only:

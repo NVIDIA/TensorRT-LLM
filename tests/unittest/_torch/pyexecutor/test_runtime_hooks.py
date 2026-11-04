@@ -24,7 +24,6 @@ import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     ExecutorEvents,
-    MsaRuntimePolicy,
     RuntimeHooks,
     runtime_hooks_of,
 )
@@ -753,7 +752,9 @@ class _M3PlainModel(torch.nn.Module):
 
 
 class _M3ClassHooksModel(torch.nn.Module):
-    runtime_hooks = RuntimeHooks(loop_on_execution_stream=True, skip_unchanged_h2d=True)
+    runtime_hooks = RuntimeHooks(
+        loop_on_execution_stream=True, merge_tuned_tactics_across_ranks=True
+    )
 
 
 def test_m3_model_without_hooks_gets_the_all_off_default():
@@ -761,17 +762,11 @@ def test_m3_model_without_hooks_gets_the_all_off_default():
 
     assert hooks is DEFAULT_RUNTIME_HOOKS
     assert hooks == RuntimeHooks()
-    assert not hooks.skip_unchanged_h2d
     assert not hooks.loop_on_execution_stream
     assert not hooks.merge_tuned_tactics_across_ranks
-    assert not hooks.skip_greedy_rng_upload
     assert hooks.spec_step_fold is None
-    assert hooks.msa == MsaRuntimePolicy()
-    assert not hooks.msa.short_sequence_identity
-    assert hooks.msa.kv_update is None
-    assert not hooks.msa.skip_unchanged_block_offsets
-    assert not hooks.msa.stage_tables_on_host
-    assert not hooks.msa.reuse_pool_views
+    assert hooks.decode_prologue is None
+    assert hooks.executor_events is None
 
 
 def test_m3_hooks_declared_as_none_mean_the_default():
@@ -788,10 +783,7 @@ def test_m3_class_attribute_hooks_are_returned_as_declared():
 
 
 def test_m3_instance_attribute_hooks_are_returned_as_declared():
-    hooks = RuntimeHooks(
-        loop_on_execution_stream=True,
-        msa=MsaRuntimePolicy(short_sequence_identity=True, reuse_pool_views=True),
-    )
+    hooks = RuntimeHooks(loop_on_execution_stream=True, merge_tuned_tactics_across_ranks=True)
     model = _M3PlainModel()
     model.runtime_hooks = hooks
 
@@ -799,7 +791,7 @@ def test_m3_instance_attribute_hooks_are_returned_as_declared():
 
 
 def test_m3_instance_attribute_overrides_class_attribute():
-    hooks = RuntimeHooks(skip_greedy_rng_upload=True)
+    hooks = RuntimeHooks(merge_tuned_tactics_across_ranks=True)
     model = _M3ClassHooksModel()
     model.runtime_hooks = hooks
 
@@ -808,8 +800,8 @@ def test_m3_instance_attribute_overrides_class_attribute():
 
 @pytest.mark.parametrize(
     "declared",
-    [True, {"loop_on_execution_stream": True}, MsaRuntimePolicy(), "RuntimeHooks()"],
-    ids=["bool", "dict", "msa_policy", "str"],
+    [True, {"loop_on_execution_stream": True}, object(), "RuntimeHooks()"],
+    ids=["bool", "dict", "object", "str"],
 )
 def test_m3_hooks_of_the_wrong_type_raise(declared):
     model = _M3PlainModel()
@@ -824,22 +816,6 @@ def test_m3_hooks_are_immutable_once_declared():
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         hooks.loop_on_execution_stream = True
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        hooks.msa.reuse_pool_views = True
-
-
-@pytest.mark.parametrize(
-    "hooks, skips",
-    [
-        (RuntimeHooks(), False),
-        (RuntimeHooks(loop_on_execution_stream=True, skip_greedy_rng_upload=True), False),
-        (RuntimeHooks(skip_unchanged_h2d=True), True),
-        (RuntimeHooks(msa=MsaRuntimePolicy(skip_unchanged_block_offsets=True)), True),
-    ],
-    ids=["default", "no_skip_of_metadata", "h2d_skip", "msa_block_offset_skip"],
-)
-def test_m3_every_metadata_upload_skip_asks_for_private_metadata_buffers(hooks, skips):
-    assert hooks.skips_unchanged_metadata_uploads is skips
 
 
 @pytest.mark.parametrize(

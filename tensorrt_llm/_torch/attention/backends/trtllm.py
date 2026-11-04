@@ -187,9 +187,10 @@ class HelixMlaChunkPlan:
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
-    # Skip metadata uploads whose destination already holds the values (RuntimeHooks.skip_unchanged_uploads). Sound
-    # only while no other engine writes these buffers, so the engine then gives its graph metadata private buffers.
-    skip_unchanged_uploads: bool = field(default=False, init=False, repr=False)
+    # Whether this metadata's skippable uploads (_upload_metadata) skip values their destination already holds.
+    # Sound only while no other engine writes these buffers: an engine whose metadata class sets it gives its CUDA
+    # graph metadata private buffers. A metadata class that owns every writer of its buffers sets it.
+    skips_unchanged_uploads: ClassVar[bool] = False
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
@@ -451,16 +452,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
-        # What the skippable uploads last wrote (used only with skip_unchanged_uploads). One record set per engine:
-        # CUDA graph metadata is a shallow copy that shares it, since the copies write the same buffers.
+        self._ensure_upload_records()
+        self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _ensure_upload_records(self) -> None:
+        """What the skippable uploads last wrote (used only with skips_unchanged_uploads). One record set per
+        engine: CUDA graph metadata is a shallow copy that re-runs __post_init__ and shares it, since the copies of
+        different batch sizes write the same graph-metadata buffers."""
         if getattr(self, "_upload_records", None) is None:
             self._upload_records = device_copy.UploadRecords()
-        self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    @classmethod
+    def short_long_seq_len_threshold(
+            cls,
+            sparse_attention_config,
+            tokens_per_gen_step: int = 0) -> Optional[int]:
+        """The total sequence length splitting this metadata's decode CUDA graphs into short and long families, or
+        None for one family. A metadata class whose prepare() stages different work for short contexts sets it;
+        ``tokens_per_gen_step`` is the headroom for the in-flight step's tokens the graph key cannot see."""
+        return None
 
     def _upload_metadata(self, site: CopySiteEnum, dst: torch.Tensor,
                          src: torch.Tensor) -> bool:
         """A host-to-device metadata upload, skipped when unchanged if the model opted in; True if issued."""
-        if self.skip_unchanged_uploads:
+        if self.skips_unchanged_uploads:
             return self._upload_records.copy(site, dst, src)
         return device_copy.copy(site, dst, src)
 

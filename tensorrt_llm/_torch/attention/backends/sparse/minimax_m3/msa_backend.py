@@ -32,7 +32,7 @@ load this module, so trtllm's import chain does not come back here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple, Optional, Tuple
+from typing import ClassVar, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -40,7 +40,6 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import device_copy
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
@@ -53,6 +52,7 @@ from .common import (
     build_paged_kv_slot_mapping,
     write_kv_slots,
 )
+from .kernels import msa_kv_update as _kv_update_kernel
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
@@ -198,11 +198,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
-    # Decode-step preparation the model opted into (RuntimeHooks.msa).
-    msa_policy: MsaRuntimePolicy = MsaRuntimePolicy()
-    # Short-sequence steps (MsaRuntimePolicy.short_sequence_identity): every query token has at most topk valid
-    # blocks, so the selection is the identity table [kv_heads, tokens, topk] = (i < n_valid ? i : -1), staged here
-    # by prepare(). _msa_short_ok says whether this step staged it.
+    # MSA's uploads skip values their destination already holds (TrtllmAttentionMetadata.skips_unchanged_uploads):
+    # every MSA metadata buffer is written only by this metadata's own uploads, and the engine gives the CUDA graph
+    # metadata private buffers when this is set.
+    skips_unchanged_uploads: ClassVar[bool] = True
+    # Short-sequence decode-only steps: every query token has at most topk valid blocks, so its selection is all of
+    # them, the identity table [kv_heads, tokens, topk] = (i < n_valid ? i : -1), staged here by prepare() and read
+    # by run_indexer (and any decode kernel that takes the selection from the metadata). _msa_short_ok says whether
+    # this step staged it. Because a captured decode graph bakes that choice in, the engine keys decode graphs by
+    # short and long contexts (short_long_seq_len_threshold).
     msa_short_table: Optional[torch.Tensor] = None
     _msa_short_ok: bool = False
     # The same page table and lengths as msa_kv_indices / msa_kv_lens, in the
@@ -277,11 +281,35 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def _skip_records(self) -> Optional[device_copy.UploadRecords]:
-        """The upload records when unchanged uploads are skipped (RuntimeHooks.skip_unchanged_uploads), else None."""
-        return self._upload_records if self.skip_unchanged_uploads else None
+        """The upload records when unchanged uploads are skipped (skips_unchanged_uploads), else None."""
+        return self._upload_records if self.skips_unchanged_uploads else None
+
+    @classmethod
+    def short_long_seq_len_threshold(
+        cls, sparse_attention_config, tokens_per_gen_step: int = 0
+    ) -> Optional[int]:
+        """The total sequence length that splits the short and long decode graph families: the top-k blocks'
+        token span, within which a decode step selects every valid block (see msa_short_table), less
+        ``tokens_per_gen_step``. The short family runs the identity selection, so every token it attends must fit in
+        the top-k blocks; the graph key estimates a sequence's length from host token counts, which under the overlap
+        scheduler miss up to the in-flight step's accepted tokens."""
+        topk = getattr(sparse_attention_config, "sparse_topk_blocks", None)
+        block = getattr(sparse_attention_config, "sparse_block_size", None)
+        if topk is None or block is None:
+            return None
+        return int(topk) * int(block) - tokens_per_gen_step
+
+    def _arm_kv_cache_manager(self) -> None:
+        """Let the MiniMax-M3 KV cache manager skip unchanged block-offset gathers into this metadata's buffers: like
+        the uploads, sound because the engine keeps this metadata's CUDA graph buffers private."""
+        if self.skips_unchanged_uploads and hasattr(
+            self.kv_cache_manager, "skip_unchanged_block_offsets"
+        ):
+            self.kv_cache_manager.skip_unchanged_block_offsets = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self._arm_kv_cache_manager()
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         self._create_msa_buffers()
@@ -730,11 +758,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _stage_msa_short_table(self, n_valid: torch.Tensor, params) -> None:
         """Stage the identity block table for short-sequence steps (see msa_short_table)."""
         self._msa_short_ok = False
-        if (
-            not self.msa_policy.short_sequence_identity
-            or n_valid.numel() == 0
-            or self.num_contexts > 0
-        ):
+        if n_valid.numel() == 0 or self.num_contexts > 0:
             return
         topk = int(MSA_REQUIRED_TOPK)
         if int(n_valid.max()) > topk:
@@ -983,8 +1007,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             if self._msa_prefill_n_valid_blocks is not None
             else self.msa_n_valid_blocks
         )
-        kv_update = self.msa_policy.kv_update
-        if kv_update is not None and kv_update(
+        if _kv_update_kernel.msa_kv_update(
             self.kv_lens_cuda,
             self.msa_kv_lens_staged,
             self.seq_lens_cuda,
@@ -1135,8 +1158,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         total_q = int(n_valid_host.shape[0])
         short_prefill = (
-            self.msa_policy.short_sequence_identity
-            and self._msa_decode_span is None
+            self._msa_decode_span is None
             and total_q > 0
             and int(n_valid_host.max()) <= int(params.topk)
         )
@@ -1231,7 +1253,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             qo_offset_cpu=qo_offset_cpu,
             device=cache_device,
             # Only out_cache_loc and the host block ids are read here; stage the slots straight from the host.
-            device_tables=not self.msa_policy.stage_tables_on_host,
+            device_tables=False,
         )
         out_cache_loc = mapping.out_cache_loc
         # Only fmha_sm100 reads the flattened page table (the decode kernels
@@ -1310,7 +1332,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 self.msa_block_table[:batch_size, :block_table_cols],
                 block_table_host,
             )
-        stage_on_host = self.msa_policy.stage_tables_on_host
         device_copy.copy(
             MsaCopySite.SEQ_LENS,
             self.msa_seq_lens_cuda[:batch_size],
@@ -1318,37 +1339,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         if self.msa_cu_q_lens is not None:
             self._msa_live_batch = batch_size
-            qo_lens_cuda = self.msa_qo_lens_cuda[:batch_size]
-            if stage_on_host:
-                # Both prefix sums from the host lengths (the values the device scans would give), staged with
-                # their leading zero: copies instead of zero / scan kernels between the decode graphs.
-                # Never skipped (pool-shared CUDA graph metadata; see _stage_msa_short_table).
-                device_copy.copy(MsaCopySite.QO_LENS, qo_lens_cuda, qo_lens_cpu)
-                device_copy.copy(
-                    MsaCopySite.CU_Q_LENS,
-                    self.msa_cu_q_lens[: batch_size + 1],
-                    _host_prefix_sum(qo_lens_cpu, self.msa_cu_q_lens.dtype),
-                )
-                # on_update_kv_lens rewrites this buffer on the device, so it is never skipped.
-                device_copy.copy(
-                    MsaCopySite.CU_KV_LENS,
-                    self.msa_cu_kv_lens[: batch_size + 1],
-                    _host_prefix_sum(kv_lens_cpu, self.msa_cu_kv_lens.dtype),
-                )
-            else:
-                self.msa_cu_q_lens[0].zero_()
-                self.msa_cu_kv_lens[0].zero_()
-                qo_lens_cuda.copy_(qo_lens_cpu, non_blocking=True)
-                torch.cumsum(
-                    qo_lens_cuda,
-                    0,
-                    out=self.msa_cu_q_lens[1 : batch_size + 1],
-                )
-                torch.cumsum(
-                    self.msa_seq_lens_cuda[:batch_size],
-                    0,
-                    out=self.msa_cu_kv_lens[1 : batch_size + 1],
-                )
+            # Both prefix sums from the host lengths (the values device scans of the staged lengths would give),
+            # staged with their leading zero: copies instead of zero / scan kernels between the decode graphs.
+            # Never skipped (pool-shared CUDA graph metadata; see _stage_msa_short_table).
+            device_copy.copy(MsaCopySite.QO_LENS, self.msa_qo_lens_cuda[:batch_size], qo_lens_cpu)
+            device_copy.copy(
+                MsaCopySite.CU_Q_LENS,
+                self.msa_cu_q_lens[: batch_size + 1],
+                _host_prefix_sum(qo_lens_cpu, self.msa_cu_q_lens.dtype),
+            )
+            # on_update_kv_lens rewrites this buffer on the device, so it is never skipped.
+            device_copy.copy(
+                MsaCopySite.CU_KV_LENS,
+                self.msa_cu_kv_lens[: batch_size + 1],
+                _host_prefix_sum(kv_lens_cpu, self.msa_cu_kv_lens.dtype),
+            )
             self._msa_max_q_len = int(qo_lens_cpu.max().item())
             self._msa_max_kv_len_all = int(kv_lens_cpu.max().item())
             self._msa_total_k = int(kv_lens_cpu.to(torch.int64).sum().item())
@@ -1732,6 +1737,20 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             # Short pure-prefill step: every token selects all its valid blocks (staged once per step).
             num_kv_heads = int(self.indexer.config.num_kv_heads)
             return identity.unsqueeze(1).expand(num_tokens, num_kv_heads, int(identity.shape[1]))
+        if (
+            span is not None
+            and span.row_first == 0
+            and metadata._msa_short_ok
+            and metadata.msa_short_table is not None
+        ):
+            # Short decode-only step: the same identity selection, from the table prepare() staged (identical for
+            # every KV head). The step's graph family is keyed by it (short_long_seq_len_threshold).
+            num_kv_heads = int(self.indexer.config.num_kv_heads)
+            topk = int(MSA_REQUIRED_TOPK)
+            table = metadata.msa_short_table[: num_kv_heads * num_tokens * topk].view(
+                num_kv_heads, num_tokens, topk
+            )
+            return table[0].unsqueeze(1).expand(num_tokens, num_kv_heads, topk)
         block_table = None
         seq_lens_cuda = None
         decode_query_len = None

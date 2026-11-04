@@ -64,7 +64,6 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     BaseSparseAttentionConfig,
-    MiniMaxM3SparseAttentionConfig,
     PrefillCudaGraphBackend,
     SeqLenAwareSparseAttentionConfig,
 )
@@ -485,7 +484,10 @@ class DecoderRunner(ScheduledModelRunner):
             dist=self._dist,
             sparse_attention_config=self._sparse_attention_config,
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
-            private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
+            # A metadata class that skips unchanged uploads is sound only while no other engine writes its buffers.
+            private_metadata_buffers=getattr(
+                self._config.attention_backend.Metadata, "skips_unchanged_uploads", False
+            ),
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
@@ -504,13 +506,12 @@ class DecoderRunner(ScheduledModelRunner):
     def _short_long_seq_len_threshold(self) -> int | None:
         """The total sequence length that splits the short and long decode graph families, or None for one family.
 
-        Set by a sparse attention config that asks for the split, or by a model whose MSA
-        policy stages identity selections for short sequences: a sequence within the
-        top-k blocks attends every valid block. The short family runs the identity selection,
-        so every token it attends must fit in the top-k blocks. The graph key estimates a
-        sequence's length from host token counts, which under the overlap scheduler miss up to
-        the in-flight step's accepted tokens; the identity threshold leaves one generation
-        step's tokens of headroom for that.
+        Set by a sparse attention config that asks for the split, or by the attention metadata
+        class when its prepare() stages different work for short contexts (MiniMax-M3 MSA's
+        identity selection: a sequence within the top-k blocks attends every valid block). The graph
+        key estimates a sequence's length from host token counts, which under the overlap scheduler
+        miss up to the in-flight step's accepted tokens, so the class is given one generation step's
+        tokens of headroom.
         """
         sparse_config = self._sparse_attention_config
         if (
@@ -518,15 +519,15 @@ class DecoderRunner(ScheduledModelRunner):
             and sparse_config.needs_separate_short_long_cuda_graphs()
         ):
             return sparse_config.seq_len_threshold
-        if self.runtime_hooks.msa.short_sequence_identity:
-            if not isinstance(sparse_config, MiniMaxM3SparseAttentionConfig):
-                raise ValueError(
-                    "MsaRuntimePolicy.short_sequence_identity requires a MiniMax-M3 sparse "
-                    f"attention config, got {type(sparse_config).__name__}"
-                )
-            topk_span = sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
-            return topk_span - self._get_runtime_tokens_per_gen_step(self._config.max_draft_len)
-        return None
+        threshold = getattr(
+            self._config.attention_backend.Metadata, "short_long_seq_len_threshold", None
+        )
+        if threshold is None:
+            return None
+        return threshold(
+            sparse_config,
+            tokens_per_gen_step=self._get_runtime_tokens_per_gen_step(self._config.max_draft_len),
+        )
 
     def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
         if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:

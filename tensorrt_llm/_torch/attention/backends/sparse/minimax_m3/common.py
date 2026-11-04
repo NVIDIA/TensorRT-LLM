@@ -48,10 +48,9 @@ class MsaCopySite(CopySiteEnum):
     # (uniform_subpages_per_slot > 0), only on a step whose copy was issued: a plan for such a pool that merges it must
     # also list it in flush_after, so that copy lands before that reader (which asserts it with expect_landed).
     BLOCK_TABLE = ("msa.block_table", Direction.H2D)
-    # Read on the device before the replay by the KV prefix-sum scan unless
-    # MsaRuntimePolicy.stage_tables_on_host: a plan without host staging must not merge it.
+    # MSA stages the KV prefix sums from the host lengths, so nothing reads this on the device before the replay.
     SEQ_LENS = ("msa.seq_lens", Direction.H2D)
-    # Host-staged query lengths and query / KV prefix sums (MsaRuntimePolicy.stage_tables_on_host).
+    # Host-staged query lengths and query / KV prefix sums.
     QO_LENS = ("msa.qo_lens", Direction.H2D)
     CU_Q_LENS = ("msa.cu_q_lens", Direction.H2D)
     CU_KV_LENS = ("msa.cu_kv_lens", Direction.H2D)

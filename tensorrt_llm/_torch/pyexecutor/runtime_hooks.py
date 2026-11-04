@@ -4,8 +4,8 @@
 
 A model declares its hooks as ``runtime_hooks`` (an instance attribute or a class
 attribute). Every field defaults to off, and a model that declares nothing gets
-``RuntimeHooks()``: the step loop, the samplers and the attention metadata then
-run exactly as they do without this module.
+``RuntimeHooks()``: the step loop and the samplers then run exactly as they do
+without this module.
 
 The hooks change *where* and *how* the step loop moves data, never what a
 forward computes. Each one is armed only by a model that has measured it on its
@@ -15,7 +15,7 @@ own deployment; none is a general default.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 if TYPE_CHECKING:
     import torch
@@ -97,59 +97,6 @@ class SpecStepFold(Protocol):
         """
 
 
-class MsaKvUpdate(Protocol):
-    """Advance the MSA decode kernels' per-request state after the KV lengths moved.
-
-    Called by ``MiniMaxM3MsaSparseAttentionMetadata.on_update_kv_lens`` with the
-    metadata's own buffers; recomputes the attended lengths, the new tokens'
-    cache slots and their valid-block counts in one launch, exactly as the
-    metadata's own update does. Returns False, having written nothing, when it
-    cannot take the step.
-    """
-
-    def __call__(
-        self,
-        kv_lens: "torch.Tensor",
-        kv_lens_staged: "torch.Tensor",
-        seq_lens: "torch.Tensor",
-        q_batch_row: "torch.Tensor",
-        q_intra: "torch.Tensor",
-        block_table: "torch.Tensor",
-        tokens_per_block: int,
-        batch: int,
-        total_q: int,
-        msa_seq_lens: "torch.Tensor",
-        cu_kv_lens: Optional["torch.Tensor"],
-        out_cache_loc: "torch.Tensor",
-        n_valid_blocks: Optional["torch.Tensor"],
-    ) -> bool: ...
-
-
-@dataclass(frozen=True)
-class MsaRuntimePolicy:
-    """MiniMax-M3 MSA metadata preparation a model may opt into.
-
-    Every option changes how a step's selection and cache-write tables reach
-    the device, not which blocks are attended.
-    """
-
-    # A step whose every query token has at most top-k valid blocks attends all
-    # of them, so its selection is the identity table: prepare stages that table
-    # instead of a scoring plan, and decode CUDA graphs are keyed by short and
-    # long contexts.
-    short_sequence_identity: bool = False
-    # The model's one-launch replacement for the update after the KV lengths move.
-    kv_update: Optional[MsaKvUpdate] = None
-    # Skip a block-table copy whose inputs equal the previous step's.
-    skip_unchanged_block_offsets: bool = False
-    # Build the decode step's slot table, page table and query/KV prefix sums on the host and stage them as copies,
-    # instead of filling them with device gathers, zero fills and scans between the decode graphs. The copies are
-    # MSA copy sites (MsaCopySite): merged as the model's CopyPlan says, skipped when unchanged with skip_unchanged_h2d.
-    stage_tables_on_host: bool = False
-    # Build each KV pool view once per pool geometry instead of on every attention call.
-    reuse_pool_views: bool = False
-
-
 class DecodePrologue(Protocol):
     """Replaces the decode step's input prologue with one launch.
 
@@ -163,6 +110,23 @@ class DecodePrologue(Protocol):
         self, preparer: Any, inputs: Any, *, enable_spec_decode: bool, runtime_draft_len: int
     ) -> bool:
         """``preparer`` is the ``DecoderInputPreparer`` running the step's preprocessing."""
+
+
+class SpecOffsetsOp(Protocol):
+    """Applies the overlap scheduler's speculative step correction in one launch.
+
+    Called on a step's generation rows with ``positions += position_offsets`` and
+    ``kv_lens += kv_lens_offsets`` to do (int32 adds). Returns False, having written
+    nothing, to decline; the two in-tree adds then run.
+    """
+
+    def __call__(
+        self,
+        positions: "torch.Tensor",
+        position_offsets: "torch.Tensor",
+        kv_lens: "torch.Tensor",
+        kv_lens_offsets: "torch.Tensor",
+    ) -> bool: ...
 
 
 class ExecutorEvents(Protocol):
@@ -182,24 +146,14 @@ class ExecutorEvents(Protocol):
 class RuntimeHooks:
     """The step-loop hooks a model opts into. All off by default.
 
-    When the per-step copies land (merged up to a barrier) is the model's ``CopyPlan`` (``device_copy``), not a hook;
-    whether an unchanged upload is skipped is decided by each buffer's owner, which the hooks below turn on.
+    When the per-step copies land (merged up to a barrier) is the model's ``CopyPlan`` (``device_copy``), not a hook.
+    Behaviour that belongs to a component (whether an attention backend skips unchanged uploads, how MiniMax-M3's MSA
+    stages its tables) is that component's own, not a hook either.
     """
 
     decode_prologue: Optional[DecodePrologue] = None
     executor_events: Optional[ExecutorEvents] = None
-    # Skip host-to-device metadata copies whose values the destination already holds.
-    skip_unchanged_h2d: bool = False
-    # A speculative step under the overlap scheduler re-derives its KV-length metadata (on_update_kv_lens) once,
-    # after the forward's KV-length correction, instead of also before it: the first pass's device writes are all
-    # rewritten by the second.
-    kv_lens_update_once: bool = False
-    # The overlap scheduler's speculative step correction (position_ids += position offsets, kv_lens += KV-length
-    # offsets) as the model's one launch, called as ``op(positions, position_offsets, kv_lens, kv_lens_offsets)`` on the
-    # generation rows; it returns False to decline (the two in-tree adds run).
-    spec_offsets_op: Optional[
-        Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], bool]
-    ] = None
+    spec_offsets_op: Optional[SpecOffsetsOp] = None
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False
@@ -218,33 +172,12 @@ class RuntimeHooks:
     mxfp8_pinned_tactics: bool = False
     # After warmup, log every CuTe DSL / Triton compile as a late compile (tensorrt_llm/_torch/late_compile.py).
     late_compile_detect: bool = False
-    # Skip the per-step Philox seed and offset uploads on all-greedy
-    # one-model speculative batches (the argmax path never reads them).
-    skip_greedy_rng_upload: bool = False
-    # The one-model speculative step's small per-step uploads: the accepted-draft
-    # counts join the step-input pack, and the spec sampler keeps its slot ids in
-    # a device buffer it re-uploads only when they change.
-    spec_small_h2d: bool = False
     # Speculative step-input staging folded into the forward (see SpecStepFold).
     spec_step_fold: Optional[SpecStepFold] = None
-    # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side
-    # stream, so those copies overlap the next step's input staging instead of preceding it.
-    sampler_d2h_side_stream: bool = False
     # Time the iteration log's device step with one timing event per iteration boundary, recorded on a side
     # stream that waits for the current stream, instead of an end and a start event back to back on the
     # current stream (the same instant, with no GPU work between them). The reported step times are unchanged.
     iteration_timing_one_event: bool = False
-    # MiniMax-M3 MSA metadata preparation.
-    msa: MsaRuntimePolicy = MsaRuntimePolicy()
-
-    @property
-    def skips_unchanged_metadata_uploads(self) -> bool:
-        """Whether a hook skips uploads into graph metadata buffers that already hold the values.
-
-        Such a skip is sound only while no other engine writes those buffers, so the engine
-        then gives its CUDA graph metadata a buffer pool of its own.
-        """
-        return self.skip_unchanged_h2d or self.msa.skip_unchanged_block_offsets
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()

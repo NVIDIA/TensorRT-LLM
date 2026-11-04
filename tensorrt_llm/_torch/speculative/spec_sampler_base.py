@@ -181,14 +181,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
     # The model's speculative step-input staging, when it opted into one (bind_spec_step_fold).
     spec_step_fold: Optional[SpecStepFold] = None
-    # Copy the store on the D2H side stream also on the steps a step fold's forward stored the rows, when the fold
-    # awaits the copies through its store_copies_done (RuntimeHooks.sampler_d2h_side_stream).
-    d2h_side_stream_copies: bool = False
-    # Keep the stored rows' slot ids in a device buffer re-uploaded only when they change
-    # (RuntimeHooks.spec_small_h2d).
-    static_slot_ids: bool = False
-    _slot_ids_host: Optional[list[int]] = None
-    _slot_ids_cuda: Optional[torch.Tensor] = None
+    # The slot ids of _scatter_to_stores, allocated on first use (_device_slot_ids). Only that method writes the
+    # buffer, so an upload equal to the last one is skipped; the stream orders each upload after the scatter that
+    # read the previous ids.
+    _slot_ids_buffer: Optional[DeviceCopyBuffer] = None
+    _slot_ids_capacity: int = 0
 
     SampleState = SampleStateSpec
 
@@ -352,6 +349,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
                 pin_memory=prefer_pinned(),
             )
+        self._slot_ids_capacity = seq_slots
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.
         self._store_copies_done: Optional[torch.cuda.Event] = None
@@ -365,23 +363,20 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         )
 
     def _device_slot_ids(self, seq_slots: list[int]) -> torch.Tensor:
-        """The slot ids on the device, uploaded only when they differ from the last upload.
-
-        The buffer is this sampler's own: only this method writes it, so the last uploaded
-        list describes its contents, and the stream orders each upload after the scatter that
-        read the previous ids.
-        """
+        """The slot ids on the store's device, uploaded only when they differ from the last upload (see
+        _slot_ids_buffer)."""
         n = len(seq_slots)
-        if self._slot_ids_cuda is None or self._slot_ids_cuda.numel() < n:
-            self._slot_ids_cuda = torch.empty(max(n, 8), dtype=torch.long, device="cuda")
-            self._slot_ids_host = None
-        if self._slot_ids_host != list(seq_slots):
-            self._slot_ids_cuda[:n].copy_(
-                torch.tensor(seq_slots, dtype=torch.long, pin_memory=prefer_pinned()),
-                non_blocking=True,
+        if self._slot_ids_buffer is None or self._slot_ids_buffer.tensor.numel() < n:
+            self._slot_ids_buffer = DeviceCopyBuffer(
+                torch.zeros(
+                    (max(self._slot_ids_capacity, n),),
+                    dtype=torch.long,
+                    device=self.store.new_tokens.device,
+                ),
+                pin_memory=prefer_pinned(),
             )
-            self._slot_ids_host = list(seq_slots)
-        return self._slot_ids_cuda[:n]
+        self._slot_ids_buffer.update(torch.tensor(seq_slots, dtype=torch.long))
+        return self._slot_ids_buffer.tensor[:n]
 
     def _copy_outputs_to_host(
         self,
@@ -398,12 +393,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         stream.
 
         When the forward stored the rows (a step fold), the next replay rewrites the store, so the copies stay on
-        the main stream unless the fold awaits them: with ``d2h_side_stream_copies`` and the fold's
-        ``store_copies_done``, that event is recorded on the side stream after the copies and the forward waits
-        on it before it writes the store.
+        the main stream unless the fold awaits them: a fold that exposes ``store_copies_done`` waits on that event
+        before every store write, so it is recorded on the side stream after the copies.
         """
         verify_lens = self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
-        fold_awaits_copies = self.d2h_side_stream_copies and store_copies_done is not None
+        fold_awaits_copies = store_copies_done is not None
         if self._async_worker_active() or (forward_stored_rows and not fold_awaits_copies):
             host = SampleStateTensorsSpec(
                 new_tokens=self._copy_to_host(self.store.new_tokens),
@@ -518,11 +512,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     ) -> None:
         """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
         num_sampling_requests = len(slots)
-        if self.static_slot_ids:
-            slots_device = self._device_slot_ids(slots)
-        else:
-            slots_device = torch.as_tensor(slots, dtype=torch.long)
-            slots_device = slots_device.to(device="cuda", non_blocking=True)
+        slots_device = self._device_slot_ids(slots)
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
