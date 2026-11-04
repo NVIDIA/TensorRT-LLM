@@ -215,18 +215,34 @@ def test_metrics_shadowing_order(live_snapshots):
     )
 
 
-def test_error_configurations(tmp_path):
-    expected = {
-        "llm_rl_and_runtime_control": (
-            "ValueError: Legacy RL control and runtime control endpoints cannot both be enabled."
-        ),
-        "mm_encoder_rl_control": "ValueError: RL control endpoints require AsyncLLM",
-        "embedding_runtime_control": (
-            "ValueError: Runtime control endpoints are not supported for embedding servers"
-        ),
+# The only configurations that fail at construction, with their exact errors.
+_ERROR_CONFIGURATIONS = {
+    "llm_rl_and_runtime_control": (
+        "ValueError: Legacy RL control and runtime control endpoints cannot both be enabled."
+    ),
+    "mm_encoder_rl_control": "ValueError: RL control endpoints require AsyncLLM",
+    "embedding_runtime_control": (
+        "ValueError: Runtime control endpoints are not supported for embedding servers"
+    ),
+}
+
+
+def test_valid_configurations_build(live_snapshots):
+    failing = {
+        name: snapshot.get("error")
+        for name, snapshot in live_snapshots.items()
+        if name not in _ERROR_CONFIGURATIONS and "routes" not in snapshot
     }
+    assert not failing, (
+        f"these configurations must build but fail at construction: {failing}. Only the "
+        "configurations in _ERROR_CONFIGURATIONS may fail, and a regenerated reference that "
+        "records the error does not change that."
+    )
+
+
+def test_error_configurations(tmp_path):
     by_name = {config.name: config for config in CONFIGS}
-    for name, message in expected.items():
+    for name, message in _ERROR_CONFIGURATIONS.items():
         snapshot = snapshot_config(by_name[name], tmp_path / name)
         assert snapshot.get("error") == message, (
             f"configuration '{name}' must fail at construction with exactly "
