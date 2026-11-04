@@ -834,7 +834,7 @@ def test_plain_dflash_block_decode_matches_full_attention_reference():
     assert diff < 0.02, f"plain DFlash parity failed: max abs diff {diff}"
 
 
-def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_size=32):
+def _paged_block_decode_inputs(drafter, captured, noise_embed, cache_dtype, page_size=32):
     """Block decode through the TRTLLM paged cache, one request per history.
 
     Pages are shuffled across requests, so only the block tables decide which
@@ -865,7 +865,7 @@ def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_si
             cache[pages, 0, :, offsets] = k[:, layer]
             cache[pages, 1, :, offsets] = v[:, layer]
     caches = [cache.to(cache_dtype) for cache in caches]
-    out = drafter.dflash_forward(
+    return dict(
         noise_embedding=torch.stack(noise_embed).to(dev, torch.bfloat16),
         query_positions=torch.stack([torch.arange(n, n + blk) for n in lengths]).to(dev),
         num_ctx_per_req=torch.tensor(lengths, device=dev),
@@ -875,23 +875,17 @@ def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_si
         ctx_kv_cache=caches,
         ctx_page_table=page_table,
     )
-    return out.float().cpu().view(len(lengths), blk, -1)
+
+
+def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_size=32):
+    inputs = _paged_block_decode_inputs(drafter, captured, noise_embed, cache_dtype, page_size)
+    out = drafter.dflash_forward(**inputs)
+    return out.float().cpu().view(len(captured), TINY["block_size"], -1)
 
 
 @needs_trtllm_gen
-@pytest.mark.parametrize(
-    "cache_dtype,tolerance",
-    [(torch.bfloat16, 0.02), (torch.float8_e4m3fn, 0.05)],
-    ids=["bf16", "fp8"],
-)
-def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype, tolerance):
-    """The TRTLLM non-causal block attention over a paged BF16 or FP8 cache
-    matches the eager reference for requests with different history lengths.
-
-    Each block query runs as its own one-token decode request over its
-    parent's pages, so a wrong table, length or block write shows up here.
-    An FP8 cache also takes the block's K/V and queries in FP8.
-    """
+def test_trtllm_paged_block_decode_matches_full_attention_reference():
+    """Folded BF16 block decode matches full attention over each request's pages."""
     weights = _tiny_weights()
     drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
     g = torch.Generator().manual_seed(44)
@@ -903,7 +897,7 @@ def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype,
         torch.randn(TINY["block_size"], TINY["hidden_size"], generator=g) * 0.5 for _ in lengths
     ]
 
-    out = _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype)
+    out = _run_paged_block_decode(drafter, captured, noise_embed, torch.bfloat16)
 
     for row in range(len(lengths)):
         expected = _reference_block_decode(
@@ -911,7 +905,35 @@ def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype,
         )
         expected = expected.float()
         rel_err = ((out[row] - expected).norm() / expected.norm()).item()
-        assert rel_err < tolerance, f"request {row}: relative error {rel_err}"
+        assert rel_err < 0.02, f"request {row}: relative error {rel_err}"
+
+
+@needs_trtllm_gen
+def test_trtllm_paged_fp8_cache_is_rejected_before_mutation(monkeypatch):
+    from dataclasses import replace
+
+    weights = _tiny_weights()
+    drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
+    generator = torch.Generator().manual_seed(45)
+    captured = [torch.randn(CTX_LEN, TINY["hidden_size"] * NUM_CAPTURE, generator=generator)]
+    noise_embed = [torch.randn(TINY["block_size"], TINY["hidden_size"], generator=generator)]
+    inputs = _paged_block_decode_inputs(drafter, captured, noise_embed, torch.float8_e4m3fn)
+    caches = inputs["ctx_kv_cache"]
+    before = [cache.view(torch.uint8).clone() for cache in caches]
+
+    def unexpected_mutation(*args, **kwargs):
+        pytest.fail("FP8 cache rejection must precede buffer preparation and paged append")
+
+    monkeypatch.setattr(drafter, "_prepare_dflash_trtllm_gen_buffers", unexpected_mutation)
+    monkeypatch.setattr(
+        drafter,
+        "_dflash_trtllm_gen_ops",
+        replace(drafter._dflash_trtllm_gen_ops, append_paged_kv_cache=unexpected_mutation),
+    )
+    with pytest.raises(ValueError, match="draft activation dtype"):
+        drafter.dflash_forward(**inputs)
+    for cache, original in zip(caches, before):
+        assert torch.equal(cache.view(torch.uint8), original)
 
 
 # ---------------------------------------------------------------------------

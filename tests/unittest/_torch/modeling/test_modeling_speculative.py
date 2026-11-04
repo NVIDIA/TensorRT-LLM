@@ -743,3 +743,32 @@ def test_external_draft_inherits_block_scaling_backend(enabled: bool) -> None:
     model_config.use_cute_dsl_blockscaling_mm = enabled
     kwargs = external_drafter_config_kwargs(model_config, _external_spec_config(None))
     assert kwargs["use_cute_dsl_blockscaling_mm"] is enabled
+
+
+@pytest.mark.parametrize(
+    "block,heads,kv_heads,chunk", [(16, 12, 1, 10), (9, 32, 2, 8), (21, 6, 2, 21)]
+)
+def test_dflash_workspace_sizes_the_largest_folded_chunk(block, heads, kv_heads, chunk):
+    wrapper = _fake_dflash_buffer_wrapper()
+    wrapper.validate_block_attention_windows.return_value = ["non-causal folded decode"]
+    with (
+        patch(
+            "torch.cuda.get_device_properties",
+            return_value=SimpleNamespace(multi_processor_count=148),
+        ),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        wrapper._prepare_dflash_trtllm_gen_buffers(
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            max_batch_size=3,
+            block_size=block,
+            num_heads=heads,
+            num_kv_heads=kv_heads,
+            head_dim=128,
+        )
+    calls = wrapper._dflash_trtllm_gen_ops.get_workspace_size.call_args_list
+    assert [(call.kwargs["num_tokens"], call.kwargs["num_heads"]) for call in calls] == [
+        (3 * block, heads),
+        (3, heads * chunk),
+    ]

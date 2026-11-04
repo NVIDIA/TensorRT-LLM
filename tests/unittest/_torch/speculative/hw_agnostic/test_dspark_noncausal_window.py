@@ -20,11 +20,13 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_dflash import (
     dflash_merge_future_block_attention,
+    dflash_trtllm_folded_block_attention,
     dflash_trtllm_windowed_block_attention,
 )
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 from tensorrt_llm._torch.speculative.dflash_attention import (
     DFLASH_FOLDED_DECODE_LOWERING,
+    get_dflash_folded_decode_chunk_size,
     validate_dflash_trtllm_gen_runtime,
 )
 
@@ -553,3 +555,202 @@ def test_dflash_paged_cache_dtype_is_validated_before_allocation(
             ctx_kv_cache=cache,
             ctx_page_table=torch.zeros(1, 1, dtype=torch.int32),
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "block,heads,kv_heads,expected_heads",
+    [
+        (1, 4, 2, [4]),
+        (4, 8, 2, [32]),
+        (4, 16, 1, [64]),
+        (8, 16, 1, [128]),
+        (9, 16, 1, [128, 16]),
+        (15, 32, 2, [256, 224]),
+        (16, 24, 2, [240, 144]),
+        (16, 12, 1, [120, 72]),
+        (21, 6, 2, [126]),
+        (43, 6, 2, [252, 6]),
+    ],
+)
+def test_folded_decode_chunks_preserve_full_attention(block, heads, kv_heads, expected_heads):
+    """Independent dense attention checks head grouping, query order and the tail chunk."""
+    torch.manual_seed(302 + block)
+    batch, dim = 2, 8
+    context_lengths = [1, 3]
+    query = torch.randn(batch, block, heads, dim)
+    keys = [torch.randn(length + block, kv_heads, dim) for length in context_lengths]
+    values = [torch.randn_like(key) for key in keys]
+    output = torch.empty(batch * block, heads, dim)
+    table = torch.zeros(batch, 1, dtype=torch.int32)
+    lengths = torch.tensor([length + block for length in context_lengths], dtype=torch.int32)
+    calls = []
+
+    def decode(**kwargs):
+        folded = kwargs["query"]
+        calls.append(folded.shape[1])
+        assert kwargs["seq_lens"] is lengths
+        assert kwargs["block_tables"] is table
+        assert kwargs["q_len_per_req"] == 1
+        assert kwargs["window_left"] == -1
+        for row in range(batch):
+            result = torch.nn.functional.scaled_dot_product_attention(
+                folded[row].unsqueeze(0).unsqueeze(2),
+                keys[row].permute(1, 0, 2).unsqueeze(0),
+                values[row].permute(1, 0, 2).unsqueeze(0),
+                enable_gqa=True,
+            )
+            kwargs["out"][row].copy_(result[0, :, 0])
+        return kwargs["out"]
+
+    dflash_trtllm_folded_block_attention(
+        SimpleNamespace(batch_decode_with_kv_cache=decode),
+        query,
+        torch.empty(1, 2, kv_heads, block + 3, dim),
+        table,
+        lengths,
+        block + 3,
+        torch.empty(0),
+        torch.empty(0),
+        output,
+    )
+    expected, _ = _oracle(query, keys, values, context_lengths, -1, -1, False)
+    torch.testing.assert_close(output, expected, atol=1e-5, rtol=1e-5)
+    assert calls == expected_heads
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "block,heads,kv_heads", [(16, 12, 1), (16, 24, 2)] + [(b, 16, 1) for b in range(9, 16)]
+)
+def test_folded_runtime_accepts_large_blocks_by_chunking(block, heads, kv_heads):
+    with patch("tensorrt_llm._torch.speculative.dflash_attention.get_dflash_trtllm_gen_ops"):
+        validate_dflash_trtllm_gen_runtime(
+            dtype=torch.bfloat16,
+            num_heads=heads,
+            num_kv_heads=kv_heads,
+            head_dim=128,
+            tokens_per_block=32,
+            has_context_attention=False,
+            folded_block_size=block,
+        )
+    chunk = get_dflash_folded_decode_chunk_size(block, heads, kv_heads)
+    assert chunk > 0
+    assert heads // kv_heads * chunk <= 128
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "block,heads,kv_heads",
+    [(0, 16, 1), (-1, 16, 1), (4, 0, 1), (4, 16, 0), (4, 7, 2), (4, 64, 1)],
+)
+def test_folded_chunk_plan_rejects_unsupported_base_shapes(block, heads, kv_heads):
+    with pytest.raises(RuntimeError, match="positive|divisible|validated"):
+        get_dflash_folded_decode_chunk_size(block, heads, kv_heads)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["TRTLLM", "FA4"])
+@pytest.mark.parametrize("bad_layer", [0, 1])
+def test_paged_fp8_rejection_precedes_model_or_cache_mutation(backend, bad_layer):
+    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.dflash_attention_backend = backend
+    caches = [torch.randn(1, 2, 1, 16, 8).to(torch.bfloat16) for _ in range(2)]
+    caches[bad_layer] = caches[bad_layer].to(torch.float8_e4m3fn)
+    snapshots = [cache.view(torch.uint8).clone() for cache in caches]
+    before_state = dict(wrapper.__dict__)
+    with pytest.raises(ValueError, match="draft activation dtype"):
+        wrapper.dflash_forward(
+            noise_embedding=torch.zeros(1, 2, 32, dtype=torch.bfloat16),
+            query_positions=torch.tensor([[0, 1]]),
+            num_ctx_per_req=torch.tensor([0]),
+            ctx_k_cache=None,
+            ctx_v_cache=None,
+            ctx_cache_batch_idx=torch.tensor([0]),
+            ctx_kv_cache=caches,
+            ctx_page_table=torch.zeros(1, 1, dtype=torch.int32),
+        )
+    assert wrapper.__dict__ == before_state
+    for cache, snapshot in zip(caches, snapshots):
+        assert torch.equal(cache.view(torch.uint8), snapshot)
+
+
+@pytest.mark.parametrize(
+    "block,heads,kv_heads",
+    [(1, 4, 2), (4, 8, 2), (4, 16, 1), (8, 16, 1), (16, 12, 1), (16, 24, 2)]
+    + [(block, 16 * kv_heads, kv_heads) for block in range(9, 16) for kv_heads in (1, 2)],
+)
+def test_trtllm_folded_chunks_match_full_attention_and_graph(block, heads, kv_heads):
+    """Large effective ratios, multiple KV groups and partial final chunks."""
+    ops = _trtllm_gen_ops_or_skip()
+    torch.manual_seed(403 + block + heads)
+    case = _PagedCase(ops, [0, 31, 65], block, heads, kv_heads, 128, 32)
+    batch = len(case.ctx_lens)
+    chunk = get_dflash_folded_decode_chunk_size(block, heads, kv_heads)
+    workspace_bytes = ops.get_workspace_size(
+        dtype=torch.bfloat16,
+        num_tokens=batch,
+        num_gen_tokens=batch,
+        num_heads=heads * chunk,
+        num_kv_heads=kv_heads,
+        head_size=128,
+        max_num_requests=batch,
+        rotary_embedding_dim=0,
+        fp8_context_fmha=False,
+    )
+    if case.workspace.numel() < workspace_bytes:
+        case.workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
+    case.counters = torch.zeros(
+        ops.get_multi_ctas_kv_counter_size(
+            heads * chunk, batch, torch.cuda.get_device_properties("cuda").multi_processor_count
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    output = torch.empty(batch * block, heads, 128, dtype=torch.bfloat16, device="cuda")
+
+    decoded_heads = []
+
+    def decode(**kwargs):
+        decoded_heads.append(kwargs["query"].shape[1])
+        return ops.batch_decode_with_kv_cache(**kwargs)
+
+    observed_ops = SimpleNamespace(batch_decode_with_kv_cache=decode)
+
+    def run():
+        dflash_trtllm_folded_block_attention(
+            observed_ops,
+            case.query,
+            case.cache,
+            case.block_tables,
+            case.seq_lens,
+            case.max_pages * case.page_size,
+            case.workspace,
+            case.counters,
+            output,
+        )
+
+    case.append_block()
+    run()
+    assert decoded_heads == [heads * min(chunk, block - start) for start in range(0, block, chunk)]
+    if heads * block // kv_heads <= 128:
+        assert decoded_heads == [heads * block]
+    expected, _ = _oracle(case.query, case.keys, case.values, case.ctx_lens, -1, -1, False)
+    torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        case.query.normal_()
+        for row in range(batch):
+            case.keys[row][-block:].normal_()
+            case.values[row][-block:].normal_()
+        case.block_key.copy_(torch.stack([key[-block:] for key in case.keys]))
+        case.block_value.copy_(torch.stack([value[-block:] for value in case.values]))
+        case.append_block()
+        graph.replay()
+        expected, _ = _oracle(case.query, case.keys, case.values, case.ctx_lens, -1, -1, False)
+        torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
