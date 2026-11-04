@@ -2465,7 +2465,8 @@ class KimiK3MoERuntime(nn.Module):
     def cache_derived_state(self) -> None:
         self._column_parallel_tail_supported = self._supports_column_parallel_tail()
         self._latent_up_mxfp8_supported = (
-            isinstance(self.routed_expert_up_proj, _Fp8BlockScaleWeightReadLinear)
+            self._reduce_routed_output
+            and isinstance(self.routed_expert_up_proj, _Fp8BlockScaleWeightReadLinear)
             and self.routed_expert_norm.weight.dtype == torch.bfloat16
             and self.routed_experts.all_reduce.mnnvl_runs_fusion(
                 AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, self.moe_hidden_size
