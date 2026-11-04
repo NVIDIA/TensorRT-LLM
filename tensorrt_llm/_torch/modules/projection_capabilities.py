@@ -68,6 +68,9 @@ class PrequantizedInputProjection(nn.Module):
     ``forward_prequantized`` the quantized form of ``num_rows`` rows (an
     activation and its scale, in the layout the projection documents) instead
     of the rows themselves; there ``forward_prequantized`` equals ``self(rows)``.
+    ``stages_weights(num_rows)`` says whether ``forward_prequantized`` with
+    ``stage_weights`` holds its weights on chip before it waits for its input,
+    so that the producer may release it at the producer's entry (same result).
     """
 
     @property
@@ -78,7 +81,13 @@ class PrequantizedInputProjection(nn.Module):
     def takes_prequantized_input(self, num_rows: int) -> bool:
         raise NotImplementedError
 
+    def stages_weights(self, num_rows: int) -> bool:
+        return False
+
     def forward_prequantized(
-        self, activation: torch.Tensor, activation_scale: torch.Tensor
+        self,
+        activation: torch.Tensor,
+        activation_scale: torch.Tensor,
+        stage_weights: bool = False,
     ) -> torch.Tensor:
         raise NotImplementedError

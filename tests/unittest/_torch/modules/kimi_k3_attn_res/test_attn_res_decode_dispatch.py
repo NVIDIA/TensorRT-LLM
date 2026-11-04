@@ -328,14 +328,26 @@ def test_decoder_layers_mxfp8_handoff(m: int, attention: str):
     assert torch.equal(xs[offsets], ref_s)
 
 
-def _kda_mixer_taking_mxfp8(max_rows: int):
+def _kda_mixer_taking_mxfp8(max_rows: int, max_staged_rows: int = 0):
+    """A mixer stand-in and a fused q/k/v/g projection that takes MXFP8 inputs of up to
+    ``max_rows`` rows and stages its weights for up to ``max_staged_rows``; installing the
+    projection is left to the test."""
     from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+    from tensorrt_llm._torch.modules.projection_capabilities import PrequantizedInputProjection
+
+    class _Projection(PrequantizedInputProjection):
+        def takes_prequantized_input(self, num_rows: int) -> bool:
+            return 1 <= num_rows <= max_rows
+
+        def stages_weights(self, num_rows: int) -> bool:
+            return self.takes_prequantized_input(num_rows) and num_rows <= max_staged_rows
 
     mixer = KimiKDALinearAttention.__new__(KimiKDALinearAttention)
     nn.Module.__init__(mixer)
     mixer.register_to_config = False
-    mixer._qkvg_takes_prequantized = None
-    return mixer, lambda num_rows: 1 <= num_rows <= max_rows
+    mixer.qkvg_proj = None
+    mixer._qkvg_prequantized = None
+    return mixer, _Projection()
 
 
 def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
@@ -344,7 +356,7 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     fused q/k/v/g projection was not declared to take one, nor a padded batch."""
     from types import SimpleNamespace
 
-    mixer, takes = _kda_mixer_taking_mxfp8(max_rows=32)
+    mixer, projection = _kda_mixer_taking_mxfp8(max_rows=32)
 
     def metadata(num_contexts: int, num_tokens: int, num_requests: int):
         return SimpleNamespace(
@@ -353,7 +365,8 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
 
     verify = metadata(0, 16, 4)
     assert not mixer.takes_prequantized_input(16, verify)
-    mixer.accept_prequantized_qkvg_input(takes)
+    mixer.qkvg_proj = projection
+    mixer.accept_prequantized_qkvg_input()
     assert mixer.takes_prequantized_input(16, verify)
     assert not mixer.takes_prequantized_input(64, metadata(0, 64, 8))
     assert not mixer.takes_prequantized_input(4, metadata(0, 4, 4))
@@ -474,10 +487,12 @@ def test_prewarm_compiles_what_the_mixes_launch(monkeypatch):
 def test_kda_mixer_qkvg_stages_weights_only_where_declared():
     """A mixer stages its q/k/v/g weights (and lets the mix release the projection at entry) only
     for the row counts its fused projection declared."""
-    mixer, takes = _kda_mixer_taking_mxfp8(max_rows=32)
+    mixer, projection = _kda_mixer_taking_mxfp8(max_rows=32)
     assert not mixer.qkvg_stages_weights(16)
-    mixer.accept_prequantized_qkvg_input(takes)
+    mixer.qkvg_proj = projection
+    mixer.accept_prequantized_qkvg_input()
     assert not mixer.qkvg_stages_weights(16)
-    mixer.accept_prequantized_qkvg_input(takes, lambda num_rows: num_rows <= 16)
+    mixer.qkvg_proj = _kda_mixer_taking_mxfp8(max_rows=32, max_staged_rows=16)[1]
+    mixer.accept_prequantized_qkvg_input()
     assert mixer.qkvg_stages_weights(16)
     assert not mixer.qkvg_stages_weights(32)

@@ -5358,9 +5358,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     _swap_linear_to_fp8_weight_read(attention, name, (TrtllmLinear,), *reduction)
             fused = getattr(attention, "qkvg_proj", None)
             if isinstance(fused, _Fp8BlockScaleWeightReadLinear):
-                attention.accept_prequantized_qkvg_input(
-                    fused.takes_prequantized_input, fused.stages_weights
-                )
+                attention.accept_prequantized_qkvg_input()
                 offset = 0
                 for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
                     projection = getattr(attention, name)

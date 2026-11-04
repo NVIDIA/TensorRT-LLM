@@ -22,7 +22,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from fla.modules import ShortConvolution
@@ -263,12 +263,22 @@ def kda_core_inplace(hidden_states: torch.Tensor, layer_idx: str, output: torch.
 maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
 
 
+class _VerifyInputs(NamedTuple):
+    """The projected inputs of target verification (``_project_verify_inputs``)."""
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    # None where ``f_a`` is set.
+    forget_gate: Optional[torch.Tensor]
+    beta: torch.Tensor
+    onorm_g: Optional[torch.Tensor]
+    # The BF16 ``f_a`` the f_a-mode fab kernel produced; the verify kernel computes the gate.
+    f_a: Optional[torch.Tensor] = None
+
+
 class KimiKDALinearAttention(nn.Module):
     """Production Kimi K3 KDA module with direct cache-pool ownership."""
-
-    # Row counts for which ``qkvg_proj`` holds its weights on chip before its PDL wait on a
-    # prequantized input; set by ``accept_prequantized_qkvg_input``.
-    _qkvg_stages_weights: Optional[Callable[[int], bool]] = None
 
     def __init__(
         self,
@@ -397,10 +407,9 @@ class KimiKDALinearAttention(nn.Module):
         # [q | k | v | g] projection and its output-section metadata.
         self.qkvg_proj: Optional[nn.Module] = None
         self.qkvg_split_sizes: Optional[List[int]] = None
-        # Row counts for which ``qkvg_proj`` projects a prequantized (MXFP8) input bitwise like
-        # its BF16 rows; set by ``accept_prequantized_qkvg_input`` when such a projection is
-        # installed.
-        self._qkvg_takes_prequantized: Optional[Callable[[int], bool]] = None
+        # ``qkvg_proj`` where it consumes a prequantized (MXFP8) input; set by
+        # ``accept_prequantized_qkvg_input`` once the projection is installed.
+        self._qkvg_prequantized: Optional[PrequantizedInputProjection] = None
         _meta_safe_cast_dtype(self, torch.bfloat16)
 
         # The optimized decode/verify kernels specialize the Kimi K3
@@ -571,27 +580,28 @@ class KimiKDALinearAttention(nn.Module):
         # verify call never allocates (a capture-unsafe lazy allocation).
         self._build_mtp_conv_weights()
 
-    def accept_prequantized_qkvg_input(
-        self,
-        takes_prequantized: Callable[[int], bool],
-        stages_weights: Optional[Callable[[int], bool]] = None,
-    ) -> None:
-        """Declare that the fused q/k/v/g projection consumes the MXFP8 form of its input
-        (``forward_prequantized``) for the row counts where ``takes_prequantized(num_rows)``, and
-        holds its weights on chip before its PDL wait where ``stages_weights(num_rows)``."""
-        self._qkvg_takes_prequantized = takes_prequantized
-        self._qkvg_stages_weights = stages_weights
+    def accept_prequantized_qkvg_input(self) -> None:
+        """Resolve, once the fused q/k/v/g projection is installed, whether it consumes the
+        MXFP8 form of its input (a :class:`PrequantizedInputProjection`)."""
+        self._qkvg_prequantized = (
+            self.qkvg_proj if isinstance(self.qkvg_proj, PrequantizedInputProjection) else None
+        )
 
     def qkvg_stages_weights(self, num_rows: int) -> bool:
         """Whether the fused q/k/v/g projection of ``num_rows`` prequantized rows holds its
         weights on chip before its PDL wait: then the producer of its input may release it at
         that producer's entry (``kimi_k3_attn_res`` ``entry_trigger``)."""
-        return self._qkvg_stages_weights is not None and self._qkvg_stages_weights(num_rows)
+        return self._qkvg_prequantized is not None and self._qkvg_prequantized.stages_weights(
+            num_rows
+        )
 
     def qkvg_takes_prequantized(self, num_rows: int) -> bool:
         """Whether the fused q/k/v/g projection consumes the MXFP8 form of ``num_rows`` rows
         (``accept_prequantized_qkvg_input``), in any batch."""
-        return self._qkvg_takes_prequantized is not None and self._qkvg_takes_prequantized(num_rows)
+        return (
+            self._qkvg_prequantized is not None
+            and self._qkvg_prequantized.takes_prequantized_input(num_rows)
+        )
 
     @staticmethod
     def _is_verify_only_batch(attn_metadata: AttentionMetadata) -> bool:
@@ -609,7 +619,7 @@ class KimiKDALinearAttention(nn.Module):
         batch's tokens), whose fused q/k/v/g projection takes a prequantized operand for that
         many rows. The producer and :meth:`forward` both decide by this method."""
         return (
-            self._qkvg_takes_prequantized is not None
+            self._qkvg_prequantized is not None
             and self._is_verify_only_batch(attn_metadata)
             and attn_metadata.num_tokens == num_rows
             and not (self.register_to_config and is_in_breakable_cuda_graph())
@@ -1507,18 +1517,18 @@ class KimiKDALinearAttention(nn.Module):
         preserve_section_strides: bool = False,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         gate_from_fa: bool = False,
-    ) -> Optional[tuple]:
+    ) -> Optional[_VerifyInputs]:
         """Project fused QKVG and [f_a | b] inputs for target verification.
 
-        Returns ``(q, k, v, forget_gate, beta, onorm_g)``. With
+        Returns the :class:`_VerifyInputs`, or None without a fused QKVG projection. With
         ``preserve_section_strides`` the q/k/v/gate sections stay strided
         views of the fused QKVG output (and beta of the fused ``[f_a | b]``
         output); the packed fused verify kernel reads them in place instead of
         paying one copy per section. The fused QKVG projection consumes
         ``prequantized_input`` (the MXFP8 form of ``x``) where it is given.
-        With ``gate_from_fa`` a seventh element is appended: the BF16 ``f_a``
-        view when the f_a-mode fab kernel served these rows (``forget_gate`` is
-        then ``None`` and the verify kernel computes it), else ``None``.
+        With ``gate_from_fa`` the f_a-mode fab kernel may serve these rows: then
+        ``f_a`` is its BF16 view and ``forget_gate`` is ``None`` (the verify
+        kernel computes it).
         """
         qkvg_weight = self._qkvg_proj_weight
         fused_qkvg = self.qkvg_proj
@@ -1587,10 +1597,9 @@ class KimiKDALinearAttention(nn.Module):
             q_proj, k_proj, v_proj = q_proj.contiguous(), k_proj.contiguous(), v_proj.contiguous()
             if onorm_g is not None:
                 onorm_g = onorm_g.contiguous()
-        if gate_from_fa:
-            f_a = forget_gate if fab_fa else None
-            return q_proj, k_proj, v_proj, None if fab_fa else forget_gate, beta, onorm_g, f_a
-        return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
+        if fab_fa:
+            return _VerifyInputs(q_proj, k_proj, v_proj, None, beta, onorm_g, f_a=forget_gate)
+        return _VerifyInputs(q_proj, k_proj, v_proj, forget_gate, beta, onorm_g)
 
     def forward_verify_fused(
         self,
@@ -1656,9 +1665,7 @@ class KimiKDALinearAttention(nn.Module):
             beta_proj = self.b_proj(x)
             onorm_g = None
         else:
-            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections[:6]
-            if len(projections) > 6:
-                f_a = projections[6]
+            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g, f_a = projections
         fuse_output_norm = can_fuse_output_norm and onorm_g is not None
         if f_a is not None and not fuse_output_norm:
             # Only the fused-norm verify computes the forget gate from f_a.
@@ -1823,7 +1830,7 @@ class KimiKDALinearAttention(nn.Module):
             beta = self.b_proj(x).float()
             onorm_g = None
         else:
-            q_proj_states, k_proj_states, v_proj_states, g, beta, onorm_g = projections
+            q_proj_states, k_proj_states, v_proj_states, g, beta, onorm_g, _ = projections
             beta = beta.float()
         g = rearrange(g, "... (h d) -> ... h d", d=self.head_dim)
 
