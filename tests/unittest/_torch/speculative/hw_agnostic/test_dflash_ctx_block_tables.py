@@ -155,7 +155,8 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
 def test_unified_cache_keeps_strict_allocation_check_in_generation_prepare(unified: bool) -> None:
     worker = _worker(unified=unified)
     worker._paged_latent_prepare = True
-    worker._draft_tokens_per_req = 8
+    # K = 7 drafts: _draft_tokens_per_req is K + 1 = 8.
+    worker.spec_config = SimpleNamespace(max_draft_len=7)
     metadata = SimpleNamespace(runtime_draft_len=7, captured_hidden_states=object())
 
     assert worker._fused_gen_prepare_applies(metadata) is not unified
