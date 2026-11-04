@@ -43,6 +43,15 @@ how much of this runs:
   copy of that row (``_BlockOffsetsMemo``, which states when the memo is
   trusted); the readable columns hold the same words as with the full copy.
 
+``step_loop_inline_commits`` (on top of both) changes how the launches are issued, with the
+same words written:
+
+* A launch whose descriptors fit a kernel parameter block carries its table
+  there (``step_commit.StepStaging``'s ``inline_commit``).
+* ``RuntimeHooks.overlap_offsets_applier``: in captured decode graphs the
+  overlap scheduler's two offset adds run as one launch that releases its
+  programmatic dependent at entry (``ops/runtime/overlap_offsets.py``).
+
 Steps that do not qualify -- prefill or mixed batches, eager steps, graph
 capture, dummies, any configuration outside the one ``StepInputStaging.ineligible``
 accepts -- run the built-in code untouched. Within a qualifying step, a write
@@ -65,6 +74,7 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
+from .ops.runtime import overlap_offsets as _ia
 from .ops.runtime import step_commit as _sc
 
 #: Store slot count (one per request: the sampler's ``max_batch_size``) above
@@ -651,7 +661,13 @@ class _PrepareStager:
 class StepInputStaging:
     """The model's ``StepInputStagerSource``: one ``_PrepareStager`` window per eligible step."""
 
-    def __init__(self, pp_size: int = 1, incremental_blocks: bool = False, plan: Any = None):
+    def __init__(
+        self,
+        pp_size: int = 1,
+        incremental_blocks: bool = False,
+        plan: Any = None,
+        inline_commit: bool = False,
+    ):
         """Allocate the pinned staging block.
 
         Args:
@@ -662,10 +678,11 @@ class StepInputStaging:
             plan: the model's plan (``dispatch.Plan``): ``begin_if_eligible`` counts its
                 steps (``Plan.step``) and reports the steps ``incremental_block_offsets``
                 declined (``Plan.declined``); None reports nothing.
+            inline_commit: the staging block's ``inline_commit`` (``step_commit.StepStaging``).
         """
         self.pp_size = pp_size
         self.plan = plan
-        self.staging = _sc.StepStaging()
+        self.staging = _sc.StepStaging(inline_commit=inline_commit)
         self.counts: Counter = Counter()
         self.blocks_memo: Optional[_BlockOffsetsMemo] = (
             _BlockOffsetsMemo() if incremental_blocks else None
@@ -801,16 +818,20 @@ class StepInputStaging:
 class SampleStoreWriter:
     """The model's ``SamplerStoreWriter``: the store rows and the host snapshots in one launch."""
 
-    def __init__(self, pp_size: int = 1):
+    def __init__(self, pp_size: int = 1, inline_commit: bool = False):
         """Allocate the two pinned staging blocks the steps alternate between.
 
         Args:
             pp_size: the model's pipeline-parallel size; any value above 1 declines,
                 since the sampler's host snapshots are then sent asynchronously
                 (``isend_object``), which the snapshot ring does not fence.
+            inline_commit: the staging blocks' ``inline_commit`` (``step_commit.StepStaging``).
         """
         self.pp_size = pp_size
-        self._staging = [_sc.StepStaging(), _sc.StepStaging()]
+        self._staging = [
+            _sc.StepStaging(inline_commit=inline_commit),
+            _sc.StepStaging(inline_commit=inline_commit),
+        ]
         self._turn = 0
         self._host_ring: list[Optional[tuple[torch.Tensor, ...]]] = [None] * _HOST_RING
         self._host_events: list[Optional[torch.cuda.Event]] = [None] * _HOST_RING
@@ -1069,12 +1090,14 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
     Args:
         model: the shell; both parts get its ``_mapping.pp_size`` (1 without one). Its plan
             (``_plan``) selects the parts (``deferred_input_prep``, ``sampler_store``) and the
-            levers ``step_loop_on_execution_stream`` and ``incremental_block_offsets``; a
-            model without one gets both parts and neither lever.
+            levers ``step_loop_on_execution_stream``, ``incremental_block_offsets`` and
+            ``step_loop_inline_commits``; a model without one gets both parts and no lever.
 
     Returns:
         ``RuntimeHooks`` declaring the step-input stager (``StepInputStaging``) and the
-        sampler store writer (``SampleStoreWriter``) the plan carries.
+        sampler store writer (``SampleStoreWriter``) the plan carries; under
+        ``step_loop_inline_commits`` also the inline commit tables and the overlap offsets
+        applier (``ops/runtime/overlap_offsets.py``, built and checked here).
     """
     pp_size = int(getattr(getattr(model, "_mapping", None), "pp_size", 1) or 1)
     plan = getattr(model, "_plan", None)
@@ -1082,15 +1105,26 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
     writer = plan is None or plan.enabled("sampler_store")
     one_stream = plan is not None and plan.enabled("step_loop_on_execution_stream")
     incremental_blocks = plan is not None and plan.enabled("incremental_block_offsets")
+    inline_commit = plan is not None and plan.enabled("step_loop_inline_commits")
     hooks = RuntimeHooks(
-        step_input_stager=StepInputStaging(pp_size, incremental_blocks, plan) if stager else None,
-        sampler_store_writer=SampleStoreWriter(pp_size) if writer else None,
+        step_input_stager=(
+            StepInputStaging(pp_size, incremental_blocks, plan, inline_commit=inline_commit)
+            if stager
+            else None
+        ),
+        sampler_store_writer=(
+            SampleStoreWriter(pp_size, inline_commit=inline_commit) if writer else None
+        ),
         step_loop_on_execution_stream=one_stream,
+        # Without step_loop_inline_commits: None, the two built-in adds.
+        overlap_offsets_applier=_ia.build_applier(2) if inline_commit else None,
     )
-    _sc.warm_up()
+    _sc.warm_up(inline_commit=inline_commit)
     logger.info(
         f"[musespark_open] executor hooks: step input staging {'on' if stager else 'off'}, "
         f"sampler store writer {'on' if writer else 'off'}, pp_size={pp_size}, step loop on "
-        f"the execution stream={one_stream}, incremental block offsets={incremental_blocks}"
+        f"the execution stream={one_stream}, incremental block offsets={incremental_blocks}, "
+        f"inline commit tables={inline_commit}, "
+        f"overlap offsets fold={hooks.overlap_offsets_applier is not None}"
     )
     return hooks
