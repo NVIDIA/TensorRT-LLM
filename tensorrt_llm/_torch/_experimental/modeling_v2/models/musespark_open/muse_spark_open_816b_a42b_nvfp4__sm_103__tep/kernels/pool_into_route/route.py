@@ -67,12 +67,28 @@ recorded here and ``ring_buddy_assign(half=True)`` does not run. Same bits.
 An armed layer whose call does not take the prologue's routed path raises: its peers
 would poll for a record nobody publishes. Eager steps and other row counts keep
 the tagged chain; the transports never share memory.
+
+With the ``edge_bf16_moe_front`` fast path (``OB_BF16_DIRECT``, on top of
+``moe_prologue.PF_BF16_FRONT`` 2): the two BF16-expert layers (0 and 61), whose 8-row decode
+call then runs the prologue's routed chain on the tagged inbox, become sites too
+(``_routes_bf16``). Their producers are the same two kernels with the same outputs (the pool
+GEMM into the slot, ``router_shard_publish`` into the boxes), and their routed kernel is
+``pool_direct_route``'s BF16 norm variant (``bf16_norm=``, ``PF_BF16_FRONT`` 2's statements).
+Same bits as ``PF_BF16_FRONT`` 2 on the tagged inbox. The sites stay in call order, so the
+buffer sequence covers all 62 layers (``buffer_sequence(62)``: layer 0 on buffer 0, layer 61 on
+buffer 1). Under the megakernel,
+which replaces layers 1-60 and keeps its own transports, ``DecodeTarget`` arms only the sites
+of the layers outside it (``DirectPool.armed(rows, skip=...)``): layers 0 and 61 alone, on
+buffers 0 and 1, so consecutive calls on the workspace still never share a buffer, the last
+call of a step and the first of the next included, and the reuse argument holds as written:
+between layer 0's routed kernel and layer 61's pool GEMM every kernel of the step on the main
+stream (the megakernel launches included) waits for its predecessor before it completes.
 """
 
 from __future__ import annotations
 
 import contextlib
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 
@@ -95,6 +111,11 @@ from ..projection_gathers.gathers import _require_aligned
 
 #: The one row count the transport is armed for: the K = 7 verify step.
 ROWS = 8
+
+#: Part of the ``edge_bf16_moe_front`` fast path: the BF16-expert layers' 8-row calls on the
+#: direct transport too (see the module docstring), on the layers ``moe_prologue.install`` gave
+#: the routed BF16 front (``_pf_bf16_site``); needs ``moe_prologue.PF_BF16_FRONT`` 2.
+OB_BF16_DIRECT = True
 
 
 def _publish_copy(slot: torch.Tensor, product: torch.Tensor) -> None:
@@ -245,6 +266,64 @@ class DirectPoolSite:
         moe._prologue_record_routing(out, place, state, workspace.world)
         return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
 
+    def prepare_bf16(self, moe, hidden_states: torch.Tensor, warps: int):
+        """``(router_logits, normed pool)`` of an armed 8-row call of a BF16-expert layer.
+
+        ``PF_BF16_FRONT`` 2 (``MuseSparkOpenTepPrologueMoE._pf_bf16_front`` with ``fused_norm``) on
+        the transport: the same router shard and pool GEMM publishing into this site's buffer,
+        then ``pool_direct_route``'s BF16 norm variant with the norm's raw weight and the
+        install-time unit scale (which that variant does not read).
+        """
+        from ..moe_prologue.prologue import _placement
+
+        rows = hidden_states.shape[0]
+        if rows != ROWS:
+            raise RuntimeError(
+                f"[musespark_open] pool_into_route: a layer armed for {ROWS}-row calls got {rows} rows; its peers "
+                "poll the transport for its records"
+            )
+        workspace, buffer = self.workspace, self.buffer
+        routing = moe.experts.routing_method
+        side = moe._router_stream
+        main = torch.cuda.current_stream()
+        with moe.nvtx("router"):
+            boxes = workspace.boxes(buffer, rows)
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                _shard.router_shard_publish(
+                    hidden_states,
+                    moe.router.weight,
+                    workspace.rank,
+                    moe.metap_multiplier,
+                    warps,
+                    boxes,
+                    ranks=workspace.world,
+                )
+        with moe.nvtx("pool"):
+            self._projected_into_slot(moe, hidden_states, workspace.slot(buffer, rows))
+            main.wait_stream(side)
+            place, static_from, state = _placement(moe, workspace.world)
+            bias = routing.e_score_correction_bias
+            weight = moe.pre_expert_norm.weight
+            _require_aligned(gain=weight, bias=bias)
+            out = _pdr.pool_direct_route(
+                workspace,
+                buffer,
+                rows,
+                weight,
+                moe._pf_unit_scale,
+                moe.pre_expert_norm.variance_epsilon,
+                bias,
+                routing.renorm_eps,
+                place,
+                static_from,
+                enable_pdl=moe._prologue_enable_pdl,
+                return_gathered=False,
+                bf16_norm=weight,
+            )
+        moe._prologue_record_routing(out, place, state, workspace.world)
+        return out.logits, out.normed
+
 
 class DirectPool:
     """What ``DecodeTarget`` holds under ``pool_into_route``: the workspaces and, once loaded, their sites.
@@ -278,9 +357,17 @@ class DirectPool:
         return bool(self.wide_sites) and _shard.WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS
 
     @contextlib.contextmanager
-    def armed(self, rows: int):
-        """Arm every site of the ``rows``-row transport for one forward; disarm on any exit."""
+    def armed(self, rows: int, skip: Optional[Callable[[int], bool]] = None):
+        """Arm the sites of the ``rows``-row transport for one forward; disarm on any exit.
+
+        ``skip`` (``OB_BF16_DIRECT``, under the megakernel): a predicate on the layer index; the
+        sites of the layers it accepts stay unarmed (their calls never reach the prologue). Every
+        rank passes the same predicate, so every rank arms the same sites. Without it every site
+        of the transport is armed.
+        """
         sites = self.sites if rows <= ROWS else self.wide_sites
+        if skip is not None:
+            sites = tuple((moe, site) for moe, site in sites if not skip(int(moe.layer_idx)))
         for moe, site in sites:
             moe._pool_direct_armed = site
         try:
@@ -288,6 +375,12 @@ class DirectPool:
         finally:
             for moe, _ in sites:
                 moe._pool_direct_armed = None
+
+    def arms_outside(self, replaces: Callable[[int], bool]) -> bool:
+        """Whether a forward whose layers ``replaces`` accepts run elsewhere (the megakernel) arms
+        any site: with ``OB_BF16_DIRECT``, when a site's layer is outside them. Construction-time
+        state only (every rank answers alike)."""
+        return OB_BF16_DIRECT and any(not replaces(int(moe.layer_idx)) for moe, _ in self.sites)
 
     def variants(self, layers: Sequence) -> list:
         """The routed kernel's variants the layers' calls launch (see ``pool_direct_route.variant``).
@@ -303,6 +396,10 @@ class DirectPool:
             moe = layer.feed_forward
             place, static_from, _ = _placement(moe)
             enable_pdl = bool(moe._prologue_enable_pdl)
+            if _routes_bf16(moe):
+                # OB_BF16_DIRECT: the BF16 norm variant, without the gathered row (PF_BF16_FRONT 2).
+                keys.add(_pdr.variant(place, static_from, enable_pdl, False, bf16_norm=True))
+                continue
             keys.add(_pdr.variant(place, static_from, enable_pdl, True))
             early = getattr(moe, "_early_ids_state", None)
             if early is not None and place != _pdr.PLACE_NONE and enable_pdl:
@@ -319,7 +416,7 @@ class DirectPool:
         layers = list(model.layers)
         routed, reason = [], None
         for layer in layers:
-            if _routes(layer.feed_forward):
+            if _routes(layer.feed_forward) or _routes_bf16(layer.feed_forward):
                 routed.append(layer)
         if not getattr(model, "_layer_kwargs", {}).get("fused_pool_gather"):
             # The decode forward passes fused_pool_gather to every layer only when the pool site
@@ -394,6 +491,7 @@ class DirectPool:
         self.workspace.start_guard_watch()
         if wide is not None:
             wide.start_guard_watch()
+        bf16 = [layer.layer_idx for layer in routed if _routes_bf16(layer.feed_forward)]
         logger.info(
             f"[musespark_open] pool_into_route: the pool GEMM and the forked router shard publish into the routed pool "
             f"kernel's direct transport on {len(sites)} of {len(layers)} layers (8-row decode "
@@ -401,6 +499,7 @@ class DirectPool:
             f"buffers alternate per layer, the last on buffer {buffers[-1]}; "
             f"{len(variants) + len(wide_variants)} kernel variants); eager steps and other row "
             "counts keep the tagged chain"
+            + (f"; BF16 direct: BF16-expert layers {bf16} on the BF16 norm variant" if bf16 else "")
         )
         return len(sites)
 
@@ -472,6 +571,26 @@ def _not_routed(moe) -> Optional[str]:
 def _routes(moe) -> bool:
     """Whether ``moe``'s 8-row decode call is to run the prologue's routed path (``_not_routed``)."""
     return _not_routed(moe) is None
+
+
+def _routes_bf16(moe) -> bool:
+    """Whether ``moe`` is a BF16-expert layer whose 8-row decode call runs ``PF_BF16_FRONT`` 2
+    (``MuseSparkOpenTepPrologueMoE._pf_bf16_site``, ``edge_bf16_moe_front``) and ``OB_BF16_DIRECT``.
+
+    Construction-time state only, as ``_not_routed``; the forward re-checks its call-time part
+    on every armed call and raises if it fails (``_pool_direct_refuse_declined``).
+    """
+    from ..moe_prologue import prologue as _prologue
+
+    if not OB_BF16_DIRECT or _prologue.PF_BF16_FRONT != "2":
+        return False
+    if not isinstance(moe, _prologue.MuseSparkOpenTepPrologueMoE):
+        return False
+    if moe._router_stream is None or getattr(moe, "_pool_inbox", None) is None:
+        return False
+    if getattr(moe.experts, "comm", None) is not None:
+        return False
+    return moe._pf_bf16_site()
 
 
 def install(model, plan, mapping=None) -> DirectPool:

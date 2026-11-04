@@ -80,6 +80,15 @@ before the CTA's own wait).
 Calls on one workspace must be issued in the same order on every rank, with the
 same row counts and buffers, serialized on one stream (graph replay included).
 The workspace is this op's alone.
+
+BF16 norm (``bf16_norm=``, a separately compiled variant; the default kernels do not include it):
+for the BF16-expert layers (0 and 61), whose expert input is the pre-expert gemma RMSNorm in
+BF16 (``moe_prologue.PF_BF16_FRONT`` mode 2), phase 3 writes that norm instead of the NVFP4
+payload, with ``pool_gather_route``'s ``bf16_norm`` statements: the same sum of squares and
+``rstd`` of phase 2, the weight loaded with flashinfer ``RMSNormKernel``'s row-broadcast tiled
+copy over the same thread-value layout, ``y = x * rstd * (w + 1)`` in FP32, one rounding to
+BF16. The norm weight is a parameter, so these warps load it before their dependency wait.
+No block scale is written and the early-id publication is not available in this variant.
 """
 
 from __future__ import annotations
@@ -348,6 +357,7 @@ if _AVAILABLE:
             world: int = WORLD,
             max_rows: int = MAX_ROWS,
             census: int = 0,
+            bf16_norm: bool = False,
         ):
             check_layout(world, max_rows)
             wide = max_rows > MAX_ROWS
@@ -373,6 +383,7 @@ if _AVAILABLE:
                 stamps,
                 world,
                 max_rows,
+                bf16_norm,
             )
             self.place = place
             self.census = int(census)
@@ -522,25 +533,63 @@ if _AVAILABLE:
                     # Warps 0-3: pool_gather_fp4quant statement for
                     # statement, the pool slices polled from the transport.
                     # ======================================================
-                    if enable_pdl:
-                        cute.arch.griddepcontrol_wait()
-                    lane_in_row = tidx % threads_per_row
-                    row_in_block = tidx // threads_per_row
-                    fp4_max_rcp = _fp4.rcp_approx_ftz(Float32(_fp4.FLOAT4_E2M1_MAX))
+                    if cutlass.const_expr(self.bf16_norm):
+                        # BF16 norm variant: the tile layouts first (address arithmetic only),
+                        # then the norm weight (a parameter) into registers, then the wait.
+                        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
+                        copy_atom_load_async = cute.make_copy_atom(
+                            cute.nvgpu.cpasync.CopyG2SOp(),
+                            mX.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        tiled_copy_load = cute.make_tiled_copy(
+                            copy_atom_load_async, tv_layout, tiler_mn
+                        )
+                        thr_copy_X = tiled_copy_load.get_slice(tidx)
+                        tXgX = thr_copy_X.partition_S(gX)
+                        tXsX = thr_copy_X.partition_D(sX)
+                        tXrX = cute.make_fragment_like(tXgX)
+                        mW_2d = cute.make_tensor(
+                            mW.iterator,
+                            cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))),
+                        )
+                        gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
+                        copy_atom_w = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            mW.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        thr_copy_W = cute.make_tiled_copy(
+                            copy_atom_w, tv_layout, tiler_mn
+                        ).get_slice(tidx)
+                        tWgW = thr_copy_W.partition_S(gW)
+                        tWrW = cute.make_fragment_like(tWgW)
+                        tXrW = thr_copy_X.retile(tWrW)
+                        cute.copy(copy_atom_w, tWgW, tWrW)
+                        if enable_pdl:
+                            cute.arch.griddepcontrol_wait()
+                        lane_in_row = tidx % threads_per_row
+                        row_in_block = tidx // threads_per_row
+                    else:
+                        if enable_pdl:
+                            cute.arch.griddepcontrol_wait()
+                        lane_in_row = tidx % threads_per_row
+                        row_in_block = tidx // threads_per_row
+                        fp4_max_rcp = _fp4.rcp_approx_ftz(Float32(_fp4.FLOAT4_E2M1_MAX))
 
-                    gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
-                    copy_atom_load_async = cute.make_copy_atom(
-                        cute.nvgpu.cpasync.CopyG2SOp(),
-                        mX.element_type,
-                        num_bits_per_copy=_fp4.COPY_BITS,
-                    )
-                    tiled_copy_load = cute.make_tiled_copy(
-                        copy_atom_load_async, tv_layout, tiler_mn
-                    )
-                    thr_copy_X = tiled_copy_load.get_slice(tidx)
-                    tXgX = thr_copy_X.partition_S(gX)
-                    tXsX = thr_copy_X.partition_D(sX)
-                    tXrX = cute.make_fragment_like(tXgX)
+                        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
+                        copy_atom_load_async = cute.make_copy_atom(
+                            cute.nvgpu.cpasync.CopyG2SOp(),
+                            mX.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        tiled_copy_load = cute.make_tiled_copy(
+                            copy_atom_load_async, tv_layout, tiler_mn
+                        )
+                        thr_copy_X = tiled_copy_load.get_slice(tidx)
+                        tXgX = thr_copy_X.partition_S(gX)
+                        tXsX = thr_copy_X.partition_D(sX)
+                        tXrX = cute.make_fragment_like(tXgX)
 
                     # Phase 1: the pool gather, from the senders' slots: vector v of a
                     # thread lies in sender owner(v)'s slot at word offset(v) + 4 * lane.
@@ -603,57 +652,87 @@ if _AVAILABLE:
                     sum_sq = _row_sum(x_sq, reduction_buffer)
                     mean_sq = sum_sq / H
                     rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
-                    global_scale_val = mGlobalScale[0]
+                    if cutlass.const_expr(not self.bf16_norm):
+                        global_scale_val = mGlobalScale[0]
                     _bar_sync(QUANT_BARRIER, QUANT_THREADS)
 
+                    if cutlass.const_expr(self.bf16_norm):
+                        # Phase 3 (BF16 norm variant): pool_gather_route's bf16_norm phase 3 --
+                        # flashinfer RMSNormKernel's pass 2 at this width (gemma, weight_bias 1).
+                        gY = cute.local_tile(mY, tiler_mn, (bidx, 0))
+                        copy_atom_y = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            mY.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        thr_copy_O = cute.make_tiled_copy(
+                            copy_atom_y, tv_layout, tiler_mn
+                        ).get_slice(tidx)
+                        tXgO = thr_copy_O.partition_D(gY)
+                        tXrO = cute.make_fragment_like(tXgO)
+                        cute.autovec_copy(tXsX, tXrX)
+                        xn = tXrX.load().to(Float32)
+                        w = tXrW.load().to(Float32)
+                        y = xn * rstd * (w + Float32(1.0))
+                        tXrO.store(y.to(mY.element_type))
+                        if actual_row_idx < M:
+                            cute.copy(copy_atom_y, tXrO, tXgO)
                     # Phase 3: RMSNorm + quantize (flashinfer's).
-                    if actual_row_idx < M:
-                        num_sf_per_thread = (
-                            num_sf_blocks_per_row + threads_per_row - 1
-                        ) // threads_per_row
-                        for sf_iter in range(num_sf_per_thread):
-                            sf_idx = lane_in_row + sf_iter * threads_per_row
-                            if sf_idx < num_sf_blocks_per_row:
-                                block_start = sf_idx * block_size
+                    if cutlass.const_expr(not self.bf16_norm):
+                        if actual_row_idx < M:
+                            num_sf_per_thread = (
+                                num_sf_blocks_per_row + threads_per_row - 1
+                            ) // threads_per_row
+                            for sf_iter in range(num_sf_per_thread):
+                                sf_idx = lane_in_row + sf_iter * threads_per_row
+                                if sf_idx < num_sf_blocks_per_row:
+                                    block_start = sf_idx * block_size
 
-                                x_h2 = cute.make_rmem_tensor((8,), Uint32)
-                                w_h2 = cute.make_rmem_tensor((8,), Uint32)
-                                x_tile = sX.iterator + row_in_block * H + block_start
-                                x_h2[0], x_h2[1], x_h2[2], x_h2[3] = _load_shared_words(x_tile)
-                                x_h2[4], x_h2[5], x_h2[6], x_h2[7] = _load_shared_words(x_tile + 8)
-                                w_ptr0 = _fp4.get_ptr_as_int64(mW, block_start)
-                                w_ptr1 = _fp4.get_ptr_as_int64(mW, block_start + Int32(8))
-                                w_h2[0], w_h2[1], w_h2[2], w_h2[3] = _fp4.ld_global_v4_u32(w_ptr0)
-                                w_h2[4], w_h2[5], w_h2[6], w_h2[7] = _fp4.ld_global_v4_u32(w_ptr1)
+                                    x_h2 = cute.make_rmem_tensor((8,), Uint32)
+                                    w_h2 = cute.make_rmem_tensor((8,), Uint32)
+                                    x_tile = sX.iterator + row_in_block * H + block_start
+                                    x_h2[0], x_h2[1], x_h2[2], x_h2[3] = _load_shared_words(x_tile)
+                                    x_h2[4], x_h2[5], x_h2[6], x_h2[7] = _load_shared_words(
+                                        x_tile + 8
+                                    )
+                                    w_ptr0 = _fp4.get_ptr_as_int64(mW, block_start)
+                                    w_ptr1 = _fp4.get_ptr_as_int64(mW, block_start + Int32(8))
+                                    w_h2[0], w_h2[1], w_h2[2], w_h2[3] = _fp4.ld_global_v4_u32(
+                                        w_ptr0
+                                    )
+                                    w_h2[4], w_h2[5], w_h2[6], w_h2[7] = _fp4.ld_global_v4_u32(
+                                        w_ptr1
+                                    )
 
-                                xw_h2 = _fp4.bfloat2_mul_8(x_h2, w_h2)
-                                max_xw_h2 = _fp4.bfloat2_max_abs_8(xw_h2)
-                                max_xw = _fp4.bfloat2_hmax_to_f32(max_xw_h2)
-                                y_f32 = _fp4.bfloat2_to_float16(xw_h2, rstd)
+                                    xw_h2 = _fp4.bfloat2_mul_8(x_h2, w_h2)
+                                    max_xw_h2 = _fp4.bfloat2_max_abs_8(xw_h2)
+                                    max_xw = _fp4.bfloat2_hmax_to_f32(max_xw_h2)
+                                    y_f32 = _fp4.bfloat2_to_float16(xw_h2, rstd)
 
-                                max_abs = max_xw * rstd
+                                    max_abs = max_xw * rstd
 
-                                scale_float = global_scale_val * max_abs * fp4_max_rcp
-                                scale_float = _fp4.fmin_f32(
-                                    scale_float, Float32(_fp4.FLOAT8_E4M3_MAX)
-                                )
+                                    scale_float = global_scale_val * max_abs * fp4_max_rcp
+                                    scale_float = _fp4.fmin_f32(
+                                        scale_float, Float32(_fp4.FLOAT8_E4M3_MAX)
+                                    )
 
-                                scale_fp8_u32 = _fp4.cvt_f32_to_e4m3(scale_float)
-                                scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
+                                    scale_fp8_u32 = _fp4.cvt_f32_to_e4m3(scale_float)
+                                    scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
 
-                                inv_scale = (
-                                    _fp4.fp8_e4m3_to_f32_and_rcp(scale_fp8_u32) * global_scale_val
-                                )
+                                    inv_scale = (
+                                        _fp4.fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+                                        * global_scale_val
+                                    )
 
-                                mS[actual_row_idx, sf_idx] = scale_fp8
+                                    mS[actual_row_idx, sf_idx] = scale_fp8
 
-                                packed64 = _fp4.quantize_and_pack_16(y_f32, inv_scale)
+                                    packed64 = _fp4.quantize_and_pack_16(y_f32, inv_scale)
 
-                                out_offset = block_start // 2
-                                out_ptr = _fp4.get_ptr_as_int64(
-                                    mY, actual_row_idx * (H // 2) + out_offset
-                                )
-                                _fp4.st_global_u64(out_ptr, packed64)
+                                    out_offset = block_start // 2
+                                    out_ptr = _fp4.get_ptr_as_int64(
+                                        mY, actual_row_idx * (H // 2) + out_offset
+                                    )
+                                    _fp4.st_global_u64(out_ptr, packed64)
                     if cutlass.const_expr(self.stamps != 0):
                         if tidx == 0:
                             _stamp_timer(Int64(self.stamps) + Int64(bidx * 64 + 32))
@@ -1090,6 +1169,7 @@ if _AVAILABLE:
         world: int = WORLD,
         max_rows: int = MAX_ROWS,
         census: int = 0,
+        bf16_norm: bool = False,
     ):
         kernel = _PoolDirectRouteKernel(
             peer_rank,
@@ -1104,15 +1184,22 @@ if _AVAILABLE:
             world,
             max_rows,
             census,
+            bf16_norm,
         )
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
+        # The BF16 norm variant's output is the [M, 4096] BF16 normalized row.
+        out_fake = (
+            fake(cutlass.BFloat16, (rows, HIDDEN), stride_order=(1, 0), assumed_align=128)
+            if bf16_norm
+            else fake(cutlass.Uint8, (rows, HIDDEN // 2), stride_order=(1, 0), assumed_align=128)
+        )
         with torch.cuda.device(device_index):
             return cute.compile(
                 kernel,
                 fake(cutlass.BFloat16, (rows, HIDDEN), stride_order=(1, 0), assumed_align=128),
                 fake(cutlass.BFloat16, (HIDDEN,), assumed_align=128),
-                fake(cutlass.Uint8, (rows, HIDDEN // 2), stride_order=(1, 0), assumed_align=128),
+                out_fake,
                 fake(
                     cutlass.Uint8, (rows, HIDDEN // BLOCK), stride_order=(1, 0), assumed_align=128
                 ),
@@ -1139,8 +1226,9 @@ if _AVAILABLE:
 
 
 #: What selects a compiled kernel: ``(place, static_from, enable_pdl, store_gathered,
-#: publish, epoch_word, trigger, stamps)`` (the early-id settings are the last four; 0 = off).
-Variant = Tuple[int, int, bool, bool, int, int, int, int]
+#: publish, epoch_word, trigger, stamps, bf16_norm)`` (the early-id settings are publish ..
+#: stamps, 0 = off; ``bf16_norm`` the BF16 norm variant).
+Variant = Tuple[int, int, bool, bool, int, int, int, int, bool]
 
 
 def variant(
@@ -1150,14 +1238,18 @@ def variant(
     store_gathered: bool = True,
     early=None,
     stamps: int = 0,
+    bf16_norm: bool = False,
 ) -> Variant:
     """The workspace's key of the kernel a call with these settings launches.
 
     ``early``: the ``EarlyExpertIds`` when this call publishes (the host decides
-    per call, ``EarlyExpertIds.may_publish``), else None.
+    per call, ``EarlyExpertIds.may_publish``), else None. ``bf16_norm``: the BF16 norm
+    variant (phase 3 writes the gemma RMSNorm in BF16; no early ids).
     """
     if place not in (PLACE_NONE,) + tuple(_route.EARLY_PLACES):
         raise ValueError(f"unknown placement kind {place}")
+    if bf16_norm and early is not None:
+        raise ValueError("the BF16 norm variant has no early-id publication")
     publish = epoch = trigger = 0
     if early is not None:
         if place not in _route.EARLY_PLACES or not enable_pdl:
@@ -1175,6 +1267,7 @@ def variant(
         int(epoch),
         int(trigger),
         int(stamps),
+        bool(bf16_norm),
     )
 
 
@@ -1421,7 +1514,17 @@ class PoolDirectWorkspace:
                 f"[musespark_open] pool_into_route: direct routed pool kernel variant {key} was not built before "
                 "graph capture"
             )
-        place, static_from, enable_pdl, store_gathered, publish, epoch, trigger, stamps = key
+        (
+            place,
+            static_from,
+            enable_pdl,
+            store_gathered,
+            publish,
+            epoch,
+            trigger,
+            stamps,
+            bf16_norm,
+        ) = key
         compiled = _compile(
             self.device.index,
             self.rank,
@@ -1438,10 +1541,13 @@ class PoolDirectWorkspace:
             self.world,
             self.max_rows,
             self._census.data_ptr() if self.wide and place != PLACE_NONE else 0,
+            bf16_norm,
         )
         # A dry launch loads the module now, not inside a capture.
         with torch.cuda.device(self.device):
-            outputs = _outputs(1, self.device, place != PLACE_NONE, store_gathered, self.world)
+            outputs = _outputs(
+                1, self.device, place != PLACE_NONE, store_gathered, self.world, bf16_norm
+            )
             gain = torch.zeros(HIDDEN, dtype=torch.bfloat16, device=self.device)
             scale = torch.zeros(1, dtype=torch.float32, device=self.device)
             _launch(compiled, outputs, gain, scale, 1, 1e-6, 1e-20, 0, 0, 0, 0, dry=1)
@@ -1451,10 +1557,21 @@ class PoolDirectWorkspace:
 
 
 def _outputs(
-    rows: int, device, placed: bool, store_gathered: bool, world: int = WORLD
+    rows: int,
+    device,
+    placed: bool,
+    store_gathered: bool,
+    world: int = WORLD,
+    bf16_norm: bool = False,
 ) -> _route.RouteOutputs:
+    """A call's outputs; the BF16 norm variant writes ``normed`` in place of ``fp4``."""
     return _route.RouteOutputs(
-        fp4=torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device),
+        fp4=None
+        if bf16_norm
+        else torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device),
+        normed=torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
+        if bf16_norm
+        else None,
         scale=torch.empty((rows, HIDDEN // BLOCK), dtype=torch.uint8, device=device),
         gathered=torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device),
         logits=torch.empty((rows, EXPERTS), dtype=torch.float32, device=device),
@@ -1486,7 +1603,7 @@ def _launch(
     compiled(
         out.gathered,
         gain,
-        out.fp4,
+        out.fp4 if out.fp4 is not None else out.normed,
         out.scale,
         global_scale,
         rows,
@@ -1624,9 +1741,15 @@ class PoolDirectRoute(OpWrapper):
         return_gathered: bool = True,
         early=None,
         stamps: Optional[torch.Tensor] = None,
+        bf16_norm: Optional[torch.Tensor] = None,
     ) -> _route.RouteOutputs:
         placed = place != PLACE_NONE
-        publish = early is not None and placed and bool(enable_pdl) and early.may_publish()
+        # ``bf16_norm`` (the gemma norm's raw [4096] BF16 weight): the kernel writes the
+        # normalized BF16 row into ``normed`` and no NVFP4 payload or scale.
+        norm = bf16_norm is not None
+        publish = (
+            early is not None and not norm and placed and bool(enable_pdl) and early.may_publish()
+        )
         key = variant(
             int(place),
             int(static_from),
@@ -1634,13 +1757,14 @@ class PoolDirectRoute(OpWrapper):
             bool(return_gathered),
             early if publish else None,
             0 if stamps is None else stamps.data_ptr(),
+            norm,
         )
         compiled = workspace.kernel(key)
-        out = _outputs(rows, gain.device, placed, True, workspace.world)
+        out = _outputs(rows, gain.device, placed, True, workspace.world, norm)
         _launch(
             compiled,
             out,
-            gain,
+            gain if not norm else bf16_norm,
             global_scale,
             rows,
             eps,
@@ -1654,6 +1778,8 @@ class PoolDirectRoute(OpWrapper):
             early.arm(out.local_ids)
         if not return_gathered:
             out.gathered = None
+        if norm:
+            out.scale = None
         return out
 
     def reference(
@@ -1713,6 +1839,7 @@ class PoolDirectRoute(OpWrapper):
         return_gathered: bool = True,
         early=None,
         stamps: Optional[torch.Tensor] = None,
+        bf16_norm: Optional[torch.Tensor] = None,
     ) -> None:
         """Raw vector accesses at fixed strides on the operands' device; the transport's
         buffer and row count must be the ones the producers published into. The wide
@@ -1728,11 +1855,14 @@ class PoolDirectRoute(OpWrapper):
             raise ValueError(f"buffer must be in 0..{BUFFERS - 1}, got {buffer}")
         if not enable_pdl and early is not None:
             raise ValueError("the early-id publication needs programmatic dependent launch")
-        for tensor, shape, dtype in (
+        checked = [
             (gain, (HIDDEN,), torch.bfloat16),
             (global_scale, (1,), torch.float32),
             (bias, (EXPERTS,), torch.float32),
-        ):
+        ]
+        if bf16_norm is not None:
+            checked.append((bf16_norm, (HIDDEN,), torch.bfloat16))
+        for tensor, shape, dtype in checked:
             if (
                 tuple(tensor.shape) != shape
                 or tensor.dtype != dtype
