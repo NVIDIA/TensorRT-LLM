@@ -177,6 +177,7 @@ class GenerationRequest:
         self.scheduling_params = scheduling_params
         self.conversation_params = conversation_params
         self.kv_hints = snapshot_kv_hints(kv_hints)
+        self._checkpoint_validation_token: str | None = None
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(
