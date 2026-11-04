@@ -16,7 +16,9 @@
 """Single-owner command delivery and bounded worker-connection recovery."""
 
 import collections
-import pickle
+
+# Only serializes executor commands; this owner does not deserialize input.
+import pickle  # nosec B403
 import sys
 import threading
 import time
