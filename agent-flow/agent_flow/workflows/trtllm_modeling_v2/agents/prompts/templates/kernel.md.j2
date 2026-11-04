@@ -1,0 +1,64 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+Workspace: {{ ctx.workspace }}
+Repository: {{ ctx.repo }}
+Architecture: {{ ctx.arch }}
+{% if ctx.target_rel %}Target: {{ ctx.target_rel }}
+{% endif %}
+Dispatch {{ ctx.item.n }}: **{{ ctx.item.mode }}** the catalog entry `{{ ctx.item.target }}`.
+{% if ctx.note %}
+{{ ctx.note }}
+{% endif %}{% if device is not none %}
+**Use `CUDA_VISIBLE_DEVICES={{ device }}` for this dispatch**, not the devices in the launch protocol above. This node has {{ ctx.devices }} devices and your batch is running concurrently; every kernel writer taking the same device turns a memory error into the symptom.
+{% endif %}{% if ctx.goal %}
+## Your task: `{{ ctx.task_id }}` (tags: {{ purpose_tags }})
+
+{{ ctx.goal }}
+{% endif %}{% if row_note %}
+{% if ctx.goal %}Its queue row's note{% else %}The plan's note for this dispatch{% endif %}: {{ row_note }}
+{% endif %}
+{{ tags }}
+{% if local_variant %}
+## Where it lands
+
+In this target's own `ops/`, as the local variant `{{ ctx.landing }}`:
+
+{% for path in ctx.paths -%}
+- `{{ path }}`
+{% endfor %}
+{% if onboard -%}
+Write the entry there.
+{% else -%}
+Start the variant as a copy of the entry as it stands, file and test (the
+shared catalog's, or the copy another target keeps in its `ops/`), keeping its
+class and its instance name (`{{ entry_name }}`), and add your cells there.
+{% endif -%}
+Leave {% for path in ctx.shared %}`{{ path }}`{% if not loop.last %} and {% endif %}{% endfor %}
+as they are: other tasks on this entry run beside yours, each in a variant
+of its own. The target imports the variant (`from .{{ variant_module }} import {{ entry_name }}`)
+and is delivered with it; the shared catalog entry is not changed by this run.
+{% endif %}
+{% if ctx.item.surface %}The surface to certify: {{ ctx.item.surface }}
+{% endif %}{% if tier is none -%}
+Sourcing: no rung is recorded for this entry. Name the one its `__call__` wraps in your decision file's `tier`.
+{% else -%}
+Sourcing: **tier {{ tier }} — {{ tier_description }}** (recorded in `vocabulary.yaml` queue row {{ ctx.item.n }}).
+{% if writes_implementation -%}
+This entry has no implementation yet — you are writing it, not wrapping one. Correct-and-slow is acceptable; the tuning phase replaces it. Say in the contract what you rejected at the cheaper rungs.
+{% elif kernel_library -%}
+The entry's `__call__` calls the FlashInfer callable directly — no trtllm op wraps it. Find it in the FlashInfer the run's interpreter has installed; certify the callable as the kernel sources below say.
+{% endif -%}
+{% endif %}
+## Where a kernel comes from
+
+An op in `torch.ops.trtllm` is registered from Python (a `torch.library.custom_op("trtllm::...")`
+under the custom ops `tree_map.md` lists: the file name is its source) or from C++ (a
+`TORCH_LIBRARY_FRAGMENT(trtllm, ...)` / `TORCH_LIBRARY_IMPL(trtllm, ...)` block), and
+`git grep` for the op's name finds it. A FlashInfer callable no op wraps is tier 3: the entry's `__call__` calls
+`flashinfer.<module>.<name>` itself. What the entry certifies follows the source: a JIT-compiled
+kernel (CuTe DSL, Triton, FlashInfer) states the architecture it compiled for and that the JIT
+path ran; a compiled-in C++ kernel is in the wheel or not. Say which in the entry's `note`.
+
+Read `{{ ctx.vocabulary_path }}` for the computation step this entry serves and the values this checkpoint passes it.
+
+{{ decision_reminder }}

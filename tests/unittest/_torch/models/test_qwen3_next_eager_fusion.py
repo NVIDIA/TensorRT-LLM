@@ -20,13 +20,14 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.distributed import AllReduceFusionOp
+from tensorrt_llm._torch.distributed import AllReduceFusionOp, MoEAllReduceParams
 from tensorrt_llm._torch.models.modeling_qwen3_next import (
     Qwen3NextForCausalLM,
     Qwen3NextFullAttentionDecoderLayer,
-    Qwen3NextLinearDecoderLayer,
     Qwen3NextMTP,
+    _DeferredSharedExpertFinalize,
     _eager_fusion_enabled,
+    _Qwen3NextDecoderLayerBase,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import EventType
@@ -35,6 +36,8 @@ from tensorrt_llm._torch.utils import EventType
 def _new_causal_lm() -> Qwen3NextForCausalLM:
     model = Qwen3NextForCausalLM.__new__(Qwen3NextForCausalLM)
     nn.Module.__init__(model)
+    model.spec_config = None
+    model.spec_worker = None
     return model
 
 
@@ -53,6 +56,8 @@ def _new_mtp() -> Qwen3NextMTP:
     model.model_config = SimpleNamespace(
         mapping=SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=True)
     )
+    model.decode_kernels = False
+    model._fc_zero_residual = None
     return model
 
 
@@ -168,18 +173,21 @@ def test_eager_fusion_is_enabled_for_gdn_by_default(monkeypatch) -> None:
 
 
 @torch.no_grad()
-def test_gdn_fusion_has_single_allreduce_owner() -> None:
+def test_pre_moe_allreduce_runs_in_mixer_output_projection() -> None:
+    """With PRE_MOE_FUSION the mixer's output projection owns the pre-MoE all-reduce + residual +
+    post_attention_layernorm; the layer's own all-reduce runs only after the MoE."""
     hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
     residual = torch.randn_like(hidden_states)
-    # Use real RMSNorm modules (lightweight) rather than mocks: their
-    # weight / use_gemma / variance_epsilon are exactly what the fused-norm
-    # path reads. The linear_attn/allreduce/mlp below stay mocks because the
-    # test asserts on *how they are called* (call_count / call_args).
     post_attention_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16, use_gemma=True)
     next_layer_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16, use_gemma=True)
     post_attention_norm.weight.copy_(torch.tensor([-0.5, 0.0, 0.5, 1.0], dtype=torch.bfloat16))
     next_layer_norm.weight.copy_(torch.tensor([0.0, 0.25, 0.5, 0.75], dtype=torch.bfloat16))
-    linear_attn = MagicMock(side_effect=lambda hidden_states, *args, **kwargs: hidden_states)
+    mixer_forward = MagicMock(
+        side_effect=lambda pos, h, md, sm, lora, all_reduce_params, **kw: (
+            h,
+            all_reduce_params.residual,
+        )
+    )
     allreduce = MagicMock(
         side_effect=lambda hidden_states, *, all_reduce_params: (
             hidden_states,
@@ -187,21 +195,26 @@ def test_gdn_fusion_has_single_allreduce_owner() -> None:
         )
     )
     mlp = MagicMock(side_effect=lambda hidden_states, *args, **kwargs: hidden_states)
+    mlp.can_defer_finalize = False
+    mlp.has_shared_expert = False
     layer = SimpleNamespace(
         layer_idx=0,
+        hidden_size=4,
         input_layernorm=MagicMock(),
-        linear_attn=linear_attn,
+        mixer_forward=mixer_forward,
         post_attention_layernorm=post_attention_norm,
         next_layer_layernorm=next_layer_norm,
+        next_layer_input_scale=None,
+        next_layer_reads_bf16=False,
+        allreduce_fp8_payload=False,
         fusion_config=SimpleNamespace(PRE_MOE_FUSION=True, POST_MOE_FUSION=True),
         disable_attn_allreduce=True,
         allreduce=allreduce,
         mlp=mlp,
         mapping=SimpleNamespace(tp_size=2),
-        moe_allreduce=MagicMock(),
     )
 
-    Qwen3NextLinearDecoderLayer.forward(
+    _Qwen3NextDecoderLayerBase.forward(
         layer,
         position_ids=torch.arange(2),
         hidden_states=hidden_states,
@@ -209,26 +222,21 @@ def test_gdn_fusion_has_single_allreduce_owner() -> None:
         residual=residual,
     )
 
-    internal_ar_params = linear_attn.call_args.kwargs["all_reduce_params"]
-    assert not internal_ar_params.enable_allreduce
-
-    # Two module-level allreduces at the layer boundary: pre-MoE and post-MoE.
-    # The GDN linear_attn's own allreduce is disabled (single-owner, asserted
-    # just above), so it does not add a third.
-    assert allreduce.call_count == 2
-    pre_ar_params = allreduce.call_args_list[0].kwargs["all_reduce_params"]
-    post_ar_params = allreduce.call_args_list[1].kwargs["all_reduce_params"]
-    assert pre_ar_params.enable_allreduce
-    assert post_ar_params.enable_allreduce
-    assert pre_ar_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
-    assert post_ar_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
+    mixer_params = mixer_forward.call_args.args[5]
+    assert mixer_params.enable_allreduce
+    assert mixer_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
+    assert mixer_params.residual is residual
     # Exact: norm_weight is the same baked (1+weight) recomputed here.
     torch.testing.assert_close(
-        pre_ar_params.norm_weight,
+        mixer_params.norm_weight,
         (post_attention_norm.weight.float() + 1.0).to(torch.bfloat16),
         atol=0.0,
         rtol=0.0,
     )
+
+    assert allreduce.call_count == 1
+    post_ar_params = allreduce.call_args.kwargs["all_reduce_params"]
+    assert post_ar_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
     torch.testing.assert_close(
         post_ar_params.norm_weight,
         (next_layer_norm.weight.float() + 1.0).to(torch.bfloat16),
@@ -239,3 +247,117 @@ def test_gdn_fusion_has_single_allreduce_owner() -> None:
     mlp_ar_params = mlp.call_args.kwargs["all_reduce_params"]
     assert not mlp_ar_params.enable_allreduce
     assert mlp.call_args.kwargs["do_finalize"]
+
+
+@pytest.mark.parametrize(
+    "model_type,sm,enabled",
+    [
+        ("qwen3_5_moe", 103, True),
+        ("qwen3_5_moe", 100, True),
+        ("qwen3_next", 103, False),
+        ("qwen3_5_moe", 107, False),
+        ("qwen3_5_moe", 90, False),
+    ],
+)
+def test_attention_takes_the_gqa_decode_kernel_on_qwen3_5_sm100_and_sm103(
+    monkeypatch, model_type, sm, enabled
+) -> None:
+    from tensorrt_llm import _utils
+    from tensorrt_llm._torch.models import modeling_qwen3_next
+    from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3Attention
+
+    built = {}
+
+    def record_init(self, *args, **kwargs) -> None:
+        nn.Module.__init__(self)
+        built.update(kwargs)
+
+    monkeypatch.setattr(_utils, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(Qwen3Attention, "__init__", record_init)
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(model_type=model_type),
+        mapping=SimpleNamespace(enable_attention_dp=False),
+    )
+
+    modeling_qwen3_next.Qwen3NextAttention(config, layer_idx=0, fuse_qk_norm_rope=True)
+
+    assert built["use_gqa_decode_fmha"] is enabled
+    assert built["cache_context_plan"] is enabled
+
+
+@pytest.mark.parametrize("can_defer_finalize", [False, True])
+def test_post_moe_allreduce_folds_the_shared_expert(can_defer_finalize) -> None:
+    """Where the MoE-output all-reduce takes the fold, the MoE hands back its routed output with the shared
+    expert and gate logits; a finalized routed output is folded without an expert index."""
+    rows, hidden = 3, 4
+    hidden_states = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    residual = torch.randn_like(hidden_states)
+    next_layer_norm = RMSNorm(hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16, use_gemma=True)
+    routed = torch.randn_like(hidden_states)
+    shared = torch.randn_like(hidden_states)
+    gate = torch.randn(rows, 1, dtype=torch.bfloat16)
+    fc2, topw, perm = torch.randn(8, hidden), torch.rand(rows, 2), torch.zeros(rows, 2)
+
+    def mlp_forward(hidden_states, *args, do_finalize, fold_shared_expert, **kwargs):
+        assert fold_shared_expert
+        assert do_finalize is not can_defer_finalize
+        return _DeferredSharedExpertFinalize(
+            (fc2, topw, perm) if not do_finalize else routed, shared, gate
+        )
+
+    mlp = MagicMock(side_effect=mlp_forward)
+    mlp.can_defer_finalize = can_defer_finalize
+    mlp.has_shared_expert = True
+    allreduce = MagicMock(
+        side_effect=lambda hidden_states, *, all_reduce_params: (
+            hidden_states,
+            all_reduce_params.residual,
+        )
+    )
+    allreduce.supports_moe_fold.return_value = True
+    layer = SimpleNamespace(
+        layer_idx=0,
+        hidden_size=hidden,
+        input_layernorm=MagicMock(),
+        mixer_forward=MagicMock(
+            side_effect=lambda pos, h, md, sm, lora, all_reduce_params, **kw: (
+                h,
+                all_reduce_params.residual,
+            )
+        ),
+        post_attention_layernorm=RMSNorm(
+            hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16, use_gemma=True
+        ),
+        next_layer_layernorm=next_layer_norm,
+        next_layer_input_scale=None,
+        next_layer_reads_bf16=False,
+        allreduce_fp8_payload=False,
+        fusion_config=SimpleNamespace(PRE_MOE_FUSION=True, POST_MOE_FUSION=True),
+        disable_attn_allreduce=True,
+        allreduce=allreduce,
+        mlp=mlp,
+        mapping=SimpleNamespace(tp_size=2),
+    )
+
+    _Qwen3NextDecoderLayerBase.forward(
+        layer,
+        position_ids=torch.arange(rows),
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+        residual=residual,
+    )
+
+    allreduce.supports_moe_fold.assert_called_once_with(rows, hidden)
+    ar_input = allreduce.call_args.args[0]
+    params = allreduce.call_args.kwargs["all_reduce_params"]
+    assert isinstance(params, MoEAllReduceParams)
+    assert params.shared_expert_output is shared
+    assert params.shared_expert_gate is gate
+    if can_defer_finalize:
+        assert ar_input is fc2
+        assert params.expanded_idx_to_permuted_idx is perm
+        assert params.expert_scale_factor is topw
+    else:
+        assert ar_input is routed
+        assert params.expanded_idx_to_permuted_idx is None
+        assert params.expert_scale_factor is None

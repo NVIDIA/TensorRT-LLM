@@ -19,7 +19,7 @@
     updated   = bf16(prefix + bf16(sum_r partial_r))  (or the sum alone without a prefix)
     normed    = KimiK3RMSNorm(attn_res(snapshots..., updated))
 
-as ``o_proj`` followed by ``trtllm::mnnvl_allreduce_attn_res``; the reduction and the epilogue follow
+as ``o_proj`` followed by ``mv2_kimi_k3_vl::mnnvl_allreduce_attn_res``; the reduction and the epilogue follow
 ``oneshotAllreduceAttnResKernel``'s arithmetic (rank chunks of 8, the same statistics, summation orders and
 roundings), so the outputs are bit-identical to that pair.
 

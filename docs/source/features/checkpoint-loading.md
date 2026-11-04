@@ -106,9 +106,25 @@ checkpoint bytes reach host memory:
 - `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
   Node-local ranks issue disjoint background `pread` requests into the Linux
   page cache while the existing mapping, transformation, and H2D path runs.
-  After every rank finishes materialization, speculative read-ahead work that
-  is still queued or active can no longer improve first-token latency and is
-  stopped. A worker already blocked in a synchronous `pread` must finish its
+  The page cache can drop those pages before materialization reads them (for
+  example, when a Lustre client cancels aged DLM locks); when the node then
+  takes major page faults during materialization, the readers re-read their
+  extents. After the first refresh, the minimum delay from a completed refresh
+  to the next refresh is 10 seconds, then 20, 40, and at most 60 seconds.
+  Faults are still sampled every 5 seconds during the cooldown; a qualifying
+  burst queues one refresh for when the cooldown ends. The delay limits
+  refresh frequency, not the total number of refreshes. A warning is logged
+  once when the delay reaches 60 seconds. Before each refresh, the reader
+  rechecks available host memory against the full checkpoint size and startup
+  headroom. If admission fails or the memory probe fails, the refresh remains
+  pending and the check is retried on later polls. A warning is logged once
+  per deferral episode. This is a conservative check, not a memory reservation:
+  resident pages charged to a cgroup can cause deferral even when only a small
+  part of the checkpoint is missing. Normal weight materialization continues
+  while refresh is deferred. After every rank finishes
+  materialization, speculative read-ahead work that is still queued or active
+  can no longer improve first-token latency and is stopped.
+  A worker already blocked in a synchronous `pread` must finish its
   current 8 MiB read before shutdown, so degraded storage can delay the join.
 
 ```yaml

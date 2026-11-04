@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -73,18 +76,17 @@ class RuntimeConfig(BaseModel):
             explicit_cli_keys=self.explicit_cli_keys)
 
         if self.backend == "pytorch":
-            cuda_graph_config = updated_llm_args.pop(
-                "cuda_graph_config", llm_args["cuda_graph_config"])
-            if cuda_graph_config:
-                # Use runtime max_batch_size as cuda_graph_config.max_batch_size
-                # if both max_batch_size and batch_sizes are not set.
-                batch_sizes_set = cuda_graph_config.get("batch_sizes",
-                                                        None) is not None
+            cuda_graph_config = updated_llm_args.get("cuda_graph_config", {})
+            if cuda_graph_config is not None:
+                cuda_graph_config = dict(cuda_graph_config)
+                # Derive defaults from the final YAML/CLI capacity without
+                # mutating the reusable performance options.
+                batch_sizes_set = bool(cuda_graph_config.get("batch_sizes"))
                 max_batch_size_set = cuda_graph_config.get(
                     "max_batch_size", None) is not None
                 if not batch_sizes_set and not max_batch_size_set:
-                    cuda_graph_config[
-                        "max_batch_size"] = self.settings_config.max_batch_size
+                    cuda_graph_config["max_batch_size"] = updated_llm_args[
+                        "max_batch_size"]
             updated_llm_args["cuda_graph_config"] = cuda_graph_config
 
         return updated_llm_args
