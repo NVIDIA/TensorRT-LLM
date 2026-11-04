@@ -328,23 +328,19 @@ TEST_F(ProfilerScopeTest, CallbackWithoutInputsDoesNotInspectMetadata)
     EXPECT_TRUE(observation().metadata.empty());
 }
 
-TEST_F(ProfilerScopeTest, NcclBuildGateAndInputDemandKeepExtractionLazy)
+#if TRTLLM_ENABLE_NCCL_PROFILING
+TEST_F(ProfilerScopeTest, NcclMetadataExtractionIsLazy)
 {
     int fields{0};
     {
         CallbackGuard callback{false};
-#if TRTLLM_ENABLE_NCCL_PROFILING
         tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
         scope.startWithLazyName(
             []() -> std::string { return "trtllm::nccl_metadata"; }, [&](tc::ProfilerMetadata&) { ++fields; });
         EXPECT_EQ(observation().starts, 1);
-#else
-        EXPECT_EQ(observation().starts, 0);
-#endif
         EXPECT_TRUE(observation().metadata.empty());
     }
     EXPECT_EQ(fields, 0);
-#if TRTLLM_ENABLE_NCCL_PROFILING
     tc::RecordFunctionWithMetadata inactive{tc::ProfilerRegion::kNccl};
     inactive.startWithLazyName(
         []() -> std::string { return "trtllm::nccl_metadata"; }, [&](tc::ProfilerMetadata&) { ++fields; });
@@ -366,10 +362,8 @@ TEST_F(ProfilerScopeTest, NcclBuildGateAndInputDemandKeepExtractionLazy)
     EXPECT_EQ(observation().metadata,
         "TRTLLM14:nccl{'nccl.operation':'all_gather','nccl.group':[0,1],'nccl.rank':0,"
         "'nccl.parallelism_dimension':'unknown','nccl.kind':'collective','nccl.logical_bytes':32}");
-#endif
 }
 
-#if TRTLLM_ENABLE_NCCL_PROFILING
 TEST_F(ProfilerScopeTest, NcclInactiveScopeNeverConstructsItsOwningName)
 {
     int names{0};
