@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Multi-rank tests for the async Ulysses A2A op.
 
 Exercises the production ``ulysses_a2a_async_prepare`` / ``ulysses_a2a_async_push``
@@ -13,6 +15,9 @@ surfaces:
    Warms up the slot out-of-capture, then captures a ``torch.cuda.CUDAGraph``
    containing one prepare+async pair, replays it K times with fresh inputs.
    Smoke-tests the cuda_graph path used by the e2e production benchmark.
+
+3. ``test_batch_one_receive_view_lifetime`` — batch-one NHD receive views,
+   repeated slot reuse with a delayed reader, in eager and CUDA graph modes.
 
 Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py -v
@@ -338,3 +343,136 @@ def test_multi_pg():
     so each must yield its own cached ``AsyncUlyssesOp`` instance + slot ring.
     """
     _run(2, _multi_pg_logic)
+
+
+def _receive_view_lifetime_logic(
+    rank: int, world_size: int, capture: bool, with_gates: bool
+) -> None:
+    """Read aliased receives after rank skew, before the next call reuses their slots."""
+    from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
+
+    device = torch.device(f"cuda:{rank}")
+    batch, seq, local_heads, head_dim = 1, 128, 4, 32
+    shape = (batch, seq, world_size * local_heads, head_dim)
+    pg = dist.group.WORLD
+    # One call issues all three slots; each following call reuses all of them.
+    layers, repeats = 8, 4
+    received = []
+
+    class DelayedNHDBackend:
+        preferred_layout = AttentionTensorLayout.NHD
+        num_heads = local_heads
+        num_kv_heads = local_heads
+        head_dim = 32
+
+        def forward(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            **kwargs: torch.Tensor | int,
+        ) -> torch.Tensor:
+            # Confirm that this really exercises receive aliases, not the old copy path.
+            recv_v, recv_q, recv_k = received[-3:]
+            assert q.data_ptr() == recv_q.data_ptr()
+            assert k.data_ptr() == recv_k.data_ptr()
+            assert v.data_ptr() == recv_v.data_ptr()
+            assert kwargs["batch_size"] == batch
+            assert kwargs["seq_len"] == world_size * seq
+            assert kwargs["seq_len_kv"] == world_size * seq
+            # Delay the READ, not just the next issue. Without the reverse collective's
+            # ordering, the faster peer can push the next layer into these same slots.
+            if rank == 0:
+                torch.cuda._sleep(2_000_000)
+            out = q + k + v
+            if with_gates:
+                out = out + kwargs["gate_compress"] + kwargs["gate_fine"]
+            return out
+
+    attention = UlyssesAttention(DelayedNHDBackend(), pg, async_ulysses=True)
+    issue = attention._issue_async
+
+    def record_issue(x: torch.Tensor) -> torch.Tensor:
+        recv = issue(x)
+        received.append(recv)
+        return recv
+
+    attention._issue_async = record_issue
+    inputs = []
+    gates = []
+    for layer in range(layers):
+        # Values stay below bf16's exact-integer range, including all replay updates.
+        inputs.append(
+            tuple(
+                torch.full(shape, 8 * layer + 2 * rank + i, dtype=torch.bfloat16, device=device)
+                for i in range(3)
+            )
+        )
+        gates.append(
+            tuple(torch.full(shape, i, dtype=torch.bfloat16, device=device) for i in (1, 2))
+        )
+
+    def reference() -> list[torch.Tensor]:
+        expected = []
+        for qkv, layer_gates in zip(inputs, gates):
+            q, k, v = (all_to_all_4d(x, 2, 1, pg) for x in qkv)
+            out = q + k + v
+            if with_gates:
+                gc, gf = (all_to_all_4d(x, 2, 1, pg) for x in layer_gates)
+                out = out + gc + gf
+            expected.append(all_to_all_4d(out, 1, 2, pg))
+        return expected
+
+    def run_chain() -> list[torch.Tensor]:
+        outputs = []
+        for qkv, layer_gates in zip(inputs, gates):
+            kwargs = (
+                dict(gate_compress=layer_gates[0], gate_fine=layer_gates[1]) if with_gates else {}
+            )
+            outputs.append(attention.forward_async(*(lambda x=x: x for x in qkv), **kwargs))
+        return outputs
+
+    # Warm every IPC slot, the shared side stream, all NCCL collectives, and tensor ops
+    # before capture. Synchronization is intentionally OUTSIDE the eight-layer chain.
+    for _ in range(2):
+        run_chain()
+    torch.cuda.synchronize()
+    received.clear()
+    graph = None
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = run_chain()
+    for replay in range(repeats):
+        for qkv in inputs:
+            for x in qkv:
+                x.add_(1)
+        expected = reference()
+        if graph is None:
+            received.clear()
+            outputs = run_chain()
+        else:
+            graph.replay()
+        # No intermediate synchronize, clone, reference collective, or host tensor read
+        # occurs between the eight real forward_async calls.
+        torch.cuda.synchronize()
+        for layer, (got, want) in enumerate(zip(outputs, expected)):
+            assert torch.equal(got, want), (
+                f"rank={rank},capture={capture},gates={with_gates},replay={replay},layer={layer}"
+            )
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("with_gates", [False, True])
+def test_batch_one_receive_view_lifetime(capture: bool, with_gates: bool) -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Test requires two GPUs")
+    run_distributed(
+        2,
+        _receive_view_lifetime_logic,
+        capture,
+        with_gates,
+        dist_backend="nccl",
+        preload=("tensorrt_llm",),
+    )

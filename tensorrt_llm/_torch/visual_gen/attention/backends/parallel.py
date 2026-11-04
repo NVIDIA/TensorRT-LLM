@@ -323,9 +323,9 @@ def _compiled_attention_with_replicated_kv_fake(
 
 def post_permute_5d_to_4d(out_5d, P):
     """5D [P, B, Sp, H/P, D] → 4D [B, P*Sp, H/P, D] (block-by-rank gather).
-    .contiguous() copies slot data out (layout-normalize for SDPA, decoupling
-    from IPC slot lifetime). Inductor fuses permute+contig with downstream
-    SDPA input prep."""
+    For contiguous batch-one inputs this is a view; other layouts need a copy.
+    Inductor can fuse layout normalization with downstream SDPA input prep.
+    """
     _P, Bt, Spt, HpP, Dt = out_5d.shape
     return out_5d.permute(1, 0, 2, 3, 4).contiguous().view(Bt, _P * Spt, HpP, Dt)
 
@@ -825,6 +825,9 @@ class UlyssesAttention(AttentionBackend):
         # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
+        # These views may alias the receive-slot ring. Every rank consumes them
+        # before the reverse collective in _output_a2a, whose completion orders
+        # the next call's slot reuse after all peers' reads on the caller stream.
         post_unscatter_is_view = (
             not is_hnd
             and B_q == 1
