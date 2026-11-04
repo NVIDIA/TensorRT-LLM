@@ -284,10 +284,13 @@ def _register_fake():
     @torch.library.register_fake("trtllm::attn_res_add_rmsnorm_persistent_fwd")
     def _(layer_residual: torch.Tensor,
           layer_residual_add: Optional[torch.Tensor],
-          block_residual: torch.Tensor, res_weight: torch.Tensor,
-          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
+          block_residual: torch.Tensor,
+          res_weight: torch.Tensor,
+          rms_weight: torch.Tensor,
+          output_rms_weight: torch.Tensor,
           rms_eps: float,
-          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+          output_rms_eps: float,
+          sm_reserve: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         # Returns (updated_layer_residual, output), both [T, B, H]. The eager
         # implementation returns layer_residual itself as the first result when
         # layer_residual_add is None; that conditional aliasing cannot be

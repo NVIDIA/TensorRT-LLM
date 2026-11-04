@@ -132,7 +132,7 @@ inline bool requiresPrefixCoverage(LifeCycle const& lc)
 
 inline bool allowsCheckpoint(LifeCycle const& lc)
 {
-    return reusePolicy(lc) == ReusePolicy::OPTIONAL;
+    return reusePolicy(lc) == ReusePolicy::OPTIONAL || reusePolicy(lc) == ReusePolicy::SINK_REQUIRED_ONLY;
 }
 
 // Free function: compute stale range via std::visit.
