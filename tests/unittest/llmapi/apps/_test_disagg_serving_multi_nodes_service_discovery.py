@@ -27,7 +27,7 @@ from test_common.socket_utils import recv_exact
 from tensorrt_llm._utils import get_free_port, get_sm_version
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 from .utils import expand_slurm_nodelist
 

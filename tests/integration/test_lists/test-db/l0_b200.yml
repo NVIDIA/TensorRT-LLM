@@ -402,8 +402,9 @@ l0_b200:
   - unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
-  - unittest/_torch/modeling -k "modeling_llama"
-  - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/_torch/modeling/test_modeling_llama.py
+  - unittest/_torch/modeling/test_modeling_llama_min_latency.py
+  - unittest/_torch/modeling/test_modeling_gpt_oss.py
   - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
