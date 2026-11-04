@@ -1735,13 +1735,23 @@ class KimiK3ReasoningParser(BaseReasoningParser):
 
     @classmethod
     def _scan_think(cls, text: str, pos: int, final: bool) -> Optional[Any]:
-        """An ``XtmlItem`` for the think block at `pos`; None/False."""
+        """An ``XtmlItem`` for the think block at `pos`; None/False.
+
+        The body runs to the first tag that can end a section. That is
+        normally the block's own close tag; a block the model left open ends
+        at ``<|close|>tools<|sep|>`` or message-level structure, which is
+        left to the section. With none of them, the text ending inside the
+        block leaves it undecided, or ends it once the text is complete.
+        """
         opened = cls._match_prefix(text, pos, cls._THINK_OPEN, final)
         if not opened:
             return opened
         body_start = pos + len(cls._THINK_OPEN)
-        body_end = text.find(cls._THINK_CLOSE, body_start)
-        if body_end == -1:
+        found = [
+            at for at in (text.find(tag, body_start)
+                          for tag in cls._SECTION_ENDS) if at != -1
+        ]
+        if not found:
             if not final:
                 return None
             return cls.XtmlItem("think",
@@ -1749,9 +1759,13 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                                 len(text),
                                 body_start=body_start,
                                 body_end=len(text))
+        body_end = min(found)
+        end = body_end
+        if text.startswith(cls._THINK_CLOSE, body_end):
+            end += len(cls._THINK_CLOSE)
         return cls.XtmlItem("think",
                             pos,
-                            body_end + len(cls._THINK_CLOSE),
+                            end,
                             body_start=body_start,
                             body_end=body_end)
 

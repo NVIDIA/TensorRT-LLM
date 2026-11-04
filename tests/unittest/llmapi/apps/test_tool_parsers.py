@@ -6782,6 +6782,16 @@ K3_CORPUS = {
         "",
         [("exec", '{"input": "ls"}'), ("exec", '{"input": "pwd"}')],
     ),
+    # A think block the model left open ends where its section does.
+    "unclosed_think_inside_tools_section": (
+        _k3_think("t") + _k3_response("") + K3_BOT + _k3_exec(1, "ls") +
+        f"{K3_OPEN}think{K3_SEP}unclosed thought" + K3_EOT +
+        _k3_response("Answer.") + K3_MESSAGE_END,
+        True,
+        "tunclosed thought",
+        "Answer.",
+        [("exec", '{"input": "ls"}')],
+    ),
     "prose_between_calls": (
         _k3_think("t") + _k3_response("") + _k3_section(
             _k3_exec(1, "ls"), "\nNow the second call:\n", _k3_exec(2, "pwd")) +
@@ -7123,6 +7133,22 @@ class TestKimiK3StreamingMatchesWholeParse:
     def test_pipeline_events_follow_the_generation(self, name, events):
         generation, thinking, *_ = K3_CORPUS[name]
         assert _k3_pipeline_events([generation], thinking) == events
+
+    def test_unclosed_think_in_a_section_does_not_hold_the_stream(self):
+        """The section, and the answer after it, stream before the end.
+
+        Only the trailing message framing is left for ``finish``, and it
+        is stripped.
+        """
+        generation, thinking, reasoning, text, _ = K3_CORPUS[
+            "unclosed_think_inside_tools_section"]
+        parser = _k3_reasoning_parser(thinking)
+        streamed = [parser.parse_delta(char) for char in generation]
+
+        assert "".join(r.reasoning_content for r in streamed) == reasoning
+        assert "".join(r.content for r in streamed).endswith(K3_EOT + text)
+        tail = parser.finish()
+        assert (tail.content, tail.reasoning_content) == ("", "")
 
     @pytest.mark.parametrize("case", range(len(K3_FUZZED)))
     def test_fuzzed_generations_read_the_same_under_every_chunking(self, case):
