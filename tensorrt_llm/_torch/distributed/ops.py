@@ -149,17 +149,24 @@ class LamportWorkspaceView:
         return self.buffer.data_ptr()
 
 
-def _lamport_workspace_view(handle: McastGPUBuffer, uc_buffer: torch.Tensor,
-                            buffer_flags: torch.Tensor, buffer_size_bytes: int,
+def _lamport_workspace_view(workspace: "_MnnvlWorkspace",
                             mapping: Mapping) -> LamportWorkspaceView:
-    """The view of a workspace's mappings; its peer pointer table is a host-to-device copy, so it
-    is built where the workspace is created (eagerly, never during CUDA graph capture). A
-    checkpoint restore maps the workspace at the same addresses, so the view stays valid."""
+    """The view of a workspace's mappings, built on the first pushed call of the workspace. Its
+    peer pointer table is a host-to-device copy, so that call runs eagerly, never during CUDA
+    graph capture (as the workspace's creation and growth do). A checkpoint restore maps the
+    workspace at the same addresses, so the view stays valid."""
+    if workspace["push_view"] is not None:
+        return workspace["push_view"]
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "First pushed MNNVL all-reduce on a workspace during CUDA graph capture: run each "
+            "shape once outside capture first")
+    handle, uc_buffer = workspace["handle"], workspace["uc_buffer"]
     peers = [
         handle.get_uc_buffer(r, (1, ), torch.uint8, 0).data_ptr()
         for r in range(mapping.tp_size)
     ]
-    return LamportWorkspaceView(
+    workspace["push_view"] = LamportWorkspaceView(
         world=mapping.tp_size,
         rank=mapping.tp_rank,
         buffer=uc_buffer,
@@ -167,9 +174,10 @@ def _lamport_workspace_view(handle: McastGPUBuffer, uc_buffer: torch.Tensor,
         peer_ptrs=torch.tensor(peers,
                                dtype=torch.int64,
                                device=uc_buffer.device),
-        flags=buffer_flags,
-        bytes_per_buffer=buffer_size_bytes,
+        flags=workspace["buffer_flags"],
+        bytes_per_buffer=workspace["buffer_size_bytes"],
     )
+    return workspace["push_view"]
 
 
 class _MnnvlWorkspace(TypedDict):
@@ -183,8 +191,9 @@ class _MnnvlWorkspace(TypedDict):
     # Set once the workspace is handed out during CUDA graph capture: the captured graphs launch on its buffers and
     # flags, so a larger workspace that replaces it must keep it alive.
     captured: bool
-    # Device addresses of the workspace for pushed all-reduces (MNNVLAllReduce.push_target).
-    push_view: LamportWorkspaceView
+    # Device addresses of the workspace for pushed all-reduces (MNNVLAllReduce.push_target),
+    # built on the first of them.
+    push_view: Optional[LamportWorkspaceView]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -566,9 +575,6 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 dtype=torch.uint32,
                 device=torch.device("cuda", _mnnvl_device_index(mapping)),
             )
-            push_view = _lamport_workspace_view(mcast_buf_handle, buffer,
-                                                buffer_flags, buffer_size_bytes,
-                                                mapping)
             candidate_workspace = {
                 "handle": mcast_buf_handle,
                 "uc_buffer": buffer,
@@ -576,7 +582,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 "buffer_size_bytes": buffer_size_bytes,
                 "comm": comm,
                 "captured": False,
-                "push_view": push_view,
+                "push_view": None,
             }
         except Exception as error:
             candidate_error = error
@@ -1598,10 +1604,10 @@ class MNNVLAllReduce(nn.Module):
             device=workspace["uc_buffer"].device)
         residual_output = None if norm_params is None else torch.empty_like(
             output)
-        return MnnvlPushTarget(workspace["push_view"], num_tokens, hidden_dim,
-                               one_shot, in_place, output, consumer_finishes,
-                               all_gather, sum_chunk, sanitize_sum, norm_params,
-                               residual_output)
+        return MnnvlPushTarget(_lamport_workspace_view(workspace, self.mapping),
+                               num_tokens, hidden_dim, one_shot, in_place,
+                               output, consumer_finishes, all_gather, sum_chunk,
+                               sanitize_sum, norm_params, residual_output)
 
     @staticmethod
     def _norm_finish_applies(num_tokens: int, hidden_dim: int,
