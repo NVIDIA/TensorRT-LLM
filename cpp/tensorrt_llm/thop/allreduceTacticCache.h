@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>
@@ -82,7 +83,15 @@ public:
         std::unique_lock lock(mMutex);
         if (mBuckets.empty() || mBuckets.back() != maxNumTokens)
         {
-            mBuckets = makeAllReduceTuningBuckets(maxNumTokens);
+            auto buckets = makeAllReduceTuningBuckets(maxNumTokens);
+            if (!mTactics.empty())
+            {
+                TLLM_LOG_WARNING(
+                    "Changing the process-wide AllReduce tuning ceiling from %lld to %lld tokens clears "
+                    "previously measured tactics. Operations without new measurements will use fallback tactics.",
+                    static_cast<long long>(mBuckets.back()), static_cast<long long>(maxNumTokens));
+            }
+            mBuckets = std::move(buckets);
             mTactics.clear();
         }
         return mBuckets;

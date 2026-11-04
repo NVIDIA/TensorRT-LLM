@@ -41,7 +41,7 @@ if(${BUILD_PYT})
     SOURCES
     allreduceTacticCacheTest.cpp
     LINK_LIBRARIES
-    tllm::common_headers
+    tllm::common_logging
     ${TORCH_LIBRARIES}
     CUDA::cudart
     LABELS
