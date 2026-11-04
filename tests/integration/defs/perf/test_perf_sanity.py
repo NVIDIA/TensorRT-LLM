@@ -1672,8 +1672,10 @@ def reserve_multi_frontend_port(host: str) -> int:
     probe fails with EADDRINUSE against a bound socket that did not set
     SO_REUSEADDR, so this one sets it too; another server still fails the probe,
     because its sockets are listening. So the reservation is transparent to the
-    server while still refusing a plain bind() from any unrelated process on the
-    node.
+    server while still refusing a bind() without SO_REUSEADDR from an unrelated
+    process on the node. The reservation is not exclusive: a process that sets
+    SO_REUSEADDR can bind the port too, and if it then listens, the launcher's
+    probe fails loudly.
 
     The socket is deliberately never listen()ed: only *listening* SO_REUSEPORT
     sockets join the kernel's accept load-balancing group, so a bound-only socket
