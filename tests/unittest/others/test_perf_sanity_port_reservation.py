@@ -91,6 +91,10 @@ def test_reserved_port_passes_the_launcher_probe(harness, serve):
         with _frontend_socket() as frontend:
             frontend.bind((_HOST, port))
             frontend.listen()
+            # The other frontends join the same port while the first listens.
+            with _frontend_socket() as second_frontend:
+                second_frontend.bind((_HOST, port))
+                second_frontend.listen()
     finally:
         lock.close()
 
