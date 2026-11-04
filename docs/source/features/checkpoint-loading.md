@@ -152,6 +152,12 @@ Sessionless compatibility is a separate structural fallback:
   structural fallback is reported at info level even for an explicit
   `rank_striped_read_ahead` request.
 
+The lazy Kimi-Linear routed-expert stream reads each checkpoint shard with
+large `pread` calls into pinned host memory, independent of
+`checkpoint_io_policy`, then drops the shard from the page cache. Set
+`TLLM_K3_DISABLE_PINNED_SHARD_READ=1` to stream those shards through the
+SafeTensors memory map instead.
+
 Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
 loading, raw-weight caching, layer overrides, insufficient host-memory
 headroom, and `.bin`/`.pth` select native materialization before readers start
