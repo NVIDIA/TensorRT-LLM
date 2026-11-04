@@ -134,6 +134,26 @@ class SamplerStoreWriter(Protocol):
         """
 
 
+class OverlapOffsetsApplier(Protocol):
+    """Applies the overlap scheduler's two input corrections of a speculative decode step.
+
+    ``_preprocess_inputs`` adds the previous step's accepted-token offsets to the
+    generation rows' position ids and KV lengths with two in-place adds. An
+    applier may issue both as one launch; on False the call site runs its two
+    original statements.
+    """
+
+    def apply(
+        self,
+        position_ids: "torch.Tensor",
+        position_offsets: "torch.Tensor",
+        kv_lens: "torch.Tensor",
+        kv_lens_offsets: "torch.Tensor",
+    ) -> bool:
+        """Issue ``position_ids += position_offsets`` and ``kv_lens += kv_lens_offsets``
+        (equal-length int32 views), or return False, having issued nothing."""
+
+
 @dataclass(frozen=True)
 class RuntimeHooks:
     """The step-loop hooks a model opts into. All off by default."""
@@ -151,6 +171,9 @@ class RuntimeHooks:
     # cross-stream wait between two forwards. Every dependency the waits expressed holds
     # on one stream, so only overlap between the two streams is given up.
     step_loop_on_execution_stream: bool = False
+    # The overlap scheduler's position-id and KV-length corrections of a speculative decode
+    # step issued by the model's applier (see OverlapOffsetsApplier) instead of two adds.
+    overlap_offsets_applier: Optional[OverlapOffsetsApplier] = None
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()

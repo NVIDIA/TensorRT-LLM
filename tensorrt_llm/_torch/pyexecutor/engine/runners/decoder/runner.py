@@ -2730,7 +2730,27 @@ class DecoderRunner(ScheduledModelRunner):
                 num_ctx_tokens = inputs["attn_metadata"].num_ctx_tokens
                 num_chunked_ctx_requests = inputs["attn_metadata"].num_chunked_ctx_requests
                 previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
-                if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
+                # A model's applier (RuntimeHooks.overlap_offsets_applier) may issue both
+                # corrections of the generation rows below as one launch.
+                applier = self.runtime_hooks.overlap_offsets_applier
+                applied = (
+                    applier is not None
+                    and inputs["position_ids"].ndim == 2
+                    and hasattr(inputs["attn_metadata"], "kv_lens_cuda")
+                    and not (
+                        num_ctx_requests >= num_chunked_ctx_requests
+                        and num_chunked_ctx_requests > 0
+                    )
+                    and applier.apply(
+                        inputs["position_ids"][0, num_ctx_tokens:],
+                        self.previous_pos_id_offsets_cuda[:previous_batch_tokens],
+                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs],
+                        self.previous_kv_lens_offsets_cuda[:num_gen_requests],
+                    )
+                )
+                if applied:
+                    pass
+                elif inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
                     inputs["position_ids"][:, :, num_ctx_tokens:] += (
                         self.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
@@ -2739,7 +2759,9 @@ class DecoderRunner(ScheduledModelRunner):
                         :previous_batch_tokens
                     ]
 
-                if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
+                if applied:
+                    inputs["attn_metadata"].on_update_kv_lens()
+                elif hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
                     if (
                         num_ctx_requests >= num_chunked_ctx_requests
                         and num_chunked_ctx_requests > 0
