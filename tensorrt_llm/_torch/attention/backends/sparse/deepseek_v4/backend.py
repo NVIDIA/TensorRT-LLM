@@ -427,11 +427,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             # layer shares it, so a selected compressed row the high layer holds is read from the
             # high layer's row instead of the pool's row.
             num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
-            compressed = global_indices[:, -num_compressed_indices:]
-            compressed.copy_(
-                mixed_precision_high_row_indices(
-                    metadata, self, compressed_local_indices, compressed, req_id
-                )
+            mixed_precision_high_row_indices(
+                metadata,
+                self,
+                compressed_local_indices,
+                global_indices[:, -num_compressed_indices:],
+                req_id,
             )
             return global_indices, None
 

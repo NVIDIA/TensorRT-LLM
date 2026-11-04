@@ -511,7 +511,7 @@ def mixed_precision_high_row_indices(
     topk_indices_global: torch.Tensor,
     requests: torch.Tensor,
 ) -> torch.Tensor:
-    """Point the selected positions the mixed-precision high pool holds at its rows.
+    """Point the selected positions the mixed-precision high pool holds at its rows, in place.
 
     On a plain pool (DSA's K pool, a DeepSeek-V4 COMPRESS pool) the mixed-precision high pool
     shares the pool's memory (the manager checks the layout), so its rows have row indices like
@@ -522,11 +522,11 @@ def mixed_precision_high_row_indices(
         attention: Attention layer whose mixed-precision high pool supplies the rows.
         topk_indices: `[num_rows, topk]` int32 KV positions each query token selected, -1 for
             none; contiguous in the last dimension.
-        topk_indices_global: `[num_rows, topk]` int32 pool rows of those positions.
+        topk_indices_global: `[num_rows, topk]` int32 pool rows of those positions; rewritten.
         requests: `[num_rows]` int32 batch index of each query token's request.
 
     Returns:
-        `[num_rows, topk]` int32 pool rows, with the held positions redirected.
+        `topk_indices_global`, with the held positions redirected.
     """
     block_table = metadata.mixed_precision_high_block_table
     if isinstance(block_table, dict):
@@ -549,4 +549,4 @@ def mixed_precision_high_row_indices(
     high_rows = torch.ops.trtllm.convert_req_index_to_global(
         requests, block_table, topk_indices, rows_per_page, topk, rows_per_page, layer_offset
     )
-    return torch.where(high_rows >= 0, high_rows, topk_indices_global)
+    return torch.where(high_rows >= 0, high_rows, topk_indices_global, out=topk_indices_global)
