@@ -249,12 +249,13 @@ class DSATrtllmAttention(TrtllmAttention):
 
         topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
-        if (
-            kv_cache_dtype != tensorrt_llm.bindings.DataType.NVFP4
-            and metadata.has_mixed_precision_high_rows
+        manager = metadata.kv_cache_manager
+        if metadata.has_mixed_precision_high_rows and (
+            manager.mixed_precision_low_dtype == manager.mixed_precision_high_dtype
         ):
-            # Plain pool: a position the mixed-precision high pool holds is read from that
-            # pool's row, which lives in the same pool.
+            # The history pool keeps the high precision (cold-page first/last-N) and the high
+            # layer shares that pool, so a selected token the high layer holds is read from the
+            # high layer's row instead of the history row.
             requests = (
                 metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens]
                 if is_generation
@@ -305,6 +306,10 @@ class DSATrtllmAttention(TrtllmAttention):
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 
+        if metadata.has_mixed_precision_high_rows:
+            raise NotImplementedError(
+                f"No DSA read path for mixed-precision high rows with a {kv_cache_dtype} pool"
+            )
         return topk_indices_global, None
 
     def _remap_topk_to_global(

@@ -3,7 +3,6 @@
 """Control-plane tests for NVFP4 cold-page compression."""
 
 import json
-from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1394,29 +1393,6 @@ def test_mixed_precision_high_window_comes_from_the_config() -> None:
     assert provider.mixed_precision_high_window == (64, 0)
     assert config.mixed_precision_high_window == (64, 0)
     assert ColdPageQuantizationCompressionConfig().mixed_precision_high_window is None
-
-
-def test_mixed_precision_high_layers_stay_out_of_the_codec() -> None:
-    """Mixed-precision high layers are not provider-owned; the native codec migrates them unchanged."""
-
-    @dataclass
-    class _Config:
-        tokens_per_block: int
-        layers: tuple
-
-    cache_config = _Config(64, _cache_config((0, "attn"), (1, "attn"), (2, "attn")).layers)
-    native, _ = _native()
-    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager().create_cold_page_codec(
-            cache_config,
-            runtime_dtype=DataType.BF16,
-            pp_layers=(0, 1),
-            num_kv_heads_per_layer=(1, 1),
-            head_dim_per_layer=(16, 16),
-            mixed_precision_high_layers=(2,),
-        )
-    assert _codec_state(native).layer_ids == (0, 1)
-    assert sorted(layout.layer_id for layout in _layouts(native)) == [0, 1]
 
 
 # --- skip_rope_quantization ---------------------------------------------------------------------

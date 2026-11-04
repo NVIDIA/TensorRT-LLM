@@ -2,7 +2,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Common runtime pipeline for cold-page quantization."""
 
-from dataclasses import replace
 from typing import Any, Optional, Sequence
 
 from ...pyexecutor.resource_manager import DataType, KVCacheCompressionManager
@@ -16,7 +15,7 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
 
     @property
     def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
-        """The first/last-N tokens the config keeps at the active precision."""
+        """``(first_n, last_n)`` from the config, else None."""
         return getattr(self.config, "mixed_precision_high_window", None)
 
     def create_cold_page_codec(
@@ -28,25 +27,11 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-        mixed_precision_high_layers: Sequence[int] = (),
     ) -> object:
-        """Create one native codec with state isolated to this KVCM.
-
-        The mixed-precision high layers stay out of the codec: the native codec migrates
-        the lifecycles it does not own unchanged, which keeps those tokens at the active
-        precision in the cold tiers.
-        """
+        """Create one native codec with state isolated to this KVCM."""
 
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
 
-        if mixed_precision_high_layers:
-            excluded = {int(layer) for layer in mixed_precision_high_layers}
-            cache_config = replace(
-                cache_config,
-                layers=[
-                    layer for layer in cache_config.layers if int(layer.layer_id) not in excluded
-                ],
-            )
         codec_state = self.build_codec_state(
             cache_config,
             runtime_dtype=runtime_dtype,

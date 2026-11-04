@@ -647,10 +647,15 @@ class DSACacheManagerV2(KVCacheManagerV2):
             if int(address) != int(expected_address):
                 raise ValueError("DSA requires contiguous per-layer K pages in each slot")
 
-        # A plain pool keeps each mixed-precision high layer in the same pool as its layer, so
-        # sparse attention reads a held row by the high layer's row index.
+        # With the cold-page first/last-N window the history keeps the high precision, so each
+        # mixed-precision high layer has the same page as its layer and sits in this K pool.
+        # Record its page offset in the slot: sparse attention reads a token the high layer
+        # holds from that row.
         self.mixed_precision_high_layer_offsets = {}
-        if self.dtype != DataType.NVFP4:
+        if (
+            self.mixed_precision_high_layers
+            and self.mixed_precision_low_dtype == self.mixed_precision_high_dtype
+        ):
             for local_layer_idx, high_layer in self.mixed_precision_high_layers.items():
                 converter = self.impl.get_page_index_converter(high_layer, Role.KEY)
                 address = self.impl.get_mem_pool_base_address(
