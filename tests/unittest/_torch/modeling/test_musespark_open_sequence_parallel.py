@@ -22,6 +22,8 @@ from torch import nn
 
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.distributed import AllReduce, allgather, reducescatter
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.models import modeling_musespark_open
 from tensorrt_llm._torch.models.modeling_musespark_open import (
     LayerNvtx,
     MuseSparkOpenAttention,
@@ -31,6 +33,8 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
     MuseSparkOpenMoE,
     MuseSparkOpenRMSNormWeightFirst,
     _pad_sequence_parallel_tokens,
+    _prefill_sp_min_tokens,
+    _reserve_mnnvl_all_reduce_workspace,
 )
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -116,10 +120,13 @@ def test_sequence_parallel_padding_preserves_rows() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("tokens,contexts", [(128, 1), (4097, 0), (4097, 1), (8193, 1)])
+@pytest.mark.parametrize("tokens,contexts", [(128, 1), (2049, 1), (4097, 0), (4097, 1), (8193, 1)])
 @pytest.mark.parametrize("projection", ["default", "padding", "overlap"])
+@pytest.mark.parametrize("min_tokens", [4096, 2048])
 @torch.no_grad()
-def test_prefill_model_boundary_shards(tokens: int, contexts: int, projection: str) -> None:
+def test_prefill_model_boundary_shards(
+    tokens: int, contexts: int, projection: str, min_tokens: int
+) -> None:
     if mpi_world_size() != 4:
         pytest.skip("Requires four MPI ranks")
     rank = mpi_rank()
@@ -133,6 +140,7 @@ def test_prefill_model_boundary_shards(tokens: int, contexts: int, projection: s
     model.m_emb = 1.0
     model._sp_mapping = mapping
     model._prefill_sp_enabled = False
+    model._prefill_sp_min_tokens = min_tokens
     model.embed_norm = RMSNorm(
         hidden_size=256, eps=1e-5, dtype=torch.bfloat16, has_weights=False
     ).cuda()
@@ -202,7 +210,7 @@ def test_prefill_model_boundary_shards(tokens: int, contexts: int, projection: s
         model._prefill_sp_enabled = True
         actual = model(attn_metadata=metadata, inputs_embeds=inputs)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        enabled = contexts > 0 and tokens >= 4096
+        enabled = contexts > 0 and tokens >= min_tokens
         assert attn_calls[-2:] == [(tokens, enabled)] * 2
         assert ffn_rows[-2:] == [((tokens + 3) // 4 if enabled else tokens)] * 2
 
@@ -319,3 +327,113 @@ def test_dense_projection_callback_stays_out_of_backend_arguments() -> None:
     custom = module(None, inputs, metadata, output_projection=lambda value: value * 2)
     torch.testing.assert_close(baseline, inputs * 6, rtol=0, atol=0)
     torch.testing.assert_close(custom, inputs * 4, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, 4096),
+        ("", 4096),
+        ("2048", 2048),
+        ("1024", 1024),
+        ("1023", 4096),
+        ("512", 4096),
+        ("0", 4096),
+        ("many", 4096),
+    ],
+)
+def test_prefill_sp_min_tokens_from_env(monkeypatch, value, expected: int) -> None:
+    if value is None:
+        monkeypatch.delenv("MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS", value)
+    assert _prefill_sp_min_tokens() == expected
+
+
+def _reducer_layer(o_proj_mapping, moe_mapping) -> SimpleNamespace:
+    """A decoder layer reduced to the all-reduce modules the MNNVL reservation reads."""
+
+    def reducer(mapping):
+        mnnvl = None if mapping is None else SimpleNamespace(mapping=mapping, dtype=torch.bfloat16)
+        return SimpleNamespace(mnnvl_allreduce=mnnvl)
+
+    return SimpleNamespace(
+        self_attn=SimpleNamespace(
+            o_proj=SimpleNamespace(all_reduce=reducer(o_proj_mapping), out_features=8192)
+        ),
+        feed_forward=SimpleNamespace(all_reduce=reducer(moe_mapping), expert_hidden_size=4096),
+    )
+
+
+@pytest.mark.parametrize("moe_mnnvl", [False, True], ids=["moe_nccl", "moe_mnnvl"])
+def test_mnnvl_reservation_uses_each_reducer_mapping(monkeypatch, moe_mnnvl: bool) -> None:
+    # The attention output projection builds its own mapping without expert
+    # parallelism, so it keys a different shared workspace than the model mapping.
+    model_mapping = Mapping(world_size=4, rank=0, gpus_per_node=4, tp_size=4, moe_ep_size=4)
+    o_proj_mapping = Mapping(world_size=4, rank=0, gpus_per_node=4, tp_size=4)
+    assert o_proj_mapping != model_mapping
+    calls = []
+    monkeypatch.setattr(
+        modeling_musespark_open,
+        "get_or_scale_allreduce_mnnvl_workspace",
+        lambda mapping, dtype, buffer_size_bytes: calls.append((mapping, dtype, buffer_size_bytes)),
+    )
+    layers = [
+        _reducer_layer(o_proj_mapping, model_mapping if moe_mnnvl else None) for _ in range(3)
+    ]
+    _reserve_mnnvl_all_reduce_workspace(layers, 16384)
+    expected = [
+        (
+            o_proj_mapping,
+            torch.bfloat16,
+            MNNVLAllReduce.get_required_workspace_size(16384, 8192, 4, torch.bfloat16),
+        )
+    ]
+    if moe_mnnvl:
+        expected.append(
+            (
+                model_mapping,
+                torch.bfloat16,
+                MNNVLAllReduce.get_required_workspace_size(16384, 4096, 4, torch.bfloat16),
+            )
+        )
+    assert calls == expected
+
+
+def test_mnnvl_reservation_skips_non_mnnvl_reducers(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        modeling_musespark_open,
+        "get_or_scale_allreduce_mnnvl_workspace",
+        lambda *args, **kwargs: calls.append(args),
+    )
+    _reserve_mnnvl_all_reduce_workspace([_reducer_layer(None, None)], 16384)
+    assert calls == []
+
+
+def test_mnnvl_reservation_runs_once_outside_capture(monkeypatch) -> None:
+    # The reservation waits for the first forward that is not captured, then
+    # never runs again; with the split off nothing is pending.
+    calls = []
+    capturing = [True]
+    monkeypatch.setattr(
+        modeling_musespark_open,
+        "_reserve_mnnvl_all_reduce_workspace",
+        lambda layers, tokens: calls.append((layers, tokens)),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    model = SimpleNamespace(layers="layers", _mnnvl_reserve_tokens=16384)
+    MuseSparkOpenModel._reserve_mnnvl_workspaces_once(model)
+    assert calls == [] and model._mnnvl_reserve_tokens == 16384
+    capturing[0] = False
+    MuseSparkOpenModel._reserve_mnnvl_workspaces_once(model)
+    MuseSparkOpenModel._reserve_mnnvl_workspaces_once(model)
+    assert calls == [("layers", 16384)] and model._mnnvl_reserve_tokens is None
+    assert MuseSparkOpenModel._mnnvl_reserve_tokens is None
+
+
+def test_split_off_keeps_the_default_threshold_and_no_reservation() -> None:
+    # Without MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL the constructor reads neither the
+    # threshold nor sets a reservation: the class defaults stand.
+    assert MuseSparkOpenModel._prefill_sp_min_tokens == 4096
+    assert MuseSparkOpenModel._mnnvl_reserve_tokens is None
