@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 __all__ = [
     "WatermarkHandler",
     "WatermarkRows",
+    "WatermarkSpecState",
     "request_carries_watermark",
     "request_wants_watermark",
 ]
@@ -555,3 +556,66 @@ class WatermarkHandler:
             from_probs=from_probs,
             skip=self._skip,
         )
+
+
+@dataclass
+class WatermarkSpecState:
+    """What one-model speculative decoding keeps of the watermark, per engine.
+
+    Created with the deploy-time settings; ``prepare`` allocates the device state once the
+    slot pool is known.
+
+    Attributes:
+        config: The engine's watermark configuration.
+        max_seq_len: Sizes the per-slot context state.
+        handler: Per-slot context state and the keyed sampling steps.
+        enabled: ``[max_num_requests]`` bool, rewritten every step: the requests whose tokens
+            carry a watermark in it (sampling, not greedy, not opted out, and sampling a token
+            this step).
+        keys_drafts: Whether draft tokens are drawn under the watermark key. Only dual-key
+            watermarking with rejection sampling does: the draft token must come from the
+            draft distribution under one key and the token after the accepted prefix from the
+            target under another, which keeps rejection sampling exact.
+        drafts: With ``keys_drafts``, the drafts of the current step as target-vocabulary ids,
+            ``[max_num_requests, max_draft_len]`` int64.
+        draft_seeds: With ``keys_drafts``, the seeds the drafts were drawn with (same shape as
+            ``drafts``), so that the next draft token continues from the right context.
+    """
+
+    config: "WatermarkConfig"
+    max_seq_len: int = 0
+    handler: Optional[WatermarkHandler] = None
+    enabled: Optional[torch.Tensor] = None
+    keys_drafts: bool = False
+    drafts: Optional[torch.Tensor] = None
+    draft_seeds: Optional[torch.Tensor] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.handler is not None
+
+    def prepare(
+        self,
+        *,
+        num_slots: int,
+        max_num_requests: int,
+        max_draft_len: int,
+        use_rejection_sampling: bool,
+        device: str = "cuda",
+    ) -> None:
+        """Allocate the device state. Idempotent; a no-op without slots."""
+        if self.ready or num_slots <= 0:
+            return
+        self.keys_drafts = self.config.algorithm == "gumbel_dual_key" and use_rejection_sampling
+        self.handler = WatermarkHandler(
+            self.config,
+            max_num_sequences=num_slots,
+            max_seq_len=self.max_seq_len or 1 << 20,
+            device=device,
+        )
+        self.enabled = torch.zeros(max_num_requests, dtype=torch.bool, device=device)
+        if self.keys_drafts:
+            self.drafts = torch.zeros(
+                (max_num_requests, max(max_draft_len, 1)), dtype=torch.int64, device=device
+            )
+            self.draft_seeds = torch.zeros_like(self.drafts)

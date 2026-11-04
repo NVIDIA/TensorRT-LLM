@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
                                        match_nemotron_h_layer_types)
 from ..pyexecutor.sampler import TorchSampler
+from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
@@ -363,8 +364,9 @@ def get_spec_metadata(spec_config,
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
         metadata.temperature_only_graphs = temperature_only_graphs
-        metadata.watermark_config = watermark_config
-        metadata.watermark_max_seq_len = max_seq_len
+        if watermark_config is not None:
+            metadata.watermark = WatermarkSpecState(watermark_config,
+                                                    max_seq_len=max_seq_len)
     return metadata
 
 

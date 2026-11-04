@@ -36,8 +36,6 @@ from ..pyexecutor import step_inputs
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
-    from tensorrt_llm.watermark.config import WatermarkConfig
-
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
@@ -51,7 +49,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
-from ..pyexecutor.sampler.watermark import WatermarkHandler
+from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from .fused_accept import MAX_DRAFT_LEN, fused_strict_accept
 from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
@@ -657,19 +655,9 @@ class SpecMetadata:
     # Whether the occurrence penalties are enabled (deploy-time; from
     # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
     enable_penalty: bool = False
-    # Text watermarking (deploy-time; from TorchLlmArgs.watermark_config). The handler keeps
-    # the per-slot context state and is created by prepare_watermark_buffers.
-    watermark_config: Optional["WatermarkConfig"] = None
-    watermark_max_seq_len: int = 0
-    watermark_handler: Optional[WatermarkHandler] = None
-    # [max_num_requests] bool, rewritten every step: the requests whose tokens carry a
-    # watermark in it (sampling, not greedy, not opted out, and sampling a token this step).
-    watermark_enabled: Optional[torch.Tensor] = None
-    # Dual-key watermarking with rejection sampling: the drafts of the current step (target
-    # vocabulary ids) and the seeds they were drawn with, so that the next draft token
-    # continues from the right context. Shape [max_num_requests, max_draft_len], int64.
-    watermark_drafts: Optional[torch.Tensor] = None
-    watermark_draft_seeds: Optional[torch.Tensor] = None
+    # Text watermarking: set from TorchLlmArgs.watermark_config, None when it is off. Its device
+    # state is allocated by prepare_watermark_buffers.
+    watermark: Optional[WatermarkSpecState] = None
     # Occurrence-penalty device state; None until prepare_penalty_buffers runs.
     # See penalty_ops.PenaltyState for what each buffer holds and why the prompt is
     # split from generated tokens.
@@ -1080,43 +1068,26 @@ class SpecMetadata:
         Sized and indexed like the penalty buffers (see ``prepare_penalty_buffers``): the slot
         pool is ``num_seq_slots`` plus one scratch row for dummy/padding requests.
         """
-        if self.watermark_config is None or self.watermark_handler is not None:
+        if self.watermark is None or self.watermark.ready:
             return
         slot_capacity = self.num_seq_slots or self.max_num_requests
-        if slot_capacity <= 0:
+        self.watermark.prepare(
+            num_slots=slot_capacity,
+            max_num_requests=self.max_num_requests,
+            max_draft_len=self.max_draft_len,
+            use_rejection_sampling=self.use_rejection_sampling)
+        if not self.watermark.ready:
             return
-        self.watermark_handler = WatermarkHandler(
-            self.watermark_config,
-            max_num_sequences=slot_capacity,
-            max_seq_len=self.watermark_max_seq_len or 1 << 20,
-            device='cuda')
         self.dummy_slot_row = slot_capacity
         if self.batch_slot_ids is None and self.max_num_requests > 0:
             self.batch_slot_ids = torch.empty((self.max_num_requests, ),
                                               dtype=torch.long,
                                               device='cuda')
-        self.watermark_enabled = torch.zeros(self.max_num_requests,
-                                             dtype=torch.bool,
-                                             device='cuda')
-        if self.watermark_keys_drafts:
-            num_steps = max(self.max_draft_len, 1)
-            self.watermark_drafts = torch.zeros(
-                (self.max_num_requests, num_steps),
-                dtype=torch.int64,
-                device='cuda')
-            self.watermark_draft_seeds = torch.zeros_like(self.watermark_drafts)
 
     @property
-    def watermark_keys_drafts(self) -> bool:
-        """Whether draft tokens are drawn under the watermark key.
-
-        Only dual-key watermarking with rejection sampling does: the draft token must come
-        from the draft distribution under one key and the token after the accepted prefix
-        from the target under another, which keeps rejection sampling exact.
-        """
-        return (self.watermark_config is not None
-                and self.watermark_config.algorithm == "gumbel_dual_key"
-                and self.use_rejection_sampling)
+    def watermark_ready(self) -> bool:
+        """Whether the watermark's device state exists (it is configured and prepared)."""
+        return self.watermark is not None and self.watermark.ready
 
     def _populate_watermark_params(self, requests):
         """Reset the state of new slot occupants and flag which requests carry a watermark.
@@ -1124,9 +1095,10 @@ class SpecMetadata:
         Runs on the host before the forward. A request that is still prefilling in chunks
         samples nothing in this step and must not advance its context.
         """
-        handler = self.watermark_handler
-        if handler is None:
+        state = self.watermark
+        if not self.watermark_ready:
             return
+        handler = state.handler
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
         def samples_a_token(request) -> bool:
@@ -1141,11 +1113,11 @@ class SpecMetadata:
             samples_a_token(r) and handler.is_enabled(r.py_seq_slot)
             for r in requests
         ]
-        flags += [False] * (self.watermark_enabled.shape[0] - len(flags))
-        self.watermark_enabled.copy_(torch.tensor(flags,
-                                                  dtype=torch.bool,
-                                                  pin_memory=prefer_pinned()),
-                                     non_blocking=True)
+        flags += [False] * (state.enabled.shape[0] - len(flags))
+        state.enabled.copy_(torch.tensor(flags,
+                                         dtype=torch.bool,
+                                         pin_memory=prefer_pinned()),
+                            non_blocking=True)
 
     @staticmethod
     def _request_prompt_tokens(request):
@@ -1632,8 +1604,7 @@ class SpecMetadata:
         # draft-sampler time to scatter draft probs by slot. The penalties need the
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling or self.enable_penalty
-                or self.watermark_handler
-                is not None) and self.batch_slot_ids is not None:
+                or self.watermark_ready) and self.batch_slot_ids is not None:
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
@@ -2794,8 +2765,8 @@ class SpecWorkerBase(nn.Module, ABC):
             vocab = probs.shape[-1]
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
-            if (spec_metadata.watermark_handler is not None
-                    and spec_metadata.watermark_keys_drafts):
+            if (spec_metadata.watermark_ready
+                    and spec_metadata.watermark.keys_drafts):
                 draft_tokens = self._watermark_draft_step(
                     spec_metadata, batch_size, draft_step, draft_tokens, probs)
         else:
@@ -3082,7 +3053,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=offset,
             )
 
-            if spec_metadata.watermark_handler is not None:
+            if spec_metadata.watermark_ready:
                 # The kernel decides which drafts are accepted and draws the token that
                 # follows them. Redraw that token under the watermark's second key so the
                 # output distribution stays the target's (see keyed_recovery).
@@ -3121,7 +3092,7 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:] = torch.minimum(
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
-        if spec_metadata.watermark_handler is not None:
+        if spec_metadata.watermark_ready:
             self._commit_watermark(spec_metadata,
                                    (context_plan, generation_plan),
                                    accepted_tokens,
@@ -3302,13 +3273,13 @@ class SpecWorkerBase(nn.Module, ABC):
         draft-vocabulary ids, but the random numbers are indexed by target-vocabulary id (what
         the detector sees), so the draft-to-target map is passed along.
         """
-        handler = spec_metadata.watermark_handler
+        handler = spec_metadata.watermark.handler
         slots = spec_metadata.batch_slot_ids[:batch_size]
-        enabled = spec_metadata.watermark_enabled[:batch_size]
+        enabled = spec_metadata.watermark.enabled[:batch_size]
         seeds, active = handler.plan_draft_step(
             slots, enabled,
-            spec_metadata.watermark_drafts[:batch_size, :draft_step],
-            spec_metadata.watermark_draft_seeds[:batch_size, :draft_step])
+            spec_metadata.watermark.drafts[:batch_size, :draft_step],
+            spec_metadata.watermark.draft_seeds[:batch_size, :draft_step])
         id_map = None
         if self._d2t is not None:
             id_map = self._d2t.data.to(torch.int64) + torch.arange(
@@ -3318,8 +3289,8 @@ class SpecWorkerBase(nn.Module, ABC):
         target_ids = tokens.to(torch.int64)
         if id_map is not None:
             target_ids = id_map[target_ids]
-        spec_metadata.watermark_drafts[:batch_size, draft_step] = target_ids
-        spec_metadata.watermark_draft_seeds[:batch_size, draft_step] = seeds
+        spec_metadata.watermark.drafts[:batch_size, draft_step] = target_ids
+        spec_metadata.watermark.draft_seeds[:batch_size, draft_step] = seeds
         return tokens
 
     def advanced_sample_draft_block(self, gen_logits: torch.Tensor,
@@ -3708,7 +3679,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # tokens, which callers of this method do not do. Reject the configuration here, at the
         # first forward (warmup or CUDA-graph capture): a per-request check would run once, at
         # capture, and a later watermarked request would replay the captured unwatermarked sampler.
-        if spec_metadata.watermark_handler is not None:
+        if spec_metadata.watermark_ready:
             raise NotImplementedError(
                 "this model's speculative sampling path does not support text watermarking: "
                 "remove watermark_config")
@@ -3736,7 +3707,7 @@ class SpecWorkerBase(nn.Module, ABC):
         watermark_plans = None
         if isinstance(logits, VocabShardedLogits):
             # A sampled, watermarked row needs the whole distribution, not this rank's shard.
-            if (spec_metadata.watermark_handler is not None
+            if (spec_metadata.watermark_ready
                     and not spec_metadata.is_all_greedy_sample):
                 logits = logits.gather()
             else:
@@ -3770,7 +3741,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
-            if spec_metadata.watermark_handler is not None:
+            if spec_metadata.watermark_ready:
                 # Rows of watermarked requests replace the ordinary draw by the keyed
                 # Gumbel-max draw over the same filtered distribution.
                 watermark_plans = self._plan_watermark(spec_metadata,
@@ -3819,9 +3790,9 @@ class SpecWorkerBase(nn.Module, ABC):
             raise NotImplementedError(
                 "text watermarking is not supported with ragged speculative verification"
             )
-        handler = spec_metadata.watermark_handler
+        handler = spec_metadata.watermark.handler
         slots = spec_metadata.batch_slot_ids[:batch_size]
-        enabled = spec_metadata.watermark_enabled[:batch_size]
+        enabled = spec_metadata.watermark.enabled[:batch_size]
         if draft_tokens is None:
             return handler.plan(slots, enabled), None
         context_plan = generation_plan = None
@@ -3841,7 +3812,7 @@ class SpecWorkerBase(nn.Module, ABC):
         """Advance the watermark context of every request by the tokens it accepted."""
         if watermark_plans is None:
             return
-        handler = spec_metadata.watermark_handler
+        handler = spec_metadata.watermark.handler
         first, second = watermark_plans
         if not has_drafts:
             # One position per request.
