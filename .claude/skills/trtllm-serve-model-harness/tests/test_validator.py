@@ -566,6 +566,24 @@ def test_verdict_names_the_matrix_bytes_it_read(tmp_path):
     assert v["thresholds_from"] == f"{matrix}@{digest}"
 
 
+def test_verdict_that_cannot_be_written_is_no_verdict(tmp_path, capsys):
+    """An output directory that cannot be made gives exit 3 (no verdict), never 1 (a FAIL)."""
+    harness = controls.write_profile(
+        str(tmp_path / "h.yaml"), controls.CONTROL_PROFILES["anthropic"]
+    )
+    done = controls._anthropic_sse([{"type": "text", "text": "ok"}], "end_turn")
+    user = {"role": "user", "content": "go"}
+    controls._write_trace(str(tmp_path / "t"), [
+        (controls._anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+         controls._sse_response("t1", done))])  # fmt: skip
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    argv = ["--harness", harness, "--population", "controls", "--claims", "conformance",
+            "--out-dir", str(blocker / "v"), str(tmp_path / "t")]  # fmt: skip
+    assert verdict.main(argv) == 3
+    assert "verdict.py: " in capsys.readouterr().err
+
+
 def test_scan_credentials_reports_an_unreadable_shard_and_goes_on(tmp_path):
     """A .zst shard that is not zstd is an error in its own row, not the end of the scan."""
     import subprocess

@@ -22,7 +22,8 @@ replay output, recorder captures), runs the turn-record checks, and writes:
     <out-dir>/verdict.json   one verdict per requested claim, per-check records
 
 Exit code: 0 every requested claim PASS or NOT_APPLICABLE; 1 any FAIL;
-2 otherwise any BLOCKED; 3 usage or internal error (no verdict).
+2 otherwise any BLOCKED; 3 usage or internal error, or outputs that cannot be
+written (no verdict).
 
 Thresholds for rate claims come from the run's matrix file (--matrix). An
 unset threshold makes its claim BLOCKED, never PASS. Nothing in the outputs
@@ -652,7 +653,6 @@ def main(argv=None) -> int:
         traceback.print_exc()
         return 3
 
-    os.makedirs(args.out_dir, exist_ok=True)
     # Every check that counted at least one event, plus every wire rule broken: what the
     # control matrix compares with each fault mode's expected set.
     tripped = sorted({r["id"] for r in records if r["count"] or r["status"] == "FLAGGED"}
@@ -696,10 +696,18 @@ def main(argv=None) -> int:
     }
     report_out = {"schema": "trtllm-serve-model-harness/report@1", **report,
                   "checks": records}  # fmt: skip
-    with open(os.path.join(args.out_dir, "report.json"), "w") as fh:
-        json.dump(report_out, fh, indent=1, sort_keys=True)
-    with open(os.path.join(args.out_dir, "verdict.json"), "w") as fh:
-        json.dump(out, fh, indent=1, sort_keys=True)
+    try:
+        os.makedirs(args.out_dir, exist_ok=True)
+        with open(os.path.join(args.out_dir, "report.json"), "w") as fh:
+            json.dump(report_out, fh, indent=1, sort_keys=True)
+        with open(os.path.join(args.out_dir, "verdict.json"), "w") as fh:
+            json.dump(out, fh, indent=1, sort_keys=True)
+    except OSError as error:  # no verdict was written, which is not a FAIL
+        print(f"verdict.py: {type(error).__name__}: {error}", file=sys.stderr)
+        return 3
+    except (TypeError, ValueError):  # a value JSON cannot hold: an internal error
+        traceback.print_exc()
+        return 3
     print(json.dumps({"claims": verdict["claims"], "tripped": tripped}))
     statuses = [verdict["claims"][c] for c in requested]
     if "FAIL" in statuses:
