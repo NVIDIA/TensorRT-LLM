@@ -24,6 +24,7 @@ the fused FP4 generation update with its query rows. Checks:
   (bitwise), including the RoPE rotation with a non-identity table.
 * Its q_b and W_UK products agree with the production GEMMs up to BF16 rounding of a different
   FP32 summation order.
+  (Both read the kernel's BF16 intermediates through ``_ProbedQFusedKernel``.)
 * With the q_a RMSNorm inside the kernel the query rows are those after FlashInfer's separate
   norm (bitwise), and ``k3_mla_latent_row`` is bitwise FlashInfer's norm plus the ``k_pe`` copy.
 * ``KimiK3MLAAttention._forward_generation_fused_query`` (multi-stream, KV half on the aux
@@ -36,8 +37,13 @@ import math
 import types
 from types import SimpleNamespace
 
+import cutlass
+import cutlass.cute as cute
 import pytest
 import torch
+from cutlass import Int32, Int64
+
+from tensorrt_llm._torch.kernels.blackwell import k3_mla_q_fused as fused_mod
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
@@ -271,10 +277,8 @@ def _external_scatter(md, latent, rot):
     _scatter(md, latent, rot, q_pe, q_pe, stub.expand(num_tokens, H, LORA + ROPE), True)
 
 
-def _run_fused(md, w, x, rot, debug=None, norm=None):
-    from tensorrt_llm._torch.kernels.blackwell import k3_mla_q_fused as fused
-
-    fused.k3_mla_q_fused(
+def _run_fused(md, w, x, rot, norm=None):
+    fused_mod.k3_mla_q_fused(
         x,
         w.w_qb,
         w.qb_exp,
@@ -286,9 +290,81 @@ def _run_fused(md, w, x, rot, debug=None, norm=None):
         md.fp4_mla_state.prequantized_q_sf.view(torch.uint8),
         gen_len=Q_LEN,
         rows_per_seq=int(md.fp4_mla_state.prequantized_q_rows_per_seq or 0) or Q_LEN * H,
-        debug=debug,
         norm=norm,
     )
+
+
+class _ProbedQFusedKernel(fused_mod.K3MlaQFusedKernel):
+    """The fused kernel, also storing its BF16 intermediates at the device addresses ``qb_addr``
+    (q_b output ``[t_pad, 96 * 192]``, q_pe before RoPE) and ``ob_addr`` (absorbed query
+    ``[t_pad, 96, 512]``), set on a subclass per launch."""
+
+    qb_addr = 0
+    ob_addr = 0
+
+    @cute.jit
+    def absorb(self, warp: Int32, lane: Int32, wuk_s: Int32, qn_s: Int32, ob_s: Int32):
+        fused_mod.K3MlaQFusedKernel.absorb(self, warp, lane, wuk_s, qn_s, ob_s)
+        # Both CTAs of the head hold all of q_nope; both store it.
+        bidx, _, _ = cute.arch.block_idx()
+        head = bidx // Int32(2)
+        vectors = self.t_pad * fused_mod.NOPE_DIM * 2 // 16
+        workers = fused_mod._ABSORB_WARPS * 32
+        for i in cutlass.range_constexpr(-(-vectors // workers)):
+            item = warp * Int32(32) + lane + Int32(i * workers)
+            if item < Int32(vectors):
+                t = item // Int32(16)
+                v = item - t * Int32(16)
+                words = fused_mod._lds_v4_b32(qn_s + t * Int32(fused_mod._QN_PITCH) + v * Int32(16))
+                dst = Int64(self.qb_addr) + (Int64(t) * (H * 192) + Int64(head) * 192) * 2
+                fused_mod._stg_v4(dst + Int64(v) * 16, *words)
+
+    @cute.jit
+    def store_prefix_group(self, t, grp, rank, head, gs, ob_s, qfp4_addr, qsf_addr, gen_len,
+                           rows_per_seq):  # fmt: skip
+        fused_mod.K3MlaQFusedKernel.store_prefix_group(
+            self, t, grp, rank, head, gs, ob_s, qfp4_addr, qsf_addr, gen_len, rows_per_seq
+        )
+        src = ob_s + t * Int32(fused_mod._OB_PITCH) + grp * Int32(32)
+        col = rank * Int32(16) + grp
+        dst = Int64(self.ob_addr) + ((Int64(t) * H + Int64(head)) * LORA + Int64(col) * 16) * 2
+        fused_mod._stg_v4(dst, *fused_mod._lds_v4_b32(src))
+        fused_mod._stg_v4(dst + Int64(16), *fused_mod._lds_v4_b32(src + Int32(16)))
+
+    @cute.jit
+    def store_rope_group(self, t, rg, head, gs, qpe_s, cs_s, qfp4_addr, qsf_addr, gen_len,
+                         rows_per_seq):  # fmt: skip
+        fused_mod.K3MlaQFusedKernel.store_rope_group(
+            self, t, rg, head, gs, qpe_s, cs_s, qfp4_addr, qsf_addr, gen_len, rows_per_seq
+        )
+        src = qpe_s + t * Int32(fused_mod._QPE_PITCH) + rg * Int32(32)
+        dst = Int64(self.qb_addr) + (
+            (Int64(t) * (H * 192) + Int64(head) * 192 + 128 + Int64(rg) * 16) * 2
+        )
+        fused_mod._stg_v4(dst, *fused_mod._lds_v4_b32(src))
+        fused_mod._stg_v4(dst + Int64(16), *fused_mod._lds_v4_b32(src + Int32(16)))
+
+
+def _run_probed(md, w, x, rot):
+    """:func:`_run_fused` with :class:`_ProbedQFusedKernel`: returns its BF16 q_b output
+    ``[T, 96 * 192]`` (q_pe before RoPE) and absorbed query ``[T, 96, 512]``."""
+    num_tokens = x.shape[0]
+    t_pad = 8 if num_tokens <= 8 else 16
+    qb = torch.zeros(t_pad, H * 192, device="cuda", dtype=torch.bfloat16)
+    ob = torch.zeros(t_pad, H, LORA, device="cuda", dtype=torch.bfloat16)
+    probe = type(
+        "_Probe", (_ProbedQFusedKernel,), {"qb_addr": qb.data_ptr(), "ob_addr": ob.data_ptr()}
+    )
+    production = fused_mod.K3MlaQFusedKernel
+    fused_mod._compiled.cache_clear()
+    fused_mod.K3MlaQFusedKernel = probe
+    try:
+        _run_fused(md, w, x, rot)
+        torch.cuda.synchronize()
+    finally:
+        fused_mod.K3MlaQFusedKernel = production
+        fused_mod._compiled.cache_clear()
+    return qb[:num_tokens], ob[:num_tokens]
 
 
 def _bf16_ulps(a, b):
@@ -341,19 +417,16 @@ def test_query_quantization_matches_cache_update(n, rope):
         rot = _rotary_table(md.max_seq_len, rope)
         x, latent = _inputs(num_tokens, 4)
         _external_scatter(md, latent, rot)
-        dbg_qb = torch.zeros(num_tokens, H * 192, device="cuda", dtype=torch.bfloat16)
-        dbg_q = torch.zeros(num_tokens, H, LORA + ROPE, device="cuda", dtype=torch.bfloat16)
-        _run_fused(md, w, x, rot, debug=(dbg_qb, dbg_q))
-        torch.cuda.synchronize()
+        qb, absorbed = _run_probed(md, w, x, rot)
         q_fused, sf_fused = _q_bytes(md, num_tokens)
         md.fp4_mla_state.prequantized_q.fill_(0)
-        q_input = dbg_q.clone()
+        q_input = torch.zeros(num_tokens, H, LORA + ROPE, device="cuda", dtype=torch.bfloat16)
+        q_input[..., :LORA] = absorbed
         q_rope_out = torch.empty(num_tokens, H, ROPE, device="cuda", dtype=torch.bfloat16)
-        q_pe = dbg_qb.view(num_tokens, H, 192)[..., 128:]
+        q_pe = qb.view(num_tokens, H, 192)[..., 128:]
         _scatter(md, latent, rot, q_pe, q_rope_out, q_input, False)
         torch.cuda.synchronize()
         q_ref, sf_ref = _q_bytes(md, num_tokens)
-        assert torch.equal(q_rope_out, dbg_q[..., LORA:])
         assert torch.equal(q_fused, q_ref)
         assert torch.equal(sf_fused, sf_ref)
     finally:
@@ -408,15 +481,13 @@ def test_projections_match_production_gemms(num_tokens):
         rot = _rotary_table(md.max_seq_len, "identity")
         x, latent = _inputs(num_tokens, 5)
         _external_scatter(md, latent, rot)
-        dbg_qb = torch.zeros(num_tokens, H * 192, device="cuda", dtype=torch.bfloat16)
-        dbg_q = torch.zeros(num_tokens, H, LORA + ROPE, device="cuda", dtype=torch.bfloat16)
-        _run_fused(md, w, x, rot, debug=(dbg_qb, dbg_q))
-        ref_qb = torch.empty_like(dbg_qb)
+        qb, absorbed = _run_probed(md, w, x, rot)
+        ref_qb = torch.empty_like(qb)
         lowm.run_low_m_gemm(x, w.w_qb, w.s_qb_packed, ref_qb)
-        q = dbg_qb.view(num_tokens, H, 192)
+        q = qb.view(num_tokens, H, 192)
         ref_uk = torch.bmm(q[..., :128].transpose(0, 1), w.w_uk.transpose(1, 2)).transpose(0, 1)
         torch.cuda.synchronize()
-        for got, ref in ((dbg_qb, ref_qb), (dbg_q[..., :LORA], ref_uk)):
+        for got, ref in ((qb, ref_qb), (absorbed, ref_uk)):
             ulps = _bf16_ulps(got, ref)
             assert float(ulps.max()) <= 2.0
             assert float((got != ref).float().mean()) < 0.02

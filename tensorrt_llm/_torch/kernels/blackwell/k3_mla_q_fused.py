@@ -87,7 +87,7 @@ from .fp8_block_scale_low_m_gemm import amax_pair as _amax_pair
 from .fp8_block_scale_low_m_gemm import bf16x2_inv_scale as _bf16x2_inv_scale
 from .fp8_block_scale_low_m_gemm import quant_bf16x8_to_e4m3 as _quant_bf16x8_to_e4m3
 from .fp8_block_scale_low_m_gemm import ue8m0_of_amax as _ue8m0_of_amax
-from .mnnvl_pushed_allreduce import _lv, _pack_bf16x2, _unpack
+from .mnnvl_pushed_allreduce import _lv, _unpack
 from .utils import griddepcontrol_launch_dependents as _griddepcontrol_launch_dependents
 from .utils import griddepcontrol_wait as _griddepcontrol_wait
 
@@ -435,18 +435,6 @@ def _sts_bf16_both(addr, peer, value, *, loc=None, ip=None):
         "{\n.reg .b16 h;\n.reg .b32 ra;\ncvt.rn.bf16.f32 h, $2;\nst.shared.b16 [$0], h;\n"
         "mapa.shared::cluster.u32 ra, $0, $1;\nst.shared::cluster.b16 [ra], h;\n}",
         "r,r,f",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _stg_bf16(addr, value, *, loc=None, ip=None):
-    _asm(
-        None,
-        [_lv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
-        "{\n.reg .b16 h;\ncvt.rn.bf16.f32 h, $1;\nst.global.b16 [$0], h;\n}",
-        "l,f",
         loc=loc,
         ip=ip,
     )
@@ -842,7 +830,6 @@ class K3MlaQFusedKernel:
             token count are computed on zeros and not stored.
         use_pdl: Programmatic dependent launch: weights are fetched before
             ``griddepcontrol.wait``.
-        debug: Also store the BF16 q_b output and the BF16 absorbed / rotated query (tests).
         fuse_norm: ``x`` is the raw q_a latent: the kernel applies the q_a RMSNorm itself
             (FlashInfer ``RMSNormKernel`` arithmetic, see :meth:`K3MlaQFusedKernel.row_rstd`).
     """
@@ -851,7 +838,6 @@ class K3MlaQFusedKernel:
         self,
         t_pad: int,
         use_pdl: bool,
-        debug: bool = False,
         fuse_norm: bool = False,
     ):
         if t_pad % 8 or not 8 <= t_pad <= MAX_TOKENS:
@@ -859,7 +845,6 @@ class K3MlaQFusedKernel:
         self.t_pad = t_pad
         self.nt = t_pad // 8
         self.use_pdl = use_pdl
-        self.debug = debug
         self.fuse_norm = fuse_norm
         assert t_pad * _OB_PITCH <= (_NTILE - _UK_TILES) * _TILE_BYTES
 
@@ -875,8 +860,6 @@ class K3MlaQFusedKernel:
         pos_addr: Int64,
         qfp4_addr: Int64,
         qsf_addr: Int64,
-        dbg_qb_addr: Int64,
-        dbg_q_addr: Int64,
         nw_addr: Int64,
         eps: Float32,
         x_ld: Int32,
@@ -933,7 +916,7 @@ class K3MlaQFusedKernel:
         )
         self.kernel(
             x_addr, wqb_desc, ew_addr, wuk_desc, gs_addr, cos_sin_addr, pos_addr, qfp4_addr,
-            qsf_addr, dbg_qb_addr, dbg_q_addr, nw_addr, eps, x_ld, num_tokens, gen_len, rows_per_seq,
+            qsf_addr, nw_addr, eps, x_ld, num_tokens, gen_len, rows_per_seq,
         ).launch(
             grid=(2 * NUM_HEADS, 1, 1),
             block=(_THREADS, 1, 1),
@@ -956,8 +939,6 @@ class K3MlaQFusedKernel:
         pos_addr: Int64,
         qfp4_addr: Int64,
         qsf_addr: Int64,
-        dbg_qb_addr: Int64,
-        dbg_q_addr: Int64,
         nw_addr: Int64,
         eps: Float32,
         x_ld: Int32,
@@ -1045,7 +1026,7 @@ class K3MlaQFusedKernel:
 
         # ---- q_b: warp w runs K half w // 6 of the CTA's 16-row tile w % 6.
         self.q_b_tile(warp, lane, rank, peer, head, row0, bsc_s, act_s, ring_s, qn_s, qpe_s,
-                      part_s, full_bar, uk_free_bar, dbg_qb_addr, num_tokens)  # fmt: skip
+                      part_s, full_bar, uk_free_bar)  # fmt: skip
         if warp == Int32(_WARPS - 1):
             if rank == Int32(1):
                 self.prefetch_rope(lane, num_tokens, pos_addr, cos_sin_addr, pos_s, cs_s)
@@ -1075,14 +1056,14 @@ class K3MlaQFusedKernel:
                 grp = item - t * Int32(16)
                 if t < num_tokens:
                     self.store_prefix_group(t, grp, rank, head, gs, ob_s, qfp4_addr, qsf_addr,
-                                            dbg_q_addr, gen_len, rows_per_seq)  # fmt: skip
+                                            gen_len, rows_per_seq)  # fmt: skip
             else:
                 t = (item - n_prefix) // Int32(4)
                 rg = item - n_prefix - t * Int32(4)
                 if t < num_tokens:
                     if _lds_b32(pos_s + t * Int32(4)) >= Int32(0):
                         self.store_rope_group(t, rg, head, gs, qpe_s, cs_s, qfp4_addr, qsf_addr,
-                                              dbg_q_addr, gen_len, rows_per_seq)  # fmt: skip
+                                              gen_len, rows_per_seq)  # fmt: skip
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_launch_dependents()
 
@@ -1179,8 +1160,6 @@ class K3MlaQFusedKernel:
         part_s: Int32,
         full_bar: Int32,
         uk_free_bar: Int32,
-        dbg_qb_addr: Int64,
-        num_tokens: Int32,
     ):
         """K half ``warp // 6`` of the CTA's 16-row q_b tile ``j = warp % 6``: FP32 sums in K order;
         the second half's warp hands its sums to the first half's warp (shared memory, named
@@ -1274,14 +1253,6 @@ class K3MlaQFusedKernel:
                             _sts_bf16(
                                 qpe_s + t * Int32(_QPE_PITCH) + (row - Int32(NOPE_DIM)) * 2, value
                             )
-                        if cutlass.const_expr(self.debug):
-                            if t < num_tokens:
-                                _stg_bf16(
-                                    dbg_qb_addr
-                                    + (Int64(t) * (NUM_HEADS * QK_HEAD_DIM)
-                                       + Int64(head) * QK_HEAD_DIM + Int64(row)) * 2,
-                                    value,
-                                )  # fmt: skip
 
     @cute.jit
     def absorb(self, warp: Int32, lane: Int32, wuk_s: Int32, qn_s: Int32, ob_s: Int32):
@@ -1345,7 +1316,6 @@ class K3MlaQFusedKernel:
         ob_s: Int32,
         qfp4_addr: Int64,
         qsf_addr: Int64,
-        dbg_q_addr: Int64,
         gen_len: Int32,
         rows_per_seq: Int32,
     ):
@@ -1363,17 +1333,6 @@ class K3MlaQFusedKernel:
         qrow = self.q_row(t, head, gen_len, rows_per_seq)
         _stg_v2(qfp4_addr + Int64(qrow) * Q_ROW_BYTES + Int64(col) * 8, w0, w1)
         _stg_u8(qsf_addr + _sf_offset(qrow, col), sf)
-        if cutlass.const_expr(self.debug):
-            dst = (
-                dbg_q_addr
-                + (
-                    (Int64(t) * NUM_HEADS + Int64(head)) * (KV_LORA_RANK + ROPE_DIM)
-                    + Int64(col) * 16
-                )
-                * 2
-            )
-            _stg_v4(dst, *words[:4])
-            _stg_v4(dst + Int64(16), *words[4:])
 
     @cute.jit
     def prefetch_rope(
@@ -1412,7 +1371,6 @@ class K3MlaQFusedKernel:
         cs_s: Int32,
         qfp4_addr: Int64,
         qsf_addr: Int64,
-        dbg_q_addr: Int64,
         gen_len: Int32,
         rows_per_seq: Int32,
     ):
@@ -1441,19 +1399,6 @@ class K3MlaQFusedKernel:
         _stg_v4(dst, m0, m1, r0, r1)
         _stg_u8(qsf_addr + _sf_offset(qrow, col), sf)
         _stg_u8(qsf_addr + _sf_offset(qrow, col + Int32(1)), rsf)
-        if cutlass.const_expr(self.debug):
-            out = (
-                dbg_q_addr
-                + (
-                    (Int64(t) * NUM_HEADS + Int64(head)) * (KV_LORA_RANK + ROPE_DIM)
-                    + KV_LORA_RANK
-                    + Int64(rg) * 16
-                )
-                * 2
-            )
-            packed = [_pack_bf16x2(rot[2 * k], rot[2 * k + 1]) for k in range(8)]
-            _stg_v4(out, *packed[:4])
-            _stg_v4(out + Int64(16), *packed[4:])
 
 
 class K3MlaLatentRowKernel:
@@ -1545,15 +1490,15 @@ def _stream():
 
 
 @functools.cache
-def _compiled(t_pad: int, use_pdl: bool, debug: bool, fuse_norm: bool):
-    kernel = K3MlaQFusedKernel(t_pad, use_pdl, debug=debug, fuse_norm=fuse_norm)
+def _compiled(t_pad: int, use_pdl: bool, fuse_norm: bool):
+    kernel = K3MlaQFusedKernel(t_pad, use_pdl, fuse_norm=fuse_norm)
     a, i = Int64(1 << 20), Int32(1)
     gmem = cute.AddressSpace.gmem
     return cute.compile(
         kernel, a,
         make_ptr(cutlass.Float8E4M3FN, 1 << 20, gmem, assumed_align=16), a,
         make_ptr(cutlass.BFloat16, 1 << 20, gmem, assumed_align=16),
-        *(a,) * 8, Float32(1e-6), *(i,) * 4, _stream(),
+        *(a,) * 6, Float32(1e-6), *(i,) * 4, _stream(),
     )  # fmt: skip
 
 
@@ -1637,7 +1582,6 @@ def k3_mla_q_fused(
     gen_len: int,
     rows_per_seq: int,
     use_pdl: bool = True,
-    debug: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     norm: Optional[tuple[torch.Tensor, float]] = None,
 ) -> None:
     """Write the FP4 decode query of ``x`` into ``q_fp4`` / ``q_sf`` (see the module docstring).
@@ -1654,8 +1598,6 @@ def k3_mla_q_fused(
         q_fp4, q_sf: The decode's Q buffers: uint8 ``[rows, 320]`` and the swizzled E4M3 scales.
             Token ``t`` of request ``t // gen_len`` owns row
             ``(t // gen_len) * rows_per_seq + (t % gen_len) * 96 + head``.
-        debug: Optional BF16 ``([T, 96 * 192], [T, 96, 576])`` outputs of the q_b projection and
-            of the absorbed / rotated query (tests).
         norm: Optional ``(weight, eps)`` of the q_a RMSNorm (BF16 ``[1536]``): ``x`` is then the
             raw q_a latent and the kernel normalizes it (``fuse_norm``).
     """
@@ -1671,7 +1613,6 @@ def k3_mla_q_fused(
         raise ValueError("q_fp4 must be a contiguous uint8 [rows, 320] tensor")
     if cos_sin.dtype != torch.float32 or not cos_sin.is_contiguous():
         raise ValueError("cos_sin must be a contiguous FP32 table")
-    dbg = (0, 0) if debug is None else (debug[0].data_ptr(), debug[1].data_ptr())
     if norm is not None and not (
         NORM_FUSION_AVAILABLE
         and norm[0].dtype == torch.bfloat16
@@ -1690,8 +1631,6 @@ def k3_mla_q_fused(
         Int64(positions.data_ptr()),
         Int64(q_fp4.data_ptr()),
         Int64(q_sf.data_ptr()),
-        Int64(dbg[0]),
-        Int64(dbg[1]),
         Int64(0 if norm is None else norm[0].data_ptr()),
         Float32(1e-6 if norm is None else norm[1]),
         Int32(x.stride(0)),
@@ -1700,7 +1639,7 @@ def k3_mla_q_fused(
         Int32(rows_per_seq),
         cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
     )
-    _compiled(t_pad, use_pdl, debug is not None, norm is not None)(*args)
+    _compiled(t_pad, use_pdl, norm is not None)(*args)
 
 
 def latent_row_supported(c_kv: torch.Tensor, k_pe: torch.Tensor, weight: torch.Tensor) -> bool:
