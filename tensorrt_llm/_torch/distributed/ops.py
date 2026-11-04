@@ -1353,9 +1353,9 @@ class AllReduce(nn.Module):
         # AllReduceRunner.forward can use during the autotuner warm-up phase.
         extra_attrs = get_model_extra_attrs()
         # Declared by the model: never run or tune NCCL_SYMMETRIC (plain NCCL instead).
-        self._exclude_nccl_symmetric = bool(
-            extra_attrs
-            and extra_attrs.get("allreduce_exclude_nccl_symmetric", False))
+        self._exclude_nccl_symmetric = bool(extra_attrs and extra_attrs.get(
+            "allreduce_exclude_nccl_symmetric", False)) or (os.environ.get(
+                "TRTLLM_AR_TUNE_NCCL_SYMMETRIC", "1") != "1")
         # Declared by the model: the MNNVL path runs its residual RMSNorm fusions on the CuTe DSL kernels.
         fused_norm = bool(
             extra_attrs
