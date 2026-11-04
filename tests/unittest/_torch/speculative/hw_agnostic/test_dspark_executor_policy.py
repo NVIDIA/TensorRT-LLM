@@ -16,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
     _decode_dspark_exact_expected_yields,
     _dspark_exact_common_graph_batch_size,
     _dspark_exact_secondary_padding_ready,
+    _dspark_tp_shared_ragged_lens,
     _encode_dspark_exact_expected_yields,
     _validate_dspark_exact_bucket,
 )
@@ -190,6 +191,18 @@ def test_secondary_dummy_is_required_only_for_a_multirow_remainder(
         )
         is expected
     )
+
+
+def test_tp_ranks_take_rank_zero_rows():
+    calls = []
+
+    class _Dist:
+        def tp_cp_broadcast_int64(self, values, root=0):
+            calls.append((list(values), root))
+            return [3, 1, 2]
+
+    assert _dspark_tp_shared_ragged_lens(_Dist(), [2, 2, 2]) == [3, 1, 2]
+    assert calls == [([2, 2, 2], 0)]
 
 
 def test_exact_bucket_must_match_the_selected_graph_key():

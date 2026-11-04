@@ -3403,6 +3403,16 @@ class DecoderInputPreparer:
 
         expected_stamp = worker.verified_draft_seq_cuda()
         stamps = worker.confidence_stamp_buffer() if expected_stamp is not None else None
+        sync_rows = None
+        if self.mapping.tp_size > 1 and not self._config.enable_attention_dp:
+            # One token layout across TP ranks: rank from TP rank 0's rows,
+            # since confidence can differ in the last bits between ranks.
+            from tensorrt_llm._torch.distributed import allgather
+
+            def sync_rows(rows):
+                rows = rows.contiguous()
+                return allgather(rows, self.mapping, dim=0)[: rows.shape[0]]
+
         result = select_windows_device(
             confidence_logits=worker.staged_confidence_buffer(),
             slot_idx=worker.batch_slot_view(padded_bs),
@@ -3414,6 +3424,7 @@ class DecoderInputPreparer:
             stamp=stamps,
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
+            sync_rows=sync_rows,
         )
 
         lens_buf[:padded_bs].copy_(result.verify_lens)
