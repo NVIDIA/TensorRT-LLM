@@ -825,10 +825,15 @@ def main() -> None:
     global TOP_KERNELS
     TOP_KERNELS = args.top_kernels
 
-    quiet, parallel = _setup_process(args)
-    torch.backends.cudnn.benchmark = args.cudnn_benchmark
     dtype = getattr(torch, args.dtype)
     backends = args.backends.split(",")
+    if "winovae" in backends and dtype is not torch.bfloat16:
+        raise ValueError(
+            f"the winovae backend needs --dtype bfloat16, got {args.dtype}; "
+            "use --backends native for other dtypes"
+        )
+    quiet, parallel = _setup_process(args)
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
     shapes = args.shapes.split(",")
     ops = args.ops.split(",")
     winovae_opts = _parse_winovae_opts(args.winovae_opts)

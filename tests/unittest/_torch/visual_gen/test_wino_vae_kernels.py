@@ -1218,10 +1218,26 @@ def test_spatial_winograd_sm100_out_xform_above_2_31_elements() -> None:
     torch.cuda.empty_cache()
 
 
+@pytest.fixture
+def isolated_cudnn_plans(monkeypatch, tmp_path):
+    """An empty, private plan cache, so the test runs the plan search and leaves the user's
+    on-disk cache alone."""
+    from tensorrt_llm._torch.visual_gen.models.wan import cudnn_conv
+
+    def reset():
+        cudnn_conv._plan_choices = None
+        cudnn_conv._convs.clear()
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    reset()
+    yield
+    reset()
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [((1, 64, 6, 12, 20), 48, True), ((1, 32, 5, 9, 11), 32, False)])
 def test_cudnn_frontend_conv3d_matches_torch(
-    dtype: torch.dtype, shape: tuple[tuple[int, ...], int, bool]
+    dtype: torch.dtype, shape: tuple[tuple[int, ...], int, bool], isolated_cudnn_plans
 ) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.cudnn_conv import (
         conv_frontend,

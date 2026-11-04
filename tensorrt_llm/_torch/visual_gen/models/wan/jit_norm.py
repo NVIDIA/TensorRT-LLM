@@ -346,6 +346,7 @@ def wino_norm_silu(
     )
     src = x if x is not None else m[0]
     channels = src.shape[-1]
+    _check_frames(frames, positions, channels, order, x, residual, cache, m)
     device = src.device.index
     opts = dict(device=src.device, dtype=torch.bfloat16)
     want_sum = return_sum and (residual is not None or in_bias is not None or x is None)
@@ -439,6 +440,36 @@ def _check_wino_operands(
         raise ValueError("order must be 2 or 4; order 4 needs fp16 Winograd inputs")
     if frames < order or frames % order:
         raise ValueError("frames must be a positive multiple of order")
+
+
+def _check_frames(
+    frames: int,
+    positions: int,
+    channels: int,
+    order: int,
+    x: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    cache: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+) -> None:
+    """The shapes of the operands the kernel reads by address: ``x`` and ``residual`` contiguous
+    ``[frames, positions, C]``, ``cache`` contiguous ``[0..2, positions, C]``, each product
+    ``[frames / order, .., C]``."""
+    want = (frames, positions, channels)
+    for name, t in (("x", x), ("residual", residual)):
+        if t is not None and (tuple(t.shape) != want or not t.is_contiguous()):
+            raise ValueError(f"{name} must be a contiguous {list(want)} tensor")
+    if cache is not None and cache.numel() and (
+        cache.dim() != 3
+        or cache.shape[0] > 2
+        or tuple(cache.shape[1:]) != (positions, channels)
+        or not cache.is_contiguous()
+    ):
+        raise ValueError(f"cache must be a contiguous [0..2, {positions}, {channels}] tensor")
+    if m is not None and any(
+        mk.dim() != 3 or mk.shape[0] != frames // order or mk.shape[2] != channels for mk in m
+    ):
+        raise ValueError(f"each product must be [{frames // order}, positions, {channels}]")
 
 
 def _wino_layout(
@@ -591,9 +622,15 @@ def add_bias_and_residual(
     ``out``: a contiguous bf16 destination of the result's shape on the input's device,
     written and returned."""
     products_geometry = _add_input_geometry(x, m, products_geometry, height, width)
+    for name, t in (("x", x), ("residual", residual), ("bias", bias)):
+        if t is not None and t.dtype is not torch.bfloat16:
+            raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
+    if m is not None and m[0].dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"m must be bf16 or fp16, got {m[0].dtype}")
     src = x if x is not None else m[0]
     channels = src.shape[2]
     order, m_ptr, stride = _products_layout(m, frames) if m is not None else (1, 0, 0)
+    _check_frames(frames, height * width, channels, order, x, residual, None, m)
     fp16_winograd = m is not None and m[0].dtype == torch.float16
     padded = pad_h > 0 or pad_w > 0
     y = _destination(out, (frames, (height + pad_h) * (width + pad_w), channels), src.device)

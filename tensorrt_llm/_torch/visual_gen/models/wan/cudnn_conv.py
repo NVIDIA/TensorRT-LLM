@@ -73,7 +73,13 @@ def _save_choice(key: str, index: int) -> None:
     path = _cache_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
+        try:
+            # Keep what other processes (e.g. the other ranks on this node) saved since this
+            # process read the file.
+            choices.update({k: v for k, v in json.loads(path.read_text()).items() if k != key})
+        except (OSError, ValueError):
+            pass
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(choices, indent=0, sort_keys=True))
         os.replace(tmp, path)
     except OSError:

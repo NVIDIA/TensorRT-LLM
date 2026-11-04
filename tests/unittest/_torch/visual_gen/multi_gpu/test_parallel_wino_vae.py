@@ -61,6 +61,17 @@ OPTION_SETS = {
 def _run(world_size: int, test_fn: Callable, *args):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+    direct = any(
+        isinstance(a, str) and a in OPTION_SETS and OPTION_SETS[a][0]["halo_exchange"] == "direct"
+        for a in args
+    )
+    if direct and not all(
+        torch.cuda.can_device_access_peer(i, j)
+        for i in range(world_size)
+        for j in range(world_size)
+        if i != j
+    ):
+        pytest.skip("direct halo exchange needs peer access between all the GPUs")
     # Fresh ranks per test: the direct halo exchange holds symmetric-memory handles for the
     # life of the process, and _model patches the conv selection in the worker.
     run_distributed(
