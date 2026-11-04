@@ -2586,3 +2586,48 @@ def test_jit_share_salt_ignores_file_times(tmp_path):
     assert salt_a == jit_share._salt(str(tmp_path / "b" / "nvcc"))
     (tmp_path / "b" / "nvcc").write_text("another compiler")
     assert salt_a != jit_share._salt(str(tmp_path / "b" / "nvcc"))
+
+
+def test_excluded_op_reuses_the_sweep_profiled_in_this_process(monkeypatch):
+    """Once this process has profiled an exclude_from_cache op's sweep, later
+    tuning-mode calls hit those entries instead of walking the sweep again, and
+    input tensors are only built for the profiles that missed the cache."""
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    counts = {"sweeps": 0, "inputs": 0}
+    real_profiles = tuner._optimization_profiles
+    real_inputs = tuner._prepare_input_tensors
+
+    def profiles(*args, **kwargs):
+        counts["sweeps"] += 1
+        return real_profiles(*args, **kwargs)
+
+    def inputs(*args, **kwargs):
+        counts["inputs"] += 1
+        return real_inputs(*args, **kwargs)
+
+    monkeypatch.setattr(tuner, "_optimization_profiles", profiles)
+    monkeypatch.setattr(tuner, "_prepare_input_tensors", inputs)
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (4, 8, 16, 32)), ),
+                          exclude_from_cache=True)
+    w = torch.randn(64, 128, device="cuda")
+    op = "autotuner_test::excluded_op_sweep_reuse"
+    with autotune():
+        tuner.choose_one(op, [GemmRunner()], config,
+                         [torch.randn(M, 64, device="cuda"), w])
+        assert counts == {"sweeps": 1, "inputs": 4}
+        # The same op in later layers, at swept and unswept shapes.
+        for m in (M, M // 2, M):
+            tuner.choose_one(op, [GemmRunner()], config,
+                             [torch.randn(m, 64, device="cuda"), w])
+    assert counts == {"sweeps": 1, "inputs": 4}
+
+    # An entry this process did not profile (e.g. received from a peer) does
+    # not prove the op's JIT ran here, so the call walks the sweep again.
+    tuner._keys_profiled_in_process.clear()
+    with autotune():
+        tuner.choose_one(op, [GemmRunner()], config,
+                         [torch.randn(M, 64, device="cuda"), w])
+    assert counts["sweeps"] == 2
+    tuner.clear_cache()
