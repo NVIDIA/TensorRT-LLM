@@ -1267,9 +1267,14 @@ def test_cudnn_frontend_conv3d_matches_torch(
     assert got.is_contiguous(memory_format=torch.channels_last_3d)
     rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel < 5e-3, f"rel_l2={rel:.2e}"
-    # second call reuses the selected plan
+    # The second call reuses the selected plan instead of searching again.
+    from tensorrt_llm._torch.visual_gen.models.wan import cudnn_conv
+
+    plans = {key: (entry, entry.plan) for key, entry in cudnn_conv._convs.items()}
     got2 = conv_frontend(x, w, b, (1, 1, 1), (0, 1, 1), (1, 1, 1))
-    assert torch.equal(got, got2)
+    assert {key: (entry, entry.plan) for key, entry in cudnn_conv._convs.items()} == plans
+    rel2 = ((got2.float() - got.float()).norm() / got.float().norm()).item()
+    assert rel2 < 1e-3, f"rel_l2={rel2:.2e}"
 
 
 @spatial_op

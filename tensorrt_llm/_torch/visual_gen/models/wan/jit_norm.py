@@ -459,11 +459,15 @@ def _check_frames(
     for name, t in (("x", x), ("residual", residual)):
         if t is not None and (tuple(t.shape) != want or not t.is_contiguous()):
             raise ValueError(f"{name} must be a contiguous {list(want)} tensor")
-    if cache is not None and cache.numel() and (
-        cache.dim() != 3
-        or cache.shape[0] > 2
-        or tuple(cache.shape[1:]) != (positions, channels)
-        or not cache.is_contiguous()
+    if (
+        cache is not None
+        and cache.numel()
+        and (
+            cache.dim() != 3
+            or cache.shape[0] > 2
+            or tuple(cache.shape[1:]) != (positions, channels)
+            or not cache.is_contiguous()
+        )
     ):
         raise ValueError(f"cache must be a contiguous [0..2, {positions}, {channels}] tensor")
     if m is not None and any(

@@ -226,6 +226,9 @@ class Shard:
         buf = symm.empty(numel, dtype=dtype, device=torch.cuda.current_device())
         buf.zero_()
         handle = symm.rendezvous(buf, self._group_name)
+        # The rendezvous is a host exchange; this stream-ordered barrier keeps a neighbour's
+        # first halo stores from landing before this rank's zero_ has run.
+        handle.barrier(channel=0)
 
         def frames(flat: torch.Tensor, g: FrameGeometry) -> torch.Tensor:
             return flat[: comps * groups * g.frame * channels].view(

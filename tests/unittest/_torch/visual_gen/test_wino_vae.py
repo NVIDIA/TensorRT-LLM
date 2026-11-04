@@ -162,6 +162,7 @@ def test_fold_latent_affine_matches_eager() -> None:
     mean = (torch.randn(z, generator=gen) * 0.5).to(DEVICE)
     std = (torch.rand(z, generator=gen) + 0.5).to(DEVICE)
     with torch.inference_mode():
+        plain = fast.decode(latents, return_dict=False)[0]
         eager = fast.decode(
             (latents.float() * std.view(1, z, 1, 1, 1) + mean.view(1, z, 1, 1, 1)).to(DTYPE),
             return_dict=False,
@@ -172,7 +173,9 @@ def test_fold_latent_affine_matches_eager() -> None:
         again = fast.decode(latents, return_dict=False)[0]
     rel = _rel_l2(folded, eager)
     assert rel < 2e-2, f"rel_l2={rel:.3e}"
-    assert not torch.equal(again.float(), folded.float())  # the fold is really off again
+    # Clearing the fold restores the unfolded decode.
+    assert _rel_l2(again, plain) < 1e-3, f"rel_l2={_rel_l2(again, plain):.3e}"
+    assert not torch.equal(again.float(), folded.float())
 
 
 def test_frame_buffer_grows_for_a_longer_chunk_in_a_new_clip() -> None:
@@ -222,16 +225,19 @@ def test_non_residual_encoder_keeps_downsample_bias() -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_rejects_non_bf16(dtype: torch.dtype) -> None:
-    """The kernels read and write bf16; any other dtype is refused up front instead of being
-    reinterpreted."""
+@pytest.mark.parametrize("wrong", ["both", "input", "weights"])
+def test_rejects_non_bf16(dtype: torch.dtype, wrong: str) -> None:
+    """The kernels read and write bf16; a non-bf16 input or non-bf16 weights are refused up
+    front instead of being reinterpreted."""
     _, fast = _pair()
-    fast = fast.to(dtype)
+    if wrong != "input":
+        fast = fast.to(dtype)
+    in_dtype = DTYPE if wrong == "weights" else dtype
     pixels, latents = _inputs(5)
     with torch.inference_mode(), pytest.raises(TypeError, match="bf16"):
-        fast.decode(latents.to(dtype), return_dict=False)
+        fast.decode(latents.to(in_dtype), return_dict=False)
     with torch.inference_mode(), pytest.raises(TypeError, match="bf16"):
-        fast.encode(pixels.to(dtype), return_dict=False)
+        fast.encode(pixels.to(in_dtype), return_dict=False)
 
 
 def test_decode_without_kernels_matches_native(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,11 +343,20 @@ def test_forward_registers_no_parameters() -> None:
 def test_conv_beyond_max_in_frames(monkeypatch: pytest.MonkeyPatch, frontend: bool) -> None:
     """A call longer than max_in_frames goes through the cuDNN graph API in one call, or in
     max_in_frames pieces without the frontend; both match the plain conv."""
-    if not frontend:
+    if frontend:
+        assert wino_vae_module.cudnn_frontend_available(), (
+            "nvidia-cudnn-frontend (a declared requirement) does not import"
+        )
+    else:
         monkeypatch.setattr(wino_vae_module, "cudnn_frontend_available", lambda: False)
     torch.manual_seed(0)
     conv = WinoVaeCausalConv3d(64, 12, 3, padding=1).to(device=DEVICE, dtype=DTYPE)
     conv.max_in_frames = 3
+    frontend_calls = []
+    run_frontend = conv._conv_frontend
+    monkeypatch.setattr(
+        conv, "_conv_frontend", lambda *a: frontend_calls.append(1) or run_frontend(*a)
+    )
     x = torch.randn(1, 64, 6, 16, 24, device=DEVICE).to(DTYPE)
     x = x.contiguous(memory_format=torch.channels_last_3d)
     with torch.inference_mode():
@@ -351,3 +366,4 @@ def test_conv_beyond_max_in_frames(monkeypatch: pytest.MonkeyPatch, frontend: bo
         )
     assert got.shape == ref.shape
     assert _rel_l2(got, ref) < 1e-2
+    assert len(frontend_calls) == (1 if frontend else 0)
