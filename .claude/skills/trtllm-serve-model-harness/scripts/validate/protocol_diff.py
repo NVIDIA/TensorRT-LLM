@@ -315,9 +315,9 @@ def compare(runs: dict) -> dict:
             parts = {}
             for part in ("system", "tools", "params"):
                 parts[part] = ref["conversation"][part] == other["conversation"][part]
-            parts["turns"] = _request_key({**ref["conversation"], "system": "", "tools": [], "params": None},
-                                          False) == \
-                _request_key({**other["conversation"], "system": "", "tools": [], "params": None}, False)  # fmt: skip
+            blank = {"system": "", "tools": [], "tools_literal": [], "params": None}
+            parts["turns"] = _request_key({**ref["conversation"], **blank}, False) == \
+                _request_key({**other["conversation"], **blank}, False)  # fmt: skip
             parts["reasoning_replay"] = _request_key(ref["conversation"], True) == \
                 _request_key(other["conversation"], True)  # fmt: skip
             billed_same = ref["billed_input"] == other["billed_input"]

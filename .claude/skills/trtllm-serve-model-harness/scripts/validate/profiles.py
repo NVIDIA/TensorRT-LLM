@@ -319,11 +319,15 @@ def has_id_run(token_ids: List[int], runs: List[Tuple[int, int]]) -> bool:
 # --------------------------------------------------------------------------- matrix
 
 
-def load_thresholds(path: Optional[str]) -> dict:
-    """The ``thresholds`` section of a run's matrix file, or {} (every rate unknown)."""
+def load_thresholds(path: Optional[str]) -> Tuple[dict, Optional[str]]:
+    """The ``thresholds`` section of a run's matrix file, or {} (every rate unknown).
+
+    Also returns the SHA-256 of the bytes they were read from (None without a file).
+    """
     if not path:
-        return {}
-    with open(path) as fh:
-        data = yaml.safe_load(fh) or {}
+        return {}, None
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    data = yaml.safe_load(raw) or {}
     thresholds = data.get("thresholds") if isinstance(data, dict) else None
-    return thresholds if isinstance(thresholds, dict) else {}
+    return (thresholds if isinstance(thresholds, dict) else {}), hashlib.sha256(raw).hexdigest()

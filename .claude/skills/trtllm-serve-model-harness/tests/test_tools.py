@@ -68,6 +68,22 @@ def test_strip_encrypted_keeps_the_visible_reasoning():
     assert done == ["reasoning:strip-encrypted"]
 
 
+def test_the_corpus_is_readable_by_its_owner_only(tmp_path):
+    """The corpus holds whole request bodies: 0600, whether new or overwritten."""
+    shard = tmp_path / "requests-1.jsonl"
+    shard.write_text(json.dumps({"event": "request", "trace_id": "t1", "route": "/v1/responses",
+                                 "body": {"model": "m", "input": "go"}}) + "\n")  # fmt: skip
+    out = tmp_path / "corpus.jsonl"
+    out.write_text("")
+    os.chmod(out, 0o644)
+    result = subprocess.run([sys.executable, os.path.join(SCRIPTS, "build_replay_corpus.py"),
+                             "--out", str(out), "--manifest", str(tmp_path / "manifest.json"),
+                             str(shard)], capture_output=True, text=True)  # fmt: skip
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+    assert len(out.read_text().splitlines()) == 1
+
+
 # --------------------------------------------------------------------------- replay
 
 EVENT = b'event: response.created\ndata: {"type": "response.created"}\n\n'
@@ -169,6 +185,33 @@ def test_a_trial_build_takes_its_paths_from_the_caller(tmp_path):
     assert not (repo / "trial").exists()
     provenance = (sub / "prov.txt").read_text()
     assert "item feat feat head=" in provenance and "result trial-br head=" in provenance
+
+
+# --------------------------------------------------------------------------- mutation gate
+
+
+def test_a_mutation_that_hangs_is_detected_and_restored(tmp_path):
+    """A planted bug that loops is stopped at --timeout, counted DETECTED, and taken out."""
+    # mutate.py resolves `file` against the repository four levels above its own directory.
+    gate = tmp_path / ".claude" / "skills" / "s" / "scripts" / "mutate.py"
+    gate.parent.mkdir(parents=True)
+    shutil.copy(os.path.join(SCRIPTS, "mutate.py"), gate)
+    target = tmp_path / "target.py"
+    target.write_text("HANG = False\n")
+    mutations = tmp_path / "t.mutations"
+    mutations.write_text("[mutation]\nname = loops\nfile = target.py\n"
+                         "find = HANG = False\nreplace = HANG = True\n")  # fmt: skip
+    runner = tmp_path / "runner.py"
+    runner.write_text(f"import time\nif 'True' in open({str(target)!r}).read():\n"
+                      "    time.sleep(20)\n")  # fmt: skip
+
+    result = subprocess.run([sys.executable, str(gate), str(mutations), "--runner", str(runner),
+                             "--timeout", "2"], capture_output=True, text=True,
+                            timeout=60)  # fmt: skip
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "DETECTED loops" in result.stdout
+    assert target.read_text() == "HANG = False\n"
 
 
 # --------------------------------------------------------------------------- pi kit

@@ -613,7 +613,7 @@ def main(argv=None) -> int:
     try:
         harness = prof.load_profile(args.harness)
         model = prof.load_profile(args.model)
-        thresholds = prof.load_thresholds(args.matrix)
+        thresholds, thresholds_sha256 = prof.load_thresholds(args.matrix)
         requested = args.claims.split(",") if args.claims else list(DEFAULT_CLAIMS[args.population])
         unknown = [c for c in requested if c not in CLAIMS]
         if unknown:
@@ -692,7 +692,7 @@ def main(argv=None) -> int:
             "harness": harness.path,
             "harness_sha256": harness.sha256,
         },  # fmt: skip
-        "thresholds_from": args.matrix,
+        "thresholds_from": f"{args.matrix}@{thresholds_sha256}" if args.matrix else None,
     }
     report_out = {"schema": "trtllm-serve-model-harness/report@1", **report,
                   "checks": records}  # fmt: skip

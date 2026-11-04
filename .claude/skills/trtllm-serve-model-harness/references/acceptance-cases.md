@@ -10,8 +10,10 @@ its tree SHA-256, issues verdicts only after its control matrix passes (check V-
 
 ## Running the matrix
 
+From the repository root:
+
 ```bash
-python scripts/validate/controls.py --out-dir <dir>      # all protocols + cross cases -> <dir>/controls.json
+python .claude/skills/trtllm-serve-model-harness/scripts/validate/controls.py --out-dir <dir>  # -> <dir>/controls.json
 MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 

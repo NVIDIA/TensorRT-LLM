@@ -347,6 +347,52 @@ def test_protocol_diff_attributes_each_difference(tmp_path):
     assert _diff_runs(tmp_path / "d", system="other") == "harness"
 
 
+def test_protocol_diff_turns_leave_the_tools_out(tmp_path):
+    """`request_equal.turns` compares the turns only, not the tools as each API wrote them."""
+    chat, anth = controls.diff_runs(str(tmp_path))
+    runs = {"chat": protocol_diff.load_run(chat), "messages": protocol_diff.load_run(anth)}
+    conversation = runs["messages"][0]["conversation"]
+    conversation["tools_literal"] = [(n, s + " ") for n, s in conversation["tools_literal"]]
+    row = protocol_diff.compare(runs)["rows"][0]["messages"]
+    assert row["attribution"] == "harness_literal"
+    assert row["request_equal"]["turns"] is True
+
+
+def test_verdict_names_the_matrix_bytes_it_read(tmp_path):
+    """V-02: a verdict names its thresholds by the SHA-256 of the matrix file as read."""
+    import hashlib
+
+    matrix = tmp_path / "matrix.yaml"
+    matrix.write_text("thresholds:\n  unit_for_rates: reply\n")
+    harness = controls.write_profile(
+        str(tmp_path / "h.yaml"), controls.CONTROL_PROFILES["anthropic"]
+    )
+    done = controls._anthropic_sse([{"type": "text", "text": "ok"}], "end_turn")
+    user = {"role": "user", "content": "go"}
+    controls._write_trace(str(tmp_path / "t"), [
+        (controls._anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+         controls._sse_response("t1", done))])  # fmt: skip
+    _, v = controls.run_verdict(str(tmp_path / "v"), [str(tmp_path / "t")], harness, "window",
+                                "conformance", matrix=str(matrix))  # fmt: skip
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    assert v["thresholds_from"] == f"{matrix}@{digest}"
+
+
+def test_scan_credentials_reports_an_unreadable_shard_and_goes_on(tmp_path):
+    """A .zst shard that is not zstd is an error in its own row, not the end of the scan."""
+    import subprocess
+
+    (tmp_path / "requests-1.jsonl.zst").write_bytes(b"not zstd\n" * 4)
+    (tmp_path / "requests-2.jsonl").write_text('{"k": "Bearer ' + "a1B2c3D4" * 4 + '"}\n')
+    out = tmp_path / "scan.json"
+    result = subprocess.run([sys.executable, os.path.join(VALIDATE, "scan_credentials.py"),
+                             "--out", str(out), str(tmp_path)], capture_output=True)  # fmt: skip
+    assert result.returncode == 0, result.stderr
+    rows = {os.path.basename(r["file"]): r for r in json.loads(out.read_text())["files"]}
+    assert rows["requests-1.jsonl.zst"]["error"] == "ZstdError"
+    assert "bearer" in rows["requests-2.jsonl"]["patterns"]
+
+
 def test_cross_cases(tmp_path):
     results = controls.cross_cases(str(tmp_path))
     assert results and all(r["ok"] for r in results), results

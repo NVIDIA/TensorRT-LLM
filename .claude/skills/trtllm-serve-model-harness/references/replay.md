@@ -79,10 +79,14 @@ python scripts/build_replay_corpus.py --workers 16 --out corpus.jsonl --manifest
     --per-thread 3 --max-records 2000 --model <served-model-name> --reasoning drop \
     --max-output-tokens 4096 [--route /v1/responses] <request shards or hour dirs>
 python scripts/replay_requests.py --base-url http://<host>:<port> --out-dir replay_out \
-    --concurrency 16 --first-event-timeout 120 corpus.jsonl
+    --concurrency 16 --first-event-timeout <first_event_s> corpus.jsonl
 python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model profiles/model/<m>.yaml \
     --matrix <run>/matrix.yaml --population replay --out-dir replay_out/verdict replay_out
 ```
+
+`<first_event_s>` is the harness profile's `timeouts.first_event_s` (Codex 120, pi 300, Claude
+Code 360): a replay that gives up sooner than the harness would records a timeout the harness
+never had.
 
 ### Selection
 

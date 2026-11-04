@@ -388,7 +388,10 @@ def main():
     # Pass 2: copy and transform only the selected lines.
     out_sha = hashlib.sha256()
     written = 0
-    with open(args.out, "w") as out:
+    # The corpus holds whole request bodies (user code, tool output): owner only.
+    fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as out:
         for path in sorted(wanted):
             lines = wanted[path]
             for line_no, raw in iter_lines(path):

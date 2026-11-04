@@ -48,6 +48,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tracelib import iter_lines  # noqa: E402
 
+# What a file that cannot be read raises: it is reported in the file's row, and the scan goes on.
+FILE_ERRORS = (OSError, EOFError, ValueError)
+try:
+    import zstandard
+
+    FILE_ERRORS += (zstandard.ZstdError,)  # a .zst shard that is not zstd
+except ImportError:  # without zstandard no .zst shard is read at all
+    pass
+
 # (name, pattern, word boundary required before the match). A pattern with a
 # named group "value" is digested on that group, else on the whole match.
 PATTERNS = (
@@ -131,7 +140,7 @@ def main():
                     entry = per.setdefault(name, {})
                     slot = entry.setdefault(digest, {"count": 0, "chars": len(value)})
                     slot["count"] += 1
-        except (OSError, EOFError, ValueError) as error:
+        except FILE_ERRORS as error:
             report_files.append({"file": path, "error": type(error).__name__})
             continue
         if not per:

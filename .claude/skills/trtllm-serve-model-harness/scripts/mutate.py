@@ -26,7 +26,10 @@ while the gate runs.
 Usage (``references/verify-logic.md``)::
 
     python3 scripts/mutate.py <file.mutations> --runner <property runner> \
-        [--runner-args "..."] [--python <interpreter with hypothesis>]
+        [--runner-args "..."] [--python <interpreter with hypothesis>] [--timeout S]
+
+A mutated run that does not end within ``--timeout`` seconds (a planted bug that loops) is
+stopped and counts as DETECTED: the property did not hold.
 
 ``file`` paths are relative to the root of the repository that holds this skill.
 
@@ -74,6 +77,7 @@ def main() -> int:
         help="the property runner: a script that exits 0 when every property holds",
     )
     ap.add_argument("--runner-args", default="")
+    ap.add_argument("--timeout", type=float, default=600.0, help="seconds per mutated run")
     ap.add_argument(
         "--python",
         default=sys.executable,
@@ -129,11 +133,16 @@ def main() -> int:
         shutil.copy2(target, backup)
         try:
             target.write_text(original.replace(m["find"], m["replace"]))
-            res = subprocess.run(
-                [args.python, str(runner), *args.runner_args.split()],
-                capture_output=True,
-                text=True,
-            )
+            try:
+                res = subprocess.run(
+                    [args.python, str(runner), *args.runner_args.split()],
+                    capture_output=True,
+                    text=True,
+                    timeout=args.timeout,
+                )
+            except subprocess.TimeoutExpired:
+                print_now(f"DETECTED {m['name']} (no result within {args.timeout:g} s)")
+                continue
             detected = res.returncode != 0 and res.returncode != 3
             if base.returncode == res.returncode and not baseline_clean:
                 detected = res.stdout != base.stdout

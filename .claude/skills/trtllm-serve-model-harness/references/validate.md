@@ -148,7 +148,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | H-04 | G07 | Over-length reaches the harness's compaction path | FAIL if the harness resends instead. NOT_APPLICABLE when no over-length reply was followed by a next turn | all |
 | H-05 | G07 | Compaction requests answered with substantive summaries | Sampled semantic review | planned |
 | V-01 | G20 | The validator tree hash has a passing control receipt (`acceptance-cases.md`) | Without one, no verdict counts | all (controls.py receipt) |
-| V-02 | G20 | The report binds the input manifest, profile hashes and validator hash | Missing gives BLOCKED | partial (profiles, tree hash, the evidence read and the declared `--build-id`; a `MANIFEST.sha256` beside the evidence is recorded, not verified) |
+| V-02 | G20 | The report binds the input manifest, profile hashes and validator hash | Missing gives BLOCKED | partial (profiles, tree hash, the evidence read, the matrix and the declared `--build-id`; a `MANIFEST.sha256` beside the evidence is recorded, not verified) |
 | V-03 | G20 | Invalidations consumed before a saved PASS is trusted | — | planned |
 
 Gates that do not apply to a cell:
@@ -207,6 +207,8 @@ can run to gigabytes. That belongs in the full tier, and only at stage exits.
   each ending in a newline: it names the bytes judged in their roles, wherever they lie, and
   changes with any byte. A `MANIFEST.sha256` in a given directory or the one above it (a frozen
   snapshot's root) is recorded with its own SHA-256; it is not checked against the shards (I-03).
+- **Which thresholds.** `thresholds_from` is the `--matrix` file as given, `@` the SHA-256 of the
+  bytes its thresholds were read from (null without `--matrix`).
 - **Which code it checked (I-05).** `revision` holds `--build-id` as given (null when not given,
   "" when empty), whether the replies were checked against it, and the build ids they carry.
   Replies that carry one while none is declared make inventory BLOCKED (section 8 says what to
