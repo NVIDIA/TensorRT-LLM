@@ -8,7 +8,19 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-_SPLITS = {(40, 8): 4, (48, 8): 4, (48, 6): 4, (56, 8): 3, (60, 6): 3}
+_SPLITS = {
+    (40, 8): 4,
+    (48, 8): 4,
+    (48, 6): 4,
+    (56, 8): 3,
+    (60, 6): 3,
+    (72, 6): 2,
+    (78, 6): 2,
+    (84, 6): 2,
+    (90, 6): 2,
+    (96, 6): 2,
+    (102, 6): 2,
+}
 _ENVELOPE = 1048576
 _WORKSPACE_ELEMENTS = (2048 + 160 * 16384 * 8) // 4
 _workspaces: dict[tuple[int, int], torch.Tensor] = {}
@@ -87,11 +99,16 @@ def run(
             hint_free=True,
             fused_k=2048,
         )
-        # All selected grids have 148 < rows * split <= 212. These are the
-        # shared varlen launcher's tail parameters for those actual rows.
-        assert rows * split > 148
+        # Match the shared varlen launcher's tail parameters for this grid.
+        big = rows * split <= 148
         pre = (0, stride, 2048, 8192, 4096, split, 0, 0, 0, 0, 0)
-        tail = (2816, 48, 7168, 1, 0)
+        tail = (
+            4096 if big else 2816,
+            32 if split == 2 else 48,
+            6144 if split == 2 else 7168,
+            0 if big else 1,
+            0,
+        )
         launcher = (fn, pre, tail)
         _launchers[key] = launcher
         logger.info(
