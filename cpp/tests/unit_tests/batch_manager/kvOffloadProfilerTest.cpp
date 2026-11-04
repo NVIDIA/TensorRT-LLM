@@ -15,7 +15,6 @@
  */
 
 #include "kvCacheManagerV2TestUtils.h"
-#include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
@@ -135,10 +134,16 @@ class V2KvOffloadProfilerTest : public KvOffloadProfilerTest, public ::testing::
 {
 };
 
-TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
+void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected)
 {
     auto config = v2::test::makeConfig();
-    config.cacheTiers.emplace_back(v2::HostCacheTierConfig{4 << 20});
+    switch (coldTier)
+    {
+    case v2::CacheTier::HOST_MEM: config.cacheTiers.emplace_back(v2::HostCacheTierConfig{4 << 20}); break;
+    case v2::CacheTier::GPU_MEM: config.cacheTiers.emplace_back(v2::GpuCacheTierConfig{4 << 20}); break;
+    case v2::CacheTier::DISK: config.cacheTiers.emplace_back(v2::DiskCacheTierConfig{4 << 20, "/tmp"}); break;
+    }
+
     auto manager = std::make_shared<v2::KvCacheManager>(config);
     auto stream = std::make_shared<tr::CudaStream>();
     auto& storage = manager->storage();
@@ -165,10 +170,12 @@ TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
     }
     source->commit(span);
     source->close();
-    bool const inputs = GetParam();
     CallbackGuard callback(inputs);
     v2::TypedVec<v2::PoolGroupIndex, v2::SlotCount> goals(storage.numPoolGroups(v2::kHotLevel), 0);
     goals[hotGroup] = storage.getStatistics(v2::kHotLevel, hotGroup).total;
+    storage.prepareFreeSlots(v2::kHotLevel, goals);
+    ASSERT_EQ(storage.getStatistics(coldLevel, coldGroup).evictable, 2);
+    // Repeating the satisfied requirement must not submit another migration.
     storage.prepareFreeSlots(v2::kHotLevel, goals);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     // Overwrite recycled hot memory so a missing restore cannot reuse the original bytes.
@@ -177,6 +184,9 @@ TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
     ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(base), 0, hotBytes * goals[hotGroup]), cudaSuccess);
     auto restored = manager->createKvCache({}, span, 2);
     ASSERT_EQ(restored->numCommittedTokens(), 8);
+    // Drive StorageManager::prefetch through the public cache API, including a no-work repeat.
+    ASSERT_TRUE(restored->prefetch(v2::kHotLevel));
+    ASSERT_TRUE(restored->prefetch(v2::kHotLevel));
     ASSERT_TRUE(restored->resume(stream->get()));
     stream->synchronize();
     for (int page = 0; page < 2; ++page)
@@ -187,6 +197,13 @@ TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
         ASSERT_EQ(cudaMemcpy(bytes.data(), reinterpret_cast<void const*>(address), hotBytes, cudaMemcpyDeviceToHost),
             cudaSuccess);
         EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](auto byte) { return byte == 0x5A; }));
+    }
+    if (!selected || coldTier != v2::CacheTier::HOST_MEM)
+    {
+        EXPECT_TRUE(observations().empty());
+        restored->close();
+        manager->shutdown();
+        return;
     }
     ASSERT_EQ(observations().size(), 2);
     EXPECT_EQ(observations()[0].name, "trtllm::kv_cache_offload");
@@ -208,56 +225,50 @@ TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
     manager->shutdown();
 }
 
-INSTANTIATE_TEST_SUITE_P(CallbackInputs, V2KvOffloadProfilerTest, ::testing::Bool());
-
-TEST_F(KvOffloadProfilerTest, V2DoesNotMislabelOtherTiersOrEmptyWork)
+TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
 {
-    auto stream = std::make_shared<tr::CudaStream>();
-    tr::BufferManager buffers(stream);
-    auto gpu = buffers.gpu(32);
-    auto host = tr::BufferManager::pinned(32);
-    auto gpuAddr = reinterpret_cast<v2::MemAddress>(gpu->data());
-    auto hostAddr = reinterpret_cast<v2::MemAddress>(host->data());
-    v2::CopyEngine engine(nullptr);
-    CallbackGuard callback;
-    engine.transfer(v2::CacheTier::GPU_MEM, v2::CacheTier::GPU_MEM, 16, {{gpuAddr + 16, gpuAddr}}, stream->get());
-    engine.transfer(v2::CacheTier::HOST_MEM, v2::CacheTier::HOST_MEM, 16, {{hostAddr + 16, hostAddr}}, stream->get());
-    engine.transfer(v2::CacheTier::HOST_MEM, v2::CacheTier::GPU_MEM, 0, {{hostAddr, gpuAddr}}, stream->get());
-    engine.transfer(v2::CacheTier::GPU_MEM, v2::CacheTier::HOST_MEM, 32, {}, stream->get());
-    stream->synchronize();
-    EXPECT_TRUE(observations().empty());
+    expectV2RoundTrip(v2::CacheTier::HOST_MEM, GetParam(), true);
 }
 
-TEST(KvOffloadDisabledTest, DisabledSelectionPreservesNativeRoundTrip)
+INSTANTIATE_TEST_SUITE_P(CallbackInputs, V2KvOffloadProfilerTest, ::testing::Bool());
+
+class V2OtherTierProfilerTest : public KvOffloadProfilerTest, public ::testing::WithParamInterface<v2::CacheTier>
 {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0)
+};
+
+TEST_P(V2OtherTierProfilerTest, ProductionMigrationDoesNotMislabelOtherTiersOrEmptyWork)
+{
+    expectV2RoundTrip(GetParam(), true, true);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ColdTier, V2OtherTierProfilerTest, ::testing::Values(v2::CacheTier::GPU_MEM, v2::CacheTier::DISK));
+
+class KvOffloadDisabledTest : public ::testing::Test
+{
+protected:
+    void SetUp() override
     {
-        GTEST_SKIP() << "CUDA device required";
+        int count = 0;
+        if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0)
+        {
+            GTEST_SKIP() << "CUDA device required";
+        }
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        // gtest_discover_tests launches each case in a fresh process, before selector caching.
+#if defined(_WIN32)
+        ASSERT_EQ(_putenv_s("TLLM_PROFILE_CUSTOM_REGIONS", "none"), 0);
+#else
+        ASSERT_EQ(setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none", 1), 0);
+#endif
+        ASSERT_FALSE(tc::initializeProfiler().has_value());
+        ASSERT_FALSE(tc::customRegionEnabled(tc::ProfilerRegion::kKv));
     }
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    ASSERT_FALSE(tc::initializeProfiler().has_value());
-    if (tc::customRegionEnabled(tc::ProfilerRegion::kKv))
-    {
-        GTEST_SKIP() << "Run in a separate process with TLLM_PROFILE_CUSTOM_REGIONS=none";
-    }
-    auto stream = std::make_shared<tr::CudaStream>();
-    tr::BufferManager buffers(stream);
-    auto gpu = buffers.gpu(32);
-    auto host = tr::BufferManager::pinned(32);
-    auto gpuAddr = reinterpret_cast<v2::MemAddress>(gpu->data());
-    auto hostAddr = reinterpret_cast<v2::MemAddress>(host->data());
-    std::memset(host->data(), 0x5A, 32);
-    v2::CopyEngine engine(nullptr);
-    CallbackGuard callback;
-    engine.transfer(v2::CacheTier::GPU_MEM, v2::CacheTier::HOST_MEM, 32, {{gpuAddr, hostAddr}}, stream->get());
-    stream->synchronize();
-    std::memset(host->data(), 0, 32);
-    engine.transfer(v2::CacheTier::HOST_MEM, v2::CacheTier::GPU_MEM, 32, {{hostAddr, gpuAddr}}, stream->get());
-    stream->synchronize();
-    auto const* bytes = static_cast<unsigned char const*>(host->data());
-    EXPECT_TRUE(std::all_of(bytes, bytes + 32, [](auto byte) { return byte == 0x5A; }));
-    EXPECT_TRUE(observations().empty());
+};
+
+TEST_F(KvOffloadDisabledTest, V2ProductionRoundTripPreservesPayload)
+{
+    expectV2RoundTrip(v2::CacheTier::HOST_MEM, true, false);
 }
 
 class LegacyKvOffloadProfilerTest
@@ -266,9 +277,9 @@ class LegacyKvOffloadProfilerTest
 {
 };
 
-TEST_P(LegacyKvOffloadProfilerTest, ReportsActualPoolPayloadAndPreservesRoundTrip)
+void expectLegacyRoundTrip(
+    bool layerFirst, bool scales, int tokens, int expectedBytes, tensorrt_llm::DataType dtype, bool selected)
 {
-    auto const [layerFirst, scales, tokens, expectedBytes, dtype] = GetParam();
     auto stream = std::make_shared<tr::CudaStream>();
     tr::BufferManager buffers(stream);
     tr::ITensor::SharedPtr primary = buffers.gpu(tr::ITensor::makeShape({2, 2, 2, 32}), dtype);
@@ -299,20 +310,34 @@ TEST_P(LegacyKvOffloadProfilerTest, ReportsActualPoolPayloadAndPreservesRoundTri
             : index >= 2 * blockBytes && index < 3 * blockBytes && payloadAt(index - 2 * blockBytes);
         EXPECT_EQ(hostBytes[index], copied ? 0x5A : 0) << "host byte " << index;
     }
-    ASSERT_EQ(observations().size(), 1);
-    expectField(observations()[0], "'kv.payload_bytes':" + std::to_string(expectedBytes));
-    expectField(observations()[0], "'kv.manager_version':'legacy'");
-    expectField(observations()[0], "'kv.pool_index':0");
-    expectField(observations()[0], "'kv.source_block_id':11");
-    EXPECT_EQ(observations()[0].name, "trtllm::kv_cache_offload");
+    if (selected)
+    {
+        ASSERT_EQ(observations().size(), 1);
+        expectField(observations()[0], "'kv.payload_bytes':" + std::to_string(expectedBytes));
+        expectField(observations()[0], "'kv.manager_version':'legacy'");
+        expectField(observations()[0], "'kv.pool_index':0");
+        expectField(observations()[0], "'kv.source_block_id':11");
+        EXPECT_EQ(observations()[0].name, "trtllm::kv_cache_offload");
+    }
+    else
+    {
+        EXPECT_TRUE(observations().empty());
+    }
     ASSERT_EQ(cudaMemset(primary->data(), 0, primary->getSizeInBytes()), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     tensorrt_llm::testing::KVCacheTransferManagerTestAccess::copy(manager, dst, src, {pool}, false, tokens);
     manager.syncTransfers();
     stream->synchronize();
-    ASSERT_EQ(observations().size(), 2);
-    EXPECT_EQ(observations()[1].name, "trtllm::kv_cache_restore");
-    expectField(observations()[1], "'kv.payload_bytes':" + std::to_string(expectedBytes));
+    if (selected)
+    {
+        ASSERT_EQ(observations().size(), 2);
+        EXPECT_EQ(observations()[1].name, "trtllm::kv_cache_restore");
+        expectField(observations()[1], "'kv.payload_bytes':" + std::to_string(expectedBytes));
+    }
+    else
+    {
+        EXPECT_TRUE(observations().empty());
+    }
     auto check = tr::BufferManager::pinned(primary->getSizeInBytes());
     ASSERT_EQ(cudaMemcpy(check->data(), primary->data(), check->getSizeInBytes(), cudaMemcpyDeviceToHost), cudaSuccess);
     auto const* restored = static_cast<unsigned char const*>(check->data());
@@ -323,6 +348,17 @@ TEST_P(LegacyKvOffloadProfilerTest, ReportsActualPoolPayloadAndPreservesRoundTri
             : index >= blockBytes && index < 2 * blockBytes && payloadAt(index - blockBytes);
         EXPECT_EQ(restored[index], copied ? 0x5A : 0) << "restored byte " << index;
     }
+}
+
+TEST_P(LegacyKvOffloadProfilerTest, ReportsActualPoolPayloadAndPreservesRoundTrip)
+{
+    auto const [layerFirst, scales, tokens, expectedBytes, dtype] = GetParam();
+    expectLegacyRoundTrip(layerFirst, scales, tokens, expectedBytes, dtype, true);
+}
+
+TEST_F(KvOffloadDisabledTest, LegacyProductionRoundTripPreservesPayload)
+{
+    expectLegacyRoundTrip(false, false, 3, 192, tensorrt_llm::DataType::kFLOAT, false);
 }
 
 TEST_F(KvOffloadProfilerTest, LegacyDeviceReuseIsNotOffload)
