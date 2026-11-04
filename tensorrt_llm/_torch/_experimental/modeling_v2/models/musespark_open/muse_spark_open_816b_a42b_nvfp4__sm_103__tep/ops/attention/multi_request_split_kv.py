@@ -99,6 +99,21 @@ NQ = 2
 #: holds next to its Q buffers, 20 pages with a one-term Q (the served E4M3 Q) and 16 with a
 #: two-term Q (24 and 20 do not launch). sm107: 16 pages for either Q.
 RING_STAGES_BY_SM = {103: {1: 20, 2: 16}, 107: {1: 16, 2: 16}}
+#: sm107's ring depths with ``split_kv_deep_ring`` (``set_deep_ring``): 20 pages with a one-term
+#: Q (a deeper ring adds nothing at the context depths of large decode batches), 16 with a
+#: two-term Q. The ring depth changes only when pages land, never an output bit.
+SM107_DEEP_RING_STAGES = {1: 20, 2: 16}
+#: Whether sm107 builds take ``SM107_DEEP_RING_STAGES`` (``set_deep_ring``).
+_deep_ring = False
+
+
+def set_deep_ring(on: bool) -> None:
+    """Give every later sm107 build without an explicit ring depth ``SM107_DEEP_RING_STAGES``
+    (``split_kv_deep_ring``), or ``RING_STAGES_BY_SM``'s. Set by the install, before any build."""
+    global _deep_ring
+    _deep_ring = bool(on)
+
+
 #: sm103's ring depths.
 RING_STAGES = RING_STAGES_BY_SM[103]
 
@@ -110,7 +125,8 @@ def ring_stages(device_index: int, q_terms: int) -> int:
         ValueError: on a device ``RING_STAGES_BY_SM`` does not list.
     """
     major, minor = torch.cuda.get_device_capability(device_index)
-    table = RING_STAGES_BY_SM.get(10 * major + minor)
+    sm = 10 * major + minor
+    table = SM107_DEEP_RING_STAGES if sm == 107 and _deep_ring else RING_STAGES_BY_SM.get(sm)
     if table is None:
         raise ValueError(
             f"multi_request_split_kv: no ring depth for sm{10 * major + minor} "
@@ -177,7 +193,6 @@ def request_slots(seq_lens, rows: int, window: int, num_work: int):
     return out
 
 
-@functools.lru_cache(maxsize=32)
 def _compiled_kernel(
     device_index: int,
     enable_pdl: bool,
@@ -191,7 +206,36 @@ def _compiled_kernel(
     max_requests: int = REQUEST_BUILDS[0],
 ):
     """The compiled split kernel of one build (its ring depth from ``ring_stages`` unless
-    ``stages`` is given)."""
+    ``stages`` is given), cached per ring depth."""
+    if stages is None:
+        stages = ring_stages(device_index, 1 if q_fp8 else nq)
+    return _compiled_build(
+        device_index,
+        enable_pdl,
+        kv_heads,
+        window,
+        nq,
+        rescale_cols,
+        q_fp8,
+        device_scale,
+        stages,
+        max_requests,
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _compiled_build(
+    device_index: int,
+    enable_pdl: bool,
+    kv_heads: int,
+    window: int,
+    nq: int,
+    rescale_cols: int,
+    q_fp8: bool,
+    device_scale: bool,
+    stages: int,
+    max_requests: int,
+):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -200,8 +244,6 @@ def _compiled_kernel(
     from . import multi_request_split_kv_kernel as mk
 
     assert (mk.MAX_ROWS, mk.REQUEST_BUILDS) == (MAX_ROWS, REQUEST_BUILDS)
-    if stages is None:
-        stages = ring_stages(device_index, 1 if q_fp8 else nq)
     kernel = mk.MultiRequestSplitKvKernel(
         enable_pdl=enable_pdl,
         kv_heads=kv_heads,

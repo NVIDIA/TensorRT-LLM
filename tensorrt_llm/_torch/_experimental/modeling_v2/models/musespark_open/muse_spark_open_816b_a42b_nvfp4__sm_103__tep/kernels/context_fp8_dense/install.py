@@ -111,18 +111,50 @@ _MIXED_512 = (
     "static",
     "m",
 )
+_BASE_512_21_CLC_N = (
+    "base",
+    (512, 256, 128),
+    (256, 256, 64),
+    (2, 1),
+    False,
+    False,
+    "clc_dynamic",
+    "n",
+    1,
+)
+_BASE_512X192_21 = ("base", (512, 192, 128), (256, 192, 64), (2, 1), False, False, "static", "m", 1)
+_BASE_512X192_21_CLC_N = (
+    "base",
+    (512, 192, 128),
+    (256, 192, 64),
+    (2, 1),
+    False,
+    False,
+    "clc_dynamic",
+    "n",
+    1,
+)
 
 #: ``(out_features, in_features) -> ((fewest rows, tactic), ...)``, rows ascending: a call of M
 #: rows runs the tactic of the last entry with ``fewest rows <= M``. The fastest non-swapped
 #: tactic per row count of a sweep on one Rubin GPU under CUDA-graph replay (this model's TP4 shapes).
+#: Between 1024 and 2048 rows (the sequence-parallel shard of pool / unpool) and between 4096
+#: and 8192 rows (QKV) the buckets follow the M-tile counts: an entry starting at
+#: ``256 * j + 1`` covers the rows with one more 256-row tile than ``256 * j``. Unpool keeps the
+#: static ``_BASE_256_42`` from 1537 rows: its CLC twin, faster alone, is slower in serving at
+#: 2048 rows. Every tactic here is split-K 1 and gives the same bits as every other at the same
+#: shape.
 TACTICS: Dict[Tuple[int, int], Tuple[Tuple[int, Tuple[Any, ...]], ...]] = {
     (4608, 8192): (  # QKV
         (0, _BASE_256_22_CLC),
         (1536, _BASE_512_21),
         (2048, _BASE_512_22_N),
         (3072, _MIXED_256),
-        (6144, _BASE_256_22_CLC),
-        (8192, _MIXED_512),
+        (4097, _BASE_512_22_N),
+        (5121, _BASE_512_21_CLC_N),
+        (5633, _BASE_512X192_21_CLC_N),
+        (6657, _MIXED_256),
+        (7169, _MIXED_512),
     ),
     (8192, 2048): (  # o_proj
         (0, _BASE_512_21),
@@ -131,7 +163,10 @@ TACTICS: Dict[Tuple[int, int], Tuple[Tuple[int, Tuple[Any, ...]], ...]] = {
     ),
     (4096, 8192): (  # pool
         (0, _MIXED_256),
-        (2048, _BASE_512_22_N),
+        (1024, _BASE_256_21_CLC),
+        (1281, _MIXED_256),
+        (1537, _BASE_512X192_21),
+        (2049, _BASE_512_22_N),
         (3072, _MIXED_512),
         (4096, _BASE_256_42),
         (6144, _BASE_512_21),
@@ -139,7 +174,7 @@ TACTICS: Dict[Tuple[int, int], Tuple[Tuple[int, Tuple[Any, ...]], ...]] = {
     ),
     (8192, 4096): (  # unpool
         (0, _BASE_512_21),
-        (1536, _BASE_256_42),
+        (1537, _BASE_256_42),
         (3072, _MIXED_512),
         (4096, _MIXED_256),
         (8192, _BASE_512_21),

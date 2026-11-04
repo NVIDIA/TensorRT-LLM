@@ -29,7 +29,9 @@ residual join writes the router's FP32 input next to the pre-FFN norm output
 (``router_input``); both are bitwise. There the attention input of steps of at least
 ``ce_gather.MIN_ROWS`` rows is gathered by the copy engines and the QKV projection runs
 in row blocks behind per-peer flags (``ce_gather``); also bitwise. On sm107 the router
-logits and the attention input are all-gathered.
+logits and the attention input are all-gathered; with ``context_sp_router_input`` the
+attention-side join writes the router's FP32 input as on sm103 (``router_input``), in
+place of the router's standalone BF16 -> FP32 copy of the norm output (``parts_of``).
 
 DFlash taps the residual stream after its capture layers, and that stream is
 sharded here. For the forward the step's capture buffer
@@ -84,6 +86,7 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
+from tensorrt_llm.logger import logger
 
 #: The fewest rows a step captured into the breakable prefill CUDA graph needs to run
 #: sequence-parallel: below it the two collectives' fixed cost per all-reduce replaced
@@ -158,13 +161,25 @@ SHARD_PARTS_BY_SM = {
 }
 
 
-def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequenceParallel":
+def parts_of(sm: Optional[int], router_input: bool = False) -> Optional[Tuple[str, ...]]:
+    """The parts ``install`` wires on ``sm`` (``SHARD_PARTS_BY_SM``), or None. With
+    ``router_input`` (``context_sp_router_input``) sm107 adds the router's FP32 input from
+    the attention-side join (bitwise with the router's standalone copy)."""
+    parts = SHARD_PARTS_BY_SM.get(sm)
+    if router_input and parts is not None and "router_input" not in parts:
+        parts = (*parts, "router_input")
+    return parts
+
+
+def install(
+    model: MuseSparkOpenModel, sm: Optional[int], router_input: bool = False
+) -> "ContextSequenceParallel":
     """The path's forward for ``model``, with every layer's MoE re-classed (``moe.install``).
 
     ``sm`` is the SM version the model's composition was built for
     (``dispatch.sm_of``), required: the parts differ per SM, so none is assumed. It
     picks the eager threshold (``EAGER_MIN_ROWS_BY_SM``) and the parts installed
-    beside the MoE re-class (``SHARD_PARTS_BY_SM``).
+    beside the MoE re-class (``parts_of(sm, router_input)``).
 
     The MNNVL all-reduce workspaces are grown on the first prefill step
     (``ContextSequenceParallel.reserve``).
@@ -176,7 +191,7 @@ def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequencePar
     """
     from . import moe as _moe
 
-    parts = SHARD_PARTS_BY_SM.get(sm)
+    parts = parts_of(sm, router_input)
     if parts is None:
         got = "no SM version" if sm is None else f"sm{sm}"
         raise ValueError(
@@ -192,6 +207,7 @@ def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequencePar
         from . import ce_gather as _ce_gather
 
         path.ce_gather = _ce_gather.install(model)
+    logger.info(f"[musespark_open] context_sequence_parallel: sm{sm} parts {list(parts)}")
     return path
 
 
