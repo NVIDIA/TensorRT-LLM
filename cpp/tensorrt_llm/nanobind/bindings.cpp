@@ -26,6 +26,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <string_view>
 #include <torch/extension.h>
@@ -86,10 +87,11 @@ using OptVec = std::optional<std::vector<T>>;
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
 #if defined(TORCH_CUDA)
+    // Native Logger rank filtering may query CUDA before any device is available.
     auto const diagnostic = tc::initializeProfiler();
     if (diagnostic)
     {
-        TLLM_LOG_WARNING("%s", diagnostic->c_str());
+        std::fprintf(stderr, "TensorRT-LLM profiler warning: %s\n", diagnostic->c_str());
     }
     if (char const* selection = std::getenv("TLLM_PROFILE_CUSTOM_REGIONS"); !diagnostic && selection != nullptr
         && std::string_view{selection}.find_first_not_of(" \t\r\n") != std::string_view::npos)
@@ -98,9 +100,10 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         {
             if (!available && tc::customRegionEnabled(region))
             {
-                std::string const message = std::string{"TLLM_PROFILE_CUSTOM_REGIONS selects "} + name
-                    + ", but this build omits its probes (" + option + "=OFF)";
-                TLLM_LOG_WARNING("%s", message.c_str());
+                std::fprintf(stderr,
+                    "TensorRT-LLM profiler warning: TLLM_PROFILE_CUSTOM_REGIONS selects %s, "
+                    "but this build omits its probes (%s=OFF)\n",
+                    name, option);
             }
         };
         warnUnavailable(
