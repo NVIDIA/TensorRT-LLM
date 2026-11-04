@@ -391,6 +391,7 @@ def test_default_loader_returns_native_token_ids(native_processor):
 
 
 def test_image_hashes_and_positions_are_independent_of_companions(native_processor):
+    from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
     from tensorrt_llm.inputs.registry import create_input_processor_with_hash
 
     wrapped = create_input_processor_with_hash(native_processor)
@@ -403,8 +404,9 @@ def test_image_hashes_and_positions_are_independent_of_companions(native_process
         blocks = native_processor._image_blocks(ids)
         assert mm.multimodal_positions == [begin for begin, _ in blocks]
         assert mm.multimodal_lengths == [end - begin for begin, end in blocks]
-        counts = extra["multimodal_data"]["multimodal_embedding_lengths"]
-        assert counts == [6] * len(images)
+        # The wrapper records each image's embedding length in the item metadata.
+        metadata = get_multimodal_item_metadata(extra["multimodal_data"])
+        assert list(metadata.output_embedding_lengths) == [6] * len(images)
         return ids, mm.multimodal_hashes
 
     alone, ha = process([a], "Color [IMG]?")
