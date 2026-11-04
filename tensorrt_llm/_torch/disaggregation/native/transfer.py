@@ -914,7 +914,20 @@ class Sender(SenderBase):
         request: TransferRequest,
         on_submitted: Optional[Callable[[], None]] = None,
     ) -> tuple[bool, Optional[str]]:
-        if not self._owns_task(task):
+        owned = self._owns_task(task)
+        try:
+            # This query cannot submit a transfer. Reject before acquiring backend ownership.
+            if request.op == TransferOp.WRITE and not self._agent.check_remote_descs(
+                request.remote_name, request.dst_descs
+            ):
+                raise RuntimeError("NIXL WRITE remote descriptors unavailable")
+        except Exception as error:
+            if owned:
+                task.retire_unsubmitted_physical_operation(peer_rank)
+            raise _TransferNotSubmittedError(
+                "NIXL sender rejected transfer before backend submission"
+            ) from error
+        if not owned:
             status = self._agent.submit_transfer_requests(request)
             if on_submitted is not None:
                 with disagg_diagnostics.suppress_diagnostic_errors():
