@@ -911,11 +911,21 @@ def _num_sms(device: torch.device) -> int:
 
 def v2_verify_applies(num_heads: int, num_requests: int, num_spec: int, device) -> bool:
     """Whether a packed, fused-norm, BF16-output verify of ``num_heads`` x ``num_requests``
-    tiles runs ``kda_decode_mtp_v2_kernel`` (see `_select_verify_kernel`)."""
+    tiles runs ``kda_decode_mtp_v2_kernel`` (`_select_verify_kernel`, for operands on its
+    contract)."""
     return (
-        not _bf16_math_enabled()
-        and num_spec <= MAX_NUM_SPEC
-        and num_heads * num_requests <= _num_sms(device)
+        _select_verify_kernel(
+            packed_token_layout=True,
+            fuse_output_norm=True,
+            quantize_output=False,
+            bf16_math=_bf16_math_enabled(),
+            replay_only=False,
+            num_spec=num_spec,
+            num_tiles=num_heads * num_requests,
+            num_sms=_num_sms(device),
+            operands_ok=lambda: True,
+        )
+        == "v2"
     )
 
 

@@ -123,10 +123,21 @@ def _verify_kernel_single_wave(num_heads: int, num_requests: int, device: torch.
     return ctas <= _num_sms(index)
 
 
+def _fab_fa_takes_fb_weight(fb_weight: torch.Tensor, num_heads: int) -> bool:
+    """Whether the in-kernel f_b of the f_a-mode verify reads ``fb_weight`` (``f_b_proj``)."""
+    return (
+        fb_weight.dtype == torch.bfloat16
+        and fb_weight.is_contiguous()
+        and tuple(fb_weight.shape) == (num_heads * 128, 128)
+        and fb_weight.data_ptr() % 16 == 0
+    )
+
+
 def _use_fab_fa(
     x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
 ) -> bool:
-    """Whether the verify gate comes from ``trtllm::k3_kda_fab_fa`` + the in-kernel f_b.
+    """Whether the verify gate comes from ``trtllm::k3_kda_fab_fa`` + the in-kernel f_b, for
+    an ``fb_weight`` that :func:`_fab_fa_takes_fb_weight`.
 
     ``x`` is the ``[requests, steps, hidden]`` verify input."""
     if torch.compiler.is_compiling() or not x.is_contiguous():
@@ -138,13 +149,6 @@ def _use_fab_fa(
         return False
     if num_requests * num_steps <= _KDA_FUSED_FB_LOWM_ROWS and not _verify_kernel_single_wave(
         num_heads, num_requests, x.device
-    ):
-        return False
-    if (
-        fb_weight.dtype != torch.bfloat16
-        or not fb_weight.is_contiguous()
-        or tuple(fb_weight.shape) != (num_heads * 128, 128)
-        or fb_weight.data_ptr() % 16
     ):
         return False
     from ...attention.kernels.blackwell.kimi_k3_kda import k3_kda_fab
@@ -443,6 +447,9 @@ class KimiKDALinearAttention(nn.Module):
         # and batched [f_b; g_b]. FP8 fusion remains full-rank only.
         self._qkvg_proj_weight: Optional[torch.Tensor] = None
         self._bfa_proj_weight: Optional[torch.Tensor] = None
+        # Whether the f_a-mode verify's in-kernel f_b reads f_b_proj's weight; set with
+        # _bfa_proj_weight.
+        self._fab_fa_fb_weight = False
         # Low-rank gate only: ``[2, head_dim, D]`` transposed view of the
         # stacked ``[f_b; g_b]`` weights for one batched GEMM.
         self._gate_b_t: Optional[torch.Tensor] = None
@@ -513,6 +520,9 @@ class KimiKDALinearAttention(nn.Module):
                 self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
                 self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
             self._bfa_proj_weight = self._merge_projection_weights(bfa_modules, pad_rows_to=8)
+            self._fab_fa_fb_weight = self.use_full_rank_gate and _fab_fa_takes_fb_weight(
+                self.f_b_proj.weight, self.num_heads
+            )
             self._build_decode_kernel_constants()
 
     @staticmethod
@@ -1554,7 +1564,7 @@ class KimiKDALinearAttention(nn.Module):
             fb_weight = self.f_b_proj.weight
             fab_fa = (
                 gate_from_fa
-                and self.use_full_rank_gate
+                and self._fab_fa_fb_weight
                 and _use_fab_fa(x, self._bfa_proj_weight, fb_weight, self.num_heads)
             )
             fused_fab = (
