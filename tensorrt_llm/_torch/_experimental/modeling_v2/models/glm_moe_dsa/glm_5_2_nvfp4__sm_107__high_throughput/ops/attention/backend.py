@@ -269,7 +269,13 @@ class RubinDSATrtllmAttention(TrtllmAttention):
                 and self.num_heads == 64
                 and self.head_dim == 576
                 and topk_indices_global.shape[1] == 2048
-                and (num_rows, metadata.gen_token_stride) in ((56, 8), (60, 6), (96, 6))
+                and (
+                    (num_rows, metadata.gen_token_stride) == (56, 8)
+                    or (
+                        metadata.gen_token_stride == 6
+                        and num_rows in (60, 66, 72, 78, 84, 90, 96, 102)
+                    )
+                )
             ):
                 forward_args.sparse_runtime_params.max_num_ctas_per_seq_kv = 1
             if num_rows > scratch.shape[0] or num_rows > compact_indices.shape[0]:
