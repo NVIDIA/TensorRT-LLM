@@ -5334,7 +5334,9 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction():
+def _adjust_torch_mem_fraction(safety_margin: int = 32 * 1024**2):
+    # ``safety_margin`` is device memory kept outside the PyTorch cap for
+    # driver allocations made after setup.
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
@@ -5372,9 +5374,6 @@ def _adjust_torch_mem_fraction():
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
-    # Keep room outside the PyTorch cap for driver allocations made after setup
-    # (streams, events, copy launches in the KV cache manager and transfer agents).
-    safety_margin = 1024**3
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(
