@@ -80,7 +80,7 @@ from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_d
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyStore
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig, SleepConfig
 from tensorrt_llm.mapping import Mapping
 
 # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
@@ -1038,7 +1038,7 @@ def test_resource_factory_rejects_live_slots_before_rebinding(monkeypatch):
             )
         ),
     )
-    scheduler_config = SimpleNamespace(
+    scheduler_config = SchedulerConfig(
         use_python_scheduler=True,
         enable_prefix_aware_scheduling=True,
         capacity_scheduler_policy=util_module.CapacitySchedulerPolicy.MAX_UTILIZATION,
