@@ -167,6 +167,7 @@ OVERRIDDEN = (
     "_prepare_kv_for_draft_forward",
     "prepare_1st_drafter_inputs",
     "_apply_dflash2_selector",
+    "_sample_dflash2_block",
     "_apply_kv_rewind_after_draft",
     "_prepare_next_new_tokens",
 )
@@ -221,6 +222,42 @@ _FORWARD_ARGS = (
     "spec_metadata",
     "draft_model",
 )
+
+
+def _rs_draft(
+    worker,
+    rs,
+    step,
+    tail,
+    draft_model,
+    selector,
+    gen_logits,
+    block_hidden_states,
+    anchor_tokens,
+    spec_metadata,
+) -> torch.Tensor:
+    """The rejection-sampling draft of a step ``rs.draft_step`` admitted: the dr draft tail's walk draws the drafts
+    from q (``rs.walk_args``) with the path-walk tail's rewind and next tokens, and the tail bookkeeping as
+    ``SpecLoopFoldDFlashWorker._apply_dflash2_selector``'s tail path; returns the ``[1, K]`` draft tokens. The draft
+    head's deferred logit transform is handed to the selector as on that path (``_draft_head_transform_for``)."""
+    kv_lens, rewind, batch_indices = worker._path_walk_tail_args(step, gen_logits, spec_metadata)
+    tokens, next_tokens = _draft_head.selector_draft_tokens(
+        gen_logits,
+        block_hidden_states,
+        anchor_tokens,
+        selector,
+        worker.mapping,
+        worker.__dict__.get("_draft_head_allreduce"),
+        tail=tail,
+        tail_walk=(step.accepted, step.num_accepted, batch_indices, kv_lens, rewind),
+        transform=worker._draft_head_transform_for(draft_model, gen_logits),
+        rs=rs.walk_args(spec_metadata),
+    )
+    step.tail = _Tail(tokens, next_tokens, kv_lens is not None, batch_indices)
+    if kv_lens is not None:
+        # The walk has rewound kv_lens_cuda (as the greedy tail walk does).
+        worker._kv_rewind_pending = False
+    return tokens
 
 
 def _forward_arg(name: str, args: tuple, kwargs: dict):
@@ -751,6 +788,63 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 return None
             return kv_lens, rewind, batch_indices
         return None, None, batch_indices
+
+    def _sample_dflash2_block(
+        self,
+        draft_model,
+        gen_logits,
+        block_hidden_states,
+        anchor_tokens,
+        spec_metadata,
+        num_contexts,
+        batch_size,
+    ):
+        """The built-in ancestral DFlash 2 draft of a rejection-sampling step, or the fused one.
+
+        Fused rejection sampling (kernels/rs_sampler): a step ``rs.draft_step`` admits takes the
+        dr draft tail's walk, which draws the drafts from q and writes the slot's q record
+        (``_rs_draft``). Every other step takes the built-in sampler, which fills the dense
+        ``draft_probs`` rows; its slots' q records stay consumed, so a fused verify of those
+        drafts takes strict rows.
+        """
+        rs = self.__dict__.get("_rs")
+        if rs is not None:
+            step = self._fold_current()
+            selector = draft_model.candidate_selector
+            full_vocab = selector.predecessor_codebook.shape[0]
+            tail = self.__dict__.get("_dr_draft_tail")
+            if rs.draft_step(
+                self,
+                spec_metadata,
+                gen_logits,
+                block_hidden_states,
+                step,
+                tail,
+                selector,
+                full_vocab,
+            ):
+                tokens = _rs_draft(
+                    self,
+                    rs,
+                    step,
+                    tail,
+                    draft_model,
+                    selector,
+                    gen_logits,
+                    block_hidden_states,
+                    anchor_tokens,
+                    spec_metadata,
+                )
+                return tokens.to(torch.int32), full_vocab
+        return super()._sample_dflash2_block(
+            draft_model,
+            gen_logits,
+            block_hidden_states,
+            anchor_tokens,
+            spec_metadata,
+            num_contexts,
+            batch_size,
+        )
 
     def _apply_dflash2_selector(
         self, draft_model, gen_logits, block_hidden_states, anchor_tokens, spec_metadata

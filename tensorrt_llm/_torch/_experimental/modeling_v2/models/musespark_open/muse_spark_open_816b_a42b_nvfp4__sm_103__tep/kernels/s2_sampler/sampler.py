@@ -23,6 +23,9 @@ The pieces:
 * ``S2States``: the fold + LL state publish, the every-rank state poll, and the every-rank draw (the served kernel B's
   tokens: the walk on the rank holding the walker's vectors, the result through an LL token slot; a filtered row's
   vectors through an LL row area). Collective construction: library load, the multicast areas, agreements.
+* rejection sampling (the ``rejection_sampler`` fast path, ``rs_sampler``): ``S2States`` built with ``rs_areas``
+  also reserves the candidate-slot and digest areas (``_layout``); ``fold_publish_rs`` + ``rs_draw``
+  (``S2Head.sample_rejection``) run the verify rows' chain test and residual / plain race against the slot's q record.
 * ``S2Head``: the target head's 8-row decode calls (``split_sampler.target_head.TargetHead`` hands them
   over once ``S2Head`` is armed): the LM-head GEMM on the copy with the dispatcher's own runner and tactic, the
   context-K/V head fork point where the stock call fires it, ``sample`` (fold + draw) for the fused sampler, and
@@ -38,7 +41,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -62,6 +65,76 @@ LIBRARY_NAME = "musespark_open_s2_sampler"
 SOURCE = Path(__file__).resolve().parent / "s2_sampler.cu"
 #: ``fusedSamplingKernelsCommon.cuh`` (``OnlineSoftmax``, ``loadRowParams``) lives with the served sampler.
 INCLUDE_DIR = Path(__file__).resolve().parents[2] / "ops" / "spec" / "_head_sampler"
+#: Rows with a draft (K = 7) and candidate lanes per row (``rs_common``).
+RS_POS = 7
+RS_LANES = 16
+#: Words of one row of ``rs_draw``'s test export and their offsets (``s2_sampler.cu`` ``kExport*``; ints are stored
+#: as their bits): scalars, then per candidate lane ``w``, ``qZ``, the race key, ``x`` and ``log E``.
+RS_EXPORT_WORDS = 96
+RS_EXPORT = {
+    "m": 0,
+    "z": 1,
+    "koff": 2,
+    "ioff": 3,
+    "kd": 4,
+    "acc": 5,
+    "y": 6,
+    "out": 7,
+    "usable": 8,
+    "reason": 9,
+    "ua": 10,
+    "kstar": 11,
+    "w": 16,
+    "qz": 32,
+    "kc": 48,
+    "x": 64,
+    "loge": 80,
+}
+#: ``RS_EXPORT["reason"]`` values (``s2_sampler.cu`` ``RsReason``), in the order the draw tests them.
+RS_REASONS = ("usable", "kind", "poison", "drafts", "qdiv", "qinvalid", "kd", "dup", "qzero")
+#: Words of one row of ``rs_draw``'s filtered-row owner export and their offsets (``s2_sampler.cu`` ``kFExport*``;
+#: ints stored as their bits): scalars, then per candidate lane ``w [w >= tau]``, ``fl(qf K)`` and the residual.
+RS_FEXPORT_WORDS = 80
+RS_FEXPORT = {
+    "phi": 0,
+    "raw_s": 1,
+    "tau": 2,
+    "kept": 3,
+    "s1": 4,
+    "n": 5,
+    "nmax": 6,
+    "r_off": 7,
+    "r_c": 8,
+    "target": 9,
+    "ur": 10,
+    "claim": 11,
+    "out": 12,
+    "flags": 13,
+    "ua": 14,
+    "kd": 15,
+    "y": 16,
+    "m": 17,
+    "z": 18,
+    "case": 19,
+    "kept_count": 20,
+    "wk": 32,
+    "qk": 48,
+    "rho": 64,
+}
+#: ``RS_FEXPORT["case"]`` values: the screen's floor (none, top-p only, min-p, top-k without min-p).
+RS_SCREEN_CASES = ("none", "top_p", "min_p", "top_k")
+#: Bits of a filtered row's flags word (``s2_sampler.cu`` ``kFlag*``).
+RS_FLAG = {
+    "acc": 1 << 0,
+    "usable": 1 << 1,
+    "reason_shift": 2,
+    "d_unkept": 1 << 6,
+    "screen_fallback": 1 << 7,
+    "resid_fallback": 1 << 8,
+    "plain": 1 << 9,
+    "hash_shift": 10,
+    "hash_mask": 0x3FFFF,
+}
 #: The served sampler library's flags (``head_sampler.NVCC_FLAGS``): no fast math, so ``tanhf`` and the fold's
 #: arithmetic compile as there.
 NVCC_FLAGS = ("-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "-lineinfo")
@@ -88,13 +161,15 @@ def load_library() -> str:
         if _LOADED is None:
             from torch.utils.cpp_extension import load
 
+            from ..rs_sampler import rs_common as _rs_common
+
             target = arch_target()
             path = load(
                 name=f"{LIBRARY_NAME}_sm{target}",
                 sources=[str(SOURCE)],
                 extra_cuda_cflags=list(NVCC_FLAGS)
                 + [f"-gencode=arch=compute_{target},code=sm_{target}"],
-                extra_include_paths=[str(INCLUDE_DIR)],
+                extra_include_paths=[str(INCLUDE_DIR), str(_rs_common.INCLUDE_DIR)],
                 is_python_module=False,
                 verbose=False,
             )
@@ -192,6 +267,32 @@ def row_area_bytes(rows: int, world: int, shard: int) -> int:
     return rows * world * (shard // 4) * 16
 
 
+def rs_cand_bytes(world: int) -> int:
+    """Bytes of one candidate-slot area: one entry (two 64-bit LL elements) per (row t < 7, lane, rank)."""
+    return RS_POS * RS_LANES * world * 16
+
+
+def rs_dig_bytes(world: int) -> int:
+    """Bytes of one digest area: one entry (two 64-bit LL elements) per (row t < 7, rank)."""
+    return RS_POS * world * 16
+
+
+def rs_list_cap(vocab: int) -> int:
+    """Entries of one filtered row's survivor list (``s2_sampler.cu`` ``rsListCap``): every element of the row,
+    ``4 * ceil(vocab / 4 / 1024)`` per thread of the draw CTA."""
+    return 4 * -(-(vocab // 4) // VIRTUAL_THREADS) * VIRTUAL_THREADS
+
+
+def kernel_attributes(device) -> dict:
+    """Resolve the RS kernels (and the non-RS fold / draw) and return ``{name: (registers, local bytes, static shared
+    bytes, max threads per block)}``, so nothing loads during a later CUDA-graph capture."""
+    load_library()
+    anchor = torch.empty(1, dtype=torch.int32, device=device)
+    rows = torch.ops.musespark_open_s2_sampler.rs_attributes(anchor).tolist()
+    names = ("rs_fold", "rs_draw", "rs_draw_trigger", "fold", "draw")
+    return {n: tuple(int(v) for v in r) for n, r in zip(names, rows)}
+
+
 def new_states(rows: int, device) -> torch.Tensor:
     """Scratch for ``rows`` rows of states at their virtual thread (``head_sampler.new_states``'s layout)."""
     return torch.empty(rows * VIRTUAL_THREADS * STATE_WORDS, dtype=torch.int32, device=device)
@@ -210,13 +311,16 @@ class S2States:
         fold_shape: tuple = FOLD_SHAPE,
         form: int = FOLD_FORM,
         emulated_world: Optional[int] = None,
+        rs_areas: bool = False,
     ) -> None:
         """Collective over the TP group of ``mapping``.
 
         ``emulated_world`` (tests only, no ``mapping``): one process stands in for that many ranks on a plain device
         buffer that is both the multicast and the receive area; ``fold_publish(..., rank=r)`` publishes rank ``r``'s
-        states with that rank's own epoch counters.
+        states with that rank's own epoch counters. ``rs_areas``: reserve the rejection-sampling areas; every rank must
+        decide alike.
         """
+        self.rs_areas = bool(rs_areas)
         self.shard = int(shard)
         self.rows = int(rows)
         self.device = device
@@ -240,6 +344,7 @@ class S2States:
             self.draw_counters = [
                 torch.zeros(self.rows, dtype=torch.int32, device=device) for _ in range(self.world)
             ]
+            self._new_rs_lists(self.world)
             torch.ops.musespark_open_s2_sampler.dry(self.poll_counters)
             torch.cuda.synchronize(device)
             return
@@ -281,6 +386,7 @@ class S2States:
                 # One counter per row, shared by the state poll and the draw (a call runs one of them).
                 self.poll_counters = torch.zeros(self.rows, dtype=torch.int32, device=device)
                 self.draw_counters = None
+                self._new_rs_lists(1)
                 torch.ops.musespark_open_s2_sampler.dry(self.poll_counters)
                 torch.cuda.synchronize(device)
         except Exception as exc:  # noqa: BLE001
@@ -292,12 +398,34 @@ class S2States:
             ) from error
 
     def _layout(self) -> None:
-        """Byte offsets in the fabric buffer: two state areas, two token-slot areas, two row areas."""
+        """Byte offsets in the fabric buffer: two state areas, two token-slot areas, two row areas; with ``rs_areas``
+        then two candidate-slot areas and two digest areas (the offsets before them unchanged; 0 when not reserved)."""
         self.slot_area = slot_bytes(self.rows, self.world)
         self.row_area = row_area_bytes(self.rows, self.world, self.shard)
         self.slot_offset = 2 * self.area
         self.rows_offset = self.slot_offset + 2 * self.slot_area
         self.total = self.rows_offset + 2 * self.row_area
+        self.rs_cand_offset = self.rs_cand_bytes = self.rs_dig_offset = self.rs_dig_bytes = 0
+        if self.rs_areas:
+            self.rs_cand_bytes = rs_cand_bytes(self.world)
+            self.rs_dig_bytes = rs_dig_bytes(self.world)
+            self.rs_cand_offset = self.total
+            self.rs_dig_offset = self.rs_cand_offset + 2 * self.rs_cand_bytes
+            self.total = self.rs_dig_offset + 2 * self.rs_dig_bytes
+
+    def _new_rs_lists(self, copies: int) -> None:
+        """With the RS areas: the filtered rows' survivor lists of ``rs_draw`` (``s2_sampler.cu`` ``rsFilteredRow``),
+        FP32 values and int32 ids ``[ceil(rows / world), rs_list_cap(vocab)]``, one pair per emulated rank."""
+        self.rs_list_x = self.rs_list_id = None
+        if not self.rs_areas:
+            return
+        shape = (-(-self.rows // self.world), rs_list_cap(self.world * self.shard))
+        self.rs_list_x = [
+            torch.empty(shape, dtype=torch.float32, device=self.device) for _ in range(copies)
+        ]
+        self.rs_list_id = [
+            torch.empty(shape, dtype=torch.int32, device=self.device) for _ in range(copies)
+        ]
 
     def _new_fold_counters(self) -> torch.Tensor:
         ctas = self.rows * (VIRTUAL_THREADS // self.world) // self.vts
@@ -422,6 +550,192 @@ class S2States:
             stamps,
             int(slot),
             int(bool(force_multi)),
+        )
+        self.calls += 1
+        return tokens
+
+    def _require_rs(self) -> None:
+        if not self.rs_areas:
+            raise RuntimeError(
+                "[musespark_open] s2 sampler: the RS areas are not reserved (S2States built without rs_areas)"
+            )
+
+    def fold_publish_rs(
+        self,
+        local: torch.Tensor,
+        temperatures: torch.Tensor,
+        multiplier: float,
+        soft_cap: float,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+        rs,
+        *,
+        rank: Optional[int] = None,
+        own_states: Optional[torch.Tensor] = None,
+        stamps: Optional[torch.Tensor] = None,
+        slot: int = 0,
+        pdl: bool = True,
+        export_e: Optional[torch.Tensor] = None,
+        no_exclude: bool = False,
+    ) -> None:
+        """The rejection-sampling fold of this call (``s2_sampler.cu`` ``s2FoldPublishKernel<4, 256, 2, true>``):
+        ``fold_publish`` with the row params (mandatory) + the race words, the candidate slots and the digests.
+
+        ``rs`` carries ``records``, ``num_slots``, ``slot_ids`` (request 0's slot first), ``draft_in`` (int32 /
+        int64 ``[1, 7]``, read in place) and ``vocab``; ``seed`` / ``offset`` are the per-row int64 RNG state.
+        ``rank`` (emulated instances) selects the emulated rank. Tests only: ``export_e`` (FP32 ``[2, rows, vocab]``)
+        receives every folded element's ``log E`` ([0]) and ``x`` ([1]); ``no_exclude`` keeps the candidates in the
+        race.
+        """
+        from ...ops.spec import head_sampler as _hs
+
+        self._require_rs()
+        if rank is None:
+            rank, counters = self.rank, self.fold_counters[0]
+        else:
+            counters = self.fold_counters[int(rank)]
+        m, inv, cap = _hs.cap_constants(multiplier, soft_cap)
+        torch.ops.musespark_open_s2_sampler.fold_publish_rs(
+            local,
+            temperatures,
+            counters,
+            self._mc_ptr,
+            self.area,
+            int(rank),
+            self.world,
+            m,
+            inv,
+            cap,
+            self.vts,
+            self.threads,
+            self.form,
+            pdl,
+            own_states,
+            stamps,
+            int(slot),
+            top_ks,
+            top_ps,
+            min_ps,
+            self._mc_ptr + self.rows_offset,
+            self.row_area,
+            seed,
+            offset,
+            rs.records,
+            int(rs.num_slots),
+            rs.slot_ids,
+            rs.draft_in,
+            self._mc_ptr + self.rs_cand_offset,
+            self.rs_cand_bytes,
+            self._mc_ptr + self.rs_dig_offset,
+            self.rs_dig_bytes,
+            int(rs.vocab),
+            export_e,
+            bool(no_exclude),
+        )
+
+    def rs_draw(
+        self,
+        local: torch.Tensor,
+        scratch: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+        multiplier: float,
+        soft_cap: float,
+        rs,
+        *,
+        rank: Optional[int] = None,
+        stamps: Optional[torch.Tensor] = None,
+        slot: int = 0,
+        pdl: bool = True,
+        trigger: bool = False,
+        force_ua: Optional[torch.Tensor] = None,
+        force_loge: Optional[torch.Tensor] = None,
+        exports: Optional[torch.Tensor] = None,
+        force_screen: int = 0,
+        fexports: Optional[torch.Tensor] = None,
+        fstamps: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """The rejection-sampling draw of this call on every rank (``s2_sampler.cu`` ``s2RsDrawKernel``): int32
+        ``[rows]``, ``out_t = accepted ? d_t : y_t`` for rows t < 7 and the plain race for row 7; follows
+        ``fold_publish_rs`` of the same call. Clears the record's valid bit of each row t < 7 at its end. A row with
+        top-k / top-p / min-p is decided by exact filtered rejection sampling on the rank ``row % world`` (or by the
+        strict body under ``rs.filter_mode`` strict).
+
+        ``rs`` carries ``records``, ``num_slots``, ``dummy_slot``, ``slot_ids``, ``draft_in``, ``vocab``, ``check``,
+        ``diag`` (int64 ``[rs_common.DIAG_WORDS]``) and optionally ``ring`` / ``ring_head`` and ``filter_mode``
+        (``rs_common.FilterMode``, default exact). ``local`` holds one request's K + 1 = 8 rows. Tests only:
+        ``force_ua`` (FP32 ``[rows]``), ``force_loge`` (FP32 ``[rows, 16]``), ``exports`` (FP32
+        ``[rows, RS_EXPORT_WORDS]``, layout ``RS_EXPORT``), ``force_screen`` (1: no raw-logit screen, 2: no screen),
+        ``fexports`` (FP32 ``[rows, RS_FEXPORT_WORDS]``, layout ``RS_FEXPORT``, written by each filtered row's owner);
+        bench: ``fstamps`` (int64 ``[slots, 4]``, the filtered rows' stamps).
+        """
+        from ...ops.spec import head_sampler as _hs
+
+        self._require_rs()
+        if rank is None:
+            rank, counters = self.rank, self.poll_counters
+            lists = 0
+        else:
+            counters = self.draw_counters[int(rank)]
+            lists = int(rank)
+        m, inv, cap = _hs.cap_constants(multiplier, soft_cap)
+        tokens = torch.ops.musespark_open_s2_sampler.rs_draw(
+            local,
+            scratch,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            counters,
+            self._uc_ptr,
+            self.area,
+            self._uc_ptr + self.slot_offset,
+            self._mc_ptr + self.slot_offset,
+            self.slot_area,
+            self._uc_ptr + self.rows_offset,
+            self.row_area,
+            int(rank),
+            self.world,
+            m,
+            inv,
+            cap,
+            self.timeout_ns,
+            pdl,
+            trigger,
+            stamps,
+            int(slot),
+            rs.records,
+            int(rs.num_slots),
+            int(rs.dummy_slot),
+            rs.slot_ids,
+            rs.draft_in,
+            self._uc_ptr + self.rs_cand_offset,
+            self.rs_cand_bytes,
+            self._uc_ptr + self.rs_dig_offset,
+            self.rs_dig_bytes,
+            int(rs.vocab),
+            int(rs.check),
+            rs.diag,
+            getattr(rs, "ring", None),
+            getattr(rs, "ring_head", None),
+            force_ua,
+            force_loge,
+            exports,
+            self.rs_list_x[lists],
+            self.rs_list_id[lists],
+            int(getattr(rs, "filter_mode", 0)),
+            int(force_screen),
+            fexports,
+            fstamps,
         )
         self.calls += 1
         return tokens
@@ -671,6 +985,53 @@ class S2Head:
             trigger=verify_pdl and pdl,
         )
 
+    def sample_rejection(
+        self,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed,
+        offset,
+        multiplier: float,
+        soft_cap: float,
+        pdl: bool,
+        rs,
+        verify_pdl: bool = False,
+    ) -> torch.Tensor:
+        """The rejection-sampling verify tokens of this call (int32 ``[8]``): ``out_t = accepted ? d_t : y_t`` for the
+        draft rows, the plain race for the bonus row (``S2States.fold_publish_rs`` then ``rs_draw``); ``rs`` is the
+        step's ``RsVerifyArgs``. ``verify_pdl`` (``TargetHead.verify_pdl``): the draw releases its dependent at entry.
+        """
+        self.states.fold_publish_rs(
+            self.local,
+            temperatures,
+            multiplier,
+            soft_cap,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            rs,
+            pdl=pdl,
+        )
+        return self.states.rs_draw(
+            self.local,
+            self.scratch,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            multiplier,
+            soft_cap,
+            rs,
+            pdl=pdl,
+            trigger=verify_pdl and pdl,
+        )
+
     def full_row(self, gather) -> torch.Tensor:
         """This call's ``[8, vocab]`` BF16 row in vocabulary order, in ``scratch``: ``gather`` (the head's one-shot
         ``PvLogitsGather``, collective) of the interleaved shards, then the inverse permutation."""
@@ -725,7 +1086,9 @@ def unsupported_reason(llm, mapping) -> Optional[str]:
     return geometry_reason(int(mapping.tp_size), int(lm_head.weight.shape[0]))
 
 
-def install(llm, mapping) -> Optional[S2Head]:
+def install(
+    llm, mapping, rs_facts: Optional[Tuple[bool, Optional[str]]] = None
+) -> Optional[S2Head]:
     """``distributed_head_sampler``: build this rank's interleaved LM-head copy and the s2 sampler's fabric areas and
     attach the ``S2Head`` to the split_sampler head as ``_split_head.s2``, which hands it the 8-row decode calls once
     it is armed (``S2Head._decide``). Collective over the TP group (the agreed refusal, the fabric areas, the copy's
@@ -736,6 +1099,12 @@ def install(llm, mapping) -> Optional[S2Head]:
     them from ``load_draft_weights`` and again from ``post_load_weights``): once a head is attached, a repeated call
     returns it and builds nothing. Every rank takes the same branch, since an
     install that fails raises on every rank alike.
+
+    ``rs_facts``: None when the composition has no ``rejection_sampler`` path (no rejection-sampling areas, and the
+    refusal agrees nothing else); otherwise this rank's ``rs_sampler.rs.agreement_facts`` ``(wanted, forced mode)``,
+    which the refusal's collective also agrees: ranks that differ refuse before the fabric is sized, and the RS install
+    that follows then branches alike on every rank. The RS areas are reserved when rejection sampling is wanted and
+    not inert under forced acceptance.
 
     Raises:
         ValueError: if some rank cannot build them (on every rank alike, before any other collective).
@@ -749,7 +1118,7 @@ def install(llm, mapping) -> Optional[S2Head]:
 
     from ... import dispatch as _tp_agreement
 
-    reason = _tp_agreement.agreed_refusal(mapping, unsupported_reason(llm, mapping))
+    reason = _tp_agreement.agreed_refusal(mapping, unsupported_reason(llm, mapping), facts=rs_facts)
     if reason is not None:
         raise ValueError(f"[musespark_open] s2 sampler cannot run here: {reason}")
     head = llm.logits_processor._split_head
@@ -757,7 +1126,8 @@ def install(llm, mapping) -> Optional[S2Head]:
     device = lm_head.weight.device
     free_before, _ = torch.cuda.mem_get_info(device)
     start = time.perf_counter()
-    states = S2States(mapping, int(lm_head.weight.shape[0]), device)
+    rs_areas = rs_facts is not None and rs_facts[0] and rs_facts[1] != "inert"
+    states = S2States(mapping, int(lm_head.weight.shape[0]), device, rs_areas=rs_areas)
     weight = build_interleaved_shard(lm_head.weight.detach(), mapping)
     torch.cuda.empty_cache()
     seconds = time.perf_counter() - start

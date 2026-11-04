@@ -116,6 +116,7 @@ from ... import dispatch as _tp_agreement
 from ...dispatch import LAUNCH_PDL
 from ...ops.spec import head_sampler as _hs
 from ..pv_logits import gather as _pv_logits
+from ..rs_sampler import rs_common as _rs_common
 
 #: The feature ids this module installs.
 
@@ -337,6 +338,12 @@ class TargetHead:
     #: Whether the pending row was produced by ``s2`` (its local shard only; the full row is
     #: gathered on demand).
     pending_s2 = False
+    #: fused rejection sampling's state (``kernels/rs_sampler.rs.install`` attaches it, the
+    #: ``rejection_sampler`` fast path); its verify rows run on ``s2``.
+    rs = None
+    #: the ``RsVerifyArgs`` of the verify this step routed to ``sample_rejection`` (set by the worker's
+    #: ``_accept_draft_tokens``, consumed by its ``_sample_tokens_for_batch``).
+    rs_pending = None
 
     def __init__(
         self,
@@ -659,6 +666,45 @@ class TargetHead:
             self.vp.view, local, self.multiplier, self.soft_cap, self.pdl
         )
 
+    def sample_rejection(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: Optional[torch.Tensor],
+        offset: Optional[torch.Tensor],
+        rs_args,
+    ) -> torch.Tensor:
+        """The fused rejection-sampling verify tokens for the pending s2 row (``S2Head.sample_rejection``: each
+        draft row's chain test against the slot's q record, its residual or plain race; the bonus row's race);
+        consumes it.
+
+        Raises:
+            RuntimeError: if the pending row is not an s2 row (the routing requires one).
+        """
+        if not self.pending_s2:
+            raise RuntimeError(
+                "[musespark_open] rs: a rejection-sampling verify was routed to a head row that s2 did not produce"
+            )
+        self.pending = None
+        self.pending_inbox = False
+        self.pending_s2 = False
+        return self.s2.sample_rejection(
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            self.multiplier,
+            self.soft_cap,
+            self.pdl,
+            rs_args,
+            verify_pdl=self.verify_pdl,
+        )
+
     def _gather_now(self, logits: torch.Tensor) -> Optional[torch.Tensor]:
         """Consume the pending row; returns the gathered BF16 row of a vocab-parallel one."""
         if self.pending_s2:
@@ -711,6 +757,7 @@ class TargetHead:
     def drain(self) -> None:
         """Consume a pending row nothing sampled (resets its inbox words; a vocab-parallel or an
         ``s2`` row has none, and is dropped without a gather)."""
+        self.rs_pending = None
         if self.pending_s2:
             # An s2 row's exchanges run only in sample / materialize, on every rank alike.
             self.pending = None
@@ -740,6 +787,32 @@ class SplitSamplerLogitsProcessor(MuseSparkOpenLogitsProcessor):
         return super().forward(hidden_states, lm_head, attn_metadata, return_context_logits)
 
 
+def _rs_verify(worker, head, rs, logits, draft_tokens, num_contexts, batch_size, spec_metadata):
+    """A fused rejection-sampling verify: the worker's strict acceptance base on the RS draw's tokens.
+
+    ``head.rs_pending`` routes the base's ``_sample_tokens_for_batch`` call to ``TargetHead.sample_rejection``.
+    Occurrence penalties are off (``RsState.verify_step``), so the built-in body's penalty and count-commit calls
+    would be no-ops; the base is called directly.
+
+    Raises:
+        RuntimeError: if the base returned without sampling the verify row.
+    """
+    from ..rs_sampler import rs as _rs
+
+    head.rs_pending = _rs.RsVerifyArgs.of(rs, spec_metadata, draft_tokens)
+    try:
+        accepted = worker._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata
+        )
+    except BaseException:
+        head.rs_pending = None
+        raise
+    if head.rs_pending is not None:
+        head.rs_pending = None
+        raise RuntimeError("[musespark_open] rs: the rejection-sampling verify row was not sampled")
+    return accepted
+
+
 class TargetHeadDFlashWorker(DFlashWorker):
     """The DFlash worker sampling a pending head row with the split sampler (``TargetHead``).
 
@@ -763,6 +836,26 @@ class TargetHeadDFlashWorker(DFlashWorker):
         # penalties are enabled (a penalized copy) or rejection sampling applies.
         head = self._split_sampler_head
         head.check_routed(logits, "_accept_draft_tokens")
+        _rs_common.check_forced_inert_metadata(spec_metadata, "_accept_draft_tokens")
+        rs = head.rs
+        if rs is not None:
+            if not torch.cuda.is_current_stream_capturing():
+                # The q records are allocated by the first eager forward, before any capture.
+                rs.ready(spec_metadata)
+            if rs.verify_step(
+                self, spec_metadata, num_contexts, batch_size, draft_tokens, head, logits
+            ):
+                return _rs_verify(
+                    self, head, rs, logits, draft_tokens, num_contexts, batch_size, spec_metadata
+                )
+            if (
+                spec_metadata is not None
+                and batch_size > num_contexts
+                and self._can_use_rejection_sampling(spec_metadata)
+                and rs.ready(spec_metadata)
+            ):
+                # Before any ownership test: a mixed step has no pending row but may verify a fused step's drafts.
+                rs.densify(spec_metadata, num_contexts, batch_size)
         if head.owns(logits) and (
             spec_metadata is None
             or getattr(spec_metadata, "enable_penalty", False)
@@ -776,6 +869,20 @@ class TargetHeadDFlashWorker(DFlashWorker):
     def _sample_tokens_for_batch(self, logits, spec_metadata, num_contexts, batch_size):
         head = self._split_sampler_head
         head.check_routed(logits, "_sample_tokens_for_batch")
+        if head.owns(logits) and head.rs_pending is not None:
+            rs_args, head.rs_pending = head.rs_pending, None
+            num_tokens = logits.shape[0]
+            seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
+            return head.sample_rejection(
+                logits,
+                spec_metadata.temperatures[:num_tokens],
+                spec_metadata.top_ks[:num_tokens],
+                spec_metadata.top_ps[:num_tokens],
+                spec_metadata.min_ps[:num_tokens],
+                seed,
+                offset,
+                rs_args,
+            )
         if head.owns(logits):
             if (
                 spec_metadata is not None

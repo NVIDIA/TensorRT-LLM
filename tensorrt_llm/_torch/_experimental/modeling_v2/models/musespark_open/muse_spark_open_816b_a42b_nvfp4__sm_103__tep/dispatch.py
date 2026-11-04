@@ -2012,7 +2012,7 @@ def group_size(mapping) -> int:
     return int(getattr(mapping, "tp_size", 1) or 1) if mapping is not None else 1
 
 
-def agreed_refusal(mapping, local: Optional[str]) -> Optional[str]:
+def agreed_refusal(mapping, local: Optional[str], facts: Optional[Any] = None) -> Optional[str]:
     """``local`` (this rank's reason to refuse, or None) as every rank of ``mapping``'s TP group agrees.
 
     Collective over the TP group when it has more than one rank: every rank of the
@@ -2020,10 +2020,24 @@ def agreed_refusal(mapping, local: Optional[str]) -> Optional[str]:
     returns ``local``. Returns None when no rank refuses; the reason itself when
     every rank gives the same one; otherwise the distinct reasons, followed by the
     TP ranks that gave one. Changes nothing.
+
+    ``facts`` (optional, a small picklable value with ``==``): what every rank must
+    hold alike, gathered in the same collective. Ranks whose ``facts`` differ are a
+    refusal on every rank, naming each rank's value.
     """
     if group_size(mapping) <= 1:
         return local
-    everyone = Distributed.get(mapping).tp_allgather(local, small_payload=True)
+    if facts is None:
+        everyone = Distributed.get(mapping).tp_allgather(local, small_payload=True)
+    else:
+        gathered = Distributed.get(mapping).tp_allgather((local, facts), small_payload=True)
+        everyone = [why for why, _ in gathered]
+        values = [value for _, value in gathered]
+        if any(value != values[0] for value in values):
+            by_rank = ", ".join(f"rank {rank}: {value!r}" for rank, value in enumerate(values))
+            differ = f"the TP ranks disagree on {by_rank}"
+            reasons = sorted({why for why in everyone if why is not None})
+            return "; ".join(reasons + [differ])
     refused = [(rank, why) for rank, why in enumerate(everyone) if why is not None]
     if not refused:
         return None
