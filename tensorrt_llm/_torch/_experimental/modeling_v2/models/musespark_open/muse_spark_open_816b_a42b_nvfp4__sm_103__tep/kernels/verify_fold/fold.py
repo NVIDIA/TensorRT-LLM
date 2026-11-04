@@ -68,6 +68,7 @@ one must pass the accepted tokens and counts through unchanged.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -92,6 +93,37 @@ from ..replicated_embedding import embedding as _replicated_embedding
 
 #: The drafter block width the fold writes positions for.
 MAX_BLOCK = 64
+
+#: ``drafter_preamble_late_join`` (``SpecLoopFoldDFlashWorker._fold_late_join``): on a forked
+#: folded step whose preamble the commit wrote and whose drafter forward is
+#: ``windowed_block_decode``, the main stream's join of the context-K/V side chain moves from the
+#: end of the prepare into the drafter forward, right before layer 0's QK norm + RoPE
+#: (``drafter_block_decode.DrafterPreamble.join``). Between the two points the main stream runs the
+#: drafter's layer-0 input norm, its coefficient GEMV, the block convolution and the QKV GEMV,
+#: which read the noise block, its residual copy and weights only; every reader of the side
+#: chain's outputs (the positions, the lengths, the arena, ``_seq_lens_cuda``) runs after the join
+#: in either placement. Value-identical: an ordering only.
+_LATE_JOIN_LOGGED = False
+
+
+def _log_late_join_once() -> None:
+    global _LATE_JOIN_LOGGED
+    if not _LATE_JOIN_LOGGED:
+        _LATE_JOIN_LOGGED = True
+        logger.info(
+            "[musespark_open] drafter_preamble_late_join: the context-K/V side chain is joined "
+            "inside the drafter forward, before layer 0's QK norm + RoPE"
+        )
+
+
+def _join_holding(fork, launched, held) -> None:
+    """``fork.join(launched)``.
+
+    ``held`` (unused here) is bound with the call so that the side chain's main-stream inputs stay
+    referenced until the join is enqueued: no main-stream allocation in between can reuse their
+    memory while the side stream may still read it.
+    """
+    fork.join(launched)
 
 
 def _preamble_refusal(worker, fold, attn_metadata, num_gens: int, block_size: int) -> Optional[str]:
@@ -203,7 +235,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
 
     Never constructed: ``install`` re-classes the worker as a class derived
     from this one and the worker's current class, and sets which folds run
-    (``_fold_verify``: ``verify_fold``; ``_fold_path_walk_tail``: ``path_walk_tail``).
+    (``_fold_verify``: ``verify_fold``; ``_fold_path_walk_tail``: ``path_walk_tail``)
+    and how (``_fold_preamble``, ``_fold_verify_pdl``, ``_fold_late_join``).
     """
 
     _fold_verify: bool = False
@@ -215,6 +248,15 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
     #: Its ``_apply_dflash2_selector`` applies the draft head's deferred drafter
     #: logit transform (``draft_head.head._defers_transform``).
     _draft_transform_aware = True
+    #: ``distributed_head_sampler``: the fold launches with PDL and loads everything but the sampled
+    #: tokens before its wait, and the noise gather launches with PDL. The fold's predecessor is the
+    #: split sampler's kernel B, which under the same lever releases its dependent only after its
+    #: own wait (``TargetHead.verify_pdl``), so every value the fold loads before its wait is final;
+    #: another sampler (no early trigger) releases the fold at its exit. Value-identical.
+    _fold_verify_pdl: bool = False
+    #: ``drafter_preamble_late_join``: a preamble the commit wrote carries the side chain's join into
+    #: the drafter forward (``_join_holding``). Value-identical.
+    _fold_late_join: bool = False
 
     # ------------------------------------------------------------------
     # The per-step state
@@ -373,6 +415,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             int(self._fold_mask_token_id(step.draft_model)),
             attn_metadata.kv_lens_cuda if bumps_kv_lens else None,
             seq_lens,
+            self._fold_verify_pdl,
         )
         step.fold, step.seq_lens_source = fold, seq_lens
         if bumps_kv_lens:
@@ -507,6 +550,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             return self._fold_forked_inputs(
                 fork, launched, fold, embed_tokens, attn_metadata, spec_metadata, slots,
                 gen_num_accepted, total_tokens_per_req, block_size, has_target_features,
+                draft_model,
             )  # fmt: skip
         noise_embed_2d = self._fold_noise_block(embed_tokens, fold, num_gens, block_size)
 
@@ -541,6 +585,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         total_tokens_per_req,
         block_size,
         has_target_features,
+        draft_model=None,
     ):
         """The drafter inputs of a folded step whose context store the context-K/V fork's side chain ran.
 
@@ -549,8 +594,12 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         The fold kernel was the main stream's last read of ``_ctx_len`` in this step
         (the query and context positions are its outputs), so the fork's commit is
         launched first, the noise block runs on the main stream meanwhile, and the
-        main stream joins the side stream before returning, then settles a windowed
-        arena that ``drafter_window_compact`` compacts (``_settle_context``).
+        main stream joins the side stream before returning (or, with
+        ``context_kv_late_join``, leaves that join to the drafter's block decode,
+        ``ContextKvFork.defer_join``), then settles a windowed arena that
+        ``drafter_window_compact`` compacts (``_settle_context``), always after the join.
+        With ``drafter_preamble_late_join`` a preamble the commit wrote carries the join to
+        the drafter forward instead.
         """
         num_gens = fold.accepted.shape[0]
         if (
@@ -583,11 +632,45 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             )
             table = _replicated_embedding.table_of(embed_tokens)
             residual = None
+            normed = None
+            tt_rows = None
+            # The fused gather + norm (``install_gather``, which no composition installs): the gather,
+            # its copy and layer 0's input norm in one kernel.
+            gather_norm = (
+                draft_model.__dict__.get("_ox_entry_gather") if draft_model is not None else None
+            )
+            # drafter_folds' layer-0 table: the gather also writes layer 0's qkv and
+            # side-1 coefficient rows from the drafter's per-token table.
+            tt = draft_model.__dict__.get("_tt_drafter_l0") if draft_model is not None else None
             if table is not None and fold.noise_ids.numel() <= _replicated_embedding.MAX_ROWS:
-                noise_embed_2d, residual = replicated_embedding_gather_twice(table, fold.noise_ids)
+                if tt is not None and tt.takes(
+                    table, fold.noise_ids, getattr(self, "_resolved_mask_token_id", None)
+                ):
+                    noise_embed_2d, residual, tt_rows = tt(
+                        table, fold.noise_ids, self._fold_verify_pdl
+                    )
+                elif gather_norm is not None and gather_norm.takes(table, fold.noise_ids):
+                    noise_embed_2d, residual, normed = gather_norm(table, fold.noise_ids)
+                else:
+                    noise_embed_2d, residual = replicated_embedding_gather_twice(
+                        table, fold.noise_ids, self._fold_verify_pdl
+                    )
             else:
                 noise_embed_2d = self._fold_noise_block(embed_tokens, fold, num_gens, block_size)
-            fork.join(launched)
+            join = None
+            if (
+                self._fold_late_join
+                and draft_model is not None
+                and _block_decode.defers_join(draft_model)
+            ):
+                # drafter_preamble_late_join: the drafter forward joins right before layer 0's
+                # QK norm + RoPE.
+                join = functools.partial(
+                    _join_holding, fork, launched, (slots, gen_num_accepted, fold.query_positions)
+                )
+                _log_late_join_once()
+            else:
+                fork.join(launched)
             attn_metadata._seq_lens[0:num_gens] = total_tokens_per_req
             inputs = self._drafter_inputs(
                 noise_embed_2d, fold.query_positions, num_ctx, slots, fold.gen_rows, fold.bonus
@@ -601,6 +684,9 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                     noise_embed_2d,
                     i32s,
                     residual,
+                    join,
+                    normed,
+                    tt_rows,
                 )
             )
             return inputs
@@ -608,7 +694,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             self._fold_declined("drafter_preamble_from_commit", refusal, f"{num_gens} requests")
         num_ctx = fork.commit(launched, slots, gen_num_accepted)
         noise_embed_2d = self._fold_noise_block(embed_tokens, fold, num_gens, block_size)
-        fork.join(launched)
+        if num_ctx is None or not fork.defer_join(launched):
+            fork.join(launched)
         if num_ctx is None:
             num_ctx = self._settle_context(slots, fold.gen_rows)
         attn_metadata._seq_lens_cuda[0:num_gens] = total_tokens_per_req
@@ -690,6 +777,15 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 edges, unary, ids, accepted, num_accepted, batch_indices, kv_lens, rewind
             )
 
+        tail = self.__dict__.get("_dr_draft_tail")
+        tail_args = (
+            {}
+            if tail is None
+            else {
+                "tail": tail,
+                "tail_walk": (accepted, num_accepted, batch_indices, kv_lens, rewind),
+            }
+        )
         tokens, next_tokens = _draft_head.selector_draft_tokens(
             gen_logits,
             block_hidden_states,
@@ -699,6 +795,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             self.__dict__.get("_draft_head_allreduce"),
             walk=walk,
             transform=self._draft_head_transform_for(draft_model, gen_logits),
+            **tail_args,
         )
         step.tail = _Tail(tokens, next_tokens, kv_lens is not None, batch_indices)
         if kv_lens is not None:
@@ -804,15 +901,19 @@ def install(
     path_walk_tail: bool,
     preamble: bool = False,
     declined: Optional[Callable[..., None]] = None,
+    verify_pdl: bool = False,
+    late_join: bool = False,
 ) -> bool:
     """Re-class the DFlash worker for the verify fold (``verify_fold``) and the path-walk tail
     (``path_walk_tail``) asked for; return whether anything changed.
 
     ``preamble`` (``drafter_preamble_from_commit``, with ``verify_fold``) has a forked
     folded step's commit write the drafter preamble; ``declined`` reports the steps it
-    leaves to ``ContextKvFork.commit`` (``dispatch.Plan.declined``). Idempotent; the shell
-    calls it from every drafter load hook, after ``draft_head.install`` and
-    ``drafter_worker.install``.
+    leaves to ``ContextKvFork.commit`` (``dispatch.Plan.declined``). ``verify_pdl``
+    (``distributed_head_sampler``) and ``late_join`` (``drafter_preamble_late_join``, with
+    ``preamble``) set how the verify fold runs (``SpecLoopFoldDFlashWorker._fold_verify_pdl``
+    / ``_fold_late_join``). Idempotent; the shell calls it from every drafter load hook,
+    after ``draft_head.install`` and ``drafter_worker.install``.
 
     Raises:
         ValueError: if a fold asked for cannot be installed (``unsupported_reason``).
@@ -830,16 +931,21 @@ def install(
     if reason is not None:
         raise ValueError(f"[musespark_open] {','.join(selected)} cannot run here: {reason}")
     preamble = bool(preamble and verify_fold)
+    late_join = bool(late_join and preamble)
     if isinstance(spec_worker, SpecLoopFoldDFlashWorker):
         changed = (
             spec_worker._fold_verify,
             spec_worker._fold_path_walk_tail,
             spec_worker._fold_preamble,
-        ) != (verify_fold, path_walk_tail, preamble)
+            spec_worker._fold_verify_pdl,
+            spec_worker._fold_late_join,
+        ) != (verify_fold, path_walk_tail, preamble, verify_pdl, late_join)
         spec_worker._fold_verify = verify_fold
         spec_worker._fold_path_walk_tail = path_walk_tail
         spec_worker._fold_preamble = preamble
         spec_worker._fold_declined = declined
+        spec_worker._fold_verify_pdl = verify_pdl
+        spec_worker._fold_late_join = late_join
         return changed
     cls = type(spec_worker)
     composed = _COMPOSED_WORKERS.get(cls)
@@ -858,6 +964,8 @@ def install(
     spec_worker._fold_path_walk_tail = path_walk_tail
     spec_worker._fold_preamble = preamble
     spec_worker._fold_declined = declined
+    spec_worker._fold_verify_pdl = verify_pdl
+    spec_worker._fold_late_join = late_join
     sites = [
         name
         for on, name in (

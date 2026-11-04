@@ -52,6 +52,14 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             fixed_gemms,
             # Passed only when selected, as the load-phase installers' keywords are.
             **({"fc_inbox": True} if plan.enabled("drafter_fc_inbox") else {}),
+            **(
+                {
+                    "fc_inbox_rows": plan.param("drafter_fc_inbox_wide", "MAX_ROWS"),
+                    "fc_inbox_programs": plan.param("drafter_fc_inbox_wide", "PROGRAMS"),
+                }
+                if plan.enabled("drafter_fc_inbox_wide")
+                else {}
+            ),
         )
     if plan.enabled("context_kv_fork"):
         # Derives from the class draft_head / fused_accept left the worker with;
@@ -69,19 +77,26 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             parallel_min_requests=(
                 plan.param("windowed_commit_parallel", "MIN_REQUESTS") if parallel else None
             ),
+            late_join=plan.enabled("context_kv_late_join"),
             declined=plan.declined,
         )
     verify_fold = plan.enabled("verify_fold")
     path_walk_tail = plan.enabled("path_walk_tail")
+    distributed_head_sampler = plan.enabled("distributed_head_sampler")
     if verify_fold or path_walk_tail:
         from .kernels.verify_fold import fold as _spec_loop_fold
 
+        # distributed_head_sampler: the fold loads before its wait behind the sampler's early
+        # release. drafter_preamble_late_join: the preamble carries the side chain's join into
+        # the drafter forward.
         _spec_loop_fold.install(
             getattr(shell.llm, "spec_worker", None),
             verify_fold,
             path_walk_tail,
             preamble=plan.enabled("drafter_preamble_from_commit"),
             declined=plan.declined,
+            verify_pdl=distributed_head_sampler,
+            late_join=plan.enabled("drafter_preamble_late_join"),
         )
     if plan.enabled("drafter_hops"):
         from .kernels.drafter_hops import hops as _drafter_hops
@@ -89,12 +104,35 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         _drafter_hops.install(getattr(shell.llm, "draft_model", None), shell._mapping)
         if plan.enabled("wide_drafter_hops"):
             _drafter_hops.install_wide(getattr(shell.llm, "draft_model", None), shell._mapping)
+    drafter_folds = plan.enabled("drafter_folds")
+    if drafter_folds:
+        # drafter_folds: the layer-0 input norm releasing its dependent at entry.
+        from .kernels.ox_entry import entry_norm as _ox_entry_norm
+
+        _ox_entry_norm.install(getattr(shell.llm, "draft_model", None))
     if plan.enabled("drafter_pdl_chain"):
         # After the drafter_fixed_gemms GEMM methods and the drafter_hops hops:
         # the entry triggers rely on both.
         from .kernels.drafter_pdl_chain import chain as _drafter_pdl
 
         _drafter_pdl.install(shell.llm, shell._mapping)
+    if drafter_folds:
+        # drafter_folds: the QK norm + RoPE on a PDL copy, the window attention's split loading
+        # before its wait.
+        from .kernels.drafter_attn_pdl import attn_pdl as _drafter_attn_pdl
+
+        _drafter_attn_pdl.install(getattr(shell.llm, "draft_model", None))
+        # drafter_folds: elementwise steps folded into the drafter's GEMVs. After the block
+        # installs, the fixed GEMMs (the tactics) and the PDL chain (the MLP class it consults).
+        from .kernels.dr3_folds import folds as _dr3_folds
+
+        _dr3_folds.install(getattr(shell.llm, "draft_model", None))
+    if plan.enabled("draft_head_tail"):
+        # draft_head_tail: the draft head's tail after the shard GEMM as CUDA launches. After
+        # draft_head (its worker class and key exchange). Collective.
+        from .kernels.dr_draft_tail import tail as _dr_draft_tail
+
+        _dr_draft_tail.install(shell.llm, shell._mapping)
     # After draft_head / fused_accept: the head features re-class the worker as a class
     # derived from whatever class those left it with.
     if plan.enabled("split_sampler"):
@@ -109,17 +147,35 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             plan.enabled("vocab_parallel_head"),
             multimem_gather=multimem,
             coop_max_rows=plan.param("head_sampler_coop_fold", "MAX_ROWS") if coop else 0,
+            distributed=distributed_head_sampler,
         )
         if multimem:
             # The gather's refusal is agreed over the TP group, so every rank reports alike.
             plan.installed(
                 "head_multimem_gather", head.multimem is not None, str(head.multimem_refusal)
             )
+        if distributed_head_sampler:
+            # distributed_head_sampler: the interleaved LM-head copy and the sampler-state
+            # exchange. After the head (it attaches to it). Collective.
+            from .kernels.s2_sampler import sampler as _s2_sampler
+
+            _s2_sampler.install(shell.llm, shell._mapping)
         if plan.enabled("wide_split_sampler"):
             _target_head.widen(shell.llm)
+    if drafter_folds:
+        # drafter_folds: the drafter's layer-0 front as a per-token table. After the head paths:
+        # the table is built by running the layer-0 modules as every install above left them,
+        # and the verify fold's worker resolves the mask id the noise ids carry.
+        from .kernels.tt_table import drafter_l0 as _tt_drafter_l0
+
+        _tt_drafter_l0.install(shell.llm)
     # Last: the arena compaction derives its worker class from whatever class every
     # other draft and head fast path left the worker with.
     if plan.enabled("drafter_window_compact"):
         from .kernels.drafter_window_compact import compact as _window_compact
 
         _window_compact.install(getattr(shell.llm, "spec_worker", None))
+    if plan.enabled("step_window_compact"):
+        from .kernels.drafter_window_compact import compact as _window_compact
+
+        _window_compact.install_steps(getattr(shell.llm, "spec_worker", None))

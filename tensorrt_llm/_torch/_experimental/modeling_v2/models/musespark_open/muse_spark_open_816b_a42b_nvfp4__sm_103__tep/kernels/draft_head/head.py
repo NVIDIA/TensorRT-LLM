@@ -205,6 +205,8 @@ def selector_draft_tokens(
     mapping,
     allreduce: nn.Module | None = None,
     walk=None,
+    tail=None,
+    tail_walk=None,
     *,
     transform: Optional[DraftLogitTransform],
 ):
@@ -223,7 +225,26 @@ def selector_draft_tokens(
     the keys are then canonical and the unary values the transformed ones, so
     the tokens are the built-in ones on the transformed logits. Keyword-only
     and required, so no call site drops it by accident.
+
+    ``tail`` (``dr_draft_tail.tail.DrDraftTail``, ``draft_head_tail``) runs the steps after the
+    shard GEMM as its own launches when it ``takes`` the call and ``transform`` is None (it
+    ranks the untransformed keys), with the same results; ``tail_walk`` (``accepted,
+    num_accepted, batch_indices, kv_lens, rewind``) then stands in for the
+    ``path_walk_tail`` walk.
     """
+    if (
+        tail is not None
+        and transform is None
+        and tail.takes(local_logits, block_hidden_states, selector)
+    ):
+        return tail.draft_tokens(
+            local_logits,
+            block_hidden_states,
+            anchor_tokens,
+            selector,
+            draft_path_walk if walk is None else walk,
+            tail_walk,
+        )
     requests, positions, shard = local_logits.shape
     local = local_logits.reshape(requests * positions, shard)
     canon = canon_kwargs(transform)
@@ -543,6 +564,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
                 spec_metadata,
             )
         if takes:
+            tail = self.__dict__.get("_dr_draft_tail")
             tokens = selector_draft_tokens(
                 gen_logits,
                 block_hidden_states,
@@ -551,6 +573,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
                 self.mapping,
                 self.__dict__.get("_draft_head_allreduce"),
                 transform=self._draft_head_transform_for(draft_model, gen_logits),
+                **({} if tail is None else {"tail": tail}),
             )
             stand_in = tokens.unsqueeze(-1).expand(*tokens.shape, full_vocab)
             setattr(stand_in, TOKENS_ATTR, tokens)

@@ -65,6 +65,8 @@ from ...ops.spec.dflash_window_attention import (
     geometry_unsupported_reason,
     unsupported_reason,
 )
+from ..context_kv_fork.fork import join_is_pending as _join_is_pending
+from ..context_kv_fork.fork import join_pending as _join_pending
 
 #: Operand dtypes the fused convolution takes; anything else runs the built-in.
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
@@ -79,17 +81,63 @@ class DrafterPreamble:
     tensors (identity), otherwise ignored: ``i32s`` = (``num_ctx.to(int32)``,
     that ``+ block``, ``slots.to(int32)``, ``query_positions.reshape(-1).to(int32)``),
     ``residual`` a copy of ``noise``'s bytes (or None).
+
+    ``join`` (``drafter_preamble_late_join``): the context-K/V side chain's join that the
+    prepare left to this forward, a callable, or None when the prepare joined. The side chain
+    writes ``num_ctx``, ``i32s``, the arena and ``_seq_lens_cuda``; the forward's first read of
+    any of them is layer 0's QK norm + RoPE (the query positions), so ``windowed_block_decode``
+    runs the join right before it. A preamble the forward does not take has its join run when it
+    is dropped (``_take_preamble``, ``settle_preamble``).
+
+    ``normed`` (not installed by any composition): layer 0's input norm of ``noise``'s rows
+    (``[rows, hidden]``), written by the prepare's fused gather (``ox_entry.EntryGatherNorm``,
+    the drafter's own layer-0 ``input_layernorm`` weight and eps), or None.
+
+    ``tt`` (``drafter_folds``' layer-0 table): ``(qkv, coefficients)``, layer 0's pre-RoPE
+    ``qkv_proj`` output (``[rows, q + 2 kv]``) and ``prepare``'s side-1 coefficients
+    (``[rows, taps, groups]``) for ``noise``'s rows, written by the prepare's table gather
+    (``tt_table.drafter_l0``) as the installed layer-0 front computes them, or None.
     """
 
-    __slots__ = ("num_ctx", "slots", "query_positions", "noise", "i32s", "residual")
+    __slots__ = (
+        "num_ctx",
+        "slots",
+        "query_positions",
+        "noise",
+        "i32s",
+        "residual",
+        "join",
+        "normed",
+        "tt",
+    )
 
-    def __init__(self, num_ctx, slots, query_positions, noise, i32s, residual):
+    def __init__(
+        self,
+        num_ctx,
+        slots,
+        query_positions,
+        noise,
+        i32s,
+        residual,
+        join=None,
+        normed=None,
+        tt=None,
+    ):
         self.num_ctx = num_ctx
         self.slots = slots
         self.query_positions = query_positions
         self.noise = noise
         self.i32s = i32s
         self.residual = residual
+        self.join = join
+        self.normed = normed
+        self.tt = tt
+
+    def run_join(self) -> None:
+        """Run the deferred join once; a no-op when there is none or it has run."""
+        join, self.join = self.join, None
+        if join is not None:
+            join()
 
 
 _PUBLISHED_PREAMBLE = None
@@ -100,21 +148,44 @@ def publish_preamble(memo: DrafterPreamble) -> None:
     _PUBLISHED_PREAMBLE = memo
 
 
+def settle_preamble() -> None:
+    """Drop a published preamble no forward will take, running its deferred join."""
+    global _PUBLISHED_PREAMBLE
+    memo, _PUBLISHED_PREAMBLE = _PUBLISHED_PREAMBLE, None
+    if memo is not None:
+        memo.run_join()
+
+
+def defers_join(draft_model: nn.Module) -> bool:
+    """Whether a preamble's deferred join reaches ``draft_model``'s forward
+    (``drafter_preamble_late_join``).
+
+    True when its ``dflash_forward`` is ``windowed_block_decode``.
+    """
+    bound = draft_model.__dict__.get("dflash_forward")
+    return isinstance(bound, types.MethodType) and bound.__func__ is windowed_block_decode
+
+
 def _take_preamble(
     noise_embedding, query_positions, num_ctx_per_req, ctx_cache_batch_idx, B, block_size
 ):
-    """The published preamble when this forward's inputs are its tensors, else None; consumed either way."""
+    """The published preamble when this forward's inputs are its tensors, else None; consumed either way.
+
+    A preamble not taken has its deferred join run here.
+    """
     global _PUBLISHED_PREAMBLE
     memo, _PUBLISHED_PREAMBLE = _PUBLISHED_PREAMBLE, None
+    if memo is None:
+        return None
     if (
-        memo is None
-        or memo.noise is not noise_embedding
+        memo.noise is not noise_embedding
         or memo.query_positions is not query_positions
         or memo.num_ctx is not num_ctx_per_req
         or memo.slots is not ctx_cache_batch_idx
         or num_ctx_per_req.shape[0] != B
         or query_positions.numel() != B * block_size
     ):
+        memo.run_join()
         return None
     return memo
 
@@ -159,6 +230,18 @@ class FusedDFlash2BlockConv(DFlash2BlockConv):
                 hidden_states, delta, base_kernel, block_size, self.group_size, True
             )
         return dflash2_block_conv(hidden_states, delta, base_kernel, block_size, self.group_size)
+
+    def prepare(
+        self, hidden_states: torch.Tensor, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The conv fold (``kernels/dr3_folds``, ``drafter_folds``): the projection weight's side-0
+        # rows are permuted and the 8-row prepare runs in the projection GEMV's epilogue.
+        tactic = self.__dict__.get("_dr3_cf")
+        if tactic is None:
+            return super().prepare(hidden_states, block_size)
+        from ..dr3_folds import folds as _dr3_folds
+
+        return _dr3_folds.folded_prepare(self, tactic, hidden_states, block_size)
 
 
 def install_fused_block_conv(draft_model: nn.Module) -> int:
@@ -335,6 +418,8 @@ def windowed_block_decode(
         and v0.stride(-1) == 1
         and noise_embedding.shape[1] <= self.block_size
     ):
+        settle_preamble()
+        _join_pending(self)
         return DFlashForCausalLM.dflash_forward(
             self,
             noise_embedding,
@@ -365,17 +450,39 @@ def windowed_block_decode(
         noise_embedding, query_positions, num_ctx_per_req, ctx_cache_batch_idx, B, block_size
     )
     if preamble is not None:
+        # The preamble's lengths come from the folded commit: join first.
+        _join_pending(self)
         cache_seqlens_i32, seq_lens_after, cache_batch_idx_i32, query_positions_flat_i32 = (
             preamble.i32s
         )
+    elif _join_is_pending(self):
+        # ``context_kv_late_join``: the lengths the context-K/V fork's commit wrote are
+        # read right before the first block attention, after the join the prepare left
+        # pending (``join_pending``).
+        cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
+        query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
+        seq_lens_after = None
     else:
         cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
         cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
         seq_lens_after = cache_seqlens_i32 + block_size
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
+    # drafter_preamble_late_join: the side chain's join, run before layer 0's QK norm + RoPE
+    # (None: already joined).
+    pending_join = preamble.run_join if preamble is not None and preamble.join is not None else None
 
     residual = None
     has_block_conv = self.has_block_conv
+    # drafter_folds' layer-0 table: layer 0's qkv and side-1 coefficient rows, written by
+    # the prepare's table gather, when they fit this block (else layer 0 runs its own front).
+    tt_rows = preamble.tt if preamble is not None else None
+    if tt_rows is not None and not (
+        has_block_conv
+        and preamble.residual is not None
+        and tuple(tt_rows[0].shape) == (B * block_size, q_size + 2 * kv_size)
+        and tt_rows[1].shape[0] == B * block_size
+    ):
+        tt_rows = None
     # ``drafter_hops``: every hop site of this forward on the fused drafter hop, or none.
     hops = self.__dict__.get("_drafter_hop")
     if hops is not None and not (
@@ -394,41 +501,81 @@ def windowed_block_decode(
     wide = self.__dict__.get("_wide_window_attention")
     if wide is not None and not wide.takes(B * block_size):
         wide = None
+    # ``drafter_attn_pdl`` (``drafter_folds``): QK norm + RoPE on the PDL copy and the split's pre-wait
+    # loads (PDL only; not with the wide op, which has no pre-wait split).
+    attn_pdl = self.__dict__.get("_pt_attn_pdl") if enable_pdl and wide is None else None
+    # The QK fold (``kernels/dr3_folds``, not installed by any composition; on attn_pdl's path only): the window
+    # attention's split normalizes and rotates the raw q / k_new instead of a QK norm + RoPE launch.
+    qk_fold = self.__dict__.get("_dr3_qf") if attn_pdl is not None else None
+    if qk_fold is not None:
+        from ..dr3_folds import folds as _dr3_folds
     for layer_idx, layer in enumerate(layers):
         attn_mod = layer.self_attn
 
-        hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if prenormed is not None:
-            # The previous layer's hop already applied this layer's input norm.
-            hs_normed_flat = prenormed
-        elif residual is None:
-            if preamble is not None and preamble.residual is not None:
-                # The noise gather's second output, the same bytes as the clone.
-                residual = preamble.residual
-            else:
-                residual = (
-                    hidden_states.clone(memory_format=torch.contiguous_format)
-                    if hops is not None
-                    else hidden_states.clone()
-                )
-            hs_normed_flat = layer.input_layernorm(hs_flat)
+        if layer_idx == 0 and tt_rows is not None:
+            # drafter_folds' layer-0 table: layer 0's input norm, coefficient GEMV, prepare conv and
+            # qkv_proj are the table gather's rows (the installed front's bits for this block's bonus id).
+            residual = preamble.residual
+            qkv_query, attn_conv_coefficients = tt_rows
         else:
-            res_flat = residual.reshape(-1, residual.shape[-1])
-            hs_normed_flat, res_flat = layer.input_layernorm(hs_flat, res_flat)
-            residual = res_flat.reshape(B, block_size, -1)
+            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            if prenormed is not None:
+                # The previous layer's hop already applied this layer's input norm.
+                hs_normed_flat = prenormed
+            elif residual is None:
+                if preamble is not None and preamble.residual is not None:
+                    # The noise gather's second output, the same bytes as the clone.
+                    residual = preamble.residual
+                else:
+                    residual = (
+                        hidden_states.clone(memory_format=torch.contiguous_format)
+                        if hops is not None
+                        else hidden_states.clone()
+                    )
+                # drafter_folds' entry-trigger norm: the same norm, releasing its dependent at entry.
+                entry_norm = self.__dict__.get("_ox_entry_norm")
+                normed = preamble.normed if preamble is not None else None
+                if normed is not None and normed.shape == hs_flat.shape:
+                    # The prepare's fused gather + norm (``install_gather``, which no composition installs)
+                    # applied this norm.
+                    hs_normed_flat = normed
+                elif entry_norm is not None and entry_norm.takes(hs_flat):
+                    hs_normed_flat = entry_norm(hs_flat)
+                else:
+                    hs_normed_flat = layer.input_layernorm(hs_flat)
+            else:
+                res_flat = residual.reshape(-1, residual.shape[-1])
+                hs_normed_flat, res_flat = layer.input_layernorm(hs_flat, res_flat)
+                residual = res_flat.reshape(B, block_size, -1)
 
-        attn_conv_coefficients = None
-        if has_block_conv:
-            hs_normed_flat, attn_conv_coefficients = self.attention_convs[layer_idx].prepare(
-                hs_normed_flat, block_size
+            attn_conv_coefficients = None
+            if has_block_conv:
+                hs_normed_flat, attn_conv_coefficients = self.attention_convs[layer_idx].prepare(
+                    hs_normed_flat, block_size
+                )
+
+            qkv_query = attn_mod.qkv_proj(hs_normed_flat)
+        if pending_join is not None:
+            # drafter_preamble_late_join: the first read of the side chain's outputs (positions,
+            # lengths, arena) follows.
+            pending_join()
+            pending_join = None
+        layer_qk_fold = None
+        if qk_fold is not None:
+            layer_qk_fold = _dr3_folds.layer_qk_fold(
+                qk_fold, layer_idx, attn_mod, query_positions_flat_i32
             )
-
-        qkv_query = attn_mod.qkv_proj(hs_normed_flat)
-        attn_mod.apply_qk_norm_rope(qkv_query, query_positions_flat_i32)
+        elif attn_pdl is not None:
+            attn_pdl.qk_norm_rope(layer_idx, attn_mod, qkv_query, query_positions_flat_i32)
+        else:
+            attn_mod.apply_qk_norm_rope(qkv_query, query_positions_flat_i32)
         q_bshd = qkv_query[:, :q_size].reshape(B, block_size, num_heads_per_rank, head_dim)
         k_new = qkv_query[:, q_size : q_size + kv_size].reshape(-1, num_kv_heads_per_rank, head_dim)
         v_new = qkv_query[:, q_size + kv_size :].reshape(-1, num_kv_heads_per_rank, head_dim)
 
+        if seq_lens_after is None:
+            _join_pending(self)
+            seq_lens_after = num_ctx_per_req[:B].to(torch.int32) + block_size
         _, window_size = self._resolve_block_attention(layer_idx)
         k_cache, v_cache = caches[layer_idx]
         if wide is not None:
@@ -458,6 +605,8 @@ def windowed_block_decode(
                 v_new,
                 merge_entry,
                 ctx_page_table,
+                attn_pdl is not None,
+                qk_fold=layer_qk_fold,
             )
         attn_output = out.reshape(B * block_size, q_size)
 
