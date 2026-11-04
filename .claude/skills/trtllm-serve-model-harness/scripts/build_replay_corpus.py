@@ -70,20 +70,9 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "validate"))
+from scan_credentials import matches as credential_matches  # noqa: E402
 from tracelib import ShardError, iter_lines  # noqa: E402
 
-PATTERNS = (  # strong credential signatures; kept in step with validate/scan_credentials.py
-    re.compile(rb"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}"),
-    re.compile(rb"\bsk-(?:proj-|live-|svcacct-)?[A-Za-z0-9_-]{20,}"),
-    re.compile(rb"\bnvapi-[A-Za-z0-9_-]{20,}"),
-    re.compile(rb"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"),
-    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(rb"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----"),
-    re.compile(rb"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
-    re.compile(rb"\bhf_[A-Za-z0-9]{30,}"),
-    re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b"),
-)
 SHARD = re.compile(r"(^|/)requests-[^/]*\.jsonl(\.zst|\.gz)?$")
 
 
@@ -279,7 +268,7 @@ def scan_shard(path):
         if not isinstance(body, dict):
             counts["drop:body"] += 1
             continue
-        if any(rx.search(raw) for rx in PATTERNS):
+        if any(credential_matches(raw)):  # the strong-credential patterns of scan_credentials.py
             counts["drop:credential"] += 1
             continue
         if body.get("previous_response_id"):

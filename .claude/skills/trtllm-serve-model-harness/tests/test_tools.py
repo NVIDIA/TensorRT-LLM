@@ -87,6 +87,25 @@ def test_the_corpus_is_readable_by_its_owner_only(tmp_path):
     assert len(out.read_text().splitlines()) == 1
 
 
+def test_the_corpus_leaves_out_what_the_credential_scan_flags(tmp_path):
+    """A request the scan flags, an environment dump included, never reaches the corpus."""
+    dump = "HOME=/root\nOPENAI_API_KEY=" + "FAKE" * 6 + "\nPATH=/bin"  # obviously not a key
+    tool_turn = [{"type": "message", "role": "user", "content": "go"},
+                 {"type": "function_call_output", "call_id": "c1", "output": dump}]  # fmt: skip
+    shard = tmp_path / "requests-1.jsonl"
+    shard.write_text("".join(json.dumps({"event": "request", "trace_id": f"t{i}",
+                                         "route": "/v1/responses",
+                                         "body": {"model": "m", "input": body}}) + "\n"
+                             for i, body in enumerate(["go", tool_turn])))  # fmt: skip
+    out, manifest = tmp_path / "corpus.jsonl", tmp_path / "manifest.json"
+    result = subprocess.run([sys.executable, os.path.join(SCRIPTS, "build_replay_corpus.py"),
+                             "--out", str(out), "--manifest", str(manifest), str(shard)],
+                            capture_output=True, text=True)  # fmt: skip
+    assert result.returncode == 0, result.stderr
+    assert "FAKE" not in out.read_text() and len(out.read_text().splitlines()) == 1
+    assert json.loads(manifest.read_text())["counts"]["drop:credential"] == 1
+
+
 def test_a_corpus_cut_while_it_is_written_leaves_no_corpus(tmp_path, monkeypatch):
     """A shard that fails during the second pass leaves neither a corpus nor a manifest."""
     from tracelib import ShardError
