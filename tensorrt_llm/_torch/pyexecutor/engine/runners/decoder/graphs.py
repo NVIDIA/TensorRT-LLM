@@ -307,6 +307,7 @@ class DecoderCudaGraphs:
             promoted_context_request_ids=promoted_context_request_ids,
             peft_cache_data_type=peft_cache_data_type,
             use_lora_graph=use_lora_graph,
+            lora_slots_fit=self.lora_slots_fit(padded_requests),
         )
         return GraphSelection(key, graph_attn_metadata, graph_spec_metadata, use_lora_graph)
 
@@ -417,6 +418,17 @@ class DecoderCudaGraphs:
         return any(
             request.lora_task_id is not None for request in scheduled_requests.generation_requests
         )
+
+    def lora_slots_fit(self, scheduled_requests: ScheduledRequests) -> bool:
+        """Whether the LoRA CUDA graph's adapter slots hold every adapter of a batch.
+
+        A batch with more distinct adapters than slots runs eagerly, where LoRA
+        has no per-batch adapter limit.
+        """
+        cuda_graph_lora_manager = self._lora.cuda_graph_manager
+        if cuda_graph_lora_manager is None:
+            return True
+        return cuda_graph_lora_manager.fits_batch(scheduled_requests.generation_requests)
 
     def promote_final_contexts(
         self,
