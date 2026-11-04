@@ -208,6 +208,27 @@ class _MsgspecRoute(KvHintsRoute):
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+# The header in which a /v1/responses reply names the engine request it
+# answers; see _engine_request_id_headers.
+ENGINE_REQUEST_ID_HEADER = "x-trtllm-engine-request-id"
+
+
+def _engine_request_id_headers(
+        promise: RequestOutput) -> Optional[Dict[str, str]]:
+    """The response headers that name the engine request behind ``promise``.
+
+    A /v1/responses reply is named with a random ``resp_`` id, while the
+    server's log lines, perf metrics and post-processor hook name a request by
+    the id the engine gave it. ENGINE_REQUEST_ID_HEADER carries that id, so a
+    reply can be matched with them. None, so no header is sent, when the
+    promise carries no request id.
+    """
+    request_id = getattr(promise, "request_id", None)
+    if request_id is None:
+        return None
+    return {ENGINE_REQUEST_ID_HEADER: str(request_id)}
+
+
 _warned_unresolvable_thinking = False
 
 
@@ -3558,6 +3579,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
+            headers = _engine_request_id_headers(promise)
             if request.stream:
                 return ClosingStreamingResponse(
                     content=keep_responses_stream_alive(
@@ -3566,7 +3588,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                                        postproc_params),
                             streaming_processor.get_stream_failed_events,
                         )),
-                    media_type="text/event-stream")
+                    media_type="text/event-stream",
+                    headers=headers)
             else:
                 response = await create_response(promise, postproc_params)
                 # Context-only: the orchestrator may ask for the prompt as a
@@ -3580,7 +3603,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
                 # by_alias: e.g. text.format.schema goes out under its wire name.
-                return JSONResponse(content=response.model_dump(by_alias=True))
+                return JSONResponse(content=response.model_dump(by_alias=True),
+                                    headers=headers)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
