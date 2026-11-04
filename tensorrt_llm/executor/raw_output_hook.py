@@ -35,6 +35,7 @@ appends one JSON line per finished output to
 import json
 import os
 import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 from ..logger import logger
@@ -92,18 +93,30 @@ class RawOutputDump:
     - ``token_ids``, ``num_output_tokens``: the generated token ids, collected
       from ``chunk.token_ids_diff``, and their count. They also show tokens that
       detokenization leaves out of ``text``, such as skipped special tokens.
+    - ``frames_consistent``: whether ``frames`` add up to ``text``.
     - ``streaming``, ``aborted``: from the final chunk.
     - ``started_at``, ``finished_at``: UTC ISO-8601 times of the output's first
       chunk and of the record.
     - ``partial``, ``end_reason``: false and null for an output that finished.
     - ``event``: always ``"raw_output"``.
 
-    A request that a post-processing worker drops because of an error gets no
-    final chunk; :meth:`on_request_end` writes what each of its outputs had
-    generated, with ``partial`` true and ``end_reason`` set. A request that
-    gets neither (without the worker pool: an executor error, or a stream whose
-    client disconnects first) is not recorded, and its state is kept until the
-    process exits.
+    A record matches its output exactly when the request generates one sequence
+    (``n`` and ``best_of`` of 1, the default). When it generates several
+    (``n`` or ``best_of`` above 1, which includes beam search), ``frames`` and
+    ``token_ids`` are what the hook was handed for that output index, which need
+    not be one sequence's own history: ``token_ids`` can repeat ids, and when
+    sampling with ``best_of`` above ``n`` the index is a rank that can change
+    between chunks, so one record can join chunks of different sequences.
+    ``text`` is always the text at the output's last chunk, and
+    ``frames_consistent`` is false when ``frames`` do not add up to it.
+
+    A request that ends in an error gets no final chunk; :meth:`on_request_end`
+    writes what each of its outputs had generated, with ``partial`` true and
+    ``end_reason`` set. An output that gets neither (without the worker pool, a
+    stream whose client disconnects first) stays in flight. At most
+    :attr:`max_pending` outputs are kept in flight: past that, the least
+    recently updated one is written with ``partial`` true and ``end_reason``
+    ``"evicted"``.
 
     The hook seam fails a request whose hook raises. A debug dump must not, so
     this hook never raises: a record that cannot be written is dropped and
@@ -111,10 +124,15 @@ class RawOutputDump:
     every 1000th after it.
     """
 
+    #: The most outputs kept in flight. A subclass can set another limit and be
+    #: passed to ``--post_processor_hook`` instead.
+    max_pending = 4096
+
     def __init__(self) -> None:
         self._dir = os.environ.get(RAW_OUTPUT_DIR_ENV) or None
         self._file_name = f"raw-{os.getpid()}.jsonl"
-        self._pending: dict[tuple[int, int], _Pending] = {}
+        # Ordered from the least to the most recently updated output.
+        self._pending: OrderedDict[tuple[int, int], _Pending] = OrderedDict()
         # One instance can be called from more than one thread of its process (for
         # example, threads each waiting on an ``LLM`` result): ``_lock`` guards the
         # pending state and the drop count, ``_write_lock`` keeps each line whole.
@@ -131,54 +149,75 @@ class RawOutputDump:
         if self._dir is None:
             return verdict
         try:
-            finished = self._observe(chunk)
-            if finished is not None:
-                self._write(finished)
+            ended = self._observe(chunk)
         except Exception as error:  # noqa: BLE001 - a debug dump must not fail a request
             self._note_drop(error)
+            return verdict
+        for pending, end_reason in ended:
+            self._write_or_drop(pending, end_reason)
         return verdict
 
     def on_request_end(self, request_id: int, reason: str) -> None:
         """Release a request that ended without a final chunk, recording what it generated.
 
-        Called through ``end_post_processor_hook`` by the post-processing worker
-        when it drops a request after an error. Each of the request's outputs
-        that produced text or token ids is written with ``partial`` true and
-        ``end_reason`` set to ``reason``.
+        Called through ``end_post_processor_hook`` when a request ends in an
+        error. Each of the request's outputs that produced text or token ids is
+        written with ``partial`` true and ``end_reason`` set to ``reason``.
 
         Args:
             request_id: The request's ``chunk.request_id``.
-            reason: Why the request ended, as the worker reports it.
+            reason: Why the request ended, as the caller reports it.
         """
         with self._lock:
             keys = [key for key in self._pending if key[0] == request_id]
             ended = [self._pending.pop(key) for key in keys]
         for pending in ended:
-            if not (pending.frames or pending.token_ids):
-                continue
-            try:
-                self._write(pending, end_reason=reason)
-            except Exception as error:  # noqa: BLE001 - a debug dump must not fail a request
-                self._note_drop(error)
+            self._write_or_drop(pending, reason)
 
-    def _observe(self, chunk: PostProcessorHookChunk) -> _Pending | None:
-        """Add ``chunk`` to its output's state; return the state once the output has finished."""
+    def _observe(self, chunk: PostProcessorHookChunk) -> list[tuple[_Pending, str | None]]:
+        """Add ``chunk`` to its output's state.
+
+        Returns the outputs to write, each with its end reason: the chunk's
+        output once it has finished (reason None), and any output evicted to
+        keep at most ``max_pending`` in flight (reason ``"evicted"``).
+        """
         key = (chunk.request_id, chunk.output_index)
+        ended = []
         with self._lock:
-            pending = self._pending.get(key)
+            pending = self._pending.pop(key, None)
             if pending is None:
-                pending = self._pending[key] = _Pending(chunk)
+                pending = _Pending(chunk)
             pending.last = chunk
             # A chunk that added no text (the final call often adds none) is not a frame.
             if chunk.text_diff:
                 pending.frames.append(chunk.text_diff)
             pending.token_ids.extend(chunk.token_ids_diff)
-            if not chunk.is_final:
-                return None
-            # ``is_final`` is request-level: with n > 1 every output of the request gets
-            # its final chunk in the same call, each under its own key.
-            del self._pending[key]
-            return pending
+            if chunk.is_final:
+                # ``is_final`` is request-level: every output the result returns gets its
+                # final chunk in the same call, each under its own key. When sampling with
+                # best_of > n, the result returns the top n and each key holds a rank, so a
+                # sequence that drops out of the top n gets no final chunk under the key it
+                # had: the sequence now at that rank continues its entry (see the class
+                # docstring).
+                ended.append((pending, None))
+            else:
+                self._pending[key] = pending
+            while len(self._pending) > self.max_pending:
+                ended.append((self._pending.popitem(last=False)[1], "evicted"))
+        return ended
+
+    def _write_or_drop(self, pending: _Pending, end_reason: str | None) -> None:
+        """Write the record of ``pending``; a record that cannot be written is counted as dropped.
+
+        An output that ended early (``end_reason`` set) without producing text or
+        token ids is not written.
+        """
+        if end_reason is not None and not (pending.frames or pending.token_ids):
+            return
+        try:
+            self._write(pending, end_reason)
+        except Exception as error:  # noqa: BLE001 - a debug dump must not fail a request
+            self._note_drop(error)
 
     def _write(self, pending: _Pending, end_reason: str | None = None) -> None:
         """Append the record of one output to this process's file for the current hour."""
@@ -199,6 +238,7 @@ class RawOutputDump:
             "end_reason": end_reason,
             "text": chunk.text,
             "frames": pending.frames,
+            "frames_consistent": "".join(pending.frames) == chunk.text,
             "token_ids": pending.token_ids,
             "num_output_tokens": len(pending.token_ids),
         }

@@ -154,7 +154,8 @@ class PostProcessorHook(Protocol):
     hook that keeps per-request state can also define
     ``on_request_end(request_id, reason)``. It is optional; the worker calls it
     through :func:`end_post_processor_hook` when it drops such a request, so the
-    hook can release (or record) what it holds for that request.
+    hook can release (or record) what it holds for that request. Without the
+    worker pool, it is called when the executor reports an error for a request.
     """
 
     def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict: ...

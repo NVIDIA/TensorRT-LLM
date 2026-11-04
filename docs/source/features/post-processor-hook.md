@@ -168,6 +168,7 @@ worker) appends one JSON line per finished output — not per chunk — to
 | `output_index` | The output's index within the request (`n` > 1, beam search). |
 | `text` | The output's full detokenized text. |
 | `frames` | The text each chunk added, in order; chunks that added none are left out. |
+| `frames_consistent` | Whether `frames` add up to `text`; see below. |
 | `token_ids`, `num_output_tokens` | The generated token ids and their count. |
 | `streaming`, `aborted` | From the output's final chunk. |
 | `started_at`, `finished_at` | UTC ISO-8601 times of the output's first chunk and of the record. |
@@ -180,11 +181,21 @@ incremental parsers fail at chunk boundaries: a tool-call marker split across tw
 as one emitted whole once the chunks are joined. `token_ids` also shows tokens that detokenization
 leaves out of `text`, such as skipped special tokens.
 
-When the post-processing worker pool is enabled, a request that ends in an error is written with
-`"partial": true` and `end_reason` set to the reason the worker reports (see
-[Per-request state](#per-request-state)), so output cut off by an error is kept and told apart from a
-finished one. A request that gets neither a final chunk nor `on_request_end` (see the same section)
-is not recorded, and the hook keeps what it had generated until the process exits.
+A record matches its output exactly when the request generates one sequence (`n` and `best_of` of 1,
+the default). When it generates several (`n` or `best_of` above 1, which includes beam search),
+`frames` and `token_ids` are what the hook was handed for that output index, which need not be one
+sequence's own history: `token_ids` can repeat ids, and when sampling with `best_of` above `n` the
+index is a rank that can change between chunks, so one record can join chunks of different
+sequences. `text` is always the text at the output's last chunk, and `frames_consistent` is `false`
+when `frames` do not add up to it.
+
+A request that ends in an error is written with `"partial": true` and `end_reason` set to the reason
+`on_request_end` reports (see [Per-request state](#per-request-state)), so output cut off by an error
+is kept and told apart from a finished one. An output that gets neither a final chunk nor
+`on_request_end` (see the same section) stays in flight. The hook keeps at most `max_pending` outputs
+(4096) in flight: past that, it writes the least recently updated one with `"partial": true` and
+`end_reason` `"evicted"`. To keep more or fewer, set `max_pending` in a subclass and pass the
+subclass's import path to `--post_processor_hook`.
 
 A hook that raises fails the request (see *Hook errors fail closed* below). A debug dump must not, so
 this hook never raises: a record that cannot be written — for example, because the directory is not
@@ -206,10 +217,11 @@ calls it when it drops such a request, with `reason` set to `"error"` or `"postp
 the hook can release (or record) what it holds for that request. A hook without the method is left
 alone, and an exception raised by it is logged rather than propagated.
 
-Without the worker pool, the hook runs as the server reads each response of a request, and
-`on_request_end` is not called. A request whose final response the server does not read that way gets
-no final chunk: one that ends in an executor error (the error is raised before the hook runs), or a
-stream whose client disconnects before it finishes.
+Without the worker pool, the hook runs as the server reads each response of a request. A request that
+ends in an executor error gets no final chunk there either (the error is raised before the hook
+runs), and `on_request_end` is called for it with `reason` set to `"error"`. A stream whose client
+disconnects before it finishes gets neither: the server stops reading its responses, so the hook sees
+no further chunk for it.
 
 Engine-level batching is transparent to the hook: even when requests are batched together in the
 engine, the hook is invoked **once per request** (per output, per chunk) — there is no batched-call

@@ -23,20 +23,25 @@ import asyncio
 import glob
 import json
 import os
+import queue
+from types import SimpleNamespace
 
 import pytest
 
 import tensorrt_llm.executor.raw_output_hook as raw_output_hook
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.executor.postproc_worker import PostprocWorker
+from tensorrt_llm.executor.executor import GenerationExecutor
+from tensorrt_llm.executor.postproc_worker import PostprocParams, PostprocWorker
 from tensorrt_llm.executor.postprocessor_hook import (
     apply_post_processor_hook,
     end_post_processor_hook,
     load_post_processor_hook,
 )
 from tensorrt_llm.executor.raw_output_hook import RAW_OUTPUT_DIR_ENV, RawOutputDump
-from tensorrt_llm.executor.result import CompletionOutput
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.result import CompletionOutput, DetokenizedGenerationResultBase
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
+from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -94,6 +99,63 @@ def dump_dir(tmp_path, monkeypatch):
     return directory
 
 
+class LetterTokenizer:
+    """Decodes token id ``i`` to the ``i``-th lowercase letter.
+
+    It has no ``decode_incrementally``, so a result re-decodes all of an
+    output's token ids on every response.
+    """
+
+    def decode(self, token_ids, **kwargs):
+        return "".join(chr(ord("a") + token_id % 26) for token_id in token_ids)
+
+
+def engine_response(
+    client_id, token_ids, sequence_index=0, cum_logprob=0.0, finished=False, is_final=False
+):
+    """A response from the engine for one sequence of a request, as a result reads it."""
+    result = SimpleNamespace(
+        is_final=is_final,
+        sequence_index=sequence_index,
+        output_token_ids=[list(token_ids)],
+        cum_log_probs=[cum_logprob],
+        finish_reasons=[FinishReason.LENGTH if finished else FinishReason.NOT_FINISHED],
+        context_phase_params=None,
+        decoding_iter=1,
+        avg_decoded_tokens_per_iter=None,
+        request_perf_metrics=None,
+        log_probs=None,
+        generation_logits=None,
+        context_logits=None,
+        additional_context_outputs=None,
+        additional_generation_outputs=None,
+        time_breakdown_metrics=None,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+    )
+    return SimpleNamespace(
+        client_id=client_id, request_id=client_id, result=result, has_error=lambda: False
+    )
+
+
+def engine_error(client_id, message):
+    """An error the engine reports for a request."""
+    return SimpleNamespace(
+        client_id=client_id, request_id=client_id, error_msg=message, has_error=lambda: True
+    )
+
+
+class ExecutorErrors:
+    """Handles a result's errors with the executor's own background error handler."""
+
+    _handle_background_error = GenerationExecutor._handle_background_error
+
+    def __init__(self):
+        # Errors from the executor's background threads; none in these tests.
+        self._error_queue = queue.Queue()
+
+
 def test_the_served_text_is_unchanged(dump_dir):
     hook = RawOutputDump()
     deltas = ["<think>", "weighing ", "it</think>", "the answer"]
@@ -132,6 +194,7 @@ def test_streaming_frames_keep_the_chunk_boundaries(dump_dir):
     (record,) = records_in(dump_dir)
     assert record["frames"] == deltas
     assert record["text"] == "".join(deltas)
+    assert record["frames_consistent"] is True
     assert record["streaming"] is True
     assert record["request_id"] == "99"
     assert record["output_index"] == 0
@@ -163,6 +226,33 @@ def test_each_output_of_a_request_keeps_its_own_frames(dump_dir):
     assert all(record["request_id"] == "5" for record in records)
     assert records[0]["frames"] == ["a1", "a2"]
     assert records[1]["frames"] == ["b1", "b2"]
+
+
+def test_a_record_that_joins_two_sampled_sequences_is_marked(dump_dir):
+    """With best_of > n the output index is a rank the result recomputes on every response.
+
+    Two sequences answer separately; the second ranks higher, so it takes index 0
+    from the first, and the record of index 0 joins a chunk of each.
+    """
+    hook = RawOutputDump()
+    result = DetokenizedGenerationResultBase(
+        7,
+        SamplingParams(n=1, best_of=2, temperature=1.0),
+        tokenizer=LetterTokenizer(),
+        post_processor_hook=hook,
+    )
+
+    result._handle_response(engine_response(7, [0, 1, 2], 0, cum_logprob=-3.0, finished=True))
+    result._handle_response(
+        engine_response(7, [3, 4], 1, cum_logprob=-1.0, finished=True, is_final=True)
+    )
+
+    (record,) = records_in(dump_dir)
+    assert record["output_index"] == 0
+    assert record["text"] == "de", "the text is that of the sequence returned at index 0"
+    assert record["frames"] == ["abc", "de"]
+    assert record["frames_consistent"] is False
+    assert hook._pending == {}
 
 
 def test_a_non_streaming_request_records_its_one_chunk(dump_dir):
@@ -394,6 +484,75 @@ def test_ending_an_unknown_request_is_harmless(dump_dir):
     assert records_in(dump_dir) == []
 
 
+def test_an_executor_error_without_the_worker_pool_releases_the_request(dump_dir):
+    """The executor's error is raised before the hook runs; the request is still ended in it."""
+    hook = RawOutputDump()
+    executor = ExecutorErrors()
+    result = DetokenizedGenerationResultBase(
+        7,
+        SamplingParams(),
+        tokenizer=LetterTokenizer(),
+        streaming=True,
+        background_error_handler=executor._handle_background_error,
+        post_processor_hook=hook,
+    )
+    result._handle_response(engine_response(7, [7, 4]))
+    assert list(hook._pending) == [(7, 0)]
+
+    with pytest.raises(RequestError, match="boom"):
+        result._handle_response(engine_error(7, "boom"))
+
+    assert hook._pending == {}
+    (record,) = records_in(dump_dir)
+    assert record["partial"] is True
+    assert record["end_reason"] == "error"
+    assert record["text"] == "he"
+    assert record["token_ids"] == [7, 4]
+
+
+def test_outputs_past_the_limit_are_written_as_evicted(dump_dir):
+    """An output that never finishes (a stream whose reader went away) cannot pile up."""
+    hook = RawOutputDump()
+    hook.max_pending = 2
+    results = [FakeResult(request_id=request_id) for request_id in range(3)]
+
+    for result in results:
+        advance(result.outputs[0], f"r{result.id}", [result.id])
+        apply_post_processor_hook(hook, result, streaming=True)
+
+    assert list(hook._pending) == [(1, 0), (2, 0)]
+    (record,) = records_in(dump_dir)
+    assert record["request_id"] == "0"
+    assert record["partial"] is True
+    assert record["end_reason"] == "evicted"
+    assert record["text"] == "r0"
+    assert record["token_ids"] == [0]
+
+
+def test_the_least_recently_updated_output_is_evicted_first(dump_dir):
+    hook = RawOutputDump()
+    hook.max_pending = 2
+    first, second, third = (FakeResult(request_id=request_id) for request_id in range(3))
+    for result in (first, second, first, third):
+        advance(result.outputs[0], "x")
+        apply_post_processor_hook(hook, result, streaming=True)
+
+    assert list(hook._pending) == [(0, 0), (2, 0)]
+    (record,) = records_in(dump_dir)
+    assert record["request_id"] == "1"
+    assert record["end_reason"] == "evicted"
+
+
+def test_an_evicted_output_that_produced_nothing_is_not_written(dump_dir):
+    hook = RawOutputDump()
+    hook.max_pending = 1
+    for request_id in range(2):
+        apply_post_processor_hook(hook, FakeResult(request_id=request_id), streaming=True)
+
+    assert list(hook._pending) == [(1, 0)]
+    assert records_in(dump_dir) == []
+
+
 class _Pipe:
     def __init__(self, items):
         self._items = list(items)
@@ -426,3 +585,57 @@ def test_the_worker_ends_a_request_that_fails_after_output(dump_dir):
     assert record["partial"] is True
     assert record["end_reason"] == "error"
     assert record["text"] == "cut off"
+
+
+def test_the_worker_ends_a_request_whose_post_processing_raises_after_output(dump_dir):
+    """The worker builds its own record and runs the hook on it, then the formatter raises.
+
+    The record is the worker's real one (``default_record_creator``), handled by
+    ``_handle_input`` for each response: the hook records the first two chunks,
+    and the per-endpoint formatter raises on the second, after the hook ran.
+    """
+    hook = RawOutputDump()
+    formatted = []
+
+    def post_processor(record, args):
+        formatted.append(record.outputs[0].text_diff)
+        if len(formatted) == 2:
+            raise RuntimeError("formatter bug")
+        return []
+
+    def request_input(token_ids):
+        return PostprocWorker.Input(
+            rsp=engine_response(7, token_ids),
+            sampling_params=SamplingParams(),
+            postproc_params=PostprocParams(
+                post_processor=post_processor, postproc_args=SimpleNamespace()
+            ),
+            streaming=True,
+        )
+
+    worker = object.__new__(PostprocWorker)
+    worker._records = {}
+    worker._record_creator = PostprocWorker.default_record_creator
+    worker._tokenizer = LetterTokenizer()
+    worker._post_processor_hook = hook
+    worker._to_stop = asyncio.Event()
+    worker._pull_pipe = _Pipe([[request_input([7, 4])], [request_input([11, 11])], None])
+
+    async def drain():
+        return [batch async for batch in worker._mainloop() if batch]
+
+    batches = asyncio.run(drain())
+
+    assert formatted == ["he", "ll"]
+    assert isinstance(batches[0][0], PostprocWorker.Output)
+    (error,) = batches[1]
+    assert isinstance(error, ErrorResponse)
+    assert "formatter bug" in error.error_msg
+    assert worker._records == {}
+    assert hook._pending == {}
+    (record,) = records_in(dump_dir)
+    assert record["partial"] is True
+    assert record["end_reason"] == "postprocessing_error"
+    assert record["frames"] == ["he", "ll"]
+    assert record["text"] == "hell"
+    assert record["token_ids"] == [7, 4, 11, 11]
