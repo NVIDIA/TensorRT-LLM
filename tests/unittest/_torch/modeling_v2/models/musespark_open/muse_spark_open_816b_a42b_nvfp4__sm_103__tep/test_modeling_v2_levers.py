@@ -252,6 +252,35 @@ SERVED_AT = {
     "tep8_publish_join": ({(107, 8)}, "lossless-bitwise", "LL"),
     "tep8_pool_programmatic_fork": ({(107, 8)}, "lossless-bitwise", "LL"),
     "tep8_wide_projection_gathers": ({(107, 8)}, "lossless-numeric", "LL"),
+    "step_window_compact": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "fmk_context_fmha": ({(107, 4)}, "lossless-numeric", "HC"),
+    "context_kv_late_join": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "hop_cluster_split": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "drafter_fc_inbox_wide": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "l061_tile32_pin": ({(107, 4)}, "lossless-numeric", "HC"),
+    "router_staged_epilogue": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "decode_qkv_mxfp8": ({(107, 4)}, "lossy", "HC"),
+    "split_kv_deep_ring": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "context_prep_rows_vec": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "context_embedding_replicated": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "context_sp_router_input": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "swa_blocks_per_program": ({(107, 4)}, "lossless-bitwise", "midc"),
+    "wide_qkv_prefetch": ({(107, 4)}, "lossless-bitwise", "midc"),
+    "wide_capture_fold": ({(107, 4)}, "lossless-bitwise", "midc"),
+    "megakernel": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "megakernel_one_exchange_boundaries": ({(107, 8)}, "lossless-numeric", "LL"),
+    "megakernel_two_term_pool": ({(107, 8)}, "lossless-numeric", "LL"),
+    "megakernel_router_by_linearity": ({(107, 8)}, "lossless-numeric", "LL"),
+    "megakernel_zero_exchange_boundary": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "layer0_qkv_table": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "edge_bf16_moe_front": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "last_layer_boundary": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "context_kv_fork_last_layer": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "distributed_head_sampler": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "drafter_preamble_late_join": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "drafter_folds": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "draft_head_tail": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "step_loop_inline_commits": ({(107, 8)}, "lossless-bitwise", "LL"),
 }
 
 
@@ -328,13 +357,86 @@ TEP4_PATHS_SM103 = TEP4_PATHS - {"wide_swa_block", "wide_full_attention", "wide_
 #: The numeric low-latency levers: an unknown role passes none of their accuracy gates.
 VR_NUMERIC = {name for name in VR_TEP4 | VR_TEP8 if RULES[name].kind.value == "lossless-numeric"}
 
+#: The bitwise levers of 2..4-request decode steps: on aggregated sm107 TEP4 servers of
+#: max_batch_size 2..8 (``levers.WIDE_AGG_BATCH``); the default band does not run them.
+WIDE_STEPS = {
+    "swa_blocks_per_program",
+    "wide_qkv_prefetch",
+    "wide_capture_fold",
+}
+#: ... and the full-attention prep fold those servers run on the same steps
+#: (``full_attention_fold_multi``'s rule in the aggregated sm107 band).
+AGG_WIDE = WIDE_STEPS | {"full_attention_fold_multi"}
+#: The levers of aggregated sm107 TEP4 servers of max_batch_size ``HC_LEVERS_MIN_BATCH`` and
+#: up (the wider drafter fc inbox, ``INBOX``, also needs decode steps of 129 rows; the layer
+#: 0 / 61 tile pin, ``L061``, also needs ``hot_replicas``).
+AGG_TEP4_CORE = {
+    "step_window_compact",
+    "fmk_context_fmha",
+    "context_kv_late_join",
+    "hop_cluster_split",
+    "router_staged_epilogue",
+    "split_kv_deep_ring",
+    "context_prep_rows_vec",
+    "context_embedding_replicated",
+    "context_sp_router_input",
+}
+INBOX = {"drafter_fc_inbox_wide"}
+AGG_TEP4 = AGG_TEP4_CORE | INBOX
+L061 = {"l061_tile32_pin"}
+#: The single-request decode schedule of aggregated sm107 TEP8 servers of max_batch_size 1 over a
+#: dense arena, under auto: everything of ``dispatch.SM107_TEP8_ONLY`` but the boundary variant no
+#: build has (``megakernel_zero_exchange_boundary``) and the draft head's tail, which waits for a
+#: drafter that declares no logit transform (``SINGLE_TAIL``).
+SINGLE = {
+    "megakernel",
+    "megakernel_one_exchange_boundaries",
+    "megakernel_two_term_pool",
+    "megakernel_router_by_linearity",
+    "layer0_qkv_table",
+    "edge_bf16_moe_front",
+    "last_layer_boundary",
+    "context_kv_fork_last_layer",
+    "distributed_head_sampler",
+    "drafter_preamble_late_join",
+    "drafter_folds",
+    "step_loop_inline_commits",
+}
+SINGLE_TAIL = {"draft_head_tail"}
+
+#: The low-latency levers that stand down where one of ``WIDE_STEPS`` is on (by band on
+#: aggregated sm107 TEP4 servers; elsewhere where a knob turns one on): the sliding-window
+#: block's other builds of those steps (``exclusive``) and the dense prefetch and QKV tables
+#: that ``wide_qkv_prefetch`` reads.
+VR_YIELD_WIDE = {
+    "swa_one_cluster_block",
+    "swa_prep_split",
+    "swa_eight_requests",
+    "weight_prefetch_after_join",
+    "splitk_frontier_tables",
+}
+#: The context-K/V levers that stand down where ``context_kv_late_join`` is on (aggregated
+#: sm107 TEP4 servers of max_batch_size 4 and up).
+VR_YIELD_LATE_JOIN = {"drafter_kv_glue", "drafter_kv_fork_before_head"}
+#: The levers that stand down on the single-request decode schedule (``SINGLE``).
+VR_YIELD_SINGLE = {
+    "vocab_parallel_head",
+    "step_commit_v2",
+    "drafter_kv_fork_before_head",
+    "weight_prefetch_after_join",
+}
+#: What the default band's sm107 TEP8 set leaves on beside the single-request schedule under
+#: ``auto``: nothing, an aggregated sm107 server is the aggregated sm107 band's
+#: (``levers.band_of``).
+VR_SINGLE: set = set()
+
 REGIONS = [
     pytest.param(
         (107, 8),
         "agg",
         (1,),
         "dense",
-        LL | DENSE | VR_TEP8_DENSE | TEP4_PATHS,
+        LL | DENSE | VR_SINGLE | SINGLE,
         id="ll-agg-tep8-mbs1",
     ),
     pytest.param(
@@ -342,12 +444,7 @@ REGIONS = [
         "agg",
         (1,),
         "windowed",
-        LL
-        | {"half_window_experts", "wide_finalize_transport"}
-        | PREFILL
-        | VR_TEP4
-        | CONTEXT_SP
-        | TEP4_PATHS,
+        LL | {"half_window_experts", "wide_finalize_transport"} | PREFILL | TEP4_PATHS,
         id="ll-agg-tep4-mbs1",
     ),
     pytest.param((107, 8), "gen", (1,), "windowed", LL | VR_TEP8 | TEP4_PATHS, id="gen-tep8-b1"),
@@ -376,31 +473,73 @@ REGIONS = [
     pytest.param(
         (107, 4),
         "agg",
-        (2, 3, 4),
+        (2, 3),
         "windowed",
-        MIDC | LL | {"half_window_experts"} | PREFILL | VR_TEP4 | CONTEXT_SP | TEP4_PATHS,
-        id="agg-caps-2-4",
+        MIDC | LL | {"half_window_experts"} | PREFILL | TEP4_PATHS | AGG_WIDE,
+        id="agg-caps-2-3",
     ),
     pytest.param(
         (107, 4),
         "agg",
-        (6, 8),
+        (4,),
+        "windowed",
+        MIDC | LL | {"half_window_experts"} | PREFILL | TEP4_PATHS | AGG_TEP4_CORE | AGG_WIDE,
+        id="agg-cap-4",
+    ),
+    pytest.param(
+        (107, 4),
+        "agg",
+        (5, 6, 8),
         "windowed",
         HC
         | MIDC
         | {"incremental_block_offsets", "head_sampler_coop_fold", "half_window_experts"}
         | PREFILL
-        | VR_TEP4
-        | CONTEXT_SP
-        | TEP4_PATHS,
-        id="agg-caps-6-8",
+        | TEP4_PATHS
+        | AGG_TEP4_CORE
+        | AGG_WIDE,
+        id="agg-caps-5-8",
     ),
     pytest.param(
         (107, 4),
         "agg",
-        (16, 32),
+        (9, 15),
         "windowed",
-        HC | MIDC | {"head_sampler_coop_fold", "hot_replicas"} | PREFILL | TEP4_PATHS,
+        HC
+        | MIDC
+        | {"head_sampler_coop_fold", "hot_replicas"}
+        | PREFILL
+        | TEP4_PATHS
+        | AGG_TEP4_CORE
+        | L061,
+        id="agg-mid-9-15",
+    ),
+    pytest.param(
+        (107, 4),
+        "agg",
+        (16,),
+        "windowed",
+        HC
+        | MIDC
+        | {"head_sampler_coop_fold", "hot_replicas"}
+        | PREFILL
+        | TEP4_PATHS
+        | AGG_TEP4_CORE
+        | L061,
+        id="agg-mid-16",
+    ),
+    pytest.param(
+        (107, 4),
+        "agg",
+        (17, 32),
+        "windowed",
+        HC
+        | MIDC
+        | {"head_sampler_coop_fold", "hot_replicas"}
+        | PREFILL
+        | TEP4_PATHS
+        | AGG_TEP4
+        | L061,
         id="agg-mid-high",
     ),
     pytest.param(
@@ -408,13 +547,13 @@ REGIONS = [
         "agg",
         (48, 64),
         "windowed",
-        HC | {"graph_start_qkv_prefetch", "hot_replicas"} | PREFILL | TEP4_PATHS,
+        HC | {"graph_start_qkv_prefetch", "hot_replicas"} | PREFILL | TEP4_PATHS | AGG_TEP4 | L061,
         id="agg-hc",
     ),
     pytest.param(
         (107, 4),
         "gen",
-        (8,),
+        (5, 8),
         "windowed",
         HC
         | MIDC
@@ -422,7 +561,7 @@ REGIONS = [
         | PREFILL
         | VR_TEP4
         | TEP4_PATHS,
-        id="gen-tep4-b8",
+        id="gen-tep4-b5-b8",
     ),
     pytest.param(
         (107, 4),
@@ -437,7 +576,7 @@ REGIONS = [
         "agg",
         (2, 4),
         "dense",
-        LL | DENSE | VR_TEP8_DENSE | TEP4_PATHS,
+        LL | DENSE,
         id="agg-tep8-mbs2-4",
     ),
     pytest.param(
@@ -445,10 +584,7 @@ REGIONS = [
         "agg",
         (8,),
         "dense",
-        {"incremental_block_offsets", "head_sampler_coop_fold"}
-        | DENSE
-        | VR_TEP8_DENSE
-        | TEP4_PATHS,
+        {"incremental_block_offsets", "head_sampler_coop_fold"} | DENSE,
         id="agg-tep8-mbs8",
     ),
     pytest.param(
@@ -508,14 +644,24 @@ def test_the_vera_rubin_low_latency_deployments():
     # A TEP4 generation server of three requests; its context server.
     tep4 = table((107, 4), 3, "gen", "windowed")
     assert VR_TEP4 <= rule_levers_on(tep4)
+    # The 2..4-request step levers are the aggregated sm107 band's: off here.
+    assert not rule_levers_on(tep4) & WIDE_STEPS
     assert not rule_levers_on(tep4) & CONTEXT_SP
     ctx = table((107, 4), 64, "ctx", "windowed")
     assert rule_levers_on(ctx) & (VR_TEP4 | CONTEXT_SP) == CONTEXT_SP
     # Above eight requests every low-latency lever is off, on either key.
-    for key, role in (((107, 4), "gen"), ((107, 4), "agg"), ((107, 8), "agg")):
-        above = table(key, 9, role, "windowed")
-        assert not rule_levers_on(above) & (VR_TEP4 | VR_TEP8 | CONTEXT_SP), (key, role)
+    for key in ((107, 4), (107, 8)):
+        above = table(key, 9, "gen", "windowed")
+        assert not rule_levers_on(above) & (VR_TEP4 | VR_TEP8 | CONTEXT_SP), key
         assert above.decisions["swa_prep_split"].why == "max_batch_size 9 is above 8"
+    # An aggregated sm107 server runs none of them, at any max_batch_size (band); the
+    # full-attention fold there is its 2..4-request step lever.
+    for key in ((107, 4), (107, 8)):
+        for mbs in (1, 4, 9):
+            agg = table(key, mbs, "agg", "windowed")
+            low_latency = (VR_TEP4 | VR_TEP8 | CONTEXT_SP) - AGG_WIDE
+            assert not rule_levers_on(agg) & low_latency, (key, mbs)
+            assert agg.decisions["swa_prep_split"].source == "band", (key, mbs)
 
 
 def test_the_vocabulary_parallel_head_rule():
@@ -549,8 +695,11 @@ def test_the_context_lever_runs_where_context_steps_run():
         lever_table = table((107, 4), mbs, "ctx", "windowed")
         assert lever_table.on("context_sp_extra_parts"), mbs
         assert lever_table.param("context_sp_extra_parts", "PARTS") == ("router_input", "ce_gather")
-    assert table((107, 4), 8, "agg", "windowed").on("context_sp_extra_parts")
-    assert not table((107, 4), 16, "agg", "windowed").on("context_sp_extra_parts")
+    # An aggregated sm107 server runs its own band's context levers instead.
+    for mbs in (8, 16):
+        agg = table((107, 4), mbs, "agg", "windowed")
+        assert not agg.on("context_sp_extra_parts"), mbs
+        assert agg.decisions["context_sp_extra_parts"].source == "band", mbs
     assert not table((107, 4), 8, "gen", "windowed").on("context_sp_extra_parts")
     parts = table(
         (107, 4), 64, "ctx", "windowed", knobs(context_sp_extra_parts__PARTS="router_input")
@@ -558,6 +707,249 @@ def test_the_context_lever_runs_where_context_steps_run():
     assert parts.param("context_sp_extra_parts", "PARTS") == ("router_input",)
     off = table((107, 4), 64, "ctx", "windowed", knobs(context_sp_extra_parts="off"))
     assert not off.on("context_sp_extra_parts")
+
+
+# --------------------------------------------------------------------------
+# Band ownership: the low-latency levers beside the aggregated sm107 band's own levers
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("mbs", [2, 3, 4])
+def test_the_low_latency_levers_yield_to_the_two_to_four_request_steps(mbs):
+    # A generation server runs the low-latency levers, not the 2..4-request step levers.
+    gen = table((107, 4), mbs, "gen", "windowed")
+    assert VR_YIELD_WIDE <= rule_levers_on(gen) and not WIDE_STEPS & rule_levers_on(gen)
+    # The step levers turned on by their knobs take those steps: the low-latency ones yield.
+    forced = table(
+        (107, 4),
+        mbs,
+        "gen",
+        "windowed",
+        knobs(swa_blocks_per_program="on", wide_qkv_prefetch="on"),
+    )
+    for name in VR_YIELD_WIDE:
+        decision = forced.decisions[name]
+        assert not decision.on and decision.source == "auto", (mbs, name)
+        assert "yields to" in decision.why, (mbs, name)
+    # An aggregated server runs the step levers; the low-latency ones are off by band.
+    agg = table((107, 4), mbs, "agg", "windowed")
+    assert WIDE_STEPS <= rule_levers_on(agg), mbs
+    for name in VR_YIELD_WIDE:
+        assert agg.decisions[name].source == "band", (mbs, name)
+
+
+def test_the_other_sliding_window_builds_cannot_join_the_split_programs():
+    for name in ("swa_one_cluster_block", "swa_prep_split", "swa_eight_requests"):
+        with pytest.raises(ValueError, match="cannot both be on"):
+            table((107, 4), 3, "agg", "windowed", knobs(**{name: "on"}))
+        lever_table = table(
+            (107, 4), 3, "agg", "windowed", knobs(**{name: "on", "swa_blocks_per_program": "off"})
+        )
+        assert lever_table.on(name)
+
+
+def test_the_context_kv_levers_yield_to_the_late_join():
+    for mbs in (4, 8):
+        lever_table = table((107, 4), mbs, "agg", "windowed")
+        assert lever_table.on("context_kv_late_join")
+        assert not rule_levers_on(lever_table) & VR_YIELD_LATE_JOIN, mbs
+    # A generation server runs the low-latency context-K/V levers; the late join turned on
+    # by its knob takes their steps.
+    gen = table((107, 4), 4, "gen", "windowed")
+    assert VR_YIELD_LATE_JOIN <= rule_levers_on(gen) and not gen.on("context_kv_late_join")
+    forced = table((107, 4), 4, "gen", "windowed", knobs(context_kv_late_join="on"))
+    assert forced.on("context_kv_late_join")
+    for name in VR_YIELD_LATE_JOIN:
+        assert "yields to context_kv_late_join" in forced.decisions[name].why, name
+
+
+def test_the_low_latency_levers_yield_to_the_single_request_schedule():
+    lever_table = table((107, 8), 1, "agg", "dense")
+    for name in VR_YIELD_SINGLE:
+        assert not lever_table.on(name), name
+        assert lever_table.decisions[name].source == "band", name
+    # The vocabulary-parallel head would take the distributed sampler's 8-row verify heads.
+    with pytest.raises(ValueError, match="cannot both be on"):
+        table((107, 8), 1, "agg", "dense", knobs(vocab_parallel_head="on"))
+    alone = table(
+        (107, 8), 1, "agg", "dense", knobs(distributed_head_sampler="off", vocab_parallel_head="on")
+    )
+    assert alone.on("vocab_parallel_head")
+    # A generation server of one request runs the low-latency levers; the single-request
+    # schedule's levers turned on by their knobs take their steps.
+    gen = table((107, 8), 1, "gen", "dense")
+    assert VR_YIELD_SINGLE <= rule_levers_on(gen)
+    forced = table(
+        (107, 8),
+        1,
+        "gen",
+        "dense",
+        knobs(
+            distributed_head_sampler="on",
+            step_loop_inline_commits="on",
+            layer0_qkv_table="on",
+            context_kv_fork_last_layer="on",
+        ),
+    )
+    for name in VR_YIELD_SINGLE:
+        assert not forced.on(name) and "yields to" in forced.decisions[name].why, name
+
+
+class _SettingsPlan:
+    """The two ``dispatch.Plan`` reads ``lever_settings.apply`` makes, over a lever table."""
+
+    def __init__(self, lever_table) -> None:
+        self.table = lever_table
+
+    def __bool__(self) -> bool:
+        return True
+
+    def enabled(self, name: str) -> bool:
+        return self.table.on(name)
+
+    def param(self, name: str, key: str):
+        return self.table.param(name, key)
+
+
+def _settings(lever_table) -> dict:
+    """``lever_settings.apply``'s ``configure`` calls for ``lever_table``, by module."""
+    settings = importlib.import_module(f"{_PACKAGE}.lever_settings")
+    calls = {}
+    original = settings._configure
+    settings._configure = lambda module, values, defaults: calls.__setitem__(
+        module, (values, defaults)
+    )
+    try:
+        settings.apply(_SettingsPlan(lever_table), 107)
+    finally:
+        settings._configure = original
+    return calls
+
+
+def test_the_duplicate_rings_and_context_parts_share_one_configure():
+    ring = "ops.attention.multi_request_split_kv"
+    fa_ring = "ops.attention.full_attention_split_kv_kernel"
+    parts = "kernels.context_sequence_parallel.forward"
+    # The aggregated sm107 band, at any max_batch_size from 4: the 20-page multi-request ring
+    # and the router input.
+    for mbs in (48, 8):
+        hc = _settings(table((107, 4), mbs, "agg", "windowed"))
+        assert hc[ring][0] == {"sm107_stages": 20}, mbs
+        assert hc[fa_ring][0] == {"stages": 16}, mbs
+        assert hc[parts][0] == {"sm107_extra_parts": ("router_input",)}, mbs
+    # The default band's levers: both rings on a generation server of 8 requests, the router
+    # input and the CE gather on a context server.
+    gen = _settings(table((107, 4), 8, "gen", "windowed"))
+    assert gen[ring][0] == {"sm107_stages": 20} and gen[fa_ring][0] == {"stages": 20}
+    ctx = _settings(table((107, 4), 64, "ctx", "windowed"))
+    assert ctx[parts][0] == {"sm107_extra_parts": ("router_input", "ce_gather")}
+    # Both bands' levers on together: one configure each, the union.
+    low = _settings(
+        table(
+            (107, 4),
+            8,
+            "agg",
+            "windowed",
+            knobs(split_kv_deep_rings="on", context_sp_extra_parts="on"),
+        )
+    )
+    assert low[ring][0] == {"sm107_stages": 20}
+    assert low[fa_ring][0] == {"stages": 20}
+    assert low[parts][0] == {"sm107_extra_parts": ("router_input", "ce_gather")}
+    # Each alone.
+    only_hc = _settings(table((107, 4), 8, "agg", "windowed", knobs(split_kv_deep_rings="off")))
+    assert only_hc[ring][0] == {"sm107_stages": 20} and only_hc[fa_ring][0] == {"stages": 16}
+    neither = _settings(
+        table(
+            (107, 4),
+            48,
+            "agg",
+            "windowed",
+            knobs(split_kv_deep_ring="off", context_sp_router_input="off"),
+        )
+    )
+    assert neither[ring][0] == {"sm107_stages": None}
+    assert neither[parts][0] == {"sm107_extra_parts": ()}
+
+
+def test_the_single_request_set_is_the_sm107_tep8_set():
+    assert SINGLE | SINGLE_TAIL | {"megakernel_zero_exchange_boundary"} == set(
+        DISPATCH.SM107_TEP8_ONLY
+    )
+    assert SINGLE | SINGLE_TAIL <= TARGET_PATHS[(107, 8)].served
+    assert not DISPATCH.SM107_TEP8_ONLY & (
+        TARGET_PATHS[(103, 8)].served | TARGET_PATHS[(103, 4)].served
+    )
+
+
+@pytest.mark.parametrize(
+    "key, expected",
+    [
+        ((107, 8), LL | DENSE | SINGLE | VR_SINGLE),
+        ((103, 8), {"lm_head_inbox", "graph_start_qkv_prefetch"}),
+    ],
+    ids=["sm107", "sm103"],
+)
+def test_agg_tep8_mbs1_dense_on_sm107_and_sm103(key, expected):
+    lever_table = table(key, 1, "agg", "dense")
+    assert rule_levers_on(lever_table) == expected
+    assert base_off(lever_table) == set()
+
+
+@pytest.mark.parametrize(
+    "transform, expected",
+    [(None, set()), (True, set()), (False, SINGLE_TAIL)],
+    ids=["unknown", "declared", "none"],
+)
+def test_the_draft_head_tail_waits_for_a_drafter_without_a_logit_transform(transform, expected):
+    sm, tp = 107, 8
+    lever_table = DISPATCH.table_for(
+        TARGET_PATHS, sm, tp, 1, "agg", "dense", None, None, draft_logit_transform=transform
+    )
+    assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | VR_SINGLE | expected
+    if not expected:
+        with pytest.raises(ValueError, match="logit transform"):
+            DISPATCH.table_for(
+                TARGET_PATHS,
+                sm,
+                tp,
+                1,
+                "agg",
+                "dense",
+                knobs(draft_head_tail="on"),
+                None,
+                draft_logit_transform=transform,
+            )
+
+
+@pytest.mark.parametrize(
+    "key, mbs, role, arena",
+    [
+        ((107, 8), 2, "agg", "dense"),
+        ((107, 8), 1, "gen", "dense"),
+        ((107, 8), 1, "agg", "paged"),
+        ((107, 8), 1, "agg", "windowed"),
+        ((107, 4), 1, "agg", "windowed"),
+    ],
+)
+def test_the_single_request_set_stays_off_outside_its_deployment(key, mbs, role, arena):
+    lever_table = table(key, mbs, role, arena, facts=None)
+    assert not rule_levers_on(lever_table) & (SINGLE | SINGLE_TAIL)
+
+
+def test_the_numerics_levers_are_switchable_and_the_megakernel_needs_them():
+    """Opting out of one numerics lever runs the stock layers (no other build exists)."""
+    nb, bh, rl = (
+        "megakernel_one_exchange_boundaries",
+        "megakernel_two_term_pool",
+        "megakernel_router_by_linearity",
+    )
+    # bh builds on nb, so opting out of nb takes bh with it.
+    for name, off in ((nb, {nb, bh}), (bh, {bh}), (rl, {rl})):
+        lever_table = table((107, 8), 1, "agg", "dense", knobs(**{name: "off"}))
+        assert rule_levers_on(lever_table) == (
+            LL | DENSE | VR_SINGLE | SINGLE - {"megakernel"} - off
+        ), name
+    with pytest.raises(ValueError):
+        table((107, 8), 1, "agg", "dense", knobs(megakernel_zero_exchange_boundary="on"))
 
 
 def test_the_router_per_row_gates():
@@ -569,6 +961,75 @@ def test_the_router_per_row_gates():
         off = table((107, 4), mbs, "agg", "windowed").decisions["wide_router_per_row"]
         assert not off.on and off.source == "gate", mbs
     assert not table((107, 4), 1, "agg", "windowed").on("wide_router_per_row")
+
+
+@pytest.mark.parametrize(
+    "role, sizes, on",
+    [
+        ("gen", (None, 1, 2, 3, 4, 5, 8, 16, 48), False),
+        ("agg", (2, 3, 4, 5, 6, 7, 8), True),
+        ("agg", (None, 1, 9, 16, 47, HC_MIN_BATCH, 64), False),
+        ("ctx", (1, 4, 8, 64), False),
+        ("unknown", (2, 4, 8), False),
+    ],
+)
+def test_the_two_to_four_request_step_levers_under_auto(role, sizes, on):
+    for mbs in sizes:
+        lever_table = table((107, 4), mbs, role, "windowed")
+        for name in WIDE_STEPS:
+            decision = lever_table.decisions[name]
+            assert decision.on is on, (name, mbs)
+            # wide_capture_fold builds on wide_direct_transports, off where no decode step
+            # reaches 16 rows and on the high-concurrency selection; the other roles are
+            # the default band's.
+            first = "auto" if role == "agg" else "band"
+            sources = {first} if on else {first, "dependency"}
+            assert decision.source in sources, (name, mbs, decision.source)
+            assert decision.source == first or name == "wide_capture_fold", (name, mbs)
+            assert RULES[name].kind.value == "lossless-bitwise", name
+    assert LEVERS.WIDE_AGG_BATCH == (2, 8)
+
+
+def test_the_two_to_four_request_step_levers_are_tep4_only():
+    for name in WIDE_STEPS:
+        assert name not in TARGET_PATHS[(107, 8)].served, name
+        with pytest.raises(ValueError, match=re.escape(f"does not serve {name}")):
+            table((107, 8), 2, "gen", "windowed", knobs(**{name: "on"}))
+
+
+def test_the_two_to_four_request_step_levers_follow_their_knobs_and_paths():
+    # on outside the measured band, off inside it, and off with the path each builds on.
+    outside = table((107, 4), 8, "gen", "windowed", knobs(wide_qkv_prefetch="on"))
+    assert outside.on("wide_qkv_prefetch")
+    assert outside.decisions["wide_qkv_prefetch"].source == "knob"
+    inside = table((107, 4), 2, "agg", "windowed", knobs(swa_blocks_per_program="off"))
+    assert not inside.on("swa_blocks_per_program")
+    assert WIDE_STEPS - {"swa_blocks_per_program"} <= rule_levers_on(inside)
+    for base, lever in (
+        ("wide_swa_block", "swa_blocks_per_program"),
+        ("next_qkv_prefetch", "wide_qkv_prefetch"),
+        ("wide_dense_gemms", "wide_qkv_prefetch"),
+        ("capture_fold", "wide_capture_fold"),
+        ("wide_direct_transports", "wide_capture_fold"),
+    ):
+        lever_table = table((107, 4), 3, "agg", "windowed", knobs(**{base: "off"}))
+        assert lever_table.decisions[lever].source == "dependency", (base, lever)
+        assert not lever_table.on(lever), (base, lever)
+    baseline = table((107, 4), 3, "agg", "windowed", BASELINE)
+    assert not WIDE_STEPS & rule_levers_on(baseline)
+
+
+def test_the_retired_two_to_four_request_step_switches_name_their_levers():
+    for old, name in (
+        ("TRTLLM_MUSESPARK_SWA_BLOCKS_PER_PROGRAM", "swa_blocks_per_program"),
+        ("TRTLLM_MUSESPARK_TEP_WIDE_FULL_FOLD", "full_attention_fold_multi"),
+        ("TRTLLM_MUSESPARK_TEP_WIDE_QKV_PREFETCH", "wide_qkv_prefetch"),
+        ("TRTLLM_MUSESPARK_TEP_WIDE_CAPTURE_FOLD", "wide_capture_fold"),
+    ):
+        assert LEVERS.retired_replacement(old) == LEVERS.knob_name(name), old
+        for value in ("0", "1", "auto"):
+            with pytest.raises(ValueError, match=re.escape(f"{old} is retired")):
+                table((107, 4), 2, "gen", "windowed", {old: value})
 
 
 def test_the_lossy_and_flagged_levers_are_never_on_under_auto():
@@ -599,7 +1060,8 @@ def test_sm103_resolves_under_auto_as_under_baseline(key):
 VR_OFF_TEP8 = knobs(**{name: "off" for name in VR_TEP8 | TEP4_PATHS})
 VR_OFF_TEP4 = knobs(**{name: "off" for name in VR_TEP4 | CONTEXT_SP})
 R_LL = {**knobs(head_multimem_gather="on"), **VR_OFF_TEP8}
-R_H = knobs(
+#: The high-concurrency selection of the wide and fold levers, by knobs.
+R_H_CORE = knobs(
     wide_direct_transports="off",
     wide_oproj_publish="off",
     wide_finalize_transport="off",
@@ -609,6 +1071,8 @@ R_H = knobs(
     context_fp8_dense="on",
     context_fp8_attn_gather="on",
 )
+#: ``R_H_CORE`` with the aggregated TP4 levers off: the selection before them.
+R_H = {**R_H_CORE, **knobs(**{name: "off" for name in sorted(AGG_TEP4 | L061)})}
 B_LL = {
     **knobs(
         step_loop_on_execution_stream="off",
@@ -622,7 +1086,7 @@ B_LL = {
 
 def test_r_ll_selects_the_low_latency_set():
     lever_table = table((107, 8), 1, "agg", "dense", R_LL)
-    assert rule_levers_on(lever_table) == LL | DENSE | {"head_multimem_gather"}
+    assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | {"head_multimem_gather"}
     assert lever_table.decisions["head_multimem_gather"].source == "knob"
     assert not lever_table.on("lm_head_inbox") and not lever_table.on("graph_start_qkv_prefetch")
 
@@ -679,7 +1143,7 @@ def test_baseline_tep8_gen_mbs1_is_the_previous_generation_selection():
 
 
 R_B1 = dict(B_LL, **knobs(wide_finalize_transport="off"))
-_LL_REPLAY = LL | DENSE | {"head_multimem_gather"}
+_LL_REPLAY = LL | DENSE | SINGLE | {"head_multimem_gather"}
 
 
 @pytest.mark.parametrize(
@@ -741,11 +1205,11 @@ def test_a_replay_set_is_the_whole_plan_it_replays(key, mbs, role, arena, knob_s
     assert set(table(key, mbs, role, arena, knob_set).paths()) == want
 
 
-def test_auto_at_the_high_concurrency_selection_is_r_h():
+def test_auto_at_the_high_concurrency_selection_is_r_h_core():
     opt_ins = knobs(context_fp8_dense="on", context_fp8_attn_gather="on")
     for mbs in (HC_MIN_BATCH, 64):
         auto = table((107, 4), mbs, "agg", "windowed", opt_ins).decisions
-        replay = table((107, 4), mbs, "agg", "windowed", R_H).decisions
+        replay = table((107, 4), mbs, "agg", "windowed", R_H_CORE).decisions
         assert {
             name
             for name, d in auto.items()
@@ -774,13 +1238,17 @@ def test_the_ladder_shapes_resolve_alike_on_agg_and_gen(key, mbs, arm):
         return {n: (d.on, dict(d.params)) for n, d in lever_table.decisions.items()}
 
     agg, gen = selection("agg"), selection("gen")
-    # The router-per-row accuracy gate holds on generation servers only; the context lever runs
-    # on servers that take context steps, which a generation server does not.
+    # The router-per-row accuracy gate holds on generation servers only.
     gated = {"wide_router_per_row"} if gen.get("wide_router_per_row", (False,))[0] else set()
-    context = CONTEXT_SP if agg.get("context_sp_extra_parts", (False,))[0] else set()
-    assert {n for n in agg if agg[n] != gen[n]} == gated | context
+    # Every other difference is a lever of one band's selection, on in its own band only
+    # (the full-attention fold serves both bands, with each band's rule).
+    banded = {n for n in agg if LEVERS.lever_band(n) is not None} | {"full_attention_fold_multi"}
+    differ = {n for n in agg if agg[n] != gen[n]}
+    assert differ - banded == gated
     assert all(not agg[n][0] for n in gated)
-    assert all(not gen[n][0] for n in context)
+    for name in differ & banded - {"full_attention_fold_multi"}:
+        mine = LEVERS.lever_band(name) is LEVERS.Band.AGGREGATED_SM107
+        assert (agg[name][0], gen[name][0]) == (mine, not mine), name
 
 
 # --------------------------------------------------------------------------
@@ -1180,6 +1648,54 @@ SPEC_RETIRED = (
     "MUSESPARK_OPEN_DROP_PATHS",
     "MUSESPARK_OPEN_FC_SHARD_PREWARM",
     "MUSESPARK_OPEN_SP_SM107_PARTS",
+    "MUSESPARK_OPEN_SM107_FMK_CONTEXT_FMHA",
+    "MUSESPARK_OPEN_CTX_KV_LATE_JOIN",
+    "MUSESPARK_OPEN_HOP_CLUSTER",
+    "MUSESPARK_OPEN_HOP_CLUSTER_ROWS",
+    "MUSESPARK_OPEN_FC_INBOX_MAX_ROWS",
+    "MUSESPARK_OPEN_FC_INBOX_PROGRAMS",
+    "MUSESPARK_OPEN_L061_TILE32_PIN",
+    "MUSESPARK_OPEN_ROUTER_STAGED_EPILOGUE",
+    "MUSESPARK_OPEN_DECODE_QKV_MXFP8",
+    "MUSESPARK_OPEN_CTX_SP_SM107_ROUTER_INPUT",
+    "MUSESPARK_OPEN_CTX_KV_FORK_POINT",
+    "MUSESPARK_OPEN_HOP_PAYLOAD",
+    "MUSESPARK_OPEN_FINALIZE_PAYLOAD",
+    "MUSESPARK_OPEN_ROUTER_WEIGHT_PROLOGUE",
+    "MUSESPARK_OPEN_POOL_FORK_AFTER_ROUTER",
+    "MUSESPARK_OPEN_SM107_UNPOOL_TGV",
+    "MUSESPARK_OPEN_DECODE_ROUTE_RECORD_DIR",
+    "MUSESPARK_OPEN_MEGAKERNEL",
+    "MUSESPARK_OPEN_MEGAKERNEL_NB",
+    "MUSESPARK_OPEN_MEGAKERNEL_BH",
+    "MUSESPARK_OPEN_MEGAKERNEL_RL",
+    "MUSESPARK_OPEN_MEGAKERNEL_FZ",
+    "MUSESPARK_OPEN_TQ_TARGET_L0",
+    "MUSESPARK_OPEN_PF_FUSED_PRE",
+    "MUSESPARK_OPEN_OB_PRE_VARIANT",
+    "MUSESPARK_OPEN_PV_L0_INPUT_MK",
+    "MUSESPARK_OPEN_PF_BF16_FRONT",
+    "MUSESPARK_OPEN_OB_BF16_DIRECT",
+    "MUSESPARK_OPEN_OB_BF16_MOE_PDL",
+    "MUSESPARK_OPEN_G2_L61_BOUNDARY",
+    "MUSESPARK_OPEN_PV_GLUE_FUSED",
+    "MUSESPARK_OPEN_PF_SIDE_FORK",
+    "MUSESPARK_OPEN_PV_EARLY_FC_AFTER_HOP1",
+    "MUSESPARK_OPEN_S2_SAMPLER",
+    "MUSESPARK_OPEN_PV_LOGITS_ONESHOT",
+    "MUSESPARK_OPEN_PV_LOGITS_POLL",
+    "MUSESPARK_OPEN_PT_VERIFY_PDL",
+    "MUSESPARK_OPEN_OX_DEJ",
+    "MUSESPARK_OPEN_DR3_CONV_FOLD",
+    "MUSESPARK_OPEN_DR3_SILU_FOLD",
+    "MUSESPARK_OPEN_SP_CF_V2",
+    "MUSESPARK_OPEN_DG_SF_TACTIC",
+    "MUSESPARK_OPEN_OX_DE",
+    "MUSESPARK_OPEN_PT_ATTN_PDL",
+    "MUSESPARK_OPEN_TT_DRAFTER_L0",
+    "MUSESPARK_OPEN_DR_DRAFT_TAIL",
+    "MUSESPARK_OPEN_GR_INLINE_COMMIT",
+    "MUSESPARK_OPEN_IA_FOLD",
 )
 
 
@@ -1187,7 +1703,11 @@ def test_retired_is_the_spec_list():
     assert set(LEVERS.RETIRED) == set(SPEC_RETIRED)
 
 
-@pytest.mark.parametrize("name", sorted(SPEC_RETIRED) + ["MUSESPARK_OPEN_PS_ANYTHING_ELSE"])
+@pytest.mark.parametrize(
+    "name",
+    sorted(SPEC_RETIRED)
+    + ["MUSESPARK_OPEN_PS_ANYTHING_ELSE", "MUSESPARK_OPEN_MEGAKERNEL_ANYTHING_ELSE"],
+)
 def test_a_retired_switch_raises_naming_its_replacement(name):
     replacement = LEVERS.retired_replacement(name)
     assert replacement
@@ -1292,6 +1812,72 @@ def test_a_parameter_moves_the_band():
         (107, 8), 8, "agg", "dense", knobs(step_loop_on_execution_stream__MAX_BATCH=8)
     )
     assert lever_table.on("step_loop_on_execution_stream")
+
+
+def test_the_aggregated_tep4_levers_and_their_parameters():
+    hc = table((107, 4), 48, "agg", "windowed")
+    assert hc.param("hop_cluster_split", "CLUSTER") == 2
+    assert hc.param("hop_cluster_split", "ROWS") == ((192, 208), (248, 264))
+    assert hc.param("drafter_fc_inbox_wide", "MAX_ROWS") == 384
+    assert hc.param("drafter_fc_inbox_wide", "PROGRAMS") == 128
+    assert "gate: aggregated sm107 tep4 servers" in hc.decisions["fmk_context_fmha"].why
+    moved = table(
+        (107, 4),
+        48,
+        "agg",
+        "windowed",
+        knobs(hop_cluster_split__ROWS=" 264, 200-216 ", hop_cluster_split__CLUSTER=1),
+    )
+    assert moved.param("hop_cluster_split", "ROWS") == ((200, 216), (264, 264))
+    assert moved.param("hop_cluster_split", "CLUSTER") == 1
+    for value, message in (("8-16", "outside 9..1024"), ("300-200", "descending"), (",", "lo-hi")):
+        with pytest.raises(ValueError, match=message):
+            table((107, 4), 48, "agg", "windowed", knobs(hop_cluster_split__ROWS=value))
+    with pytest.raises(ValueError, match="1..2"):
+        table((107, 4), 48, "agg", "windowed", knobs(hop_cluster_split__CLUSTER=4))
+    assert '"ROWS":[[192,208],[248,264]]' in hc.as_json()
+
+
+def test_the_aggregated_tep4_floor_and_the_inbox_reach():
+    assert LEVERS.HC_LEVERS_MIN_BATCH == 4
+    for mbs in (1, 2, 3):
+        low = table((107, 4), mbs, "agg", "windowed")
+        for name in AGG_TEP4:
+            assert not low.on(name), (mbs, name)
+        assert "max_batch_size 4 and up" in low.decisions["router_staged_epilogue"].why
+        assert low.decisions["fmk_context_fmha"].source == "auto"
+    unknown = table((107, 4), None, "agg", "windowed")
+    assert not unknown.on("router_staged_epilogue")
+    capped = table((107, 4), 16, "agg", "windowed")
+    assert capped.on("router_staged_epilogue")
+    assert not capped.on("drafter_fc_inbox_wide")
+    assert "129 rows" in capped.decisions["drafter_fc_inbox_wide"].why
+    assert table((107, 4), 17, "agg", "windowed").on("drafter_fc_inbox_wide")
+
+
+def test_decode_qkv_mxfp8_needs_the_context_fp8_qkv_copies():
+    off = table((107, 4), 48, "agg", "windowed", knobs(decode_qkv_mxfp8="auto"))
+    assert not off.on("decode_qkv_mxfp8")
+    assert off.decisions["decode_qkv_mxfp8"].source == "dependency"
+    with pytest.raises(ValueError, match="DECODE_QKV_MXFP8=on"):
+        table((107, 4), 48, "agg", "windowed", knobs(decode_qkv_mxfp8="on"))
+    on = table((107, 4), 48, "agg", "windowed", {**knobs(decode_qkv_mxfp8="on"), **R_H_CORE})
+    assert on.on("decode_qkv_mxfp8") and on.decisions["decode_qkv_mxfp8"].source == "knob"
+    no_qkv = {
+        **knobs(decode_qkv_mxfp8="on", context_fp8_dense="on"),
+        **knobs(context_fp8_dense__PROJECTIONS="o_proj,pool,unpool"),
+    }
+    with pytest.raises(ValueError, match="leaves out"):
+        table((107, 4), 48, "agg", "windowed", no_qkv)
+
+
+def test_an_aggregated_tep4_lever_on_a_generation_server_only_by_its_knob():
+    gen = table((107, 4), 48, "gen", "windowed")
+    assert not gen.on("router_staged_epilogue")
+    assert gen.decisions["router_staged_epilogue"].source == "band"
+    forced = table((107, 4), 48, "gen", "windowed", knobs(fmk_context_fmha="on"))
+    assert forced.on("fmk_context_fmha")
+    assert any("FMK_CONTEXT_FMHA=on outside its accuracy gates" in w for w in forced.warnings)
 
 
 def test_on_outside_a_numeric_gate_warns():
@@ -1418,10 +2004,14 @@ def test_the_role():
         LEVERS.role_of(hint, False)
     unknown = table((107, 4), 4, "unknown", "windowed")
     assert any("role unknown" in warning for warning in unknown.warnings)
-    # Counted as a decoding server; no accuracy gate names an unknown role.
+    # Counted as a decoding server of the default band; no accuracy gate names an unknown
+    # role, and the context lever runs on servers that may take context steps.
     gen = rule_levers_on(table((107, 4), 4, "gen", "windowed"))
     assert rule_levers_on(unknown) == (gen - {"wide_router_per_row"} - VR_NUMERIC) | CONTEXT_SP
     assert unknown.decisions["wide_router_per_row"].source == "gate"
+    for name in WIDE_STEPS:
+        decision = unknown.decisions[name]
+        assert decision.source == "band" and "default band" in decision.why, name
 
 
 def test_the_table_lines_and_json():

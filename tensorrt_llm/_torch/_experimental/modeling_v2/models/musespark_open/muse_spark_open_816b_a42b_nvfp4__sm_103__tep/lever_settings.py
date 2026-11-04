@@ -77,6 +77,20 @@ def _configure(module: str, settings: dict, defaults: dict) -> None:
     importlib.import_module(f"{__package__}.{module}").configure(**settings)
 
 
+def _context_sp_parts(plan: "_dispatch.Plan") -> Tuple[str, ...]:
+    """sm103's parts the sm107 sequence-parallel context step adds: ``context_sp_extra_parts``'s
+    PARTS, and the router input under ``context_sp_router_input`` (the aggregated TEP4
+    selection)."""
+    parts = (
+        tuple(plan.param("context_sp_extra_parts", "PARTS"))
+        if plan.enabled("context_sp_extra_parts")
+        else ()
+    )
+    if plan.enabled("context_sp_router_input") and "router_input" not in parts:
+        parts += ("router_input",)
+    return parts
+
+
 def apply(plan: "_dispatch.Plan", sm: Optional[int]) -> None:
     """Configure the kernel modules from ``plan``, each with one ``configure`` call.
 
@@ -92,6 +106,7 @@ def apply(plan: "_dispatch.Plan", sm: Optional[int]) -> None:
     fc_wide = on("tep8_fc_shard_wide")
     one_cluster = on("swa_one_cluster_block")
     deep = on("split_kv_deep_rings")
+    deep_multi = on("split_kv_deep_ring")
     prerouted = on("prerouted_experts")
     push = on("tep8_router_push")
     early = on("tep8_early_multicast_hop")
@@ -177,7 +192,8 @@ def apply(plan: "_dispatch.Plan", sm: Optional[int]) -> None:
         ),
         (
             "ops.attention.multi_request_split_kv",
-            dict(sm107_stages=SPLIT_KV_RING_STAGES if deep else None),
+            # ``split_kv_deep_ring`` deepens this ring only (the aggregated TEP4 selection).
+            dict(sm107_stages=SPLIT_KV_RING_STAGES if deep or deep_multi else None),
             dict(sm107_stages=None),
         ),
         # Experts and routing.
@@ -300,11 +316,7 @@ def apply(plan: "_dispatch.Plan", sm: Optional[int]) -> None:
         # Context steps.
         (
             "kernels.context_sequence_parallel.forward",
-            dict(
-                sm107_extra_parts=tuple(plan.param("context_sp_extra_parts", "PARTS"))
-                if on("context_sp_extra_parts")
-                else ()
-            ),
+            dict(sm107_extra_parts=_context_sp_parts(plan)),
             dict(sm107_extra_parts=()),
         ),
     )

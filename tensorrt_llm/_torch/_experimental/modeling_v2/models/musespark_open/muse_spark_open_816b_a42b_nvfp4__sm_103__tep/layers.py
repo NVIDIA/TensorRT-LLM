@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-from typing import Callable, Optional, Tuple
+from typing import Callable, FrozenSet, Optional, Tuple
 
 import torch
 
@@ -50,6 +50,15 @@ def _refuse_unfused_sites(layer_kwargs: dict, plan: "_dispatch.Plan") -> None:
                 f"[musespark_open] {name} {what} the projection_gathers fused unpool boundary, which "
                 "runs the built-in path on this installation (see the projection_gathers warning above)"
             )
+
+
+def _wide_qkv_setting(plan: "_dispatch.Plan") -> str:
+    """``next_qkv_prefetch``'s wide setting: moved after the experts under ``wide_qkv_prefetch``,
+    else off (the 9..32-row steps keep the unpooler's prefetch). ``boundary_early_release``
+    imports the same module for its drop rows."""
+    from .kernels.next_qkv_prefetch import prefetch as _qkv_prefetch
+
+    return _qkv_prefetch.WIDE_MOVE if plan.enabled("wide_qkv_prefetch") else _qkv_prefetch.WIDE_OFF
 
 
 def _refuse_unconverted_edges(converted: list, kept: list, num_layers: int) -> None:
@@ -786,8 +795,16 @@ def _build_post_attn_hop(
     return PostAttnHopCall(workspace, joins, wide=wide_workspace)
 
 
-def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHopCall:
+def _build_wide_hop(
+    model: MuseSparkOpenModel,
+    call: PostAttnHopCall,
+    cluster: int = _wide.CLUSTER,
+    cluster_rows: Optional[FrozenSet[int]] = None,
+) -> WideHopCall:
     """``multi_request_post_attention_hop``: take the group's wide-hop workspace (collective) for ``call``'s joins.
+
+    ``cluster`` / ``cluster_rows`` are the row split of ``hop_cluster_split`` (the 4-CTA
+    split and every row count without it), for both capacities.
 
     The joins are ``post_attention_hop``'s, whose refusals already read every layer; the
     wide op computes the same pair on more rows, so nothing else is checked. The workspace
@@ -819,6 +836,8 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         multicast=_wide.SERVED_MULTICAST and tep8,
         variants=variants,
         early_launch=_wide.SERVED_EARLY_LAUNCH and tep8,
+        cluster=cluster,
+        cluster_rows=cluster_rows,
     )
     # The 8-row hop's call keeps every row count it takes (its wide TP4 transport's too).
     min_rows = (call.wide.max_rows if call.wide is not None else _hop.MAX_ROWS) + 1
@@ -831,6 +850,8 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         r2=workspace.r2,
         r2_wide=workspace.r2_wide,
         smem_pad=workspace.smem_pad,
+        cluster=cluster,
+        cluster_rows=cluster_rows,
     )
 
     def wide_factory() -> "_wide.WideHopWorkspace":
@@ -855,6 +876,8 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
             variants=variants,
             early_launch=_wide.SERVED_EARLY_LAUNCH and tep8,
             max_rows=_wide.WIDE_MAX_ROWS,
+            cluster=cluster,
+            cluster_rows=cluster_rows,
         )
         logger.info(
             f"[musespark_open] multi_request_post_attention_hop: first decode step above "
@@ -1302,6 +1325,8 @@ def adopt_model(
         # MuseSparkOpenTepAttention by now; the later mixins keep the instance attribute.
         for layer in model.layers:
             layer.self_attn._zero_padded_rows = True
+            if plan.enabled("context_prep_rows_vec"):
+                layer.self_attn._context_prep_row_vec = True
         logger.info(
             "[musespark_open] context_prep: context steps' pre-attention prep in one launch on "
             f"all {len(model.layers)} layers; a replayed prefill graph's padded rows get a zero "
@@ -1424,7 +1449,11 @@ def adopt_model(
     if swa_block is not None:
         swa_attention_block.log_installed(model.layers, swa_block)
         if plan.enabled("wide_swa_block"):
-            swa_attention_block.install_multi(model)
+            # swa_blocks_per_program: the split geometry of 2..4-sequence steps by their count.
+            swa_attention_block.install_multi(
+                model,
+                swa_attention_block.AUTO if plan.enabled("swa_blocks_per_program") else 1,
+            )
     if plan.enabled("mixed_step_gen_rows"):
         # After every other attention re-class and after select_decode_fmha: the mixin goes
         # in front of all of them and acts only on mixed steps, which none of the others
@@ -1434,6 +1463,21 @@ def adopt_model(
         _tp_agreement.agreed_install(
             model.layers[0].mapping, lambda: mixed_step_gen_rows.install(model)
         )
+    if plan.enabled("fmk_context_fmha"):
+        # After mixed_step_gen_rows, whose context-phase library it replaces; agreed like
+        # it. The installer checks every layer before it changes any, so a refusal leaves
+        # the model on mixed_step_gen_rows' library.
+        from .kernels.fmk_context_fmha import attention as fmk_context_fmha
+
+        try:
+            _tp_agreement.agreed_install(
+                model.layers[0].mapping,
+                lambda: fmk_context_fmha.install(model, compute_capability),
+            )
+        except ValueError as refusal:
+            plan.installed("fmk_context_fmha", False, str(refusal))
+        else:
+            plan.installed("fmk_context_fmha", True)
     layer_kwargs = {}
     if plan.enabled("projection_gathers"):
         # Imported only when planned: with no fast path the target imports
@@ -1447,7 +1491,8 @@ def adopt_model(
     if plan.enabled("moe_prologue"):
         from .kernels.moe_prologue import prologue as moe_prologue
 
-        installed = moe_prologue.install(model)
+        # edge_bf16_moe_front: the BF16-expert layers' decode front through the routed chain.
+        installed = moe_prologue.install(model, bf16_front=plan.enabled("edge_bf16_moe_front"))
         # None installed (the pool site not fused) is agreed over the TP group inside
         # install, before the prologue's inbox is built, so every rank raises alike.
         _refuse_uninstalled_prologue(installed)
@@ -1479,8 +1524,10 @@ def adopt_model(
             if plan.enabled("wide_prologue")
             else _router_gemm.MIN_ROWS
         )
+        # router_staged_epilogue: the GEMM's partials through shared memory (same bits).
+        staged = "bulk" if plan.enabled("router_staged_epilogue") else None
         router_gemm = _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: _router_gemm.install(model, min_rows)
+            model.layers[0].mapping, lambda: _router_gemm.install(model, min_rows, staged)
         )
     # The capture layers whose boundary writes the DFlash capture (capture_fold): no
     # plain capture copy follows their boundary, so boundary_early_release converts
@@ -1490,7 +1537,7 @@ def adopt_model(
         from .kernels.capture_fold import fold as capture_fold
 
         spec_config = getattr(getattr(model, "model_config", None), "spec_config", None)
-        installed = capture_fold.install(model, spec_config)
+        installed = capture_fold.install(model, spec_config, wide=plan.enabled("wide_capture_fold"))
         layer_kwargs = dict(layer_kwargs, **installed)
         if installed:
             capture_folded = capture_fold.folded_layers(model, spec_config)
@@ -1515,7 +1562,7 @@ def adopt_model(
         )
         _refuse_unconverted_edges(converted, kept, len(model.layers))
         dropped = pdl_triggers.drop_converted_prefetches(
-            model, dense_gemm_plan, qkv=bool(converted)
+            model, dense_gemm_plan, qkv=bool(converted), wide_qkv=_wide_qkv_setting(plan)
         )
         pdl_triggers.log_installed(
             len(model.layers),
@@ -1532,9 +1579,18 @@ def adopt_model(
         # collectives follow.
         from .kernels.next_qkv_prefetch import prefetch as _qkv_prefetch
 
+        wide_qkv = _wide_qkv_setting(plan)
         qkv_prefetch = _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: _qkv_prefetch.install(model, dense_gemm_plan)
+            model.layers[0].mapping,
+            lambda: _qkv_prefetch.install(model, dense_gemm_plan, wide=wide_qkv),
         )
+        if plan.enabled("wide_qkv_prefetch"):
+            # The dense_gemms plan is the same on every rank, so is this outcome.
+            plan.installed(
+                "wide_qkv_prefetch",
+                bool(_qkv_prefetch.wide_fork_rows(dense_gemm_plan)),
+                "no wide QKV kernel of the dense_gemms plan stages its weight before its wait",
+            )
     unpool_direct = None
     if plan.enabled("unpool_into_boundary"):
         # After projection_gathers (whose join it re-classes), dense_gemms (whose
@@ -1570,6 +1626,14 @@ def adopt_model(
             "wide_direct_transports",
             not unbuilt,
             "no wide direct transport on " + ", ".join(unbuilt),
+        )
+    if plan.enabled("wide_capture_fold"):
+        # The capture of a wide step is stored only by a boundary armed on the wide direct
+        # transport, built (or not) from the same agreed state on every rank.
+        plan.installed(
+            "wide_capture_fold",
+            unpool_direct is not None and unpool_direct.wide_workspace is not None,
+            "no wide direct transport on unpool_into_boundary",
         )
     # finalize_transport replaces only the object every MoE layer calls its fused
     # finalize on, whatever class the MoE has.
@@ -1619,7 +1683,16 @@ def adopt_model(
     wide_hop = None
     if plan.enabled("multi_request_post_attention_hop"):
         # After post_attention_hop, whose joins it arms on 9..1024-row decode steps.
-        wide_hop = _build_wide_hop(model, post_attn_hop)
+        # hop_cluster_split: the calls of its ROWS run a row on CLUSTER CTAs (same bits).
+        split = plan.enabled("hop_cluster_split")
+        wide_hop = _build_wide_hop(
+            model,
+            post_attn_hop,
+            cluster=plan.param("hop_cluster_split", "CLUSTER") if split else _wide.CLUSTER,
+            cluster_rows=(
+                _wide.cluster_rows_of(plan.param("hop_cluster_split", "ROWS")) if split else None
+            ),
+        )
     wide_projections = None
     if plan.enabled("wide_projection_gathers"):
         # After projection_gathers (whose MoE and join classes read its inboxes) and
