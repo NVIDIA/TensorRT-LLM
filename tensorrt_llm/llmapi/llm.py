@@ -1517,8 +1517,12 @@ class BaseLLM:
                 # An explicit end_id skips the end_id/pad_id/EOS defaults of
                 # _setup, but the stop and bad strings still have to be
                 # tokenized before the request is built.
-                if self.tokenizer is None and (sampling_params.stop
-                                               or sampling_params.bad):
+                # A bare string needs the tokenizer even when it is empty;
+                # an empty list does not.
+                if self.tokenizer is None and any(
+                        isinstance(words, str) or words
+                        for words in (sampling_params.stop,
+                                      sampling_params.bad)):
                     raise ValueError(
                         "tokenizer is required to tokenize the stop and bad strings of sampling_params"
                     )
