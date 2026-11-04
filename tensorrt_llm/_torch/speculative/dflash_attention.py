@@ -25,6 +25,11 @@ from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
+# TRTLLM lowering ``validate_block_attention_windows`` reports for a draft
+# layer that runs the context kernel; every other lowering is the block decode,
+# so only this one is subject to the context kernel's head-size limits.
+DFLASH_CONTEXT_LOWERING = "non-causal context"
+
 
 @dataclass(frozen=True)
 class DFlashTrtllmGenOps:
@@ -135,16 +140,14 @@ def get_dflash_trtllm_gen_ops() -> DFlashTrtllmGenOps:
 
     import flashinfer
 
-    from ..attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_multi_ctas_kv_counter_size,
-        _get_workspace_size,
-    )
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import _get_workspace_size
+    from ..attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 
     return DFlashTrtllmGenOps(
         append_paged_kv_cache=flashinfer.page.append_paged_kv_cache,
         batch_context_with_kv_cache=flashinfer.prefill.trtllm_batch_context_with_kv_cache,
         batch_decode_with_kv_cache=flashinfer.decode.trtllm_batch_decode_with_kv_cache,
-        get_multi_ctas_kv_counter_size=_get_multi_ctas_kv_counter_size,
+        get_multi_ctas_kv_counter_size=get_multi_ctas_kv_counter_size,
         get_workspace_size=_get_workspace_size,
     )
 

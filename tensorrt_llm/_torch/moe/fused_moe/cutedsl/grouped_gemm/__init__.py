@@ -27,6 +27,7 @@ from ..identity import GROUPED_GEMM_FAMILY, grouped_gemm_identity
 from .base import CuteDslFusedMoEBase
 from .bf16 import TrtllmCutedslGroupedGemmBf16Impl
 from .nvfp4 import TrtllmCutedslGroupedGemmNvfp4Impl
+from .nvfp4_plus import TrtllmCutedslGroupedGemmNvfp4PlusImpl
 
 
 def find_cutedsl_grouped_gemm_leaf(quant_algo: QuantAlgo | None) -> type | None:
@@ -55,6 +56,7 @@ __all__ = [
     "CuteDslFusedMoEBase",
     "TrtllmCutedslGroupedGemmBf16Impl",
     "TrtllmCutedslGroupedGemmNvfp4Impl",
+    "TrtllmCutedslGroupedGemmNvfp4PlusImpl",
     "cutedsl_grouped_gemm_leaf",
     "find_cutedsl_grouped_gemm_leaf",
 ]

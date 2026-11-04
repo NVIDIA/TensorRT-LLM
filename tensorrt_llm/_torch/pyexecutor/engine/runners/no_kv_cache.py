@@ -15,7 +15,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
@@ -31,7 +30,6 @@ from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
 from ..input_buffers import InputBuffers
-from ..lora import LoraParamBuilder
 from ..metadata import build_attention_metadata
 from .common import (
     apply_position_id_offset,
@@ -80,10 +78,6 @@ class NoKVCacheRunner(ScheduledModelRunner):
             use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
         )
         self._config = config
-        self._lora = LoraParamBuilder(
-            attn_backend=config.attention_backend,
-            cuda_graph_manager=None,
-        )
         self._attn_metadata: AttentionMetadata | None = None
 
     def _setup_attn_metadata(self) -> AttentionMetadata:
@@ -226,18 +220,9 @@ class NoKVCacheRunner(ScheduledModelRunner):
 
         # This is for no-KV-cache attention, not for dummy attention.
         if attn_metadata.kv_cache_manager is None:
-            assert isinstance(
-                attn_metadata,
-                (VanillaAttentionMetadata, TrtllmAttentionMetadata),
-            ), (
-                "Only vanilla and trtllm attention metadata are supported for "
-                "no-KV-cache attention for now"
-            )
             attn_metadata.max_seq_len = runner_config.max_seq_len
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
-
-        lora_params = self._lora.build(scheduled_requests, attn_metadata)
 
         inputs = token_model_inputs(
             attn_metadata,
@@ -258,9 +243,6 @@ class NoKVCacheRunner(ScheduledModelRunner):
                 num_ctx_tokens=num_tokens,
                 total_num_tokens=num_tokens,
             )
-
-        if bool(lora_params):
-            inputs["lora_params"] = lora_params
 
         # support attention dp
         if runner_config.enable_attention_dp:
@@ -299,7 +281,6 @@ class NoKVCacheRunner(ScheduledModelRunner):
             return self._forward_step(
                 prepared.kwargs,
                 batch,
-                gather_ids=prepared.gather_ids,
                 gather_context_logits=inputs.gather_context_logits,
             )
 
@@ -309,7 +290,6 @@ class NoKVCacheRunner(ScheduledModelRunner):
         inputs: dict[str, Any],
         scheduled_requests: ScheduledRequests,
         *,
-        gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
         """Run the model-family-specific forward step."""

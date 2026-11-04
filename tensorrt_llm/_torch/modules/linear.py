@@ -32,11 +32,11 @@ from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
-    per_token_quant_and_transform, resmooth_to_fp8_e8m0,
-    transform_k128_scales_to_cutedsl_mxfp8_layout,
+    Fp8BlockScaleWeightSliceCache, per_token_quant_and_transform,
+    resmooth_to_fp8_e8m0, transform_k128_scales_to_cutedsl_mxfp8_layout,
     transform_sf_into_required_layout)
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f, is_sm_120f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -50,7 +50,8 @@ from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
-from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
+from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
+                         low_m_gemm_dispatcher)
 
 
 class WeightMode(str, enum.Enum):
@@ -496,10 +497,29 @@ class LinearMethodBase(ABC):
               bias: Optional[torch.Tensor], *args, **kwargs):
         raise NotImplementedError
 
+    def apply_slice(self, module: Linear, input: torch.Tensor, start: int,
+                    end: int) -> torch.Tensor:
+        raise NotImplementedError(
+            "This quantization method does not support output slicing")
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        """Validate slicing support and prepare quantization-specific state."""
+        raise NotImplementedError(
+            "This quantization method does not support output slicing")
+
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
                                tp_group: List[int], *args, **kwargs):
         raise NotImplementedError
+
+    def apply_linear_allreduce_norm(
+        self, module: Linear, input: torch.Tensor,
+        all_reduce_params: AllReduceParams
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """The row-parallel projection, its all-reduce and the residual RMSNorm fusion of
+        ``all_reduce_params`` as one kernel (outputs of ``AllReduce``), or None."""
+        return None
 
     def load_weights(self,
                      module: Linear,
@@ -673,25 +693,29 @@ class UnquantizedLinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              weight: Optional[torch.Tensor] = None):
+        weight = module.weight if weight is None else weight
         # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
         # kernel and returns None to fall through to the normal GEMM path.
         # Skip when use_custom_cublas_mm is set: that path may allocate output
         # in an NCCL symmetric-memory window for TP all-reduce fusion, which
         # the low-M dispatcher does not support.
-        if _should_apply_low_m_gemm(input) and not getattr(
+        if _should_apply_low_m_gemm(input, module) and not getattr(
                 module, "use_custom_cublas_mm", False):
-            output = apply_low_m_gemm(module, input, module.weight, bias)
+            output = apply_low_m_gemm(module, input, weight, bias)
             if output is not None:
                 return output
         # CuTe DSL BF16 GEMM path for Blackwell / SM107
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
-                and module.weight.dtype == torch.bfloat16):
+                and weight.dtype == torch.bfloat16):
             # input: [*, K], weight: [N, K], output: [*, N]
             input_2d = input.view(-1, input.shape[-1])  # [M, K]
             m, k = input_2d.shape
-            n = module.weight.shape[0]
+            n = weight.shape[0]
             output = torch.empty(m,
                                  n,
                                  dtype=torch.bfloat16,
@@ -701,7 +725,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                             torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
             bf16_gemm_op(
                 input_2d.contiguous(),
-                module.weight,
+                weight,
                 output,
             )
             # Reshape output back to match input batch dims
@@ -720,14 +744,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
                      and module.mapping is not None else None)
             output = torch.ops.trtllm.cublas_mm(
                 input,
-                module.weight.t(),
+                weight.t(),
                 bias,
                 out_dtype=None,
                 output_buffer_kind=output_buffer_kind,
                 group=group)
         else:
-            output = F.linear(input, module.weight, bias)
+            output = F.linear(input, weight, bias)
         return output
+
+    def apply_slice(self, module: Linear, input: torch.Tensor, start: int,
+                    end: int) -> torch.Tensor:
+        bias = module.bias[start:end] if module.bias is not None else None
+        return self.apply(module, input, bias, weight=module.weight[start:end])
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        # Quantized subclasses must explicitly opt in to their slice preparation.
+        if type(self) is not UnquantizedLinearMethod:
+            super().prepare_output_slice(module, start, end)
 
     def load_weights_vanilla(self,
                              module: Linear,
@@ -831,13 +866,23 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        static_input_scale = self.get_static_input_scale(module)
+        # The opt-in low-M dispatcher races cuBLAS against the low-M FP8 GEMM
+        # for static-scale projections; None falls through to the stock path.
+        if (static_input_scale is not None and bias is None
+                and _should_apply_low_m_gemm(input, module)):
+            dispatcher = low_m_gemm_dispatcher(module)
+            output = dispatcher.apply_fp8(
+                input, module.weight, module.weight_scale, static_input_scale,
+                module.dtype or torch.bfloat16) if dispatcher else None
+            if output is not None:
+                return output
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
-        static_input_scale = self.get_static_input_scale(module)
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
             if static_input_scale is not None:
@@ -903,6 +948,32 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_linear_allreduce_norm(
+        self, module: Linear, input: torch.Tensor,
+        all_reduce_params: AllReduceParams
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """The MNNVL GEMM + all-reduce + residual RMSNorm kernel, where the low-M race picked the warp-MMA
+        GEMM for this projection (same summation order as the plain projection)."""
+        static_input_scale = self.get_static_input_scale(module)
+        dispatcher = low_m_gemm_dispatcher(module)
+        if (static_input_scale is None or module.bias is not None
+                or dispatcher is None or input.dim() != 2
+                or not _should_apply_low_m_gemm(input, module)):
+            return None
+        tactic = dispatcher.warp_mma_tactic(input.shape[0],
+                                            module.weight,
+                                            module.weight_scale,
+                                            static_input_scale,
+                                            quantize=input.dtype
+                                            != torch.float8_e4m3fn)
+        if tactic is None:
+            return None
+        return module.all_reduce.gemm_allreduce_norm(input, module.weight,
+                                                     module.weight_scale,
+                                                     static_input_scale,
+                                                     all_reduce_params,
+                                                     tactic[:3])
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -1364,6 +1435,12 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        return self._apply_with_weights(module, input, bias, module.weight,
+                                        module.weight_scale)
+
+    def _apply_with_weights(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor], weight: torch.Tensor,
+                            weight_scale: torch.Tensor):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
         # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
         if isinstance(input, tuple):
@@ -1379,15 +1456,14 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                         or module.disable_deep_gemm))
             if uses_cute_dsl_rubin:
                 output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                    activation, module.weight, activation_scale,
-                    module.weight_scale)
+                    activation, weight, activation_scale, weight_scale)
             elif (activation_scale.dtype == torch.int32 and is_sm_100f()
                   and not module.disable_deep_gemm):
                 output = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
                     activation,
                     activation_scale,
-                    module.weight,
-                    module.weight_scale,
+                    weight,
+                    weight_scale,
                     disable_ue8m0_cast=True,
                 )
             else:
@@ -1417,15 +1493,13 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     act_input_fp8, act_input_sf = (
                         torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input))
                     output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                        act_input_fp8, module.weight, act_input_sf,
-                        module.weight_scale)
+                        act_input_fp8, weight, act_input_sf, weight_scale)
                 else:
                     act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                         input)
                     if sm_version in (100, 103):
                         output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                            act_input_fp8, module.weight, act_input_sf,
-                            module.weight_scale)
+                            act_input_fp8, weight, act_input_sf, weight_scale)
                     else:
                         # cute_dsl_fp8_gemm_blackwell runs only on sm100/103. On
                         # other sm_100f GPUs (e.g. sm107 without the CuTe DSL
@@ -1439,21 +1513,21 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                 "trtllm-gen kernel instead.",
                                 key="cute_dsl_fp8_blockscale_unsupported_sm")
                         output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                            act_input_fp8, module.weight, act_input_sf,
-                            module.weight_scale)
+                            act_input_fp8, weight, act_input_sf, weight_scale)
             else:
-                output = fp8_block_scale_ue8m0_gemm(input, module.weight,
-                                                    module.weight_scale,
-                                                    module.fp8_low_m_gemm)
-        elif sm_version == 120:
+                low_m = (module.fp8_low_m_gemm if weight is module.weight else
+                         Fp8BlockScaleLowMGemmRange())
+                output = fp8_block_scale_ue8m0_gemm(input, weight, weight_scale,
+                                                    low_m)
+        elif is_sm_120f(sm_version):
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+                act_input_fp8, weight, act_input_sf, weight_scale)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+                act_input_fp8, weight, act_input_sf, weight_scale)
 
         # Reshape output back to original shape (with out_features as last dim)
         if len(original_shape) > 2:
@@ -1462,6 +1536,28 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_slice(self, module: Linear, input: torch.Tensor, start: int,
+                    end: int) -> torch.Tensor:
+        # Keep the original N-block quantization grid when a head boundary
+        # falls inside a 128-row scale block. The extra rows are cropped
+        # after GEMM; their cost is bounded by two scale blocks.
+        assert module._output_slice_cache is not None
+        weight, scale, crop = module._output_slice_cache.get(
+            module.weight, start, end)
+        output = self._apply_with_weights(module, input, None, weight, scale)
+        output = output[..., crop:crop + end - start].contiguous()
+        if module.bias is not None:
+            output = output + module.bias[start:end]
+        return output
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        module.transform_weights()
+        if module._output_slice_cache is None:
+            module._output_slice_cache = Fp8BlockScaleWeightSliceCache()
+        module._output_slice_cache.prepare(module.weight, module.weight_scale,
+                                           start, end)
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
@@ -1587,12 +1683,14 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 module.rebuild_tensor_metadata)
             return
         use_deep_gemm_layout = (
-            is_sm_100f()
-            and not (module.use_cute_dsl_blockscaling_mm
-                     or module.disable_deep_gemm)) or get_sm_version() == 120
+            is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                  or module.disable_deep_gemm)) or is_sm_120f()
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
-        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
+        # Consumers that read UE8M0 scales from the FP32 K128 layout (e.g. the
+        # fused shared FC12 kernel) ask for the rounding alone.
+        round_to_ue8m0 = getattr(module, "round_block_scales_to_ue8m0", False)
+        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout or round_to_ue8m0:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
 
@@ -1638,6 +1736,15 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             if get_sm_version() != 107:
                 module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange.for_weight(
                     *weight.shape)
+        elif round_to_ue8m0:
+            # Same FP32 K128 layout; the rounded tensors may live on another device.
+            replace_parameter_and_save_metadata(
+                module, "weight", nn.Parameter(weight, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(
+                module, "weight_scale",
+                nn.Parameter(weight_scale, requires_grad=False),
+                module.rebuild_tensor_metadata)
 
 
 class NVFP4LinearMethod(LinearMethodBase):
@@ -2436,7 +2543,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     def is_supported(module: Linear) -> bool:
         sm_version = get_sm_version()
         block_width = fp4_utils.nvfp4_scaling_vector_size(module.quant_config)
-        return ((89 <= sm_version < 100 or sm_version in (120, 121))
+        return ((89 <= sm_version < 100 or is_sm_120f(sm_version))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
                 and block_width
@@ -2450,7 +2557,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
         if not cls.is_supported(module):
             return False
         sm_version = get_sm_version()
-        return (sm_version in (120, 121)
+        return (is_sm_120f(sm_version)
                 or "marlin" in getattr(module, "nvfp4_allowed_backends", ()))
 
     def transform_weights(self, module: Linear) -> None:
@@ -3412,21 +3519,58 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
 
 
 def _mxfp8_cutlass_op_available() -> bool:
-    """Cached check for whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in.
+    """Check whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in and runs on this GPU.
 
     Pre-M2-build the op is absent and we fall back to the dequant reference
     path; post-build the op is registered under torch.ops.trtllm and we route
     Linear.apply through it.
     """
-    return hasattr(torch.ops.trtllm,
-                   "mxfp8_mxfp8_gemm") and torch.cuda.is_available(
-                   ) and torch.cuda.get_device_capability()[0] >= 10
+    return hasattr(
+        torch.ops.trtllm,
+        "mxfp8_mxfp8_gemm") and torch.cuda.is_available() and is_sm_100f()
+
+
+def _mxfp8_flashinfer_only() -> bool:
+    """Blackwell GPUs outside the SM100 family run MXFP8 GEMMs through FlashInfer only."""
+    return (not _mxfp8_cutlass_op_available()
+            and hasattr(torch.ops.trtllm, "mxfp8_quantize")
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+            and not is_sm_100f())
+
+
+def mxfp8_gemm_backend_override() -> Optional[str]:
+    """Return the fixed MXFP8 GEMM backend, or None to let the engine choose.
+
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` takes precedence on SM100-family GPUs.
+    Elsewhere the native GEMM is not compiled, so FlashInfer is the only
+    backend and other explicit choices are rejected.
+    """
+    backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND")
+    if _mxfp8_flashinfer_only():
+        if backend not in (None, "flashinfer"):
+            raise ValueError(
+                f"TRTLLM_MXFP8_GEMM_BACKEND={backend!r} is not supported on "
+                "this GPU: the native MXFP8 GEMM runs on SM100-family GPUs "
+                "only, so use 'flashinfer' or leave it unset")
+        backend = "flashinfer"
+    return backend
 
 
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+
+
+def flashinfer_mxfp8_autotune_active() -> bool:
+    """Whether the current forward runs inside ``flashinfer_mxfp8_autotune``."""
+    return _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+
+
+def flashinfer_mxfp8_decode_graph_capture_active() -> bool:
+    """Whether the current forward is a decode CUDA-graph warmup or capture."""
+    return _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
 
 
 @contextmanager
@@ -3482,8 +3626,9 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def __init__(self) -> None:
         super().__init__()
-        self.use_cutlass = _mxfp8_cutlass_op_available()
-        self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        self.use_cutlass = _mxfp8_cutlass_op_available(
+        ) or _mxfp8_flashinfer_only()
+        self.backend = mxfp8_gemm_backend_override() or "trtllm"
         # Only ModelEngine owns the startup tuning lifecycle. Keep
         # standalone modules and engine paths that skip warmup (for example,
         # Helix CP) on the direct native op instead of leaving Python
@@ -3546,7 +3691,7 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def enable_flashinfer_auto(self) -> bool:
         """Enable graph-only FlashInfer dispatch unless the user overrode it."""
-        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+        if mxfp8_gemm_backend_override() is not None:
             return self.backend == "auto"
         if not self._load_flashinfer(required=False):
             return False
@@ -4164,6 +4309,7 @@ class Linear(nn.Module):
         self._weights_created = False
         self._weights_transformed = False
         self.reduce_output = reduce_output
+        self._output_slice_cache: Optional[Fp8BlockScaleWeightSliceCache] = None
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
         self.lora = lora
@@ -4542,6 +4688,37 @@ class Linear(nn.Module):
             assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
             return False
 
+    def forward_slice(self, input: torch.Tensor, start: int,
+                      end: int) -> torch.Tensor:
+        """Project a contiguous range of this rank's output features.
+
+        The range is local to the existing COLUMN shard. This reuses its
+        loaded weights and quantization without materializing all outputs.
+
+        Args:
+            input: Activations with shape [..., in_features].
+            start: First output feature in the local weight shard.
+            end: Exclusive end of the local output feature range.
+
+        Returns:
+            A contiguous tensor with shape [..., end - start].
+        """
+        self.prepare_output_slice(start, end)
+        return self.quant_method.apply_slice(self, input, start, end)
+
+    def prepare_output_slice(self, start: int, end: int) -> None:
+        """Validate output slicing and prepare method-specific state."""
+        if self.tp_mode == TensorParallelMode.ROW or self.gather_output:
+            raise ValueError(
+                "Output slicing requires a local COLUMN projection")
+        if not 0 <= start < end <= self.weight.shape[0]:
+            raise ValueError(f"Invalid output feature range [{start}, {end})")
+        if self._locality_domain_weight_shards is not None or self.lora is not None:
+            raise NotImplementedError(
+                "Output slicing does not support locality-domain shards or LoRA"
+            )
+        self.quant_method.prepare_output_slice(self, start, end)
+
     def forward(
         self,
         input: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -4563,7 +4740,16 @@ class Linear(nn.Module):
                 use_fused_gemm_allreduce = all_reduce_params.enable_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
 
             bias = None if (self.tp_rank > 0) else self.bias
-            if self.reduce_output:
+            fused_norm = None
+            if (self.reduce_output and all_reduce_params is not None
+                    and all_reduce_params.enable_allreduce
+                    and all_reduce_params.fusion_op != AllReduceFusionOp.NONE
+                    and not use_locality_domain and lora_params is None):
+                fused_norm = self.quant_method.apply_linear_allreduce_norm(
+                    self, input, all_reduce_params)
+            if fused_norm is not None:
+                output = fused_norm
+            elif self.reduce_output:
                 if use_fused_gemm_allreduce:
                     output = self.apply_linear_allreduce(
                         input, self.bias, layer_idx)
@@ -4616,6 +4802,7 @@ class Linear(nn.Module):
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")
         self._weights_transformed = False
+        self._output_slice_cache = None
         self.quant_method.load_weights(
             self,
             weights,
@@ -4628,6 +4815,7 @@ class Linear(nn.Module):
     def transform_weights(self) -> None:
         if self._weights_transformed:
             return
+        self._output_slice_cache = None
         self.quant_method.transform_weights(self)
         # Localized allocations and full-weight release belong to the mutating
         # stage so both staged ModelLoader walks and post_load_weights run them.
@@ -4655,6 +4843,7 @@ class Linear(nn.Module):
         self.transform_weights()
 
     def pre_reload_weights(self):
+        self._output_slice_cache = None
         assert hasattr(
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
