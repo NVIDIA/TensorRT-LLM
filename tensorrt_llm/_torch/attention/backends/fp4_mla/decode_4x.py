@@ -123,19 +123,33 @@ def _fp4_mla_4x_split_buffers(
     rows = num_heads * query_len
     pairs_per_request = rows // 256
     task_capacity = plan_4x_task_capacity(num_requests, pairs_per_request)
-    # The workspaces are process-wide (layout._ensure_workspace_tensor); size them once for the largest batch any
-    # graph bucket or eager call can bring, so no bucket ever allocates its own copy.
-    max_requests = max(_max_sequences(metadata), num_requests)
-    capacity_bound = max(
-        plan_4x_task_capacity_bound(max_requests, pairs_per_request), task_capacity
-    )
+    # The workspaces are process-wide (layout._ensure_workspace_tensor); size them once for the largest batch and
+    # every even query width any graph bucket or eager call can bring, so no bucket ever allocates its own copy.
+    # Batches past SPLIT_MAX_PAIRS pairs never reach split mode (envelope_reason_static), so they do not count.
+    from . import fp4_mla_cutedsl_4x_host as host_4x
+
+    sequences = _max_sequences(metadata)
+    width = max(query_len, 1 + int(getattr(metadata, "max_total_draft_tokens", None) or 0))
+    plan_len_bound = plan_4x_length(num_requests, task_capacity)
+    slot_rows_bound = task_capacity * rows
+    for q in sorted({query_len, *range(2, width + 1, 2)}):
+        rows_q = num_heads * q
+        if rows_q % 256:
+            continue
+        pairs_q = rows_q // 256
+        requests_q = max(min(sequences, host_4x.SPLIT_MAX_PAIRS // pairs_q), 1)
+        if q == query_len:
+            requests_q = max(requests_q, num_requests)
+        bound_q = plan_4x_task_capacity_bound(requests_q, pairs_q)
+        plan_len_bound = max(plan_len_bound, plan_4x_length(requests_q, bound_q))
+        slot_rows_bound = max(slot_rows_bound, bound_q * rows_q)
     plan = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_4x_plan",
         (plan_4x_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
-        capacity_numel=plan_4x_length(max_requests, capacity_bound),
+        capacity_numel=plan_len_bound,
     )
     # flat, grow-only workspaces viewed per call (a leading slice of a flat buffer is always contiguous)
     partial = _ensure_workspace_tensor(
@@ -144,7 +158,7 @@ def _fp4_mla_4x_split_buffers(
         (task_capacity * rows * 512,),
         dtype=torch.float32,
         device=device,
-        capacity_numel=capacity_bound * rows * 512,
+        capacity_numel=slot_rows_bound * 512,
     ).view(task_capacity, rows, 512)
     maxima = _ensure_workspace_tensor(
         metadata,
@@ -152,7 +166,7 @@ def _fp4_mla_4x_split_buffers(
         (task_capacity * rows,),
         dtype=torch.float32,
         device=device,
-        capacity_numel=capacity_bound * rows,
+        capacity_numel=slot_rows_bound,
     ).view(task_capacity, rows)
     sums = _ensure_workspace_tensor(
         metadata,
@@ -160,7 +174,7 @@ def _fp4_mla_4x_split_buffers(
         (task_capacity * rows,),
         dtype=torch.float32,
         device=device,
-        capacity_numel=capacity_bound * rows,
+        capacity_numel=slot_rows_bound,
     ).view(task_capacity, rows)
     key = (
         num_requests,

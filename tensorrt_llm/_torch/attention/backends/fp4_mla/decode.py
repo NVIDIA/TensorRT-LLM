@@ -43,6 +43,7 @@ from .layout import (
     _validate_fp4_mla_attention_q_shape,
     _validate_fp4_mla_cache_shape,
     _validate_fp4_mla_kv_storage_shape,
+    _workspace_capacity_numel,
     get_fp4_mla_v_scale_pool_view,
 )
 from .metadata import (
@@ -381,17 +382,10 @@ def _run_triton_attention_decode(
     # reduce during capture so we never allocate mid-capture. The single-level
     # reduce is numerically identical (it just launches fewer CTAs).
     if num_reduce_groups > 1 and torch.cuda.is_current_stream_capturing():
-        gmax = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_max_buf")
-        gsum = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_sum_buf")
-        groups_ready = (
-            gmax is not None
-            and gsum is not None
-            and gmax.shape[0] >= num_queries
-            and gmax.shape[1] >= num_reduce_groups
-            and gmax.shape[2] >= num_heads
-            and gsum.shape[0] >= num_queries
-            and gsum.shape[1] >= num_reduce_groups
-            and gsum.shape[2] >= num_heads
+        needed = num_queries * num_reduce_groups * num_heads
+        groups_ready = all(
+            _workspace_capacity_numel(metadata, name, torch.float32, q_fp4.device) >= needed
+            for name in ("_fp4_mla_attention_group_max_buf", "_fp4_mla_attention_group_sum_buf")
         )
         if not groups_ready:
             num_reduce_groups = 1
@@ -536,13 +530,11 @@ def _run_triton_attention_decode(
     # Fall back to the unsplit PV (numerically identical) during capture unless a
     # warmup forward already sized that workspace, so capture never allocates.
     if page_split > 1 and torch.cuda.is_current_stream_capturing():
-        pbuf = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_pv_partial_buf")
         partial_ready = (
-            pbuf is not None
-            and pbuf.shape[0] >= num_queries
-            and pbuf.shape[1] >= page_split
-            and pbuf.shape[2] >= num_heads
-            and pbuf.shape[3] >= kv_lora_rank
+            _workspace_capacity_numel(
+                metadata, "_fp4_mla_attention_pv_partial_buf", torch.float32, q_fp4.device
+            )
+            >= num_queries * page_split * num_heads * kv_lora_rank
         )
         if not partial_ready:
             page_split = 1
@@ -864,16 +856,17 @@ def _run_cutedsl_packed_decode(
     # generation lengths; a stale key means this call plans on other bounds.
     if metadata.fp4_mla_state.packed_plan_key != plan_geometry.key:
         _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
-    # Process-wide scratch (layout._ensure_workspace_tensor): one block per name, sized for the largest batch any
-    # bucket can bring (plan_geometry.task_bound slots), shared by every graph bucket and the eager path.
-    task_bound = max(plan_geometry.task_bound, task_capacity)
+    # Process-wide scratch (layout._ensure_workspace_tensor): one block per name, sized for the largest batch and
+    # query width any bucket can bring (plan_geometry.slot_rows_bound), shared by every graph bucket and the eager
+    # path.
+    slot_rows_bound = max(plan_geometry.slot_rows_bound, task_capacity * physical_m)
     partial = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_split_partial",
         (task_capacity, physical_m, 512),
         dtype=torch.float32,
         device=device,
-        capacity_numel=task_bound * physical_m * 512,
+        capacity_numel=slot_rows_bound * 512,
     )[:tasks]
     maxima = _ensure_workspace_tensor(
         metadata,
@@ -881,7 +874,7 @@ def _run_cutedsl_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
-        capacity_numel=task_bound * physical_m,
+        capacity_numel=slot_rows_bound,
     )[:tasks]
     sums = _ensure_workspace_tensor(
         metadata,
@@ -889,7 +882,7 @@ def _run_cutedsl_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
-        capacity_numel=task_bound * physical_m,
+        capacity_numel=slot_rows_bound,
     )[:tasks]
     module.run_trtllm_fp4_mla_decode_packed(
         q_fp4,
