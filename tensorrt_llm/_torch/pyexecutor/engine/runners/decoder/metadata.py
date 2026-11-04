@@ -58,6 +58,7 @@ class DecoderMetadata:
 
     # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+    _host_uploader: HostUploader | None = None
 
     def __init__(
         self,
@@ -410,9 +411,9 @@ def sync_group_all_greedy_sample(
     spec_metadata: SpecMetadata,
     mapping: Mapping,
     dist: Distributed | None,
-    cuda_graph_runner: CUDAGraphRunner,
-    batch: ScheduledRequests,
     *,
+    cuda_graph_runner: CUDAGraphRunner | None = None,
+    batch: ScheduledRequests | None = None,
     confidence_enabled: bool = False,
 ) -> None:
     """All-gather the per-rank greedy flags and store the group AND.
@@ -449,7 +450,11 @@ def sync_group_all_greedy_sample(
     local = (
         int(spec_metadata.is_all_greedy_sample) | int(spec_metadata.local_all_temperature_only) << 1
     )
-    modes = cuda_graph_runner.take_sampling_modes(batch) if shard_sampling else None
+    modes = (
+        cuda_graph_runner.take_sampling_modes(batch)
+        if shard_sampling and cuda_graph_runner is not None
+        else None
+    )
     if modes is None:
         modes = dist.tp_allgather_int64([local])[:, 0].tolist() if mapping.tp_size > 1 else [local]
     elif modes[mapping.tp_rank] != local:

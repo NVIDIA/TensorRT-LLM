@@ -8774,9 +8774,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             self.impl.clear_stats_excluded(request_id)
             return
+        kv_cache.discard_pending_stats()
         if self._sharing is not None:
             self._sharing._on_free(request_id, kv_cache)
-        # close() discards the pending stats itself.
         kv_cache.close()
         self.impl.clear_stats_excluded(request_id)
         if request_id in self._early_freed_index_requests:
