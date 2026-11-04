@@ -64,11 +64,14 @@ def _make_timeout_request(request_id=7, in_progress=False):
     )
 
 
-def _make_response_handler_stub(active_requests, tp_allgather_result):
+def _make_response_handler_stub(
+    active_requests: list[SimpleNamespace], tp_allgather_result: list[bool]
+) -> PyExecutor:
     """Executor with a real coordinator and real adapter wiring; only the
     transceiver, dist and the executor's own error/response primitives are
     mocked."""
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor.active_requests = list(active_requests)
     executor.canceled_req_ids = []
     executor.perf_manager = Mock()
@@ -309,6 +312,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch: pytest.Monke
         finish_by_reason=Mock(),
     )
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor.enable_attention_dp = False
     executor.active_requests = [request]
     executor.canceled_req_ids = [request.py_request_id]
@@ -351,8 +355,9 @@ def test_flag_unset_generation_driver_skips_cancel_pipeline():
     effects.fail_requests.assert_not_called()
 
 
-def test_preclassified_fatal_error_keeps_adp_response_collectives_aligned():
+def test_preclassified_fatal_error_keeps_adp_response_collectives_aligned() -> None:
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor._fatal_error = RuntimeError("already fatal")
     executor._error_budget = Mock()
     executor.is_shutdown = False
