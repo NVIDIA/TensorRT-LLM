@@ -2368,7 +2368,7 @@ def test_cutedsl_fc12_die_major_weights():
         for n, (xs, logits) in inputs.items()
     }
     shapes = [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)]
-    assert backend.allow_die_major_weights()
+    backend.allow_die_major_weights()
     assert backend._die_major_applies()
     backend._place_weights_die_major()
     assert backend.weights_die_major
@@ -2385,10 +2385,12 @@ def test_die_major_weights_need_the_model_opt_in():
     from tensorrt_llm._torch.moe.fused_moe import MoEImplBase
     from tensorrt_llm._torch.moe.fused_moe.cutedsl import TrtllmCutedslFusedFc12Nvfp4Impl
 
-    assert MoEImplBase.allow_die_major_weights(None) is False
+    declined = SimpleNamespace()
+    MoEImplBase.allow_die_major_weights(declined)
+    assert not vars(declined)
     backend = object.__new__(TrtllmCutedslFusedFc12Nvfp4Impl)
     assert not backend._die_major_applies()
-    assert backend.allow_die_major_weights() is True
+    backend.allow_die_major_weights()
     assert backend._die_major_allowed
 
 

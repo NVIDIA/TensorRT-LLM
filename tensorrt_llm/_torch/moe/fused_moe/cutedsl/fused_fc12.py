@@ -309,11 +309,10 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self._concurrent_sm_reserve = num_sms
         return num_sms
 
-    def allow_die_major_weights(self) -> bool:
+    def allow_die_major_weights(self) -> None:
         """Both kernels read die-major weights; ``post_load_weights`` places them where
         ``_die_major_applies``."""
         self._die_major_allowed = True
-        return True
 
     def consumes_sort_tables(self) -> bool:
         """``run_moe_nvfp4`` runs on the routing kernel's tables when they match
