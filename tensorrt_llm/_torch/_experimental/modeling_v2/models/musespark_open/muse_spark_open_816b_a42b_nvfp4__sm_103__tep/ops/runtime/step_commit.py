@@ -98,21 +98,52 @@ def _step_commit_kernel(desc_addr, BLOCK: tl.constexpr):
             tl.store(dst_v + offs, tl.where(bad, 0, scaled + a5.to(tl.int32)), mask=mask)
 
 
+# ---- The table in the kernel's parameter block ----------------------------------------------
+# A ``StepStaging`` built with ``inline_commit`` (the ``step_loop_inline_commits`` fast path)
+# runs a ``launch`` whose pending rows and payload words fit ``step_commit_inline``'s
+# parameter block through that kernel instead (no pinned-memory reads; the same words); every
+# other launch runs the kernel above.
+
+
+def _inline_commit():
+    """A new ``step_commit_inline.InlineCommit``, or None when the inline kernel is unavailable here."""
+    from . import step_commit_inline
+
+    return step_commit_inline.InlineCommit() if step_commit_inline.available() else None
+
+
+# ---- End of the parameter-block launch ------------------------------------------------------
+
+
 class StepStaging:
     """A pinned descriptor table plus a data area, executed by ``launch``.
 
     Descriptors accumulate between ``reset`` calls; each ``launch`` executes the
     ones recorded since the previous ``launch`` and leaves the block in use, so
     one step may launch more than once (to order writes across launches).
+
+    Args:
+        max_descriptors: descriptors the block holds initially.
+        data_bytes: bytes of COPY payload the block holds initially.
+        inline_commit: a launch whose pending rows fit a kernel parameter block
+            passes its table there (``step_commit_inline``) instead of in pinned memory.
     """
 
-    def __init__(self, max_descriptors: int = 1024, data_bytes: int = 1 << 18):
+    def __init__(
+        self, max_descriptors: int = 1024, data_bytes: int = 1 << 18, inline_commit: bool = False
+    ):
         self._allocate(max_descriptors, data_bytes)
         self.num = 0
         self.launched = 0
         self.data_used = 0
         self._max_count = 0
         self._event: Optional[torch.cuda.Event] = None
+        #: Whether a launch since the last ``reset`` reads the block when it executes (``reset`` waits).
+        self._fence = False
+        #: Whether ``launch`` tries the parameter-block launch first (``_launch_inline``).
+        self.inline_commit = inline_commit
+        #: The parameter-block launcher, created on the first inline launch (False: unavailable).
+        self._inline = None
         #: Set when ``room`` answered ``False``; ``reset`` then grows the block.
         self.short = False
 
@@ -238,10 +269,16 @@ class StepStaging:
         return self.num - self.launched
 
     def launch(self) -> bool:
-        """Execute the pending descriptors on the current stream; ``False`` if there were none."""
+        """Execute the pending descriptors on the current stream; ``False`` if there were none.
+
+        With ``inline_commit`` a launch whose rows fit the parameter block runs
+        ``step_commit_inline``.
+        """
         pending = self.num - self.launched
         if pending <= 0:
             return False
+        if self.inline_commit and self._launch_inline():
+            return True
         chunks = triton.cdiv(self._max_count, _BLOCK)
         _step_commit_kernel[(pending, chunks)](
             self._desc_base + self.launched * _DESC_BYTES, BLOCK=_BLOCK, num_warps=_NUM_WARPS
@@ -251,6 +288,24 @@ class StepStaging:
         if self._event is None:
             self._event = torch.cuda.Event()
         self._event.record()
+        self._fence = True
+        return True
+
+    def _launch_inline(self) -> bool:
+        """Launch the pending rows with their table in the parameter block; False if they do not fit.
+
+        The parameter block is copied when the launch is issued, so this launch does not
+        read the staging block afterwards and needs no fence in ``reset``.
+        """
+        if self._inline is None:
+            self._inline = _inline_commit() or False
+        if not self._inline or not self._inline.pack(
+            self._desc_np[self.launched : self.num], self._data_np, self._data_base
+        ):
+            return False
+        self._inline.launch()
+        self.launched = self.num
+        self._max_count = 0
         return True
 
     def reset(self) -> None:
@@ -261,8 +316,9 @@ class StepStaging:
         ``MAX_DATA_BYTES``); nothing reads the old one once the event has
         completed.
         """
-        if self._event is not None and self.launched:
+        if self._event is not None and self._fence:
             self._event.synchronize()
+        self._fence = False
         if self.short:
             self.short = False
             descriptors, data_bytes = self.capacity
@@ -275,9 +331,16 @@ class StepStaging:
         self._max_count = 0
 
 
-def warm_up() -> None:
-    """Compile the kernel now (one launch over a no-op descriptor list on the current device)."""
-    staging = StepStaging(max_descriptors=4, data_bytes=64)
+def warm_up(inline_commit: bool = False) -> None:
+    """Build the step-commit launch now: one launch over a no-op descriptor list on the
+    current device (through the parameter-block kernel when ``inline_commit`` and it is
+    available, else the Triton kernel), checked against the expected words.
+
+    Args:
+        inline_commit: launch through a ``StepStaging`` built with ``inline_commit``, as the
+            stagings it warms up are, so the parameter-block kernel is built (NVRTC) and checked.
+    """
+    staging = StepStaging(max_descriptors=4, data_bytes=64, inline_commit=inline_commit)
     scratch = torch.zeros(4, dtype=torch.int32, device="cuda")
     staging.fill(scratch.data_ptr(), 1, 4, 7)
     staging.launch()
@@ -285,3 +348,13 @@ def warm_up() -> None:
     if scratch.tolist() != [7, 7, 7, 7]:
         raise RuntimeError(f"step_commit warm-up wrote {scratch.tolist()}, expected [7, 7, 7, 7]")
     staging.reset()
+    if inline_commit:
+        # Build the inline kernel now (NVRTC) and check one launch through it.
+        staging.fill(scratch.data_ptr(), 1, 4, 9)
+        staging.launch()
+        torch.cuda.current_stream().synchronize()
+        if scratch.tolist() != [9, 9, 9, 9]:
+            raise RuntimeError(
+                f"step_commit inline warm-up wrote {scratch.tolist()}, expected [9, 9, 9, 9]"
+            )
+        staging.reset()
