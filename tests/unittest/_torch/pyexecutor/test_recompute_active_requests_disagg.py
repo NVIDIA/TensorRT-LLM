@@ -57,6 +57,8 @@ def _request(
 class _RecomputeExecutor:
     """Minimal stand-in for PyExecutor exposing what recompute_active_requests uses."""
 
+    kv_connector_manager = None
+
     _DISAGG_TRANSFER_BOUND_STATES = PyExecutor._DISAGG_TRANSFER_BOUND_STATES
     _is_disagg_transfer_bound = PyExecutor._is_disagg_transfer_bound
 

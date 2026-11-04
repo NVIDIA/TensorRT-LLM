@@ -1452,7 +1452,7 @@ class TestListenerAbortAndShutdown:
         assert sent_acks[0]["error"] is None
         assert "rank 0 send failed" in sent_acks[0]["reason"]
 
-    def test_abort_before_control_barrier_unblocks_later_control_request(self):
+    def test_abort_before_control_barrier_unblocks_later_control_request(self) -> None:
         """An early ABORT is recorded and later consumed by matching control."""
         import threading
         from unittest.mock import patch
@@ -1485,6 +1485,7 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
+        executor.kv_connector_manager = None
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1, pp_size=1)
