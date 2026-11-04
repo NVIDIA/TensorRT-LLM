@@ -5334,15 +5334,21 @@ class TestMiniMaxM2ToolParser:
                 "label": '"42"',
             }
 
-    def test_complete_invoke_collapses_repeated_parameters(self, sample_tools):
-        """A complete unstreamed invoke keeps the last value for each name."""
+    @pytest.mark.parametrize("split_after_invoke", [False, True])
+    def test_complete_invoke_collapses_repeated_parameters(
+            self, sample_tools, split_after_invoke):
+        """A call with no streamed arguments keeps the last value per name."""
         parser = MiniMaxM2ToolParser()
-        result = parser.parse_streaming_increment(
-            '<minimax:tool_call><invoke name="get_weather">'
-            '<parameter name="location">Paris</parameter>'
-            '<parameter name="location">Berlin</parameter>'
-            '</invoke></minimax:tool_call>', sample_tools)
-        arguments = "".join(call.parameters for call in result.calls)
+        start = '<minimax:tool_call><invoke name="get_weather">'
+        end = ('<parameter name="location">Paris</parameter>'
+               '<parameter name="location">Berlin</parameter>'
+               '</invoke></minimax:tool_call>')
+        chunks = [start, end] if split_after_invoke else [start + end]
+        results = [
+            parser.parse_streaming_increment(c, sample_tools) for c in chunks
+        ]
+        arguments = "".join(call.parameters for result in results
+                            for call in result.calls)
         assert json.loads(arguments,
                           object_pairs_hook=list) == [("location", "Berlin")]
         assert parser.finish(sample_tools).calls == []

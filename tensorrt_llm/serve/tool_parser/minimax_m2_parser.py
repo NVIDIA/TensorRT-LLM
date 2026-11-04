@@ -255,7 +255,13 @@ class MiniMaxM2ToolParser(BaseToolParser):
 
                 params = self.param_regex.findall(params_text)
                 args_json = _serialize_streamed_params(
-                    params, func_name, tools, collapse_repeated=not self.current_tool_name_sent
+                    params,
+                    func_name,
+                    tools,
+                    collapse_repeated=(
+                        not self.current_tool_name_sent
+                        or not self._json_buffers.get(self.current_tool_id)
+                    ),
                 )
                 if self.current_tool_name_sent:
                     # The name and an argument prefix were already streamed
