@@ -112,7 +112,8 @@ def generate_timeout_xml(
         classname_escaped = escape(classname, quote=True)
         name_escaped = escape(name, quote=True)
         file_escaped = escape(file, quote=True)
-        if test in confirmed_timeout_tests:
+        is_timeout = test in confirmed_timeout_tests
+        if is_timeout:
             error_block = '<error message="pytest_timeout">Pytest timeout.</error>'
         else:
             error_block = (
@@ -120,7 +121,9 @@ def generate_timeout_xml(
             )
         xmlContent += (
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
-            f'file="{file_escaped}" time="{duration:.2f}">\n'
+            f'file="{file_escaped}" time="{duration:.2f}" '
+            f'unfinished_test="1" timeout="{int(is_timeout)}" '
+            f'terminated_unexpectedly="{int(not is_timeout)}">\n'
             f"        {error_block}\n"
             f"</testcase>\n"
         )
