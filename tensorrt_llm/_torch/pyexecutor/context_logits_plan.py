@@ -150,7 +150,9 @@ class ContextLogitsPlan:
             host_storage = (
                 _keeps_context_logits(request) and request.py_result.context_logits_on_cpu
             )
-            buffers = workspace.acquire(count, host_storage=host_storage)
+            buffers = workspace.acquire(
+                count, host_storage=host_storage, local_ok=storage_error is None
+            )
             capacity = buffers[0].shape[0]
             for begin in range(0, count, capacity):
                 end = min(begin + capacity, count)
@@ -176,14 +178,24 @@ class ContextLogitsPlan:
         if tail_count == 0:
             workspace.require_all(storage_error is None, "context-logits storage")
         else:
-            tail = hidden[context_rows:]
-            slots = list(range(len(contexts), len(contexts) + generation_rows))
-            if tail_rows:
-                indices = torch.tensor(tail_rows, dtype=torch.int64, device=hidden.device)
-                tail = torch.cat([hidden.index_select(0, indices), tail])
-                slots = tail_slots + slots
-            slot_indices = torch.tensor(slots, dtype=torch.int64, device=hidden.device)
-            buffers = workspace.acquire(tail_count, host_storage=False)
+            tail = slot_indices = None
+            try:
+                tail = hidden[context_rows:]
+                slots = list(range(len(contexts), len(contexts) + generation_rows))
+                if tail_rows:
+                    indices = torch.tensor(tail_rows, dtype=torch.int64, device=hidden.device)
+                    tail = torch.cat([hidden.index_select(0, indices), tail])
+                    slots = tail_slots + slots
+                slot_indices = torch.tensor(slots, dtype=torch.int64, device=hidden.device)
+            except torch.OutOfMemoryError:
+                # Reported to every TP rank by the capacity vote below.
+                pass
+            buffers = workspace.acquire(
+                tail_count,
+                host_storage=False,
+                local_ok=storage_error is None and slot_indices is not None,
+            )
+            assert tail is not None and slot_indices is not None
             capacity = buffers[0].shape[0]
             for begin in range(0, tail_count, capacity):
                 end = min(begin + capacity, tail_count)
