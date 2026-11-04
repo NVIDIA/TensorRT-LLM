@@ -4457,6 +4457,7 @@ class PyExecutor:
             )
 
     def _executor_loop_pp(self):
+        """Drive pipeline-parallel batches through their microbatch slots."""
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -10773,6 +10774,7 @@ class PyExecutor:
     @nvtx_range("_schedule")
     @record_function_with_metadata("trtllm::schedule")
     def _schedule(self):
+        """Schedule context, generation, and encoder requests for execution."""
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
@@ -12233,6 +12235,7 @@ class PyExecutor:
             new_tensors_device: Optional[SampleStateTensors] = None,
             *,
             microbatch_id: int | None = None) -> Optional[dict[str, object]]:
+        """Run a model batch with routing capture and stream ordering."""
         self._maybe_record_hang_diagnostic_phase(
             "forward_call",
             scheduled_requests,
@@ -12479,6 +12482,7 @@ class PyExecutor:
     @record_function_with_metadata("trtllm::sampling")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
+        """Handle model outputs and submit asynchronous token sampling."""
         self._maybe_record_hang_diagnostic_phase("sampling", scheduled_batch)
         try:
             if batch_outputs is not None:
@@ -12542,6 +12546,7 @@ class PyExecutor:
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
+        """Apply sampled results and route sampling errors to the executor."""
         try:
             self.sampler.update_requests(sample_state, resource_manager)
             self._accumulate_spec_dec_stats(sample_state)
@@ -13646,6 +13651,7 @@ class PyExecutor:
     @nvtx_range("_handle_responses")
     @record_function_with_metadata("trtllm::handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
+        """Publish ready responses and retire completed requests."""
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by the coordinator's context reap (DISAGG_CONTEXT_COMPLETE);
