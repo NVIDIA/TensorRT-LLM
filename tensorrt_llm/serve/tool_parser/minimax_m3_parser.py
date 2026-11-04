@@ -213,6 +213,9 @@ class MiniMaxM3ToolParser(BaseToolParser):
             logger.error(f"Error in MiniMaxM3 parse_streaming_increment: {exc}")
             return StreamingParseResult(normal_text=current_text)
 
+        for call in result.calls:
+            self.current_tool_id += 1
+            call.tool_index = self.current_tool_id
         self._buffer = ""
         return result
 

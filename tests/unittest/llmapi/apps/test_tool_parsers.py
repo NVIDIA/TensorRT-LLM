@@ -42,6 +42,7 @@ from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m3_parser import MiniMaxM3ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
@@ -4930,6 +4931,42 @@ class TestToolParserIntegration:
 # ============================================================================
 # MiniMaxM2ToolParser Tests
 # ============================================================================
+
+
+class TestMiniMaxM3StreamingIndices:
+
+    @staticmethod
+    def _block(*names):
+        ns = "]<]minimax[>["
+        invokes = "".join(ns + f'<invoke name="{name}">' + ns + "</invoke>"
+                          for name in names)
+        return ns + "<tool_call>" + invokes + ns + "</tool_call>"
+
+    def test_indices_continue_across_blocks(self):
+        parser = MiniMaxM3ToolParser()
+        first = parser.parse_streaming_increment(self._block("one"), [])
+        second = parser.parse_streaming_increment(self._block("two"), [])
+        assert [call.tool_index for call in first.calls] == [0]
+        assert [call.tool_index for call in second.calls] == [1]
+        assert [call.name
+                for call in first.calls + second.calls] == ["one", "two"]
+
+    def test_multiple_calls_then_another_block_and_fresh_parser(self):
+        parser = MiniMaxM3ToolParser()
+        first = parser.parse_streaming_increment(self._block("one", "two"), [])
+        assert parser.parse_streaming_increment("plain text", []).calls == []
+        second = parser.parse_streaming_increment(self._block("three"), [])
+        assert [call.tool_index
+                for call in first.calls + second.calls] == [0, 1, 2]
+        assert [
+            call.tool_index
+            for call in MiniMaxM3ToolParser().parse_streaming_increment(
+                self._block("fresh"), []).calls
+        ] == [0]
+        assert [
+            call.tool_index for call in parser.detect_and_parse(
+                self._block("one", "two"), []).calls
+        ] == [0, 1]
 
 
 class TestMiniMaxM2ToolParser:
