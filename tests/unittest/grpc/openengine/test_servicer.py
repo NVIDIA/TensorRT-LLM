@@ -26,6 +26,7 @@ import tensorrt_llm.grpc.openengine.disagg as oe_disagg  # noqa: E402
 import tensorrt_llm.grpc.openengine.formatting as oe_formatting  # noqa: E402
 import tensorrt_llm.grpc.openengine.servicer as openengine_servicer  # noqa: E402
 import tensorrt_llm.grpc.openengine.streaming as oe_streaming  # noqa: E402
+from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2, openengine_pb2_grpc  # noqa: E402
 from tensorrt_llm.grpc.openengine.request_mapping import sampling_params_from_request  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
@@ -688,6 +689,61 @@ def test_generate_aborts_when_response_stream_closes() -> None:
     asyncio.run(close_after_first_response())
 
     assert llm.result_handle.aborted
+
+
+@pytest.mark.parametrize("engine_dead", [False, True])
+def test_generate_reports_failure_without_cancelling_dead_engine(engine_dead: bool) -> None:
+    """Terminal executor failures must reach the client without another cancel."""
+    error = (
+        EngineDeadError(RuntimeError("worker died"))
+        if engine_dead
+        else RuntimeError("response processing failed")
+    )
+
+    class _FailingHandle(_FakeResultHandle):
+        async def __aiter__(self) -> AsyncIterator[Any]:
+            raise error
+            yield  # pragma: no cover
+
+    llm = _FakeLlm([])
+    llm.result_handle = _FailingHandle([])
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="engine-failure", model="test-model", prompt="hello"
+    )
+
+    async def collect() -> list[generation_pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
+
+    responses = asyncio.run(collect())
+    assert responses[-1].HasField("error")
+    assert str(error) in responses[-1].error.message
+    assert llm.result_handle.aborted is (not engine_dead)
+
+
+@pytest.mark.parametrize(
+    "failure,code",
+    [
+        (EngineUnavailableError("recovering"), grpc.StatusCode.UNAVAILABLE),
+        (TypeError("bad engine signature"), grpc.StatusCode.INTERNAL),
+    ],
+)
+def test_submission_failure_preserves_retryability(failure, code) -> None:
+    llm = _FakeLlm([])
+
+    def reject(**kwargs):
+        raise failure
+
+    llm.generate_async = reject
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    request = generation_pb2.GenerateRequest(request_id="rejected", model="test-model", prompt="hi")
+
+    async def collect():
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect())
+    assert error.value.code == code
 
 
 def test_generate_releases_result_after_completion() -> None:
