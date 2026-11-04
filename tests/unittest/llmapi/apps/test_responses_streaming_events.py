@@ -35,6 +35,7 @@ from openai.types.responses.tool import FunctionTool
 from starlette.requests import ClientDisconnect
 
 import tensorrt_llm.serve.responses_utils as responses_utils
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
@@ -961,19 +962,37 @@ def _server_streaming(monkeypatch, steps):
     server.conversation_store = None
     server._validate_internal_disagg_request = lambda request, raw_request: None
     server._extract_metrics = AsyncMock()
+    server._adjusted_steady_clock = AdjustedSteadyClock()
 
     class Generation:
-        prompt_token_ids = [1, 2, 3]
-        finished = False
+        """The promise as the route sees it, an async iterator like GenerationResult.
 
-        async def __aiter__(self):
-            text = ""
-            for i, (pause, diff) in enumerate(steps):
-                await asyncio.sleep(pause)
-                text += diff
-                result = _step(text, diff, done=i == len(steps) - 1)
-                self.finished = result._done
-                yield result
+        It yields itself after each step and is finished from the start when
+        there is no step.
+        """
+
+        prompt_token_ids = [1, 2, 3]
+        cached_tokens = 0
+
+        def __init__(self):
+            self._pending = list(enumerate(steps))
+            self._text = ""
+            self._take(_step("", "", done=not steps))
+
+        def _take(self, step):
+            self.outputs, self._done, self.finished = step.outputs, step._done, step.finished
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._done:
+                raise StopAsyncIteration
+            i, (pause, diff) = self._pending.pop(0)
+            await asyncio.sleep(pause)
+            self._text += diff
+            self._take(_step(self._text, diff, done=i == len(steps) - 1))
+            return self
 
     server.generator = SimpleNamespace(
         args=SimpleNamespace(reasoning_parser=None, num_postprocess_workers=0),
@@ -1005,3 +1024,44 @@ async def test_the_responses_route_keeps_a_silent_stream_alive(monkeypatch):
     assert any(i > types.index("response.output_text.delta") for i in keepalives)
     assert types[-1] == "response.completed"
     assert [_event_data(f)["sequence_number"] for f in sent] == list(range(len(sent)))
+
+
+@pytest.mark.asyncio
+async def test_a_promise_finished_before_the_stream_reads_it_ends_normally(monkeypatch):
+    """A promise with no result left to yield is its own last result.
+
+    The stream ends with response.completed, not with an error.
+    """
+    server = _server_streaming(monkeypatch, steps=[])
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(request, raw_request)
+    sent = await _collect(response.body_iterator)
+
+    types = [_event_type(f) for f in sent]
+    assert types[:2] == ["response.created", "response.in_progress"]
+    assert types[-1] == "response.completed"
+    assert "error" not in types
+    assert _event_data(sent[-1])["response"]["output"] == []
+    server._extract_metrics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_first_token_time_is_taken_at_the_first_result(monkeypatch):
+    """The TTFT the perf metrics record is the wait for the first result, not the whole stream."""
+    server = _server_streaming(monkeypatch, [(0.1, "Hello"), (0.3, " world")])
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    clock = server._adjusted_steady_clock
+
+    start = clock.now()
+    response = await server.openai_responses(request, raw_request)
+    await _collect(response.body_iterator)
+    end = clock.now()
+
+    first = getattr(raw_request.state, "server_first_token_time", None)
+    assert first is not None, "the stream did not record its first-token time"
+    assert start <= first <= end
+    # The second step's 0.3 s pause comes after the first result.
+    assert end - first >= 0.25
