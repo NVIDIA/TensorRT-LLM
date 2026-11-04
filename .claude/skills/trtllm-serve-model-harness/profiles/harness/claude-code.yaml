@@ -54,7 +54,8 @@ tools:
 parallel_tool_calls: TODO   # does it ever send disable_parallel_tool_use? main rejects it with a 400
 
 outcomes:                   # tool_result blocks by tool_use_id; measured (2.1.289, fake server):
-                            # all four carry is_error: true, so order matters
+                            # all four carry is_error: true, so order matters, and a result
+                            # without it is the tool's output, whatever its text
   aborted:                  # a call Claude Code did not run: rejected by the user or a permission
     prefix:                 # rule, or interrupted; read from the 2.1.289, 2.1.299 and 2.1.309
       - "The user doesn't want to proceed with this tool use."   # binaries
@@ -62,8 +63,9 @@ outcomes:                   # tool_result blocks by tool_use_id; measured (2.1.2
       - "Permission to use "
       - "[Request interrupted by user for tool use]"
       - "[Tool call did not complete:"
-  unsupported: {contains: "No such tool available"}    # <tool_use_error>Error: No such tool available: NAME</tool_use_error>
-  arguments_rejected: {contains: "InputValidationError"}  # <tool_use_error>InputValidationError: ...</tool_use_error>
+    is_error: true
+  unsupported: {contains: "No such tool available", is_error: true}    # <tool_use_error>Error: No such tool available: NAME</tool_use_error>
+  arguments_rejected: {contains: "InputValidationError", is_error: true}  # <tool_use_error>InputValidationError: ...</tool_use_error>
   tool_error: {is_error: true}                         # the tool ran and failed, e.g. "File does not exist."
 
 errors:

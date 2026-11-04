@@ -112,8 +112,10 @@ class OutcomeRules:
         error: {is_error: true}
 
     Rules are tried in profile order; the first match wins; no match is ``result``. A ``prefix``
-    may be a list (any of them). ``{none: reason}`` declares that the harness has no such outcome:
-    it matches nothing, and a rated check of that class is NOT_APPLICABLE with the reason.
+    may be a list (any of them). ``is_error`` next to a text pattern is one more condition: the
+    result must carry that flag (an absent flag is not ``true``). ``{none: reason}`` declares that
+    the harness has no such outcome: it matches nothing, and a rated check of that class is
+    NOT_APPLICABLE with the reason.
     """
 
     def __init__(self, rules: Dict[str, Dict[str, Any]]):
@@ -133,6 +135,8 @@ class OutcomeRules:
         stripped = (text or "").strip()
         view = outcome_view(stripped)
         for cls, rule in self.rules:
+            if "is_error" in rule and is_error is not rule["is_error"]:
+                continue
             if "exact" in rule and stripped == rule["exact"]:
                 return cls
             if "prefix" in rule and stripped.startswith(rule["prefix"]):
@@ -141,7 +145,7 @@ class OutcomeRules:
                 return cls
             if "_rx" in rule and rule["_rx"].search(view):
                 return cls
-            if "is_error" in rule and set(rule) <= {"is_error"} and is_error is rule["is_error"]:
+            if set(rule) == {"is_error"}:
                 return cls
         return "result"
 

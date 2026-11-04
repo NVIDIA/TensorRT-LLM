@@ -395,6 +395,19 @@ def test_todo_profile_fields_are_unknown():
     assert profile.get_path("timeouts.first_event_s") == 30
 
 
+@pytest.mark.parametrize("text, cls", [
+    ("Permission to use Bash has been denied.", "aborted"),
+    ("<tool_use_error>Error: No such tool available: Foo</tool_use_error>", "unsupported"),
+    ("<tool_use_error>InputValidationError: Read failed</tool_use_error>", "arguments_rejected"),
+])  # fmt: skip
+def test_claude_code_error_wordings_count_only_on_an_error_result(text, cls):
+    """A Claude Code outcome wording in a result without is_error: true is the tool's output."""
+    path = os.path.join(os.path.dirname(VALIDATE), "..", "profiles", "harness", "claude-code.yaml")
+    rules = profiles.outcome_rules(profiles.load_profile(path))
+    assert rules.classify(text, True) == cls
+    assert rules.classify(text, False) == rules.classify(text, None) == "result"
+
+
 def test_session_rates_need_session_identity():
     report = {"counts": {"den:replies": 50, "den:calls": 40, "M-02": 0}, "sessions": 0,
               "sessions_with": {}, "outcome_classes": {}, "examples": {}, "by_rule": {}}  # fmt: skip
