@@ -35,7 +35,7 @@
 #include "tensorrt_llm/common/cudaArchitectures.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
-#if TRTLLM_ENABLE_NCCL_PROFILING
+#if defined(TORCH_CUDA)
 #include "tensorrt_llm/common/profiler.h"
 #endif
 #include "tensorrt_llm/common/tllmDataType.h"
@@ -85,7 +85,7 @@ using OptVec = std::optional<std::vector<T>>;
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
-#if TRTLLM_ENABLE_NCCL_PROFILING
+#if defined(TORCH_CUDA)
     auto const diagnostic = tc::initializeProfiler();
     if (diagnostic)
     {
