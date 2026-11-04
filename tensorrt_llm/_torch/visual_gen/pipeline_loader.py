@@ -32,6 +32,7 @@ Dynamic Quantization:
 
 import os
 import time
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -48,10 +49,12 @@ from tensorrt_llm.visual_gen.args import VisualGenArgs
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
+from .models.ltx23.checkpoint import resolve_ltx23_checkpoint
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline
+    from .sleep import SleepRestoreMode
 
 
 class PipelineLoader:
@@ -89,11 +92,11 @@ class PipelineLoader:
         self.device = torch.device(device)
 
     def _resolve_checkpoint_dir(self, checkpoint_dir: str) -> str:
-        """Resolve checkpoint_dir to a local directory path.
+        """Resolve checkpoint_dir to a local checkpoint path.
 
-        If checkpoint_dir is an existing local path, returns it unchanged.
-        Otherwise, attempts to download from HuggingFace Hub using the
-        file-lock-protected download utility. Pipelines may register an
+        LTX-2.3 directories and Hub IDs select one workflow-specific file.
+        Other existing local paths are returned unchanged. Hub downloads use
+        the file-lock-protected download utility. Pipelines may register an
         allow-list so repositories with multiple checkpoint variants only
         fetch the components supported by TRT-LLM.
 
@@ -101,13 +104,27 @@ class PipelineLoader:
             checkpoint_dir: Local path or HuggingFace Hub model ID.
 
         Returns:
-            Path to local directory containing the model.
+            Local checkpoint file or directory containing the model.
 
         Raises:
             ValueError: If the path cannot be resolved (invalid repo ID,
                 authentication failure, offline with no cache, etc.)
         """
         if os.path.exists(checkpoint_dir):
+            if os.path.isdir(checkpoint_dir):
+                try:
+                    class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+                except ValueError:
+                    return checkpoint_dir
+                if class_name in ("LTX23Pipeline", "LTX23RetakePipeline"):
+                    default_workflow = (
+                        "retake" if class_name == "LTX23RetakePipeline" else "generation"
+                    )
+                    return resolve_ltx23_checkpoint(
+                        checkpoint_dir,
+                        workflow=self.args.pipeline_config.get("workflow", default_workflow),
+                        revision=self.args.revision,
+                    )
             return checkpoint_dir
 
         revision = self.args.revision
@@ -124,6 +141,17 @@ class PipelineLoader:
                 ),
                 None,
             )
+            if entry is not None and entry.pipeline_cls.__name__ in (
+                "LTX23Pipeline",
+                "LTX23RetakePipeline",
+            ):
+                return resolve_ltx23_checkpoint(
+                    checkpoint_dir,
+                    workflow=self.args.pipeline_config.get(
+                        "workflow", entry.defaults.get("workflow", "generation")
+                    ),
+                    revision=revision,
+                )
             if entry is not None and entry.download_patterns:
                 local_dir = download_hf_partial(
                     checkpoint_dir,
@@ -200,6 +228,41 @@ class PipelineLoader:
         checkpoint_dir: Optional[str] = None,
         skip_warmup: bool = False,
         skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
+        *,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
+    ) -> "BasePipeline":
+        """Load a pipeline, optionally backing its persistent GPU state in host RAM.
+
+        Sleep support and configuration checks belong to the resolved pipeline.
+        Its loading context captures persistent allocations before weights are
+        materialized; warmup runs after that context exits. Ordinary loading
+        does not enter the sleep loading context.
+        """
+        if sleep_restore_mode is None:
+            return self._load(checkpoint_dir, skip_warmup, skip_components)
+
+        with ExitStack() as loading_stack:
+            # Constructor capability checks must use the loader's target GPU.
+            loading_stack.enter_context(torch.cuda.device(self.device))
+            pipeline = self._load(
+                checkpoint_dir,
+                True,
+                skip_components,
+                sleep_restore_mode=sleep_restore_mode,
+                loading_stack=loading_stack,
+            )
+        if not skip_warmup:
+            pipeline.warmup()
+        return pipeline
+
+    def _load(
+        self,
+        checkpoint_dir: Optional[str],
+        skip_warmup: bool,
+        skip_components: Optional[List[Union[str, PipelineComponent]]],
+        *,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
+        loading_stack: ExitStack | None = None,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
@@ -294,6 +357,13 @@ class PipelineLoader:
         logger.info("Creating pipeline with MetaInitMode")
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
+
+        if sleep_restore_mode is not None:
+            if loading_stack is None:
+                raise RuntimeError("Sleep loading requires a loading context stack")
+            loading_stack.enter_context(
+                pipeline._sleep_loading_context(sleep_restore_mode, device=self.device)
+            )
 
         # Convert meta tensors to their runtime devices. Offloaded submodules
         # stay on CPU until they are explicitly staged.

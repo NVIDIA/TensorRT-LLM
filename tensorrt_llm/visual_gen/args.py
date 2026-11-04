@@ -103,6 +103,15 @@ class QuantAttentionConfig(StrictBaseModel):
             "quantized type has to cover. SageAttention only."
         ),
     )
+    smooth_v: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Subtract the per-channel V mean before quantizing V and add it back to the output. "
+            "SageAttention only; applied where the attention runs on the PrimTS kernels, while "
+            "the trtllm-gen kernels quantize V without it."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -152,10 +161,12 @@ class AttentionConfig(StrictBaseModel):
                 ("int8", "fp8", (1, 16, 1)),
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
             },
             103: {
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
             },
         }
         # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
@@ -176,6 +187,7 @@ class AttentionConfig(StrictBaseModel):
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 1)),
             ("nvfp4", "fp8", (0, 0, 0)),
@@ -205,15 +217,20 @@ class AttentionConfig(StrictBaseModel):
                     f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
                     f"{sorted(recipes)}."
                 )
-            if q_config.smooth_k and q_config.q_block_size == 0:
+            if (q_config.smooth_k or q_config.smooth_v) and q_config.q_block_size == 0:
                 raise ValueError(
-                    "smooth_k is a SageAttention option and does not apply to the per-tensor "
-                    f"recipe {recipe!r}."
+                    "smooth_k and smooth_v are SageAttention options and do not apply to the "
+                    f"per-tensor recipe {recipe!r}."
                 )
-        elif q_config.smooth_k:
+            if q_config.smooth_v and sm_version not in (100, 103):
+                raise ValueError(
+                    "smooth_v needs the PrimTS kernels, which add the V mean back to the "
+                    f"attention output and run on SM100 and SM103 only; got SM{sm_version}."
+                )
+        elif q_config.smooth_k or q_config.smooth_v:
             raise ValueError(
-                f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
-                f"backend='{self.backend}'."
+                f"smooth_k and smooth_v are SageAttention options and require backend='TRTLLM', "
+                f"got backend='{self.backend}'."
             )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
@@ -276,15 +293,23 @@ class AttentionConfig(StrictBaseModel):
         if self.quant_attention_config is None or self.sparse_attention_config is None:
             return self
 
-        # VSA and SOL replace the dense attention path on every backend that
-        # serves them and never consume quant_attention_config, so accepting a
-        # quantization recipe would silently ignore user configuration.
+        # VSA and SOL replace the dense attention path. On TRTLLM every call
+        # carries the SageAttention recipe to the attention kernels, which either
+        # apply it or reject the call, so the recipe is never silently dropped.
+        # The other backends never consume quant_attention_config on that path,
+        # so accepting a recipe there would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
+        if self.backend == "TRTLLM":
+            return self
         algorithm = self.sparse_attention_config.algorithm
         if algorithm == "vsa":
-            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "VSA and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         if algorithm == "sol_attn":
-            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "SOL and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         return self
 
 
@@ -388,6 +413,20 @@ class ParallelConfig(StrictBaseModel):
         """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
         return self.tp_layout == "token_sharded"
 
+    text_encoder_tp_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=(
+            "Text encoder tensor-parallel group size. Currently MiniMax-H3 "
+            "only: text-only prompts shard the Qwen3-VL text encoder across "
+            "ranks [0, text_encoder_tp_size), while Ref2VA or FL2VA requests "
+            "with Qwen vision inputs must use text_encoder_tp_size=1. "
+            "The rank 0 worker broadcasts prompt "
+            "embeddings to the remaining ranks."
+        ),
+    )
+
     @property
     def seq_parallel_size(self) -> int:
         """Parallelism degree over the sequence/context axis.
@@ -453,6 +492,11 @@ class ParallelConfig(StrictBaseModel):
         if self.total_parallel_size > world_size:
             raise ValueError(
                 f"total_parallel_size ({self.total_parallel_size}) "
+                f"exceeds world_size ({world_size})"
+            )
+        if self.text_encoder_tp_size > world_size:
+            raise ValueError(
+                f"text_encoder_tp_size ({self.text_encoder_tp_size}) "
                 f"exceeds world_size ({world_size})"
             )
 

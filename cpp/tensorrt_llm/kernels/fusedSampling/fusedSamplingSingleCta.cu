@@ -18,8 +18,8 @@
 #include "fusedSamplingKernelsCommon.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace fusedSampling
@@ -111,4 +111,5 @@ template void launchFusedSamplingSingleCta<__nv_bfloat16>(FusedSamplingParams co
 
 } // namespace fusedSampling
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -86,8 +86,7 @@ class GuidedRequest:
         return cls(
             guided_decoding_params=request.py_guided_decoding_params,
             request_id=request.py_request_id,
-            seq_slot=(request.py_target_seq_slot
-                      if request.py_is_draft else request.py_seq_slot),
+            seq_slot=request.py_seq_slot,
             prev_seq_slot=request.py_batch_idx,
             is_context_init_state=request.is_context_init_state,
             is_last_context_chunk=(request.is_context_init_state
@@ -100,7 +99,6 @@ class GuidedRequest:
                 and request.py_decoding_iter == 1
                 and request.py_batch_idx is None),
             new_token=request.get_last_tokens(0),
-            is_draft=request.py_is_draft,
             draft_tokens=request.py_draft_tokens,
             num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
 
@@ -563,7 +561,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
         # self.token_event.record() should be called inside CUDA graph capturing;
-        # currently, it is in DecoderRunner._preprocess_inputs.
+        # currently, it is in DecoderInputPreparer.preprocess_inputs.
 
     @hostfunc
     def fetch_batch(self) -> None:

@@ -16,9 +16,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-    gvr_topk_decode_self_sampling_host as ss,
-)
+from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling_host as ss
 from tensorrt_llm._utils import get_sm_version
 
 skip_not_sm100 = pytest.mark.skipif(
@@ -33,8 +31,13 @@ _SHAPES = [
     (64, 131072, 512),
     (128, 32768, 2048),
     (1, 524288, 1024),
+    (256, 32783, 1024),
+    (512, 32783, 2048),
+    (256, 131087, 2048),
+    (512, 131075, 1024),
+    (4, 32771, 2048),  # reg_clus with K=2048
 ]
-_PATTERNS = ["unique", "quantized", "equal", "boundary"]
+_PATTERNS = ["unique", "quantized", "equal", "boundary", "clustered"]
 
 
 def _row(n: int, k: int, pattern: str) -> torch.Tensor:
@@ -46,6 +49,10 @@ def _row(n: int, k: int, pattern: str) -> torch.Tensor:
         return base.bfloat16().float()
     if pattern == "equal":
         return torch.ones(n)
+    if pattern == "clustered":
+        # Concentrate high scores in the chunks owned by a single warp.
+        indices = torch.arange(n)
+        return base + 2 * ((indices // 4) % 512 < 32).float()
     perm = torch.randperm(n, generator=gen)  # 64 ties straddling the boundary, 16 of them selected
     row = torch.zeros(n)
     row[perm[: k - 16]] = 2
@@ -61,6 +68,8 @@ def _oracle(row: torch.Tensor, k: int) -> set:
 
 def _run(scores, k, n, **kw):
     b = scores.shape[0]
+    if scores.shape[1] % 16:
+        scores = torch.nn.functional.pad(scores, (0, -scores.shape[1] % 16))
     lengths = torch.full((b,), n, dtype=torch.int32, device="cuda")
     out = torch.empty((b, k), dtype=torch.int32, device="cuda")
     ss.run_varlen(scores, lengths, out, max_seq_len=n, **kw)

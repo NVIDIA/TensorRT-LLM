@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared layout of the route records produced before sparse attention."""
+"""Layout of the route records the block-sparse prepare writes before attention."""
 
 from dataclasses import dataclass
 
@@ -25,6 +25,7 @@ _PREPARED_ROUTE_IS_FULL_FLAG = 1 << 0
 _PREPARED_ROUTE_IS_PROXY_FLAG = 1 << 1
 _SUPPORTED_KV_ROUTE_SIZES = (128, 256)
 _SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
+_FLOAT4_WORDS = 4
 
 
 def _validate_int(value: object, name: str, *, allow_zero: bool) -> int:

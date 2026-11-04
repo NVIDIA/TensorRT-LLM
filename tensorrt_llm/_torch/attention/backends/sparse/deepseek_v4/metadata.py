@@ -241,6 +241,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
+        # Absolute token positions feed the PrimTS sparse MLA FMHA (window
+        # lengths and the fused output RoPE). The DSA base allocates them only
+        # for the fp8_ds_mla layout, so provide them for every DSv4 cache mode.
+        if getattr(self, "token_positions_cuda", None) is None:
+            self.token_positions_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name="token_positions_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+
         # Compute max_compressed_indices for CUDA graph compatibility.
         # For ratio=4, the indexer selects index_topk compressed tokens.
         # For ratio=128, use max_seq_len / 128 rounded up to next power of 2
@@ -295,6 +307,23 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
+        # One mixed-precision high page table per compression ratio; -1 = not in the high pool.
+        manager = self.kv_cache_manager
+        if manager.mixed_precision_high_layers:
+            self._mixed_precision_high_table_layers = {}
+            for local, high_layer in manager.mixed_precision_high_layers.items():
+                ratio = manager._compress_ratios[manager.pp_layers[local]]
+                self._mixed_precision_high_table_layers.setdefault(ratio, high_layer)
+            self.mixed_precision_high_block_table = {
+                compress_ratio: self.get_empty(
+                    self.cuda_graph_buffers,
+                    compress_block_table_shape,
+                    cache_name=f"mixed_precision_high_block_table_{compress_ratio}",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
+                for compress_ratio in self._mixed_precision_high_table_layers
+            }
         self._init_sparse_offload_state()
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -308,6 +337,28 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             for compress_ratio in self.compress_ratio_set
+        }
+        # Live per-source lengths for the dual-pool FMHA libraries, derived once
+        # per step next to sparse_mla_topk_lens: SWA rows live per token
+        # (min(pos + 1, window)) and compressed rows live per compress ratio
+        # (sparse_mla_topk_lens[ratio] - window). Shape: [max_num_tokens].
+        self.sparse_mla_swa_lens = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens,),
+            cache_name="sparse_mla_swa_lens",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.sparse_mla_extra_lens = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name=f"sparse_mla_extra_lens_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self.compress_ratio_set
+            if compress_ratio > 1
         }
 
         # cached_token_lens_cuda: number of tokens already cached per request
@@ -484,6 +535,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
+        for compress_ratio, high_table in (self.mixed_precision_high_block_table or {}).items():
+            # Any mixed-precision high layer of this ratio shares the pool.
+            self._fill_mixed_precision_high_block_table(
+                self.kv_cache_manager,
+                self._mixed_precision_high_table_layers[compress_ratio],
+                high_table,
+            )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
@@ -504,7 +562,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
             token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
 
-        if self.use_fp8_ds_mla:
+        if self.token_positions_cuda is not None:
             self.token_positions_cuda[: token_positions.shape[0]] = token_positions
 
         self._prepare_deepseek_v4_indices_compiled(
@@ -516,6 +574,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.compressed_local_indices_cuda,
             self.sparse_mla_topk_lens,
             self._compress_ratios_sorted,
+            self.sparse_mla_swa_lens,
+            self.sparse_mla_extra_lens,
         )
 
     @staticmethod
@@ -529,8 +589,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_local_indices_buf: torch.Tensor,
         sparse_mla_topk_lens_bufs: Dict[int, torch.Tensor],
         compress_ratios: list,
+        swa_lens_buf: torch.Tensor,
+        extra_lens_bufs: Dict[int, torch.Tensor],
     ):
-        """Build SWA indices, compressed indices, and topk_lens in one fused graph."""
+        """Build SWA indices, compressed indices, topk_lens and live lengths in one fused graph."""
         device = token_positions.device
         num_tokens = token_positions.shape[0]
 
@@ -568,6 +630,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For ratio>1, the SWA region always occupies exactly window_size (128)
         # slots. Invalid SWA positions are padded with -1 in the index buffer.
         kv_lens = token_positions + 1
+        swa_lens_buf[:num_tokens] = kv_lens.clamp(max=window_size).to(torch.int32)
         for compress_ratio in compress_ratios:
             if compress_ratio == 1:
                 total_count = kv_lens.clamp(max=window_size)
@@ -580,6 +643,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             else:
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
+            if compress_ratio > 1:
+                extra_lens_bufs[compress_ratio][:num_tokens] = compressed_count.to(torch.int32)
 
     def _build_cache_buffer_data_pointers(
         self, manager: "DeepseekV4CacheManager", compress_ratios_by_layer: list[int]
@@ -657,6 +722,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Repoint sparse fields to the draft buffers for a draft forward."""
+        # Draft layers have no mixed-precision high layer while the draft manager is in use.
+        self.swap_for_draft("mixed_precision_high_block_table", None)
         if self.draft_sliding_block_tables is None:
             return None
         saved_state = {field: getattr(self, field) for field in self._DRAFT_SPARSE_FIELDS}
@@ -931,9 +998,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 gen_output_offsets,
             )
 
-    def on_update_kv_lens(self):
+    def on_update_kv_lens(self, skip_indexer_schedule: bool = False):
         """Recompute kv-lens-dependent DeepSeek-V4 metadata on device."""
-        super().on_update_kv_lens()
+        super().on_update_kv_lens(skip_indexer_schedule=skip_indexer_schedule)
 
         batch_size = self.num_seqs
         num_tokens = self.num_tokens

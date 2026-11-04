@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     MLAParams,
     PositionalEmbeddingParams,
     PositionEmbeddingType,
+    RopeParams,
     RotaryScalingType,
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
@@ -46,7 +47,6 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
-from tensorrt_llm._torch.attention.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import get_sm_version
@@ -131,6 +131,7 @@ class DummyAttentionMetadata:
         self.num_total_compressed_tokens = num_total_compressed_tokens
         self.max_ctx_compressed_tokens = max_ctx_compressed_tokens
         self.compressed_mask_cuda = compressed_mask_cuda
+        self.has_mixed_precision_high_rows = False
         self.num_gen_tokens_per_seq = 0  # Set by caller
         self.gen_new_tokens_per_seq = None
         self.kv_lens_cuda_runtime = None  # Set by caller

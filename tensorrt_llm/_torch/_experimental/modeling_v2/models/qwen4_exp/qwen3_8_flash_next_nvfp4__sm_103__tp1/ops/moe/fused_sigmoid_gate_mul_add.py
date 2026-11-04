@@ -59,30 +59,12 @@ class FusedSigmoidGateMulAdd(OpWrapper):
             why="_moe_block / MTPLayer._moe decode: one token, in place; 8 warps",
             spec=_ckpt(1),
         ),
-        Cell(why="2 tokens: the smallest multi-row grid", spec=_ckpt(2)),
-        Cell(why="17 tokens: an odd count", spec=_ckpt(17)),
         Cell(why="2048 tokens: prefill-shaped", spec=_ckpt(2048)),
-        Cell(why="fp16 activations", spec=_ckpt(33, dtype=torch.float16, gate_dtype=torch.float16)),
-        Cell(why="fp32 activations", spec=_ckpt(33, dtype=torch.float32, gate_dtype=torch.float32)),
-        Cell(why="fp32 gate against bf16 activations", spec=_ckpt(9, gate_dtype=torch.float32)),
-        Cell(why="gate as a flat [T] vector", spec=_ckpt(33, gate_layout="flat")),
-        Cell(why="gate as a [1, T] row", spec=_ckpt(33, gate_layout="row")),
         Cell(
-            why="gate as a strided column of a wider tensor", spec=_ckpt(33, gate_layout="strided")
+            why="gate as a strided column of a wider tensor, as the trunk's fused shared-expert "
+            "GEMM leaves it",
+            spec=_ckpt(33, gate_layout="strided"),
         ),
-        Cell(why="into an output buffer: both inputs untouched", spec=_ckpt(17, dest="output")),
-        Cell(
-            why="row-padded windows: every tensor's row stride exceeds hidden",
-            spec=_ckpt(33, dest="padded"),
-        ),
-        # Launch regimes: the column block is next_pow2(hidden) capped at 8192,
-        # and the warp count steps with it.
-        Cell(why="hidden 1: the 16-wide minimum block, 2 warps", spec=_ckpt(8, hidden=1)),
-        Cell(why="hidden 7: an odd width inside the minimum block", spec=_ckpt(8, hidden=7)),
-        Cell(why="hidden 640: a 1024 block, 4 warps", spec=_ckpt(8, hidden=640)),
-        Cell(why="hidden 6145: one 8192 block, mostly masked", spec=_ckpt(8, hidden=6145)),
-        Cell(why="hidden 12288: two column blocks", spec=_ckpt(8, hidden=12288)),
-        Cell(why="hidden 20480: three column blocks, masked tail", spec=_ckpt(8, hidden=20480)),
     )
 
     note = """
@@ -90,15 +72,16 @@ class FusedSigmoidGateMulAdd(OpWrapper):
     The Triton kernel JIT-compiles on first call.
 
     Preconditions, all enforced loudly by the callable (AssertionError before
-    any launch): `final_hidden_states` 2-D; `shared_expert_output` and `output`
-    match it in shape and dtype; `gate_logits.numel() == num_tokens`; the
-    destination has `stride(-1) == 1` (its row stride is free). A
-    column-strided `final_hidden_states` or `shared_expert_output` is densified
-    inside the call (an extra copy kernel), as is a non-contiguous gate. Host
-    operands raise ValueError from Triton. `num_tokens == 0` returns the
-    destination without launching. `output` may alias `shared_expert_output`.
+    any launch; the test holds the wrong-length gate): `final_hidden_states`
+    2-D; `shared_expert_output` and `output` match it in shape and dtype;
+    `gate_logits.numel() == num_tokens`; the destination has `stride(-1) == 1`
+    (its row stride is free). A column-strided `final_hidden_states` or
+    `shared_expert_output` is densified inside the call (an extra copy kernel),
+    as is a non-contiguous gate. `num_tokens == 0` returns the destination
+    without launching (certified).
 
-    Numerics: the default `assert_close` band holds for bf16, fp16 and fp32.
+    Numerics: the default `assert_close` band holds for bf16, the dtype the target
+    calls it with; fp16 and fp32 run the same kernel and are not certified.
     bf16 at hidden 2560 is bitwise equal at 1-2 tokens and >= 99.993% bitwise
     at 17-8192 tokens, one ulp otherwise -- `tl.sigmoid`'s fast exponential.
     Wrong variants land 29,000-152,000x outside the bf16 band: no sigmoid,
@@ -108,8 +91,11 @@ class FusedSigmoidGateMulAdd(OpWrapper):
     Hard limits
       num_tokens  row offset widened to int64 in the kernel; largest run 8192
 
-    Not certified: CUDA-graph capture, torch.compile, operands on two devices,
-    float8 activations.
+    Not certified: hidden sizes other than 2560 (the column block and warp count
+    step with it), gate layouts other than `[T, 1]` and the strided column, an
+    `output` buffer (including one aliasing `shared_expert_output`), row-padded
+    operands, host operands, CUDA-graph capture, torch.compile, operands on two
+    devices, float8 activations.
     """
 
     def __call__(

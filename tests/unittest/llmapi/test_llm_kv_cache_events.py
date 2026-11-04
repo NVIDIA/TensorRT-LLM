@@ -36,7 +36,7 @@ global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,
                                       enable_block_reuse=True,
                                       max_tokens=256,
-                                      use_kv_cache_manager_v2=False)
+                                      use_kv_cache_manager_v2=True)
 
 
 def create_kv_cache_manager():
@@ -48,7 +48,8 @@ def create_kv_cache_manager():
     max_batch_size = 1
     mapping = Mapping()
     return KVCacheManager(
-        kv_cache_config=global_kvcache_config,
+        kv_cache_config=global_kvcache_config.model_copy(
+            update={"use_kv_cache_manager_v2": False}),
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.
         SELF,
         num_layers=num_layers,
@@ -61,10 +62,12 @@ def create_kv_cache_manager():
     )
 
 
-def create_llm(tensor_parallel_size=1):
+def create_llm(tensor_parallel_size=1, kv_cache_config=None):
+    if kv_cache_config is None:
+        kv_cache_config = global_kvcache_config
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
-               kv_cache_config=global_kvcache_config,
+               kv_cache_config=kv_cache_config,
                enable_autotuner=False)
 
 
@@ -245,6 +248,26 @@ def test_mm_key_with_uuid():
     result_old_format = KVCacheEventSerializer._mm_key_to_json(
         mock_mm_key_old_format)
     assert result_old_format["hash"] == expected_hash
+
+    # V2 marks UUID as additive: hash remains the digest and UUID is emitted
+    # separately for routing identity.
+    mock_mm_key_v2 = (mock_hash, mock_offset, test_uuid, True)
+    result_v2 = KVCacheEventSerializer._mm_key_to_json(mock_mm_key_v2)
+    assert result_v2 == {
+        "type": "mm_key",
+        "hash": expected_hash,
+        "uuid": test_uuid,
+        "start_offset": 42,
+    }
+
+    mock_mm_key_v2_without_uuid = (mock_hash, mock_offset, None, True)
+    result_v2_without_uuid = KVCacheEventSerializer._mm_key_to_json(
+        mock_mm_key_v2_without_uuid)
+    assert result_v2_without_uuid == {
+        "type": "mm_key",
+        "hash": expected_hash,
+        "start_offset": 42,
+    }
 
 
 def test_apply_mm_hashes_with_uuids():
@@ -788,52 +811,56 @@ def test_apply_mm_hashes_multiple_modalities():
 
 def test_mm_keys_in_stored_events():
     """Test that mm_keys field is present in stored block events."""
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
+        events = llm.get_kv_cache_events(5)
 
-    # Find stored events and verify mm_keys and cache_salt fields
-    for event in events:
-        if event and event["data"]["type"] == "stored":
-            blocks = event["data"]["blocks"]
-            for block in blocks:
-                # mm_keys should always be present (empty list for text-only)
-                assert "mm_keys" in block
-                assert isinstance(block["mm_keys"], list)
-                # For text-only requests, mm_keys should be empty
-                assert block["mm_keys"] == []
-                # cache_salt should be present (None for unsalted requests)
-                assert "cache_salt" in block
-                assert block["cache_salt"] is None
+        # Find stored events and verify mm_keys and cache_salt fields
+        found_stored = False
+        for event in events:
+            if event and event["data"]["type"] == "stored":
+                found_stored = True
+                blocks = event["data"]["blocks"]
+                for block in blocks:
+                    # mm_keys should always be present (empty list for text-only)
+                    assert "mm_keys" in block
+                    assert isinstance(block["mm_keys"], list)
+                    # For text-only requests, mm_keys should be empty
+                    assert block["mm_keys"] == []
+                    # cache_salt should be present (None for unsalted requests)
+                    assert "cache_salt" in block
+                    assert block["cache_salt"] is None
+
+        assert found_stored, "No stored events found"
 
 
 def test_cache_salt_in_stored_events():
     """Test that cache_salt string is preserved in stored block events."""
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt,
-                     sampling_params=sampling_params,
-                     cache_salt="tenant-A")
+        _ = llm.generate(prompt,
+                         sampling_params=sampling_params,
+                         cache_salt="tenant-A")
 
-    events = llm.get_kv_cache_events(5)
+        events = llm.get_kv_cache_events(5)
 
-    # Find stored events and verify cache_salt field
-    found_stored = False
-    for event in events:
-        if event and event["data"]["type"] == "stored":
-            found_stored = True
-            blocks = event["data"]["blocks"]
-            for block in blocks:
-                assert "cache_salt" in block
-                assert block["cache_salt"] == "tenant-A"
+        # Find stored events and verify cache_salt field
+        found_stored = False
+        for event in events:
+            if event and event["data"]["type"] == "stored":
+                found_stored = True
+                blocks = event["data"]["blocks"]
+                for block in blocks:
+                    assert "cache_salt" in block
+                    assert block["cache_salt"] == "tenant-A"
 
-    assert found_stored, "No stored events found"
+        assert found_stored, "No stored events found"
 
 
 def test_cache_salt_max_length_validation():
@@ -869,41 +896,43 @@ def test_cache_salt_max_length_validation():
 
 def test_non_ascii_cache_salt_in_stored_events():
     """Test that a non-ASCII cache_salt string is preserved in stored block events."""
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
-    salt = "tenant-中文"  # mixed ASCII + Chinese
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
+        salt = "tenant-中文"  # mixed ASCII + Chinese
 
-    _ = llm.generate(prompt, sampling_params=sampling_params, cache_salt=salt)
+        _ = llm.generate(prompt,
+                         sampling_params=sampling_params,
+                         cache_salt=salt)
 
-    events = llm.get_kv_cache_events(5)
+        events = llm.get_kv_cache_events(5)
 
-    found_stored = False
-    for event in events:
-        if event and event["data"]["type"] == "stored":
-            found_stored = True
-            for block in event["data"]["blocks"]:
-                assert block.get("cache_salt") == salt
+        found_stored = False
+        for event in events:
+            if event and event["data"]["type"] == "stored":
+                found_stored = True
+                for block in event["data"]["blocks"]:
+                    assert block.get("cache_salt") == salt
 
-    assert found_stored, "No stored events found"
+        assert found_stored, "No stored events found"
 
 
 def test_expected_kv_cache_events():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
-    # created + stored events
-    assert events and len(events) >= 2
-    for event in events:
-        if event:
-            if event["event_id"] == 0:
-                assert event["data"]["type"] == "created"
-            elif event["event_id"] == 1:
-                assert event["data"]["type"] == "stored"
+        events = llm.get_kv_cache_events(5)
+        # created + stored events
+        assert events and len(events) >= 2
+        for event in events:
+            if event:
+                if event["event_id"] == 0:
+                    assert event["data"]["type"] == "created"
+                elif event["event_id"] == 1:
+                    assert event["data"]["type"] == "stored"
 
 
 def test_expected_v2_kv_cache_events():
@@ -939,155 +968,168 @@ def test_expected_v2_kv_cache_events():
 
 
 def test_kv_cache_event_async_api():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    async def generate():
-        async for output in llm.generate_async(prompt,
-                                               streaming=True,
-                                               sampling_params=sampling_params):
-            pass
+        async def generate():
+            async for output in llm.generate_async(
+                    prompt, streaming=True, sampling_params=sampling_params):
+                pass
 
-    events = []
+        events = []
 
-    async def get_events():
-        async for event in llm.get_kv_cache_events_async():
-            events.append(event)
+        async def get_events():
+            async for event in llm.get_kv_cache_events_async():
+                events.append(event)
 
-        assert events
+            assert events
 
-    async def main():
-        await generate()
-        await asyncio.gather(generate(), get_events())
-        await asyncio.gather(generate(), get_events())
+        async def main():
+            await generate()
+            await asyncio.gather(generate(), get_events())
+            await asyncio.gather(generate(), get_events())
 
-    asyncio.run(main())
+        asyncio.run(main())
 
 
-def check_events(llm,
-                 requests,
-                 sampling_params,
-                 scheduling_params=None,
-                 attention_dp_rank=None):
+def check_v2_events(llm: LLM,
+                    sampling_params: SamplingParams,
+                    all_created_events: list[dict],
+                    scheduling_params: SchedulingParams | None = None,
+                    attention_dp_rank: int | None = None) -> None:
 
-    _ = llm.generate(requests[0],
-                     sampling_params=sampling_params,
-                     scheduling_params=scheduling_params)
-    time.sleep(1)
-    events = llm.get_kv_cache_events(5)
-    # Created or stored event
-    total_stored_blocks = 0
-    if attention_dp_rank is None:
-        event = events.pop(0)  # created event
-        assert event["event_id"] == 0
-        assert event["data"]["type"] == "created"
-        while events:
-            event = events.pop(0)
-            if event:
-                assert event["data"]["type"] == "stored"
-                assert event["event_id"] > 0
-                total_stored_blocks += len(event["data"]["blocks"])
-    else:
-        while events:
-            event = events.pop(0)
-            if not event:
-                continue
-            assert "attention_dp_rank" in event
-            if event["attention_dp_rank"] == attention_dp_rank:
-                assert event["data"]["type"] in ["created", "stored"]
-                if event["data"]["type"] == "created":
-                    assert event["event_id"] == 0
-                if event["data"]["type"] == "stored":
-                    assert event["event_id"] > 0
-                    total_stored_blocks += len(event["data"]["blocks"])
+    def events_for_rank(events: list[dict]) -> list[dict]:
+        events = [event for event in events if event]
+        if attention_dp_rank is None:
+            return events
+        assert all("attention_dp_rank" in event for event in events)
+        return [
+            event for event in events
+            if event["attention_dp_rank"] == attention_dp_rank
+        ]
 
-    assert total_stored_blocks == 5  # Should have 5 blocks in total
+    tokens_per_block = llm.get_kv_cache_capacity()["tokensPerBlock"]
+    prompt_length = 127
+    # The last sampled token has no KV, so it is never committed.
+    committed_length = prompt_length + sampling_params.max_tokens - 1
+    blocks_per_request = (committed_length + tokens_per_block -
+                          1) // tokens_per_block
+    num_requests = 1
+    cached_blocks = {}
+    last_event_id = 0
+    num_offloaded_blocks = 0
+    num_removed_blocks = 0
 
-    _ = llm.generate(requests[1],
-                     sampling_params=sampling_params,
-                     scheduling_params=scheduling_params)
-    time.sleep(1)
-    events2 = llm.get_kv_cache_events(5)
+    request_index = 0
+    while request_index < num_requests:
+        prompt = list(range(request_index, request_index + prompt_length))
+        output = llm.generate(prompt,
+                              sampling_params=sampling_params,
+                              scheduling_params=scheduling_params)
+        assert len(output.outputs[0].token_ids) == sampling_params.max_tokens
+        time.sleep(1)
+        events = [event for event in llm.get_kv_cache_events(5) if event]
+        if request_index == 0:
+            # Created events become visible after the first executor iteration.
+            # Retain all ranks' events when validating attention DP sequentially.
+            all_created_events.extend(event for event in events
+                                      if event["data"]["type"] == "created")
+            created_events = events_for_rank(all_created_events)
+            assert len(created_events) == 1
+            created = created_events[0]
+            assert created["event_id"] == 0
+            assert created["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+            tier_blocks = created["data"]["num_blocks_per_cache_level"]
+            assert len(tier_blocks) == 2
+            assert all(blocks > 0 for blocks in tier_blocks)
+            # Distinct prefixes must exhaust both the GPU and host tier.
+            num_requests = sum(tier_blocks) // blocks_per_request + 2
+            events = [
+                event for event in events if event["data"]["type"] != "created"
+            ]
+        events = events_for_rank(events)
+        stored_blocks = []
+        for event in events:
+            assert event["event_id"] == last_event_id + 1
+            last_event_id = event["event_id"]
+            assert event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+            data = event["data"]
+            if data["type"] == "stored":
+                assert data["blocks"]
+                stored_blocks.extend(data["blocks"])
+                for block in data["blocks"]:
+                    block_hash = block["block_hash"]
+                    assert block_hash not in cached_blocks
+                    assert block["cache_level"] == 0
+                    cached_blocks[block_hash] = 0
+            elif data["type"] == "updated":
+                block_hash = data["block_hash"]
+                assert cached_blocks[block_hash] == 0
+                assert data["cache_level"] == {
+                    "type": "event_diff",
+                    "old_value": 0,
+                    "new_value": 1,
+                }
+                cached_blocks[block_hash] = 1
+                num_offloaded_blocks += 1
+            else:
+                assert data["type"] == "removed"
+                assert data["block_hashes"]
+                for block_hash in data["block_hashes"]:
+                    assert block_hash in cached_blocks
+                    del cached_blocks[block_hash]
+                    num_removed_blocks += 1
 
-    total_stored_blocks = 0
-    has_removed_event = False
-    while events2:
-        event = events2.pop(0)
-        if event and (attention_dp_rank is None
-                      or event.get("attention_dp_rank") == attention_dp_rank):
-            if event["data"]["type"] == "removed":
-                has_removed_event = True
-                assert event["data"]["block_hashes"]
-            # stored events
-            elif event["data"]["type"] == "stored":
-                total_stored_blocks += len(event["data"]["blocks"])
+        # V2 publishes the prompt and the decode tokens, including the partial tail.
+        committed_tokens = (
+            prompt + list(output.outputs[0].token_ids))[:committed_length]
+        assert [[token["token_id"] for token in block["tokens"]]
+                for block in stored_blocks] == [
+                    committed_tokens[start:start + tokens_per_block]
+                    for start in range(0, committed_length, tokens_per_block)
+                ]
+        if request_index == 0:
+            assert num_offloaded_blocks == 0
+            assert num_removed_blocks == 0
+        request_index += 1
 
-    assert total_stored_blocks == 5  # Should have 5 blocks in total
-    assert has_removed_event
-
-    _ = llm.generate(requests[2],
-                     sampling_params=sampling_params,
-                     scheduling_params=scheduling_params)
-    time.sleep(1)
-    events3 = llm.get_kv_cache_events(5)
-
-    total_stored_blocks = 0
-    has_removed_event = False
-    while events3:
-        event = events3.pop(0)
-        if event and (attention_dp_rank is None
-                      or event.get("attention_dp_rank") == attention_dp_rank):
-
-            if event["data"]["type"] == "removed":
-                has_removed_event = True
-                assert event["data"]["block_hashes"]
-            elif event["data"]["type"] == "stored":
-                total_stored_blocks += len(event["data"]["blocks"])
-
-    assert total_stored_blocks == 5  # Should have 5 blocks in total
-    assert has_removed_event
-
-    # no more events after request is finished
+    assert num_offloaded_blocks > 0
+    assert num_removed_blocks > 0
     assert not llm.get_kv_cache_events(5)
 
 
 def test_llm_kv_events_api():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6,
-                                     temperature=0.01,
-                                     ignore_eos=True)
+    tiered_config = global_kvcache_config.model_copy(
+        update={"host_cache_size": 32 * 1024 * 1024})
+    with create_llm(kv_cache_config=tiered_config) as llm:
+        sampling_params = SamplingParams(max_tokens=6,
+                                         temperature=0.01,
+                                         ignore_eos=True)
 
-    requests = []
-    for i in range(3):
-        input_tokens = list(range(127 + i))[i:]
-        requests.append(input_tokens)
-
-    check_events(llm, requests, sampling_params)
+        check_v2_events(llm, sampling_params, [])
 
 
 @skip_single_gpu
 @pytest.mark.threadleak(enabled=False)
 def test_llm_api_attention_dp_kv_events():
-
+    tiered_config = global_kvcache_config.model_copy(
+        update={"host_cache_size": 32 * 1024 * 1024})
     llm = LLM(model=llama_model_path,
               tensor_parallel_size=2,
               enable_attention_dp=True,
-              kv_cache_config=global_kvcache_config,
+              enable_lm_head_tp_in_adp=True,
+              kv_cache_config=tiered_config,
               enable_autotuner=False)
 
     sampling_params = SamplingParams(max_tokens=6,
                                      temperature=0.01,
                                      ignore_eos=True)
 
+    created_events = []
     for attention_dp_rank in range(2):
-        requests = []
-        for i in range(3):
-            input_tokens = list(range(127 + i))[i:]
-            requests.append(input_tokens)
-
         scheduling_params = SchedulingParams(
             attention_dp_rank=attention_dp_rank, attention_dp_relax=False)
 
-        check_events(llm, requests, sampling_params, scheduling_params,
-                     attention_dp_rank)
+        check_v2_events(llm, sampling_params, created_events, scheduling_params,
+                        attention_dp_rank)

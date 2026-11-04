@@ -499,3 +499,89 @@ def test_default_slurm_partition_empty_when_none_flagged(
 ):
     _fake_sinfo(monkeypatch, local_submit_module, "batch\ninteractive\n")
     assert local_submit_module.default_slurm_partition() == ""
+
+
+def _dwdp_disagg_config(num_ctx_servers=16, dwdp_size=16, num_groups=1, ctx_tp=1):
+    return {
+        "hardware": {"gpus_per_node": 4, "num_ctx_servers": num_ctx_servers, "num_gen_servers": 3},
+        "worker_config": {
+            "ctx": {
+                "tensor_parallel_size": ctx_tp,
+                "dwdp_config": {"dwdp_size": dwdp_size, "num_groups": num_groups},
+            },
+            "gen": {"tensor_parallel_size": 1, "context_parallel_size": 8},
+        },
+    }
+
+
+def _disagg_hardware(module: ModuleType, config: dict, benchmark_mode: str = "e2e") -> dict:
+    if Path(module.__file__).parent.name == "local":
+        return module.get_hardware_config(config, "disaggregated", benchmark_mode)
+    return module.get_hardware_config(config, "disaggregated", benchmark_mode, None)
+
+
+def test_dwdp_ctx_servers_pack_into_one_mpi_step(submit_module: ModuleType):
+    # 16 single-GPU ctx servers fill 4 nodes as one MPI step instead of taking
+    # a node each; the 3 helix CP8 gen servers keep 2 nodes apiece.
+    hardware = _disagg_hardware(submit_module, _dwdp_disagg_config())
+    assert hardware["dwdp_size"] == 16
+    assert hardware["ctx_nodes"] == 4
+    assert hardware["total_nodes"] == 4 + 3 * 2
+    assert hardware["total_gpus"] == 40
+
+
+def test_non_dwdp_ctx_servers_keep_one_node_slice_each(submit_module: ModuleType):
+    config = _dwdp_disagg_config()
+    del config["worker_config"]["ctx"]["dwdp_config"]
+    hardware = _disagg_hardware(submit_module, config)
+    assert hardware["dwdp_size"] == 0
+    assert hardware["ctx_nodes"] == 16
+    assert hardware["total_nodes"] == 16 + 3 * 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"ctx_tp": 2}, r"tp \* pp \* cp == 1"),
+        ({"num_ctx_servers": 8}, "num_ctx_servers must equal dwdp_size"),
+        ({"num_ctx_servers": 6, "dwdp_size": 3, "num_groups": 2}, "fill whole nodes"),
+    ),
+)
+def test_dwdp_ctx_layout_rejects_unlaunchable_configs(
+    submit_module: ModuleType, overrides: dict, message: str
+):
+    with pytest.raises(ValueError, match=message):
+        _disagg_hardware(submit_module, _dwdp_disagg_config(**overrides))
+
+
+def test_dwdp_ctx_worker_command_replaces_llmapi_launch(ci_submit_module: ModuleType):
+    worker_line = (
+        'export partialPytestCommandWorker="LLM_ROOT=/src COLUMNS=300 '
+        '/src/tensorrt_llm/llmapi/trtllm-llmapi-launch pytest -vv --test-list=/w/list.txt"'
+    )
+    assert ci_submit_module.get_dwdp_ctx_worker_command(worker_line, "bash /rank.sh") == (
+        'export partialPytestCommandDWDPCtxWorker="LLM_ROOT=/src COLUMNS=300 '
+        'bash /rank.sh pytest -vv --test-list=/w/list.txt"'
+    )
+
+
+def _aggregated_hardware(module: ModuleType, config: dict, benchmark_mode: str) -> dict:
+    if Path(module.__file__).parent.name == "local":
+        return module.get_hardware_config(config, "aggregated", benchmark_mode)
+    return module.get_hardware_config(config, "aggregated", benchmark_mode, None)
+
+
+def test_ctx_only_folds_dwdp_ctx_servers_into_one_server(submit_module: ModuleType):
+    # ctx_only runs the 16 single-GPU DWDP ctx servers as one 16-GPU
+    # attention-DP server, not as a single one-GPU server.
+    hardware = _aggregated_hardware(submit_module, _dwdp_disagg_config(), "ctx_only")
+    assert hardware["gpus_per_server"] == 16
+    assert hardware["total_nodes"] == 4
+
+
+def test_ctx_only_without_dwdp_sizes_from_ctx_parallelism(submit_module: ModuleType):
+    config = _dwdp_disagg_config(num_ctx_servers=2, ctx_tp=8)
+    del config["worker_config"]["ctx"]["dwdp_config"]
+    hardware = _aggregated_hardware(submit_module, config, "ctx_only")
+    assert hardware["gpus_per_server"] == 8
+    assert hardware["total_nodes"] == 2

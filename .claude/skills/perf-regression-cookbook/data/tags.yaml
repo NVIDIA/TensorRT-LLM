@@ -1,0 +1,155 @@
+# Controlled vocabulary for regression-case frontmatter.
+#
+# Case frontmatter fields MUST use canonical terms from this file only.
+# Synonyms live in aliases.yaml and are for QUERY-TIME normalization —
+# never write a synonym into frontmatter. Check by hand when adding a case.
+#
+# Extend by adding a term here first (one term, one meaning); do not invent
+# terms inline in a case file.
+
+# WHERE the defect lived — the module the fix landed in. Single-valued, and
+# it MUST equal the case file's parent directory name under references/.
+# This is the primary index: `references/<module>/<slug>.md`.
+#
+# Tie-break when a case could sit in two modules: file it under the module
+# the FIX landed in, not the one that showed the symptom. A missing FMHA
+# warmup grid is fixed by editing the warmup enumeration -> jit-and-warmup;
+# a slow FMHA dispatcher is fixed in the dispatcher -> attention-fmha.
+# Cross-cutting queries are served by `subsystems:` (multi-valued), e.g.
+# `grep -l attention-kernel references/*/*.md`.
+#
+# The same 18 terms are used by both cookbooks, so a module query works
+# across them; see data/modules.yaml for what each module covers and how it
+# maps onto the module ids in the NVBug/PR corpus summary.
+module:
+  - attention-fmha
+  - kernel-fusion
+  - jit-and-warmup
+  - cuda-graph-and-compile
+  - moe
+  - gemm-and-quantization
+  - autotuner
+  - communication
+  - kv-cache-manager
+  - kv-cache-transceiver
+  - disagg-orchestrator
+  - scheduler-and-executor
+  - sampler
+  - spec-decode
+  - tokenization
+  - model-definition
+  - runtime-and-serving
+  - measurement-and-test
+
+# HOW it broke, coarse — the mechanism family. Retained as a label only: it
+# no longer names a directory (`module:` does). Kept because it groups the
+# `regression_class` values below into five buckets a triage question tends
+# to arrive in, and because patterns.yaml is indexed by it.
+family:
+  - kernel-and-fusion
+  - execution-and-graph
+  - memory-and-capacity
+  - communication
+  - measurement-and-test
+
+# How-it-broke classes — the cookbook's primary axis. A regression case
+# lists 1–2. These are failure modes, not bottleneck classes: the same
+# host-overhead bottleneck can arise from sync-introduced OR host-work-added.
+regression_class:
+  - host-work-added            # new host-side work/python/bookkeeping on hot path
+  - sync-introduced            # new host-device sync / blocking collective on hot path
+  - fusion-broken              # expected fusion not firing / pattern no longer matches
+  - kernel-swap-regressed      # a kernel change/replacement itself got slower
+  - kernel-selection-regression  # heuristic/routing/backend picks a slower variant
+  - fast-path-fallback         # a fast path silently disabled; generic/slow path runs
+  - cuda-graph-regression      # graph capture coverage/defaults regressed; eager fallback
+  - warmup-jit-gap             # JIT/compile/capture cost lands at runtime, not warmup
+  - capacity-accounting-error  # size estimate/budget bug shrinks KV/batch capacity
+  - memory-footprint-regression  # genuine footprint growth or leak reduces capacity
+  - scheduler-batching-regression  # scheduler/admission/batching behavior change
+  - communication-regression   # collective strategy/kernel/scope regressed
+  - dependency-regression      # dep bump (torch/cutlass/etc.) regressed perf
+  - redundant-cross-rank-work  # same work duplicated on every rank instead of split
+  - redundant-device-work      # device work whose result is never needed (fill/copy/cast
+                               #   overwritten before read) — GPU busy, not host-bound
+  - stale-cached-metadata      # a cached index/offset/layout tensor reused after the
+                               #   layout it encodes changed
+  - optimization-lost-in-port  # a perf fix missing after branch/port/refactor
+  - measurement-artifact       # the *measurement* regressed, not the product
+
+# Observable detection signals — how the regression class shows up in a
+# profile / log / metric. A case lists 2–5.
+signals:
+  - throughput-drop            # TPS / tokens-per-second down vs previous build
+  - ttft-increase              # time-to-first-token up (prefill-side)
+  - itl-increase               # inter-token latency / TPOT up (decode-side)
+  - perf-ci-bar-failure        # perf sanity/regression CI test tripped
+  - gpu-idle-between-steps     # nsys: bubbles between forward steps
+  - many-small-kernels         # nsys: fused region reappears as unfused kernel stream
+  - eager-fallback-in-log      # log shows CUDA-graph/compiled path falling back
+  - slower-kernel-in-trace     # trace shows a different (slower) kernel than before
+  - midrun-stall               # sporadic long iteration (JIT/compile/alloc mid-run)
+  - kv-capacity-drop           # fewer KV blocks / smaller achievable batch
+  - memory-usage-increase      # peak/workspace memory up
+  - startup-time-increase      # server start / warmup / autotune time up
+  - host-time-increase         # host span grows in profile; GPU waits on CPU
+  - acceptance-length-drop     # spec-decode accepted tokens per step down
+
+# Which code the fix touched — 1–3 terms, from the diff's file paths. This is
+# the CROSS-CUTTING axis: `module:` is single-valued and names the directory,
+# so a case that spans two subsystems records both here.
+#
+# This list is identical in both cookbooks (they had drifted apart, which made
+# a cross-cookbook subsystem query unanswerable). Terms one cookbook has never
+# used yet are still listed, so neither side has to extend the vocabulary to
+# file a case.
+subsystems:
+  - attention-kernel
+  - fmha-kernel
+  - mla-attention
+  - dsa-attention
+  - moe
+  - gemm-kernel
+  - sampler
+  - tokenizer
+  - kv-cache
+  - memory-allocator
+  - cuda-graph
+  - scheduler-executor
+  - model-engine
+  - spec-decode
+  - communication
+  - disagg-serve
+  - adp-router
+  - autotuner
+  - model-definition
+  - runtime-python
+  - runtime-cpp
+  - serve-endpoint
+  - visual-gen-pipeline
+  - perf-test-config
+  - perf-test-harness
+  - unit-test-infra
+  - build-dependency
+
+# How the regression got introduced (when identifiable from the fix PR).
+introduced_via:
+  - refactor                   # code motion broke an invariant (fusion pattern, graph region)
+  - new-feature                # feature added a cost to an unrelated hot path
+  - dep-bump                   # dependency upgrade changed kernel/runtime behavior
+  - config-default-change      # a default flipped, disabling/regressing a tuned path
+  - kernel-change              # kernel rewrite/tuning regressed a shape/arch
+  - incomplete-coverage        # optimization shipped but missed a path/dtype/arch/shape
+  - prior-fix-side-effect      # an earlier bug fix introduced the perf cost
+  - pre-existing-gap           # never was fast: below-expectation perf bug, not a
+                               #   regression from a previously faster state
+  - unknown                    # the fix PR does not identify the cause
+
+phase:
+  - prefill
+  - decode
+  - any-phase
+
+maturity:
+  - stub
+  - full

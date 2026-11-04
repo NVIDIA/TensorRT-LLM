@@ -21,8 +21,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -48,4 +48,5 @@ template void invokeFusedSampling<__half>(FusedSamplingParams const&, cudaStream
 template void invokeFusedSampling<__nv_bfloat16>(FusedSamplingParams const&, cudaStream_t);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

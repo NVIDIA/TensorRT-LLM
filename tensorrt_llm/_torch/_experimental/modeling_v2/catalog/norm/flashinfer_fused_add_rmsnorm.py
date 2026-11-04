@@ -29,21 +29,13 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
     form, no quantization.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # The two hidden sizes the shipped targets normalize over, at a decode
-    # shape and a prefill shape. Both targets call this op only on the
+    # A prefill shape here; the shipped targets' decode shapes at their hidden
+    # sizes are in this entry's test. Both targets call this op only on the
     # residual stream, so there is no third width to cover and no 3-D case:
     # unlike plain rmsnorm this one never runs on a per-head view.
     CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="decode-shaped, gpt-oss-120b hidden",
-            spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
-        ),
-        Cell(
-            why="decode-shaped, deepseek-r1 hidden",
-            spec=dict(shape=(1, 7168), dtype=torch.bfloat16, eps=1e-6),
-        ),
         Cell(
             why="prefill-shaped: enough rows to cross the kernel's grid tiling",
             spec=dict(shape=(2048, 7168), dtype=torch.bfloat16, eps=1e-6),

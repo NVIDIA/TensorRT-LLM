@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _fill_kv_pages,
 )
+from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1061,6 +1062,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if generation_size_per_token <= 0:
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
+
+    # One mixed-precision high layer per compressed layer.
+    _supports_mixed_precision_kv = True
+    _own_pool_is_mixed_precision_low = True
+
+    def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
+        return super()._is_mixed_precision_layer(local_layer_idx) and compress_ratio_has_attention(
+            self._compress_ratios[self.pp_layers[local_layer_idx]], DeepseekV4AttentionType.COMPRESS
+        )
+
+    def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
+        # A compressed page holds tokens_per_block // ratio rows.
+        return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
@@ -2146,14 +2160,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             for buffer_key, buffer in buffers:
                 if buffer_key in buffers_handled:
                     continue
-                # process in chunks of 256 pages to avoid OoM
-                for i in range(0, buffer.shape[0], 256):
-                    buffer_slice = buffer[i : i + 256]
-                    try:
-                        has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                        has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                    except NotImplementedError:
-                        some_checks_unavailable = True
+                if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                    some_checks_unavailable = True
                 if fill_with_zero:
                     buffer.zero_()
                     # Warmup scrubs the cache with fill_with_zero before inference;

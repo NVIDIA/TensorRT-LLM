@@ -247,34 +247,22 @@ def get_unique_pool_memory_descs(
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if lg.kind == CacheKind.STATE:
             assert isinstance(lg, MambaLayerGroup)
-            if lg.slot_major_layout:
-                # MambaHybridCacheManagerV2: roles may share one allocation
-                # (interleaved, equal sizes) or be separate (unequal sizes).
-                # Process lowest-base first so the covering region registers
-                # before higher-offset roles that fall inside it.
-                pools = sorted(
-                    (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
-                    key=lambda p: p.base_address,
-                )
-                for pool in pools:
-                    pool_size = pool.num_slots * pool.slot_stride_bytes
-                    if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
-                        continue
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
-            else:
-                # Layer-major (MambaHybridCacheManager): each role is a separate
-                # allocation. Register each: size = num_layers * layer_stride.
-                for pv in lg.pool_views:
-                    pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                    num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
-                    pool_size = num_layers * pool.layer_stride_bytes
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
+            # MambaHybridCacheManagerV2: roles may share one allocation
+            # (interleaved, equal sizes) or be separate (unequal sizes).
+            # Process lowest-base first so the covering region registers
+            # before higher-offset roles that fall inside it.
+            pools = sorted(
+                (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
+                key=lambda p: p.base_address,
+            )
+            for pool in pools:
+                pool_size = pool.num_slots * pool.slot_stride_bytes
+                if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
+                    continue
+                pool_key = (pool.base_address, pool_size)
+                if pool_key not in unique_pools:
+                    unique_pools[pool_key] = pool_counter
+                    pool_counter += 1
         else:
             # PAGED (attention): each pool view is an independent allocation
             for pv in lg.pool_views:

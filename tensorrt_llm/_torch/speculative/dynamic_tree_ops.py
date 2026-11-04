@@ -27,8 +27,6 @@ Key Features:
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import compute_probs_from_logits
-
 
 class DynamicTreeOpsConverter:
     """
@@ -79,25 +77,32 @@ class DynamicTreeOpsConverter:
         self._rej_accept_token_buf = torch.zeros(
             max_batch_size, max_path_len, dtype=torch.int64, device=device
         )
-        self._rej_seed_buf = torch.zeros(1, dtype=torch.int64, device=device)
-        self._rej_offset_buf = torch.zeros(1, dtype=torch.int64, device=device)
+        self._rej_seed_buf = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
+        self._rej_offset_buf = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
 
     def _get_rejection_rng_tensor(
         self,
         value: int | torch.Tensor,
         buffer: torch.Tensor,
         name: str,
+        num_gens: int,
     ) -> torch.Tensor:
-        """Normalize a rejection RNG input to a one-element int64 CUDA tensor."""
+        """Normalize a rejection RNG input to an int64 CUDA tensor with one entry per request.
+
+        An int is shared by every request; a tensor must already hold one entry per request.
+        """
         if isinstance(value, int):
-            buffer.fill_(value)
-            return buffer
+            rng = buffer[:num_gens]
+            rng.fill_(value)
+            return rng
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"{name} must be an int or torch.Tensor, got {type(value)!r}")
         if value.dtype != torch.int64:
             raise TypeError(f"{name} must be int64 tensor, got {value.dtype}")
-        if value.numel() != 1:
-            raise ValueError(f"{name} tensor must have exactly one element, got {value.numel()}")
+        if value.numel() != num_gens:
+            raise ValueError(
+                f"{name} tensor must have one element per request ({num_gens}), got {value.numel()}"
+            )
         if value.device != buffer.device:
             raise ValueError(f"{name} tensor must be on device {buffer.device}, got {value.device}")
         return value.reshape(-1)
@@ -223,13 +228,10 @@ class DynamicTreeOpsConverter:
     def verify_dynamic_tree_rejection_out(
         self,
         draft_tokens: torch.Tensor,
-        target_logits_tree: torch.Tensor,
+        target_probs: torch.Tensor,
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         tree_valid: torch.Tensor,
-        temperatures: torch.Tensor,
-        top_k: torch.Tensor | None,
-        top_p: torch.Tensor | None,
         num_gens: int,
         num_spec_step: int,
         seed: int | torch.Tensor = 0,
@@ -237,50 +239,33 @@ class DynamicTreeOpsConverter:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Dynamic tree rejection sampling.
 
-        Computes target probabilities from logits, then runs the target-only
-        rejection kernel. No draft probabilities are needed.
-        `tree_valid` guards first-gen and dummy requests without a valid tree.
+        Runs the target-only rejection kernel on ``target_probs``
+        (``[num_gens, N, vocab]``, already filtered); no draft probabilities
+        are needed. `tree_valid` guards first-gen and dummy requests without a
+        valid tree.
         """
         accept_index = self._rej_accept_index_buf[:num_gens]
         accept_token = self._rej_accept_token_buf[:num_gens]
         accept_tok_num = self._rej_accept_token_num_buf[:num_gens]
-        seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
-        offset_tensor = self._get_rejection_rng_tensor(offset, self._rej_offset_buf, "offset")
+        seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed", num_gens)
+        offset_tensor = self._get_rejection_rng_tensor(
+            offset, self._rej_offset_buf, "offset", num_gens
+        )
         if num_gens <= 0:
             raise ValueError(f"num_gens must be positive, got {num_gens}")
-        if target_logits_tree.shape[0] % num_gens != 0:
+        if target_probs.dim() != 3 or target_probs.shape[0] != num_gens:
             raise ValueError(
-                "target_logits_tree rows must be divisible by num_gens, got "
-                f"{target_logits_tree.shape[0]} and {num_gens}"
+                f"target_probs must be [num_gens={num_gens}, N, vocab], got {tuple(target_probs.shape)}"
             )
-        # draft_tokens has shape [num_gens, N-1]; derive total tree nodes N from target_logits_tree.
-        num_draft_tokens = target_logits_tree.shape[0] // num_gens
 
         if tree_valid is None:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=draft_tokens.device)
         tree_valid = tree_valid.contiguous()
 
-        # Expand per-request sampling params to per-tree-position (num_gens * N rows).
-        temps_exp = temperatures.repeat_interleave(num_draft_tokens)
-        top_k_exp = top_k.repeat_interleave(num_draft_tokens) if top_k is not None else None
-        top_p_exp = top_p.repeat_interleave(num_draft_tokens) if top_p is not None else None
-
-        # Compute target probs using the shared linear-path interface (FlashInfer fast
-        # path when available, sort-based fallback otherwise). Returns dense full-vocab
-        # probs [num_gens * N, vocab_size]; no sparse support indices needed.
-        target_probs_flat = compute_probs_from_logits(
-            target_logits_tree,
-            temps_exp,
-            top_k_exp,
-            top_p_exp,
-        )
-        vocab_size = target_probs_flat.shape[-1]
-        target_probs_tree = target_probs_flat.reshape(num_gens, num_draft_tokens, vocab_size)
-
         try:
             torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
                 draft_tokens,
-                target_probs_tree,
+                target_probs,
                 retrieve_next_token,
                 retrieve_next_sibling,
                 tree_valid,
@@ -295,7 +280,7 @@ class DynamicTreeOpsConverter:
             raise RuntimeError(
                 f"dynamic tree rejection target-only op chain failed: {e}\n"
                 f"Inputs: num_gens={num_gens}, N={draft_tokens.shape[1] + 1}, "
-                f"target_vocab={target_logits_tree.shape[-1]}, num_spec_step={num_spec_step}"
+                f"target_vocab={target_probs.shape[-1]}, num_spec_step={num_spec_step}"
             ) from e
 
         return accept_index, accept_tok_num, accept_token

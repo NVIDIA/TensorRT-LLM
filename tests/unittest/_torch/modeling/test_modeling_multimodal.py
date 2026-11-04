@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_nemotron_hybrid,
     is_qwen3_hybrid,
 )
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
@@ -209,7 +210,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 ):
                     module.post_load_weights()
 
-        # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
+        # ModelEngine builds the vision encoders' AttentionMetadata after
         # load via `setup_mm_encoder_attn_metadata`. These standalone
         # model tests don't go through the engine, so mirror that walk here --
         # otherwise the encoder forward raises on an uninitialized attn_metadata.
@@ -525,7 +526,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             # Prepare metadata before capture
             trtllm_inputs["attn_metadata"].prepare()
 
-            key = (1, 0, False)
+            key = KeyType(batch_size=1, draft_len=0)
             graph_runner.capture(
                 key=key,
                 forward_fn=lambda inputs: self.trtllm_model.forward(**inputs),
