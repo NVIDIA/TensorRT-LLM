@@ -147,6 +147,12 @@ class _ForwardStep:
     operand: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
 
+def _output_projection_takes_gate(mapping: Mapping) -> bool:
+    """Whether o_proj under ``mapping`` can apply the output gate in its GEMM: not under Helix
+    with attention DP, whose output projection reduce-scatters."""
+    return not (mapping.has_cp_helix() and mapping.enable_attention_dp)
+
+
 def _runs_flashinfer_cute_rmsnorm(norm: torch.nn.Module) -> bool:
     """Whether ``norm`` of BF16 rows runs FlashInfer's CuTe DSL RMSNorm, the arithmetic the
     fused K3 MLA kernels repeat bit for bit."""
@@ -319,7 +325,7 @@ class KimiK3MLAAttention(MLA):
         super().cache_derived_state()
         self._fused_output_gate = (
             self.use_output_gate
-            and not (self.mapping.has_cp_helix() and self.mapping.enable_attention_dp)
+            and _output_projection_takes_gate(self.mapping)
             and isinstance(self.g_proj, GatedEpilogueProjection)
             and isinstance(self.o_proj, GatedEpilogueProjection)
         )

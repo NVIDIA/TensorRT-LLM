@@ -139,51 +139,25 @@ def _build_k3_mla(fp8: bool, gate: bool):
     return config, mapping, reference, runtime
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("helix_adp", [False, True], ids=["single_rank", "helix_adp"])
-def test_k3_mla_output_gate_unfused_under_helix_with_attention_dp(monkeypatch, helix_adp) -> None:
+@pytest.mark.parametrize(
+    "cp_size,attention_dp,expected",
+    [(1, False, True), (2, False, True), (2, True, False)],
+    ids=["single_rank", "helix", "helix_adp"],
+)
+def test_k3_mla_output_gate_unfused_under_helix_with_attention_dp(cp_size, attention_dp, expected):
     """The fused output gate bypasses the output projection's Helix + attention-DP
     reduce-scatter, so with that mapping the gate falls back to the unfused path."""
     from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention
-    from tensorrt_llm._torch.modules.linear import Linear
 
-    mapping_with_cp = (
-        Mapping(
-            world_size=4,
-            tp_size=2,
-            cp_size=2,
-            rank=0,
-            cp_config={"cp_type": "HELIX"},
-            enable_attention_dp=True,
-        )
-        if helix_adp
-        else None
+    mapping = Mapping(
+        world_size=2 * cp_size,
+        tp_size=2,
+        cp_size=cp_size,
+        rank=0,
+        cp_config={"cp_type": "HELIX"} if cp_size > 1 else {},
+        enable_attention_dp=attention_dp,
     )
-    model_config = ModelConfig(
-        mapping=Mapping(world_size=1, rank=0, tp_size=1),
-        quant_config=QuantConfig(),
-        skip_create_weights_in_init=True,
-    )
-    mla = kimi_k3_mla_attention.KimiK3MLAAttention(
-        hidden_size=256,
-        num_heads=32,
-        q_lora_rank=1536,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        dtype=torch.bfloat16,
-        use_output_gate=True,
-        model_config=model_config,
-        aux_stream_dict={},
-        mapping_with_cp=mapping_with_cp,
-    )
-    # Both projections declare the gated epilogue, so only the mapping decides. The base
-    # MLA's head slicing needs loaded weights, which this construction-only test skips.
-    monkeypatch.setattr(kimi_k3_mla_attention, "GatedEpilogueProjection", Linear)
-    monkeypatch.setattr(MLA, "cache_derived_state", lambda self: None)
-    mla.cache_derived_state()
-    assert mla._fused_output_gate == (not helix_adp)
+    assert kimi_k3_mla_attention._output_projection_takes_gate(mapping) is expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -566,9 +540,13 @@ def test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface(
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("num_tokens", [1, 8, 64, 96])
-def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
+def test_k3_mla_fused_output_gate_matches_unfused(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
     """The output gate fused into g_proj / o_proj (sigmoid and gated low-M GEMMs), also on
-    the aux stream from the Helix exchange event, equals sigmoid, multiply and o_proj."""
+    the aux stream from the Helix exchange event, equals sigmoid, multiply and o_proj; a
+    generation-only forward of a fused-tail batch decides the tail once and forks the gate
+    when it starts."""
     from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
@@ -632,6 +610,30 @@ def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
         mixer.helix_exchange_event = None
         mixer._step = None
     assert torch.equal(first, expected)
+
+    # forward() of a fused-tail batch: one _ForwardStep for the whole forward, with the gate
+    # forked when the forward starts (the base MLA forward, which reads it, is stubbed).
+    seen = []
+    monkeypatch.setattr(MLA, "forward", lambda self, *args, **kwargs: seen.append(self._step))
+    monkeypatch.setattr(mixer, "_helix_tail_max_tokens", num_tokens)
+    mixer.helix_exchange_event = torch.cuda.Event()
+    mixer._tail_gate_fork = torch.cuda.Event()
+    tail_batch = SimpleNamespace(
+        num_tokens=num_tokens, num_ctx_tokens=0, num_contexts=0, num_generations=num_tokens
+    )
+    try:
+        with with_multi_stream(True):
+            mixer.forward(None, hidden, tail_batch)
+            (step,) = seen
+            assert step.fused_tail and not step.fused_query and step.gate is not None
+            assert step.gate_pending == mixer._gate_on_aux_stream()
+            if step.gate_pending:
+                mixer._join_tail_gate(step)
+        torch.cuda.synchronize()
+    finally:
+        mixer.helix_exchange_event = None
+    assert mixer._step is None
+    assert torch.equal(step.gate, mixer._gate(hidden))
 
 
 def test_fp8_cached_kv_context_is_a_model_opt_in() -> None:

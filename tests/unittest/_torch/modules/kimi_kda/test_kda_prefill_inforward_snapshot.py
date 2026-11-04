@@ -17,11 +17,12 @@ import torch
 
 pytest.importorskip("fla")
 
+from kda_prefill_test_utils import assert_kda_close  # noqa: E402
+
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
     KDAKernelDispatch,
     is_intree_prefill_available,
 )
-from kda_prefill_test_utils import assert_kda_close  # noqa: E402
 
 NUM_HEADS = 96
 HEAD_DIM = 128
@@ -149,7 +150,8 @@ def _run(
     if snapshot_offsets is not None:
         assert all(offset % CHUNK == 0 for offset in snapshot_offsets if offset >= 0)
         rows = [b if offset >= 0 else -1 for b, offset in enumerate(snapshot_offsets)]
-        chunks = [offset // CHUNK if offset >= 0 else -1 for offset in snapshot_offsets]
+        # As _prepare_inforward_split emits it: no snapshot is row -1, chunk 0.
+        chunks = [offset // CHUNK if offset >= 0 else 0 for offset in snapshot_offsets]
         snapshot_kwargs = {
             "snapshot": (
                 snapshot_pool,
