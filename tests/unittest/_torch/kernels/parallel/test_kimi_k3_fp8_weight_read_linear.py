@@ -26,7 +26,6 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     _get_kimi_k3_mxfp8_tuning_buckets,
-    _is_kimi_k3_mxfp8_tactic_profiled,
     _kimi_k3_mxfp8_tuning_bucket,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -244,44 +243,47 @@ def test_kimi_k3_fine_m_tuning_uses_hybrid_buckets():
     )
 
 
-def test_kimi_k3_mxfp8_tactic_filter():
-    def base(tiler_m, inst_m, swap_ab, use_prefetch, split_k):
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="needs SM107 and SM107 CuTe DSL support",
+)
+@pytest.mark.parametrize("m", [16, 256, 512])
+def test_kimi_k3_mxfp8_tactic_space(m):
+    """The K3 MXFP8 runner profiles the SM107 MXFP8 tactics without the 1-CTA b-reuse tile,
+    with prefetch only on the unswapped 2-CTA b-reuse tile and split-K only up to M 256."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLKimiK3MXFP8RubinLinear,
+        CuteDSLMXFP8RubinLinear,
+    )
+
+    n, k = 2048, 7168
+    inputs = [
+        torch.empty((m, k), device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty((n, k), device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty((m * k // 32,), device="cuda", dtype=torch.uint8),
+        torch.empty((n * k // 32,), device="cuda", dtype=torch.uint8),
+        torch.ones((), device="cuda", dtype=torch.float32),
+    ]
+
+    def fields(tactic):
+        """(mma_m, swap_ab, use_prefetch, split_k) of a base or mixed-cluster tactic."""
+        mma_m = (tactic[1][0], tactic[2][0])
+        if tactic[0] == "base":
+            return mma_m, tactic[4], tactic[5], tactic[8]
+        return mma_m, tactic[5], tactic[6], 1
+
+    def profiled(tactic):
+        mma_m, swap_ab, use_prefetch, split_k = fields(tactic)
         return (
-            "base",
-            (tiler_m, 192, 128),
-            (inst_m, 192, 64),
-            (2, 1),
-            swap_ab,
-            use_prefetch,
-            "clc_dynamic",
-            "m",
-            split_k,
+            mma_m != (256, 128)
+            and (not use_prefetch or (not swap_ab and mma_m == (512, 256)))
+            and (split_k == 1 or m <= 256)
         )
 
-    def mixed(tiler_m, inst_m, swap_ab, use_prefetch):
-        return (
-            "mixed_clusters",
-            (tiler_m, 256, 128),
-            (inst_m, 256, 64),
-            (4, 2),
-            (2, 1),
-            swap_ab,
-            use_prefetch,
-            "clc_dynamic",
-            "m",
-        )
-
-    profiled = _is_kimi_k3_mxfp8_tactic_profiled
-    assert profiled(base(256, 256, True, False, 8), 256)
-    assert not profiled(base(256, 256, False, False, 2), 512)
-    assert not profiled(base(256, 128, True, False, 1), 64)
-    assert profiled(base(512, 256, False, True, 1), 16384)
-    assert not profiled(base(512, 256, True, True, 1), 64)
-    assert not profiled(base(256, 256, False, True, 1), 16384)
-    assert profiled(mixed(512, 256, False, False), 4096)
-    assert profiled(mixed(512, 256, False, True), 4096)
-    assert not profiled(mixed(256, 128, False, False), 4096)
-    assert not profiled(mixed(128, 128, False, True), 4096)
+    full = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16).get_valid_tactics(inputs, None)
+    k3 = CuteDSLKimiK3MXFP8RubinLinear(output_dtype=torch.bfloat16).get_valid_tactics(inputs, None)
+    assert k3 and len(k3) < len(full)
+    assert k3 == [tactic for tactic in full if profiled(tactic)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

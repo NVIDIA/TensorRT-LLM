@@ -152,34 +152,6 @@ def _kimi_k3_mxfp8_tuning_bucket(num_tokens: int) -> int:
     return next_positive_power_of_2(num_tokens)
 
 
-# Largest tuning M at which the K3 MXFP8 runner profiles split-K tactics.
-_KIMI_K3_MXFP8_MAX_SPLIT_K_M = 256
-
-
-def _is_kimi_k3_mxfp8_tactic_profiled(tactic: tuple, m: int) -> bool:
-    """Whether the K3 MXFP8 runner profiles an SM107 tactic at tuning M ``m``.
-
-    Skips 1-CTA b-reuse tiles (mma_tiler_m 256, mma_inst_m 128), prefetch on
-    any tile but the unswapped 2-CTA b-reuse tile (512, 256), and split-K
-    above M 256. For every K3 MXFP8 weight and tuning bucket, the best
-    remaining tactic is within 1% of the best of the full SM107 space.
-    """
-    if tactic[0] == "base":
-        mma_tiler_mnk, mma_inst_shape = tactic[1], tactic[2]
-        swap_ab, use_prefetch = tactic[4], tactic[5]
-        split_k = tactic[8] if len(tactic) > 8 else 1
-    else:
-        mma_tiler_mnk, mma_inst_shape = tactic[1], tactic[2]
-        swap_ab, use_prefetch = tactic[5], tactic[6]
-        split_k = 1
-    mma_m = (mma_tiler_mnk[0], mma_inst_shape[0])
-    if mma_m == (256, 128):
-        return False
-    if use_prefetch and (swap_ab or mma_m != (512, 256)):
-        return False
-    return split_k == 1 or m <= _KIMI_K3_MXFP8_MAX_SPLIT_K_M
-
-
 def _with_input_cuda_device(function):
     """Run a custom-op implementation under its input tensor's CUDA device."""
 
@@ -14449,6 +14421,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            # Valid (mma_tiler_m, mma_inst_shape_m) combinations:
+            # Without b-reuse: mma_tiler_m == mma_inst_shape_m
+            #   - (128, 128): no b-reuse
+            #   - (256, 256): no b-reuse, 2CTA mode
+            # With b-reuse: mma_tiler_m == 2 * mma_inst_shape_m
+            #   - (256, 128): b-reuse
+            #   - (512, 256): b-reuse, 2CTA mode
+            mma_m_candidates: ClassVar[Tuple[Tuple[int, int], ...]] = (
+                (128, 128),  # no b-reuse, 1CTA
+                (256, 256),  # no b-reuse, 2CTA
+                (256, 128),  # b-reuse, 1CTA
+                (512, 256),  # b-reuse, 2CTA
+            )
+            # The only (mma_tiler_m, mma_inst_shape_m) whose unswapped tactics
+            # profile prefetch; None: every tactic does.
+            prefetch_mma_m: ClassVar[Optional[Tuple[int, int]]] = None
+            # The largest M that profiles split-K > 1; None: every M does.
+            split_k_max_m: ClassVar[Optional[int]] = None
             # Whether an output_tensor without partition_id is a plain in-place
             # GEMM. Otherwise a missing partition_id is rejected.
             allow_unpartitioned_output: ClassVar[bool] = False
@@ -14485,6 +14475,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if not isinstance(other, self.__class__):
                     return False
                 return self.unique_id() == other.unique_id()
+
+            def _profiles_prefetch(self, mma_m: Tuple[int, int],
+                                   swap_ab: bool) -> bool:
+                """Whether tactics of this (mma_tiler_m, mma_inst_shape_m) and
+                orientation profile prefetch (``prefetch_mma_m``)."""
+                return self.prefetch_mma_m is None or (not swap_ab and mma_m
+                                                       == self.prefetch_mma_m)
 
             def get_valid_tactics(
                 self,
@@ -14559,20 +14556,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # b-reuse is enabled when mma_tiler_m = 2 * mma_inst_shape_m
                 mma_tiler_k = self.mma_tiler_k
                 mma_inst_shape_k = self.mma_inst_shape_k
-
-                # Valid (mma_tiler_m, mma_inst_shape_m) combinations:
-                # Without b-reuse: mma_tiler_m == mma_inst_shape_m
-                #   - (128, 128): no b-reuse
-                #   - (256, 256): no b-reuse, 2CTA mode
-                # With b-reuse: mma_tiler_m == 2 * mma_inst_shape_m
-                #   - (256, 128): b-reuse
-                #   - (512, 256): b-reuse, 2CTA mode
-                mma_m_candidates = [
-                    (128, 128),  # no b-reuse, 1CTA
-                    (256, 256),  # no b-reuse, 2CTA
-                    (256, 128),  # b-reuse, 1CTA
-                    (512, 256),  # b-reuse, 2CTA
-                ]
+                mma_m_candidates = self.mma_m_candidates
+                split_k_candidates = (self.split_k_candidates
+                                      if self.split_k_max_m is None
+                                      or m <= self.split_k_max_m else (1, ))
                 mma_n_candidates = [64, 128, 192, 256]
 
                 # Cluster shapes - must be divisible by 2 for 2CTA mode (mma_inst_m=256)
@@ -14597,6 +14584,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # Check 2CTA cluster constraint: cluster_m must be divisible by 2
                     if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
                         continue
+                    if use_prefetch and not self._profiles_prefetch(
+                        (mma_tiler_m, mma_inst_m), swap_ab):
+                        continue
 
                     mma_tiler_mnk = (mma_tiler_m, mma_n, mma_tiler_k)
                     mma_inst_shape = (mma_inst_m, mma_n, mma_inst_shape_k)
@@ -14610,7 +14600,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         kernel_m = m
                         kernel_n = n
 
-                    for split_k in self.split_k_candidates:
+                    for split_k in split_k_candidates:
                         if self.__class__.kernel_class.can_implement(
                             (kernel_m, kernel_n, real_k, batch_size),
                                 self.a_dtype,
@@ -14654,6 +14644,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_m_candidates, mma_n_candidates,
                         raster_order_candidates, mixed_swap_ab_candidates,
                         use_prefetch_candidates):
+                    if use_prefetch and not self._profiles_prefetch(
+                        (mma_tiler_m, mma_inst_m), swap_ab):
+                        continue
                     mma_tiler_mnk = (mma_tiler_m, mma_n, mma_tiler_k)
                     mma_inst_shape = (mma_inst_m, mma_n, mma_inst_shape_k)
 
@@ -15247,7 +15240,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
         class CuteDSLKimiK3MXFP8RubinLinear(CuteDSLMXFP8RubinLinear):
-            """MXFP8 runner with fine-grained tuning for K3's low-M range."""
+            """MXFP8 runner with fine-grained tuning for K3's low-M range,
+            over a narrowed tactic space: no 1-CTA b-reuse tile, prefetch
+            only on the unswapped 2-CTA b-reuse tile, split-K up to M 256."""
+
+            mma_m_candidates = ((128, 128), (256, 256), (512, 256))
+            prefetch_mma_m = (512, 256)
+            split_k_max_m = 256
 
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
@@ -15259,19 +15258,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
                 use_cuda_graph=True,
             )
-
-            def get_valid_tactics(
-                self,
-                inputs: List[torch.Tensor],
-                profile: OptimizationProfile,
-                **kwargs,
-            ) -> List[tuple]:
-                m = inputs[0].shape[0]
-                return [
-                    tactic for tactic in super().get_valid_tactics(
-                        inputs, profile, **kwargs)
-                    if _is_kimi_k3_mxfp8_tactic_profiled(tactic, m)
-                ]
 
         class CuteDSLMXFP8InplaceRubinLinear(CuteDSLMXFP8RubinLinear):
             """SM107 MXFP8 runner that writes into a caller-owned output.
