@@ -63,7 +63,6 @@ orderings provide that:
 from __future__ import annotations
 
 import dataclasses
-import functools
 import struct
 from typing import Callable, Dict, Optional, Tuple
 
@@ -1254,8 +1253,19 @@ def latent_tactic(m: int) -> low_m.LowMTactic:
     return low_m.split_tactic(m, LATENT, HIDDEN, split, mid=False)
 
 
-@functools.cache
-def _compiled_head(n: int, tactic: low_m.LowMTactic, world: int):
+#: Compiled kernels by ``(builder, compile arguments)``; :func:`is_compiled` reads it.
+_COMPILED: Dict[tuple, object] = {}
+
+
+def _compiled(build: Callable, *args):
+    key = (build, *args)
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        compiled = _COMPILED[key] = build(*args)
+    return compiled
+
+
+def _compile_head(n: int, tactic: low_m.LowMTactic, world: int):
     gemm = low_m.Fp8BlockScaleLowMGemmKernel(
         n,
         HIDDEN,
@@ -1290,10 +1300,7 @@ def _local_cap(local_num: int) -> int:
     return _SMALL_LOCAL_CAP if local_num <= _SMALL_LOCAL_CAP else NUM_EXPERTS
 
 
-@functools.cache
-def _compiled_route(
-    num_warps: int, warps_per_token: int, local_cap: int, world: int, publish: bool
-):
+def _compile_route(num_warps: int, warps_per_token: int, local_cap: int, world: int, publish: bool):
     kernel = KimiK3MoEFrontRouteKernel(num_warps, warps_per_token, local_cap, world, publish)
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1310,25 +1317,22 @@ def _compiled_route(
     )
 
 
-#: Launch shapes compiled so far (see :func:`is_compiled`).
-_READY: set = set()
+def _head_args(m: int, plan: MoEFrontPlan) -> tuple:
+    return plan.latent_w.shape[0], latent_tactic(m), plan.world
 
 
-def _shape_key(m: int, plan: MoEFrontPlan, publish: bool) -> tuple:
-    return (
-        publish,
-        plan.latent_w.shape[0],
-        latent_tactic(m),
-        plan.world,
-        _local_cap(plan.local_num),
-        _config(m),
-    )
+def _route_args(m: int, plan: MoEFrontPlan, publish: bool) -> tuple:
+    warps_per_token, num_warps = _config(m)
+    return num_warps, warps_per_token, _local_cap(plan.local_num), plan.world, publish
 
 
 def is_compiled(m: int, plan: MoEFrontPlan, publish: bool = False) -> bool:
     """Whether a call of ``m`` rows with this plan's shapes runs without compiling (required
     inside CUDA graph capture)."""
-    return _shape_key(m, plan, publish) in _READY
+    return (_compile_head, *_head_args(m, plan)) in _COMPILED and (
+        _compile_route,
+        *_route_args(m, plan, publish),
+    ) in _COMPILED
 
 
 def _gptr(dtype, t: torch.Tensor):
@@ -1380,10 +1384,9 @@ def run_moe_front(
     m = x.shape[0]
     if not can_run(x, plan, global_sf):
         raise ValueError(f"Kimi-K3 MoE front: unsupported call x {tuple(x.shape)} {x.dtype}")
-    tactic = latent_tactic(m)
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     flags = ws.next_flags()
-    _compiled_head(plan.latent_w.shape[0], tactic, plan.world)(
+    _compiled(_compile_head, *_head_args(m, plan))(
         _gptr(cutlass.Float8E4M3FN, plan.latent_w),
         _gptr(cutlass.BFloat16, x),
         _gptr(cutlass.Uint8, plan.latent_ws),
@@ -1421,8 +1424,7 @@ def run_moe_front(
         )
         tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
     scale_bits = struct.unpack("<q", struct.pack("<d", plan.routed_scaling_factor))[0]
-    warps_per_token, num_warps = _config(m)
-    _compiled_route(num_warps, warps_per_token, _local_cap(plan.local_num), plan.world, publish)(
+    _compiled(_compile_route, *_route_args(m, plan, publish))(
         Int32(m),
         Int64(ws.uc_local),
         Int64(flags.data_ptr()),
@@ -1443,7 +1445,6 @@ def run_moe_front(
         Int64(global_sf.data_ptr()),
         stream,
     )
-    _READY.add(_shape_key(m, plan, publish))
     return topk_ids, topk_weights, sort_outputs, codes, scales
 
 
