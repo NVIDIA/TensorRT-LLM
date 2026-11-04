@@ -75,6 +75,25 @@ class _UnsyncableTokenizer:
         return {"input_ids": ids, "offset_mapping": offsets}
 
 
+class _ExpandingTokenizer:
+    """Char-level, except that "ﬀ" becomes two equal tokens with the same offsets.
+
+    As with a byte-fallback character or an NFKC ligature, a split can land on
+    the second token of the character, and a long run of them makes the tail
+    agree with the cached ids however it is misaligned.
+    """
+
+    is_fast = True
+
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
+        ids, offsets = [], []
+        for i, char in enumerate(text):
+            for _ in range(2 if char == "ﬀ" else 1):
+                ids.append(_tok_id(char))
+                offsets.append((i, i + 1))
+        return {"input_ids": ids, "offset_mapping": offsets}
+
+
 _MIN_CHARS = 16
 # A shared opening longer than min_chars, so growing prompts land in the same
 # bucket and the prefix lookup can find them.
@@ -138,13 +157,30 @@ def test_rewritten_history_is_identical_to_full_tokenization(tokenizer: Any) -> 
         assert cache.encode(tokenizer, prompt) == tokenizer(prompt)["input_ids"]
         # Trim the last message and append a different one, as agents do.
         rewritten = prompt[: len(prompt) - 20] + f"rewritten tail {i} there. "
+        hits, failures = cache.hits, cache.resync_failures
         assert cache.encode(tokenizer, rewritten) == tokenizer(rewritten)["input_ids"]
+        if isinstance(tokenizer, _MergeTokenizer):
+            assert cache.hits == hits + 1
+        else:
+            # Spliced from the history and rejected at the seam.
+            assert cache.resync_failures == failures + 1
     if isinstance(tokenizer, _MergeTokenizer):
         assert cache.divergent_hits >= len(turns)
         # The rewritten branch does not evict the history it diverged from.
         assert any(entry.text == turns[-1] for entry in cache._entries.values())
     else:
-        assert cache.divergent_hits == 0 and cache.resync_failures > 0
+        assert cache.divergent_hits == 0
+
+
+def test_a_split_inside_a_multi_token_character_is_not_used() -> None:
+    tokenizer, cache = _ExpandingTokenizer(), _cache()
+    text = _PREAMBLE
+    for i in range(12):
+        # The odd character shifts every later split onto the other token of a pair.
+        text += "ﬀ" * 40 + "." * (i % 2)
+        assert cache.encode(tokenizer, text) == tokenizer(text)["input_ids"]
+        rewritten = text[:-10] + "rewritten. "
+        assert cache.encode(tokenizer, rewritten) == tokenizer(rewritten)["input_ids"]
 
 
 def test_short_prompts_are_tokenized_but_not_cached() -> None:

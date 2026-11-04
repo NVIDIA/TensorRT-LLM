@@ -243,7 +243,7 @@ class PrefixTokenCache:
         if found is not None:
             entry = found.entry
             tail_ids, tail_offsets = self._tokenize(tokenizer, text[found.split_char :])
-            if self._resynced(entry, found.split_token, tail_ids):
+            if self._resynced(entry, found.split_token, tail_ids, tail_offsets):
                 ids = entry.ids[: found.split_token].tolist() + list(tail_ids)
                 base_token, base_char = found.split_token, found.split_char
         if ids is None:
@@ -305,8 +305,21 @@ class PrefixTokenCache:
             out.append(base_char + tail_offsets[index - base_token][0])
         return out
 
-    def _resynced(self, entry: _Entry, split_token: int, tail_ids: Sequence[int]) -> bool:
+    def _resynced(
+        self,
+        entry: _Entry,
+        split_token: int,
+        tail_ids: Sequence[int],
+        tail_offsets: Sequence[tuple[int, int]],
+    ) -> bool:
         """Whether the tokenizer re-synchronized with the cached ids at the seam."""
+        # A character tokenized into several tokens (a byte-fallback character,
+        # an expanded ligature) reports the same start for each. If the tail
+        # opens with one, the split token may not be the first of them and the
+        # tail would repeat the cached ids before it, which a run of equal ids
+        # can hide from the comparison below.
+        if len(tail_offsets) > 1 and tail_offsets[1][0] == tail_offsets[0][0]:
+            return False
         cached_tail = entry.ids[split_token:]
         span = min(self._config.resync, len(tail_ids), len(cached_tail))
         return span > 0 and list(tail_ids[:span]) == cached_tail[:span].tolist()
