@@ -714,8 +714,8 @@ class DecoderRunner(ScheduledModelRunner):
                     spec_metadata,
                     self._mapping,
                     self._dist,
-                    self.cuda_graph_runner,
-                    padded_graph_requests,
+                    cuda_graph_runner=self.cuda_graph_runner,
+                    batch=padded_graph_requests,
                     confidence_enabled=self._dspark_confidence_enabled,
                 )
                 validate_dspark_draft_sampling(

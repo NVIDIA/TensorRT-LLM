@@ -1367,6 +1367,9 @@ class DeepseekV41Model(DeepseekV4Model):
     _encoder_pass_graph: EncoderPassGraph | None = None
     # This forward's Engram context-overlap decision, taken at its entry.
     _engram_overlap_decision: bool | None = None
+    # Models built without __init__ (test stubs) do not overlap the Engram context work.
+    _engram_context_overlap = False
+    _engram_projection_layers: dict[int, int] = {}
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__(model_config, *args, **kwargs)

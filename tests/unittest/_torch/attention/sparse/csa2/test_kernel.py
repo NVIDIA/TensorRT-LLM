@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     row_bytes,
     unpack_rows,
 )
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.math_utils import ceil_div, pad_up
 
 skip_pre_blackwell = pytest.mark.skipif(
@@ -2568,7 +2569,8 @@ def test_fused_decode_select_matches_chain(rows, width, ties):
     torch.testing.assert_close(
         fused, _decode_select_reference(logits, valid, visible, top_k), atol=0, rtol=0
     )
-    if not ties:
+    # The decode chain's CuTe DSL Top-K serves these widths on SM100-family GPUs only.
+    if not ties and is_sm_100f():
         chain = torch.empty_like(fused)
         masked = logits.clone()
         kernel.mask_logits_(masked, valid, row_lengths=visible)
