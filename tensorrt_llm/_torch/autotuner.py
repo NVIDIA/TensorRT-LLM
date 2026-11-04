@@ -944,6 +944,9 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
+        # Cache keys whose runner ran in this process (so any JIT it drives
+        # has happened here), as opposed to keys loaded from disk or peers.
+        self._keys_profiled_in_process: set[Tuple] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1160,18 +1163,25 @@ class AutoTuner:
         # was populated by this process's own warmup.
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
-        if tuning_config.exclude_from_cache and self.is_tuning_mode:
+        is_cache_hit, best_runner_id, best_tactic, min_time = (
+            self.profiling_cache.search_cache(custom_op,
+                                              runners,
+                                              input_shapes,
+                                              tuning_config,
+                                              apply_map_to_tuning_buckets=True))
+        if (tuning_config.exclude_from_cache and self.is_tuning_mode
+                and is_cache_hit and self.profiling_cache.get_cache_key(
+                    custom_op,
+                    runners[best_runner_id],
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets=True)
+                not in self._keys_profiled_in_process):
+            # Only an entry this process profiled proves its JIT side
+            # effects already ran here; re-profile anything else.
             is_cache_hit = False
             best_runner_id, best_tactic, min_time = (
                 self.profiling_cache.fallback_entry())
-        else:
-            is_cache_hit, best_runner_id, best_tactic, min_time = (
-                self.profiling_cache.search_cache(
-                    custom_op,
-                    runners,
-                    input_shapes,
-                    tuning_config,
-                    apply_map_to_tuning_buckets=True))
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -1224,7 +1234,6 @@ class AutoTuner:
                 tuning_config.distributed_tuning_strategy):
             with self._shared_profile_graph_pool():
                 for p in profiles:
-                    tensors = self._prepare_input_tensors(p, inputs)
                     is_cache_hit, *_ = self.profiling_cache.search_cache(
                         custom_op,
                         runners,
@@ -1233,6 +1242,7 @@ class AutoTuner:
                         apply_map_to_tuning_buckets=False,
                     )
                     if not is_cache_hit:
+                        tensors = self._prepare_input_tensors(p, inputs)
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         with nvtx_range(
                                 f"{custom_op}, shape {p.get_opt_shapes()}"):
@@ -1530,6 +1540,7 @@ class AutoTuner:
             # TODO: use named tuple to make it more readable
             self.profiling_cache[cache_key] = (best_runner_id, best_tactic,
                                                min_time)
+            self._keys_profiled_in_process.add(cache_key)
 
             self.stats.tuned_op_profiled_configs[custom_op] += 1
         else:
@@ -1999,6 +2010,7 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        self._keys_profiled_in_process.clear()
         if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
             torch.ops.trtllm.clear_allreduce_tactic_cache()
 
