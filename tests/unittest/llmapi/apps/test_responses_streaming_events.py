@@ -1053,6 +1053,34 @@ async def test_a_promise_finished_before_the_stream_reads_it_ends_normally(monke
 
 
 @pytest.mark.asyncio
+async def test_a_promise_finished_with_text_before_the_stream_reads_it_streams_the_text(
+    monkeypatch,
+):
+    """The text a promise already holds when the stream first reads it is streamed and kept."""
+    server = _server_streaming(monkeypatch, steps=[])
+    # With no step the promise is finished from the start; give it the engine's whole answer.
+    promise = server.generator.generate_async()
+    promise._take(_step("Hello", "Hello", done=True))
+    server.generator.generate_async = lambda **kwargs: promise
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(request, raw_request)
+    sent = await _collect(response.body_iterator)
+
+    types = [_event_type(f) for f in sent]
+    deltas = [
+        _event_data(f)["delta"] for f in sent if _event_type(f) == "response.output_text.delta"
+    ]
+    assert "".join(deltas) == "Hello"
+    assert types[-1] == "response.completed"
+    assert "error" not in types
+    output = _event_data(sent[-1])["response"]["output"]
+    assert [part["text"] for item in output for part in item["content"]] == ["Hello"]
+    server._extract_metrics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_the_first_token_time_is_taken_at_the_first_result(monkeypatch):
     """The TTFT the perf metrics record is the wait for the first result, not the whole stream."""
     yielded_at = []
