@@ -141,7 +141,9 @@ def test_oversized_header_length_is_rejected(tmp_path, header_len, file_size):
     path = tmp_path / "bad.safetensors"
     with open(path, "wb") as f:
         f.write(struct.pack("<Q", header_len) + b"{}")
-        f.truncate(file_size)  # shorter than the header, or sparse: fits in the file but exceeds the cap
+        f.truncate(
+            file_size
+        )  # shorter than the header, or sparse: fits in the file but exceeds the cap
     with pytest.raises(ValueError, match="invalid SafeTensors header length"):
         PinnedSafetensorsFile(str(path)).__enter__()
 
