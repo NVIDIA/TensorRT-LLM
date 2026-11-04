@@ -4,6 +4,7 @@
 import json
 import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -12,8 +13,6 @@ from safetensors import safe_open
 from tensorrt_llm._torch.models.checkpoints.hf import pinned_safetensors
 from tensorrt_llm._torch.models.checkpoints.hf.pinned_safetensors import PinnedSafetensorsFile
 from tensorrt_llm._utils import prefer_pinned
-
-pytestmark = pytest.mark.cpu_only
 
 # Every SafeTensors dtype the reader maps that this torch build has.
 _DTYPES = {
@@ -53,6 +52,7 @@ def _write_shard(path: str, tensors: dict[str, tuple[str, torch.Tensor]]) -> Non
         f.write(struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", sorted(_DTYPES))
 def test_get_tensor_matches_safe_open_bit_for_bit(tmp_path, monkeypatch, name):
     monkeypatch.setattr(pinned_safetensors, "_READ_BYTES", 1000)  # ragged multi-chunk reads
@@ -76,10 +76,10 @@ def test_get_tensor_matches_safe_open_bit_for_bit(tmp_path, monkeypatch, name):
             assert torch.equal(
                 got.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8)
             )
-        assert ours.get_tensor("large").is_pinned() == prefer_pinned()
         assert not ours.get_tensor("small").is_pinned()
 
 
+@pytest.mark.cpu_only
 def test_partial_preadv_results_are_resumed(tmp_path, monkeypatch):
     path = str(tmp_path / "shard.safetensors")
     weights = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)  # 64 KiB
@@ -94,6 +94,7 @@ def test_partial_preadv_results_are_resumed(tmp_path, monkeypatch):
         assert torch.equal(shard.get_tensor("w"), weights)
 
 
+@pytest.mark.cpu_only
 def test_missing_bytes_raise_instead_of_returning_a_partial_tensor(tmp_path):
     path = str(tmp_path / "shard.safetensors")
     ints = torch.arange(16, dtype=torch.int32)
@@ -106,6 +107,7 @@ def test_missing_bytes_raise_instead_of_returning_a_partial_tensor(tmp_path):
             shard.get_tensor("b")
 
 
+@pytest.mark.cpu_only
 def test_unsupported_dtype_fails_only_its_own_tensor(tmp_path):
     path = str(tmp_path / "shard.safetensors")
     ints = torch.arange(4, dtype=torch.int32)
@@ -116,6 +118,7 @@ def test_unsupported_dtype_fails_only_its_own_tensor(tmp_path):
             shard.get_tensor("odd")
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "header",
     [b"\xff" * 8, json.dumps({"t": {"dtype": "U8", "shape": [1]}}).encode()],
@@ -128,3 +131,26 @@ def test_failed_open_does_not_leak_the_file_descriptor(tmp_path, header):
     with pytest.raises((KeyError, ValueError, OSError)):
         PinnedSafetensorsFile(str(path)).__enter__()
     assert len(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.cpu_only
+def test_header_length_beyond_the_file_is_rejected(tmp_path):
+    path = tmp_path / "bad.safetensors"
+    path.write_bytes(struct.pack("<Q", 1 << 40) + b"{}")
+    with pytest.raises(ValueError, match="exceeds the file"):
+        PinnedSafetensorsFile(str(path)).__enter__()
+
+
+@pytest.mark.skipif(not prefer_pinned(), reason="pinned host memory needs CUDA")
+def test_large_tensors_are_pinned_and_exact_under_concurrent_reads(tmp_path):
+    path = str(tmp_path / "shard.safetensors")
+    tensors = {
+        f"w{i}": ("BF16", _random_bits(torch.bfloat16, (256, 1024), i)) for i in range(8)
+    }  # 512 KiB each, above _PIN_MIN_BYTES
+    _write_shard(path, tensors)
+    with PinnedSafetensorsFile(path) as ours, safe_open(path, framework="pt", device="cpu") as ref:
+        with ThreadPoolExecutor(4) as pool:
+            got = dict(zip(tensors, pool.map(ours.get_tensor, tensors)))
+        for key, tensor in got.items():
+            assert tensor.is_pinned()
+            assert torch.equal(tensor.view(torch.uint8), ref.get_tensor(key).view(torch.uint8))
