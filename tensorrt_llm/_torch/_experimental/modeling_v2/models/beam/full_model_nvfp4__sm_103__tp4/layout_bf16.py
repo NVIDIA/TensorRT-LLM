@@ -175,6 +175,10 @@ def check_config(config: Any) -> Schedule:
         actual = _get(config, field)
         if actual != expected or type(actual) is not type(expected):
             raise ValueError(f"unsupported {field}={actual!r}; this layout computes {expected!r}")
+    for field, expected in (("partial_rotary_factor", 1.0), ("use_sliding_window", True)):
+        actual = _get(config, field)
+        if actual is not None and actual != expected:
+            raise ValueError(f"unsupported {field}={actual!r}; this layout computes {expected!r}")
     layers = SUPPORTED_CONFIG["num_hidden_layers"]
     attention = tuple(_get(config, "layer_types") or ())
     mlp = tuple(_get(config, "mlp_layer_types") or ())
@@ -196,6 +200,7 @@ def check_config(config: Any) -> Schedule:
         or not isinstance(sliding, Mapping)
         or sliding.get("rope_type") != "default"
         or sliding.get("rope_theta") != SLIDING_ROPE_THETA
+        or sliding.get("partial_rotary_factor", 1.0) != 1.0
     ):
         raise ValueError(
             "rope_parameters must give sliding layers default RoPE with theta "

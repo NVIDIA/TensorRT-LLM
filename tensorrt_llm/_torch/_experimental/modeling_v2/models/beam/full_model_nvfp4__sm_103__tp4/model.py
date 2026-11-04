@@ -94,8 +94,8 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         """Raise ValueError unless ``manager`` holds every logical layer as this model needs.
 
         Required: BF16, ``head_dim`` 128, 2 kv heads per rank on every layer, logical layers
-        0..51 in local slots 0..51, the sliding window on sliding layers and the whole sequence
-        on full-attention layers. Reads host-side manager state only.
+        0..51 in local slots 0..51, sliding or full-context retention on sliding layers,
+        and the whole sequence on full-attention layers. Reads host-side manager state only.
         """
         offsets = getattr(manager, "layer_offsets", None)
         if not isinstance(offsets, Mapping) or dict(offsets) != {
@@ -121,7 +121,10 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             raise ValueError(f"the KV cache manager states {len(windows)} attention windows")
         for layer, window in enumerate(windows):
             if self.schedule.is_sliding(layer):
-                ok = window is not None and int(window) == self.window
+                # The estimator uses a full-context pool, and short sequences
+                # normalize the sliding window to full context. The attention
+                # operator still applies self.window independently of retention.
+                ok = window is None or int(window) in (self.window, manager.max_seq_len)
             else:
                 ok = window is None or int(window) >= manager.max_seq_len
             if not ok:

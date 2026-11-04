@@ -29,3 +29,27 @@ endpoint; see its adjacent `gsm8k_eval/README.md` for arguments and resume behav
 
 This baseline does not enable speculative decoding, FP8 KV, disaggregated serving,
 Dynamo, CUDA graphs or overlap scheduling. Those configurations require separate qualification.
+
+## Baseline accuracy qualification
+
+The named `TestModelingV2BeamFullModelNvfp4Sm103Tp4` gate starts the baseline with
+`trtllm-serve` and `modeling_v2: require`, then runs the public evaluator's pinned
+first 100 GSM8K questions. It requires at least 95 correct answers and no execution,
+parsing or truncation failures. It uses BF16 KV, no drafter, and one request at a time.
+This is a manual four-GB300 qualification with a 45-minute cap; it is not an L0
+or full-dataset CI test. LR/nightly scheduling requires timing and accuracy
+qualification on a build matching this extracted baseline.
+
+Stage an authorized target below `LLM_MODELS_ROOT`, set
+`TRTLLM_TEST_TARGET_RELATIVE_PATH` to its relative directory, and stage the pinned
+GSM8K files at `$LLM_MODELS_ROOT/datasets/openai/gsm8k` as described in the public
+evaluator README. Missing inputs fail the selected run. With exactly four GB300s visible:
+
+```bash
+pytest tests/integration/defs/accuracy/modeling_v2/test_beam.py \
+  -k test_gsm8k_first100 --timeout=2700
+```
+
+The test writes its server configuration, logs, per-question records and summary
+under pytest's temporary directory. The timeout and incomplete runs are failures,
+not accuracy passes. A gate definition alone does not qualify this baseline.

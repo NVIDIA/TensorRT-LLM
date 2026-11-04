@@ -6,6 +6,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+from tensorrt_llm.quantization.modelopt_config import (
+    canonicalize_quant_algo,
+    read_modelopt_quant_config,
+)
+
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
@@ -16,28 +21,40 @@ if TYPE_CHECKING:
 def _quant_algo(pretrained_config: Any) -> Optional[str]:
     quant = getattr(pretrained_config, "quantization_config", None)
     if isinstance(quant, dict):
-        return quant.get("quant_algo")
-    return getattr(quant, "quant_algo", None)
+        if "quantization" in quant or "quant_method" in quant or "producer" in quant:
+            return read_modelopt_quant_config(quant).get("quant_algo")
+        return canonicalize_quant_algo(quant.get("quant_algo"))
+    return canonicalize_quant_algo(getattr(quant, "quant_algo", None))
 
 
 def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
-    """Why the engine's per-step token budget exceeds what the target computes, or None.
-
-    The target runs at most ``model.MAX_NUM_TOKENS`` tokens per call (the attention op's
-    measured step size), so ``max_num_tokens`` must lie in ``[1, MAX_NUM_TOKENS]``.
-    """
-    if llm_args is not None:
-        if getattr(llm_args, "cuda_graph_config", None) is not None:
-            return "CUDA graphs are not supported by this eager Beam target"
-        if not getattr(llm_args, "disable_overlap_scheduler", True):
-            return "the overlap scheduler is not supported by this eager Beam target"
-    if llm_args is None or getattr(llm_args, "max_num_tokens", None) is None:
+    """Report engine options this eager target cannot implement."""
+    if llm_args is None:
         return None
-    from .full_model_nvfp4__sm_103__tp4.model import MAX_NUM_TOKENS
+    reasons = []
+    if getattr(llm_args, "cuda_graph_config", None) is not None:
+        reasons.append("CUDA graphs are not supported by this eager Beam target")
+    if not getattr(llm_args, "disable_overlap_scheduler", True):
+        reasons.append("the overlap scheduler is not supported by this eager Beam target")
+    load_format = getattr(llm_args, "load_format", "auto")
+    if str(getattr(load_format, "name", load_format)).lower() != "auto":
+        reasons.append("load_format must be auto")
+    if getattr(llm_args, "max_beam_width", 1) not in (None, 1):
+        reasons.append("beam search is not supported; max_beam_width must be 1")
+    if getattr(llm_args, "attn_backend", "TRTLLM") != "TRTLLM":
+        reasons.append("attn_backend must be TRTLLM")
+    for field in ("lora_config", "kv_connector_config", "cache_transceiver_config"):
+        if getattr(llm_args, field, None) is not None:
+            reasons.append(f"{field} is not supported by this Beam target")
+    if getattr(llm_args, "enable_return_routed_experts", False):
+        reasons.append("returning routed experts is not supported")
+    max_tokens = getattr(llm_args, "max_num_tokens", None)
+    if max_tokens is not None:
+        from .full_model_nvfp4__sm_103__tp4.model import MAX_NUM_TOKENS
 
-    if not 1 <= llm_args.max_num_tokens <= MAX_NUM_TOKENS:
-        return f"max_num_tokens {llm_args.max_num_tokens} is outside [1, {MAX_NUM_TOKENS}]"
-    return None
+        if not 1 <= max_tokens <= MAX_NUM_TOKENS:
+            reasons.append(f"max_num_tokens {max_tokens} is outside [1, {MAX_NUM_TOKENS}]")
+    return "; ".join(reasons) or None
 
 
 @routes("BeamForCausalLM")
@@ -70,7 +87,10 @@ def route(
         bool(mapping.enable_attention_dp),
     )
     refusal = engine_refusal(llm_args)
-    quant_algo = _quant_algo(pretrained_config)
+    try:
+        quant_algo = _quant_algo(pretrained_config)
+    except ValueError as exc:
+        raise NoTarget(str(exc)) from exc
     if quant_algo is None:
         algo = getattr(model_config.quant_config, "quant_algo", None)
         quant_algo = getattr(algo, "value", algo)
@@ -83,6 +103,18 @@ def route(
         and kv_cache_quant_algo is None
         and refusal is None
     ):
+        from .full_model_nvfp4__sm_103__tp4.weights import BeamNvfp4CheckpointLoader
+
+        loader = getattr(llm_args, "checkpoint_loader", None)
+        registered_format = (
+            loader is None and getattr(llm_args, "checkpoint_format", None) == "beam_nvfp4"
+        )
+        if not registered_format and not isinstance(loader, BeamNvfp4CheckpointLoader):
+            raise NoTarget(
+                "this Beam target requires checkpoint_format='beam_nvfp4' or "
+                "checkpoint_loader=BeamNvfp4CheckpointLoader(); "
+                "the default HF checkpoint loader cannot populate its packed weights"
+            )
         from .full_model_nvfp4__sm_103__tp4.layout import check_checkpoint, checkpoint_dir_of
 
         try:
