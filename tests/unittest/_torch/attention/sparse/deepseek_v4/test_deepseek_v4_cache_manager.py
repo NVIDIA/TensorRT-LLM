@@ -670,6 +670,7 @@ def _history_case(
     manager._stream = stream or Mock(cuda_stream=19, device=None)
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.conversation_manager = None
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     cache = _HistoryCache(tokens_per_block, manager._stream.cuda_stream)

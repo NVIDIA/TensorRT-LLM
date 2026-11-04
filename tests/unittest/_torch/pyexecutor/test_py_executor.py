@@ -486,6 +486,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     is_warmup: bool, has_transceiver: bool
 ) -> None:
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import executor_request_to_llm_request
 
     creator = object.__new__(KvCacheCreator)
@@ -510,7 +511,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     if not has_transceiver:
         executor.kv_cache_transceiver = None
     executor.max_beam_width = 1
-    executor.kv_cache_manager = None
+    executor.kv_cache_manager = Mock(spec=KVCacheManagerV2)
     executor.sampler = Mock()
     executor._configure_csa2_remote_tail = types.MethodType(
         PyExecutor._configure_csa2_remote_tail, executor
@@ -976,6 +977,7 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=Mock(),
         _prefetched_request_ids={41},
+        kv_connector_manager=None,
         enable_attention_dp=False,
         disagg=Mock(),
     )
@@ -1568,7 +1570,7 @@ def _make_encoder_decoder_request(request_id, encoder_input, encoder_len):
     )
 
 
-def _make_handoff_executor(tp_size=1):
+def _make_handoff_executor(tp_size: int = 1) -> PyExecutor:
     """Async encoder executor that publishes through the real handoff methods."""
     executor = _make_async_encoder_executor(future=None)
     del executor._publish_encoder_step
@@ -1582,6 +1584,7 @@ def _make_handoff_executor(tp_size=1):
     executor.active_requests = []
     executor.enable_attention_dp = False
     executor.kv_cache_transceiver = None
+    executor.kv_connector_manager = None
     return executor
 
 
@@ -1902,6 +1905,7 @@ def test_getter_methods(mock_executor):
 
 def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor.resource_manager = Mock()
     executor.resource_manager.resource_managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
@@ -3148,6 +3152,8 @@ def _make_adp_request(
 
 
 class _StubADPExecutor:
+    kv_connector_manager = None
+    _kv_connector_moves_kv = PyExecutor._kv_connector_moves_kv
     _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
 
     def __init__(
@@ -4441,10 +4447,11 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
     assert reverted == [real_gen_request]
 
 
-def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
+def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse() -> None:
     # The V2 scheduler grows both pools together, so a skipped batch hands both
     # back. Attention DP keeps one unified pool and never reaches this pairing.
     stub = object.__new__(PyExecutor)
+    stub.kv_connector_manager = None
     stub._is_kv_manager_v2 = True
     stub.kv_cache_manager = Mock()
     stub.draft_kv_cache_manager = Mock()
@@ -4506,9 +4513,10 @@ def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_
 
 
 class TestPendingTransferResponseFlush:
-    def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
+    def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self) -> None:
         """A lone fatal rank must fail locally rather than desynchronize TP."""
         executor = object.__new__(PyExecutor)
+        executor.kv_connector_manager = None
         executor._error_budget = Mock()
         executor._error_budget.consume.return_value = True
         executor._error_budget.budget = 0.0
@@ -4531,9 +4539,10 @@ class TestPendingTransferResponseFlush:
         executor._enqueue_responses.assert_not_called()
         executor.executor_request_queue.enqueue_shutdown_request.assert_called_once_with()
 
-    def test_adp_flush_participates_with_an_empty_response_list(self):
+    def test_adp_flush_participates_with_an_empty_response_list(self) -> None:
         """Ranks without an error still join the synchronized response gather."""
         executor = object.__new__(PyExecutor)
+        executor.kv_connector_manager = None
         executor._pending_transfer_responses = []
         executor._pending_response_terminations = []
         executor.enable_attention_dp = True
@@ -4543,8 +4552,9 @@ class TestPendingTransferResponseFlush:
 
         executor._enqueue_responses.assert_called_once_with([])
 
-    def test_flush_delivers_and_clears_buffered_responses(self):
+    def test_flush_delivers_and_clears_buffered_responses(self) -> None:
         executor = object.__new__(PyExecutor)
+        executor.kv_connector_manager = None
         responses = [(7, Mock())]
         executor._pending_transfer_responses = responses
         executor._pending_response_terminations = []
@@ -4556,9 +4566,10 @@ class TestPendingTransferResponseFlush:
         executor._enqueue_responses.assert_called_once_with(responses)
         assert executor._pending_transfer_responses == []
 
-    def test_rank_zero_keeps_result_queue_until_buffered_error_flushes(self):
+    def test_rank_zero_keeps_result_queue_until_buffered_error_flushes(self) -> None:
         """A queued client receives a rank-0 ADP error before cleanup."""
         executor = object.__new__(PyExecutor)
+        executor.kv_connector_manager = None
         request_id = 7
         response = LlmResponse(request_id=request_id)
         response.request_id = request_id
@@ -4588,6 +4599,7 @@ class TestPendingTransferResponseFlush:
     @staticmethod
     def _make_executor_loop_stub() -> PyExecutor:
         executor = object.__new__(PyExecutor)
+        executor.kv_connector_manager = None
         executor.enable_attention_dp = False
         executor.device_id = 0
         profiler = MagicMock()
@@ -4769,6 +4781,7 @@ class TestOneModelMTPDraftTokenScheduling:
         immediately instead of padding a batch this test does not exercise.
         """
         ex = object.__new__(PyExecutor)
+        ex.kv_connector_manager = None
         ex.drafter = None
         ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
         spec_config = MTPDecodingConfig(
@@ -5194,3 +5207,12 @@ def test_disagg_gen_first_step_is_streamed_once():
     executor.active_requests = [request]
     PyExecutor._handle_responses(executor)
     assert request.create_response.call_count == 1
+
+
+@pytest.mark.parametrize("route", ["transceiver", "connector"])
+def test_completion_reservation_routes_cannot_rebalance_pools(route: str) -> None:
+    executor = object.__new__(PyExecutor)
+    executor.enable_kv_pool_rebalance = True
+    executor.kv_cache_transceiver = Mock() if route == "transceiver" else None
+    executor.kv_connector_manager = Mock() if route == "connector" else None
+    assert not executor._can_pause_for_rebalance()

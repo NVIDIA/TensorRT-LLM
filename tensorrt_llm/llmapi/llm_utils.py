@@ -650,6 +650,12 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
             "block_reuse_config.enable_branch_snapshot requires KV cache "
             "manager v2, but use_kv_cache_manager_v2='auto' resolved to V1. "
             "Set kv_cache_config.use_kv_cache_manager_v2=True explicitly.")
+    if not use_v2 and llm_args.kv_cache_config.enable_disagg_completion_reservation:
+        logger.warning(
+            "use_kv_cache_manager_v2='auto' resolved to V1; "
+            "enable_disagg_completion_reservation will not take effect. "
+            "Select a supported V2 configuration to reserve completion capacity."
+        )
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2
     return use_v2
 

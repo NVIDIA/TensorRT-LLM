@@ -551,6 +551,10 @@ class KVCacheManagerConfig:
     # Regions, each with a life cycle of its own, numbered after every layer life cycle in
     # declaration order. A (layer, role) pair belongs to one layer config or one region.
     regions: list[RegionConfig] = ...
+
+    # Candidate alignment after backoff, before each coverage validation;
+    # a positive divisor of tokens_per_block. 1 keeps token-granular reuse.
+    reuse_match_alignment: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

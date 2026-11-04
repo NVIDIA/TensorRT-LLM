@@ -27,6 +27,7 @@ class _StubRequest:
 
 def _make_executor(handler: Mock | None) -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor.enable_attention_dp = False
     executor.sampler = Mock()
     executor.model_engine = None

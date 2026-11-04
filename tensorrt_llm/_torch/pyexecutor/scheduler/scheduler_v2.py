@@ -425,6 +425,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        self.kv_cache_manager.begin_completion_admission(active_requests)
         self._sched_iter += 1
         self._reuse_probes.clear()
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
@@ -1343,6 +1344,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         Source reservations advance the prefix before budget checks. Destination
         pages are allocated here; loads are accepted after the final batch trims.
         A loading request remains outside the schedulable state range.
+
+        On a disaggregated server without an eviction tier whose connector
+        declares `requires_completion_reservation`, or whose
+        `kv_cache_config.enable_disagg_completion_reservation` is set, a
+        connector first chunk can be deferred for completion headroom; the
+        rollback below also drops its bound.
         """
         first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
@@ -1420,6 +1427,15 @@ class KVCacheV2Scheduler(RequestScheduler):
                 manager.free_resources(req)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
+    def _defer_for_completion_headroom(self, req: LlmRequest) -> bool:
+        if self.kv_cache_manager.reserve_context_completion(req):
+            return False
+        logger.debug(
+            "Deferring context request %s: admitted requests hold the completion headroom",
+            req.py_request_id,
+        )
+        return True
+
     def _try_schedule_context_full(
         self,
         req: LlmRequest,
@@ -1430,6 +1446,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns ``(action, tokens, chunking_flag)``.
         """
+        if self.kv_cache_manager.completion_admission_blocked(req):
+            return ScheduleAction.SKIP, 0, False
         pre_prepare_context_tokens = req.context_remaining_length
         draft_len = get_draft_token_length(req)
         if not self.enable_prefix_aware_scheduling:
@@ -1467,6 +1485,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
         req.context_chunk_size = context_tokens
+        if self._defer_for_completion_headroom(req):
+            return ScheduleAction.SKIP, 0, False
         if not self._try_allocate_context(req, context_tokens + draft_len):
             # Out of pages. Give up one started request so this one can
             # proceed, and retry next iteration: a failed resize leaves a
@@ -1546,6 +1566,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         be chunked small enough is skipped, allowing subsequent gen requests
         (needing only ~1 token) to still be scheduled.
         """
+        if self.kv_cache_manager.completion_admission_blocked(req):
+            return ScheduleAction.SKIP, 0, False
         remaining_budget = budget.remaining_tokens
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
@@ -1669,6 +1691,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 chunk_tokens += draft_len
                 resize_tokens += draft_len
 
+        if self._defer_for_completion_headroom(req):
+            return ScheduleAction.SKIP, 0, False
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
         if not self._try_allocate_context(req, resize_tokens):
@@ -2373,7 +2397,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             for r in pending_ctx
             if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
         )
-        if num_gen_candidates == 0 and num_ctx_candidates == 0:
+        num_gen_init_candidates = sum(
+            r.state_value == self._disagg_gen_init_state_value
+            and r.request_id not in inflight_request_ids
+            for r in active_requests
+        )
+        if num_gen_candidates == 0 and num_ctx_candidates == 0 and num_gen_init_candidates == 0:
             # Legitimately idle: nothing to schedule.
             if self._stalled_schedules:
                 logger.debug(
@@ -2484,7 +2513,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         raise RuntimeError(
             f"V2 scheduler deadlock: {num_gen_candidates} generation and "
-            f"{num_ctx_candidates} context request(s) active but none could "
+            f"{num_ctx_candidates} context and {num_gen_init_candidates} "
+            f"generation-init request(s) active but none could "
             f"be scheduled, suspended or preempted in "
             f"{self._stalled_schedules} consecutive attempts. The KV cache "
             f"pool is likely exhausted. {remedy}"
@@ -2514,15 +2544,22 @@ class KVCacheV2Scheduler(RequestScheduler):
             for r in pending_ctx
             if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
         ]
-        states = Counter(LlmRequestState(r.state_value).name for r in gen + ctx)
-        sample_ids = [r.py_request_id for r in (gen + ctx)[:5]]
+        gen_init = [
+            r
+            for r in active_requests
+            if r.state_value == self._disagg_gen_init_state_value
+            and r.request_id not in inflight_request_ids
+        ]
+        states = Counter(LlmRequestState(r.state_value).name for r in gen + ctx + gen_init)
+        sample_ids = [r.py_request_id for r in (gen + ctx + gen_init)[:5]]
         has_connector = getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None
         transfers_in_flight = (
             self._async_transfer_manager is not None
             and self._async_transfer_manager.has_any_inflight_requests()
         )
         return (
-            f"{len(gen)} generation and {len(ctx)} context request(s) blocked; "
+            f"{len(gen)} generation, {len(ctx)} context and {len(gen_init)} "
+            "generation-init request(s) blocked; "
             f"states={dict(states)}; sample_ids={sample_ids}; "
             f"kv_connector={has_connector}; "
             f"cache_tier_below_gpu={self.kv_cache_manager.has_cache_tier_below_gpu}; "

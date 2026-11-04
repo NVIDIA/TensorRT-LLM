@@ -140,6 +140,7 @@ class _KVCacheManagerConfigFieldSpec:
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
     host_sparse_pool_quota: object = None
     regions: object = None
+    reuse_match_alignment: int = 1
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__

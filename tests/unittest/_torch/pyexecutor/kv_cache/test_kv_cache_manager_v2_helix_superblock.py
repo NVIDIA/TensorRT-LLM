@@ -229,6 +229,7 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         _kv_reserve_draft_tokens=0,
         # No scheduler ran, so nothing recorded a generation allocation; the
         # rewind falls back to the reserve width.
+        _retained_generation_allocations={},
         _allocated_draft_lens={},
         _inflight_draft_lens={},
         kv_cache_map={7: kv},

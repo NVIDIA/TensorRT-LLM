@@ -279,6 +279,11 @@ void _validateRegions(std::vector<LayerConfig> const& layers, std::vector<Region
 
 void KVCacheManagerConfig::validate() const
 {
+    if (reuseMatchAlignment <= 0 || tokensPerBlock % reuseMatchAlignment != 0)
+    {
+        throw AssertionError("KVCacheManagerConfig: reuse_match_alignment (" + std::to_string(reuseMatchAlignment)
+            + ") must be a positive divisor of tokens_per_block (" + std::to_string(tokensPerBlock) + ")");
+    }
     if (swaScratchReuse.has_value())
     {
         swaScratchReuse->validate();

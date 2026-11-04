@@ -5121,6 +5121,13 @@
           "title": "Enable Block Reuse",
           "type": "boolean"
         },
+        "enable_disagg_completion_reservation": {
+          "default": false,
+          "description": "Reserve logical GPU KV capacity for completion on a disaggregated server using KV cache manager v2, no host or disk tier, beam width 1, one pipeline stage, and full attention on every layer. Explicit V1 or offload configurations are rejected; other unmet conditions are logged and disable reservation. Context-only requests reserve their remaining prompt; every decoding request also reserves output growth, including local full requests. Bounds are capped at idle pool capacity. A deferred request holds back later admissions while admitted work continues. No pages are allocated early. A connector can enable this policy through requires_completion_reservation.",
+          "status": "prototype",
+          "title": "Enable Disagg Completion Reservation",
+          "type": "boolean"
+        },
         "enable_kv_pool_rebalance": {
           "default": false,
           "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",

@@ -1111,6 +1111,7 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently() -
     freed = []
 
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor._mm_encoder_item_scheduling_enabled = True
     executor.enable_attention_dp = False
     executor.global_rank = 0
@@ -1251,16 +1252,19 @@ _BYTES_PER_ROW = 4
 
 def _make_v2_multimodal_scheduler(
     *,
-    kv_capacity,
-    max_num_tokens,
-    encoder_max_num_tokens,
-    encoder_batch_size,
-    stable_cache_keys=True,
-    context_chunk_unit_size=None,
-    scheduler_cls=MultimodalScheduler,
-):
+    kv_capacity: int,
+    max_num_tokens: int,
+    encoder_max_num_tokens: int,
+    encoder_batch_size: int,
+    stable_cache_keys: bool = True,
+    context_chunk_unit_size: int | None = None,
+    scheduler_cls: type[MultimodalScheduler] = MultimodalScheduler,
+) -> tuple[MultimodalScheduler, dict[int, int]]:
     kv_allocated = {}
     manager = Mock(spec=KVCacheManagerV2)
+    manager.kv_connector_manager = None
+    manager.completion_admission_blocked.return_value = False
+    manager.reserve_context_completion.return_value = True
     manager.context_replay_tokens.return_value = None
     manager.can_share_inflight_prefix = False
     manager.tokens_per_block = 10

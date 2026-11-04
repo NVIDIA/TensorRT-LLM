@@ -59,6 +59,13 @@ def _manager() -> Mock:
     manager._on_allocation_stream = set()
     manager._allocation_ready = {}
     manager._pending_preemption = {}
+    # Completion reservation is explicitly disabled for receive-ordering tests.
+    manager._reserves_disagg_completion = False
+    manager.completion_admission_blocked = MethodType(
+        KVCacheManagerV2.completion_admission_blocked, manager
+    )
+    manager._disagg_completion_pool_counts = {}
+    manager._disagg_completion_limits = {}
     manager.is_draft = False
     manager.kv_connector_manager = None
     manager.enable_block_reuse = False
@@ -234,6 +241,7 @@ def test_cancelled_admission_releases_event() -> None:
     ready = Mock()
     manager._disagg_receive_ready[request.py_request_id] = ready
     manager.conversation_manager = None
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()

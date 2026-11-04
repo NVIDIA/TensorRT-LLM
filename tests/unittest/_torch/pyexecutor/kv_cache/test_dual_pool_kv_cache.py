@@ -1326,6 +1326,7 @@ class TestCrossCacheV2Lifecycle:
         manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
         manager.conversation_manager = None
         manager.is_draft = False
+        manager._retained_generation_allocations = {}
         manager._allocated_draft_lens = {}
         manager.kv_compression_manages_history = False
         manager._has_cp_helix = False

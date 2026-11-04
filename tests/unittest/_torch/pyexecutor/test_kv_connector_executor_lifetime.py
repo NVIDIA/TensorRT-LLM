@@ -30,6 +30,7 @@ pytestmark = pytest.mark.cpu_only
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
+    executor.execution_stream = Mock()
     executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
     executor._kv_connector_failed = False
     executor._kv_connector_has_pending = False
@@ -40,6 +41,9 @@ def _executor() -> PyExecutor:
     # leaves it unset fails loudly rather than silently lifting the executor
     # off the connector's per-request path.
     executor.kv_connector_manager.capacity_only = False
+    executor.kv_connector_manager.reports_failed_loads = False
+    executor.kv_connector_manager.speculative_prefill_only = False
+    executor.kv_connector_manager.refuses.return_value = False
     executor.kv_connector_manager.prefix_reservations_enabled = True
     executor.kv_connector_manager.defer_load_termination.return_value = False
     executor.kv_connector_manager.has_outstanding_save.return_value = False
@@ -73,6 +77,7 @@ def _request(request_id: int = 1) -> SimpleNamespace:
         state=LlmRequestState.CONTEXT_INIT,
         is_child=False,
         is_dummy_request=False,
+        py_connector_load_failed=False,
         is_finished=False,
         py_decoding_iter=0,
         cached_tokens=32,
@@ -808,3 +813,86 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     # The worker thread first: it is the one still handing the connector work.
     executor.worker_thread.join.assert_called_once_with()
     assert order == ["connector", "kv pools"]
+
+
+@pytest.mark.parametrize("request_count", [0, 1, 2])
+def test_failed_connector_load_batch_preserves_cleanup_order(request_count: int) -> None:
+    executor = object.__new__(PyExecutor)
+    requests = [
+        SimpleNamespace(request_id=i, py_connector_load_failed=False) for i in range(request_count)
+    ]
+    calls: list[str] = []
+    executor.execution_stream = SimpleNamespace(synchronize=lambda: calls.append("fence"))
+    executor.kv_connector_manager = SimpleNamespace(
+        drop_bound_saves=Mock(side_effect=lambda reqs: calls.append("drop_saves"))
+    )
+    executor.kv_cache_manager = SimpleNamespace(
+        drop_context_allocation=lambda req: calls.append("drop_allocation")
+    )
+    spec_manager = SimpleNamespace(free_resources=lambda req: calls.append("drop_spec"))
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda kind: spec_manager)
+
+    assert executor._restart_failed_connector_loads(requests) == list(range(request_count))
+
+    assert all(req.py_connector_load_failed for req in requests)
+    if request_count:
+        executor.kv_connector_manager.drop_bound_saves.assert_called_once_with(requests)
+        assert calls == ["fence", "drop_saves"] + ["drop_allocation", "drop_spec"] * request_count
+    else:
+        executor.kv_connector_manager.drop_bound_saves.assert_not_called()
+        assert calls == []
+
+
+def test_real_request_keeps_failure_marker_across_reset_and_requery() -> None:
+    """Reset callbacks and the subsequent connector lookup see the failed-load marker."""
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.bindings import SamplingConfig
+
+    request = LlmRequest(
+        request_id=81,
+        max_new_tokens=4,
+        input_tokens=[1, 2, 3, 4],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    executor = object.__new__(PyExecutor)
+    executor.execution_stream = Mock()
+    executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
+    executor.kv_cache_manager = Mock(spec=KVCacheManagerV2)
+    executor.resource_manager = Mock()
+    executor.resource_manager.get_resource_manager.return_value = None
+
+    def drop_allocation(req: LlmRequest) -> None:
+        assert req.py_connector_load_failed
+        req.reset_for_recompute(32)
+
+    executor.kv_cache_manager.drop_context_allocation.side_effect = drop_allocation
+    executor._restart_failed_connector_loads([request])
+    assert request.py_connector_load_failed
+
+    connector = KvCacheConnectorManager.__new__(KvCacheConnectorManager)
+    connector.capacity_only = False
+    connector.speculative_prefill_only = False
+    connector.enable_attention_dp = True
+    connector.scheduler = Mock()
+    connector.finished_async_loading_requests = {}
+    connector.scheduler.get_num_new_matched_tokens.return_value = (2, False)
+    connector.query_num_new_matched_tokens(request, 0)
+    queried = connector.scheduler.get_num_new_matched_tokens.call_args.args[0]
+    assert queried is request and queried.py_connector_load_failed
+
+
+def test_repeated_failed_load_fails_request_without_restarting_again() -> None:
+    executor = _executor()
+    executor._handle_errors = Mock()
+    request = _request()
+    request.py_connector_load_failed = True
+    assert not executor._restart_failed_connector_loads([request])
+    executor._handle_errors.assert_called_once()
+    executor.kv_connector_manager.drop_bound_saves.assert_called_once_with([request])
+    assert executor._handle_errors.call_args.kwargs == {
+        "requests": [request],
+        "charge_budget": False,
+    }
+    executor.kv_cache_manager.drop_context_allocation.assert_not_called()

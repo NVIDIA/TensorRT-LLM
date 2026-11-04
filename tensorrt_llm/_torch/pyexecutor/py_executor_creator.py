@@ -26,8 +26,9 @@ from tensorrt_llm._torch.modules.dwdp.dense.manager import (
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
-from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+from tensorrt_llm._utils import get_sm_version, normalize_disagg_role
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
@@ -53,7 +54,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
-                    instantiate_sampler, is_disagg_enabled, is_mla)
+                    instantiate_sampler, is_disagg_enabled, is_mla,
+                    kv_cache_manager_v2_incompatible_features)
 from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -297,6 +299,64 @@ def _flashinfer_one_engine_spec_supported(attn_backend: str,
     if spec_config.spec_dec_mode.is_dflash():
         return False
     return not should_use_separate_draft_kv_cache(spec_config)
+
+
+def _connector_runs_speculative_prefill_only(
+        spec_config: Optional[SpeculativeConfig], worker_cls: type,
+        scheduler_cls: Optional[type],
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
+        use_kv_cache_manager_v2: bool | str) -> bool:
+    """Whether a KV connector may run next to this speculative decoding.
+
+    Rejected draft tokens shrink a request's page list underneath the
+    connector, which is why speculative decoding is refused next to one. A
+    context-only request on a disaggregated context server never rejects a
+    draft token, so the append-only page deltas the connector receives stay
+    valid there. One-model MTP and EAGLE3 keep their draft KV in the target
+    pool, which is registered with the connector. Generation work is refused
+    at admission and at the connector boundary
+    (`KvCacheConnectorManager.speculative_prefill_only`).
+
+    Args:
+        spec_config: The resolved speculative config, or None.
+        worker_cls: The connector worker class.
+        scheduler_cls: The connector scheduler class.
+        cache_transceiver_config: The cache transceiver config; a backend
+            marks a disaggregated server.
+        use_kv_cache_manager_v2: The tri-state
+            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+
+    Returns:
+        True when the connector runs in the speculative-prefill-only mode.
+    """
+    if use_kv_cache_manager_v2 is False:
+        # V1 has no speculative-prefill mode; this helper only selects V2 modes.
+        return False
+    if spec_config is None or (spec_config.max_draft_len or 0) <= 0:
+        return False
+    mode = spec_config.spec_dec_mode
+    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+        return False
+    return (is_disagg_enabled(cache_transceiver_config)
+            and KvCacheConnectorManager.declares_speculative_prefill(
+                worker_cls, scheduler_cls))
+
+
+def _validate_speculative_connector_role(
+        connector: KvCacheConnectorManager) -> None:
+    """Reject a speculative KV-moving connector on a known generation server."""
+    if not connector.speculative_prefill_only or connector.capacity_only:
+        return
+    role = normalize_disagg_role(os.environ.get("TRTLLM_DISAGG_ROLE"))
+    if role == "generation":
+        raise ValueError(
+            "A generation server cannot use a speculative-prefill-only KV connector; "
+            "use a capacity_only connector role or disable the connector.")
+    if role != "context":
+        logger.warning(
+            "KV connector speculative-prefill-only mode has an unknown server role; "
+            "only context-only requests can be admitted. Set TRTLLM_DISAGG_ROLE=context."
+        )
 
 
 ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR = "TRTLLM_ALLOW_UNCORRECTED_OVERLAP_SPEC"
@@ -1172,23 +1232,9 @@ def _create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the manager-dependent
-        # rejections below fire here when the config selects a boolean value,
-        # including the default True, sparing it a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats them against the
-        # manager that was actually built.
+        # Model loading has resolved "auto". Executor initialization checks
+        # the actual manager too, since incompatible features can select V1.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
-
-        # Rejected draft tokens shrink a request's page list, and the freed slot
-        # goes to whichever request allocates next. The connector is only told
-        # about pages appended since the last report, so it would keep
-        # addressing a slot another request now owns.
-        if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
-            raise NotImplementedError(
-                "KV connector is not supported with speculative decoding. "
-                "Disable speculative decoding to run a connector.")
 
         # V1 registers a single pool. V2 checks its resolved layer groups
         # during executor initialization.
@@ -1206,21 +1252,39 @@ def _create_py_executor(
                 "KV connector attention data parallelism requires KVCacheManagerV2. "
                 "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
+        module = importlib.import_module(kv_connector_config.connector_module)
+        worker_cls = getattr(module, kv_connector_config.connector_worker_class)
+        scheduler_cls = getattr(module,
+                                kv_connector_config.connector_scheduler_class)
+
+        if mapping.enable_attention_dp:
+            KvCacheConnectorManager.validate_attention_dp(
+                worker_cls,
+                scheduler_cls,
+                pp_size=mapping.pp_size,
+                cp_size=mapping.cp_size)
+
+        # Rejected draft tokens shrink a request's page list, and the freed
+        # slot goes to whichever request allocates next. The connector is
+        # only told about pages appended since the last report, so it would
+        # keep addressing a slot another request now owns. Context-only
+        # requests never reject a draft token, which is what the
+        # speculative-prefill-only mode relies on. Checked once the classes
+        # are resolved, since the mode depends on their declarations, and
+        # still before any connector instance exists.
+        speculative_prefill_only = _connector_runs_speculative_prefill_only(
+            spec_config, worker_cls, scheduler_cls, cache_transceiver_config,
+            v2_selection)
+        if (spec_config is not None and (spec_config.max_draft_len or 0) > 0
+                and v2_selection is True and not speculative_prefill_only):
+            raise NotImplementedError(
+                "KV connector is not supported with speculative decoding. "
+                "One-model MTP or EAGLE3 is supported on a disaggregated "
+                "context server when the connector scheduler and worker "
+                "both declare supports_speculative_prefill=True. Otherwise "
+                "disable speculative decoding to run a connector.")
+
         try:
-            module = importlib.import_module(
-                kv_connector_config.connector_module)
-            worker_cls = getattr(module,
-                                 kv_connector_config.connector_worker_class)
-            scheduler_cls = getattr(
-                module, kv_connector_config.connector_scheduler_class)
-
-            if mapping.enable_attention_dp:
-                KvCacheConnectorManager.validate_attention_dp(
-                    worker_cls,
-                    scheduler_cls,
-                    pp_size=mapping.pp_size,
-                    cp_size=mapping.cp_size)
-
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -1247,11 +1311,23 @@ def _create_py_executor(
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker,
                 connector_scheduler,
-                enable_attention_dp=mapping.enable_attention_dp)
-
+                enable_attention_dp=mapping.enable_attention_dp,
+                speculative_prefill_only=speculative_prefill_only)
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
-            raise e
+            raise
+
+        _validate_speculative_connector_role(kv_connector_manager)
+
+        if not kv_connector_manager.capacity_only and (
+                mapping.enable_attention_dp or speculative_prefill_only):
+            incompatible = kv_cache_manager_v2_incompatible_features(
+                llm_args.max_beam_width, enable_sleep=enable_sleep)
+            if incompatible:
+                raise ValueError(
+                    "KV connector attention-DP/speculative-prefill mode requires KVCacheManagerV2; "
+                    f"disable {', '.join(incompatible)} to prevent fallback to V1."
+                )
 
         if not kv_connector_manager.capacity_only:
             if (scheduler_config.capacity_scheduler_policy

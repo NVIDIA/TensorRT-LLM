@@ -15,7 +15,7 @@
 """Connector prefix reservation, allocation and legacy final-batch query tests."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -100,6 +100,7 @@ class FakeRequest:
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
+        self.py_connector_load_failed = False
         self.py_served_prefix_end = 0
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
@@ -270,6 +271,7 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager.conversation_manager = None
     manager._spec_recompute_tail = 0
     manager._has_cp_helix = False
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
@@ -1116,3 +1118,25 @@ def test_final_admission_rejects_an_invalid_local_allocation() -> None:
     assert req.py_served_prefix_end == 0
     manager.release_unused_connector_reservations(set())
     assert connector.releases == [(1, 0, 64)]
+
+
+@pytest.mark.parametrize("load_async", [False, True])
+def test_restarted_request_ignores_stale_prefix_without_losing_transfer_ownership(
+    load_async: bool,
+) -> None:
+    connector = FakeConnectorManager(num_matched=64, load_async=load_async)
+    manager = make_manager(connector)
+    request = FakeRequest()
+    request.py_connector_load_failed = True
+    cache = FakeKvCache(committed=32, capacity=PROMPT_LEN)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning_once"
+    ) as warning:
+        assert not serve(manager, request, cache)
+    assert warning.call_count == int(load_async)
+    if load_async:
+        assert warning.call_args.kwargs["key"] == "kv_connector_async_reload_after_failure"
+    assert request.context_current_position == 32
+    assert connector.queries == [(request.py_request_id, 32)]
+    assert connector.commits == [(request.py_request_id, 0, load_async)]
