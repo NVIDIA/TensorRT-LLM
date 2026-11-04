@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
+    Role,
     _fill_kv_pages,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
@@ -476,6 +477,44 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     COMPRESS_BLOCK_SCALE_ROLE,
                     PageIndexMode.SHARED,
                 )
+
+        # With the cold-page window each mixed-precision high layer shares the COMPRESS pool of its
+        # compression ratio with the same slot layout; record its page offset in the slot for the
+        # in-place read.
+        self.mixed_precision_high_layer_offsets: dict[int, int] = {}
+        if (
+            self.mixed_precision_high_layers
+            and self.mixed_precision_low_dtype == self.mixed_precision_high_dtype
+        ):
+            compress_role = DeepseekV4AttentionType.COMPRESS.role
+            for local, high_layer in self.mixed_precision_high_layers.items():
+                layer_idx = self.pp_layers[local]
+                compress_layer = self._layer_attn_to_layer_id[
+                    layer_idx, DeepseekV4AttentionType.COMPRESS
+                ]
+                converter = self.impl.get_page_index_converter(high_layer, Role.KEY)
+                compress_converter = self.impl.get_page_index_converter(
+                    compress_layer, compress_role
+                )
+                address = self.impl.get_mem_pool_base_address(
+                    high_layer, Role.KEY, PageIndexMode.SHARED
+                )
+                expected_address = int(
+                    self.compress_pool_ptrs[self._compress_ratios[layer_idx]]
+                ) + int(converter.layer_offset) * int(
+                    self.impl.get_page_stride(compress_layer, compress_role)
+                )
+                if (
+                    int(converter.scale) != int(compress_converter.scale)
+                    or int(converter.expansion) != 1
+                    or int(address) != expected_address
+                ):
+                    raise ValueError(
+                        "DeepSeek-V4 mixed-precision high layers must share the COMPRESS pool of "
+                        f"their compression ratio: layer {layer_idx} high layer {high_layer} at "
+                        f"{int(address):#x}, expected {expected_address:#x}"
+                    )
+                self.mixed_precision_high_layer_offsets[local] = int(converter.layer_offset)
 
     @property
     def nvfp4_residual_dim(self) -> int:
@@ -1075,6 +1114,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
         # A compressed page holds tokens_per_block // ratio rows.
         return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
+
+    def _mixed_precision_layer_page(self, local_layer_idx: int) -> tuple[int, DataRole]:
+        # The high layer holds compressed rows, so it copies the COMPRESS page.
+        layer_id = self._layer_attn_to_layer_id[
+            self.pp_layers[local_layer_idx], DeepseekV4AttentionType.COMPRESS
+        ]
+        return int(layer_id), DeepseekV4AttentionType.COMPRESS.role
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """

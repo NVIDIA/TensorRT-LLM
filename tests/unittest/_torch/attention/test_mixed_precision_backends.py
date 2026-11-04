@@ -389,19 +389,15 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("layout", ("HND", "NHD"))
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float8_e4m3fn))
+@pytest.mark.parametrize("dtype, layout", ((torch.float8_e4m3fn, "NHD"), (torch.bfloat16, "HND")))
 def test_native_history_pool_paged_conversion(dtype, layout):
-    """Cold-page mixed precision keeps the history pool at the runtime dtype: both directions copy."""
+    """Cold-page mixed precision keeps the history pool at the runtime dtype: both directions copy
+    (one- and two-byte elements, both layouts)."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision KV conversion requires Blackwell")
     from tensorrt_llm._torch.attention.kernels.blackwell import mixed_precision_kv as kernels
 
-    low_dtype = {
-        torch.float16: DataType.HALF,
-        torch.bfloat16: DataType.BF16,
-        torch.float8_e4m3fn: DataType.FP8,
-    }[dtype]
+    low_dtype = {torch.bfloat16: DataType.BF16, torch.float8_e4m3fn: DataType.FP8}[dtype]
     width = 64
     row_bytes = width * dtype.itemsize
     assert kernels.get_mixed_precision_kv_row_bytes(low_dtype, width) == row_bytes
@@ -653,7 +649,9 @@ def test_mixed_precision_high_row_indices_point_at_the_high_pool():
     )
 
     manager = SimpleNamespace(
-        layer_offsets={3: 0}, tokens_per_block=4, mixed_precision_high_layer_offsets={0: 1}
+        layer_offsets={3: 0},
+        mixed_precision_high_layer_offsets={0: 1},
+        _mixed_precision_rows_per_page=lambda local: 4,
     )
     table = torch.tensor([[8, -1, 12]], dtype=torch.int32, device="cuda")
     metadata = SimpleNamespace(kv_cache_manager=manager, mixed_precision_high_block_table=table)

@@ -282,9 +282,9 @@ including its per-step staging cost on dense attention backends.
 
 The option is a prototype and has the limits of the mixed-precision KV cache:
 `use_kv_cache_manager_v2: true` with the TRTLLM or FlashInfer attention backend,
-the standard V2 manager, the hybrid Mamba manager and the DSA sparse backend
-(DeepSeek-V4 is not supported yet), single-beam decoding, speculative decoding
-except dynamic-tree drafting, and no KV connector. MTP drafter layers keep their
+the standard V2 manager, the hybrid Mamba manager and the DSA and DeepSeek-V4
+sparse backends, single-beam decoding, speculative decoding except dynamic-tree
+drafting, and no KV connector. MTP drafter layers keep their
 first/last tokens like the target layers; a drafter with its own architecture
 keeps a plain cache.
 

@@ -513,9 +513,9 @@ def mixed_precision_high_row_indices(
 ) -> torch.Tensor:
     """Point the selected positions the mixed-precision high pool holds at its rows.
 
-    On a plain pool the mixed-precision high pool shares the pool's memory (the manager checks
-    the layout), so its rows have row indices like any other; positions it no longer holds map
-    to -1 and keep the pool's row.
+    On a plain pool (DSA's K pool, a DeepSeek-V4 COMPRESS pool) the mixed-precision high pool
+    shares the pool's memory (the manager checks the layout), so its rows have row indices like
+    any other; positions it no longer holds map to -1 and keep the pool's row.
 
     Args:
         metadata: Attention metadata of the batch.
@@ -535,9 +535,8 @@ def mixed_precision_high_row_indices(
     if block_table is None:
         return topk_indices_global
     manager = metadata.kv_cache_manager
-    layer_offset = manager.mixed_precision_high_layer_offsets.get(
-        manager.layer_offsets[attention.layer_idx]
-    )
+    local = manager.layer_offsets[attention.layer_idx]
+    layer_offset = manager.mixed_precision_high_layer_offsets.get(local)
     if layer_offset is None:
         # No mixed-precision high pool (e.g. an Eagle3 drafter layer): a plain cache.
         return topk_indices_global
@@ -545,9 +544,9 @@ def mixed_precision_high_row_indices(
     if num_rows == 0 or topk == 0:
         return topk_indices_global
     assert topk_indices.stride(1) == 1
-    tokens_per_block = manager.tokens_per_block
+    rows_per_page = manager._mixed_precision_rows_per_page(local)
     # The page table already carries the page scale, so a page is one block of rows.
     high_rows = torch.ops.trtllm.convert_req_index_to_global(
-        requests, block_table, topk_indices, tokens_per_block, topk, tokens_per_block, layer_offset
+        requests, block_table, topk_indices, rows_per_page, topk, rows_per_page, layer_offset
     )
     return torch.where(high_rows >= 0, high_rows, topk_indices_global)

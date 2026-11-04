@@ -4739,19 +4739,16 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                 "use_dynamic_tree": True,
                 "dynamic_tree_max_topK": 2,
             })
-    # DSA reads the mixed-precision high rows in place; DeepSeek-V4 is pending.
-    TorchLlmArgs(model="/tmp/dummy_model",
-                 kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-                 kv_cache_compression_config=cold_window,
-                 sparse_attention_config=DeepSeekSparseAttentionConfig(
-                     index_head_dim=128))
-    with pytest.raises(NotImplementedError, match="deepseek_v4"):
+    # The sparse MLA backends read the mixed-precision high rows in place.
+    for sparse in (DeepSeekSparseAttentionConfig(index_head_dim=128),
+                   DeepSeekV4SparseAttentionConfig(index_head_dim=128,
+                                                   window_size=128,
+                                                   compress_ratios=[1, 4])):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
             kv_cache_compression_config=cold_window,
-            sparse_attention_config=DeepSeekV4SparseAttentionConfig(
-                index_head_dim=128, window_size=128, compress_ratios=[1, 4]))
+            sparse_attention_config=sparse)
     # Plain cold-page compression keeps its unrestricted backend choice.
     TorchLlmArgs(
         model="/tmp/dummy_model",

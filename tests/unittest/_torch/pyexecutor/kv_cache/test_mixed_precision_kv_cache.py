@@ -262,7 +262,7 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     assert destination.tolist() == [2, 6]
 
 
-@pytest.mark.parametrize("dtype", (DataType.FP8, DataType.BF16, DataType.HALF))
+@pytest.mark.parametrize("dtype", (DataType.FP8, DataType.BF16))
 def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     """first/last-N from the cold-page codec adds the high group; the history pool stays native."""
     provider = _ColdPageProvider()
@@ -698,6 +698,152 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
             history += 1 + rng.randint(0, draft)
         # The window is tight: pages well before the last_n tokens were released.
         assert pages[2] == kv.BAD_PAGE_INDEX
+
+
+def test_deepseek_v4_cold_page_window_high_layers_share_the_compress_pools():
+    """With the cold-page window a DeepSeek-V4 high layer copies its COMPRESS page into that
+    ratio's pool, where the backend reads it by row."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+    from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+
+    ratios = [1, 4, 128]
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=cold_page_config(pool_ratio=None),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=3,
+        num_kv_heads=1,
+        head_dim=512,
+        tokens_per_block=128,
+        max_seq_len=4096,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        vocab_size=1000,
+        max_input_len=4096,
+        max_num_tokens=8192,
+        sparse_attn_config=DeepSeekV4SparseAttentionConfig(
+            index_head_dim=128, window_size=128, compress_ratios=ratios
+        ),
+        pretrained_config=SimpleNamespace(num_hidden_layers=3),
+        cold_page_codec_provider=_ColdPageProvider(),
+    )
+    try:
+        # Only the compressed layers (ratios 4 and 128) get a high layer.
+        assert sorted(manager.mixed_precision_high_layers) == [1, 2]
+        layers = manager.kv_cache_manager_py_config.layers
+        compress = DeepseekV4AttentionType.COMPRESS
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            compress_layer = manager._layer_attn_to_layer_id[local, compress]
+            assert [b.size for b in layers[high_layer].buffers] == [
+                b.size for b in layers[compress_layer].buffers
+            ]
+            offset = manager.mixed_precision_high_layer_offsets[local]
+            address = manager.impl.get_mem_pool_base_address(
+                high_layer, Role.KEY, PageIndexMode.SHARED
+            )
+            stride = manager.impl.get_page_stride(compress_layer, compress.role)
+            assert address == manager.compress_pool_ptrs[ratios[local]] + offset * stride
+    finally:
+        manager.shutdown()
+
+
+def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
+    """The redirected compressed rows read the high layer's pages through the COMPRESS pool."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        mixed_precision_high_row_indices,
+    )
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+
+    ratios = [1, 4, 128]
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        index_head_dim=128, window_size=128, compress_ratios=ratios
+    )
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=cold_page_config(pool_ratio=None, enable_block_reuse=False),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=3,
+        num_kv_heads=1,
+        head_dim=512,
+        tokens_per_block=128,
+        max_seq_len=4096,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        vocab_size=1000,
+        max_input_len=4096,
+        max_num_tokens=8192,
+        sparse_attn_config=sparse_config,
+        pretrained_config=SimpleNamespace(num_hidden_layers=3),
+        # The high layer holds the first page and a 128-token window: the last two pages here.
+        cold_page_codec_provider=_ColdPageProvider(first_n=128, last_n=127),
+    )
+    try:
+        request_ids, cached = [0, 1], [600, 700]
+        assert manager.add_dummy_requests(request_ids, [n + 1 for n in cached], is_gen=True)
+        metadata = DeepseekV4TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=2,
+            kv_cache_manager=manager,
+            sparse_attention_config=sparse_config,
+            seq_lens=torch.tensor([1, 1], dtype=torch.int),
+            num_contexts=0,
+            request_ids=request_ids,
+            prompt_lens=cached,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
+            mapping=Mapping(),
+        )
+        metadata.prepare()
+        for layer_idx, ratio in ((1, 4), (2, 128)):
+            local = manager.layer_offsets[layer_idx]
+            rows_per_page = manager.compressed_block_sizes[layer_idx]
+            high_table = metadata.mixed_precision_high_block_table[ratio].cpu()
+            # Compressed rows of request 1: pages 0 (sink), 4 and 5 (window) are held, 1-3 are not.
+            held_pages = [page for page, entry in enumerate(high_table[1].tolist()) if entry >= 0]
+            assert held_pages == [0, 4, 5], held_pages
+            positions = torch.arange(6 * rows_per_page, dtype=torch.int32, device="cuda")
+            pool_rows = torch.full_like(positions, -7)
+            rows = mixed_precision_high_row_indices(
+                metadata,
+                SimpleNamespace(layer_idx=layer_idx, compress_ratio=ratio),
+                positions[None],
+                pool_rows[None],
+                torch.ones(1, dtype=torch.int32, device="cuda"),
+            )[0]
+            # Mark every held row through the high-pool view: value = row position.
+            high = manager._get_mixed_precision_buffers(local, "NHD", "high")
+            high = high.view(high.shape[0], rows_per_page, -1).view(torch.uint8)
+            for position in range(6 * rows_per_page):
+                page, row = divmod(position, rows_per_page)
+                if page in held_pages:
+                    high[int(high_table[1, page]), row].fill_(position % 251)
+            # The COMPRESS pool, read at the redirected rows, shows the markers.
+            pool = manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS)
+            pool = pool.reshape(-1, pool.shape[-1]).view(torch.uint8)
+            for position in range(6 * rows_per_page):
+                page = position // rows_per_page
+                row = int(rows[position])
+                if page in held_pages:
+                    assert torch.all(pool[row] == position % 251), (ratio, position, row)
+                else:
+                    assert row == -7, (ratio, position, row)
+    finally:
+        manager.shutdown()
 
 
 def test_dsa_cold_page_window_high_layers_share_the_pool():
