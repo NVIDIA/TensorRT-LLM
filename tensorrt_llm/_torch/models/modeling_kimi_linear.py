@@ -3944,13 +3944,19 @@ class KimiLinearModel(DecoderModel):
             if any(sliced)
             else None
         )
-        # The FP4 MLA backend writes a generation-only step's metadata on this
-        # stream ahead of the first MLA layer; every MLA layer has the same
-        # per-rank query heads.
+        # With an FP4 KV cache the FP4 MLA backend writes a generation-only step's metadata on
+        # this stream ahead of the first MLA layer; every MLA layer has the same per-rank query
+        # heads.
         self._mla_num_heads = next(
             (layer.self_attn.mixer.num_heads_tp for layer in self.layers if not layer.is_kda), 0
         )
-        self._fp4_mla_metadata_stream = torch.cuda.Stream() if self._mla_num_heads > 0 else None
+        self._fp4_mla_metadata_stream = (
+            torch.cuda.Stream()
+            if self._mla_num_heads > 0
+            and model_config.quant_config is not None
+            and model_config.quant_config.quant_mode.has_fp4_kv_cache()
+            else None
+        )
         self.norm = RMSNorm(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
 
         # KimiK3RMSNorm (not RMSNorm): consumed field-wise (.weight/.eps)
@@ -4072,12 +4078,11 @@ class KimiLinearModel(DecoderModel):
                 f"{hidden_states.shape[0]} rows, metadata says {num_tokens} tokens)."
             )
 
-        fp4_mla_state = getattr(attn_metadata, "fp4_mla_state", None)
-        if (
-            fp4_mla_state is not None
-            and self._fp4_mla_metadata_stream is not None
-            and do_multi_stream()
-        ):
+        # FP4 MLA layers run on the TRTLLM backend, whose metadata holds the FP4 MLA state.
+        fp4_mla_state = (
+            attn_metadata.fp4_mla_state if self._fp4_mla_metadata_stream is not None else None
+        )
+        if fp4_mla_state is not None and do_multi_stream():
             fp4_mla_state.launch_generation_metadata_ahead(
                 attn_metadata, num_heads=self._mla_num_heads, stream=self._fp4_mla_metadata_stream
             )
