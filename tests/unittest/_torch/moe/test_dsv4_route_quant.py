@@ -184,12 +184,14 @@ def test_moe_with_routing_tables_is_bitwise_to_its_own_routing(num_tokens, do_fi
     runner = torch.classes.trtllm.FP4BlockScaleMoERunner(0)
 
     def run(tactic, routing_tables):
-        return runner.run_moe(
+        args = (
             None, None, x_fp4, x_sf.flatten().view(torch.float8_e4m3fn), w13, w13_sf,
             None, None, None, clamp, w2, w2_sf, None, one, one, one, NUM_EXPERTS, TOP_K,
-            None, None, inter, 0, NUM_EXPERTS, None, 1, do_finalize, tactic, weights, ids,
-            None, routing_tables, list(ROUTING_TABLE_TILES),
+            None, None, inter, 0, NUM_EXPERTS, None, 1, do_finalize, tactic, weights, ids, None,
         )  # fmt: skip
+        if routing_tables is None:
+            return runner.run_moe(*args)
+        return runner.run_moe_routing_tables(*args, routing_tables, list(ROUTING_TABLE_TILES))
 
     tactics = runner.get_valid_configs(TOP_K, HIDDEN, inter, NUM_EXPERTS, num_tokens)
     for tile in sorted({tactic[0] for tactic in tactics}):

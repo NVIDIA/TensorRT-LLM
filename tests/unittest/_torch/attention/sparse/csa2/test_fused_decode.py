@@ -49,18 +49,18 @@ def _pools(swa_rows: int, main_rows: int, seed: int):
 
 def _reference(q, swa_pool, swa_slots, main_pool, main_slots, sinks, chunk=32):
     """Exact FP32 attention over the dequantized selected rows; invalid rows are excluded."""
-    swa_kv = unpack_rows(swa_pool, DIM, "swa", torch.float32)
-    main_kv = None if main_pool is None else unpack_rows(main_pool, DIM, "main", torch.float32)
     out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     for start in range(0, q.shape[0], chunk):
         end = min(q.shape[0], start + chunk)
+        # Only the chunk's selected rows are dequantized.
         slots = swa_slots[start:end].long()
-        valid = (slots >= 0) & (slots < swa_kv.shape[0])
-        kv = swa_kv[slots.clamp(0, swa_kv.shape[0] - 1)]
-        if main_kv is not None and main_slots is not None:
+        valid = (slots >= 0) & (slots < swa_pool.shape[0])
+        kv = unpack_rows(swa_pool[slots.clamp(0, swa_pool.shape[0] - 1)], DIM, "swa", torch.float32)
+        if main_pool is not None and main_slots is not None:
             main = main_slots[start:end].long()
-            main_valid = (main >= 0) & (main < main_kv.shape[0])
-            kv = torch.cat((kv, main_kv[main.clamp(0, main_kv.shape[0] - 1)]), 1)
+            main_valid = (main >= 0) & (main < main_pool.shape[0])
+            main_kv = main_pool[main.clamp(0, main_pool.shape[0] - 1)]
+            kv = torch.cat((kv, unpack_rows(main_kv, DIM, "main", torch.float32)), 1)
             valid = torch.cat((valid, main_valid), 1)
         logits = torch.einsum("mhd,mkd->mhk", q[start:end].float(), kv) * SCALE
         logits.masked_fill_(~valid[:, None, :], -torch.inf)
@@ -406,6 +406,20 @@ def _call_reference(call):
             main, requests, table, visible, page_size, limit
         )
     return _reference(q, swa_pool, swa, main_pool, slots, sinks)
+
+
+def _record_references(monkeypatch):
+    """The FP32 reference of every eager fused decode launch, taken on its inputs as it launches
+    (no cache snapshot outlives the launch)."""
+    references = []
+    op = torch.ops.trtllm.csa2_sparse_decode
+
+    def recorder(*args):
+        references.append(_call_reference(args[:11]))
+        return op(*args)
+
+    monkeypatch.setattr(torch.ops.trtllm, "csa2_sparse_decode", recorder)
+    return references
 
 
 def _rel(a, b):
@@ -768,9 +782,9 @@ def test_ratio2_group_large_decode_on_gen_fmha(monkeypatch, large_decode_cache):
     # The fused decode on every layer gives each layer's exact inputs for the FP32 reference.
     with monkeypatch.context() as patch:
         patch.setattr(csa2_backend, "_GEN_FMHA_MIN_ROWS", 1 << 30)
-        calls = _record_fused_calls(patch)
+        references = _record_references(patch)
         fused = _forward(layers, _large_decode_step(manager, requests, cached), hidden)
-    assert len(calls) == len(layers)
+    assert len(references) == len(layers)
     # The staged native cubin on the same inputs sets the error the core must stay within.
     with monkeypatch.context() as patch:
         patch.setattr(csa2_backend, "_GEN_FMHA_MIN_ROWS", 1 << 30)
@@ -779,16 +793,19 @@ def test_ratio2_group_large_decode_on_gen_fmha(monkeypatch, large_decode_cache):
         cubin = _forward(layers, _large_decode_step(manager, requests, cached), hidden)
     monkeypatch.setattr(gen_fmha, "gen_sparse_attention", record_core)
     with monkeypatch.context() as patch:
-        kept = _record_fused_calls(patch)
+        kept = []
+        op = torch.ops.trtllm.csa2_sparse_decode
+        patch.setattr(
+            torch.ops.trtllm, "csa2_sparse_decode", lambda *args: kept.append(1) or op(*args)
+        )
         mixed = _forward(layers, _large_decode_step(manager, requests, cached), hidden)
     # Only the ratio-2 group leaves the fused decode for the core.
     assert len(cores) == sum(GEN_FMHA_LAYERS) and len(kept) == len(layers) - sum(GEN_FMHA_LAYERS)
-    for layer_idx, (output, call) in enumerate(zip(mixed, calls)):
+    for layer_idx, (output, reference) in enumerate(zip(mixed, references)):
         if not GEN_FMHA_LAYERS[layer_idx]:
             assert torch.equal(output, fused[layer_idx]), layer_idx
             continue
         assert torch.isfinite(output).all(), layer_idx
-        reference = _call_reference(call)
         error, cubin_error = _rel(output, reference), _rel(cubin[layer_idx], reference)
         assert error <= max(1.25 * cubin_error, 2e-2), (layer_idx, error, cubin_error)
         drift, cubin_drift = (

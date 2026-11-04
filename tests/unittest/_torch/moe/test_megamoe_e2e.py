@@ -532,6 +532,9 @@ def _run(one_round: bool) -> list:
             kernels.clear()
             return schedules
 
+        # Only SM103 has DS-V4.1-Flash shape-tuned default tactics (phase interleave at hi); elsewhere
+        # the token-bucket defaults are grouped at both buckets.
+        tuned_defaults = get_sm_version() == 103
         first, default_kinds = [], set()
         for call in calls:
             label, _, _, x, counts = call
@@ -566,9 +569,10 @@ def _run(one_round: bool) -> list:
                 patch.setattr(MegaMoECuteDsl, "_route_quant_bucket", lambda *a, **k: None)
                 plain = run(call).clone()
                 plain_schedule = launched()
+            differs = schedule != plain_schedule or not tuned_defaults
             _assert_on_all_ranks(
                 None
-                if schedule and plain_schedule and schedule != plain_schedule
+                if schedule and plain_schedule and differs
                 else f"{label}: schedules {schedule} vs {plain_schedule}"
             )
             _assert_on_all_ranks(None if torch.isfinite(default).all() else f"{label}: non-finite")
@@ -576,9 +580,11 @@ def _run(one_round: bool) -> list:
                 None if torch.equal(default, plain) else f"{label}: differs from the plain path"
             )
             first.append(default)
-        # The default path runs both schedulers: grouped at the mid bucket, phase interleave at hi.
+        # The tuned default path runs both schedulers: grouped at the mid bucket, phase interleave at hi.
         _assert_on_all_ranks(
-            None if default_kinds == {True, False} else f"default schedules {default_kinds}"
+            None
+            if default_kinds == {True, False} or not tuned_defaults
+            else f"default schedules {default_kinds}"
         )
 
         for name, schedule in (("again", calls), ("shifted", calls[1:] + calls[:1])):
