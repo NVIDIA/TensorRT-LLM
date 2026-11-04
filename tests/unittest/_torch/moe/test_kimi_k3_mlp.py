@@ -334,6 +334,66 @@ def test_kimi_k3_shared_expert_parallel_construction(
     assert shared.down_proj.weight.shape == (config.hidden_size, local_intermediate)
 
 
+@pytest.mark.parametrize("min_latency", [False, True], ids=["default", "min_latency"])
+def test_kimi_k3_min_latency_kernels_follow_enable_min_latency(monkeypatch, min_latency):
+    """The lossy few-row MoE tail and persistent shared expert are prepared only under
+    ``enable_min_latency``, read once at construction."""
+    from tensorrt_llm._torch import distributed
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    class _FakeAllReduce(nn.Module):
+        def __init__(self, mapping=None, *args, **kwargs):
+            super().__init__()
+            self.mapping = mapping
+
+        def mnnvl_runs_fusion(self, fusion_op, hidden_size):
+            return False
+
+    class _FakeMoE(ConfigurableMoE):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.backend = SimpleNamespace(
+                initial_local_expert_ids=[0, 1, 2, 3],
+                scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+            )
+            self.comm = None
+            self.layer_load_balancer = None
+            self.all_reduce = _FakeAllReduce()
+
+    fake_moe = _FakeMoE()
+    monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
+    monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **kwargs: fake_moe)
+    monkeypatch.setattr(distributed, "AllReduce", _FakeAllReduce)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    mapping = Mapping(world_size=4, rank=0, tp_size=4)
+    fake_moe.all_reduce.mapping = mapping
+    model_config = ModelConfig(
+        mapping=mapping,
+        quant_config=QuantConfig(),
+        moe_backend="CUTLASS",
+        enable_min_latency=min_latency,
+    )
+    runtime = modeling_kimi_linear.KimiK3MoERuntime(
+        model_config, _runtime_config(), layer_idx=1, aux_stream_dict=_make_aux_stream_dict()
+    )
+    assert runtime.latent_up_rows is not None
+
+    # Past the gate the preparation reads the shared expert's BF16 weights; stop it there.
+    prepared = []
+    monkeypatch.setattr(modeling_kimi_linear, "SituAndMul", nn.Module)
+    monkeypatch.setattr(
+        modeling_kimi_linear, "_bf16_weight", lambda linear: prepared.append(linear) or None
+    )
+    runtime._prepare_min_latency_tail()
+    assert bool(prepared) is min_latency
+    assert runtime._moe_tail_wexp is None and runtime._shared_frags is None
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "defer,multi_stream,is_compiling,has_aux_stream",

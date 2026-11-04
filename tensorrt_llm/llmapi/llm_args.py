@@ -7061,7 +7061,10 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_min_latency: bool = Field(
         default=False,
         description=
-        "If true, enable min-latency mode. Currently only used for Llama4.",
+        "If true, enable min-latency mode for Llama4 and Kimi K3. For Kimi K3 it runs lossy decode "
+        "kernels on generation steps of at most 8 rows: the MoE tail and the shared expert read BF16 "
+        "activations instead of MXFP8, apply the RMSNorm scale late and use approximate tanh / sigmoid. "
+        "Leave it unset where accuracy must match the default kernels or batches exceed 8 rows.",
         status="beta")
 
     # TODO: make this a per-request parameter

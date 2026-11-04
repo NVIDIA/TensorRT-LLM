@@ -8,7 +8,10 @@
 #
 # max_num_tokens 32 (4 requests x 8 tokens with 7 draft tokens) keeps every
 # MoE call within the CUTEDSL_FC12 small-batch kernel, which then also places
-# the expert weights die-major. Add the speculative_config of your drafter.
+# the expert weights die-major. enable_min_latency runs the MoE tail and the
+# shared expert of steps of up to 8 rows as single lossy kernels; drop it where
+# accuracy must match the default kernels. Add the speculative_config of your
+# drafter.
 context_parallel_size: 16
 cp_config:
   cp_type: HELIX
@@ -18,6 +21,7 @@ moe_tensor_parallel_size: 4
 moe_expert_parallel_size: 4
 max_batch_size: 4
 max_num_tokens: 32
+enable_min_latency: true
 trust_remote_code: true
 cuda_graph_config:
   batch_sizes:

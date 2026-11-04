@@ -320,7 +320,7 @@ class ModelConfig(Generic[TConfig]):
     # Batch sizes of the generation CUDA graphs (empty without them).
     cuda_graph_batch_sizes: Tuple[int, ...] = ()
 
-    # If true, enable min-latency mode. Currently only used for Llama4.
+    # If true, enable min-latency mode (Llama4; Kimi K3 lossy few-row decode kernels).
     enable_min_latency: bool = False
 
     # Allow models to select op according to whether CUDA Graphs are used.
