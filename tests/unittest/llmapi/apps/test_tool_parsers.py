@@ -727,6 +727,33 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "get-weather"
 
+    def test_integer_too_long_to_convert_is_not_streamed_as_text(
+            self, sample_tools):
+        """Arguments json.loads cannot convert do not reach the text.
+
+        Past Python's integer digit limit json.loads raises a ValueError that
+        is not a JSONDecodeError. The call is then read like arguments that do
+        not parse yet, whether the number arrives whole or split.
+        """
+        text = ('<|tool_calls_section_begin|><|tool_call_begin|>'
+                'functions.get_weather:0<|tool_call_argument_begin|>'
+                '{"location": ' + "9" * 5000 + '}<|tool_call_end|>'
+                '<|tool_calls_section_end|>')
+
+        for chunks in ([text], _kimi_k2_split_after(text, "9" * 4400)):
+            parser = KimiK2ToolParser()
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+
+            assert "".join(result.normal_text for result in results) == ""
+            assert [
+                call.name for result in results for call in result.calls
+                if call.name
+            ] == ["get_weather"]
+
 
 _KIMI_K2_WEATHER_CALL = (
     '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>'
@@ -739,6 +766,9 @@ _KIMI_K2_OUTPUTS = {
                  "<|tool_calls_section_end|>"),
     "two_calls": ("<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
                   _KIMI_K2_SEARCH_CALL + "<|tool_calls_section_end|>"),
+    "text_before_a_call":
+    ("Sure, checking.<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+     "<|tool_calls_section_end|>"),
     "text_around_calls": ("Let me check both.\n<|tool_calls_section_begin|>" +
                           _KIMI_K2_WEATHER_CALL + "\n" + _KIMI_K2_SEARCH_CALL +
                           "<|tool_calls_section_end|>\nDone."),
@@ -760,16 +790,19 @@ def _kimi_k2_split_after(text, prefix_end):
     return [text[:cut], text[cut:]]
 
 
-# The outputs above, and one that stops inside a call's arguments.
+# The outputs above, and ones that stop inside a call's arguments and inside
+# the token that ends the calls.
 _KIMI_K2_TEXT_CASES = dict(
     _KIMI_K2_OUTPUTS,
     stream_cut_inside_a_call=_kimi_k2_split_after(
         _KIMI_K2_OUTPUTS["text_around_calls"], '"unit": "cel')[0],
+    stream_cut_inside_the_end_token=_kimi_k2_split_after(
+        _KIMI_K2_OUTPUTS["text_around_calls"], "<|tool_calls_section_e")[0],
 )
 
 
 class TestKimiK2StreamingMatchesWholeTextParse:
-    """Streamed Kimi K2 calls end equal to the whole-text parse.
+    """Streamed Kimi K2 calls and text end equal to the whole-text parse.
 
     Whatever the increments, a client assembling the streamed calls by index
     must end with the calls ``detect_and_parse`` finds in the whole text,
@@ -835,14 +868,21 @@ class TestKimiK2StreamingMatchesWholeTextParse:
             f"calls than the whole-text parse, e.g. {differing[:8]}")
 
     @pytest.mark.parametrize("output", sorted(_KIMI_K2_TEXT_CASES))
-    def test_streamed_text_has_no_markup(self, sample_tools, output):
-        """No part of the tool calls reaches the text, for every chunking.
+    def test_streamed_text_matches_whole_text_parse(self, sample_tools, output):
+        """The streamed text is the whole-text parse's, for every chunking.
 
-        That includes finish(), also when the stream stops inside a call.
+        That is the text before the tool calls, with no part of them: also
+        when that text shares an increment with a call, when text follows the
+        calls, and from finish() when the stream stops inside a call or a
+        token.
         """
         text = _KIMI_K2_TEXT_CASES[output]
+        expected = KimiK2ToolParser().detect_and_parse(text,
+                                                       sample_tools).normal_text
+        assert "<|" not in expected and "functions." not in expected
+
         chunkings = list(_chunkings(text))
-        leaking = []
+        differing = []
         for label, chunks in chunkings:
             parser = KimiK2ToolParser()
             results = [
@@ -851,12 +891,12 @@ class TestKimiK2StreamingMatchesWholeTextParse:
             ]
             results.append(parser.finish(sample_tools))
             streamed_text = "".join(result.normal_text for result in results)
-            if "<|" in streamed_text or "functions." in streamed_text:
-                leaking.append(label)
+            if streamed_text != expected:
+                differing.append((label, streamed_text))
 
-        assert not leaking, (
-            f"{len(leaking)} of {len(chunkings)} chunkings stream tool-call "
-            f"markup as text, e.g. {leaking[:8]}")
+        assert not differing, (
+            f"{len(differing)} of {len(chunkings)} chunkings stream other "
+            f"text than {expected!r}, e.g. {differing[:4]}")
 
     @pytest.mark.parametrize(
         "chunks",

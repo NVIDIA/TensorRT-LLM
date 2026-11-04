@@ -43,6 +43,9 @@ class KimiK2ToolParser(BaseToolParser):
         )
 
         self._last_arguments = ""
+        # Set once the stream reaches its first tool-call token. Like
+        # detect_and_parse, streaming sends no text after that token.
+        self._tool_calls_started = False
 
         # Robust parser for ids like "functions.search:0", "functions.get-weather:0"
         # or fallback "search:0"
@@ -108,21 +111,24 @@ class KimiK2ToolParser(BaseToolParser):
 
         Every call that is complete by the end of an increment is released in
         full by that increment, since it may be the last one of the stream.
+        The streamed text is the text before the first tool-call token, as
+        ``detect_and_parse`` returns it, however the output is split.
         """
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = self.bot_token in current_text or self.tool_call_start_token in current_text
-
-        if not has_tool_call:
-            # An end of the text that may be the start of a token is held
-            # back until the next increment shows whether it is one.
-            cut = len(current_text) - self._partial_token_length(current_text)
-            normal_text, self._buffer = current_text[:cut], current_text[cut:]
-            for e_token in [self.eot_token, self.tool_call_end_token]:
-                normal_text = normal_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=normal_text)
+        normal_text = ""
+        if not self._tool_calls_started:
+            start = self._tool_calls_start(current_text)
+            if start == -1:
+                # An end of the text that may be the start of a token is held
+                # back until the next increment shows whether it is one.
+                cut = len(current_text) - self._partial_token_length(current_text)
+                return StreamingParseResult(normal_text=self._take_text(cut))
+            # The text before the tool calls goes out with the calls that
+            # follow it in this increment.
+            self._tool_calls_started = True
+            normal_text = self._take_text(start)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -137,13 +143,13 @@ class KimiK2ToolParser(BaseToolParser):
                 if self._buffer == buffered:
                     break
 
-            if not (self.bot_token in self._buffer or self.tool_call_start_token in self._buffer):
-                # No call is left. Like detect_and_parse, which returns no
-                # text after the calls, drop the rest of the buffer, keeping
-                # only an end that may be the start of a token.
+            if self._tool_calls_start(self._buffer) == -1:
+                # No call is left. The calls have started, so the rest of the
+                # buffer is not text: drop it, keeping only an end that may
+                # be the start of a token.
                 cut = len(self._buffer) - self._partial_token_length(self._buffer)
                 self._buffer = self._buffer[cut:]
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
@@ -181,7 +187,7 @@ class KimiK2ToolParser(BaseToolParser):
         arguments = function_args.split(self.tool_call_end_token, 1)[0]
         try:
             parsed_args = json.loads(arguments)
-        except json.JSONDecodeError:
+        except ValueError:  # JSONDecodeError, or an integer too long for int()
             parsed_args = None
             held = self._ends_with_partial_token(arguments, self.tool_call_end_token)
             arguments = arguments[: len(arguments) - held]
@@ -248,6 +254,22 @@ class KimiK2ToolParser(BaseToolParser):
         self._last_arguments = ""
         self.current_tool_name_sent = False
 
+    def _tool_calls_start(self, text: str) -> int:
+        """Index of the first token in ``text`` that starts tool calls, or -1."""
+        starts = [
+            index
+            for index in (text.find(self.bot_token), text.find(self.tool_call_start_token))
+            if index != -1
+        ]
+        return min(starts, default=-1)
+
+    def _take_text(self, end: int) -> str:
+        """Take the buffer up to ``end`` as text, dropping stray end tokens."""
+        text, self._buffer = self._buffer[:end], self._buffer[end:]
+        for e_token in (self.eot_token, self.tool_call_end_token):
+            text = text.replace(e_token, "")
+        return text
+
     def _partial_token_length(self, text: str) -> int:
         """Length of the end of ``text`` that may be the start of a token."""
         return max(
@@ -263,9 +285,10 @@ class KimiK2ToolParser(BaseToolParser):
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """Release the text held back as the possible start of a token.
 
-        A tool call the stream left unfinished stays withheld.
+        Once the tool calls have started, nothing is released: neither a call
+        the stream left unfinished nor the start of a token.
         """
-        if self.bot_token in self._buffer or self.tool_call_start_token in self._buffer:
+        if self._tool_calls_started:
             return StreamingParseResult()
         normal_text, self._buffer = self._buffer, ""
         return StreamingParseResult(normal_text=normal_text)
