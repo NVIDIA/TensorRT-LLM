@@ -18,6 +18,8 @@ Private adapter and four-vectorcall coverage also require a pinned native fixtur
 these tests exercise the normal product module, not a replacement extension.
 """
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -167,3 +169,89 @@ print('capability=' + str(int(getattr(bindings.BuildInfo, '{option}'))))
     assert result.returncode == 0, result.stdout + result.stderr
     expected = int("capability=0" in result.stdout)
     assert (result.stdout + result.stderr).count(f"{option}=OFF") == expected
+
+
+@pytest.mark.parametrize(
+    "selector,option",
+    [
+        ("none", None),
+        ("unknown", None),
+        ("nanobind", "ENABLE_NANOBIND_PROFILING"),
+        ("nccl", "ENABLE_NCCL_PROFILING"),
+    ],
+)
+def test_native_module_initialization_warnings_do_not_require_cuda(
+    selector: str, option: str | None, tmp_path: Path
+) -> None:
+    """Initialize the actual extension without the separate package/MPI bootstrap."""
+    import tensorrt_llm.bindings as bindings
+
+    parent_extension = Path(bindings.__file__).resolve()
+    expected_hash = hashlib.sha256(parent_extension.read_bytes()).hexdigest()
+    script = """
+import hashlib
+import importlib
+import importlib.machinery
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import torch
+assert torch.cuda.device_count() == 0
+print('visible_cuda_devices=0', flush=True)
+package = importlib.machinery.PathFinder.find_spec('tensorrt_llm')
+spec = importlib.machinery.PathFinder.find_spec(
+    'tensorrt_llm.bindings', package.submodule_search_locations
+)
+assert isinstance(spec.loader, importlib.machinery.ExtensionFileLoader)
+bindings = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = bindings
+spec.loader.exec_module(bindings)
+assert importlib.import_module(spec.name) is bindings
+assert bindings.QuantMode.none().value == 0
+print(json.dumps({
+    'file': bindings.__file__,
+    'sha256': hashlib.sha256(Path(bindings.__file__).read_bytes()).hexdigest(),
+    'flags': {name: getattr(bindings.BuildInfo, name) for name in (
+        'ENABLE_NANOBIND_PROFILING', 'ENABLE_NCCL_PROFILING'
+    )},
+    'visible_cuda_devices': torch.cuda.device_count(),
+}))
+"""
+    environment = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        TLLM_PROFILE_CUSTOM_REGIONS=selector,
+        TLLM_LOG_LEVEL="INFO",
+        TLLM_LOG_FIRST_RANK_ONLY="ON",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    (tmp_path / "native-extension-init.stdout.txt").write_text(result.stdout)
+    (tmp_path / "native-extension-init.stderr.txt").write_text(result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    info = json.loads(result.stdout.strip().splitlines()[-1])
+    (tmp_path / "native-extension-init.json").write_text(
+        json.dumps({"selector": selector, "scope": "native-extension initialization", **info})
+    )
+    assert info["visible_cuda_devices"] == 0
+    assert Path(info["file"]).resolve() == parent_extension
+    assert info["sha256"] == expected_hash
+    assert info["flags"] == {
+        name: getattr(bindings.BuildInfo, name)
+        for name in ("ENABLE_NANOBIND_PROFILING", "ENABLE_NCCL_PROFILING")
+    }
+    assert all(type(flag) is bool for flag in info["flags"].values())
+    if selector == "unknown":
+        assert result.stderr.count("Invalid TLLM_PROFILE_CUSTOM_REGIONS region:") == 1
+    elif option is not None:
+        assert result.stderr.count(f"{option}=OFF") == int(not info["flags"][option])
+    else:
+        assert "TLLM_PROFILE_CUSTOM_REGIONS" not in result.stderr
