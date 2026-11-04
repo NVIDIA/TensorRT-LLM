@@ -213,7 +213,7 @@ num_heads_groups = [
 num_tokens_list = [1, 3, 8, 32, 256]
 is_neox_list = [False, True]
 partial_rotary_factor_list = [1.0, 0.5]
-dtypes = [torch.bfloat16]  # TODO: support float16
+dtypes = [torch.bfloat16, torch.float16]
 
 
 @pytest.mark.parametrize("head_dim", head_dims)
@@ -315,6 +315,99 @@ def test_fused_qk_norm_rope(
         rtol=5e-2,
         atol=1e-1,
     )
+    v_offset = (num_heads_q + num_heads_k) * head_dim
+    torch.testing.assert_close(output[:, v_offset:], qkv_copy[:, v_offset:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("is_neox", [False, True])
+def test_fused_qk_norm_rope_fp16_head_dim_256(is_neox: bool) -> None:
+    """Cover the FP16 256-dimension specialization with reference and exact V checks."""
+    test_fused_qk_norm_rope(
+        head_dim=256,
+        num_heads_group=(8, 1, 1),
+        num_tokens=3,
+        partial_rotary_factor=1.0,
+        is_neox=is_neox,
+        dtype=torch.float16,
+    )
+
+
+def _make_fused_qk_norm_rope_inputs(
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create valid inputs for two Q heads and one K/V head of dimension 64."""
+    qkv = torch.zeros(3, 4 * 64, dtype=dtype, device="cuda")
+    positions = torch.arange(3, dtype=torch.int32, device="cuda") + 100
+    q_weight = torch.ones(64, dtype=dtype, device="cuda")
+    k_weight = torch.ones_like(q_weight)
+    return qkv, positions, q_weight, k_weight
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("weight_name", ["q_weight", "k_weight"])
+def test_fused_qk_norm_rope_rejects_mismatched_weights(
+    dtype: torch.dtype, weight_name: str
+) -> None:
+    """Each norm weight must independently match the QKV dtype."""
+    qkv, positions, q_weight, k_weight = _make_fused_qk_norm_rope_inputs(dtype)
+    mismatched_dtype = torch.bfloat16 if dtype == torch.float16 else torch.float16
+    if weight_name == "q_weight":
+        q_weight = q_weight.to(mismatched_dtype)
+    else:
+        k_weight = k_weight.to(mismatched_dtype)
+    with pytest.raises(RuntimeError, match=rf"{weight_name} dtype is .* while .* is expected"):
+        torch.ops.trtllm.fused_qk_norm_rope(
+            qkv,
+            2,
+            1,
+            1,
+            64,
+            64,
+            1e-5,
+            q_weight,
+            k_weight,
+            10000.0,
+            True,
+            positions,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            True,
+            False,
+            False,
+            0,
+            0,
+        )
+
+
+def test_fused_qk_norm_rope_to_fp8_rejects_fp16_input() -> None:
+    """FP8 output requires BF16 input even when FP16 norm weights match."""
+    qkv, positions, q_weight, k_weight = _make_fused_qk_norm_rope_inputs(torch.float16)
+    with pytest.raises(RuntimeError, match="FP8 output requires a bfloat16 QKV input"):
+        torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+            qkv,
+            2,
+            1,
+            1,
+            64,
+            64,
+            1e-5,
+            q_weight,
+            k_weight,
+            10000.0,
+            True,
+            positions,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            True,
+            False,
+            False,
+            0,
+            0,
+        )
 
 
 @torch.inference_mode()
