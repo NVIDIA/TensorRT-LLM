@@ -26,6 +26,18 @@ def _clear_cache_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mimalloc_thp_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _prepare_environment() sets the mimalloc default with a plain os.environ
+    # assignment. monkeypatch restores only what it recorded, and delenv records
+    # nothing for an absent variable, so setenv records the original value first
+    # and teardown restores it (or removes the variable) whatever the test set.
+    monkeypatch.setenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV, "")
+    monkeypatch.delenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV)
+    monkeypatch.setattr(_bootstrap, "_mimalloc_thp_default_applied", False)
+    monkeypatch.setattr(_bootstrap, "_thp_disabled_before_torch", None)
+
+
 def test_unified_cache_is_disabled_without_root() -> None:
     _bootstrap._setup_unified_cache()
 
@@ -160,10 +172,9 @@ def test_explicit_inductor_compile_pool_quiesce_setting_takes_precedence(
 
 @pytest.fixture
 def _mimalloc_default_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV, raising=False)
+    # Linux, where the default applies; _isolate_mimalloc_thp_state has already
+    # removed the variable and reset the module state.
     monkeypatch.setattr(_bootstrap.sys, "platform", "linux")
-    monkeypatch.setattr(_bootstrap, "_mimalloc_thp_default_applied", False)
-    monkeypatch.setattr(_bootstrap, "_thp_disabled_before_torch", None)
 
 
 @pytest.mark.usefixtures("_mimalloc_default_state")
@@ -270,6 +281,12 @@ def test_thp_disable_flag_round_trip() -> None:
 
     libc = ctypes.CDLL(None, use_errno=True)
     original = libc.prctl(_bootstrap._PR_GET_THP_DISABLE, 0, 0, 0, 0)
+    if original == 3:
+        # PR_THP_DISABLE_EXCEPT_ADVISED (Linux 6.18+), inherited from the parent.
+        # The round trip below would restore it as the plain flag, so only check
+        # that it reads as disabled.
+        assert _bootstrap._thp_disable_flag() is True
+        return
     assert original in (0, 1)
     try:
         assert libc.prctl(_bootstrap._PR_SET_THP_DISABLE, 1, 0, 0, 0) == 0
@@ -301,19 +318,51 @@ def test_importing_tensorrt_llm_keeps_process_thp_enabled() -> None:
         "assert libc.prctl(42, 0, 0, 0, 0) == 0\n"
         "import torch\n"
         "keep = torch.empty(64 << 20, dtype=torch.uint8)\n"
+        "arenas = 0\n"
         "advised = []\n"
         "name = None\n"
         "for line in open('/proc/self/smaps'):\n"
         "    if line[:1] in '0123456789abcdef' and '-' in line.split()[0]:\n"
         "        name = line.split()[5] if len(line.split()) > 5 else ''\n"
+        "        arenas += name == '[anon:mimalloc]'\n"
         "    elif line.startswith('VmFlags:') and name == '[anon:mimalloc]' and ' hg' in line:\n"
         "        advised.append(line)\n"
+        "if not arenas:\n"
+        "    raise SystemExit(78)\n"
         "assert not advised, advised\n"
     )
     env = {k: v for k, v in os.environ.items() if k != "MIMALLOC_ALLOW_THP"}
     result = subprocess.run([sys.executable, "-c", code], env=env, timeout=600)
     if result.returncode == 77:
         pytest.skip("THP is already disabled for processes started here")
+    if result.returncode == 78:
+        # The process-wide checks passed, but there was no arena to inspect:
+        # torch's CPU allocator is not mimalloc here (x86), or the kernel does not
+        # name anonymous mappings.
+        pytest.skip("no [anon:mimalloc] mapping in /proc/self/smaps")
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the mimalloc default is Linux-only")
+def test_failed_torch_import_withdraws_the_mimalloc_default(tmp_path: Path) -> None:
+    # The package import fails when torch does; a process that handles the error
+    # and goes on must not keep the mimalloc default in its environment.
+    fake_torch = tmp_path / "torch"
+    fake_torch.mkdir()
+    (fake_torch / "__init__.py").write_text("raise ImportError('torch cannot be imported')\n")
+    code = (
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(tmp_path)!r})\n"
+        "try:\n"
+        "    import tensorrt_llm\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise SystemExit('tensorrt_llm was imported without torch')\n"
+        "assert 'MIMALLOC_ALLOW_THP' not in os.environ\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "MIMALLOC_ALLOW_THP"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, timeout=600)
     assert result.returncode == 0
 
 

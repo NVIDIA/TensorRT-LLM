@@ -23,27 +23,29 @@ import sys
 
 from ._bootstrap import _init, _prepare_environment, _restore_process_thp
 
-# Phase 1: cache environment, DLL search path, Python-library preload and
-# vendored triton_kernels precedence. Must run before torch and before any
-# TensorRT-LLM shared object.
-_prepare_environment()
+try:
+    # Phase 1: cache environment, DLL search path, Python-library preload and
+    # vendored triton_kernels precedence. Must run before torch and before any
+    # TensorRT-LLM shared object.
+    _prepare_environment()
 
-# The package's public surface is loaded lazily (PEP 562): importing
-# tensorrt_llm no longer executes the whole product tree (previously ~99% of
-# product modules ran at import time through the eager chain below). Accessing
-# any public name (tensorrt_llm.LLM, tensorrt_llm.models, ...) imports just
-# what that name needs. The TYPE_CHECKING block keeps the original imports
-# visible to static tooling.
-import importlib
-from typing import TYPE_CHECKING
+    # The package's public surface is loaded lazily (PEP 562): importing
+    # tensorrt_llm no longer executes the whole product tree (previously ~99% of
+    # product modules ran at import time through the eager chain below). Accessing
+    # any public name (tensorrt_llm.LLM, tensorrt_llm.models, ...) imports just
+    # what that name needs. The TYPE_CHECKING block keeps the original imports
+    # visible to static tooling.
+    import importlib
+    from typing import TYPE_CHECKING
 
-# Need to import torch before tensorrt_llm library, otherwise some shared binary files
-# cannot be found for the public PyTorch, raising errors like:
-# ImportError: libc10.so: cannot open shared object file: No such file or directory
-import torch  # noqa
-
-# Undo the process-wide part of the mimalloc option phase 1 set (see _bootstrap).
-_restore_process_thp()
+    # Need to import torch before tensorrt_llm library, otherwise some shared binary files
+    # cannot be found for the public PyTorch, raising errors like:
+    # ImportError: libc10.so: cannot open shared object file: No such file or directory
+    import torch  # noqa
+finally:
+    # Undo the process-wide part of the mimalloc option phase 1 set (see
+    # _bootstrap), also when phase 1 or the torch import raises.
+    _restore_process_thp()
 
 from .logger import logger
 from .version import __version__

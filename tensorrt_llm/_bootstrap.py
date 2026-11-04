@@ -131,6 +131,8 @@ def _keep_mimalloc_arenas_off_thp() -> None:
     # touching a fresh heap page) waits tens of milliseconds, and its
     # tensor-parallel peers wait with it. mimalloc reads the option when torch
     # loads it, so it is set before that import; a value the caller sets wins.
+    # A process that imports torch before tensorrt_llm keeps mimalloc's
+    # default; it needs MIMALLOC_ALLOW_THP=0 in its own environment instead.
     global _mimalloc_thp_default_applied, _thp_disabled_before_torch
     if sys.platform != "linux" or _MIMALLOC_ALLOW_THP_ENV in os.environ:
         return
@@ -149,6 +151,11 @@ def _restore_process_thp() -> None:
     # bundle their own mimalloc (pyarrow does) and from child processes that do
     # not import TensorRT LLM, and a flag the torch import set is cleared again.
     # A flag that was already set before is left alone.
+    # Torch's arenas then stay off huge pages only under the `madvise` THP mode
+    # (/sys/kernel/mm/transparent_hugepage/enabled), where memory that was not
+    # advised gets none. Under `always` they are eligible again, as they are
+    # without this default; the flag is cleared there too, because keeping it
+    # would also deny huge pages to the memory that asks for them.
     global _mimalloc_thp_default_applied
     if not _mimalloc_thp_default_applied:
         return
