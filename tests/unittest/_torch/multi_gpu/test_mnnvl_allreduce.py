@@ -1145,10 +1145,12 @@ def run_own_workspace_single_rank(tensor_parallel_size, hidden_size,
             ref_q, _ = low_m.mxfp8_quantize_reference(out_own)
             assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
         # A two-shot size falls back to the strategies after MNNVL; the own workspace keeps its
-        # size.
+        # size. The fallback may return an NCCL window tensor, which needs a lease scope (the
+        # decoder layer's in a model).
         x = (torch.randn(big + 1, hidden_size, device="cuda") * 0.5).to(
             torch.bfloat16)
-        torch.testing.assert_close(own(x), shared(x), rtol=0.02, atol=0.05)
+        with discard_nccl_window_tensor_outputs(x):
+            torch.testing.assert_close(own(x), shared(x), rtol=0.02, atol=0.05)
         assert own.mnnvl_allreduce._workspace()["buffer_size_bytes"] == limit
         torch.cuda.synchronize()
     except Exception:
