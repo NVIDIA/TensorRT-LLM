@@ -134,12 +134,14 @@ def test_failed_open_does_not_leak_the_file_descriptor(tmp_path, header):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("file_size", [10, 1 << 31], ids=["beyond_file", "above_cap_sparse"])
-def test_oversized_header_length_is_rejected(tmp_path, file_size):
+@pytest.mark.parametrize(
+    "header_len, file_size", [(64, 10), (1 << 30, 1 << 31)], ids=["beyond_file", "above_cap_sparse"]
+)
+def test_oversized_header_length_is_rejected(tmp_path, header_len, file_size):
     path = tmp_path / "bad.safetensors"
     with open(path, "wb") as f:
-        f.write(struct.pack("<Q", 1 << 30) + b"{}")
-        f.truncate(file_size)  # sparse: the declared header fits in the file but exceeds the cap
+        f.write(struct.pack("<Q", header_len) + b"{}")
+        f.truncate(file_size)  # shorter than the header, or sparse: fits in the file but exceeds the cap
     with pytest.raises(ValueError, match="invalid SafeTensors header length"):
         PinnedSafetensorsFile(str(path)).__enter__()
 
