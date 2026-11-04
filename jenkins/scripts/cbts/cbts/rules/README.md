@@ -16,7 +16,7 @@ for the overall CBTS architecture.
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
@@ -303,7 +303,20 @@ Outcomes:
 Path-only rule. Claims non-documentation source changes under
 `tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
 path (one flat forward per checkpoint/arch/parallel triple, assembled
-from a catalog of op wrappers).
+from a catalog of op wrappers), including each family's native code
+(`models/<family>/csrc/`, `models/<family>/<target>/csrc/`: one torch-op library
+per model family, loaded only when routing picks one of the family's targets),
+plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
+native build module `cpp/cmake/modules/modeling_v2.cmake`.
+
+Scope — per model node, else all of modeling_v2: source changes under
+`models/` (native `csrc/` included) select the nearest model node's unit tests
+and the accuracy gates of its targets. Family-shared code selects the whole
+family. A covering directory entry is retained when no more specific entry
+exists, unless it ignores that node. Whole-tree unit checks are always retained.
+Shared Python or native infrastructure selects every modeling_v2 entry, as does
+an unreadable routing tree. If no modeling_v2 entry matches, the rule falls back
+to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -318,9 +331,10 @@ in `backend: pytorch` blocks beside everything else. A block belongs to
 modeling_v2 iff one of its `tests:` entries matches
 `_MV2_ENTRY_PATTERNS`:
 
-- `unittest/_torch/modeling_v2/` — the op-level catalog matrix, carried
-  as whole-directory entries (one on `l0_gb300`, one on
-  `l0_gb300_multi_gpus` for the 4-rank collectives).
+- `unittest/_torch/modeling_v2/` — the unit tests: one directory entry
+  (`--ignore` of `comm/`) that collects the catalog matrix and every
+  family's tests under `models/<family>`, plus `comm/` on
+  `l0_gb300_multi_gpus` for the 4-rank collectives.
 - `test_modeling_v2_` — the accuracy gates, and any future unit file.
 
 Both markers are exact by construction rather than by luck: every test
@@ -331,9 +345,9 @@ carve-out is needed.
 
 Outward fallback: not needed, and by design rather than by accident.
 Nothing beyond the resolver module is imported unless `LLM(modeling_v2=...)`
-is on — the model loader calls `modeling_v2_resolve`, which returns
-immediately when the switch is off, and the routing modules are imported
-lazily behind it. The callers outside the subtree,
+is on — the model loader calls `modeling_v2_resolve_on_all_ranks`, which
+returns immediately when the switch is off, and the routing modules are
+imported lazily behind it. The callers outside the subtree,
 `tensorrt_llm/_torch/pyexecutor/model_loader.py` (decides) and
 `tensorrt_llm/_torch/models/modeling_auto.py` (reads the decision off
 `ModelConfig`), are deliberately left unclaimed: a change to the shared

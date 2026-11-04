@@ -1984,10 +1984,9 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             },
             "param6": [1, 2, 3],
             "param7": None,
-            "param8": {
-                "arg1": 3,
-                "arg2": [1, 2]
-            }
+            # An unknown type is decoded as JSON only; a Python literal is
+            # not JSON, so the text is kept.
+            "param8": "{'arg1': 3, 'arg2': [1, 2]}",
         }
 
     def test_parse_anyof_parameter_type_conversion(self, parser):
@@ -2152,6 +2151,516 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "execute_bash"
         assert json.loads(result.calls[0].parameters) == {
             "command": "pwd && ls"
+        }
+
+    @pytest.mark.parametrize(
+        "schema,raw,expected",
+        [
+            # Booleans accept 1/0 and surrounding whitespace; any other text
+            # is kept as written instead of turning into false.
+            ({
+                "type": "boolean"
+            }, "1", True),
+            ({
+                "type": "boolean"
+            }, " False ", False),
+            ({
+                "type": "boolean"
+            }, "yes", "yes"),
+            # Every type a schema allows is tried, null first.
+            ({
+                "type": ["integer", "null"]
+            }, "null", None),
+            ({
+                "type": ["integer", "null"]
+            }, "7", 7),
+            ({
+                "anyOf": [{
+                    "type": "integer"
+                }, {
+                    "type": "string"
+                }]
+            }, "12", 12),
+            ({
+                "type": ["number", "string"]
+            }, "abc", "abc"),
+            ({
+                "enum": [1, 2, 3]
+            }, "2", 2),
+            # A string parameter keeps null and numerals as text.
+            ({
+                "type": "string"
+            }, "null", "null"),
+            ({
+                "type": "string"
+            }, "42", "42"),
+            # A non-finite number is not valid JSON, so the text is kept.
+            ({
+                "type": "number"
+            }, "inf", "inf"),
+            ({
+                "type": "number"
+            }, "5.0", 5),
+            # Objects are decoded as JSON only, not as Python literals.
+            ({
+                "type": "object"
+            }, "{'a': 1}", "{'a': 1}"),
+        ],
+    )
+    def test_parameter_value_typing(self, parser, schema, raw, expected):
+        """Values are typed by their schema the way vLLM's Qwen3 parser types them."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "p": schema
+                    }
+                },
+            ),
+        )
+        text = ("<tool_call>\n<function=f>\n"
+                f"<parameter=p>\n{raw}\n</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool])
+
+        value = json.loads(result.calls[0].parameters)["p"]
+        assert value == expected
+        assert type(value) is type(expected)
+
+    def test_string_values_are_kept_verbatim(self, parser):
+        """Only the newline the template puts on each side of a value is removed.
+
+        Indentation, trailing spaces and literal HTML entities belong to the
+        value, as they do in the code a coding model writes.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="write",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string"
+                        }
+                    },
+                },
+            ),
+        )
+        content = "    if a &lt; b:\n        return a  "
+        text = ("<tool_call>\n<function=write>\n"
+                f"<parameter=content>\n{content}\n</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool])
+
+        assert json.loads(result.calls[0].parameters) == {"content": content}
+
+    def test_values_stay_strings_without_a_schema(self, parser):
+        """Without a schema to type them by, values are kept as written."""
+        text = ("<tool_call>\n<function=search>\n"
+                "<parameter=limit>10</parameter>\n"
+                "<parameter=label>null</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [])
+
+        assert json.loads(result.calls[0].parameters) == {
+            "limit": "10",
+            "label": "null",
+        }
+
+    def test_streaming_matches_detect_and_parse(self, parser):
+        """Streamed arguments equal the whole-text parse, key order included.
+
+        The second delta completes several parameters at once, and they must be
+        streamed in the order the model wrote them.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "first": {
+                            "type": "string"
+                        },
+                        "count": {
+                            "type": "integer"
+                        },
+                        "ratio": {
+                            "type": "number"
+                        },
+                        "flag": {
+                            "type": "boolean"
+                        },
+                        "label": {
+                            "type": ["string", "null"]
+                        },
+                        "items": {
+                            "type": "array"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("<parameter=first>\nx\n</parameter>\n"
+                "<parameter=count>\n3\n</parameter>\n"
+                "<parameter=ratio>\n0.5\n</parameter>\n"
+                "<parameter=flag>\n1\n</parameter>\n"
+                "<parameter=label>\nnull\n</parameter>\n"
+                "<parameter=items>\n[1, 2]\n</parameter>\n")
+        split = body.index("<parameter=count>")
+        deltas = [
+            "<tool_call>",
+            "\n<function=f>\n" + body[:split],
+            body[split:] + "</function>\n",
+            "</tool_call>",
+        ]
+
+        streamed = ""
+        for delta in deltas:
+            for call in parser.parse_streaming_increment(delta, [tool]).calls:
+                streamed += call.parameters or ""
+        whole = Qwen3CoderToolParser().detect_and_parse("".join(deltas), [tool])
+
+        assert streamed == whole.calls[0].parameters
+        assert json.loads(streamed) == {
+            "first": "x",
+            "count": 3,
+            "ratio": 0.5,
+            "flag": True,
+            "label": None,
+            "items": [1, 2],
+        }
+
+    def test_missing_parameter_end_tag_ends_at_next_parameter(self, parser):
+        """A parameter left without its closing tag ends where the next begins.
+
+        Otherwise the next parameter would be swallowed into its value.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "a": {
+                            "type": "integer"
+                        },
+                        "b": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("\n<function=f>\n"
+                "<parameter=a>\n1\n"
+                "<parameter=b>\nx\n</parameter>\n"
+                "</function>\n")
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        for delta in ("<tool_call>", body, "</tool_call>"):
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        assert json.loads(whole.calls[0].parameters) == {"a": 1, "b": "x"}
+        assert streamed == whole.calls[0].parameters
+
+    @pytest.mark.parametrize(
+        "schema,raw,expected",
+        [
+            # One newline on each side is the template's; the rest is the value.
+            ({
+                "type": "string"
+            }, "\n\nhello\n\n", "\nhello\n"),
+            (None, "\n\nhello\n\n", "\nhello\n"),
+            # A carriage return is part of the value; only the newline is
+            # trimmed.
+            ({
+                "type": "string"
+            }, "\r\nhello\r\n", "\r\nhello\r"),
+            ({
+                "type": "string"
+            }, "\n\r\nhello\r\n\n", "\r\nhello\r\n"),
+            # Escape sequences written as text are not decoded.
+            ({
+                "type": "string"
+            }, "\\r\\nhello\\r\\n", "\\r\\nhello\\r\\n"),
+            ({
+                "type": "boolean"
+            }, "\\r\\nhello\\r\\n", "\\r\\nhello\\r\\n"),
+            # true is text unless the schema allows a boolean.
+            ({
+                "type": "string"
+            }, "true", "true"),
+            (None, "true", "true"),
+            ({
+                "type": ["string", "boolean"]
+            }, "true", True),
+            ({
+                "type": "boolean"
+            }, "\ntrue\n", True),
+            # Spaces and HTML entities in a string are part of the value.
+            ({
+                "type": "string"
+            }, "  keep &amp;  ", "  keep &amp;  "),
+            # null is text unless the schema allows null.
+            ({
+                "type": "string"
+            }, "null", "null"),
+            ({
+                "type": "string"
+            }, "NULL", "NULL"),
+            (None, "null", "null"),
+            ({
+                "type": ["string", "null"]
+            }, "null", None),
+            # A boolean is read through surrounding spaces and accepts 1/0;
+            # other text is kept.
+            ({
+                "type": "boolean"
+            }, " true ", True),
+            ({
+                "type": "boolean"
+            }, "1", True),
+            ({
+                "type": "boolean"
+            }, "maybe", "maybe"),
+            # An integer that does not parse falls back to JSON, which reads a
+            # padded null as null.
+            ({
+                "type": "integer"
+            }, " null ", None),
+            # When string is allowed, digits stay text.
+            ({
+                "type": ["string", "null"]
+            }, "123", "123"),
+            ({
+                "anyOf": [{
+                    "type": "string"
+                }, {
+                    "type": "null"
+                }]
+            }, "123", "123"),
+            # An object is decoded as JSON only, not as a Python literal.
+            ({
+                "type": "object"
+            }, "{'x': 1}", "{'x': 1}"),
+        ],
+    )
+    def test_raw_values_are_typed_as_written(self, parser, schema, raw,
+                                             expected):
+        """The text between the parameter tags is the value, as in vLLM.
+
+        The value is placed between the tags exactly as given, with no newline
+        added by the test, and must come out the same whole and streamed.
+        """
+        properties = {} if schema is None else {"p": schema}
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": properties
+                },
+            ),
+        )
+        body = f"\n<function=f>\n<parameter=p>{raw}</parameter>\n</function>\n"
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        for delta in deltas:
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        value = json.loads(whole.calls[0].parameters)["p"]
+        assert value == expected
+        assert type(value) is type(expected)
+        assert streamed == whole.calls[0].parameters
+
+    @pytest.mark.parametrize("function_end", ["</function>\n", ""])
+    def test_unterminated_last_parameter_ends_with_function(
+            self, parser, function_end):
+        """A last parameter with no closing tag runs to the end of the function.
+
+        This holds whole and streamed alike, also when </function> is missing,
+        and a warning names the parameter.
+        """
+        from unittest.mock import patch
+
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "a": {
+                            "type": "integer"
+                        },
+                        "b": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("\n<function=f>\n<parameter=a>\n1\n</parameter>\n"
+                "<parameter=b>\nnever closed\n" + function_end)
+        logger_path = "tensorrt_llm.serve.tool_parser.qwen3_coder_parser.logger"
+
+        with patch(logger_path) as mock_logger:
+            whole = parser.detect_and_parse(
+                "<tool_call>" + body + "</tool_call>", [tool])
+        assert json.loads(whole.calls[0].parameters) == {
+            "a": 1,
+            "b": "never closed"
+        }
+        assert mock_logger.warning.call_count == 1
+        assert "'b'" in mock_logger.warning.call_args.args[0]
+
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        with patch(logger_path) as mock_logger:
+            results = [
+                streaming_parser.parse_streaming_increment(delta, [tool])
+                for delta in deltas
+            ]
+            # The serving layer finishes every stream; an unclosed last
+            # parameter is only known to have ended once the stream does.
+            results.append(streaming_parser.finish([tool]))
+        for result in results:
+            for call in result.calls:
+                streamed += call.parameters or ""
+        assert streamed == whole.calls[0].parameters
+        assert mock_logger.warning.call_count == 1
+        assert "'b'" in mock_logger.warning.call_args.args[0]
+
+    def test_value_containing_function_tags_stays_whole(self, parser):
+        """Function tags inside a closed value are part of the value."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string"
+                        },
+                        "n": {
+                            "type": "integer"
+                        },
+                    },
+                },
+            ),
+        )
+        code = 'print("</function>", "<function=g>")'
+        body = (f"\n<function=f>\n<parameter=code>\n{code}\n</parameter>\n"
+                "<parameter=n>\n2\n</parameter>\n</function>\n")
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        for delta in deltas:
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        assert [call.name for call in whole.calls] == ["f"]
+        assert json.loads(whole.calls[0].parameters) == {"code": code, "n": 2}
+        assert streamed == whole.calls[0].parameters
+
+    @pytest.mark.parametrize("streaming", [False, True],
+                             ids=["non_streaming", "streaming"])
+    def test_parse_preserves_string_and_null_types(self, parser, streaming):
+        """None stays text where a string is allowed and is null elsewhere."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="set_values",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "literal_none": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "literal_null": {
+                            "type": "string"
+                        },
+                        "nullable_null": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "nullable_integer": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                },
+            ),
+        )
+        chunks = [
+            "<tool_call>\n",
+            "<function=set_values>\n",
+            "<parameter=literal_none>None</parameter>\n",
+            "<parameter=literal_null>null</parameter>\n",
+            "<parameter=nullable_null>null</parameter>\n",
+            "<parameter=nullable_integer>None</parameter>\n",
+            "</function>\n</tool_call>",
+        ]
+        if streaming:
+            calls = []
+            for chunk in chunks:
+                calls.extend(
+                    parser.parse_streaming_increment(chunk, [tool_def]).calls)
+        else:
+            calls = parser.detect_and_parse("".join(chunks), [tool_def]).calls
+
+        assert [call.name for call in calls if call.name] == ["set_values"]
+        parameters = "".join(call.parameters for call in calls
+                             if call.parameters)
+        assert json.loads(parameters) == {
+            "literal_none": "None",
+            "literal_null": "null",
+            "nullable_null": None,
+            "nullable_integer": None,
         }
 
 
@@ -2649,6 +3158,53 @@ def test_deepseek_streaming_keeps_markdown_fences(
 
     assert streamed == text, f"Expected {text!r}, got {streamed!r}"
     assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
+
+
+def _dsml_tool_call(tag_prefix: str, block_name: str, name: str,
+                    string_arguments: dict[str, str]) -> str:
+    """A tool call as the DSML encoders render it: each string value verbatim."""
+    parameters = "\n".join(
+        f'<{tag_prefix}parameter name="{key}" string="true">{value}'
+        f"</{tag_prefix}parameter>" for key, value in string_arguments.items())
+    return (f"<{tag_prefix}{block_name}>\n"
+            f'<{tag_prefix}invoke name="{name}">\n{parameters}\n'
+            f"</{tag_prefix}invoke>\n</{tag_prefix}{block_name}>")
+
+
+@pytest.mark.parametrize("parser_cls,tag_prefix,block_name", [
+    (DeepSeekV32Parser, "｜DSML｜", "function_calls"),
+    (DeepSeekV4Parser, "｜DSML｜", "tool_calls"),
+    (DeepSeekV41Parser, "｜DSML｜ ", "calls"),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_dsml_string_parameter_values_are_kept_as_written(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tag_prefix: str, block_name: str,
+        streaming: bool) -> None:
+    """A string value's leading and trailing whitespace is part of the value.
+
+    An edit's ``old_string`` must match the file including its indentation,
+    and a written file keeps its last newline.
+    """
+    arguments = {
+        "location": "    indented line\n    second line",
+        "unit": "file content\n",
+    }
+    text = _dsml_tool_call(tag_prefix, block_name, "get_weather", arguments)
+
+    parser = parser_cls()
+    if streaming:
+        results = [
+            parser.parse_streaming_increment(text[i:i + 7], sample_tools)
+            for i in range(0, len(text), 7)
+        ]
+        calls = [call for result in results for call in result.calls]
+    else:
+        calls = parser.detect_and_parse(text, sample_tools).calls
+
+    assert [call.name for call in calls if call.name] == ["get_weather"]
+    assert json.loads("".join(call.parameters or ""
+                              for call in calls)) == arguments
 
 
 @pytest.mark.parametrize(
@@ -6112,6 +6668,73 @@ class TestConfigureParserSpecialTokenDecoding:
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
 
+    @pytest.mark.parametrize(
+        "reasoning_parser, tool_parser, with_tools, skip, spaces",
+        [
+            ("kimi_k3", "kimi_k3", True, False, False),
+            ("kimi_k3", None, False, False, False),
+            (None, "deepseek_v32", True, False, True),
+            (None, "deepseek_v32", False, True, True),
+            (None, None, True, True, True),
+        ],
+    )
+    def test_the_responses_route_applies_it(self, monkeypatch, reasoning_parser,
+                                            tool_parser, with_tools, skip,
+                                            spaces) -> None:
+        """/v1/responses detokenizes for the parsers as chat completions does.
+
+        Without it Kimi-K3's tags arrive with their special tokens dropped or
+        spaced apart, and its tool calls reach the client as message text.
+        """
+        import asyncio
+        from types import SimpleNamespace
+
+        import tensorrt_llm.serve.openai_server as server_module
+        from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        async def fake_preprocess(**kwargs):
+            return [1, 2, 3], SamplingParams()
+
+        monkeypatch.setattr(server_module, "responses_api_request_preprocess",
+                            fake_preprocess)
+        submitted = []
+
+        def generate_async(*, sampling_params, **kwargs):
+            submitted.append(sampling_params)
+            raise RuntimeError("stop after submission")
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.enable_store = False
+        server.use_harmony = False
+        server.tokenizer = None
+        server.model_config = None
+        server.processor = None
+        server.multimodal_server_config = None
+        server.chat_template = None
+        server.tool_parser = tool_parser
+        server.metrics_collector = None
+        server.conversation_store = None
+        server.generator = SimpleNamespace(args=SimpleNamespace(
+            reasoning_parser=reasoning_parser, num_postprocess_workers=0),
+                                           generate_async=generate_async)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        tools = [{
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object"
+            }
+        }] if with_tools else None
+        request = ResponsesRequest(model="test-model", input="hi", tools=tools)
+
+        asyncio.run(server.openai_responses(request, raw_request))
+
+        (sampling_params, ) = submitted
+        assert sampling_params.skip_special_tokens is skip
+        assert sampling_params.spaces_between_special_tokens is spaces
+
 
 # ============================================================================
 # Forced tool call: argument truncation — TRTLLM-12758
@@ -6843,3 +7466,167 @@ def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
 
     assert [(c.name, c.tool_index)
             for c in calls] == [("functions.get_weather", -1)]
+
+
+# ============================================================================
+# DeepSeek DSML layout: the newlines inside a tool-call block are not content
+# ============================================================================
+
+_DSML_FORMATS = [
+    (DeepSeekV32Parser, "function_calls", "invoke", "parameter"),
+    (DeepSeekV4Parser, "tool_calls", "invoke", "parameter"),
+    (DeepSeekV41Parser, " calls", " invoke", " parameter"),
+]
+
+
+def _dsml_block(calls_tag: str, invoke_tag: str, parameter_tag: str) -> str:
+    """Two calls laid out as the checkpoint encoders write them: one per line."""
+    dsml = "｜DSML｜"
+
+    def invoke(name: str, key: str, value: str) -> str:
+        return (f'<{dsml}{invoke_tag} name="{name}">\n'
+                f'<{dsml}{parameter_tag} name="{key}" string="true">{value}'
+                f"</{dsml}{parameter_tag}>\n"
+                f"</{dsml}{invoke_tag}>")
+
+    return (f"<{dsml}{calls_tag}>\n" +
+            invoke("get_weather", "location", "NYC") + "\n" +
+            invoke("search_web", "query", "AI") + "\n" +
+            f"</{dsml}{calls_tag}>")
+
+
+def _stream(parser,
+            text: str,
+            chunk_size: int,
+            tools: list[ChatCompletionToolsParam],
+            *,
+            finish: bool = True):
+    results = [
+        parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+        for i in range(0, len(text), chunk_size)
+    ]
+    if finish:
+        results.append(parser.finish(tools))
+    content = "".join(result.normal_text for result in results)
+    calls = [call for result in results for call in result.calls]
+    return content, calls
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 10_000])
+def test_dsml_newlines_between_calls_are_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The newline after each invoke is the block's layout, however it is chunked.
+
+    Streamed as text, it became content after every tool call: over Anthropic
+    Messages, a whitespace-only text block followed each tool_use, and a client
+    that drops such blocks sent back a turn that no longer matched what was
+    served.
+    """
+    text = "Let me check.\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Let me check."
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+    arguments = [
+        json.loads(call.parameters) for call in calls
+        if not call.name and call.parameters
+    ]
+    assert arguments == [{"location": "NYC"}, {"query": "AI"}]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [5, 10_000])
+def test_dsml_text_after_the_block_is_still_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Only the layout inside the block is dropped; text after it is kept.
+
+    In one increment, the closing tag and the text after it follow the last
+    invoke; that text must come out of that increment.
+    """
+    text = _dsml_block(calls_tag, invoke_tag, parameter_tag) + " Done."
+
+    parser = parser_cls()
+    content, calls = _stream(parser,
+                             text,
+                             chunk_size,
+                             sample_tools,
+                             finish=False)
+
+    assert content == " Done."
+    finish_result = parser.finish(sample_tools)
+    assert finish_result.normal_text == ""
+    assert finish_result.calls == []
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 10_000])
+def test_dsml_blank_line_before_the_block_is_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The encoders write a blank line between the content and the block.
+
+    The content keeps its own whitespace; only that blank line is dropped, on
+    both paths.
+    """
+    content_in = "  Indented first line.\nLast line.\n"
+    text = content_in + "\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == content_in
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content_in
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_trailing_blank_lines_without_a_block_are_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Newlines held back in case a block follows come out when none does."""
+    text = "Done.\n\n"
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == text
+    assert calls == []
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """A stream cut short inside the block ends with its content.
+
+    The non-streaming path reads the same text the same way.
+    """
+    block = _dsml_block(calls_tag, invoke_tag, parameter_tag)
+    text = "Checking.\n\n" + block[:block.index("</｜DSML｜")]
+
+    content, _ = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Checking."
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content

@@ -590,6 +590,7 @@ def test_selfsampling_route_factorization():
                 2560,
                 4096,
                 8192,
+                12288,
                 16384,
                 4 * 1024,
                 4 * 4096,
@@ -635,42 +636,40 @@ def test_selfsampling_dispatch_is_pure_and_total():
             assert r["block"] >= 128 and r["grid"][0] >= 1
 
 
-def test_selfsampling_route_4k_8k_register_rungs():
-    """4K < n <= 8K (n4 in (1024, 2048]) dispatches to two one-wave register
-    rungs: wide rows BLK=1024 x VPT=2 with 2*NB bins, 148 < b <= 296 BLK=512 x
-    VPT=4 x MINB=2 with NB bins; b > 296 keeps the main slab and both band
-    edges keep their previous plans. Every register plan carries QC == QUADC
-    and the kernel pin IMGOFF == NBH. CPU-only."""
+def test_selfsampling_route_4k_8k_register_rungs() -> None:
+    """Check register launch geometry, boundary tails and histogram layout."""
     for k in (512, 1024, 2048):
         for n in (4100, 6144, 8192, 8195):
             npad = (n + 63) // 64 * 64
             for b in (1, 64, 148):
                 r = ss_host.route(b, n, npad, k)
-                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == (1024, 2, 1), (b, n, k, r)
+                want = (512, 3, 1) if k == 2048 and n <= 6144 else (1024, 2, 1)
+                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == want, (b, n, k, r)
                 assert r["tpl"][7] == 2 * ss_host.NB
-            for b in (149, 160, 256, 296):
+            for b in (149, 160, 256, 296, 297):
                 r = ss_host.route(b, n, npad, k)
-                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == (512, 4, 2), (b, n, k, r)
+                want = (512, 3, 2) if n <= 6144 else (512, 4, 2)
+                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == want, (b, n, k, r)
                 assert r["tpl"][7] == ss_host.NB
-            assert ss_host.route(297, n, npad, k)["kernel"] == "main"
-        # band edges: n4 == 1024 keeps the n4 <= 1024 rungs, n4 == 2049 the VPT=4 plan
+        lower_edge = {
+            512: ("regimg", (1024, 1, 2)),
+            1024: ("reg", (1024, 1, 1)),
+            2048: ("reg", (512, 2, 1)),
+        }
         lo = ss_host.route(64, 4099, 4160, k)
-        assert lo["kernel"] == ("regimg" if k == 512 else "reg") and tuple(lo["tpl"][:3]) == (
-            1024,
-            1,
-            2,
-        )
+        assert (lo["kernel"], tuple(lo["tpl"][:3])) == lower_edge[k]
         assert tuple(ss_host.route(160, 4099, 4160, k)["tpl"][:3]) == (512, 2, 4)
         hi = ss_host.route(64, 8196, 8256, k)
-        assert hi["kernel"] == "reg" and tuple(hi["tpl"][:3]) == (1024, 4, 1)
-        assert ss_host.route(160, 8196, 8256, k)["kernel"] == "main"
+        assert hi["kernel"] == "reg" and tuple(hi["tpl"][:3]) == (1024, 3, 1)
+        mid_hi = ss_host.route(160, 8196, 8256, k)
+        assert mid_hi["kernel"] == "reg" and tuple(mid_hi["tpl"][:3]) == (512, 5, 2)
     for k in (512, 1024, 2048):
         for b in (1, 148, 149, 296, 297, 1024):
             for n in range(k + 1, 16385, 97):
                 npad = (n + 63) // 64 * 64
                 r = ss_host.route(b, n, npad, k)
                 if r["kernel"] in ("reg", "regimg"):
-                    assert r["rt"]["QC"] == ss_host.QUADC, (b, n, k)
+                    assert r["rt"]["QC"] == 160, (b, n, k)
                     assert r["rt"]["IMGOFF"] == r["tpl"][7], (
                         b,
                         n,
@@ -678,6 +677,10 @@ def test_selfsampling_route_4k_8k_register_rungs():
                         r["rt"]["IMGOFF"],
                         r["tpl"][7],
                     )
+                    scratch = 2 * r["rt"]["CMP"]
+                    if r["kernel"] == "regimg":
+                        scratch = max(scratch, (n + 3) & ~3)
+                    assert r["smem"] == (r["tpl"][7] + scratch) * 4, (b, n, k, r)
 
 
 def test_selfsampling_register_rungs_follow_available_sms() -> None:
@@ -692,11 +695,17 @@ def test_selfsampling_register_rungs_follow_available_sms() -> None:
                 mid = ss_host.route(rows, n, npad, k, num_sms)
                 assert mid["kernel"] == "reg"
                 assert tuple(mid["tpl"][:3]) == (512, 4, 2)
-            assert ss_host.route(2 * num_sms + 1, n, npad, k, num_sms)["kernel"] == "main"
+            tall = ss_host.route(2 * num_sms + 1, n, npad, k, num_sms)
+            assert tall["kernel"] == "reg"
+            assert tuple(tall["tpl"][:3]) == (512, 4, 2)
 
             n, npad = 12288, 12288
-            assert ss_host.route(num_sms, n, npad, k, num_sms)["kernel"] == "reg"
-            assert ss_host.route(num_sms + 1, n, npad, k, num_sms)["kernel"] == "main"
+            wide = ss_host.route(num_sms, n, npad, k, num_sms)
+            assert wide["kernel"] == "reg"
+            assert tuple(wide["tpl"][:3]) == (1024, 3, 1)
+            mid = ss_host.route(num_sms + 1, n, npad, k, num_sms)
+            assert mid["kernel"] == "reg"
+            assert tuple(mid["tpl"][:3]) == (512, 6, 2)
 
         # Streaming and clustered-register tuning is intentionally invariant.
         for rows, n, k, family in (
@@ -716,11 +725,47 @@ def test_selfsampling_register_rungs_follow_available_sms() -> None:
             )
 
 
+def test_selfsampling_route_12k_register_coverage() -> None:
+    """The 12K register envelope covers both architectures and all batch sizes."""
+    for sm_version in (100, 103):
+        for num_sms in (148, 160, 208):
+            for k in (512, 1024, 2048):
+                for rows in (
+                    1,
+                    num_sms,
+                    num_sms + 1,
+                    2 * num_sms,
+                    2 * num_sms + 1,
+                    512,
+                    768,
+                    1024,
+                    1280,
+                    2048,
+                    8192,
+                ):
+                    for n in (8196, 10240, 12287, 12288):
+                        for det in (False, True):
+                            npad = (n + 63) // 64 * 64
+                            plan = ss_host.route(rows, n, npad, k, num_sms, sm_version, det)
+                            assert plan["kernel"] == "reg", (rows, n, k, plan)
+                            assert plan["grid"] == (rows, 1) and plan["cluster"] == 1
+                            assert not plan["ws"]
+                            assert plan["tpl"][0] * plan["tpl"][1] >= n // 4
+                            if det:
+                                assert plan["tpl"][1] <= 8
+
+                # K=2048 also retains a float4 rung through its three scalar tails.
+                for n in (12289, 12290, 12291, 12292):
+                    plan = ss_host.route(8192, n, 12352, k, num_sms, sm_version)
+                    family = "reg" if k == 2048 and n <= 12291 else "main"
+                    assert plan["kernel"] == family, (n, k, plan)
+
+
 def test_selfsampling_route_sms_factorization() -> None:
     """The factored route preserves topology-dependent register plans."""
     for num_sms in (148, 160, 208):
         for rows in (num_sms, num_sms + 1, 2 * num_sms, 2 * num_sms + 1):
-            for n in (4100, 8195, 12288, 131072):
+            for n in (4100, 8195, 12288, 12289, 12292, 131072):
                 for k in (512, 1024, 2048):
                     npad = (n + 63) // 64 * 64
                     assert ss_host.route_split(rows, n, npad, k, num_sms) == ss_host.route(
@@ -729,15 +774,15 @@ def test_selfsampling_route_sms_factorization() -> None:
 
 
 def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
-    """The B300 tuning is architecture- and shape-exact."""
-    baseline = ss_host.route(512, 8192, 8192, 2048, 148)
+    """SM100 and SM103 share the large-batch K=2048 register launch geometry."""
+    sm100 = ss_host.route(512, 8192, 8192, 2048, 148)
     tuned = ss_host.route(512, 8192, 8192, 2048, 148, sm_version=103)
-    assert baseline["kernel"] == "main"
+    assert sm100 == tuned
     assert tuned["kernel"] == "reg"
     assert tuned["tpl"] == (512, 4, 2, 1, True, True, False, 1024)
     assert ss_host.route(1024, 8192, 8192, 2048, 148, 103)["kernel"] == "reg"
 
-    # Nearby K, batch, topology and architecture points retain the baseline.
+    # Nearby K, batch and topology points agree across SM100 and SM103.
     for rows, top_k, num_sms, sm_version in (
         (512, 1024, 148, 103),
         (384, 2048, 148, 103),
@@ -752,24 +797,29 @@ def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
 
     assert ss_host.route_split(512, 8192, 8192, 2048, 148, 103) == tuned
 
-    # The integer-divided n4 rung starts at n=4100 and ends at n=8195.
-    assert ss_host.route(512, 4099, 4160, 2048, 148, 103) == ss_host.route(
-        512, 4099, 4160, 2048, 148
-    )
-    assert ss_host.route(512, 4100, 4160, 2048, 148, 103)["kernel"] == "reg"
-    assert ss_host.route(512, 8195, 8256, 2048, 148, 103)["kernel"] == "reg"
-    assert ss_host.route(512, 8196, 8256, 2048, 148, 103) == ss_host.route(
-        512, 8196, 8256, 2048, 148
-    )
+    for sm_version in (100, 103):
+        for n, expected in (
+            (4099, (512, 2, 4)),
+            (4100, (256, 5, 4)),
+            (4111, (256, 5, 4)),
+            (6144, (512, 3, 2)),
+            (8192, (512, 4, 2)),
+            (8195, (512, 4, 2)),
+            (8196, (512, 5, 2)),
+        ):
+            npad = (n + 63) // 64 * 64
+            plan = ss_host.route(512, n, npad, 2048, 148, sm_version)
+            assert plan["kernel"] == "reg"
+            assert tuple(plan["tpl"][:3]) == expected, (n, sm_version, plan)
 
 
-@pytest.mark.skipif(getSMVersion() != 103, reason="requires an SM103 GPU")
+@pytest.mark.skipif(getSMVersion() not in (100, 103), reason="requires an SM100 or SM103 GPU")
 def test_selfsampling_sm103_b512_k2048_cuda_graph() -> None:
-    """Exercise the 148-SM SM103 register plan through warmup and graph replay."""
+    """Exercise the shared 148-SM SM100/SM103 plan through warmup and graph replay."""
     rows, n, npad, top_k = 512, 4111, 4160, 2048
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     if properties.multi_processor_count != 148:
-        pytest.skip("requires an SM103 GPU with 148 SMs")
+        pytest.skip("requires an SM100 or SM103 GPU with 148 SMs")
     plan = ss_host.route(
         rows,
         n,
@@ -779,7 +829,7 @@ def test_selfsampling_sm103_b512_k2048_cuda_graph() -> None:
         properties.major * 10 + properties.minor,
     )
     assert plan["kernel"] == "reg"
-    assert tuple(plan["tpl"][:3]) == (512, 4, 2)
+    assert tuple(plan["tpl"][:3]) == (256, 5, 4)
 
     ss_host.warmup_varlen(
         top_k,
@@ -1028,6 +1078,252 @@ def test_selfsampling_varlen_regclus_cuda_graph():
         assert torch.equal(got, ref_v)
 
 
+def test_selfsampling_route_k2048_regclus() -> None:
+    """K=2048 rows above the register window take reg_clus with two hint
+    slots per thread, except where the one-wave K=2048 register rung applies."""
+    k = 2048
+    for b, n in ((1, 16399), (8, 32771), (8, 65551), (16, 32771)):
+        plan = ss_host.route(b, n, (n + 63) // 64 * 64, k)
+        assert plan["kernel"] == "reg_clus" and plan["tpl"][3] == k, (b, n, plan["kernel"])
+    for b in (32, 64):
+        assert ss_host.route(b, 16399, 16448, k)["kernel"] == "reg"
+    assert ss_host.route(1, 131087, 131136, k)["kernel"] == "main"
+    assert ss_host.route(1, 65536, 65536, 1024)["tpl"][3] == 1024
+
+
+@pytest.mark.parametrize("hint_free", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_static_k_cache(hint_free: bool, deterministic: bool) -> None:
+    """Changing K at fixed cluster geometry must select the matching compiled variant."""
+    b, n, npad = 2, 65551, 65600
+    gen = torch.Generator(device=_DEV).manual_seed(20998)
+    logits = torch.randn((b, npad), generator=gen, device=_DEV)
+    logits[:, n:] = 3e38
+    lengths = torch.full((b,), n, dtype=torch.int32, device=_DEV)
+    # Revisit the first K after compiling both larger variants to exercise cache reuse.
+    for k in (512, 1024, 2048, 512):
+        assert ss_host.route(b, n, npad, k, det=deterministic)["kernel"] == "reg_clus"
+        values, hints = logits[:, :n].topk(k)
+        if hint_free:
+            out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
+            ss_host.run_varlen(logits, lengths, out, max_seq_len=n, deterministic=deterministic)
+        else:
+            # A wider output follows the host's existing packed-row convention.
+            out = torch.full((b, k + 64), -7, dtype=torch.int32, device=_DEV)
+            ss_host.run(logits, hints.to(torch.int32), n, out, deterministic=deterministic)
+            assert bool((out.flatten()[b * k :] == -7).all())
+            out = out.flatten()[: b * k].view(b, k)
+        torch.cuda.synchronize()
+        _check_exact(logits, out[:, :k], n, values)
+
+
+@pytest.mark.parametrize("pattern", ["randn", "ties", "equal"])
+@pytest.mark.parametrize(
+    "b,n", [(1, 16399), (4, 65551), (16, 32771), (1, 131072)], ids=lambda v: str(v)
+)
+def test_selfsampling_varlen_regclus_k2048_exact(b: int, n: int, pattern: str) -> None:
+    """K=2048 reg_clus is exact on random, heavily tied and all-equal rows."""
+    k, npad = 2048, (n + 63) // 64 * 64
+    key = _varlen_cache_key(b, npad, k, n, 1, 1)
+    gen = torch.Generator(device=_DEV).manual_seed(n + b)
+    lg = torch.randn((b, npad), generator=gen, dtype=torch.float32, device=_DEV)
+    if pattern == "ties":
+        lg = (lg * 4).round() / 4
+    elif pattern == "equal":
+        lg.fill_(0.5)
+    lg[:, n:] = 3e38
+    kv = torch.full((b,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, max_seq_len=n)
+    torch.cuda.synchronize()
+    assert ss_host._VARLEN_CACHE[key][0] == "reg_clus"
+    _check_exact(lg, out, n, torch.topk(lg[:, :n], k, dim=1).values)
+
+
+def test_selfsampling_varlen_regclus_k2048_short_rows():
+    """K=2048 reg_clus engine: short rows (n <= k, identity spans both hint
+    slots), a zero-window row and long rows in one MTP launch."""
+    k, msl, nn = 2048, 32771, 2
+    npad = (msl + 63) // 64 * 64
+    torch.manual_seed(13)
+    lg = torch.randn(4 * nn, npad, dtype=torch.float32, device=_DEV)
+    kv = torch.tensor([msl, 1500, nn - 1, 20000], dtype=torch.int32, device=_DEV)
+    out = torch.full((4 * nn, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=1, max_seq_len=msl)
+    assert ss_host._VARLEN_CACHE[_varlen_cache_key(4 * nn, npad, k, msl, nn, 1)][0] == "reg_clus"
+    torch.cuda.synchronize()
+    ref = _reference_varlen_indices(lg, kv, nn, 1, k)
+    for r in range(4 * nn):
+        valid = max(0, min(msl, int(kv[r // nn]) - nn + r % nn + 1))
+        if valid <= k:
+            assert torch.equal(out[r], ref[r]), f"row {r} short-row identity mismatch"
+        else:
+            row = lg[r]
+            got = row[out[r].long().clamp_min(0)].sort().values
+            want = row[ref[r].long().clamp_min(0)].sort().values
+            assert torch.equal(got, want), f"row {r} value multiset mismatch"
+            assert torch.equal(out[r] < 0, ref[r] < 0), f"row {r} pad mask mismatch"
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("b,n", [(1, 16399), (4, 65551), (8, 131071), (16, 32771)])
+@pytest.mark.parametrize("pattern", ["hidden_peak", "outlier", "equal", "ties", "infinities"])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_sampling_rescue(
+    k: int, b: int, n: int, pattern: str, deterministic: bool
+) -> None:
+    """Exact selection and stable tie membership across all cluster fragment geometries."""
+    npad = (n + 63) // 64 * 64
+    gen = torch.Generator().manual_seed(20261026 + n + k)
+    row = torch.randn(n, generator=gen)
+    if pattern == "hidden_peak":
+        row.fill_(1)
+        # High scores occupy positions outside both endpoint-inclusive block samplers.
+        sample_id = torch.arange(k)
+        for width in (32, 64):
+            positions = (sample_id // width) * (n - width) // (k // width - 1) + sample_id % width
+            row[positions] = 0
+    elif pattern == "outlier":
+        row[0] = row[-1] = 1e9
+    elif pattern == "equal":
+        row.fill_(1)
+    elif pattern == "ties":
+        row.fill_(1)
+        row[torch.randperm(n, generator=gen)[: k // 2]] = 2
+    else:
+        row[0::7] = float("inf")
+        row[1::7] = -float("inf")
+    logits = torch.full((b, npad), 3e38, dtype=torch.float32, device=_DEV)
+    logits[:, :n] = row.to(_DEV)
+    lengths = torch.full((b,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
+    kwargs = {"max_seq_len": n, "deterministic": deterministic}
+    ss_host.run_varlen(logits, lengths, out, **kwargs)
+    torch.cuda.synchronize()
+    assert ss_host.route(b, n, npad, k, det=deterministic)["kernel"] == "reg_clus"
+    reference = torch.topk(logits[:, :n], k, dim=1).values
+    _check_exact(logits, out, n, reference)
+    first = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(logits, lengths, out, **kwargs)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_exact(logits, out, n, reference)
+        if deterministic:
+            assert torch.equal(first, out), "rescue output order changed across graph replay"
+    if deterministic:
+        expected = torch.argsort(row, descending=True, stable=True)[:k].sort().values.to(_DEV)
+        assert torch.equal(out.long().sort(dim=1).values, expected.expand(b, -1))
+        ss_host.run_varlen(logits, lengths, out, sorting="ascending", **kwargs)
+        torch.cuda.synchronize()
+        assert torch.equal(out.long(), expected.expand(b, -1))
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_rescue_negative_inf_tail(k: int, deterministic: bool) -> None:
+    """Partial float4 slots must not duplicate the separately loaded scalar tail."""
+    envelope = 131072
+    valid_lengths = [base + tail for base in (k, 65536) for tail in (1, 2, 3)]
+    rows = len(valid_lengths)
+    assert ss_host.route(rows, envelope, envelope, k, det=deterministic)["kernel"] == "reg_clus"
+    logits = torch.full((rows, envelope), 3e38, dtype=torch.float32, device=_DEV)
+    for row, valid in enumerate(valid_lengths):
+        logits[row, :valid] = -float("inf")
+        # The threshold is -inf, while every real tail element is a strict winner.
+        logits[row, valid // 4 * 4 : valid] = 1
+    lengths = torch.tensor(valid_lengths, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, lengths, out, max_seq_len=envelope, deterministic=deterministic)
+    torch.cuda.synchronize()
+    for row, valid in enumerate(valid_lengths):
+        values = logits[row : row + 1, :valid]
+        _check_exact(logits[row : row + 1], out[row : row + 1], valid, values.topk(k).values)
+        if deterministic:
+            expected = torch.argsort(values, descending=True, stable=True)[:, :k]
+            assert torch.equal(out[row : row + 1].long().sort().values, expected.sort().values)
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("candidates", [16384, 16385])
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_rescue_candidate_limit(
+    k: int, candidates: int, tied: bool, deterministic: bool
+) -> None:
+    """Both sides of the rescue limit preserve strict winners and threshold ties."""
+    n, npad = 65551, 65600
+    assert ss_host.route(1, n, npad, k, det=deterministic)["kernel"] == "reg_clus"
+    logits = torch.full((1, npad), 3e38, dtype=torch.float32, device=_DEV)
+    logits[:, :n] = 0
+    logits[:, : k // 2] = 2
+    begin = (n - candidates) // 2
+    logits[:, begin : begin + candidates] = (
+        1 if tied else torch.linspace(1, 1.0001, candidates, device=_DEV)
+    )
+    lengths = torch.tensor([n], dtype=torch.int32, device=_DEV)
+    out = torch.full((1, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, lengths, out, max_seq_len=n, deterministic=deterministic)
+    torch.cuda.synchronize()
+    _check_exact(logits, out, n, logits[:, :n].topk(k).values)
+    if deterministic:
+        expected = torch.argsort(logits[:, :n], descending=True, stable=True)[:, :k]
+        assert torch.equal(out.long().sort(dim=1).values, expected.sort(dim=1).values)
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_rescue_mtp_short_rows(
+    k: int, compress_ratio: int, deterministic: bool
+) -> None:
+    """An MTP launch may mix rescued long rows, identity rows and empty windows."""
+    next_n, envelope = 4, 32771
+    npad = (envelope + 63) // 64 * 64
+    assert ss_host.route(4 * next_n, envelope, npad, k, det=deterministic)["kernel"] == "reg_clus"
+    raw_lengths = [
+        0,
+        (k - 1) * compress_ratio,
+        k * compress_ratio + next_n - 1,
+        envelope * compress_ratio + next_n - 1,
+    ]
+    logits = torch.full((4 * next_n, npad), 3e38, dtype=torch.float32, device=_DEV)
+    valid_lengths = []
+    for row in range(4 * next_n):
+        valid = max(
+            0,
+            min(
+                envelope, (raw_lengths[row // next_n] - next_n + row % next_n + 1) // compress_ratio
+            ),
+        )
+        valid_lengths.append(valid)
+        logits[row, :valid] = 1
+    lengths = torch.tensor(raw_lengths, dtype=torch.int32, device=_DEV)
+    out = torch.full((4 * next_n, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        logits,
+        lengths,
+        out,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        max_seq_len=envelope * compress_ratio,
+        deterministic=deterministic,
+    )
+    torch.cuda.synchronize()
+    for row, valid in enumerate(valid_lengths):
+        if valid <= k:
+            assert torch.equal(out[row, :valid], torch.arange(valid, device=_DEV))
+            assert bool((out[row, valid:] == -1).all())
+        else:
+            _check_exact(
+                logits[row : row + 1], out[row : row + 1], valid, torch.ones((1, k), device=_DEV)
+            )
+            if deterministic:
+                assert torch.equal(out[row].sort().values, torch.arange(k, device=_DEV))
+
+
 def test_selfsampling_varlen_reg_parity_and_oracle():
     """The varlen launcher must admit the register-resident family (and its
     img flavor) exactly where the free route picks it (route() parity tier 2),
@@ -1162,27 +1458,49 @@ def test_selfsampling_varlen_reg_cuda_graph():
         assert torch.equal(got, ref_v)
 
 
+@pytest.mark.parametrize("rows,n", [(256, 8196), (1024, 9216), (256, 12288)])
+def test_selfsampling_register_histogram_layout_exactness(rows: int, n: int) -> None:
+    """Both register entry points use the shared-memory layout selected by NBH."""
+    top_k = 512
+    npad = (n + 63) // 64 * 64
+    plan = ss_host.route(rows, n, npad, top_k)
+    assert plan["kernel"] == "reg" and plan["tpl"][7] == 1024
+    assert plan["rt"]["IMGOFF"] == 1024
+    assert plan["smem"] == (1024 + 2 * plan["rt"]["CMP"]) * 4
+
+    logits, pre_idx, indices, ref_vals = _make_case(rows, n, top_k, seed=rows + n)
+    ss_host.run(logits, pre_idx, n, indices)
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n, ref_vals)
+
+    kv_lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    indices.fill_(-7)
+    ss_host.run_varlen(logits, kv_lens, indices, max_seq_len=n)
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n, ref_vals)
+
+
 @pytest.mark.parametrize(
-    "rows,n,top_k",
+    "rows,n,top_k,expected_tpl",
     [
-        (64, 8192, 512),  # wide rung (1024,2,1)
-        (148, 4100, 2048),  # wide rung, DEG tuple, band floor
-        (160, 8195, 512),  # mid rung (512,4,2), band ceiling
-        (256, 6144, 1024),  # mid rung, KPT=2
-        (296, 8192, 2048),  # mid rung, one full wave, DEG tuple (n <= 4k+64), k > BLK
+        (64, 8192, 512, (1024, 2, 1)),
+        (148, 4100, 2048, (512, 3, 1)),
+        (160, 8195, 512, (512, 4, 2)),
+        (256, 6144, 1024, (512, 3, 2)),
+        (296, 8192, 2048, (512, 4, 2)),
     ],
     ids=["wide_b64_k512", "wide_b148_k2048", "mid_b160_k512", "mid_b256_k1024", "mid_b296_k2048"],
 )
-def test_selfsampling_varlen_4k_8k_rungs_exact(rows, n, top_k):
+def test_selfsampling_varlen_4k_8k_rungs_exact(
+    rows: int, n: int, top_k: int, expected_tpl: tuple[int, int, int]
+) -> None:
     """The 4K < n <= 8K register rungs under the hint-free varlen engine on a
     heterogeneous batch: full rows, mid-length rows, a short row (n <= k), a
     two-valued row (boundary tie class of thousands -> the crossing-bin count
-    saturates, non-quad refine) and a heavy-tailed row (first-k bracket misses
-    the k-th value -> QC = QUADC routes it to the key-space narrowing)."""
+    saturates, non-quad refine) and a heavy-tailed row."""
     npad = (n + 63) // 64 * 64
-    want = (1024, 2, 1) if rows <= 148 else (512, 4, 2)
     plan = ss_host.route(rows, n, npad, top_k)
-    assert plan["kernel"] == "reg" and tuple(plan["tpl"][:3]) == want, plan["tpl"]
+    assert plan["kernel"] == "reg" and tuple(plan["tpl"][:3]) == expected_tpl, plan["tpl"]
     gen = torch.Generator(device=_DEV).manual_seed(rows + n)
     logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
     kv = [n - (i % 7) * 3 for i in range(rows)]

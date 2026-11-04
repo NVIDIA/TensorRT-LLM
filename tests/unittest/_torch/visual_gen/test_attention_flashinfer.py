@@ -70,7 +70,7 @@ def _reference_lse(
 
 def _require_sm12x_nvfp4() -> None:
     capability = torch.cuda.get_device_capability()
-    if capability not in ((12, 0), (12, 1)):
+    if capability[0] != 12:
         pytest.skip("This FlashInfer NVFP4 recipe requires SM120 or SM121.")
     flashinfer = importlib.import_module("flashinfer")
     required_apis = ("nvfp4_attention_sm120_quantize_qkv", "nvfp4_attention_sm120_fwd")
@@ -353,7 +353,7 @@ def test_flashinfer_nvfp4_attention_sm12x_rejects_unaligned_sequence_length() ->
 @pytest.mark.usefixtures("require_flashinfer_cuda")
 def test_flashinfer_mxfp8_attention_is_rejected_on_sm12x() -> None:
     capability = torch.cuda.get_device_capability()
-    if capability not in ((12, 0), (12, 1)):
+    if capability[0] != 12:
         pytest.skip("This FlashInfer MXFP8 rejection test requires SM120 or SM121.")
 
     q = torch.randn((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)

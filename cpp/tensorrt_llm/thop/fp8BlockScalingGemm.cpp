@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -256,7 +256,7 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     {
         return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);
     }
-    else if (sm == 120)
+    else if (tensorrt_llm::common::isSM120Family(sm))
     {
         return fp8_block_scale_gemm_blackwell_geforce(mat1, mat2, mat1Scale, mat2Scale);
     }
@@ -352,12 +352,13 @@ extern torch::Tensor fp8_block_scaling_moe_gemm(torch::Tensor const& mat1, torch
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
-    switch (sm)
+    TORCH_CHECK(
+        sm == 90 || tensorrt_llm::common::isSM120Family(sm), "Unsupported SM version for FP8 block scaling MoEGEMM");
+    if (sm == 90)
     {
-    case 90: return fp8_block_scaling_moe_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale, token_offset);
-    case 120: return fp8_block_scaling_moe_gemm_blackwell_geforce(mat1, mat2, mat1Scale, mat2Scale, token_offset);
-    default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling MoEGEMM");
+        return fp8_block_scaling_moe_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale, token_offset);
     }
+    return fp8_block_scaling_moe_gemm_blackwell_geforce(mat1, mat2, mat1Scale, mat2Scale, token_offset);
 }
 
 // All inputs are k-major
@@ -365,7 +366,7 @@ torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor& out)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
-    if (sm == 120)
+    if (tensorrt_llm::common::isSM120Family(sm))
     {
         TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
         TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
@@ -407,7 +408,7 @@ torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor
     float* mat1ScalePtr = nullptr;
     float* mat2ScalePtr = nullptr;
 
-    if (sm == 120)
+    if (tensorrt_llm::common::isSM120Family(sm))
     {
         mat1ScalePtr = reinterpret_cast<float*>(mat1Scale.data_ptr());
         mat2ScalePtr = reinterpret_cast<float*>(mat2Scale.data_ptr());

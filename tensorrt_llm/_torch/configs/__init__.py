@@ -14,6 +14,12 @@
 # limitations under the License.
 
 from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
+from tensorrt_llm._torch.configs.cosmos3_edge import (
+    Cosmos3EdgeConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
+)
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
 from tensorrt_llm._torch.configs.deepseek_v41 import (
     DeepseekV41Config,
@@ -38,6 +44,7 @@ from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
+from tensorrt_llm._torch.configs.musespark_open import MuseSparkOpenConfig
 from tensorrt_llm._torch.configs.nemotron_h import NemotronHConfig
 from tensorrt_llm._torch.configs.qwen4_exp import (
     Qwen4ExpConfig,
@@ -69,6 +76,10 @@ def _register_custom_configs_with_transformers() -> None:
         # backward-compat alias for checkpoints that predate the rename.
         "cosmos3": Cosmos3Config,
         "cosmos3_omni": Cosmos3Config,
+        "cosmos3_edge": Cosmos3EdgeConfig,
+        "cosmos3_edge_text": Cosmos3EdgeTextConfig,
+        "cosmos3_edge_vision": Cosmos3EdgeVisionConfig,
+        "cosmos3_edge_projector": Cosmos3EdgeProjectorConfig,
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
@@ -133,6 +144,10 @@ del _register_custom_configs_with_transformers
 
 __all__ = [
     "Cosmos3Config",
+    "Cosmos3EdgeConfig",
+    "Cosmos3EdgeProjectorConfig",
+    "Cosmos3EdgeTextConfig",
+    "Cosmos3EdgeVisionConfig",
     "DeepseekV3Config",
     "DeepseekV41Config",
     "DeepseekV41TextConfig",
@@ -153,6 +168,7 @@ __all__ = [
     "LagunaConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
+    "MuseSparkOpenConfig",
     "NemotronHConfig",
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",

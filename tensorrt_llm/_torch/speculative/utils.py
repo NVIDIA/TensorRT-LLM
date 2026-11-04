@@ -1049,16 +1049,13 @@ def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,
                      draft_len: Optional[int] = None,
-                     speculation_permanently_disabled: bool = False) -> None:
-    """Resolve this batch's draft length and store it on the engine.
+                     speculation_permanently_disabled: bool = False) -> int:
+    """Synchronize this batch's draft buffers and return its draft length.
 
     Normal iterations must call this before ``prepare_resources`` so KV cache
     allocation uses the selected draft length.
     """
-    if not hasattr(model_engine, 'max_draft_len'):
-        return
-
-    model_engine.runtime_draft_len = resolve_draft_len(
+    return resolve_draft_len(
         model_engine.spec_config,
         scheduled_batch,
         max_draft_len=model_engine.max_draft_len,

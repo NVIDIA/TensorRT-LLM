@@ -3,11 +3,15 @@
 
 import struct
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, get_args
 
 import numpy as np
 import torch
 from PIL import Image
+
+# Canonical media names for input metadata and I/O validation.
+MediaModality = Literal["image", "video", "audio"]
+MEDIA_MODALITIES: tuple[MediaModality, ...] = get_args(MediaModality)
 
 # Video metadata fields that participate in the cache-key hash. These describe
 # how frames were sampled and therefore change the model-visible content.

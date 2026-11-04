@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Declarative GMEM workspace shared by host layout and device access."""
 
 import dataclasses
@@ -18,10 +15,11 @@ from .utils import (
     is_nested_shape,
     is_power_of_two,
     ordered_stride,
-    round_up,
     row_major_stride,
+    round_up,
     validate_static_integer_tuple,
 )
+
 
 BufferResetAttr = Literal["data", "zero_on_first_allocate", "tail_reset"]
 BufferSpace = Literal["local", "shared"]
@@ -144,18 +142,14 @@ class DeviceWorkspace:
         if self._finalized:
             raise RuntimeError("DeviceWorkspace.finalize() may only be called once.")
         for buffer_space in ("local", "shared"):
-            ordered = sorted(
-                self._registered[buffer_space], key=lambda region: _reset_order[region.reset]
-            )
+            ordered = sorted(self._registered[buffer_space], key=lambda region: _reset_order[region.reset])
             cursor = 0
             for region_index, region in enumerate(ordered):
                 stride = region.stride
                 if stride is None:
                     raise RuntimeError(f"Region {region.name!r} stride was not resolved.")
                 cosize = cosize_from_shape_stride_tuples(region.shape, stride)
-                nbytes = (
-                    _footprint_from_shape_stride(region.shape, stride) * int(region.dtype.width) + 7
-                ) // 8
+                nbytes = (_footprint_from_shape_stride(region.shape, stride) * int(region.dtype.width) + 7) // 8
                 if region.reset == "tail_reset" and (
                     region_index == 0 or ordered[region_index - 1].reset != "tail_reset"
                 ):
@@ -170,8 +164,7 @@ class DeviceWorkspace:
                 self._byte_alignment[region.name] = byte_alignment
                 cursor += nbytes
                 is_last_tail_reset_region = region.reset == "tail_reset" and (
-                    region_index + 1 == len(ordered)
-                    or ordered[region_index + 1].reset != "tail_reset"
+                    region_index + 1 == len(ordered) or ordered[region_index + 1].reset != "tail_reset"
                 )
                 if is_last_tail_reset_region:
                     cursor = round_up(cursor, 16)
@@ -246,16 +239,12 @@ class DeviceWorkspace:
         region = self._region_by_name[name]
         base = self._base[region.buffer_space]
         address = base.toint() + Int64(self._offset[name])
-        return cute.make_ptr(
-            region.dtype, address, AddressSpace.gmem, assumed_align=self._byte_alignment[name]
-        )
+        return cute.make_ptr(region.dtype, address, AddressSpace.gmem, assumed_align=self._byte_alignment[name])
 
     @cute.jit
     def tensor(self, name: str) -> cute.Tensor:
         region = self._region_by_name[name]
-        return cute.make_tensor(
-            self.ptr(name), cute.make_layout(region.shape, stride=self._stride[name])
-        )
+        return cute.make_tensor(self.ptr(name), cute.make_layout(region.shape, stride=self._stride[name]))
 
     @cute.jit
     def reset_tail(self, tid: Int32, total_threads: int) -> None:
@@ -267,17 +256,13 @@ class DeviceWorkspace:
         num_vectors = self._tail_leading[buffer_space] // 16
         if cutlass.const_expr(num_vectors > 0):
             vectors = cute.make_tensor(
-                cute.make_ptr(
-                    Int32, self._base[buffer_space].toint(), AddressSpace.gmem, assumed_align=16
-                ),
+                cute.make_ptr(Int32, self._base[buffer_space].toint(), AddressSpace.gmem, assumed_align=16),
                 cute.make_layout((num_vectors, 4), stride=(4, 1)),
             )
             zero = cute.make_rmem_tensor((4,), Int32)
             for element in cutlass.range_constexpr(4):
                 zero[element] = Int32(0)
-            store_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=128
-            )
+            store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=128)
             reset_round_count = ceil_div(num_vectors, total_threads)
             for reset_round in cutlass.range_constexpr(reset_round_count):
                 vector_index = Int32(reset_round * total_threads) + tid

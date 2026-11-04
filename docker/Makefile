@@ -39,7 +39,7 @@ DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
-CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
+CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90;100;103;107;120;121',)
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 BUILD_WHEEL_SCRIPT ?=
@@ -228,14 +228,9 @@ ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
 ubuntu24_%: BASE_TAG = 13.4.1-devel-ubuntu24.04
 ubuntu24_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
-trtllm_%: STAGE = release
+trtllm_%: STAGE = tritonrelease
 trtllm_%: PUSH_TO_STAGING := 0
-trtllm_%: DEVEL_IMAGE = $(shell \
-    if [ "$(PLATFORM)" = "amd64" ]; then \
-        . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE; \
-    elif [ "$(PLATFORM)" = "arm64" ]; then \
-        . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE; \
-    fi)
+trtllm_%: DEVEL_IMAGE = tritondevel
 trtllm_%: IMAGE_NAME = $(shell . ../jenkins/current_image_tags.properties && echo $$IMAGE_NAME)
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm

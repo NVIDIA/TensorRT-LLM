@@ -334,7 +334,6 @@ class CoverageArtifactTest(unittest.TestCase):
                     }
                 },
                 outcomes={"A10-PyTorch-1/test_x86.py::test_one": "passed"},
-                expected_workers={"A10-PyTorch-1/test_x86.py::test_one": 0},
             )
             write_leaf_database(
                 sbsa_db,
@@ -346,7 +345,6 @@ class CoverageArtifactTest(unittest.TestCase):
                     }
                 },
                 outcomes={"GH200-PyTorch-1/test_sbsa.py::test_two": "passed"},
-                expected_workers={"GH200-PyTorch-1/test_sbsa.py::test_two": 0},
             )
             urls = artifact.tarball_urls(42)
             selection = {

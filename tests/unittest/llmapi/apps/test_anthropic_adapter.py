@@ -19,11 +19,14 @@ conversion functions and the streaming reframer state machine.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 
 import pytest
 from pydantic import ValidationError
 
+import tensorrt_llm.serve.anthropic_adapter as adapter
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError,
     AnthropicResponseError,
@@ -51,6 +54,11 @@ from tensorrt_llm.serve.openai_protocol import (
 pytestmark = pytest.mark.cpu_only
 
 MODEL = "test-model"
+
+
+def thinking_signature(thinking: str) -> str:
+    """The signature the server is expected to put on a thinking block."""
+    return base64.b64encode(hashlib.sha256(thinking.encode("utf-8")).digest()).decode("ascii")
 
 
 def make_request(**overrides) -> AnthropicMessagesRequest:
@@ -121,6 +129,8 @@ def test_thinking_controls_reach_the_chat_template(
         {"type": "adaptive", "budget_tokens": 2048},
         {"type": "disabled", "budget_tokens": 2048},
         {"type": "unknown"},
+        {"type": "adaptive", "display": "verbose"},
+        {"type": "enabled", "budget_tokens": 2048, "display": "full"},
     ],
 )
 def test_invalid_thinking_config_rejected(thinking):
@@ -133,6 +143,27 @@ def test_invalid_thinking_config_rejected(thinking):
     """
     with pytest.raises(ValidationError):
         make_request(max_tokens=4096, thinking=thinking)
+
+
+@pytest.mark.parametrize("display", ["summarized", "omitted", "updates"])
+@pytest.mark.parametrize(
+    "thinking",
+    [{"type": "adaptive"}, {"type": "enabled", "budget_tokens": 2048}],
+    ids=["adaptive", "enabled"],
+)
+def test_thinking_display_is_accepted_and_changes_nothing_generated(thinking, display):
+    """`display` says what the client wants shown of the reasoning, nothing more.
+
+    Claude Code sends {"type": "adaptive", "display": "updates"}. The model is
+    asked for exactly what it would be asked for without the field.
+    """
+    plain = convert_anthropic_request(make_request(max_tokens=4096, thinking=thinking))
+    shown = convert_anthropic_request(
+        make_request(max_tokens=4096, thinking={**thinking, "display": display})
+    )
+
+    assert shown.thinking_token_budget == plain.thinking_token_budget
+    assert shown.chat_template_kwargs == plain.chat_template_kwargs
 
 
 def test_thinking_budget_must_be_less_than_max_tokens():
@@ -749,6 +780,18 @@ def test_reasoning_becomes_thinking_block():
     assert resp.content[1].type == "text"
 
 
+def test_thinking_block_is_signed():
+    """Clients replay a thinking block as thinking only when it carries a signature.
+
+    Without one, the pi coding agent sends the block back as text, and the
+    model then reads its reasoning as an answer it gave.
+    """
+    message = ChatMessage(role="assistant", content="answer", reasoning_content="step by step")
+    resp = convert_chat_response(make_chat_response(message))
+    assert resp.content[0].signature == thinking_signature("step by step")
+    assert resp.model_dump(exclude_none=True)["content"][0]["signature"]
+
+
 def test_empty_content_gets_placeholder_text_block():
     resp = convert_chat_response(make_chat_response(ChatMessage(role="assistant", content=None)))
     assert len(resp.content) == 1
@@ -839,8 +882,11 @@ def run_reframer(chunks):
 
 
 def assert_event_invariants(events):
-    """First-principles invariants of the Anthropic streaming protocol."""
-    names = [name for name, _ in events]
+    """First-principles invariants of the Anthropic streaming protocol.
+
+    Pings may appear anywhere; the invariants hold for the other events.
+    """
+    names = [name for name, _ in events if name != "ping"]
     assert names[0] == "message_start"
     assert names.count("message_start") == 1
     assert names[-1] == "message_stop"
@@ -935,6 +981,106 @@ def test_stream_tool_call_arguments_concatenate():
     assert json.loads(args) == {"city": "sf"}
     message_delta = [p for n, p in events if n == "message_delta"][0]
     assert message_delta["delta"]["stop_reason"] == "tool_use"
+
+
+def _tool_call_chunk(index, call_id, name, arguments):
+    return chunk(
+        {
+            "tool_calls": [
+                {"index": index, "id": call_id, "function": {"name": name, "arguments": arguments}}
+            ]
+        }
+    )
+
+
+def test_stream_whitespace_between_blocks_opens_no_text_block():
+    """Whitespace-only text between blocks opens no text block of its own."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "check the weather"}),
+            chunk({"content": "\n\n"}),
+            _tool_call_chunk(0, "call_1", "get_weather", '{"city": "sf"}'),
+            chunk({"content": "\n"}),
+            _tool_call_chunk(1, "call_2", "get_weather", '{"city": "nyc"}'),
+            chunk({"content": "\n"}),
+            chunk({}, finish_reason="tool_calls"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking", "tool_use", "tool_use"]
+
+
+def test_stream_whitespace_before_text_stays_with_the_text():
+    """Whitespace that precedes text is that text's, delivered unchanged."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "plan"}),
+            chunk({"content": "\n\n"}),
+            chunk({"content": "Answer.\n"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    texts = [
+        p["delta"]["text"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(texts) == "\n\nAnswer.\n"
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking", "text"]
+
+
+def test_stream_whitespace_inside_an_open_text_block_stays_with_the_text():
+    """Whitespace inside a text block that holds text is delivered unchanged."""
+    events = run_reframer(
+        [
+            chunk({"content": "hello"}),
+            chunk({"content": " "}),
+            chunk({"content": "world"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    texts = [
+        p["delta"]["text"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(texts) == "hello world"
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["text"]
+
+
+def test_stream_trailing_whitespace_opens_no_text_block():
+    """Whitespace-only text at the end of the stream opens no text block."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "plan"}),
+            chunk({"content": "\n\n"}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking"]
+    assert not [
+        p for n, p in events if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+
+
+def test_whitespace_only_content_is_not_a_text_block():
+    message = ChatMessage(
+        role="assistant",
+        content="\n\n",
+        tool_calls=[
+            ToolCall(
+                id="call_1", function=FunctionCall(name="get_weather", arguments='{"city": "sf"}')
+            )
+        ],
+    )
+    resp = convert_chat_response(make_chat_response(message, finish_reason="tool_calls"))
+    assert [block.type for block in resp.content] == ["tool_use"]
 
 
 def test_stream_parallel_tool_calls_get_separate_blocks():
@@ -1091,6 +1237,100 @@ def test_stream_thinking_then_text():
     assert starts == ["thinking", "text"]
 
 
+def test_stream_thinking_block_ends_with_its_signature():
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "first "}),
+            chunk({"reasoning_content": "second"}),
+            chunk({"content": "answer"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    thinking = [
+        (name, payload)
+        for name, payload in events
+        if name in ("content_block_delta", "content_block_stop") and payload["index"] == 0
+    ]
+    assert [name for name, _ in thinking] == [
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert thinking[2][1]["delta"] == {
+        "type": "signature_delta",
+        "signature": thinking_signature("first second"),
+    }
+    signed = [
+        p
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "signature_delta"
+    ]
+    assert len(signed) == 1, "only the thinking block is signed"
+
+
+def test_stream_thinking_block_opens_with_an_empty_signature():
+    """A thinking block always has a signature field, even before its last delta fills it."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "first"}),
+            chunk({"content": "answer"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"] for n, p in events if n == "content_block_start"]
+    assert starts[0] == {"type": "thinking", "thinking": "", "signature": ""}
+    assert "signature" not in starts[1]
+
+
+def test_stream_thinking_left_open_is_signed_when_the_stream_ends():
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "unfinished"}),
+            chunk({}, finish_reason="length"),
+        ]
+    )
+    assert_event_invariants(events)
+    deltas = [p["delta"] for n, p in events if n == "content_block_delta"]
+    assert deltas[-1] == {"type": "signature_delta", "signature": thinking_signature("unfinished")}
+
+
+def test_stream_error_signs_the_open_thinking_block_before_the_error():
+    reframer = AnthropicStreamReframer(model=MODEL)
+    frames = reframer.process_chunk(chunk({"reasoning_content": "partial"}))
+    frames += reframer.error("engine failed")
+    events = parse_frames(frames)
+    (delta_name, delta), (stop_name, stop), (error_name, error) = events[-3:]
+    assert [delta_name, stop_name, error_name] == [
+        "content_block_delta",
+        "content_block_stop",
+        "error",
+    ]
+    assert delta["delta"] == {"type": "signature_delta", "signature": thinking_signature("partial")}
+    assert stop["index"] == delta["index"]
+    assert error["error"]["message"] == "engine failed"
+
+
+def test_stream_each_thinking_block_is_signed_with_its_own_text():
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "one"}),
+            chunk({"content": "text"}),
+            chunk({"reasoning_content": "two"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    signatures = [
+        p["delta"]["signature"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "signature_delta"
+    ]
+    assert signatures == [thinking_signature("one"), thinking_signature("two")]
+
+
 def test_stream_empty_generation_still_valid():
     events = run_reframer([chunk({}, finish_reason="stop")])
     assert_event_invariants(events)
@@ -1130,6 +1370,122 @@ def test_stream_reframer_reassembles_sse_frames_split_across_chunks():
         if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
     ]
     assert "".join(text_deltas) == "hello"
+
+
+def test_stream_reframer_reads_the_upstream_to_its_end_after_done():
+    """The upstream runs past [DONE], so the work it does there runs.
+
+    The chat stream records the request's metrics after its last frame. A
+    reframer that stopped reading at [DONE] left it suspended there, to be
+    closed with GeneratorExit: every streamed /v1/messages request lost its
+    metrics, and the server logged a traceback for it.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
+def test_stream_reframer_reads_the_upstream_to_its_end_before_message_stop():
+    """A consumer that stops reading at message_stop still lets the upstream end.
+
+    A client may disconnect as soon as it has message_stop. Had message_stop
+    gone out before the upstream was drained, the chat stream would be left
+    suspended at [DONE] and its metrics never recorded.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def read_until_message_stop():
+        stream = reframe_openai_stream(source(), MODEL)
+        frames = []
+        async for frame in stream:
+            frames.append(frame)
+            if frame.startswith("event: message_stop"):
+                break
+        await stream.aclose()
+        return frames
+
+    events = parse_frames(asyncio.run(read_until_message_stop()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
+def test_stream_reframer_drops_anything_after_done():
+    """Lines after [DONE] are read to reach the end, never reframed."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        yield f"data: {chunk({'content': 'late'}).model_dump_json()}\n\n"
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    text_deltas = [
+        payload["delta"]["text"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(text_deltas) == "hello"
+
+
+def test_stream_reframer_adds_no_event_when_the_upstream_fails_after_done():
+    """message_stop stays the last event when reading past [DONE] fails."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        raise RuntimeError("failed after the last frame")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert "error" not in [name for name, _ in events]
+
+
+def test_stream_reframer_reads_a_byte_stream_to_its_end_when_done_is_split():
+    """A relayed byte stream is read to its EOF however [DONE] is chunked."""
+    body = (
+        f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        "data: [DONE]\n\n"
+    ).encode()
+    split = body.index(b"[DONE]") + len(b"[DO")
+    after_last_chunk = []
+
+    async def source():
+        yield body[:split]
+        yield body[split:]
+        after_last_chunk.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_last_chunk == ["ran"]
 
 
 def test_stream_reframer_splits_multibyte_characters():
@@ -1488,3 +1844,287 @@ def test_cached_tokens_exceeding_prompt_tokens_is_logged(monkeypatch):
     assert converted.input_tokens == 0
     assert converted.cache_read_input_tokens == 99
     assert any("exceeds prompt_tokens" in str(w) for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# Keepalive pings while a stream is silent
+# ---------------------------------------------------------------------------
+
+
+def _line(c: ChatCompletionStreamResponse) -> str:
+    return f"data: {c.model_dump_json()}\n\n"
+
+
+def _reframe_paced(monkeypatch, steps, interval):
+    """Reframe a source that waits ``pause`` seconds before each of its lines."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", interval)
+
+    async def source():
+        for pause, line in steps:
+            await asyncio.sleep(pause)
+            yield line
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    return parse_frames(asyncio.run(collect()))
+
+
+def test_stream_pings_while_silent_after_message_start(monkeypatch):
+    """A silence longer than the interval is broken by pings, inside the message."""
+    events = _reframe_paced(
+        monkeypatch,
+        [
+            (0, _line(chunk({"content": "Writing the file."}))),
+            (0.3, _line(chunk({}, finish_reason="stop"))),
+            (0, "data: [DONE]\n\n"),
+        ],
+        interval=0.05,
+    )
+
+    assert_event_invariants(events)
+    names = [name for name, _ in events]
+    pings = [i for i, name in enumerate(names) if name == "ping"]
+    assert len(pings) >= 2
+    assert names.index("message_start") < pings[0] < pings[-1] < names.index("message_delta")
+    assert all(events[i][1] == {"type": "ping"} for i in pings)
+
+
+def test_stream_pings_while_waiting_for_the_first_token(monkeypatch):
+    """A slow first token is covered too: pings come first, then the message starts."""
+    events = _reframe_paced(
+        monkeypatch,
+        [
+            (0.3, _line(chunk({"content": "hello"}))),
+            (0, _line(chunk({}, finish_reason="stop"))),
+            (0, "data: [DONE]\n\n"),
+        ],
+        interval=0.05,
+    )
+
+    assert_event_invariants(events)
+    assert events[0] == ("ping", {"type": "ping"})
+
+
+def test_stream_pings_then_fails_before_the_first_token(monkeypatch):
+    """An upstream that fails before its first chunk still ends the stream with an error."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+
+    async def source():
+        await asyncio.sleep(0.1)
+        raise RuntimeError("engine failed")
+        yield  # an async generator
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    names = [name for name, _ in parse_frames(asyncio.run(collect()))]
+    assert names[0] == "ping"
+    assert names[-1] == "error"
+    assert "message_start" not in names
+
+
+def test_stream_pings_when_chunks_bring_no_event(monkeypatch):
+    """Upstream chunks that produce no event (an empty delta) do not count as activity."""
+    steps = [(0, _line(chunk({"content": "Thinking about it."})))]
+    steps += [(0.02, _line(chunk({}))) for _ in range(15)]
+    steps += [(0, _line(chunk({}, finish_reason="stop"))), (0, "data: [DONE]\n\n")]
+
+    events = _reframe_paced(monkeypatch, steps, interval=0.05)
+
+    assert_event_invariants(events)
+    assert "ping" in [name for name, _ in events]
+
+
+def test_stream_sends_no_ping_while_events_flow(monkeypatch):
+    """Every event restarts the wait: a stream longer than the interval but never silent has no ping.
+
+    The 1 s interval is 50 times the 20 ms gap, so a loaded worker does not fake a silence.
+    """
+    steps = [(0.02, _line(chunk({"content": f"word{i} "}))) for i in range(60)]
+    steps += [(0, _line(chunk({}, finish_reason="stop"))), (0, "data: [DONE]\n\n")]
+
+    events = _reframe_paced(monkeypatch, steps, interval=1.0)
+
+    assert_event_invariants(events)
+    assert "ping" not in [name for name, _ in events]
+
+
+def test_stream_sends_no_ping_after_done(monkeypatch):
+    """After [DONE] the message is complete: a slow end of the upstream brings no ping."""
+    events = _reframe_paced(
+        monkeypatch,
+        [
+            (0, _line(chunk({"content": "hello"}))),
+            (0, _line(chunk({}, finish_reason="stop"))),
+            (0, "data: [DONE]\n\n"),
+            (0.3, "\n"),
+        ],
+        interval=0.05,
+    )
+
+    assert_event_invariants(events)
+    assert "ping" not in [name for name, _ in events]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_slow_client_holds_back_the_upstream(monkeypatch, fails):
+    """The upstream is read only as fast as the client takes frames; its end or error still arrives."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 10)
+    words = [f"w{i} " for i in range(20)]
+    produced = []
+
+    async def source():
+        for word in words:
+            produced.append(word)
+            yield _line(chunk({"content": word}))
+        if fails:
+            raise RuntimeError("engine failed")
+        yield _line(chunk({}, finish_reason="stop"))
+        yield "data: [DONE]\n\n"
+
+    async def read_slowly():
+        frames, lead = [], 0
+        async for frame in reframe_openai_stream(source(), MODEL):
+            frames.append(frame)
+            taken = sum(
+                1
+                for name, payload in parse_frames(frames)
+                if name == "content_block_delta" and payload["delta"].get("text") in words
+            )
+            lead = max(lead, len(produced) - taken)
+            await asyncio.sleep(0.005)
+        return parse_frames(frames), lead
+
+    events, lead = asyncio.run(read_slowly())
+
+    assert lead <= 3, f"the upstream ran {lead} chunks ahead of the client"
+    texts = [p["delta"]["text"] for n, p in events if n == "content_block_delta"]
+    assert texts == words
+    assert events[-1][0] == ("error" if fails else "message_stop")
+
+
+def test_a_client_that_leaves_while_a_frame_waits_closes_the_upstream(monkeypatch):
+    """The upstream is closed by the time the stream is, also while its next frame waits for the client."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 10)
+    closed = []
+
+    async def source():
+        try:
+            for i in range(20):
+                yield _line(chunk({"content": f"w{i} "}))
+        finally:
+            closed.append(True)
+
+    async def leave_after_one_frame():
+        stream = reframe_openai_stream(source(), MODEL)
+        async for _ in stream:
+            break
+        # The reader fills the queue and then waits to hand over the next frame.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await stream.aclose()
+        return list(closed)
+
+    assert asyncio.run(leave_after_one_frame()) == [True]
+
+
+def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
+    """A client that goes away mid-silence stops the upstream read at once."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.05)
+    cancelled = []
+
+    async def source():
+        yield _line(chunk({"content": "hello"}))
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        yield _line(chunk({}, finish_reason="stop"))
+
+    async def stop_at_first_ping():
+        stream = reframe_openai_stream(source(), MODEL)
+        async for frame in stream:
+            if frame.startswith("event: ping"):
+                break
+        await stream.aclose()
+        # Checked while the loop still runs: asyncio.run cancels every task left at its exit.
+        for _ in range(100):
+            if cancelled:
+                break
+            await asyncio.sleep(0.01)
+        return list(cancelled)
+
+    assert asyncio.run(asyncio.wait_for(stop_at_first_ping(), timeout=5)) == [True]
+
+
+def test_stream_reads_its_upstream_from_one_task(monkeypatch):
+    """Pings never move the upstream between tasks.
+
+    The upstream is the chat stream, and an async generator that holds a
+    task-bound context (a lock, a timeout or a cancel scope) across a yield
+    breaks if it is resumed from another task.
+    """
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+    readers = set()
+
+    async def source():
+        for line in [
+            _line(chunk({"content": "one"})),
+            _line(chunk({"content": "two"})),
+            _line(chunk({}, finish_reason="stop")),
+            "data: [DONE]\n\n",
+        ]:
+            readers.add(asyncio.current_task())
+            await asyncio.sleep(0.1)
+            yield line
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert "ping" in [name for name, _ in events]
+    assert len(readers) == 1
+
+
+def test_stream_ends_with_an_error_when_the_upstream_fails_mid_stream(monkeypatch):
+    """A failure while the stream pings still ends the message with an error event."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+
+    async def source():
+        yield _line(chunk({"content": "hello"}))
+        await asyncio.sleep(0.1)
+        raise RuntimeError("engine failed")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    names = [name for name, _ in events]
+    assert "ping" in names
+    assert names[-1] == "error"
+    # Reported as the upstream's own failure, not as a stream that ended early.
+    assert events[-1][1]["error"]["message"] == "Internal server error"
+
+
+def test_stream_ends_when_the_upstream_is_cancelled_on_its_own(monkeypatch):
+    """A cancellation raised inside the upstream ends the stream instead of leaving it to pings."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+
+    async def source():
+        yield _line(chunk({"content": "hello"}))
+        await asyncio.sleep(0.1)
+        raise asyncio.CancelledError()
+
+    async def collect():
+        frames = []
+        with pytest.raises(asyncio.CancelledError):
+            async for frame in reframe_openai_stream(source(), MODEL):
+                frames.append(frame)
+                assert len(frames) < 100, "the stream kept pinging after its upstream ended"
+        return frames
+
+    events = parse_frames(asyncio.run(asyncio.wait_for(collect(), 5)))
+    assert "ping" in [name for name, _ in events]

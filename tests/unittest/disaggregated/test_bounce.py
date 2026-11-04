@@ -786,11 +786,12 @@ def _k3_page_table() -> KVCachePageTable:
     )
 
 
-def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0):
+def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0, attention_dp=None):
     # MambaPolicy reads tp_size / tp_rank / cp_size / cp_rank /
     # attention.enable_attention_dp.
+    attention = None if attention_dp is None else SimpleNamespace(enable_attention_dp=attention_dp)
     return SimpleNamespace(
-        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=None
+        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=attention
     )
 
 
@@ -874,6 +875,24 @@ class TestMambaHelixCP:
         assert MambaPolicy._mamba_tp(_k3_rank_info(tp_size=2, tp_rank=1, cp_size=4, cp_rank=3)) == (
             8,
             7,
+        )
+
+    def test_mamba_tp_helix_attention_dp_shards_over_cp(self):
+        # Helix + attention DP (K3 helix_a2a): the CP group shares every
+        # request, so the state stays head-sharded across it; must match the
+        # executor's pool sizing in config_utils.mamba_effective_tp_size.
+        from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
+
+        ri = _k3_rank_info(cp_size=16, cp_rank=5, attention_dp=True)
+        assert MambaPolicy._mamba_tp(ri) == (16, 5)
+        mapping = SimpleNamespace(
+            enable_attention_dp=True, tp_size=1, cp_size=16, has_cp_helix=lambda: True
+        )
+        assert mamba_effective_tp_size(mapping) == 16
+        # Attention DP without CP still replicates.
+        assert MambaPolicy._mamba_tp(_k3_rank_info(tp_size=4, tp_rank=2, attention_dp=True)) == (
+            1,
+            0,
         )
 
     def test_equal_width_unpaired_sender_sends_nothing(self):

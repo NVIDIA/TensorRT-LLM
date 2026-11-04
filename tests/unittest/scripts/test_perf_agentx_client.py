@@ -15,6 +15,7 @@
 """Tests for the perf-sanity AgentX client's prefill-only (ctx_only) path."""
 
 import importlib.util
+import re
 from pathlib import Path
 from types import ModuleType
 
@@ -156,3 +157,44 @@ def test_other_request_errors_always_fail(client: ModuleType):
     errors = [_empty_content(1), {"error_details": {"type": "HTTPError"}, "count": 1}]
     with pytest.raises(RuntimeError, match="aiperf reported request errors"):
         client.check_request_errors(errors, requests=100000)
+
+
+def test_aiperf_keepalive_stays_below_trtllm_serve_keepalive(client: ModuleType):
+    # An aiperf pooled connection that outlives the server's keep-alive can be
+    # reused just as trtllm-serve closes it ("Connection reset by peer").
+    server_path = REPO_ROOT / "tensorrt_llm" / "serve" / "openai_server.py"
+    match = re.search(r"^TIMEOUT_KEEP_ALIVE = (\d+)", server_path.read_text(), re.MULTILINE)
+    assert match, "TIMEOUT_KEEP_ALIVE not found in openai_server.py"
+    assert 0 < client.AIPERF_HTTP_KEEPALIVE_TIMEOUT_S < int(match.group(1))
+
+
+class _StopBeforeAiperf(Exception):
+    """Ends ``_run`` once it has set up aiperf's environment."""
+
+
+def _keepalive_seen_by_aiperf(client: ModuleType, monkeypatch) -> "str | None":
+    """The keep-alive value in the environment ``_run`` hands to aiperf."""
+    seen = {}
+
+    def stop(*_args):
+        seen["keepalive"] = client.os.environ.get("AIPERF_HTTP_KEEPALIVE_TIMEOUT")
+        raise _StopBeforeAiperf
+
+    monkeypatch.setattr(client, "ensure_aiperf", stop)
+    with pytest.raises(_StopBeforeAiperf):
+        client._run(client.parse_args(_BASE_ARGS), "/tmp/a")
+    return seen["keepalive"]
+
+
+def test_run_sets_the_aiperf_keepalive_when_unset(client: ModuleType, monkeypatch):
+    monkeypatch.delenv("AIPERF_HTTP_KEEPALIVE_TIMEOUT", raising=False)
+    monkeypatch.delenv("HF_HUB_TRUST_REMOTE_CODE", raising=False)
+    assert _keepalive_seen_by_aiperf(client, monkeypatch) == str(
+        client.AIPERF_HTTP_KEEPALIVE_TIMEOUT_S
+    )
+
+
+def test_run_keeps_a_configured_aiperf_keepalive(client: ModuleType, monkeypatch):
+    monkeypatch.setenv("AIPERF_HTTP_KEEPALIVE_TIMEOUT", "2")
+    monkeypatch.delenv("HF_HUB_TRUST_REMOTE_CODE", raising=False)
+    assert _keepalive_seen_by_aiperf(client, monkeypatch) == "2"

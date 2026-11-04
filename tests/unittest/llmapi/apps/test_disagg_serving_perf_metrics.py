@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 import secrets
 from typing import Tuple
@@ -112,11 +114,17 @@ def workers(
         model_name, disagg_cluster_config, perf_metrics_output_dir, internal_request_auth_key
     )
 
+    # Both workers run on this host, so loopback is the only TCP device UCX
+    # needs. With every interface enabled, UCX queries each TCP interface with
+    # ethtool ioctls while the first request opens the NIXL peer connection,
+    # and that request's generation first token waits for it.
+    worker_env = {**os.environ, "UCX_NET_DEVICES": "lo"}
+
     def worker(server_role: str, port: int):
         return RemoteOpenAIServer(
             model_path,
             port=port,
-            env=os.environ.copy(),
+            env=worker_env,
             cli_args=["--server_role", server_role],
             llmapi_launch=False,
             extra_config=extra_config,

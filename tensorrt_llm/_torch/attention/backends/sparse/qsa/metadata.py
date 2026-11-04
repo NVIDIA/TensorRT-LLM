@@ -9,7 +9,6 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from .cache_manager import QSAMambaHybridCacheManagerV2
 from .constants import QSA_KEY_ROLE_INDEX
 from .kernels import triton_qsa_unscale_block_table
 from .params import QSASparseMetadataParams
@@ -45,6 +44,8 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         super().__init__(*args, **kwargs)
 
     def __post_init__(self) -> None:
+        from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
+
         super().__post_init__()
         # Draft-loop state; set by the speculative driver, read by the indexer.
         self.qsa_in_mtp_draft_loop = False
@@ -53,8 +54,9 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         self.qsa_shared_topk_indices: Optional[torch.Tensor] = None
         self.qsa_shared_topk_visible_blocks: Optional[torch.Tensor] = None
         self.qsa_shared_topk_captured_slots: set[int] = set()
-        if not isinstance(self.kv_cache_manager, QSAMambaHybridCacheManagerV2):
-            raise TypeError("QSA sparse attention requires QSAMambaHybridCacheManagerV2")
+        self.qsa_draft_block_table: Optional[torch.Tensor] = None
+        if not isinstance(self.kv_cache_manager, Qwen4ExpHybridCacheManager):
+            raise TypeError("QSA sparse attention requires Qwen4ExpHybridCacheManager")
         if not isinstance(self.sparse_metadata_params, QSASparseMetadataParams):
             raise TypeError("QSA sparse attention requires QSASparseMetadataParams")
         self.qsa_has_local_layers = self.kv_cache_manager.qsa_position_layer_id is not None
@@ -80,6 +82,7 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         self._qsa_attention_pool_id, self._qsa_page_index_scale = (
             self.kv_cache_manager.get_qsa_attention_pool_layout()
         )
+        self._init_qsa_draft_block_table()
 
         # Packed-row mapping shared by compression, selection, and sparse GQA.
         self.qsa_req_idx_per_token = self.get_empty(
@@ -164,7 +167,11 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         # compressed groups were complete when the row was captured, so the
         # reuse can tell which groups formed afterwards.
         if self.sparse_metadata_params.mtp_index_share:
+            # Slots are numbered by the bound manager; the draft loop binds the
+            # separate draft manager.
             num_slots = len(self.kv_cache_manager.qsa_shared_topk_slots)
+            if self.qsa_draft_block_table is not None:
+                num_slots = max(num_slots, len(self.draft_kv_cache_manager.qsa_shared_topk_slots))
             self.qsa_shared_topk_indices = self.get_empty(
                 buffers,
                 (
@@ -183,6 +190,34 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
+
+    def _init_qsa_draft_block_table(self) -> None:
+        """Allocate the page table of a separate one-model draft KV cache.
+
+        The draft layers' pages live in the draft manager's pools, which the
+        target table does not address. This table is its own graph-stable
+        buffer, so a captured graph reads the target table in the target
+        forward and this one in the draft loop; ``prepare()`` refreshes both
+        before every replay.
+        """
+        from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
+
+        draft_manager = self.draft_kv_cache_manager
+        if (
+            not isinstance(draft_manager, Qwen4ExpHybridCacheManager)
+            or draft_manager.qsa_position_layer_id is None
+        ):
+            return
+        self.qsa_draft_block_table = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences, draft_manager.max_blocks_per_seq),
+            cache_name="qsa_draft_block_table",
+            dtype=torch.int32,
+            capture_graph=self.is_cuda_graph,
+        )
+        self._qsa_draft_attention_pool_id, self._qsa_draft_page_index_scale = (
+            draft_manager.get_qsa_attention_pool_layout()
+        )
 
     def set_skip_topk(self, skip: bool) -> None:
         """Mark a draft step that reuses the captured selection."""
@@ -245,21 +280,45 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
             ((logical + 1) // self.sparse_metadata_params.compress_ratio).to(torch.int32)
         )
 
-    def _refresh_qsa_block_table(self) -> None:
-        """Decode V2 attention offsets into raw page IDs used by QSA kernels."""
+    def _unscale_qsa_block_table(
+        self,
+        block_offsets: torch.Tensor,
+        pool_id: int,
+        page_index_scale: int,
+        block_table: torch.Tensor,
+    ) -> None:
+        """Decode one manager's V2 attention offsets into raw page IDs."""
         num_seqs = self.num_seqs
         if num_seqs <= 0:
             return
-        scaled = self.kv_cache_block_offsets[
-            self._qsa_attention_pool_id,
-            :num_seqs,
-            QSA_KEY_ROLE_INDEX,
-            :,
-        ]
         triton_qsa_unscale_block_table(
-            scaled_block_table=scaled,
-            block_table=self.qsa_block_table[:num_seqs],
-            page_index_scale=self._qsa_page_index_scale,
+            scaled_block_table=block_offsets[pool_id, :num_seqs, QSA_KEY_ROLE_INDEX, :],
+            block_table=block_table[:num_seqs],
+            page_index_scale=page_index_scale,
+        )
+
+    def _refresh_qsa_block_table(self) -> None:
+        """Decode the bound manager's offsets into the table QSA kernels read.
+
+        While ``prepare_for_draft_forward()`` is in effect every operand here is
+        the draft manager's, so this rebuilds the draft table.
+        """
+        self._unscale_qsa_block_table(
+            self.kv_cache_block_offsets,
+            self._qsa_attention_pool_id,
+            self._qsa_page_index_scale,
+            self.qsa_block_table,
+        )
+
+    def _refresh_qsa_draft_block_table(self) -> None:
+        """Decode the separate draft manager's offsets into the draft table."""
+        if self.qsa_draft_block_table is None:
+            return
+        self._unscale_qsa_block_table(
+            self.draft_kv_cache_block_offsets,
+            self._qsa_draft_attention_pool_id,
+            self._qsa_draft_page_index_scale,
+            self.qsa_draft_block_table,
         )
 
     def _refresh_qsa_speculative_snapshot_state(self) -> None:
@@ -276,7 +335,28 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         if not self.qsa_has_local_layers:
             return
         self._refresh_qsa_block_table()
+        self._refresh_qsa_draft_block_table()
         self._refresh_qsa_token_mapping()
+
+    def prepare_for_draft_forward(self) -> None:
+        """Point the QSA page table at the separate draft manager's pages.
+
+        The caller has already swapped ``kv_cache_manager`` and
+        ``kv_cache_block_offsets`` to the draft manager's. The draft table was
+        decoded in ``prepare()``, so this only rebinds fields and launches
+        nothing; ``restore_draft_swaps()`` restores the target bindings. The
+        row mapping is manager-independent and stays as it is.
+        """
+        if self.qsa_draft_block_table is None:
+            return
+        if self.kv_cache_manager is not self.draft_kv_cache_manager:
+            raise RuntimeError(
+                "QSA draft forward expects the metadata's draft KV cache manager "
+                f"to be bound; got {type(self.kv_cache_manager).__name__}"
+            )
+        self.swap_for_draft("qsa_block_table", self.qsa_draft_block_table)
+        self.swap_for_draft("_qsa_attention_pool_id", self._qsa_draft_attention_pool_id)
+        self.swap_for_draft("_qsa_page_index_scale", self._qsa_draft_page_index_scale)
 
     def prepare(self) -> None:
         """Refresh host decisions, then rebuild graph-stable device mappings."""
