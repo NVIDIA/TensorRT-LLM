@@ -322,8 +322,8 @@ class DisaggTransferCoordinator:
         # the data, so a send still waiting for that is not flagged, and once
         # the peers have asked, the transfer is measured from that moment
         # rather than charged with their queueing delay.
-        now = time.monotonic()
         for req in self._transfers.requests_in_transfer().values():
+            now = time.monotonic()
             if self._context_send_awaits_peer(req, now, timeout_ms):
                 continue
             peer_ready_time = self._transceiver.context_transfer_peer_ready_time(req)
@@ -333,7 +333,7 @@ class DisaggTransferCoordinator:
                 and peer_ready_time > req.py_kv_transfer_start_time
             ):
                 req.py_kv_transfer_start_time = peer_ready_time
-            self._flag_transfer_timeout(req, "context", timeout_ms)
+            self._flag_transfer_timeout(req, "context", timeout_ms, current_time=now)
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 self._flag_transfer_timeout(req, "generation", timeout_ms)
