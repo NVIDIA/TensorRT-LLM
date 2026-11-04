@@ -696,13 +696,13 @@ def test_trtllm_backend_keeps_causal_and_unwindowed_layers_on_their_kernels():
         ).validate_block_attention_windows()
         == ["causal decode"] * 2
     )
-    # No window at all runs the non-causal context kernel.
+    # No window at all folds the block's queries into the decode kernel's heads.
     assert (
         _mask_wrapper(
             SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
             backend="TRTLLM",
         ).validate_block_attention_windows()
-        == ["non-causal context"] * 2
+        == ["non-causal folded decode"] * 2
     )
 
 
