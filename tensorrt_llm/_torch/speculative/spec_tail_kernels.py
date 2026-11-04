@@ -39,7 +39,18 @@ import torch
 import triton
 import triton.language as tl
 
+from .dflash_attention import DRAFT_FP8_MAX
+
 _BLOCK_TABLE_BLOCK = 2048
+_DRAFT_FP8_MAX = tl.constexpr(DRAFT_FP8_MAX)
+
+
+@triton.jit
+def draft_fp8_saturate(v):
+    """``to_draft_fp8`` of FP32 ``v`` in a kernel: clamped to the E4M3 range with NaN kept
+    (``tl.minimum`` / ``tl.maximum`` alone would drop it), rounded to nearest even."""
+    clamped = tl.minimum(tl.maximum(v, -_DRAFT_FP8_MAX), _DRAFT_FP8_MAX)
+    return tl.where(v != v, v, clamped).to(tl.float8e4nv)
 
 
 @triton.jit
@@ -441,8 +452,7 @@ def _store_context_latents_kernel(
     # x * 0 a signed zero either way.
     vals = (vals.to(tl.float32) * keep).to(vals.dtype)
     if POOL_FP8:
-        # to_draft_fp8: saturated E4M3 at unit scale, round to nearest even.
-        vals = tl.minimum(tl.maximum(vals.to(tl.float32), -448.0), 448.0).to(tl.float8e4nv)
+        vals = draft_fp8_saturate(vals.to(tl.float32))
     pool = tl.load(pool_ptrs_ptr + layer).to(tl.pointer_type(vals.dtype))
     tl.store(pool + page * stride_pool_page + off * stride_pool_off + offs, vals, mask=dmask)
 
@@ -517,8 +527,7 @@ def _scatter_rows_kernel(
     off = tl.load(offsets_ptr + row)
     vals = tl.load(src_ptr + row.to(tl.int64) * stride_src + offs, mask=mask)
     if POOL_FP8:
-        # to_draft_fp8: saturated E4M3 at unit scale, round to nearest even.
-        vals = tl.minimum(tl.maximum(vals.to(tl.float32), -448.0), 448.0).to(tl.float8e4nv)
+        vals = draft_fp8_saturate(vals.to(tl.float32))
     tl.store(dst_ptr + page * stride_dst_page + off * stride_dst_off + offs, vals, mask=mask)
 
 
@@ -568,10 +577,7 @@ def _draft_fp8_kernel(src_ptr, dst_ptr, numel, BLOCK: tl.constexpr):
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < numel
     v = tl.load(src_ptr + offs, mask=mask).to(tl.float32)
-    # clamp(-448, 448) keeping NaN (min / max would drop it), then round to nearest even.
-    clamped = tl.minimum(tl.maximum(v, -448.0), 448.0)
-    v = tl.where(v != v, v, clamped)
-    tl.store(dst_ptr + offs, v.to(tl.float8e4nv), mask=mask)
+    tl.store(dst_ptr + offs, draft_fp8_saturate(v), mask=mask)
 
 
 def draft_fp8_cast(x: torch.Tensor) -> torch.Tensor:

@@ -141,7 +141,9 @@ def test_scatter_rows_saturates_into_an_fp8_pool():
     rows, num_pages, page = 11, 6, 32
     gen = torch.Generator(device="cuda").manual_seed(3)
     src = (torch.randn(rows, HEAD_DIM, device="cuda", generator=gen) * 3).to(torch.bfloat16)
-    src[0, :3] = torch.tensor([600.0, -1000.0, 447.0], device="cuda").to(torch.bfloat16)
+    src[0, :4] = torch.tensor([600.0, -1000.0, 447.0, float("nan")], device="cuda").to(
+        torch.bfloat16
+    )
     flat = torch.randperm(num_pages * page, device="cuda", generator=gen)[:rows]
     pages, offsets = flat // page, flat % page
     pool = torch.zeros(num_pages, page, HEAD_DIM, device="cuda").to(fp8)
@@ -151,6 +153,7 @@ def test_scatter_rows_saturates_into_an_fp8_pool():
     torch.cuda.synchronize()
     assert torch.equal(pool.view(torch.uint8), reference)
     assert pool[pages[0], offsets[0], :3].float().tolist() == [448.0, -448.0, 448.0]
+    assert pool[pages[0], offsets[0], 3].float().isnan()
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
@@ -186,7 +189,7 @@ def test_draft_fp8_cast_matches_to_draft_fp8():
 
     gen = torch.Generator(device="cuda").manual_seed(4)
     x = (torch.randn(3, 7, 4, HEAD_DIM, device="cuda", generator=gen) * 200).to(torch.bfloat16)
-    x.view(-1)[:4] = torch.tensor([449.0, 1e4, -1e4, 1e-6], device="cuda").to(x.dtype)
+    x.view(-1)[:5] = torch.tensor([449.0, 1e4, -1e4, 1e-6, float("nan")], device="cuda").to(x.dtype)
     out = draft_fp8_cast(x)
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.uint8), to_draft_fp8(x).view(torch.uint8))

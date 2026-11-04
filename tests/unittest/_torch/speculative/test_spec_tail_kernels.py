@@ -291,8 +291,10 @@ def test_store_context_latents_saturates_into_an_fp8_pool():
     latent = (torch.randn(num_tokens, num_layers, latent_dim, device="cuda", generator=gen) * 3).to(
         torch.bfloat16
     )
-    # Saturating, in range, and subnormal values.
-    latent[0, :, :4] = torch.tensor([600.0, -1000.0, 447.0, 1e-3], device="cuda").to(torch.bfloat16)
+    # Saturating, in range, subnormal and NaN values.
+    latent[0, :, :5] = torch.tensor([600.0, -1000.0, 447.0, 1e-3, float("nan")], device="cuda").to(
+        torch.bfloat16
+    )
     flat = torch.randperm(num_pages * page, device="cuda", generator=gen)[:num_tokens]
     pages, offsets = flat // page, flat % page
     mask = torch.tensor([1, 1, 0, 1, 1, 1, 1, 0, 1], dtype=torch.int8, device="cuda")
@@ -310,4 +312,4 @@ def test_store_context_latents_saturates_into_an_fp8_pool():
     for layer in range(num_layers):
         assert torch.equal(pools[layer].view(torch.uint8), expected[layer])
     assert pools[0][pages[0], 0, 0, offsets[0], :3].float().tolist() == [448.0, -448.0, 448.0]
-    assert not pools[0].float().isnan().any()
+    assert int(pools[0].float().isnan().sum()) == 1

@@ -28,12 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _fp8_sat_keep_nan(v):
-    # to_draft_fp8: clamp(-448, 448) keeping NaN, round to nearest even.
-    clamped = tl.minimum(tl.maximum(v, -448.0), 448.0)
-    return tl.where(v != v, v, clamped).to(tl.float8e4nv)
+from .spec_tail_kernels import draft_fp8_saturate
 
 
 def fold_rmsnorm_weight(weight: torch.Tensor, norm_weight: torch.Tensor) -> torch.Tensor:
@@ -130,9 +125,8 @@ def _qhead_kernel(
             page = tl.load(pages_ptr + row)
             off = tl.load(offsets_ptr + row)
             dst = pool_ptr + page * stride_pool_page + off * stride_pool_off
-            # The scatter's FP8 store: clamp(-448, 448), round to nearest even.
-            tl.store(dst + d, tl.minimum(tl.maximum(latent, -448.0), 448.0).to(tl.float8e4nv))
-            tl.store(dst + LATENT + r, tl.minimum(tl.maximum(pe, -448.0), 448.0).to(tl.float8e4nv))
+            tl.store(dst + d, draft_fp8_saturate(latent))
+            tl.store(dst + LATENT + r, draft_fp8_saturate(pe))
     else:
         q_pid = pid - num_tokens
         col_blocks = LATENT // BLOCK_N + 1
@@ -160,7 +154,7 @@ def _qhead_kernel(
             latent_vals = (acc * inv[:, None]).to(tl.bfloat16).to(tl.float32)
             tl.store(
                 out_ptr + t[:, None] * stride_ot + head * stride_oh + n[None, :],
-                _fp8_sat_keep_nan(latent_vals),
+                draft_fp8_saturate(latent_vals),
                 mask=t_mask[:, None],
             )
         else:
@@ -181,7 +175,7 @@ def _qhead_kernel(
             pe = pe.to(tl.bfloat16).to(tl.float32)
             tl.store(
                 out_ptr + t[:, None] * stride_ot + head * stride_oh + LATENT + r[None, :],
-                _fp8_sat_keep_nan(pe),
+                draft_fp8_saturate(pe),
                 mask=t_mask[:, None],
             )
 
