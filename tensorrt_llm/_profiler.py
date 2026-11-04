@@ -16,31 +16,15 @@
 
 import json
 import logging
-
-
 import math
-
-
 import os
-
-
 from collections.abc import Callable, Generator, Mapping
-
-
 from contextlib import AbstractContextManager, contextmanager
-
-
 from functools import wraps
-
-
 from types import TracebackType
-
-
 from typing import Literal, ParamSpec, TypeAlias, TypeVar, cast
 
-
 import torch
-
 
 ProfilerRegion: TypeAlias = Literal["workflow", "mpi", "nccl", "nanobind", "kv", "moe"]
 MetadataValue: TypeAlias = (
