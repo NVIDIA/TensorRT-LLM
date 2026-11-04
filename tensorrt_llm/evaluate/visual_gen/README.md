@@ -1,4 +1,11 @@
-# Visual generation evaluator YAML
+# Visual generation evaluation
+
+**Table of contents**
+
+- [Image generation evaluation](#image-generation-evaluation)
+  - [Qwen Image Bench](#qwen-image-bench)
+- [Video generation evaluation](#video-generation-evaluation)
+  - [LPIPS](#lpips)
 
 `image_generation_eval` and `video_generation_eval` use two separate configurations:
 
@@ -11,73 +18,18 @@ Both commands require `--prompts` and `--output-dir`. The prompt file accepts
 one prompt per line, a JSON list, or JSONL records such as:
 
 ```json
-{"id": "fox", "prompt": "A red fox walking through snow"}
-{"id": "cat", "prompt": "A cat sitting on a windowsill"}
+{"id": 1, "prompt": "A red fox walking through snow"}
+{"id": 2, "prompt": "A cat sitting on a windowsill"}
 ```
+
+Integer IDs are accepted and converted to strings internally. IDs label results;
+video filenames follow zero-based prompt order, not the ID value.
 
 Use `--num-samples N` to evaluate only the first N prompts.
 
-## LPIPS video evaluation
+## Image generation evaluation
 
-Select LPIPS with `video_generation_eval --evaluator lpips`. An
-`--evaluator-options` YAML file is required:
-
-```yaml
-reference_dir: baselines
-generated_dir: generated  # Optional: score existing videos instead of generating them.
-net: alex                 # Optional; default: alex.
-device: cpu               # Optional; default: cpu.
-```
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `reference_dir` | Required | Existing directory containing the baseline MP4 videos. |
-| `generated_dir` | Omitted | Existing directory containing videos to score. When supplied, generation is skipped. The root CLI still requires `--model`, but does not load it in this mode. |
-| `net` | `alex` | LPIPS backbone: `alex`, `vgg`, or `squeeze`. Keep the backbone consistent when comparing scores across runs. |
-| `device` | `cpu` | PyTorch device used for scoring, such as `cpu`, `cuda`, or `cuda:0`. |
-
-Directory paths may be absolute or relative to the evaluator YAML's directory.
-Files in both directories must be named by zero-based prompt order:
-`0000.mp4`, `0001.mp4`, and so on. The first prompt in the example above maps
-to `0000.mp4`, regardless of its `id`. Every selected prompt needs a numbered
-reference and, in existing-video mode, a numbered generated video. Missing files
-fail validation before model loading. Keep prompt order consistent with both directories.
-
-To score existing videos using the YAML above:
-
-```bash
-trtllm-eval --model /path/to/video-model video_generation_eval \
-  --evaluator lpips \
-  --evaluator-options lpips.yaml \
-  --prompts prompts.jsonl \
-  --output-dir results
-```
-
-To generate and score videos, omit `generated_dir` from the evaluator YAML
-(the minimal file is just `reference_dir: baselines`), then supply the generator:
-
-```bash
-trtllm-eval --model /path/to/video-model video_generation_eval \
-  --config generator.yaml \
-  --evaluator lpips \
-  --evaluator-options lpips.yaml \
-  --prompts prompts.jsonl \
-  --output-dir results
-```
-
-New videos are saved as `results/generated_videos/0000.mp4`, etc. A supplied
-`generated_dir` is an input directory, not a destination for new generation.
-Both modes write `results.json` and `results.jsonl` under `--output-dir`.
-
-LPIPS requires the `lpips` and OpenCV packages, plus cached or downloadable
-backbone weights. Generating MP4s also requires an encoder such as FFmpeg.
-The evaluator scores decoded frame pairs individually and averages their distances;
-lower is better. Reference and generated videos must have equal frame rates,
-frame counts, and dimensions. Empty videos and non-finite scores are rejected;
-frames are not resized, trimmed, or temporally aligned. The reported aggregate is
-the mean of the per-video scores; the command does not apply a quality threshold.
-
-## Qwen Image Bench image evaluation
+### Qwen Image Bench
 
 `image_generation_eval` generates images and scores them with Qwen Image Bench.
 Pass the generator checkpoint with `--model` and the evaluator checkpoint with
@@ -141,3 +93,65 @@ Select dimensions with repeated `--criteria` flags, not YAML entries. Available
 values are `Quality`, `Aesthetics`, `Alignment`, `Real-world Fidelity`, and
 `Creative Generation`. All five are evaluated when `--criteria` is omitted;
 quote dimension names containing spaces on the command line.
+
+## Video generation evaluation
+
+### LPIPS
+
+Select LPIPS with `video_generation_eval --evaluator lpips`. An
+`--evaluator-options` YAML file is required:
+
+```yaml
+reference_dir: baselines
+generated_dir: generated  # Optional: score existing videos instead of generating them.
+net: alex                 # Optional; default: alex.
+device: cpu               # Optional; default: cpu.
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `reference_dir` | Required | Existing directory containing the baseline MP4 videos. |
+| `generated_dir` | Omitted | Existing directory containing videos to score. When supplied, generation is skipped. The root CLI still requires `--model`, but does not load it in this mode. |
+| `net` | `alex` | LPIPS backbone: `alex`, `vgg`, or `squeeze`. Keep the backbone consistent when comparing scores across runs. |
+| `device` | `cpu` | PyTorch device used for scoring, such as `cpu`, `cuda`, or `cuda:0`. |
+
+Directory paths may be absolute or relative to the evaluator YAML's directory.
+Files in both directories must be named by zero-based prompt order:
+`0000.mp4`, `0001.mp4`, and so on. The first prompt in the example above maps
+to `0000.mp4`, regardless of its `id`. Every selected prompt needs a numbered
+reference and, in existing-video mode, a numbered generated video. Missing files
+fail validation before model loading. Keep prompt order consistent with both directories.
+
+To generate and score videos, omit `generated_dir` from the evaluator YAML
+(the minimal file is just `reference_dir: baselines`), then supply the generator:
+
+```bash
+trtllm-eval --model /path/to/video-model video_generation_eval \
+  --config generator.yaml \
+  --evaluator lpips \
+  --evaluator-options lpips.yaml \
+  --prompts prompts.jsonl \
+  --output-dir results
+```
+
+To score existing videos using the YAML above:
+
+```bash
+trtllm-eval --model /path/to/video-model video_generation_eval \
+  --evaluator lpips \
+  --evaluator-options lpips.yaml \
+  --prompts prompts.jsonl \
+  --output-dir results
+```
+
+New videos are saved as `results/generated_videos/0000.mp4`, etc. A supplied
+`generated_dir` is an input directory, not a destination for new generation.
+Both modes write `results.json` and `results.jsonl` under `--output-dir`.
+
+LPIPS requires the `lpips` and OpenCV packages, plus cached or downloadable
+backbone weights. Generating MP4s also requires an encoder such as FFmpeg.
+The evaluator scores decoded frame pairs individually and averages their distances;
+lower is better. Reference and generated videos must have equal frame rates,
+frame counts, and dimensions. Empty videos and non-finite scores are rejected;
+frames are not resized, trimmed, or temporally aligned. The reported aggregate is
+the mean of the per-video scores; the command does not apply a quality threshold.
