@@ -500,22 +500,30 @@ class TestMamba2Metadata:
         assert bool(launches) is expect_fused
 
     @pytest.mark.parametrize(
-        ("num_decodes", "expect_fused"),
+        ("num_decodes", "strided", "expect_fused"),
         [
-            pytest.param(1, True, id="single"),
-            pytest.param(8, True, id="small"),
-            pytest.param(256, True, id="fused-max"),
-            pytest.param(257, False, id="above-fused-max"),
+            pytest.param(1, None, True, id="single"),
+            pytest.param(8, None, True, id="small"),
+            pytest.param(256, None, True, id="fused-max"),
+            pytest.param(257, None, False, id="above-fused-max"),
+            pytest.param(8, "prev_num_accepted_tokens", False, id="strided-accepted-counts"),
+            pytest.param(8, "cache_buf_idx", False, id="strided-buffer-index"),
         ],
     )
     def test_prepare_replay_work_items_without_all_layer_commit_dispatch(
-        self, monkeypatch, num_decodes, expect_fused
+        self, monkeypatch, num_decodes, strided, expect_fused
     ):
-        """Without the all-layer commit every batch up to the fused maximum builds in one launch,
-        with the same work items as the ATen path."""
+        """Without the all-layer commit every batch up to the fused maximum whose bookkeeping is
+        contiguous builds in one launch; a strided accepted-count or buffer-index tensor takes the
+        ATen path. Either way the work items are the ATen builder's."""
         num_slots = num_decodes + 7
-        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
-        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        slots = torch.arange(2 * num_slots, dtype=torch.int32, device="cuda")
+        bookkeeping = {"prev_num_accepted_tokens": slots % 21, "cache_buf_idx": slots % 2}
+        # The strided one holds every other element: as many slots, not contiguous.
+        prev_num_accepted_tokens, cache_buf_idx = (
+            values[::2] if name == strided else values[:num_slots]
+            for name, values in bookkeeping.items()
+        )
         manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
         manager.use_gdn_cached_replay_all_layer_commit = False
         metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)

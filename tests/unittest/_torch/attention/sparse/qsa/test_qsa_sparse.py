@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -679,6 +680,52 @@ def test_qsa_generation_token_mapping_rejects_batches_past_one_tile() -> None:
         )
 
 
+def _generation_mapping_arguments() -> dict:
+    """Valid arguments: two requests of two rows each."""
+    lengths = torch.full((2,), 2, dtype=torch.int32, device="cuda")
+    return dict(
+        kv_lens=lengths + 8,
+        seq_lens=lengths,
+        request_indices=torch.empty(4, dtype=torch.int32, device="cuda"),
+        logical_positions=torch.empty(4, dtype=torch.int64, device="cuda"),
+        sequence_lengths=torch.empty(4, dtype=torch.int32, device="cuda"),
+        visible_blocks=torch.empty(4, dtype=torch.int32, device="cuda"),
+        num_rows=4,
+        compress_ratio=4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("argument", "invalid", "match"),
+    [
+        pytest.param("seq_lens", lambda t: t.view(1, -1), "one-dimensional", id="2d-lengths"),
+        pytest.param("seq_lens", lambda t: t[:1], "matching shapes", id="length-count"),
+        pytest.param("visible_blocks", lambda t: t[:3], "too small", id="short-output"),
+        pytest.param("kv_lens", lambda t: t.long(), "int32 storage", id="int64-lengths"),
+        pytest.param(
+            "logical_positions", lambda t: t.int(), "incompatible dtypes", id="int32-positions"
+        ),
+        pytest.param("sequence_lengths", lambda t: t.cpu(), "CUDA tensors", id="host-output"),
+        pytest.param("compress_ratio", lambda ratio: 0, "must be positive", id="zero-ratio"),
+        pytest.param("compress_ratio", lambda ratio: -4, "must be positive", id="negative-ratio"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_generation_token_mapping_rejects_invalid_arguments(argument, invalid, match) -> None:
+    arguments = _generation_mapping_arguments()
+    arguments[argument] = invalid(arguments[argument])
+    with pytest.raises(ValueError, match=match):
+        triton_qsa_generation_token_mapping(**arguments)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_qsa_generation_token_mapping_rejects_outputs_on_another_device() -> None:
+    arguments = _generation_mapping_arguments()
+    arguments["visible_blocks"] = arguments["visible_blocks"].to("cuda:1")
+    with pytest.raises(ValueError, match="same CUDA device"):
+        triton_qsa_generation_token_mapping(**arguments)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_qsa_spec_dec_remaps_rows_after_the_draft_loop_packs_one_row_per_request() -> None:
     """The first draft step repacks the batch, so the row mapping must follow it."""
@@ -715,6 +762,66 @@ def test_qsa_spec_dec_remaps_rows_after_the_draft_loop_packs_one_row_per_request
     torch.testing.assert_close(
         metadata.qsa_sequence_lengths[:num_seqs], metadata.kv_lens_cuda_runtime
     )
+
+
+@pytest.mark.parametrize(
+    ("num_seqs", "one_launch"),
+    [
+        pytest.param(QSA_GENERATION_MAPPING_MAX_SEQS, True, id="at-max"),
+        pytest.param(QSA_GENERATION_MAPPING_MAX_SEQS + 1, False, id="past-max"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_metadata_maps_generation_rows_in_one_launch_up_to_the_max(
+    monkeypatch, num_seqs: int, one_launch: bool
+) -> None:
+    """A generation-only step of verify groups maps its rows in one launch up to the maximum
+    request count and with the general mapping past it; all four buffers match either way."""
+    seq_lens = [1 + i % 4 for i in range(num_seqs)]
+    num_tokens = sum(seq_lens)
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata._seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    metadata._seq_lens_cuda = metadata._seq_lens.cuda()
+    metadata._num_contexts = 0
+    metadata._num_tokens = num_tokens
+    metadata.kv_lens_cuda_runtime = (
+        metadata._seq_lens_cuda + 1029 + torch.arange(num_seqs, dtype=torch.int32, device="cuda")
+    )
+    metadata.sparse_metadata_params = SimpleNamespace(compress_ratio=4)
+    buffers = (
+        torch.full((num_tokens,), -7, dtype=torch.int32, device="cuda"),
+        torch.full((num_tokens,), -7, dtype=torch.int64, device="cuda"),
+        torch.full((num_tokens,), -7, dtype=torch.int32, device="cuda"),
+        torch.full((num_tokens,), -7, dtype=torch.int32, device="cuda"),
+    )
+    (
+        metadata.qsa_req_idx_per_token,
+        metadata.qsa_logical_positions,
+        metadata.qsa_sequence_lengths,
+        metadata.qsa_visible_blocks,
+    ) = buffers
+    metadata._qsa_cu_seq_lens = torch.zeros(num_seqs + 1, dtype=torch.int64, device="cuda")
+    metadata._qsa_token_arange = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    launches = []
+
+    def recording_mapping(**kwargs) -> None:
+        launches.append(kwargs["num_rows"])
+        triton_qsa_generation_token_mapping(**kwargs)
+
+    monkeypatch.setattr(
+        sys.modules[QSAAttentionMetadata.__module__],
+        "triton_qsa_generation_token_mapping",
+        recording_mapping,
+    )
+
+    metadata._refresh_qsa_token_mapping()
+
+    assert launches == ([num_tokens] if one_launch else [])
+    expected = _general_token_mapping(
+        metadata.kv_lens_cuda_runtime, metadata._seq_lens_cuda, num_tokens, 4
+    )
+    for actual, reference in zip(buffers, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
