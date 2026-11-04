@@ -618,7 +618,8 @@ class OpenAIServer(_VideoRoutesMixin):
             enable_runtime_control_endpoints: bool = False,
             runtime_control_api_key: Optional[str] = None,
             multi_frontend_serving: Optional[MultiFrontendServing] = None,
-            graceful_shutdown_timeout: Optional[int] = None):
+            graceful_shutdown_timeout: Optional[int] = None,
+            enable_checkpoint_mode: bool = False):
         if graceful_shutdown_timeout is not None and graceful_shutdown_timeout <= 0:
             raise ValueError(
                 "graceful_shutdown_timeout must be a positive number of "
@@ -626,6 +627,13 @@ class OpenAIServer(_VideoRoutesMixin):
         # Seconds uvicorn waits after a shutdown signal for request handlers
         # still running before it cancels them; None waits for every handler.
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
+        if enable_checkpoint_mode and (not runtime_control_api_key
+                                       or not isinstance(generator, LLM) or
+                                       generator.args.num_serve_frontends != 1
+                                       or server_role is not None):
+            raise ValueError(
+                "Checkpoint mode requires an authenticated, single-frontend "
+                "aggregated LLM server.")
         if enable_rl_control_endpoints:
             logger.warning(
                 "RL control endpoints are deprecated; use generic runtime "
@@ -907,6 +915,16 @@ class OpenAIServer(_VideoRoutesMixin):
                                                   cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
+        if enable_checkpoint_mode:
+            from tensorrt_llm.executor.checkpoint import CheckpointLifecycle
+            from tensorrt_llm.serve.checkpoint import (
+                ExecutorCheckpointBackend, register_checkpoint_routes)
+            checkpoint_backend = ExecutorCheckpointBackend(generator)
+            self.checkpoint_lifecycle = CheckpointLifecycle(checkpoint_backend)
+            register_checkpoint_routes(self.app, self.checkpoint_lifecycle,
+                                       self._require_runtime_control_auth,
+                                       checkpoint_backend.ingress,
+                                       self._check_health)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
                                                   "0") == "1"
         self.app.router.route_class = _MsgspecRoute

@@ -624,10 +624,15 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
             f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
 
 
-def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
-                                         port: int, grpc: bool,
-                                         report_addr: Optional[str],
-                                         enable_sleep_mode: bool) -> None:
+def _resolve_default_num_serve_frontends(
+        llm_args: dict,
+        *,
+        requested: bool,
+        port: int,
+        grpc: bool,
+        report_addr: Optional[str],
+        enable_sleep_mode: bool,
+        enable_checkpoint_mode: bool = False) -> None:
     """Fall back to one frontend where the default count cannot run.
 
     An explicit count (CLI, --config YAML or --set) is left alone, so the
@@ -647,6 +652,8 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
         reason = "enable_resource_governor"
     elif enable_sleep_mode:
         reason = "--enable_sleep_mode"
+    elif enable_checkpoint_mode:
+        reason = "--enable_checkpoint_mode"
     else:
         return
     logger.info(
@@ -782,7 +789,8 @@ def launch_server(
         internal_disagg_auth_key: Optional[str] = None,
         report_addr: Optional[str] = None,
         enable_runtime_control_endpoints: bool = False,
-        runtime_control_api_key: Optional[str] = None) -> None:
+        runtime_control_api_key: Optional[str] = None,
+        enable_checkpoint_mode: bool = False) -> None:
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
@@ -929,6 +937,7 @@ def launch_server(
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
                     runtime_control_api_key=runtime_control_api_key,
+                    enable_checkpoint_mode=enable_checkpoint_mode,
                     multi_frontend_serving=multi_frontend_serving,
                     graceful_shutdown_timeout=llm.args.
                     serve_graceful_shutdown_timeout_s)
@@ -1602,6 +1611,13 @@ def launch_visual_gen_server(
     "front.",
     status="prototype")
 @stability_option(
+    "--enable_checkpoint_mode",
+    is_flag=True,
+    default=False,
+    help=
+    "Enable experimental resident checkpoint lifecycle and authenticated control endpoints.",
+    status="prototype")
+@stability_option(
     "--enable_sleep_mode",
     is_flag=True,
     default=False,
@@ -1666,6 +1682,7 @@ def serve(
     report_addr: Optional[str],
     enable_locality_domains: bool,
     enable_sleep_mode: bool,
+    enable_checkpoint_mode: bool,
 ) -> None:
     """Running an OpenAI API compatible server
 
@@ -1676,6 +1693,15 @@ def serve(
         # VisualGen reports no startup error category or startup state.
         _mark_visual_gen()
     logger.set_level(log_level)
+    if enable_checkpoint_mode and (backend != "pytorch" or grpc):
+        raise click.UsageError(
+            "--enable_checkpoint_mode requires the PyTorch HTTP server.")
+    if enable_checkpoint_mode and any(
+            value is not None for value in (server_role, disagg_cluster_uri,
+                                            metadata_server_config_file)):
+        raise click.UsageError(
+            "Checkpoint mode does not support --server_role, "
+            "--disagg_cluster_uri or --metadata_server_config_file.")
     if enable_sleep_mode and backend != "pytorch":
         raise click.UsageError(
             "--enable_sleep_mode is only supported by the PyTorch backend.")
@@ -1683,11 +1709,11 @@ def serve(
         raise click.UsageError(
             "--enable_sleep_mode is only supported by the HTTP server.")
     runtime_control_api_key = None
-    if enable_sleep_mode:
+    if enable_sleep_mode or enable_checkpoint_mode:
         runtime_control_api_key = os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY")
         if not runtime_control_api_key:
             raise click.UsageError(
-                "--enable_sleep_mode requires TRTLLM_RUNTIME_CONTROL_API_KEY.")
+                "Runtime controls require TRTLLM_RUNTIME_CONTROL_API_KEY.")
 
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")
@@ -1783,9 +1809,9 @@ def serve(
             param_hint="--set")
     parsed_config_overrides = _parse_config_overrides(config_overrides)
 
-    if enable_sleep_mode and is_visual_gen:
+    if (enable_sleep_mode or enable_checkpoint_mode) and is_visual_gen:
         raise click.UsageError(
-            "--enable_sleep_mode is only supported by the HTTP "
+            "Runtime controls are only supported by the HTTP "
             "text-generation server.")
 
     def _serve_llm():
@@ -1854,15 +1880,39 @@ def serve(
         llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
         if enable_sleep_mode and llm_args.get("sleep_config") is None:
             llm_args["sleep_config"] = SleepConfig()
+        if enable_checkpoint_mode:
+            from tensorrt_llm.executor.checkpoint import (
+                CHECKPOINT_ENABLE_ENV, CHECKPOINT_REQUIRED_ENV)
+            explicit_frontends = (
+                "num_serve_frontends" in explicit_cli_keys
+                or "num_serve_frontends" in llm_args_extra_dict
+                or "num_serve_frontends" in set_top_level_fields)
+            if explicit_frontends and llm_args.get("num_serve_frontends",
+                                                   1) != 1:
+                raise click.UsageError(
+                    "Checkpoint mode requires num_serve_frontends=1.")
+            overrides = dict(llm_args.get("env_overrides") or {})
+            overrides[CHECKPOINT_ENABLE_ENV] = "1"
+            for key, value in CHECKPOINT_REQUIRED_ENV.items():
+                previous = overrides.get(key, os.environ.get(key))
+                if previous is not None and previous != value:
+                    logger.warning(
+                        f"Checkpoint mode overrides {key}: {previous} -> {value}."
+                    )
+                overrides[key] = value
+                os.environ[key] = value
+            llm_args["env_overrides"] = overrides
 
         _resolve_default_num_serve_frontends(
             llm_args,
             requested=("num_serve_frontends" in explicit_cli_keys
-                       or "num_serve_frontends" in llm_args_extra_dict),
+                       or "num_serve_frontends" in llm_args_extra_dict
+                       or "num_serve_frontends" in set_top_level_fields),
             port=port,
             grpc=grpc,
             report_addr=report_addr,
-            enable_sleep_mode=enable_sleep_mode)
+            enable_sleep_mode=enable_sleep_mode,
+            enable_checkpoint_mode=enable_checkpoint_mode)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
         # Preserve requested settings for failures before entering the LLM constructor.
@@ -2006,6 +2056,7 @@ def serve(
                 internal_disagg_auth_key=internal_disagg_auth_key,
                 report_addr=report_addr,
                 enable_runtime_control_endpoints=enable_sleep_mode,
+                enable_checkpoint_mode=enable_checkpoint_mode,
                 runtime_control_api_key=runtime_control_api_key)
 
     def _serve_visual_gen():

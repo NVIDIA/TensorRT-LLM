@@ -2743,6 +2743,8 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
     executor = object.__new__(PyExecutor)
     executor._sleep_wakeup_comm = sleep_wakeup_comm
     executor._sleep_wakeup_lock = threading.Lock()
+    executor._control_action_lock = threading.Lock()
+    executor.checkpoint = None
     executor._sleep_wakeup_listener_thread = None
     executor.control_request_barrier = threading.Event()
     executor.control_action_done = threading.Event()
@@ -2755,8 +2757,26 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
     executor.enable_kv_cache_reuse = False
 
     class _ControlRequestQueue:
-        def enqueue_control_request(self, *, drain, control_id):
+        def checkpoint_admission_closed(self) -> bool:
+            """Keep ordinary memory sleep/wake independent of checkpoint mode."""
+            return False
+
+        def enqueue_control_request(
+            self,
+            *,
+            drain: bool = True,
+            control_id: str | None = None,
+            checkpoint_session: str | None = None,
+        ) -> None:
+            """Deliver a drained control sentinel to the emulated executor loop.
+
+            Args:
+                drain: Whether the control requires request retirement.
+                control_id: Identity broadcast to the peer schedulers.
+                checkpoint_session: Must be absent for ordinary memory sleep/wake.
+            """
             assert drain
+            assert checkpoint_session is None
             control_comm.bcast(control_id, root=0)
             executor._active_control_id = control_id
             executor.control_action_done.clear()
@@ -2806,6 +2826,8 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
                 action_error = None
                 try:
                     worker._multi_rank_sleep_wakeup(action, [ExecutorMemoryType.MODEL_ENGINE_MAIN])
+                    assert not executor._control_action_lock.locked()
+                    assert not executor.control_request_barrier.is_set()
                 except Exception as error:
                     action_error = error
                 control_comm.bcast(action_error is None, root=0)

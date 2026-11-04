@@ -6,6 +6,18 @@ graph TB
         CLI --> LLMAPI
     end
 
+    subgraph "Experimental Resident Lifecycle"
+        RestoreController[External Checkpoint Controller]
+        LifecycleAPI[Authenticated Lifecycle API]
+        AdmissionGate[Persistent Admission Gate]
+        RankControl[Fixed MPI Cohort Control]
+        RestoreController -->|prepare / validate / activate / abort| LifecycleAPI
+        LifecycleAPI --> AdmissionGate
+        LifecycleAPI --> RankControl
+        RankControl -->|drain / park / private validation| PyExecutor
+        AdmissionGate -->|gate public requests| LLMAPI
+    end
+
     subgraph "Model Checkpoint"
         Checkpoint[Huggingface Models]
         Checkpoint --> CLI

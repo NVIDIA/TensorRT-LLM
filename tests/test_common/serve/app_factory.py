@@ -100,6 +100,7 @@ class AggConfig:
     governor_queue: bool = False  # FakeExecutor(resource_governor_queue=object())
     rl_control: bool = False  # FakeAsyncLLM + enable_rl_control_endpoints
     runtime_control: bool = False  # sleep_config + enable_runtime_control_endpoints
+    checkpoint: bool = False  # authenticated resident checkpoint lifecycle
     return_perf_metrics: bool = False
     perf_metrics_output_dir: bool = False  # sets args.perf_metrics_output_dir=<tmp>/perf
     env: tuple = ()  # (name, value) pairs applied before construction
@@ -243,7 +244,10 @@ class ServeTestEnv:
             enable_rl_control_endpoints=config.rl_control,
             rl_control_api_key="test-key" if config.rl_control else None,
             enable_runtime_control_endpoints=config.runtime_control,
-            runtime_control_api_key="test-key" if config.runtime_control else None,
+            runtime_control_api_key="test-key"
+            if config.runtime_control or config.checkpoint
+            else None,
+            enable_checkpoint_mode=config.checkpoint,
             multi_frontend_serving=multi_frontend_serving,
         )
         self._servers.append(server)

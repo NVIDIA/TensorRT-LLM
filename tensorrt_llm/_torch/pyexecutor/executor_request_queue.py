@@ -122,7 +122,98 @@ class ExecutorRequestQueue:
         self._pending_sleep_tags: frozenset[str] = frozenset()
         self._parked_tags: frozenset[str] = frozenset()
         self._pending_wakeup_tags: frozenset[str] = frozenset()
+        self._checkpoint_session: Optional[str] = None
+        self._checkpoint_validation_token: Optional[str] = None
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+
+    def close_checkpoint_admission(self, session: str) -> None:
+        """Latch public admission independently of memory sleep/wakeup.
+
+        Args:
+            session: Nonempty source or restore session owning the gate.
+
+        Raises:
+            ValueError: If the session is empty.
+            RuntimeError: If another session already owns the gate.
+        """
+        if not session:
+            raise ValueError("Checkpoint session must not be empty.")
+        with self.enqueue_lock:
+            if self.admission_state is not RequestAdmissionState.RUNNING:
+                raise RuntimeError(
+                    "Checkpoint requires resident, running memory.")
+            if self._checkpoint_session not in (None, session):
+                raise RuntimeError("Another checkpoint session owns admission.")
+            self._checkpoint_session = session
+
+    def bind_checkpoint_restore(self, source_session: str,
+                                restore_session: str) -> None:
+        """Replace captured gate ownership with a fresh restore session.
+
+        Args:
+            source_session: Session stored in the captured worker.
+            restore_session: Fresh destination session supplied outside the image.
+
+        Raises:
+            ValueError: If the destination does not have a fresh identity.
+            RuntimeError: If the source does not own the closed gate.
+        """
+        if not restore_session or source_session == restore_session:
+            raise ValueError("Restore requires a fresh checkpoint session.")
+        with self.enqueue_lock:
+            if self._checkpoint_session != source_session:
+                raise RuntimeError("Stale checkpoint source session.")
+            self._checkpoint_session = restore_session
+            self._checkpoint_validation_token = None
+
+    def set_checkpoint_validation(self, session: str,
+                                  token: Optional[str]) -> None:
+        """Allow one private validation request without opening public admission.
+
+        Args:
+            session: Current owner of the closed gate.
+            token: Unpredictable one-use token, or None to retire the allowance.
+
+        Raises:
+            RuntimeError: If the session does not own the gate.
+            ValueError: If an empty token is supplied.
+        """
+        if token is not None and not token:
+            raise ValueError("Validation token must not be empty.")
+        with self.enqueue_lock:
+            if self._checkpoint_session != session:
+                raise RuntimeError("Stale checkpoint validation session.")
+            self._checkpoint_validation_token = token
+
+    def open_checkpoint_admission(self, session: str) -> None:
+        """Release the gate after its owner has validated the complete cohort.
+
+        Args:
+            session: Validated restore session owning the gate.
+
+        Raises:
+            RuntimeError: If identity, memory state, or validation is incomplete.
+        """
+        with self.enqueue_lock:
+            if self._checkpoint_session != session:
+                raise RuntimeError("Stale checkpoint activation session.")
+            if (self.admission_state is not RequestAdmissionState.RUNNING
+                    or self._checkpoint_validation_token is not None):
+                raise RuntimeError(
+                    "Checkpoint activation requires usable memory "
+                    "and retired private validation.")
+            self._checkpoint_session = None
+
+    def checkpoint_admission_closed(self) -> bool:
+        """Return whether a checkpoint session still owns admission."""
+        with self.enqueue_lock:
+            return self._checkpoint_session is not None
+
+    def fail_checkpoint(self) -> None:
+        """Revoke all admission atomically, including during restore rebinding."""
+        with self.enqueue_lock:
+            self.admission_state = RequestAdmissionState.FAILED
+            self._checkpoint_validation_token = None
 
     def _transition_admission_state(
         self,
@@ -139,6 +230,9 @@ class ExecutorRequestQueue:
     def begin_sleep_transition(self, tags: Iterable[str]) -> None:
         """Close admission before the executor starts draining for sleep."""
         with self.enqueue_lock:
+            if self._checkpoint_session is not None:
+                raise RuntimeError(
+                    "Checkpoint owns the resident memory lifecycle.")
             sleep_tags = frozenset(tags)
             self._transition_admission_state(
                 RequestAdmissionState.RUNNING,
@@ -248,6 +342,15 @@ class ExecutorRequestQueue:
                 raise RuntimeError(
                     "Cannot enqueue requests while executor admission is "
                     f"{self.admission_state.value}")
+            if self._checkpoint_session is not None:
+                requests = list(requests)
+                if (len(requests) != 1
+                        or self._checkpoint_validation_token is None or getattr(
+                            requests[0], "py_checkpoint_validation_token",
+                            None) != self._checkpoint_validation_token):
+                    raise RuntimeError("Checkpoint lifecycle has closed "
+                                       "public request admission.")
+                self._checkpoint_validation_token = None
             start_time = time.time()
             for request in requests:
                 req_id = self._get_request_id(request)
@@ -289,11 +392,22 @@ class ExecutorRequestQueue:
                 for item in self.request_queue.queue if item.is_canceled_request
             }
 
-    def enqueue_control_request(self,
-                                drain: bool = True,
-                                control_id: Optional[str] = None):
+    def has_pending_non_cancellation_requests(self) -> bool:
+        """Check for executable work; late cancellation needs no retained KV owner."""
+        with self.request_queue.mutex:
+            return any(not item.is_canceled_request
+                       for item in self.request_queue.queue)
+
+    def enqueue_control_request(
+            self,
+            drain: bool = True,
+            control_id: Optional[str] = None,
+            checkpoint_session: Optional[str] = None) -> None:
         """Enqueue a control-action sentinel. See ``PyExecutor.control_action``."""
         with self.enqueue_lock:
+            if self._checkpoint_session != checkpoint_session:
+                raise RuntimeError(
+                    "Checkpoint owns the scheduler control boundary.")
             self.request_queue.put(
                 RequestQueueItem(id=CONTROL_REQUEST_ID,
                                  control_requires_drain=drain,
@@ -304,6 +418,9 @@ class ExecutorRequestQueue:
         every TP/PP rank via ``RequestBroadcaster`` so all PyExecutor
         instances apply the window in lockstep (not just the leader)."""
         with self.enqueue_lock:
+            if self._checkpoint_session is not None:
+                raise RuntimeError(
+                    "Profiling is unavailable during checkpoint operations.")
             self.request_queue.put(
                 RequestQueueItem(id=PROFILE_START_REQUEST_ID,
                                  profile_config=profile_config))
@@ -311,6 +428,9 @@ class ExecutorRequestQueue:
     def enqueue_profile_stop_request(self):
         """Enqueue a profile-stop control item. Broadcasted to every rank."""
         with self.enqueue_lock:
+            if self._checkpoint_session is not None:
+                raise RuntimeError(
+                    "Profiling is unavailable during checkpoint operations.")
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
 
     def enqueue_shutdown_request(self):
@@ -321,7 +441,8 @@ class ExecutorRequestQueue:
     def can_enqueue_request(self) -> bool:
         with self.enqueue_lock:
             return (self.active and self.dist.rank == 0
-                    and self.admission_state is RequestAdmissionState.RUNNING)
+                    and self.admission_state is RequestAdmissionState.RUNNING
+                    and self._checkpoint_session is None)
 
     def can_enqueue_control_request(self) -> bool:
         """Return whether rank zero can enqueue shutdown/control sentinels."""

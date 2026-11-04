@@ -87,6 +87,7 @@ Welcome to TensorRT LLM's Documentation!
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
+   features/checkpoint-lifecycle.md
    features/model-express.md
    features/sleep-wakeup.md
    features/ray-orchestrator.md
