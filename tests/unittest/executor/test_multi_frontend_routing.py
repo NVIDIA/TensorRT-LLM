@@ -20,6 +20,7 @@ attached-frontend proxy lifecycle over real ipc:// sockets.
 """
 
 import os
+import pickle
 import tempfile
 import time
 from types import SimpleNamespace
@@ -231,7 +232,7 @@ class TestClassicFrontendProxyEndToEnd:
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             assert get_frontend_id(result.request_id) == 1
             assert worker_ingress.poll(5)
-            received = worker_ingress.get()
+            received = pickle.loads(worker_ingress.get()[0])
             assert isinstance(received, GenerationRequest)
             assert received.id == result.request_id
 
@@ -239,7 +240,7 @@ class TestClassicFrontendProxyEndToEnd:
             # must NOT emit the None engine-shutdown sentinel.
             proxy.shutdown()
             assert worker_ingress.poll(5)
-            cancel = worker_ingress.get()
+            cancel = pickle.loads(worker_ingress.get()[0])
             assert isinstance(cancel, CancellingRequest)
             assert cancel.id == result.request_id
             assert not worker_ingress.poll(1), (

@@ -23,6 +23,7 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from fastapi.responses import StreamingResponse
@@ -31,7 +32,7 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.utils import EngineUnavailableError, ErrorResponse
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.serve.openai_protocol import CompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -57,6 +58,7 @@ class _FailingEngine:
         # exception the server's stream generator sees. Held here because the
         # result only keeps a weak reference to it.
         self._worker = object.__new__(BaseWorker)
+        self._worker.doing_shutdown = True
         self.args = SimpleNamespace(
             num_postprocess_workers=0,
             gather_generation_logits=False,
@@ -108,3 +110,28 @@ async def test_a_failed_request_ends_the_completion_stream_with_an_error_event()
     assert error["message"] == _KV_ERROR
     assert error["type"] == "server_error"
     assert chunks[1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.parametrize("temporary,partial", [(False, False), (True, False), (True, True)])
+@pytest.mark.asyncio
+async def test_admission_failure_preserves_retryable_status(temporary, partial):
+    engine = _FailingEngine("")
+
+    accepted = SimpleNamespace(abort=Mock(), prompt_token_ids=[1])
+    calls = []
+
+    def reject(*args, **kwargs):
+        calls.append(True)
+        if partial and len(calls) == 1:
+            return accepted
+        if temporary:
+            raise EngineUnavailableError("command connection is recovering")
+        raise ValueError("invalid request")
+
+    engine.generate_async = reject
+    server = _bare_server(engine)
+    request = CompletionRequest(model="test-model", prompt=[[1], [2]], max_tokens=4, stream=True)
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    response = await server.openai_completion(request, raw)
+    assert response.status_code == (503 if temporary else 400)
+    assert accepted.abort.call_count == (1 if partial else 0)

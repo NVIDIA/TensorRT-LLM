@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import atexit
-import collections
 import concurrent.futures
 import json
 import os
@@ -51,11 +50,12 @@ from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
+from .request_sender import _RequestSender
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (EngineDeadError, ErrorResponse, RequestError,
-                    WorkerCommIpcAddrs, create_mpi_comm_session,
+from .utils import (EngineDeadError, EngineUnavailableError, ErrorResponse,
+                    RequestError, WorkerCommIpcAddrs, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response,
                     multi_frontend_request_addr, multi_frontend_result_addr,
                     namespace_client_id, print_alive_threads)
@@ -108,131 +108,23 @@ def _check_collective_rpc_guard(
             "this shim only reaches rank-0.")
 
 
-class _RequestSender:
-    """Batch a proxy's requests to the rank-0 worker on one background thread.
-
-    Used only with ``TRTLLM_PROXY_BATCH_REQUESTS=1``. Callers pickle each
-    request themselves and ``send`` the bytes, so a request is captured as it
-    is when it is submitted, and one that cannot be pickled fails in its
-    caller. The sender thread sends every payload queued since its previous
-    send as one list in one HMAC-signed message, so a burst of requests costs
-    the rank-0 worker one receive and one HMAC check instead of one per
-    request; the worker then unpickles each payload. The thread starts on
-    the first ``send``. From then on it is the only thread that writes to the
-    request queue's socket, which is not thread-safe, and it also sends the
-    worker's shutdown sentinel.
-
-    Trade-off: the sender thread must take the GIL before it can send. While
-    the submitting thread keeps running Python, for example a busy
-    trtllm-serve event loop, a lone request can wait up to the interpreter's
-    switch interval (5 ms by default) before it is sent.
-    """
-
-    MAX_BATCH_SIZE = 1024
-
-    def __init__(self, request_queue: IpcQueue, error_queue: Queue):
-        self._request_queue = request_queue
-        self._error_queue = error_queue
-        self._pending = collections.deque()
-        self._cond = threading.Condition()
-        self._closed = False
-        self._send_sentinel = False
-        # Set by the thread once it has drained the queue and will stop.
-        self._stopping = False
-        self._thread: Optional[threading.Thread] = None
-        # Bound here because ``close`` can run from a finalizer during
-        # interpreter teardown, when module globals may already be None.
-        self._is_finalizing = sys.is_finalizing
-
-    def send(self, payload: bytes) -> None:
-        """Queue a pickled request for the worker.
-
-        Payloads sent after ``close`` are dropped: the proxy is shutting down.
-        """
-        with self._cond:
-            if self._closed:
-                return
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run,
-                                                daemon=True,
-                                                name="proxy_request_sender")
-                self._thread.start()
-            self._pending.append(payload)
-            self._cond.notify()
-
-    def close(self,
-              timeout: Optional[float] = None,
-              *,
-              send_sentinel: bool = False) -> bool:
-        """Send everything queued, then stop the sender thread.
-
-        With ``send_sentinel``, the thread also sends the worker's shutdown
-        sentinel after the last payload, so the request queue keeps a single
-        writer. Calls after the thread has stopped return at once. During
-        interpreter finalization this returns without doing anything: the
-        daemon thread can no longer run, the ZMQ context may be gone, and
-        joining a thread there fails.
-
-        Returns:
-            Whether the caller still has to send the sentinel: true only if
-            ``send_sentinel`` is set and the thread did not send it, because it
-            never started or had already stopped.
-        """
-        if self._is_finalizing():
-            return False
-        with self._cond:
-            self._closed = True
-            thread = self._thread
-            caller_sends_sentinel = send_sentinel and (thread is None
-                                                       or self._stopping)
-            self._send_sentinel = self._send_sentinel or send_sentinel
-            self._cond.notify()
-        if thread is not None:
-            thread.join(timeout)
-            if not thread.is_alive():
-                self._thread = None
-        return caller_sends_sentinel
-
-    def _run(self) -> None:
-        while True:
-            with self._cond:
-                while not self._pending and not self._closed:
-                    self._cond.wait()
-                if not self._pending:
-                    self._stopping = True
-                    send_sentinel = self._send_sentinel
-                    break
-                batch = [
-                    self._pending.popleft()
-                    for _ in range(min(len(self._pending), self.MAX_BATCH_SIZE))
-                ]
-            try:
-                self._request_queue.put(batch)
-            except Exception as e:
-                # The payloads are already pickled, so this is a transport
-                # error, which the proxy treats as fatal.
-                self._error_queue.put_nowait(e)
-        if send_sentinel:
-            # A bare None, not a batch: the worker stops at a top-level None.
-            try:
-                self._request_queue.put_noblock(None, retry=4)
-            except Exception as e:
-                self._error_queue.put_nowait(e)
-
-
-def _create_request_sender(request_queue: IpcQueue,
-                           error_queue: Queue) -> Optional[_RequestSender]:
-    """Return a batching request sender if TRTLLM_PROXY_BATCH_REQUESTS=1."""
-    if os.getenv("TRTLLM_PROXY_BATCH_REQUESTS", "0") != "1":
-        return None
-    return _RequestSender(request_queue, error_queue)
+def _create_request_sender(
+        request_queue: IpcQueue,
+        error_queue: Queue,
+        on_failure: Optional[weakref.WeakMethod] = None) -> _RequestSender:
+    """Create the command owner; the environment selects burst coalescing only."""
+    return _RequestSender(request_queue,
+                          error_queue,
+                          batching=os.getenv("TRTLLM_PROXY_BATCH_REQUESTS",
+                                             "0") == "1",
+                          on_failure=on_failure)
 
 
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
-    # Set when TRTLLM_PROXY_BATCH_REQUESTS=1; requests are put on
-    # ``request_queue`` directly otherwise.
+    # Every command uses this socket owner; TRTLLM_PROXY_BATCH_REQUESTS
+    # controls burst coalescing only.
     _request_sender: Optional[_RequestSender] = None
     # Total wait for the worker futures in an orderly shutdown. Generous
     # enough for the teardown of a large engine.
@@ -340,6 +232,8 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.rpc_client: Optional[RPCClient] = None
+        # Remote process watches can wake the monitor during worker startup.
+        self._shutdown_event = threading.Event()
         self._worker_process_monitor = WorkerProcessMonitor()
         logger.info(
             f"[startup][pid={os.getpid()}] executor_proxy/pre_worker_setup: "
@@ -353,10 +247,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Create RPC client after workers are started (worker starts RPC server)
         self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
 
-        # Event used to wake the error monitor thread for a clean shutdown
-        # instead of polling with sleep loops.
-        self._shutdown_event = threading.Event()
-
         # Start a background thread that monitors for fatal errors (e.g. MPI
         # worker crash) and triggers shutdown even when no health checks or
         # generate() calls are in flight.
@@ -366,32 +256,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             name="proxy_error_monitor")
         self._error_monitor_thread.start()
 
-        # Single-thread executor that owns *all* profile-control IPC traffic
-        # (``request_queue.put`` for StartProfile/StopProfile and
-        # ``profile_ack_queue.get`` for the matching ack). Pinning these
-        # ZMQ socket operations to one owning thread is required because:
-        #
-        #   * pyzmq sockets are not thread-safe; concurrent access from
-        #     multiple threads — even one writer + one reader — is undefined
-        #     behavior in libzmq.
-        #   * The HTTP handler reaches us through ``asyncio.to_thread``,
-        #     which does not pin to the same worker thread between calls,
-        #     so back-to-back ``/start_profile`` and ``/stop_profile``
-        #     could otherwise touch ``profile_ack_queue`` from two
-        #     different threads.
-        #
-        # The HTTP handler still blocks on a Future returned by this
-        # executor, so the synchronous "chrome trace is on disk by the
-        # time /stop_profile returns 200" contract is preserved without
-        # any ZMQ socket op leaking into the FastAPI thread pool.
-        #
-        # NOTE: ``request_queue`` is also written from ``submit()`` /
-        # ``abort_request()`` on user-caller threads — that pre-existing
-        # cross-thread access is out of scope for this change. The fix
-        # here narrowly targets the new profile-control path.
-        # With TRTLLM_PROXY_BATCH_REQUESTS=1, the ``_request_sender`` thread
-        # writes the queue instead once it has started, shutdown sentinel
-        # included.
+        # Profile replies have their own socket owner. Command writes go
+        # through the same sender as generation and cancellation.
         self._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="proxy_profile_control")
 
@@ -432,7 +298,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._set_fatal_error(
                 RuntimeError("MPI worker rank "
                              f"{dead_worker.rank} (pid {dead_worker.pid}) "
-                             "exited unexpectedly"))
+                             "lost process liveness"))
             if not self.doing_shutdown:
                 self.pre_shutdown()
             return True
@@ -478,12 +344,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             return False
 
         if self._drain_error_queue():
-            return self._fatal_error is None and not self.doing_shutdown
+            return (self._fatal_error is None and not self.doing_shutdown
+                    and (self._request_sender is None
+                         or self._request_sender.available))
 
         if self._check_mpi_workers():
             return False
 
-        return True
+        return self._request_sender is None or self._request_sender.available
 
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record the fatal error, then unblock every pending request.
@@ -501,6 +369,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._engine_dead:
             return
         self._engine_dead = True
+        sender = self._request_sender
+        if sender is not None:
+            sender.fail(error or EngineDeadError())
         dead_error = EngineDeadError(error)
         # Snapshot to avoid mutation-during-iteration; best-effort per result.
         # Use put() (not put_nowait()) so the async _SyncQueue path also wakes
@@ -524,16 +395,17 @@ class GenerationExecutorProxy(GenerationExecutor):
                     f"MPI session exit-join release failed (ignored): {e!r}")
 
     def _handle_worker_death(self, error: BaseException) -> None:
-        """Event-driven worker-death handler.
+        """Fail pending requests and queue terminal worker errors for cleanup.
 
-        Runs from the MPI future's done-callback thread the instant a worker
-        process exits. Enqueues the error for the monitor loop to record (which
-        drives pre_shutdown) and immediately broadcasts EngineDeadError to
-        pending requests, so they fail fast without waiting for the next poll
-        tick. Propagation is therefore no longer gated by the poll interval.
+        Used by MPI worker-death callbacks and cancellation transport failures.
+        The monitor records the fatal error and drives pre_shutdown, while the
+        immediate EngineDeadError broadcast fails requests without waiting for
+        the next poll tick.
         """
         self._error_queue.put_nowait(error)
         self._mark_engine_dead(error)
+        if hasattr(self, '_shutdown_event'):
+            self._shutdown_event.set()
 
     def _check_remote_worker_death(self) -> bool:
         """Poll a remote (pre-spawned) MPI session for forwarded worker deaths.
@@ -617,12 +489,15 @@ class GenerationExecutorProxy(GenerationExecutor):
             frontend_result_addrs = [(multi_frontend_result_addr(ipc_dir,
                                                                  i), hmac_key)
                                      for i in range(self._num_frontends)]
-            self.request_queue = IpcQueue(request_addr,
-                                          is_server=False,
-                                          socket_type=zmq.PUSH,
-                                          name="proxy_request_queue")
+            self.request_queue = IpcQueue(
+                request_addr,
+                is_server=False,
+                socket_type=zmq.PUSH,
+                name="proxy_request_queue",
+                send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
             self._request_sender = _create_request_sender(
-                self.request_queue, self._error_queue)
+                self.request_queue, self._error_queue,
+                weakref.WeakMethod(self._handle_worker_death))
             self.result_queue = FusedIpcQueue(frontend_result_addrs[0],
                                               is_server=True,
                                               fuse_message=False,
@@ -630,10 +505,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                                               name="proxy_result_queue")
         else:
             request_addr = None
-            self.request_queue = IpcQueue(is_server=True,
-                                          name="proxy_request_queue")
+            self.request_queue = IpcQueue(
+                is_server=True,
+                name="proxy_request_queue",
+                send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
             self._request_sender = _create_request_sender(
-                self.request_queue, self._error_queue)
+                self.request_queue, self._error_queue,
+                weakref.WeakMethod(self._handle_worker_death))
             # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
             # Use PULL mode when enable_postprocess_parallel as there are
             # multiple senders from multiple processes.
@@ -719,10 +597,21 @@ class GenerationExecutorProxy(GenerationExecutor):
         Args:
             request_id (int): The id of the request to abort.
         """
+        if self._engine_dead or self._fatal_error is not None:
+            return
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
-        self._send_request(CancellingRequest(request_id))
+        try:
+            self._send_request(CancellingRequest(request_id))
+        except EngineDeadError:
+            # Worker death can win after the fast-path check above.
+            return
+        except EngineUnavailableError as error:
+            if self.doing_shutdown:
+                return
+            self._handle_worker_death(
+                RuntimeError(f"Cancellation could not be queued: {error}"))
 
     # Per-call timeouts for the synchronous worker round-trip. The stop
     # path can take up to 30s because PyExecutor.stop_profile itself
@@ -798,15 +687,17 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _profile_control_call(self, kind: str, request, timeout: float) -> None:
         """Worker-side body of ``start_profile`` / ``stop_profile``.
 
-        Runs on ``_profile_control_executor`` so all profile-related
-        ZMQ socket ops (``request_queue.put`` and ``profile_ack_queue.get``
-        via ``_wait_profile_ack``) happen on a single owning thread. With
-        TRTLLM_PROXY_BATCH_REQUESTS=1 the request is put by
-        ``_request_sender`` instead.
+        Waits for replies on the profile-control owner. Commands are queued
+        to the shared command sender, which owns the request socket.
         """
         request.ack_addr = self._ensure_profile_ack_queue()
-        self._send_request(request)
-        self._wait_profile_ack(kind, timeout)
+        deadline = time.monotonic() + timeout
+        self._request_sender.set_control_deadline(deadline)
+        try:
+            self._send_request(request)
+            self._wait_profile_ack(kind, max(0.0, deadline - time.monotonic()))
+        finally:
+            self._request_sender.set_control_deadline(0.0)
 
     def _submit_profile_control(self, kind: str, request,
                                 timeout: float) -> None:
@@ -847,11 +738,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         (e.g. a profile window is already active or pending) so the
         HTTP /start_profile endpoint can return 409.
 
-        The actual ZMQ traffic (``request_queue.put`` +
-        ``profile_ack_queue.get``) is dispatched onto
-        ``_profile_control_executor`` — a single-thread executor — so the
-        FastAPI thread-pool worker that called us never touches the
-        ZMQ sockets directly. ``Future.result()`` re-raises any
+        The shared command sender owns writes; ``_profile_control_executor``
+        owns profile replies and serializes profile operations. The FastAPI
+        thread-pool worker never touches either ZMQ socket directly. ``Future.result()`` re-raises any
         ``RuntimeError`` from ``_wait_profile_ack`` so the HTTP layer
         still sees worker rejections.
         """
@@ -871,8 +760,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         file is on disk, so HTTP callers can reliably read it
         immediately after /stop_profile returns 200.
 
-        Like ``start_profile``, the actual ZMQ traffic is dispatched
-        onto ``_profile_control_executor`` so the calling thread never
+        Like ``start_profile``, command writes use the shared sender and
+        replies use ``_profile_control_executor``. The calling thread never
         touches the ZMQ sockets.
         """
         self._submit_profile_control("stop", StopProfileRequest(),
@@ -1004,7 +893,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if dead_worker is not None:
             return RuntimeInitError(
                 f"MPI worker rank {dead_worker.rank} (pid {dead_worker.pid}) "
-                "exited unexpectedly",
+                "lost process liveness",
                 reason="worker_died")
         for fut in self.mpi_futures:
             if fut.done():
@@ -1058,6 +947,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_process_identities_signal = (
             self.WORKER_PROCESS_IDENTITIES_SIGNAL
             if self._can_monitor_worker_processes() else None)
+        if not self._can_monitor_worker_processes():
+            mpi_worker_kwargs["_process_watch"] = (
+                self._worker_process_monitor.start_remote(
+                    self.model_world_size, self._shutdown_event))
 
         with _StartupTimer("worker_submit_to_ready") as startup_timer:
             with startup_timer.phase("worker_submit"):
@@ -1089,6 +982,12 @@ class GenerationExecutorProxy(GenerationExecutor):
                 self._fail_initialization(
                     wrap_worker_startup_error("Executor worker returned error",
                                               info), ready_signal)
+
+        if not self._worker_process_monitor.wait_remote_ready():
+            self._fail_initialization(
+                RuntimeError(
+                    "Remote worker process supervision is unavailable"),
+                self._worker_process_monitor.find_dead_worker())
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
@@ -1206,31 +1105,24 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._close_request_sender(send_sentinel=send_sentinel)
 
     def _send_request(self, request) -> None:
-        """Send a request to the rank-0 worker.
-
-        With TRTLLM_PROXY_BATCH_REQUESTS=1 the request is pickled here, on the
-        caller's thread, and ``_request_sender`` batches the bytes; otherwise
-        it is put on ``request_queue`` directly. Either way the worker receives
-        the request as it is now, and a request that cannot be pickled raises
-        here.
-        """
+        """Capture a command, then enqueue it for its sole socket owner."""
         if self._request_sender is None:
-            self.request_queue.put(request)
-        else:
-            self._request_sender.send(pickle.dumps(request))
+            raise RuntimeError("Executor command sender is not initialized")
+        self._request_sender.send(
+            pickle.dumps(request),
+            control=isinstance(
+                request,
+                (CancellingRequest, StartProfileRequest, StopProfileRequest)))
 
-    def _close_request_sender(self, send_sentinel: bool = False) -> None:
-        """Stop the request sender, if any, then send the shutdown sentinel if asked.
-
-        The sentinel follows every queued request. It is sent by the thread
-        that has been writing ``request_queue``: the sender thread once it has
-        started, the caller otherwise.
-        """
+    def _close_request_sender(self,
+                              send_sentinel: bool = False,
+                              *,
+                              cancel_ids: tuple[int, ...] = ()) -> None:
+        """Request bounded shutdown from the command socket's owner."""
         if self._request_sender is not None:
-            send_sentinel = self._request_sender.close(
-                timeout=5.0, send_sentinel=send_sentinel)
-        if send_sentinel:
-            self.request_queue.put_noblock(None, retry=4)
+            self._request_sender.close(timeout=7.0,
+                                       send_sentinel=send_sentinel,
+                                       cancel_ids=cancel_ids)
 
     def _get_next_client_id(self) -> int:
         client_id = super()._get_next_client_id()
@@ -1254,6 +1146,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def shutdown(self):
         if not self.workers_started:
+            monitor = getattr(self, '_worker_process_monitor', None)
+            if monitor is not None:
+                monitor.close()
             self._close_request_sender()
             self._cleanup_multi_frontend_ipc_dir()
             return
@@ -1334,7 +1229,6 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.rpc_client = None
 
         # close all the sockets
-        self.request_queue.close()
         self.worker_init_status_queue.close()
         self.result_queue.close()
         if self._resource_governor_queue is not None:
@@ -1369,6 +1263,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Sticky fast-fail: don't accept new work once the engine is known dead.
         if self._engine_dead or self._fatal_error is not None:
             raise EngineDeadError(self._fatal_error)
+        if self.doing_shutdown:
+            raise EngineUnavailableError("Executor proxy is shutting down")
 
         self._start_dispatch_threads()
 
@@ -1391,9 +1287,16 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._engine_dead or self._fatal_error is not None:
             self._results.pop(request.id, None)
             raise EngineDeadError(self._fatal_error)
+        if self.doing_shutdown:
+            self._results.pop(request.id, None)
+            raise EngineUnavailableError("Executor proxy is shutting down")
 
         with nvtx_range_debug("request_queue.put"):
-            self._send_request(request)
+            try:
+                self._send_request(request)
+            except (EngineUnavailableError, EngineDeadError):
+                self._results.pop(request.id, None)
+                raise
 
         self._handle_background_error()
 
@@ -1712,9 +1615,11 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             (attach_info["request_addr"], hmac_key),
             is_server=False,
             socket_type=zmq.PUSH,
-            name=f"frontend_{frontend_id}_request_queue")
-        self._request_sender = _create_request_sender(self.request_queue,
-                                                      self._error_queue)
+            name=f"frontend_{frontend_id}_request_queue",
+            send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+        self._request_sender = _create_request_sender(
+            self.request_queue, self._error_queue,
+            weakref.WeakMethod(self._handle_worker_death))
         self.result_queue = FusedIpcQueue(
             (attach_info["result_addrs"][frontend_id], hmac_key),
             is_server=True,
@@ -1749,18 +1654,22 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             return False
 
         if self._drain_error_queue():
-            return self._fatal_error is None and not self.doing_shutdown
+            return (self._fatal_error is None and not self.doing_shutdown
+                    and (self._request_sender is None
+                         or self._request_sender.available))
 
-        return True
+        return self._request_sender is None or self._request_sender.available
 
     def pre_shutdown(self):
         if self.doing_shutdown:
             return
         self.doing_shutdown = True
         # Abort this frontend's in-flight requests so the engine frees their
-        # slots. Never send the None engine-shutdown sentinel: the launcher
-        # frontend owns the engine lifecycle (see the class docstring).
-        self._abort_all_requests()
+        # slots. The owner sends these in bounded batches after draining its
+        # queue, so a full control queue cannot silently discard cleanup.
+        # Never send the None engine-shutdown sentinel: only the launcher
+        # frontend owns the engine lifecycle.
+        self._close_request_sender(cancel_ids=tuple(self._results))
 
     def shutdown(self):
         self.pre_shutdown()

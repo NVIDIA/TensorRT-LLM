@@ -42,8 +42,9 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
-                      StopProfileRequest)
+from .remote_worker_process_monitor import supervise_worker_process
+from .request import (_COMMAND_QUEUE_HWM, CancellingRequest, GenerationRequest,
+                      StartProfileRequest, StopProfileRequest, _CommandBarrier)
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
@@ -376,6 +377,7 @@ def _incoming_requests(request_queue: IpcQueue):
 
 
 @print_traceback_on_error
+@supervise_worker_process
 def worker_main(
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
@@ -470,7 +472,8 @@ def worker_main(
                                  is_server=multi_frontend_addrs is not None,
                                  socket_type=zmq.PULL if multi_frontend_addrs
                                  is not None else zmq.PAIR,
-                                 name="worker_request_queue")
+                                 name="worker_request_queue",
+                                 receive_hwm=_COMMAND_QUEUE_HWM)
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
             is_server=False,
@@ -664,6 +667,20 @@ def worker_main(
                 for req in _incoming_requests(request_queue):
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
+                    elif isinstance(req, _CommandBarrier):
+                        ack = IpcQueue(req.ack_addr,
+                                       is_server=False,
+                                       socket_type=zmq.PUSH,
+                                       name="worker_command_ack")
+                        try:
+                            ack.socket.setsockopt(zmq.IMMEDIATE, 1)
+                            ack.put(req.token, timeout=0.2)
+                        except zmq.Again:
+                            logger.warning(
+                                "Command recovery acknowledgement timed out")
+                        finally:
+                            ack.socket.setsockopt(zmq.LINGER, 200)
+                            ack.close()
                     elif isinstance(req, StartProfileRequest):
                         # ``PyExecutor.start_profile`` raises
                         # ``RequestError`` on the double-start path.
