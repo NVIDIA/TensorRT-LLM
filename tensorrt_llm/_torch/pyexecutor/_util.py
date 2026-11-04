@@ -92,6 +92,8 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
+_DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
+_CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS = 2
 
 # Page sizes of a standalone drafter's separate KV pool (DFlash, standalone
 # DSpark). The pool keeps the target's kv_cache_config.tokens_per_block when it
@@ -108,6 +110,15 @@ _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
 # Aggregated helix skips memory profiling, so its default KV fraction leaves
 # room for prefill activations. TODO(TRTLLM-17127): remove once helix profiles.
 _HELIX_AGG_FREE_GPU_MEMORY_FRACTION = 0.6
+
+
+def _get_num_reserved_index_slots(spec_config: Optional[SpeculativeConfig],
+                                  estimating_kv_cache: bool) -> int:
+    """Return IndexMapper headroom required by the execution policy."""
+    if getattr(spec_config, "enable_confidence_scheduling", False):
+        return (0 if estimating_kv_cache else
+                _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS)
+    return _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -963,6 +974,28 @@ def _derive_draft_max_attention_window(
         return _normalize_attention_windows(max_attention_window, max_seq_len)
 
     return None
+
+
+def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
+    """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
+    if draft_kv_config.pool_ratio is None:
+        return
+    if draft_kv_config.mixed_precision_kv is not None:
+        # An MTP draft manager with mixed-precision KV has its own pool plus a
+        # mixed-precision high pool, so the target's pool_ratio does not fit it.
+        logger.warning(
+            f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
+            "target KV cache only; the mixed-precision MTP draft KV cache sizes "
+            "its pools automatically.")
+        draft_kv_config.pool_ratio = None
+    elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
+          and len(draft_kv_config.pool_ratio) != 1):
+        # pool_ratio describes one manager's layer groups: the target's ratios do not fit the draft.
+        logger.info(
+            "Normalizing the separate one-model draft KV cache pool_ratio "
+            f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
+            "layer group.")
+        draft_kv_config.pool_ratio = [1.0]
 
 
 class KvCacheCreator:
@@ -2710,8 +2743,13 @@ class KvCacheCreator:
         max_attention_window = (None if estimating_kv_cache else
                                 self._get_draft_max_attention_window(
                                     max_seq_len, kv_cache_config))
-        return kv_cache_config.model_copy(
-            update={"max_attention_window": max_attention_window})
+        update = {"max_attention_window": max_attention_window}
+        if (kv_cache_config.mixed_precision_kv is not None and
+                not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
+            # MTP layers use mixed-precision KV like the target; a drafter with
+            # its own architecture uses the "auto" KV dtype instead.
+            update["dtype"] = "auto"
+        return kv_cache_config.model_copy(update=update)
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -2745,19 +2783,7 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
-        if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
-                and draft_kv_config.pool_ratio is not None
-                and len(draft_kv_config.pool_ratio) != 1):
-            # pool_ratio describes one manager's layer-group layout. The
-            # target hybrid manager may have separate recurrent-state and
-            # attention layer groups, while a non-VSWA draft manager has one
-            # attention layer group. Reusing the target's ratios fails its arity
-            # check.
-            logger.info(
-                "Normalizing the separate one-model draft KV cache pool_ratio "
-                f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
-                "layer group.")
-            draft_kv_config.pool_ratio = [1.0]
+        _fit_draft_pool_ratio(draft_kv_config)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -3868,6 +3894,9 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        if getattr(spec_config, "enable_confidence_scheduling", False):
+            manager_extra_kwargs["num_reserved_index_slots"] = (
+                _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
@@ -4067,6 +4096,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # The manager tells its draft layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -4125,6 +4157,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # The manager tells its draft layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
                 and model_engine is not None):

@@ -62,6 +62,7 @@ from .backends import (
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
+from .backends.sparse.mixed_precision_high_rows import store_mixed_precision_high_rows
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
 
@@ -2010,6 +2011,16 @@ class MLA(nn.Module):
                             quant_q_buffer,
                             **fp4_rope_kwargs,
                         )
+                        if getattr(attn_metadata, "has_mixed_precision_high_rows", False):
+                            # The fused kernel wrote the NVFP4 pool; also write the
+                            # mixed-precision high pool.
+                            store_mixed_precision_high_rows(
+                                self.mqa,
+                                attn_metadata,
+                                latent_cache,
+                                position_ids,
+                                is_generation=True,
+                            )
 
             if fuse_fp4_q_quant or use_fp8_mla:
                 rope_stream = None
