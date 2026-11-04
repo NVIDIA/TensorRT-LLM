@@ -169,7 +169,7 @@ message JsonObjectConstraint {}
 message GenerateResponse {
   string request_id = 1;
 
-  // PromptOutput, PrefillReady, and EngineError are request-scoped.
+  // PromptOutput, PrefillReady, EncoderReady, and EngineError are request-scoped.
   // TokenOutput and GenerationFinished are output-scoped.
   oneof event {
     PromptOutput prompt = 2;

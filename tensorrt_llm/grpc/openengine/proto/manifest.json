@@ -18,11 +18,11 @@
     "grpcio": "1.73.1"
   },
   "draft_extensions": [
-    "encoder-handoff-v1 (unpublished local proposal)"
+    "encoder-handoff-v1 (unreleased protocol proposal)"
   ],
   "source": {
     "url": "https://github.com/ai-dynamo/openengine.git",
-    "commit": "438098068bb0e1bf49a97f37c485f99310339a36",
-    "publication": "local review branch; not published"
+    "commit": "9b6f34f9efb17aa2c6b7e0ad737b78106a8ecca3",
+    "publication": "canonical review branch; not in a published BSR release"
   }
 }

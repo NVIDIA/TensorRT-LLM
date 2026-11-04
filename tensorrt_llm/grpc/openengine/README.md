@@ -336,11 +336,13 @@ Conversation-affinity placement requires `attention_dp_config.kv_cache_routing_c
 
 For disaggregated subagent context requests, configure `internal_request_auth_key` in the `trtllm-serve` config and use the same key in the Dynamo sidecar's `TRTLLM_SUBAGENT_AFFINITY_AUTH_KEY`. The sidecar sends the parent session as signed `x-trtllm-subagent-affinity-id` and `x-trtllm-subagent-affinity-auth` gRPC metadata. OpenEngine accepts the hint only on `context_only` requests with a stable child `extra["conversation_id"]` and conversation-aware attention DP; it passes the parent to the ADP router without changing the child conversation ID. `ServerInfo.extra.trtllm_supports_subagent_affinity` reports whether the receiving server is configured for this extension. Keep the gRPC listener behind a trusted gateway: the signature authenticates the sidecar-to-engine hop, while the gateway must authorize the parent-child relationship. OpenEngine rejects `openengine-routing-key` and unknown `openengine-*` metadata rather than silently ignoring routing requests.
 
-## Image encoder handoff (local draft)
+## Image encoder handoff (experimental)
 
-This branch adds an unpublished `EncoderOptions` / `EncoderReady` protocol
-extension for TP1 image E+PD with negotiated encoder-output transport. It is not in the published schema or
-nightly images. Both client and server need the matching draft bindings.
+Image E+PD uses the `EncoderOptions` / `EncoderReady` contract proposed in
+[OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
+immutable source revision in the vendor lock. Both client and server need the
+matching bindings; this proposal is not in a published BSR release or runtime.
+TP/PP/CP must each be 1.
 
 For the optional shared-file backend, set `TRTLLM_OPENENGINE_ENCODER_CACHE_DIR`
 to the same private directory in both
@@ -365,7 +367,7 @@ to 256 MiB, with at most one additional 64 MiB publication temporary under the
 cache lock. Tensor data is limited to 64 MiB per result. The shared-file backend rejects cross-host references. Both backends reject
 video/audio inputs and E+P+D handoffs.
 
-### Networked encoder handoffs (local protocol draft)
+### Networked encoder handoffs
 
 Set `TRTLLM_OPENENGINE_ENCODER_TRANSFER=nixl` on encoder and consumer engines.
 Both must load the same immutable checkpoint revision and set
@@ -392,5 +394,5 @@ registered tensor storage is bounded to 256 MiB per engine (64 MiB per request).
 An uncertain transfer stops admission and retains affected registrations and
 buffers until process exit. A missing RPC reply does not establish that a remote
 write stopped. Restart an unhealthy engine; do not retry a consumed handoff.
-The cross-host GPU path currently requires the matching local protocol and
-serving changes; a published runtime containing them is not yet available.
+The cross-host GPU path requires the matching protocol and serving changes;
+a published runtime containing them is not yet available.
