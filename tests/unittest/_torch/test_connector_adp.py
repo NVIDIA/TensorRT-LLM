@@ -115,6 +115,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.hang_detector.detected.return_value = False
     executor._profile_manager = MagicMock()
     executor.draft_model_engine = None
+    executor.enable_joint_kv_cache_reuse = False
     executor.sampler = None
     executor.worker_thread = MagicMock()
     executor._shutdown_sleep_wakeup_listeners = MagicMock()
