@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +15,7 @@ from PIL import Image, UnidentifiedImageError
 
 from tensorrt_llm.inputs.media_io import sniff_media_kind
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.openai_protocol import (
+from tensorrt_llm.serve.api.visual_gen.protocol import (
     ImageEditRequest,
     ImageGenerationRequest,
     VideoGenerationRequest,

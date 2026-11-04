@@ -200,11 +200,13 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_vanilla_key_padding_mask.py
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py
+  - unittest/_torch/visual_gen/test_visual_gen_startup_shutdown.py
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
   - unittest/_torch/visual_gen/test_wan_i2v_reference_conditioning.py
   - unittest/_torch/visual_gen/test_wan_timestep_routing.py
   - unittest/_torch/weight_sharing
   - unittest/api_stability
+  - unittest/api_stability/visual_gen/test_visual_gen_serve_api.py
   - unittest/bindings
   - unittest/disaggregated
   - unittest/docs/test_llmapi_reference_docs.py
@@ -290,6 +292,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_serving_extensions.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
+  - unittest/llmapi/apps/visual_gen/test_serve_visual_gen_isolation.py
   - unittest/llmapi/test_iteration_logging.py
   - unittest/llmapi/test_bench_async.py
   - unittest/llmapi/test_config_overrides.py
@@ -334,7 +337,6 @@ l0_cpu:
   - unittest/llmapi/test_tokenizer_decode.py
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
   - unittest/llmapi/test_utils.py
-  - unittest/llmapi/test_visual_gen_startup_shutdown.py
   - unittest/metrics/test_collector.py
   - unittest/models/test_quant_config_utils.py
   - unittest/others
@@ -342,6 +344,11 @@ l0_cpu:
   - unittest/quantization/test_nvfp4_plus_format.py
   - unittest/scaffolding
   - unittest/scripts
+  - unittest/serve
+  # VisualGen serve tests are also collected by the entry above. This entry keeps
+  # them for VisualGen-only PRs, where CBTS keeps only entries containing visual_gen/
+  # (with the trailing slash).
+  - unittest/serve/api/visual_gen/
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py

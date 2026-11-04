@@ -336,9 +336,10 @@ def _run_benchmark(
 
     Each per-request ``latency`` window covers ``generate()`` plus a
     ``save()`` to a per-run temp directory. The save mirrors what the
-    serving path (``openai_video_routes.py`` / ``openai_server.py``) does
-    inside its own ``latency`` window: encode and write to a persisted
-    location. The directory is cleaned up at the end of the run.
+    serving path (``serve/api/visual_gen/serving_videos.py`` /
+    ``serving_images.py``) does inside its own ``latency`` window: encode
+    and write to a persisted location. The directory is cleaned up at the
+    end of the run.
     """
     import asyncio
 

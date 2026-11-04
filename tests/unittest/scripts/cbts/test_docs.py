@@ -176,6 +176,7 @@ def test_documentation_does_not_trigger_backend_rules() -> None:
     assert not _is_openengine_claim("tensorrt_llm/grpc/openengine/guide.rst")
     assert not _is_spec_claim("examples/eagle/guide.rst")
     assert not _is_vg_claim("examples/visual_gen/guide.rst")
+    assert not _is_vg_claim("tensorrt_llm/serve/api/visual_gen/guide.rst")
 
 
 def test_modeling_v2_entries_cover_unit_and_accuracy_tests() -> None:

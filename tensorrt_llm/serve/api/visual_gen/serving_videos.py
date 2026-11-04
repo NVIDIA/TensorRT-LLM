@@ -1,14 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Video-generation route handlers for the OpenAI-compatible server.
-
-Extracted from ``openai_server.py`` as a small mixin to keep that file
-under the project's per-file line budget. ``OpenAIServer`` consumes this
-mixin via subclassing; the handlers reach back into the server via
-``self`` (e.g. ``self.generator``, ``self.media_storage_path``,
-``self.create_error_response``, ``self.video_gen_tasks``), so behavior
-is strictly unchanged from the inlined version.
-"""
+"""VisualGen video endpoints: ``VideoServing`` and its module helpers."""
 
 from __future__ import annotations
 
@@ -30,18 +22,25 @@ from pydantic import ValidationError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
-from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
-from tensorrt_llm.serve.visual_gen_metrics import (
+from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
+from tensorrt_llm.serve.api.visual_gen.metrics import (
     build_visual_gen_server_timings,
     build_visual_gen_timing_headers,
 )
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
+from tensorrt_llm.serve.api.visual_gen.protocol import (
+    VideoGenerationRequest,
+    VideoJob,
+    VideoJobList,
+)
+from tensorrt_llm.serve.api.visual_gen.serving_base import VisualGenBaseServing
+from tensorrt_llm.serve.api.visual_gen.utils import VIDEO_STORE, parse_visual_gen_params
 
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
+    from tensorrt_llm._utils import AdjustedSteadyClock
     from tensorrt_llm.visual_gen.params import VisualGenParams
-    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+    from tensorrt_llm.visual_gen.visual_gen import VisualGen, VisualGenResult
 
 
 def _video_content_type(suffix: str) -> str:
@@ -129,14 +128,25 @@ def _path_json_video_response(
     return JSONResponse(content={"id": video_id, "output_path": str(path)}, headers=headers)
 
 
-class _VideoRoutesMixin:
-    """Mixin providing the eight video-generation endpoints.
+class VideoServing(VisualGenBaseServing):
+    """Video generation endpoints (sync, async jobs, listing, metadata, content, delete)."""
 
-    Concrete subclasses (``OpenAIServer``) supply ``self.generator``,
-    ``self.media_storage_path``, ``self.video_gen_tasks``, ``self.model``,
-    ``self._adjusted_steady_clock``, and ``self.create_error_response`` from
-    their own initializer.
-    """
+    def __init__(
+        self,
+        *,
+        generator: VisualGen,
+        model: str,
+        media_storage_path: Path,
+        adjusted_clock: AdjustedSteadyClock,
+    ) -> None:
+        super().__init__(
+            generator=generator,
+            model=model,
+            media_storage_path=media_storage_path,
+            adjusted_clock=adjusted_clock,
+        )
+        # Background generation tasks by video id (instance state).
+        self.video_gen_tasks: dict[str, asyncio.Task] = {}
 
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
         """Synchronous video generation endpoint.
@@ -171,12 +181,10 @@ class _VideoRoutesMixin:
                 sync_video_start = time.perf_counter()
                 # Awaited, not fire-and-forget: bad media / bad params must
                 # surface as a 400 rather than a failed job.
-                handle = await asyncio.to_thread(
-                    self.generator.generate_async, request.prompt, params
-                )
+                handle = await self._generate(request.prompt, params)
                 output = await handle.aresult()
             except ValidationError as exc:
-                return self._render_pydantic_validation_error(exc)
+                return render_visual_gen_validation_error(exc, self.create_error_response)
             except ValueError as exc:
                 logger.error(f"Video request error: {exc}")
                 return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
@@ -270,7 +278,7 @@ class _VideoRoutesMixin:
             )
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(exc, self.create_error_response)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(
@@ -345,35 +353,6 @@ class _VideoRoutesMixin:
             f"Unsupported content-type: {content_type}. Use 'application/json' or 'multipart/form-data'"
         )
 
-    def _render_pydantic_validation_error(self, exc: ValidationError) -> Response:
-        """Render a multipart Pydantic ``ValidationError`` as the LLM envelope.
-
-        The visual-gen-scoped 422 envelope is the same shape JSON requests
-        get from the FastAPI ``RequestValidationError`` handler, so JSON
-        and multipart clients see indistinguishable bodies on bad
-        payloads.
-        """
-        parts: list[str] = []
-        for err in exc.errors():
-            loc = ".".join(str(seg) for seg in err.get("loc", ()) if seg != "body")
-            etype = err.get("type", "")
-            msg = err.get("msg", "")
-            if etype == "extra_forbidden":
-                parts.append(
-                    f"Unknown request field {loc!r}. Pass model-specific "
-                    "parameters via 'extra_params' instead."
-                )
-            elif loc:
-                parts.append(f"{loc}: {msg}")
-            else:
-                parts.append(msg)
-        message = "; ".join(parts) if parts else str(exc)
-        return self.create_error_response(
-            message=message,
-            err_type="BadRequestError",
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
-        )
-
     async def openai_video_generation_async(
         self,
         raw_request: Request,
@@ -422,7 +401,7 @@ class _VideoRoutesMixin:
 
             # Awaited before the 202, so bad media / unknown extra_params are a
             # 400 rather than a queued job that later fails.
-            handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
+            handle = await self._generate(request.prompt, params)
 
             # Persist the queued job before scheduling the background task so
             # that a fast-completing task can always look it up in VIDEO_STORE.
@@ -456,7 +435,7 @@ class _VideoRoutesMixin:
             return JSONResponse(content=video_job.model_dump(), status_code=202)
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(exc, self.create_error_response)
         except ValueError as e:
             logger.error(f"Async video request error: {e}")
             return self.create_error_response(str(e), status_code=HTTPStatus.BAD_REQUEST)

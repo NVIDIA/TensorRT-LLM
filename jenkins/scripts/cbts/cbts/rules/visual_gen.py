@@ -15,8 +15,9 @@
 
 VisualGen is a self-contained subsystem under
 `tensorrt_llm/_torch/visual_gen/` (Flux / LTX-2 / Wan diffusion models)
-plus the public API surface at `tensorrt_llm/visual_gen/` and the media
-helpers at `tensorrt_llm/media/`.
+plus the public API surface at `tensorrt_llm/visual_gen/`, the media
+helpers at `tensorrt_llm/media/` and the HTTP serving package at
+`tensorrt_llm/serve/api/visual_gen/`.
 
 Block selection — entry-pattern based only:
 VisualGen does NOT have its own `condition.terms.backend`; VG test
@@ -29,6 +30,15 @@ Public VisualGen and media modules participate in shared serving imports.
 Their changes keep the complete CPU suite, shared serving integration tests,
 and package/performance sanity checks in addition to VG entries. Missing API,
 schema, lazy-import, or serving validation keeps the baseline fallback.
+
+Internal serving package:
+`tensorrt_llm/serve/api/visual_gen/` is internal, not shared: no module
+outside it imports it except the trtllm-serve composition root for the
+VISUAL_GEN role, the routing table's module-path string, the lazy
+re-export in `tensorrt_llm.serve.openai_protocol` and the VisualGen
+benchmark client, so a change under it narrows like the other internal
+VG paths. `tests/unittest/llmapi/apps/visual_gen/test_serve_visual_gen_isolation.py`
+asserts this; if it fails, claiming this prefix is no longer safe.
 """
 
 from __future__ import annotations
@@ -57,6 +67,7 @@ _VG_SRC_PREFIXES: tuple[str, ...] = (
     "scripts/visualgen_eval/",
     "tensorrt_llm/_torch/visual_gen/",
     "tensorrt_llm/media/",
+    "tensorrt_llm/serve/api/visual_gen/",
     "tensorrt_llm/visual_gen/",
 )
 
@@ -64,6 +75,8 @@ _VG_SCHEMA_PATH = "tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.js
 _SCHEMA_TEST_TARGET = "unittest/llmapi/test_trtllm_serve_config_schemas.py"
 
 # These packages expose shared protocol and media dependencies to serving.
+# `tensorrt_llm/serve/api/visual_gen/` is not listed: it is internal (see the
+# module docstring).
 _VG_OUTWARD_PREFIXES: tuple[str, ...] = (
     "tensorrt_llm/media/",
     "tensorrt_llm/visual_gen/",
