@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-310 captured fields.
+333 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -71,6 +71,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cp_config.use_nccl_for_alltoall` | `bool\|none` | `value` |  |
 | `cuda_graph_config.batch_sizes` | `list[int]\|none` | `value` |  |
 | `cuda_graph_config.enable_padding` | `bool` | `value` |  |
+| `cuda_graph_config.extra_model_inputs.shape` | `list[tuple[int\|literal]]` | `categorical` | `num_tokens`, `batch_size` |
 | `cuda_graph_config.max_batch_size` | `int` | `value` |  |
 | `cuda_graph_config.max_num_token` | `int` | `value` |  |
 | `cuda_graph_config.max_seq_len` | `int` | `value` |  |
@@ -85,6 +86,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `dwdp_config.num_experts_per_worker` | `int` | `value` |  |
 | `dwdp_config.num_groups` | `int` | `value` |  |
 | `dwdp_config.num_prefetch_experts` | `int` | `value` |  |
+| `dwdp_config.num_prefetch_slots` | `int` | `value` |  |
 | `enable_attention_dp` | `bool` | `value` |  |
 | `enable_autotuner` | `bool` | `value` |  |
 | `enable_chunked_prefill` | `bool` | `value` |  |
@@ -96,6 +98,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_iter_req_stats` | `bool` | `value` |  |
 | `enable_layerwise_nvtx_marker` | `bool` | `value` |  |
 | `enable_lm_head_tp_in_adp` | `bool` | `value` |  |
+| `enable_locality_domains` | `bool` | `value` |  |
 | `enable_lora` | `bool` | `value` |  |
 | `enable_low_latency_host_dispatch` | `bool` | `value` |  |
 | `enable_min_latency` | `bool` | `value` |  |
@@ -107,6 +110,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `encode_only` | `bool` | `value` |  |
 | `encoder_cuda_graph_config.batch_sizes` | `list[int]\|none` | `value` |  |
 | `encoder_cuda_graph_config.enable_padding` | `bool` | `value` |  |
+| `encoder_cuda_graph_config.extra_model_inputs.shape` | `list[tuple[int\|literal]]` | `categorical` | `num_tokens`, `batch_size` |
 | `encoder_cuda_graph_config.max_batch_size` | `int` | `value` |  |
 | `encoder_cuda_graph_config.max_num_token` | `int` | `value` |  |
 | `encoder_cuda_graph_config.max_seq_len` | `int` | `value` |  |
@@ -122,15 +126,19 @@ unset or when the safety sanitizer rejects the runtime value.
 | `gms_config.mode` | `literal` | `categorical` | `auto`, `rw`, `ro` |
 | `gpus_per_node` | `int\|none` | `value` |  |
 | `guided_decoding_backend` | `literal\|none` | `categorical` | `xgrammar`, `llguidance` |
+| `iter_perf_stats_interval` | `int` | `value` |  |
 | `iter_stats_max_iterations` | `int\|none` | `value` |  |
 | `kv_cache_compression_config.algorithm` | `literal` | `categorical` | `quantization_for_cold_page`, `triattention` |
 | `kv_cache_compression_config.beta` | `int` | `value` |  |
 | `kv_cache_compression_config.budget` | `int` | `value` |  |
 | `kv_cache_compression_config.eviction_mode` | `literal` | `categorical` | `union`, `per_head`, `per_layer_perhead` |
 | `kv_cache_compression_config.normalize_scores` | `bool` | `value` |  |
+| `kv_cache_compression_config.nvfp4_residual_dim` | `literal` | `categorical` | `0`, `64` |
 | `kv_cache_compression_config.quant` | `literal` | `categorical` | `nvfp4` |
+| `kv_cache_compression_config.skip_rope_quantization` | `bool` | `value` |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `int` | `value` |  |
 | `kv_cache_config.avg_seq_len` | `int\|none` | `value` |  |
+| `kv_cache_config.block_reuse_config.enable_branch_snapshot` | `bool` | `value` |  |
 | `kv_cache_config.block_reuse_config.max_num_turns` | `int` | `value` |  |
 | `kv_cache_config.block_reuse_config.policy` | `literal` | `categorical` | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` | `int` | `value` |  |
@@ -139,7 +147,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
 | `kv_cache_config.disk_prefetch_num_reqs` | `int` | `value` |  |
-| `kv_cache_config.dtype` | `allowlist` | `categorical` | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `fp8_ds_mla`, `nvfp4` |
+| `kv_cache_config.dtype` | `allowlist` | `categorical` | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `fp8_ds_mla`, `nvfp4`, `mixed_nvfp4_fp8`, `mixed_nvfp4_float16`, `mixed_nvfp4_bfloat16` |
 | `kv_cache_config.enable_block_reuse` | `bool` | `value` |  |
 | `kv_cache_config.enable_kv_pool_rebalance` | `bool` | `value` |  |
 | `kv_cache_config.enable_partial_reuse` | `bool` | `value` |  |
@@ -155,23 +163,33 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.kv_events_config.hwm` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.max_queue_size` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.publisher` | `literal\|none` | `categorical` | `null`, `zmq` |
+| `kv_cache_config.kv_pool_rebalance_config.check_interval` | `int` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.cooldown_secs` | `float` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches` | `int` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.moving_average_decay` | `float` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.ratio_tolerance` | `float` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval` | `int` | `value` |  |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `literal` | `categorical` | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `int` | `value` |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `bool` | `value` |  |
-| `kv_cache_config.mamba_state_config.enable_branch_snapshot` | `bool` | `value` |  |
 | `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `int` | `value` |  |
 | `kv_cache_config.max_attention_window` | `list[int]\|none` | `value` |  |
 | `kv_cache_config.max_gpu_total_bytes` | `int` | `value` |  |
 | `kv_cache_config.max_tokens` | `int\|none` | `value` |  |
 | `kv_cache_config.max_util_for_resume` | `float` | `value` |  |
+| `kv_cache_config.mixed_precision_first_n` | `int` | `value` |  |
+| `kv_cache_config.mixed_precision_last_n` | `int` | `value` |  |
 | `kv_cache_config.pool_ratio` | `list[float]\|none` | `value` |  |
 | `kv_cache_config.sink_token_length` | `int\|none` | `value` |  |
 | `kv_cache_config.tokens_per_block` | `int` | `value` |  |
 | `kv_cache_config.use_kv_cache_manager_v2` | `bool\|literal` | `categorical` | `auto` |
 | `kv_cache_config.use_uvm` | `bool` | `value` |  |
-| `kv_connector_config.connector` | `allowlist\|none` | `categorical` | `lmcache`, `lmcache-mp`, `kvbm` |
+| `kv_connector_config.connector` | `allowlist\|none` | `categorical` | `lmcache`, `lmcache-mp`, `kvbm`, `mooncake-store` |
+| `kv_connector_config.mooncake_store.role` | `literal` | `categorical` | `both`, `producer`, `consumer`, `capacity` |
+| `kv_connector_config.mooncake_store.segment_size` | `int` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_layer_indices` | `list[int]\|none` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_mode` | `literal` | `categorical` | `NONE`, `MARK`, `COLLECT` |
+| `lm_head_output_dtype` | `literal` | `categorical` | `auto`, `float32` |
 | `load_format` | `allowlist\|enum[LoadFormat]` | `categorical` | `auto`, `dummy`, `vision_only`, `gms`, `AUTO`, `DUMMY`, `VISION_ONLY`, `GMS` |
 | `lora_config.cuda_graph_specialize_lora` | `bool` | `value` |  |
 | `lora_config.lora_ckpt_source` | `literal` | `categorical` | `hf`, `nemo` |
@@ -188,6 +206,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `max_stats_len` | `int` | `value` |  |
 | `mla_skip_correction_threshold` | `float` | `value` |  |
 | `mm_encoder_only` | `bool` | `value` |  |
+| `modeling_v2` | `literal` | `categorical` | `off`, `auto`, `require` |
 | `moe_cluster_parallel_size` | `int\|none` | `value` |  |
 | `moe_config.backend` | `literal` | `categorical` | `AUTO`, `CUTLASS`, `CUTEDSL`, `CUTEDSL_FC12`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
 | `moe_config.disable_finalize_fusion` | `bool` | `value` |  |
@@ -216,6 +235,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `peft_cache_config.num_host_module_layer` | `int` | `value` |  |
 | `peft_cache_config.num_put_workers` | `int` | `value` |  |
 | `peft_cache_config.optimal_adapter_size` | `int` | `value` |  |
+| `per_request_spec_decode_stats` | `bool` | `value` |  |
 | `perf_metrics_max_requests` | `int` | `value` |  |
 | `pipeline_parallel_size` | `int` | `value` |  |
 | `pp_partition` | `list[int]\|none` | `value` |  |
@@ -248,11 +268,12 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.use_python_scheduler` | `bool` | `value` |  |
 | `scheduler_config.waiting_queue_policy` | `enum[WaitingQueuePolicy]` | `categorical` | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `bool` | `value` |  |
-| `sparse_attention_config.algorithm` | `literal` | `categorical` | `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
+| `sparse_attention_config.algorithm` | `literal` | `categorical` | `csa2`, `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
 | `sparse_attention_config.compress_ratios` | `list[int]` | `value` |  |
 | `sparse_attention_config.enable_heuristic_topk` | `bool` | `value` |  |
 | `sparse_attention_config.enable_kv_cache_offload` | `bool` | `value` |  |
 | `sparse_attention_config.fuse_qkv_index_projection` | `bool` | `value` |  |
+| `sparse_attention_config.gvr_deterministic_topk` | `bool` | `value` |  |
 | `sparse_attention_config.implementation` | `literal` | `categorical` | `triton`, `msa` |
 | `sparse_attention_config.index_head_dim` | `int\|none` | `value` |  |
 | `sparse_attention_config.index_n_heads` | `int\|none` | `value` |  |
@@ -285,6 +306,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.topr` | `float\|int\|none` | `value` |  |
 | `sparse_attention_config.use_cute_dsl_paged_mqa_logits` | `bool` | `value` |  |
 | `sparse_attention_config.use_cute_dsl_topk` | `bool` | `value` |  |
+| `sparse_attention_config.use_fp8_staging` | `bool\|none` | `value` |  |
 | `sparse_attention_config.use_gvr_emission` | `bool` | `value` |  |
 | `sparse_attention_config.use_self_sampling_topk` | `bool` | `value` |  |
 | `sparse_attention_config.uses_spcompress` | `bool` | `value` |  |
@@ -296,6 +318,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM`, `FA4`, `AUTO`, `CUTEDSL` |
 | `speculative_config.begin_thinking_phase_token` | `int` | `value` |  |
 | `speculative_config.block_size` | `int\|none` | `value` |  |
+| `speculative_config.context_recompute_tail` | `int\|none` | `value` |  |
 | `speculative_config.decoding_type` | `literal` | `categorical` | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `int\|none` | `value` |  |
 | `speculative_config.eagle3_layers_to_capture` | `none\|set[int]` | `value` |  |
@@ -316,13 +339,13 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_non_leaves_per_layer` | `int\|none` | `value` |  |
 | `speculative_config.max_total_draft_tokens` | `int\|none` | `value` |  |
 | `speculative_config.moe_backend` | `literal\|none` | `categorical` | `AUTO`, `CUTLASS`, `CUTEDSL`, `CUTEDSL_FC12`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
-| `speculative_config.num_eagle_layers` | `int\|none` | `value` |  |
 | `speculative_config.num_nextn_predict_layers` | `int\|none` | `value` |  |
 | `speculative_config.relaxed_delta` | `float` | `value` |  |
 | `speculative_config.relaxed_topk` | `int` | `value` |  |
 | `speculative_config.sa_config.enable_global_pool` | `bool` | `value` |  |
 | `speculative_config.sa_config.threshold` | `int` | `value` |  |
 | `speculative_config.skip_ctx_buffer_budget_check` | `bool` | `value` |  |
+| `speculative_config.spec_dec_variant` | `int\|none` | `value` |  |
 | `speculative_config.target_layer_ids` | `list[int]\|none` | `value` |  |
 | `speculative_config.use_dynamic_tree` | `bool\|none` | `value` |  |
 | `speculative_config.use_mtp_vanilla` | `bool` | `value` |  |
@@ -335,6 +358,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `tensor_parallel_size` | `int` | `value` |  |
 | `tokenizer_mode` | `literal` | `categorical` | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `list[int]\|none` | `value` |  |
+| `torch_compile_config.compile_only_piecewise_graphs` | `bool` | `value` |  |
 | `torch_compile_config.enable_fullgraph` | `bool` | `value` |  |
 | `torch_compile_config.enable_inductor` | `bool` | `value` |  |
 | `torch_compile_config.enable_piecewise_cuda_graph` | `bool` | `value` |  |

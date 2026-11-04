@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from utils.util import getSMVersion, skip_blackwell_geforce, skip_pre_blackwell
+from utils.util import isSM120Family, skip_blackwell_geforce, skip_pre_blackwell
 
 # from utils.util import default_dtype
 import tensorrt_llm
@@ -46,6 +46,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
+    DeepseekV4MoE,
     DeepseekV4MTP,
     DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
@@ -540,7 +541,7 @@ def test_deepseek_v4_mla_builds_both_norms_at_the_v4_widths():
             index_n_heads=32, index_head_dim=128, index_topk=512
         ),
     )
-    if getSMVersion() in (120, 121):
+    if isSM120Family():
         # SM120/SM121 only support DeepSeek-V4 sparse MLA through the FlashInfer
         # fp8_ds_mla path; construction raises ValueError with any other dtype.
         model_config.extra_attrs["kv_cache_dtype"] = "fp8_ds_mla"
@@ -606,7 +607,7 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     monkeypatch.setattr(
         DeepseekV4TrtllmAttention,
         "_prepare_sparse_forward_args",
-        lambda self, metadata, forward_args: None,
+        lambda self, metadata, forward_args: forward_args,
     )
     attn = object.__new__(DeepseekV4TrtllmAttention)
     sink = torch.ones(4, dtype=torch.float32)
@@ -676,6 +677,124 @@ def test_deepseek_v4_nvfp4_mixed_precision_config():
         normalized_config.quant_config_dict["model.layers.0.mlp.experts"].quant_algo
         == QuantAlgo.NVFP4
     )
+
+
+@pytest.mark.parametrize(
+    ("quant_config_dict", "exclude_modules", "expected"),
+    [
+        (None, None, True),
+        (
+            {"model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None)},
+            None,
+            False,
+        ),
+        (
+            {"model.layers.4.mlp.shared_experts.down_proj": QuantConfig(quant_algo=None)},
+            None,
+            False,
+        ),
+        (None, ["*shared_experts.gate_up_proj"], False),
+        (None, ["*shared_experts.down_proj"], False),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+                "model.layers.4.mlp.shared_experts.up_proj": QuantConfig(quant_algo=None),
+            },
+            None,
+            True,
+        ),
+        # The actual shared gate/up module is one fused Linear: its first
+        # gate_proj/gate_up_proj override wins and up-only overrides are ignored.
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None),
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+            },
+            None,
+            False,
+        ),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None),
+            },
+            None,
+            True,
+        ),
+        (None, ["*shared_experts.gate_proj"], False),
+        (None, ["*shared_experts.up_proj"], False),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=64
+                ),
+                "model.layers.4.mlp.shared_experts.down_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=64
+                ),
+            },
+            None,
+            False,
+        ),
+    ],
+)
+def test_deepseek_v4_shared_fc12_uses_final_projection_quantization(
+    quant_config_dict, exclude_modules, expected
+):
+    model_config = ModelConfig(
+        pretrained_config=DeepseekV4Config(),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+            group_size=128,
+            exclude_modules=exclude_modules,
+        ),
+        quant_config_dict=quant_config_dict,
+    )
+
+    gate_up_quant, down_quant = DeepseekV4MoE._get_shared_expert_projection_quant_configs(
+        model_config, layer_idx=4
+    )
+
+    assert DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant) is expected
+
+
+@pytest.mark.parametrize(("supported", "expected"), [(False, False), (True, True)])
+def test_deepseek_v4_shared_fc12_uses_backend_capability(supported, expected):
+    backend = SimpleNamespace(
+        capabilities=SimpleNamespace(supports_per_layer_dynamic_eplb=supported)
+    )
+
+    assert DeepseekV4MoE._shared_fc12_backend_supported(backend) is expected
+
+
+def test_deepseek_v4_shared_fc12_rejects_backend_without_capabilities():
+    assert not DeepseekV4MoE._shared_fc12_backend_supported(SimpleNamespace())
+
+
+def test_deepseek_v4_shared_fc12_ignores_up_only_layerwise_override():
+    global_quant_config = QuantConfig(quant_algo=None)
+    fp8_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+    model_config = ModelConfig(
+        pretrained_config=DeepseekV4Config(),
+        quant_config=global_quant_config,
+        quant_config_dict={
+            "model.layers.4.mlp.shared_experts.up_proj": fp8_quant_config,
+            "model.layers.4.mlp.shared_experts.down_proj": fp8_quant_config,
+        },
+    )
+
+    gate_up_quant, down_quant = DeepseekV4MoE._get_shared_expert_projection_quant_configs(
+        model_config, layer_idx=4
+    )
+
+    assert gate_up_quant is global_quant_config
+    assert down_quant is fp8_quant_config
+    assert not DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant)
 
 
 def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):
@@ -1258,7 +1377,7 @@ def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, 
             256,
             tensorrt_llm.bindings.DataType.FP8,
             marks=pytest.mark.skipif(
-                getSMVersion() not in (120, 121),
+                not isSM120Family(),
                 reason="FlashInfer sparse MLA requires SM 120 or SM 121",
             ),
             id="fp8-ds-mla",

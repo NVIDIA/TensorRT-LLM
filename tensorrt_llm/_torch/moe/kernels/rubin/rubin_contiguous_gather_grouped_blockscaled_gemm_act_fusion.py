@@ -39,6 +39,9 @@ from cutlass.utils.gemm.sm100 import (
     transform_partitioned_tensor_layout,
 )
 
+from tensorrt_llm.quantization.utils.fp4_utils import float_to_ue5m3, ue5m3_to_float
+
+from ....kernels.rubin.ue5m3_utils import f32_to_ue5m3, ue5m3_to_f32
 from ....utils import ActivationType, is_gated_activation
 
 try:
@@ -213,6 +216,19 @@ contiguous dim ≥ 16B aligned (16/32 elems for f8/f4).
 For CUDA graph, A/C/SFA/token_id_mapping/tile_idx_to_expert_idx can be padded
 to permuted_m; padded tiles are filtered by the scheduler.
 """
+
+
+def _sfa_k_tiles_per_copy(
+    cta_tile_k: int, sf_vec_size: int, sf_dtype: Type[cutlass.Numeric]
+) -> int:
+    """K tiles of activation scales that one 16 B gather copy covers.
+
+    A row has ``cta_tile_k // sf_vec_size`` scales per K tile: 16 B at
+    sf_vec_size 16, 8 B at 32. A cp.async below 16 B must allocate in L1
+    (cp.async.ca), which stalls the gather, so 8 B rows copy the aligned pair
+    of K tiles that holds the current one with cp.async.cg.
+    """
+    return max(1, 128 // (cta_tile_k // sf_vec_size * sf_dtype.width))
 
 
 class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
@@ -545,7 +561,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         self.mma_tiler_sfa = (
             self.mma_inst_shape[0],
             self.mma_inst_shape[1],
-            mma_inst_shape_k * mma_inst_tile_k // 16,
+            mma_inst_shape_k * mma_inst_tile_k // self.sf_vec_size,
         )
         self.cta_tile_shape_mnk_sfa = (
             self.mma_tiler_sfa[0] // cute.size(tiled_mma.thr_id.shape),
@@ -646,14 +662,18 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             self.num_ab_stage,
         )
 
-        # SFA SMEM is plain linear (M_per_cta, tile_K_sf, stage), no pad.
-        # Each thread does one CpAsync128.CG (16B = tile_K_sf=16 × FP8) per row.
+        # SFA SMEM is plain linear (M_per_cta, copy_K_sf, stage), no pad.
+        # Each thread does one CpAsync128.CG per row: the K tile's 16 FP8 SFs
+        # at sf_vec_size 16, the aligned pair of K tiles (2 x 8) at 32.
         # Layout exposes (row, k_sf_byte, stage) with byte strides.
-        sfa_tile_k_sf = self.cta_tile_shape_mnk[2] // self.sf_vec_size
-        sf_bytes_per_row = sfa_tile_k_sf * self.sf_dtype.width // 8
+        self.sfa_k_tiles_per_copy = _sfa_k_tiles_per_copy(
+            self.cta_tile_shape_mnk[2], self.sf_vec_size, self.sf_dtype
+        )
+        sfa_copy_k_sf = self.cta_tile_shape_mnk[2] // self.sf_vec_size * self.sfa_k_tiles_per_copy
+        sf_bytes_per_row = sfa_copy_k_sf * self.sf_dtype.width // 8
         sfa_bytes_per_stage = self.cta_tile_shape_mnk[0] * sf_bytes_per_row
         self.sfa_smem_layout_staged = cute.make_layout(
-            (self.cta_tile_shape_mnk[0], sfa_tile_k_sf, self.num_ab_stage),
+            (self.cta_tile_shape_mnk[0], sfa_copy_k_sf, self.num_ab_stage),
             stride=(sf_bytes_per_row, 1, sfa_bytes_per_stage),
         )
         self.sfa_smem_alloc_bytes = self.num_ab_stage * sfa_bytes_per_stage
@@ -2099,14 +2119,17 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
 
                 ab_pipeline.producer_tail(ab_producer_state)
 
-        # Gather SFA warps (warps 12-15): CpAsync128.CG per row. 4 warps × 32
-        # threads, each loads one row (16B = 16 FP8 SFs). sSFA is plain linear
-        # (M, tile_K_sf, stage). tiled_copy_tv for SMEM dest + manual per-thread
+        # Gather SFA warps (warps 12-15): one CpAsync128.CG per row. 4 warps ×
+        # 32 threads, each loads one row (16 SFs: one K tile at sf_vec_size 16,
+        # the aligned pair of K tiles at 32). sSFA is plain linear
+        # (M, copy_K_sf, stage). tiled_copy_tv for SMEM dest + manual per-thread
         # GMEM source tensor.
         if warp_idx <= self.gather_sfa_warp_id[-1] and warp_idx >= self.gather_sfa_warp_id[0]:
             cute.arch.setmaxregister_decrease(self.num_regs_gather_sfa_warps)
 
-            sfa_tile_k_sf = self.cta_tile_shape_mnk[2] // self.sf_vec_size  # 16
+            # 16 SFs (16 B) per row per k_tile at sf_vec_size 16, 8 at 32.
+            sfa_tile_k_sf = self.cta_tile_shape_mnk[2] // self.sf_vec_size
+            sfa_copy_k_sf = sfa_tile_k_sf * self.sfa_k_tiles_per_copy
             sfa_gather_threads = len(self.gather_sfa_warp_id) * self.threads_per_warp
             # Rows per thread = cta_tile_M / gather_threads.
             # - non-breuse cta_tile_M=128: 1 row per thread
@@ -2125,13 +2148,13 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 layout=cute.make_layout(
                     (
                         self.cta_tile_shape_mnk[0],
-                        sfa_tile_k_sf,
+                        sfa_copy_k_sf,
                         self.num_ab_stage,
                     ),
                     stride=(
-                        sfa_tile_k_sf,
+                        sfa_copy_k_sf,
                         1,
-                        self.cta_tile_shape_mnk[0] * sfa_tile_k_sf,
+                        self.cta_tile_shape_mnk[0] * sfa_copy_k_sf,
                     ),
                 ),
             )
@@ -2186,19 +2209,22 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                             else cutlass.Boolean(0)
                         )
 
-                        # GMEM src for this row + k_tile.
+                        # GMEM src for this row: the aligned run of k_tiles
+                        # that holds k_tile.
                         tAgSFA_row = gSFA_mkl[(sfa_row_id, None, 0, None, 0)]
-                        tAgSFA_ktile = tAgSFA_row[(None, k_tile)]
+                        tAgSFA_ktile = tAgSFA_row[
+                            (None, k_tile - k_tile % self.sfa_k_tiles_per_copy)
+                        ]
                         tAgSFA_slice = cute.make_tensor(
                             tAgSFA_ktile.iterator,
-                            layout=cute.make_layout((sfa_tile_k_sf,)),
+                            layout=cute.make_layout((sfa_copy_k_sf,)),
                         )
 
                         # SMEM dst: direct row-indexed slice (bypass partition_D
                         # so we naturally handle multiple rows per thread).
                         tAsSFA_slice = cute.make_tensor(
                             sSFA_tiled[(row_in_cta, None, sfa_producer_state.index)].iterator,
-                            cute.make_layout((sfa_tile_k_sf,)),
+                            cute.make_layout((sfa_copy_k_sf,)),
                         )
 
                         cute.copy_atom_call(
@@ -2269,21 +2295,27 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 # non-breuse, 8 breuse). Per warp: num_m_blocks LDS.128 + 4 STTM.
                 num_m_blocks = self.cta_tile_shape_mnk[0] // 32
                 lane_in_warp = tidx % 32
+                # K-groups of 4 SFs (one u32) per row per k_tile: 4 at
+                # sf_vec_size 16, 2 at 32.
+                num_k_groups = (
+                    self.cta_tile_shape_mnk[2] // self.sf_vec_size * self.sf_dtype.width // 32
+                )
+                sfa_tile_k_sf = self.cta_tile_shape_mnk[2] // self.sf_vec_size
 
                 while is_valid_tile:
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         sfa_pipeline.consumer_wait(sfa_consumer_state)
 
-                        # LDS.128 → RMEM Uint32. Per ci read 16 SFs = 4 u32.
+                        # LDS → RMEM Uint32. Per ci read num_k_groups u32.
                         # Issue LDS before producer_acquire so SMEM→RMEM moves
                         # overlap with prior MMA still holding the next TMEM
                         # stage; STTM still gates on producer_acquire below.
                         sfa_rmem_u32 = cute.make_rmem_tensor(
-                            cute.make_layout((num_m_blocks, 4)),  # (ci, K-group)
+                            cute.make_layout((num_m_blocks, num_k_groups)),  # (ci, K-group)
                             cutlass.Uint32,
                         )
-                        # Linear sSFA (M, K_sf, stage). Each LDS reads 16
-                        # contiguous FP8 SFs (4 u32) at row_global of the
+                        # Linear sSFA (M, copy_K_sf, stage). Each LDS reads
+                        # this k_tile's contiguous SFs of row_global in the
                         # current stage.
                         for ci in range(num_m_blocks):
                             row_global = 32 * ci + lane_in_warp
@@ -2294,9 +2326,15 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                                     sfa_consumer_state.index,
                                 )
                             ]
+                            if cutlass.const_expr(self.sfa_k_tiles_per_copy > 1):
+                                smem_slice = cute.local_tile(
+                                    smem_slice,
+                                    (sfa_tile_k_sf,),
+                                    (k_tile % self.sfa_k_tiles_per_copy,),
+                                )
                             smem_slice_u32 = cute.make_tensor(
                                 cute.recast_ptr(smem_slice.iterator, dtype=cutlass.Uint32),
-                                cute.make_layout((4,)),
+                                cute.make_layout((num_k_groups,)),
                             )
                             cute.autovec_copy(smem_slice_u32, sfa_rmem_u32[ci, None])
 
@@ -2305,7 +2343,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                         # SMEM→RMEM stage isn't blocked on TMEM availability.
                         sfa_transform_pipeline.producer_acquire(sfa_transform_producer_state)
 
-                        # STTM via inline PTX. tCtSFA_layout cols:
+                        # STTM via inline PTX. tCtSFA_layout cols (sf_vec_size 16;
+                        # sf_vec_size 32 has 2 K-groups and halves of 8 cols):
                         #   non-breuse (M=128): 1 half, cols 0..15 = 4 K-groups
                         #     × 4 M-blocks (gi*4 stride). 4 STTM x4.
                         #   breuse (M=256): 2 halves at +16 col offset (keep
@@ -2318,13 +2357,13 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                         ).toint()
                         # Number of "halves" (keep/reuse splits) and the stride
                         # between them. non-breuse: 1 half, no second offset.
-                        # breuse: 2 halves, second at +16 cols.
+                        # breuse: 2 halves, second at +4 * num_k_groups cols.
                         num_halves = num_m_blocks // 4  # 1 or 2
-                        half_col_stride = 16  # cols between keep and reuse
+                        half_col_stride = 4 * num_k_groups  # cols between keep and reuse
                         for half in range(num_halves):
                             half_addr_base = sfa_tmem_addr_base + half * half_col_stride
                             ci_base = half * 4
-                            for gi in range(4):
+                            for gi in range(num_k_groups):
                                 sm100_tcgen05_st_32x32b_x4(
                                     half_addr_base + gi * 4,
                                     sfa_rmem_u32[ci_base + 0, gi],
@@ -3282,8 +3321,11 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                                         * norm_const
                                     )
 
-                            # TODO: f32x2 -> f8x2 conversion
-                            tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
+                            if cutlass.const_expr(self.sf_dtype == cutlass.FloatNV8E5M3FNU):
+                                f32_to_ue5m3(tCrSFC_pvscale, tCrSFC)
+                            else:
+                                # TODO: f32x2 -> f8x2 conversion
+                                tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                             # Store SFC to gmem.
                             # TODO: predicate (cute.elem_less)
@@ -3295,8 +3337,16 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                                 cute.autovec_copy(tCrSFC, tCgSFC)
 
                             # Quantize output and convert to c_dtype.
-                            # TODO: need to add f8x2 -> f32x2 conversion
-                            tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
+                            if cutlass.const_expr(self.sf_dtype == cutlass.FloatNV8E5M3FNU):
+                                tCrSFC_qpvscale_up = cute.make_rmem_tensor_like(tCrSFC_pvscale)
+                                sfc_codes = cute.recast_tensor(tCrSFC, cutlass.Uint8)
+                                for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                    tCrSFC_qpvscale_up[vi] = ue5m3_to_f32(
+                                        cutlass.Uint32(sfc_codes[vi])
+                                    )
+                            else:
+                                # TODO: need to add f8x2 -> f32x2 conversion
+                                tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
                             fp32_max = cutlass.Float32(3.40282346638528859812e38)
                             if cutlass.const_expr(self.vectorized_f32):
                                 for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
@@ -3839,10 +3889,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             1,
         )
 
-        # SFA SMEM is plain linear (M, tile_K_sf), no pad.
-        # Per stage = cta_tile_M × tile_K_sf bytes (FP8 = 1 byte/element).
-        sfa_tile_k_sf = cta_tile_shape_mnk[2] // sf_vec_size
-        sf_bytes_per_row = sfa_tile_k_sf * sf_dtype.width // 8
+        # SFA SMEM is plain linear (M, copy_K_sf), no pad.
+        # Per stage = cta_tile_M × copy_K_sf bytes (FP8 = 1 byte/element).
+        sfa_copy_k_sf = (
+            cta_tile_shape_mnk[2]
+            // sf_vec_size
+            * _sfa_k_tiles_per_copy(cta_tile_shape_mnk[2], sf_vec_size, sf_dtype)
+        )
+        sf_bytes_per_row = sfa_copy_k_sf * sf_dtype.width // 8
         sfa_bytes_per_stage_one = cta_tile_shape_mnk[0] * sf_bytes_per_row
 
         ab_bytes_per_stage = (
@@ -3994,13 +4048,16 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             is_valid = False
 
         # Check valid sf_dtype
-        if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
+        if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, cutlass.FloatNV8E5M3FNU}:
             is_valid = False
 
         # Check valid sf_dtype and sf_vec_size combinations
         if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
             is_valid = False
         if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
+            is_valid = False
+        # UE5M3 scales exist only for E2M1 operands (kind::mxf4nvf4).
+        if sf_dtype == cutlass.FloatNV8E5M3FNU and ab_dtype != cutlass.Float4E2M1FN:
             is_valid = False
 
         # Check valid c_dtype
@@ -4246,6 +4303,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
 
         # Check A/B layout
         if not (a_major == "k" and b_major == "k"):
+            return False
+
+        # Where the SFA gather copies pairs of K tiles (sf_vec_size 32), each
+        # row of scales must be a whole number of 16 B copies.
+        if (
+            _sfa_k_tiles_per_copy(mma_tiler[2], sf_vec_size, sf_dtype) > 1
+            and (k // sf_vec_size * sf_dtype.width // 8) % 16 != 0
+        ):
             return False
         return True
 
@@ -4965,6 +5030,10 @@ def run(
                 return (a + b - 1) // b
 
             def simulate_f8_quantization(tensor_f32, f8_dtype):
+                if f8_dtype is cutlass.FloatNV8E5M3FNU:
+                    # The DSL's UE5M3 -> f32 conversion maps codes 0xF8-0xFE
+                    # to inf, so round trip through the exact torch helpers.
+                    return ue5m3_to_float(float_to_ue5m3(tensor_f32))
                 shape = tensor_f32.shape
                 f8_torch = torch.empty(*shape, dtype=torch.uint8, device="cuda")
                 f8_tensor = from_dlpack(f8_torch, assumed_align=16).mark_layout_dynamic(
@@ -5030,14 +5099,17 @@ def run(
                 swizzled_sfc_cpu, _ = create_sf_layout_tensor(
                     1, permuted_m_local, n_out_local, sf_vec_size_local
                 )
-                swizzled_sfc_tensor, swizzled_sfc_torch = cutlass_torch.cute_tensor_like(
-                    swizzled_sfc_cpu,
-                    cutlass.Float32,
-                    is_dynamic_layout=True,
-                    assumed_align=16,
-                )
-                cute.testing.convert(sfc_tensor_local, swizzled_sfc_tensor)
-                swizzled_sfc_cpu = swizzled_sfc_torch.cpu()
+                if sf_dtype is cutlass.FloatNV8E5M3FNU:
+                    swizzled_sfc_cpu.copy_(ue5m3_to_float(sfc_torch_gpu.cpu()))
+                else:
+                    swizzled_sfc_tensor, swizzled_sfc_torch = cutlass_torch.cute_tensor_like(
+                        swizzled_sfc_cpu,
+                        cutlass.Float32,
+                        is_dynamic_layout=True,
+                        assumed_align=16,
+                    )
+                    cute.testing.convert(sfc_tensor_local, swizzled_sfc_tensor)
+                    swizzled_sfc_cpu = swizzled_sfc_torch.cpu()
                 cvt_sf_M32x4xrm_K4xrk_L_to_MKL(
                     from_dlpack(swizzled_sfc_cpu),
                     from_dlpack(unswizzled_sfc),

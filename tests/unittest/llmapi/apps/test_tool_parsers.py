@@ -617,26 +617,34 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
 
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):
-        """Test streaming parser handles multiple tool calls."""
+        """Test streaming parser handles multiple tool calls.
+
+        Each call goes out whole, with its arguments, in the increment that
+        completes it.
+        """
 
         # First tool
         parser.parse_streaming_increment('<|tool_calls_section_begin|>',
                                          sample_tools)
-        parser.parse_streaming_increment(
+        result = parser.parse_streaming_increment(
             '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|>',
             sample_tools)
+        assert [(call.tool_index, call.name, call.parameters)
+                for call in result.calls] == [(0, "get_weather",
+                                               '{"location":"NYC"}')]
 
         # Second tool
-        parser.parse_streaming_increment(
+        result = parser.parse_streaming_increment(
             '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"arg": "any value"}<|tool_call_end|>',
             sample_tools)
+        assert [(call.tool_index, call.name, call.parameters)
+                for call in result.calls] == [(1, "search_web",
+                                               '{"arg": "any value"}')]
 
         result = parser.parse_streaming_increment('<|tool_calls_section_end|>',
                                                   sample_tools)
-        # Should have started second tool
-        assert result.calls[0].name == "search_web"
-        assert result.calls[0].parameters == ""
-        assert result.calls[0].tool_index == 1
+        assert result.calls == []
+        assert result.normal_text == ""
 
     def test_structure_info_function(self):
         """Test structure_info returns correct lambda function."""
@@ -718,6 +726,287 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
 
         assert len(result.calls) == 1
         assert result.calls[0].name == "get-weather"
+
+    def test_integer_too_long_to_convert_is_not_streamed_as_text(
+            self, sample_tools):
+        """Arguments json.loads cannot convert do not reach the text.
+
+        Past Python's integer digit limit json.loads raises a ValueError that
+        is not a JSONDecodeError. The call is then read like arguments that do
+        not parse yet, whether the number arrives whole or split.
+        """
+        text = ('<|tool_calls_section_begin|><|tool_call_begin|>'
+                'functions.get_weather:0<|tool_call_argument_begin|>'
+                '{"location": ' + "9" * 5000 + '}<|tool_call_end|>'
+                '<|tool_calls_section_end|>')
+
+        for chunks in ([text], _kimi_k2_split_after(text, "9" * 4400)):
+            parser = KimiK2ToolParser()
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+
+            assert "".join(result.normal_text for result in results) == ""
+            assert [
+                call.name for result in results for call in result.calls
+                if call.name
+            ] == ["get_weather"]
+
+
+_KIMI_K2_WEATHER_CALL = (
+    '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>'
+    '{"location": "San Francisco, CA", "unit": "celsius"}<|tool_call_end|>')
+_KIMI_K2_SEARCH_CALL = (
+    '<|tool_call_begin|>functions.search_web:1<|tool_call_argument_begin|>'
+    '{"query": "SF \\"weather\\" {today} <b>"}<|tool_call_end|>')
+_KIMI_K2_OUTPUTS = {
+    "one_call": ("<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+                 "<|tool_calls_section_end|>"),
+    "two_calls": ("<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+                  _KIMI_K2_SEARCH_CALL + "<|tool_calls_section_end|>"),
+    "text_before_a_call":
+    ("Sure, checking.<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+     "<|tool_calls_section_end|>"),
+    "text_around_calls": ("Let me check both.\n<|tool_calls_section_begin|>" +
+                          _KIMI_K2_WEATHER_CALL + "\n" + _KIMI_K2_SEARCH_CALL +
+                          "<|tool_calls_section_end|>\nDone."),
+    "call_without_arguments":
+    ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+     "<|tool_call_argument_begin|>{}<|tool_call_end|>"
+     "<|tool_calls_section_end|>"),
+    # Neither parse reads a call whose id lacks the ":<index>" suffix.
+    "id_without_index_then_a_call":
+    ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather"
+     "<|tool_call_argument_begin|>{}<|tool_call_end|>" + _KIMI_K2_SEARCH_CALL +
+     "<|tool_calls_section_end|>"),
+}
+
+
+def _kimi_k2_split_after(text, prefix_end):
+    """Two increments: up to the end of `prefix_end`, then the rest."""
+    cut = text.index(prefix_end) + len(prefix_end)
+    return [text[:cut], text[cut:]]
+
+
+# The outputs above, and ones that stop inside a call's arguments and inside
+# the token that ends the calls.
+_KIMI_K2_TEXT_CASES = dict(
+    _KIMI_K2_OUTPUTS,
+    stream_cut_inside_a_call=_kimi_k2_split_after(
+        _KIMI_K2_OUTPUTS["text_around_calls"], '"unit": "cel')[0],
+    stream_cut_inside_the_end_token=_kimi_k2_split_after(
+        _KIMI_K2_OUTPUTS["text_around_calls"], "<|tool_calls_section_e")[0],
+)
+
+
+class TestKimiK2StreamingMatchesWholeTextParse:
+    """Streamed Kimi K2 calls and text end equal to the whole-text parse.
+
+    Whatever the increments, a client assembling the streamed calls by index
+    must end with the calls ``detect_and_parse`` finds in the whole text,
+    including when a call arrives in the last increment, after which nothing
+    can release it, and when an increment ends inside one of the format's
+    tokens.
+    """
+
+    @staticmethod
+    def _decoded_arguments(parameters):
+        """Decode streamed arguments; text that is not JSON stays visible."""
+        try:
+            return json.loads(parameters)
+        except json.JSONDecodeError:
+            return f"<not JSON: {parameters!r}>"
+
+    @classmethod
+    def _whole_text_calls(cls, text, tools):
+        result = KimiK2ToolParser().detect_and_parse(text, tools)
+        return [(index, call.name, cls._decoded_arguments(call.parameters))
+                for index, call in enumerate(result.calls)]
+
+    @classmethod
+    def _streamed_calls(cls, chunks, tools):
+        """Assemble the calls by tool index, as a streaming client does."""
+        parser = KimiK2ToolParser()
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(parser.finish(tools))
+        calls = {}
+        for result in results:
+            indices = [call.tool_index for call in result.calls]
+            assert len(indices) == len(set(indices)), (
+                f"one increment repeats a tool index: {indices}")
+            for call in result.calls:
+                name, arguments = calls.get(call.tool_index, (None, ""))
+                calls[call.tool_index] = (name or call.name,
+                                          arguments + call.parameters)
+        return [(index, name, cls._decoded_arguments(arguments))
+                for index, (name, arguments) in sorted(calls.items())]
+
+    @pytest.mark.parametrize("output", sorted(_KIMI_K2_OUTPUTS))
+    def test_streamed_calls_match_whole_text_parse(self, sample_tools, output):
+        """Whole output, one character, fixed sizes, every two-way split.
+
+        The per-character and two-way chunkings end an increment at every
+        position inside each of the format's tokens.
+        """
+        text = _KIMI_K2_OUTPUTS[output]
+        expected = self._whole_text_calls(text, sample_tools)
+        assert expected and all(
+            isinstance(arguments, dict) for _, _, arguments in expected)
+
+        chunkings = list(_chunkings(text))
+        differing = [
+            label for label, chunks in chunkings
+            if self._streamed_calls(chunks, sample_tools) != expected
+        ]
+
+        assert not differing, (
+            f"{len(differing)} of {len(chunkings)} chunkings end with other "
+            f"calls than the whole-text parse, e.g. {differing[:8]}")
+
+    @pytest.mark.parametrize("output", sorted(_KIMI_K2_TEXT_CASES))
+    def test_streamed_text_matches_whole_text_parse(self, sample_tools, output):
+        """The streamed text is the whole-text parse's, for every chunking.
+
+        That is the text before the tool calls, with no part of them: also
+        when that text shares an increment with a call, when text follows the
+        calls, and from finish() when the stream stops inside a call or a
+        token.
+        """
+        text = _KIMI_K2_TEXT_CASES[output]
+        expected = KimiK2ToolParser().detect_and_parse(text,
+                                                       sample_tools).normal_text
+        assert "<|" not in expected and "functions." not in expected
+
+        chunkings = list(_chunkings(text))
+        differing = []
+        for label, chunks in chunkings:
+            parser = KimiK2ToolParser()
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+            streamed_text = "".join(result.normal_text for result in results)
+            if streamed_text != expected:
+                differing.append((label, streamed_text))
+
+        assert not differing, (
+            f"{len(differing)} of {len(chunkings)} chunkings stream other "
+            f"text than {expected!r}, e.g. {differing[:4]}")
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            _kimi_k2_split_after(
+                "Let me check.\n" + _KIMI_K2_OUTPUTS["one_call"],
+                "<|tool_calls_section_begin|>"),
+            _kimi_k2_split_after(_KIMI_K2_OUTPUTS["one_call"],
+                                 "functions.get_wea"),
+        ],
+        ids=["whole_call_in_last_increment", "last_increment_has_the_rest"],
+    )
+    def test_last_increment_sends_the_arguments_with_the_name(
+            self, sample_tools, chunks):
+        """A call first named by the last increment comes with its arguments."""
+        parser = KimiK2ToolParser()
+        for chunk in chunks[:-1]:
+            assert parser.parse_streaming_increment(chunk,
+                                                    sample_tools).calls == []
+
+        last = parser.parse_streaming_increment(chunks[-1], sample_tools)
+
+        assert [(call.tool_index, call.name,
+                 self._decoded_arguments(call.parameters))
+                for call in last.calls] == [(0, "get_weather", {
+                    "location": "San Francisco, CA",
+                    "unit": "celsius"
+                })]
+        assert parser.finish(sample_tools).calls == []
+
+    def test_two_calls_in_last_increment_are_both_sent(self, sample_tools):
+        """Both whole calls of one increment are released, one item each."""
+        parser = KimiK2ToolParser()
+
+        last = parser.parse_streaming_increment(_KIMI_K2_OUTPUTS["two_calls"],
+                                                sample_tools)
+
+        assert [(call.tool_index, call.name,
+                 self._decoded_arguments(call.parameters))
+                for call in last.calls] == [
+                    (0, "get_weather", {
+                        "location": "San Francisco, CA",
+                        "unit": "celsius"
+                    }),
+                    (1, "search_web", {
+                        "query": 'SF "weather" {today} <b>'
+                    }),
+                ]
+        assert parser.finish(sample_tools).calls == []
+
+    def test_text_that_ends_like_a_token_is_kept(self, sample_tools):
+        """Text held back as the possible start of a token is released.
+
+        An increment that ends like the start of a token waits for the next
+        one, or for finish() when the stream ends there.
+        """
+        text = "Is a < b? See <|tool_hint|> and <|tool"
+        for label, chunks in _chunkings(text):
+            parser = KimiK2ToolParser()
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+
+            assert "".join(result.normal_text
+                           for result in results) == text, label
+            assert not any(result.calls for result in results), label
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            [_KIMI_K2_OUTPUTS["text_around_calls"]],
+            _kimi_k2_split_after(_KIMI_K2_OUTPUTS["text_around_calls"],
+                                 "Let me check both.\n"),
+            _kimi_k2_split_after(_KIMI_K2_OUTPUTS["two_calls"],
+                                 "functions.sea"),
+        ],
+        ids=[
+            "whole_output_in_one_step", "calls_in_last_step",
+            "last_step_has_the_rest"
+        ],
+    )
+    def test_chat_stream_carries_the_arguments_to_the_end(
+            self, sample_tools, chunks):
+        """The chat stream assembles to the whole-text calls in each case."""
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="kimi_k2", stream=True)
+
+        payloads = TestForcedToolChoicePostprocessing._stream_deltas(
+            args, chunks)
+
+        calls = {}
+        for payload in payloads:
+            for choice in payload["choices"]:
+                tool_calls = choice["delta"].get("tool_calls") or []
+                indices = [tool_call["index"] for tool_call in tool_calls]
+                assert len(indices) == len(set(indices)), (
+                    f"one chunk repeats a tool index: {indices}")
+                for tool_call in tool_calls:
+                    function = tool_call["function"]
+                    name, arguments = calls.get(tool_call["index"], (None, ""))
+                    calls[tool_call["index"]] = (
+                        name or function.get("name"),
+                        arguments + (function.get("arguments") or ""))
+        streamed = [(index, name, self._decoded_arguments(arguments))
+                    for index, (name, arguments) in sorted(calls.items())]
+
+        assert streamed == self._whole_text_calls("".join(chunks), sample_tools)
+        assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
 class TestQwen3ToolParser(BaseToolParserTestClass):
@@ -3160,6 +3449,53 @@ def test_deepseek_streaming_keeps_markdown_fences(
     assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
 
 
+def _dsml_tool_call(tag_prefix: str, block_name: str, name: str,
+                    string_arguments: dict[str, str]) -> str:
+    """A tool call as the DSML encoders render it: each string value verbatim."""
+    parameters = "\n".join(
+        f'<{tag_prefix}parameter name="{key}" string="true">{value}'
+        f"</{tag_prefix}parameter>" for key, value in string_arguments.items())
+    return (f"<{tag_prefix}{block_name}>\n"
+            f'<{tag_prefix}invoke name="{name}">\n{parameters}\n'
+            f"</{tag_prefix}invoke>\n</{tag_prefix}{block_name}>")
+
+
+@pytest.mark.parametrize("parser_cls,tag_prefix,block_name", [
+    (DeepSeekV32Parser, "｜DSML｜", "function_calls"),
+    (DeepSeekV4Parser, "｜DSML｜", "tool_calls"),
+    (DeepSeekV41Parser, "｜DSML｜ ", "calls"),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_dsml_string_parameter_values_are_kept_as_written(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tag_prefix: str, block_name: str,
+        streaming: bool) -> None:
+    """A string value's leading and trailing whitespace is part of the value.
+
+    An edit's ``old_string`` must match the file including its indentation,
+    and a written file keeps its last newline.
+    """
+    arguments = {
+        "location": "    indented line\n    second line",
+        "unit": "file content\n",
+    }
+    text = _dsml_tool_call(tag_prefix, block_name, "get_weather", arguments)
+
+    parser = parser_cls()
+    if streaming:
+        results = [
+            parser.parse_streaming_increment(text[i:i + 7], sample_tools)
+            for i in range(0, len(text), 7)
+        ]
+        calls = [call for result in results for call in result.calls]
+    else:
+        calls = parser.detect_and_parse(text, sample_tools).calls
+
+    assert [call.name for call in calls if call.name] == ["get_weather"]
+    assert json.loads("".join(call.parameters or ""
+                              for call in calls)) == arguments
+
+
 @pytest.mark.parametrize(
     "parser_cls, tool_call_text",
     [
@@ -4754,6 +5090,38 @@ class TestMiniMaxM2ToolParser:
         names = [c.name for c in result.calls if c.name]
         assert "get_weather" in names
 
+    @pytest.mark.parametrize("chunk_size", [1, 4, 9])
+    def test_parse_streaming_increment_small_chunks(self, sample_tools,
+                                                    chunk_size):
+        """Test that small streamed chunks yield the same calls as one-shot parsing."""
+        text = ('<minimax:tool_call>\n'
+                '<invoke name="get_weather">\n'
+                '<parameter name="location">NYC</parameter>\n'
+                '<parameter name="unit">celsius</parameter>\n'
+                '</invoke>\n'
+                '<invoke name="search_web">\n'
+                '<parameter name="query">news</parameter>\n'
+                '</invoke>\n'
+                '</minimax:tool_call>')
+        parser = MiniMaxM2ToolParser()
+        names = {}
+        arguments = {}
+        for i in range(0, len(text), chunk_size):
+            result = parser.parse_streaming_increment(text[i:i + chunk_size],
+                                                      sample_tools)
+            for call in result.calls:
+                if call.name:
+                    names.setdefault(call.tool_index, []).append(call.name)
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters)
+
+        assert names == {0: ["get_weather"], 1: ["search_web"]}
+        assert json.loads(arguments[0]) == {
+            "location": "NYC",
+            "unit": "celsius"
+        }
+        assert json.loads(arguments[1]) == {"query": "news"}
+
     def test_supports_structural_tag(self, parser):
         """Test that supports_structural_tag returns False."""
         assert parser.supports_structural_tag() is False
@@ -4806,6 +5174,26 @@ class TestMiniMaxM2ToolParser:
         assert "Hello!" in result.normal_text
         names = [c.name for c in result.calls if c.name]
         assert "get_weather" in names
+
+    def test_streaming_prefix_in_same_chunk_not_repeated(self, sample_tools):
+        """Test text sent with the tool token is streamed only once."""
+        parser = MiniMaxM2ToolParser()
+        chunks = [
+            "I'll check the weather in Paris for you.<minimax:tool_call>",
+            '<invoke name="get_weather">',
+            '<parameter name="location">Paris</parameter>',
+            '</invoke>',
+            '</minimax:tool_call>',
+        ]
+        normal_text = ""
+        names = []
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += result.normal_text
+            names += [c.name for c in result.calls if c.name]
+
+        assert normal_text == "I'll check the weather in Paris for you."
+        assert names == ["get_weather"]
 
 
 # ============================================================================
@@ -6621,6 +7009,73 @@ class TestConfigureParserSpecialTokenDecoding:
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
 
+    @pytest.mark.parametrize(
+        "reasoning_parser, tool_parser, with_tools, skip, spaces",
+        [
+            ("kimi_k3", "kimi_k3", True, False, False),
+            ("kimi_k3", None, False, False, False),
+            (None, "deepseek_v32", True, False, True),
+            (None, "deepseek_v32", False, True, True),
+            (None, None, True, True, True),
+        ],
+    )
+    def test_the_responses_route_applies_it(self, monkeypatch, reasoning_parser,
+                                            tool_parser, with_tools, skip,
+                                            spaces) -> None:
+        """/v1/responses detokenizes for the parsers as chat completions does.
+
+        Without it Kimi-K3's tags arrive with their special tokens dropped or
+        spaced apart, and its tool calls reach the client as message text.
+        """
+        import asyncio
+        from types import SimpleNamespace
+
+        import tensorrt_llm.serve.openai_server as server_module
+        from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        async def fake_preprocess(**kwargs):
+            return [1, 2, 3], SamplingParams()
+
+        monkeypatch.setattr(server_module, "responses_api_request_preprocess",
+                            fake_preprocess)
+        submitted = []
+
+        def generate_async(*, sampling_params, **kwargs):
+            submitted.append(sampling_params)
+            raise RuntimeError("stop after submission")
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.enable_store = False
+        server.use_harmony = False
+        server.tokenizer = None
+        server.model_config = None
+        server.processor = None
+        server.multimodal_server_config = None
+        server.chat_template = None
+        server.tool_parser = tool_parser
+        server.metrics_collector = None
+        server.conversation_store = None
+        server.generator = SimpleNamespace(args=SimpleNamespace(
+            reasoning_parser=reasoning_parser, num_postprocess_workers=0),
+                                           generate_async=generate_async)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        tools = [{
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object"
+            }
+        }] if with_tools else None
+        request = ResponsesRequest(model="test-model", input="hi", tools=tools)
+
+        asyncio.run(server.openai_responses(request, raw_request))
+
+        (sampling_params, ) = submitted
+        assert sampling_params.skip_special_tokens is skip
+        assert sampling_params.spaces_between_special_tokens is spaces
+
 
 # ============================================================================
 # Forced tool call: argument truncation — TRTLLM-12758
@@ -7165,6 +7620,46 @@ _GLM_ARGUMENT_TEXTS = [
     (_glm_pairs(("code", "a")) + "<arg_key>n</arg_key><arg_value>2", None),
 ]
 
+_GLM_EXEC_TOOLS = [
+    _glm_typed_tool("exec", cmd="string"),
+    _glm_typed_tool("f", code="string", n="integer"),
+    _glm_tool("get_time"),
+]
+
+# The argument text of a call to `exec` that the model abandoned by opening a
+# fresh call inside it.
+_GLM_ABANDONED_ARGUMENTS = [
+    "<arg_key>cmd</arg_key><arg_value>ls -la",
+    "<arg_key>cmd</arg_key><arg_value>",
+    "<arg_key>cmd</arg_key><arg_value>ls</arg_value>",
+    "<arg_key>cmd</arg_key>",
+    "<arg_key>cm",
+    # An opener that starts no call stays in the abandoned text.
+    '<arg_key>cmd</arg_key><arg_value>echo "<tool_call>" >> f',
+]
+
+# Values that quote call markup and stay in the value. The last `<tool_call>`
+# in the argument text opens a fresh call only when the name of a declared tool
+# follows it, then directly complete pairs up to the end of the call.
+_GLM_QUOTING_VALUES = [
+    'START = "<tool_call>"',
+    "Use <tool_call> to open a call.",
+    "<tool_call>",
+    "<tool_call>exec",
+    "<tool_call>exec</arg_key>",
+    'x = "<tool_call>exec<arg_key>"',
+    "<tool_call>exec<arg_key>cmd</arg_key>",
+    "<tool_call>get_time<tool_call>exec",
+    # `run` is not a declared tool. GLM-4.5 reads a name only up to a newline.
+    "<tool_call>run<arg_key>cmd</arg_key><arg_value>ls",
+    "<tool_call>run\n<arg_key>cmd</arg_key><arg_value>ls",
+]
+
+
+def _glm_open_call(parser_cls, name, argument_text):
+    """A call cut off before its `</tool_call>`."""
+    return _glm_raw_call(parser_cls, name, argument_text)[:-len("</tool_call>")]
+
 
 @pytest.mark.parametrize("parser_cls", [Glm4ToolParser, Glm47ToolParser])
 class TestGlmStreamingMatchesWholeParse:
@@ -7211,6 +7706,120 @@ class TestGlmStreamingMatchesWholeParse:
     def test_text_without_a_complete_call_streams_verbatim(
             self, parser_cls, text):
         assert _glm_parity(parser_cls, text, AGENT_TOOLS) == (text, [])
+
+    @pytest.mark.parametrize("argument_text", _GLM_ABANDONED_ARGUMENTS)
+    def test_a_fresh_call_in_the_arguments_abandons_the_open_one(
+            self, parser_cls, argument_text):
+        """The call the model finished is delivered; the abandoned one is text."""
+        abandoned = _glm_open_call(parser_cls, "exec", argument_text)
+        fresh = _glm_call(parser_cls, "exec", ("cmd", "pwd"))
+        text = "Checking." + abandoned + fresh + " Done."
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        assert calls == [("exec", dict(cmd="pwd"))]
+        assert normal == "Checking." + abandoned + " Done."
+
+    def test_an_abandoned_call_among_others(self, parser_cls):
+        call = functools.partial(_glm_call, parser_cls)
+        abandoned = _glm_open_call(parser_cls, "exec",
+                                   "<arg_key>cmd</arg_key><arg_value>ls -la")
+        text = ("Looking." + call("exec", ("cmd", "ls")) + abandoned +
+                call("exec", ("cmd", "pwd")) + call("get_time") + " Done.")
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        assert calls == [("exec", dict(cmd="ls")), ("exec", dict(cmd="pwd")),
+                         ("get_time", {})]
+        assert normal == "Looking." + abandoned + " Done."
+
+    @pytest.mark.parametrize("name", ["exec", "Let me run it"])
+    def test_every_abandoned_call_is_released(self, parser_cls, name):
+        """Two calls abandoned in turn, the first under a name or under prose."""
+        first = _glm_open_call(parser_cls, name,
+                               "<arg_key>cmd</arg_key><arg_value>ls")
+        second = _glm_open_call(parser_cls, "functions.exec",
+                                "<arg_key>cmd</arg_key><arg_value>cat a")
+        fresh = _glm_call(parser_cls, "get_time")
+
+        normal, calls = _glm_parity(parser_cls, first + second + fresh,
+                                    _GLM_EXEC_TOOLS)
+
+        assert (normal, calls) == (first + second, [("get_time", {})])
+
+    @pytest.mark.parametrize("value", _GLM_QUOTING_VALUES)
+    @pytest.mark.parametrize("last", [True, False],
+                             ids=["last argument", "another argument follows"])
+    def test_a_value_may_quote_the_call_opener(self, parser_cls, value, last):
+        pairs = [("code", value)] + ([] if last else [("n", "3")])
+        text = _glm_call(parser_cls, "f", *pairs)
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        expected = dict(code=value) if last else dict(code=value, n=3)
+        assert (normal, calls) == ("", [("f", expected)])
+
+    def test_a_value_quoting_a_whole_call_header_reads_as_a_fresh_call(
+            self, parser_cls):
+        """A limit of the rule: this value and an abandoned call are one text.
+
+        A value that quotes a declared tool's call through its first
+        `<arg_value>`, with no `</tool_call>` after it, reads as the call
+        abandoned there.
+        """
+        quoted = _glm_call(parser_cls, "exec", ("cmd", "ls"))
+        quoted = quoted[:quoted.index("ls")]
+        text = _glm_call(parser_cls, "f", ("code", f'x = "{quoted}"'))
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        assert calls == [("exec", dict(cmd='"'))]
+        assert normal == text[:text.index(quoted)]
+
+    def test_a_finished_call_quoting_the_opener_is_not_read_as_fresh(
+            self, parser_cls):
+        """A limit of the rule: only the last `<tool_call>` is read.
+
+        Here it is quoted in the finished call's value, so the abandoned call
+        is read as written, the finished call's markup in its value.
+        """
+        abandoned = _glm_open_call(parser_cls, "exec",
+                                   "<arg_key>cmd</arg_key><arg_value>ls")
+        fresh = _glm_call(parser_cls, "exec", ("cmd", 'grep "<tool_call>" log'))
+
+        normal, calls = _glm_parity(parser_cls, abandoned + fresh,
+                                    _GLM_EXEC_TOOLS)
+
+        value = "ls" + fresh[:fresh.rindex("</arg_value>")]
+        assert (normal, calls) == ("", [("exec", dict(cmd=value))])
+
+    def test_many_openers_in_the_arguments_read_one_header(
+            self, parser_cls, monkeypatch):
+        """Call openers in one call, none of them a fresh call.
+
+        Only the last opener is read as a call header, so the headers read do
+        not grow with the openers; reading every opener to the end of the call
+        makes the parse quadratic in them.
+        """
+        split_call = parser_cls._split_call
+        headers = []
+
+        def counting_split_call(self, body):
+            headers.append(body)
+            return split_call(self, body)
+
+        monkeypatch.setattr(parser_cls, "_split_call", counting_split_call)
+
+        def headers_read(openers):
+            unit = _glm_open_call(parser_cls, "exec", _glm_pairs(("cmd", "ls")))
+            text = unit * openers + "</think></tool_call>"
+            headers.clear()
+            result = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS,
+                                 [("whole", [text])])
+            assert result == (text, [])
+            return len(headers)
+
+        assert headers_read(200) == headers_read(20)
 
     def test_a_response_with_several_calls(self, parser_cls):
         """Unreadable and restarted calls among good ones, then a cut-off."""
@@ -7352,3 +7961,167 @@ def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
 
     assert [(c.name, c.tool_index)
             for c in calls] == [("functions.get_weather", -1)]
+
+
+# ============================================================================
+# DeepSeek DSML layout: the newlines inside a tool-call block are not content
+# ============================================================================
+
+_DSML_FORMATS = [
+    (DeepSeekV32Parser, "function_calls", "invoke", "parameter"),
+    (DeepSeekV4Parser, "tool_calls", "invoke", "parameter"),
+    (DeepSeekV41Parser, " calls", " invoke", " parameter"),
+]
+
+
+def _dsml_block(calls_tag: str, invoke_tag: str, parameter_tag: str) -> str:
+    """Two calls laid out as the checkpoint encoders write them: one per line."""
+    dsml = "｜DSML｜"
+
+    def invoke(name: str, key: str, value: str) -> str:
+        return (f'<{dsml}{invoke_tag} name="{name}">\n'
+                f'<{dsml}{parameter_tag} name="{key}" string="true">{value}'
+                f"</{dsml}{parameter_tag}>\n"
+                f"</{dsml}{invoke_tag}>")
+
+    return (f"<{dsml}{calls_tag}>\n" +
+            invoke("get_weather", "location", "NYC") + "\n" +
+            invoke("search_web", "query", "AI") + "\n" +
+            f"</{dsml}{calls_tag}>")
+
+
+def _stream(parser,
+            text: str,
+            chunk_size: int,
+            tools: list[ChatCompletionToolsParam],
+            *,
+            finish: bool = True):
+    results = [
+        parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+        for i in range(0, len(text), chunk_size)
+    ]
+    if finish:
+        results.append(parser.finish(tools))
+    content = "".join(result.normal_text for result in results)
+    calls = [call for result in results for call in result.calls]
+    return content, calls
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 10_000])
+def test_dsml_newlines_between_calls_are_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The newline after each invoke is the block's layout, however it is chunked.
+
+    Streamed as text, it became content after every tool call: over Anthropic
+    Messages, a whitespace-only text block followed each tool_use, and a client
+    that drops such blocks sent back a turn that no longer matched what was
+    served.
+    """
+    text = "Let me check.\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Let me check."
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+    arguments = [
+        json.loads(call.parameters) for call in calls
+        if not call.name and call.parameters
+    ]
+    assert arguments == [{"location": "NYC"}, {"query": "AI"}]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [5, 10_000])
+def test_dsml_text_after_the_block_is_still_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Only the layout inside the block is dropped; text after it is kept.
+
+    In one increment, the closing tag and the text after it follow the last
+    invoke; that text must come out of that increment.
+    """
+    text = _dsml_block(calls_tag, invoke_tag, parameter_tag) + " Done."
+
+    parser = parser_cls()
+    content, calls = _stream(parser,
+                             text,
+                             chunk_size,
+                             sample_tools,
+                             finish=False)
+
+    assert content == " Done."
+    finish_result = parser.finish(sample_tools)
+    assert finish_result.normal_text == ""
+    assert finish_result.calls == []
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 10_000])
+def test_dsml_blank_line_before_the_block_is_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The encoders write a blank line between the content and the block.
+
+    The content keeps its own whitespace; only that blank line is dropped, on
+    both paths.
+    """
+    content_in = "  Indented first line.\nLast line.\n"
+    text = content_in + "\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == content_in
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content_in
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_trailing_blank_lines_without_a_block_are_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Newlines held back in case a block follows come out when none does."""
+    text = "Done.\n\n"
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == text
+    assert calls == []
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """A stream cut short inside the block ends with its content.
+
+    The non-streaming path reads the same text the same way.
+    """
+    block = _dsml_block(calls_tag, invoke_tag, parameter_tag)
+    text = "Checking.\n\n" + block[:block.index("</｜DSML｜")]
+
+    content, _ = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Checking."
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content
