@@ -112,8 +112,9 @@ class Fp4MlaV2CacheLayoutPolicy:
     # Set by configure_manager: a disaggregated context worker keeps neither
     # V scales nor packed V (see is_fp4_mla_context_only_cache).
     fp4_mla_context_only_cache: bool = False
-    # Manager layers of a standalone drafter appended to the lifecycle manager.
-    _draft_manager_layer_ids: list = []
+    # Manager layers of a standalone drafter appended to the lifecycle manager (set by
+    # _build_cache_config).
+    _draft_manager_layer_ids: tuple[LayerId, ...] = ()
 
     def __init__(self, *args, **kwargs) -> None:
         kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")
@@ -487,10 +488,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         if not fp4_local_layers:
             raise ValueError("FP4 MLA V2 layout requires at least one local attention layer.")
         self._fp8_mla_manager_layer_ids = [LayerId(local_layer) for local_layer in fp8_local_layers]
+        fp8_lifecycle_window = (
+            self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+        )
         if fp8_local_layers:
-            fp8_lifecycle_window = (
-                self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
-            )
             for local_layer in fp8_local_layers:
                 cache_layers[local_layer] = AttentionLayerConfig(
                     layer_id=LayerId(local_layer),
@@ -506,17 +507,23 @@ class Fp4MlaV2CacheLayoutPolicy:
                     num_sink_tokens=None,
                 )
         # Draft layers take one more distinct non-evicting lifecycle: the FP4
-        # and FP8 tables address pages with their own pools' index scales.
-        self._draft_manager_layer_ids = [
+        # and FP8 tables address pages with their own pools' index scales. A
+        # lifecycle is told apart by its window: the draft window exceeds both
+        # one past a draft sequence's reach and the FP8 window.
+        self._draft_manager_layer_ids = tuple(
             LayerId(local_layer) for local_layer in sorted(self._appended_draft_layer_specs)
-        ]
-        for layer_id in self._draft_manager_layer_ids:
-            draft_lifecycle_window = (
+        )
+        draft_lifecycle_window = (
+            max(
                 self.max_seq_len
                 + self._generation_kv_capacity_headroom
                 + self._kv_reserve_draft_tokens
-                + 2
+                + 1,
+                fp8_lifecycle_window,
             )
+            + 1
+        )
+        for layer_id in self._draft_manager_layer_ids:
             draft_layer = cache_layers[int(layer_id)]
             cache_layers[int(layer_id)] = AttentionLayerConfig(
                 layer_id=layer_id,
