@@ -4133,6 +4133,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """Rows per mixed-precision high layer page; a page covers tokens_per_block tokens."""
         return self.tokens_per_block
 
+    def _mixed_precision_layer_page(self, local_layer_idx: int) -> tuple[int, DataRole]:
+        """Manager layer whose page the cold-page high layer copies, and the role of its KV rows."""
+        return local_layer_idx, Role.KEY
+
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Append the mixed-precision high layer group for every mixed-precision layer."""
         if self.mixed_precision_low_dtype is None:
@@ -4155,18 +4159,20 @@ class KVCacheManagerV2(BaseResourceManager):
             if not self._is_mixed_precision_layer(local):
                 continue
             if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
-                # Cold-page window: the high layer's page is a copy of its layer's page, so the
-                # core keeps both in one pool and sparse attention addresses its rows directly.
+                # Cold-page window: the high layer's page is a copy of its layer's page (KV rows
+                # under Role.KEY), so the core keeps both in one pool and sparse attention
+                # addresses its rows directly.
+                source_layer, row_role = self._mixed_precision_layer_page(local)
                 buffers = [
                     BufferConfig(
-                        role=buffer.role,
+                        role=Role.KEY if buffer.role == row_role else buffer.role,
                         size=buffer.size,
                         tokens_per_block_override=buffer.tokens_per_block_override,
                         is_sparse=buffer.is_sparse,
                         coalescing_group=buffer.coalescing_group,
                         sparse_unit_chunks=buffer.sparse_unit_chunks,
                     )
-                    for buffer in layer_by_id[local].buffers
+                    for buffer in layer_by_id[source_layer].buffers
                 ]
             else:
                 page_bytes = get_size_in_bytes(

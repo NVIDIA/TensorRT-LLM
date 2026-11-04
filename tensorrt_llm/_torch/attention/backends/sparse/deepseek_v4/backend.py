@@ -33,7 +33,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
-from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
+from ..mixed_precision_high_rows import (
+    mixed_precision_high_row_indices,
+    overlay_mixed_precision_high_rows,
+)
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -413,6 +416,24 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         if self.use_fp8_ds_mla:
             return result
         global_indices = result
+
+        if (
+            self.compress_ratio > 1
+            and metadata.has_mixed_precision_high_rows
+            and kv_cache_manager.mixed_precision_low_dtype
+            == kv_cache_manager.mixed_precision_high_dtype
+        ):
+            # The COMPRESS pool keeps the high precision (cold-page first/last-N) and the high
+            # layer shares it, so a selected compressed row the high layer holds is read from the
+            # high layer's row instead of the pool's row.
+            num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
+            compressed = global_indices[:, -num_compressed_indices:]
+            compressed.copy_(
+                mixed_precision_high_row_indices(
+                    metadata, self, compressed_local_indices, compressed, req_id
+                )
+            )
+            return global_indices, None
 
         if self._uses_nvfp4_compress and self.compress_ratio > 1:
             num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
