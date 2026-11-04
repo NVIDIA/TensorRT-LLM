@@ -57,6 +57,10 @@ class PinnedSafetensorsFile:
         self._fd = os.open(self._path, os.O_RDONLY)
         try:
             (header_len,) = struct.unpack("<Q", self._pread(8, 0))
+            if header_len > os.fstat(self._fd).st_size - 8:
+                raise ValueError(
+                    f"{self._path}: SafeTensors header length {header_len} exceeds the file"
+                )
             header = json.loads(self._pread(header_len, 8))
             data_start = 8 + header_len
             for key, info in header.items():

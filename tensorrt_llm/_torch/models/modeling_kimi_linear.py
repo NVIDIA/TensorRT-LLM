@@ -107,7 +107,6 @@ from typing import (
 )
 
 import torch
-from safetensors import safe_open
 from torch import nn
 
 from ..._utils import get_sm_version, is_sm_100f
@@ -155,18 +154,6 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
     os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
 )
-
-# Escape hatch: stream routed-expert shards through safe_open's mmap instead of
-# PinnedSafetensorsFile (read once at import).
-_K3_DISABLE_PINNED_SHARD_READ = os.environ.get("TLLM_K3_DISABLE_PINNED_SHARD_READ", "0") == "1"
-
-
-def _open_expert_shard(path: str):
-    """Open one checkpoint shard for the per-file routed-expert stream."""
-    if _K3_DISABLE_PINNED_SHARD_READ:
-        return safe_open(path, framework="pt", device="cpu")
-    return PinnedSafetensorsFile(path)
-
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -4429,7 +4416,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 if device.type == "cuda":
                     torch.cuda.set_device(device)
                 path = os.path.join(ckpt_dir, file_name)
-                with _open_expert_shard(path) as fh:
+                with PinnedSafetensorsFile(path) as fh:
                     # A job lands here only when every key it needs -- optional
                     # ones included, see the grouping above -- is in this file,
                     # so presence in this file is the whole question.
@@ -4456,7 +4443,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 with ExitStack() as stack:
                     handles = {
                         file_name: stack.enter_context(
-                            _open_expert_shard(os.path.join(ckpt_dir, file_name))
+                            PinnedSafetensorsFile(os.path.join(ckpt_dir, file_name))
                         )
                         for file_name in files
                     }
