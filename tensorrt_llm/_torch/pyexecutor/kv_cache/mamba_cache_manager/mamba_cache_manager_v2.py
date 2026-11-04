@@ -339,6 +339,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             for layer in draft_layer_specs
             if layer.global_layer_id in local_ids
         }
+        # One (layer id, role) per layer group in the order _with_draft_pool_ratio
+        # placed the pool ratio, checked against the native grouping once built.
+        self._pool_ratio_groups: List[tuple] = []
 
         if self.local_num_mamba_layers > 0:
             tp_size = _mamba_effective_tp_size(mapping)
@@ -471,6 +474,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
         if self._attention_cache_layout_policy is not None:
             self._attention_cache_layout_policy.finalize_manager(self)
+        for group, (layer_id, role) in enumerate(self._pool_ratio_groups):
+            if self.impl.get_buffer_group_id(layer_id, role) != group:
+                raise RuntimeError(
+                    "kv_cache_config.pool_ratio was placed for a layer-group order the native "
+                    f"manager does not use (layer {layer_id} {role} is not in group {group})"
+                )
 
         self._setup_state_pool()
 
@@ -1022,6 +1031,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return config
         keys: List[tuple] = []
         block_bytes: List[int] = []
+        representatives: List[tuple] = []
         draft_keys = set()
         target_keys = set()
         for layer in config.layers:
@@ -1043,6 +1053,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 if key not in keys:
                     keys.append(key)
                     block_bytes.append(0)
+                    representatives.append((layer.layer_id, buffer.role))
                 block_bytes[keys.index(key)] += buffer.size
                 is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
                 (draft_keys if is_draft else target_keys).add(key)
@@ -1056,6 +1067,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         full_history = [
             key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
         ]
+        self._pool_ratio_groups = representatives
         return replace(
             config,
             initial_pool_ratio=_insert_draft_pool_ratio(
