@@ -22,6 +22,7 @@ over all ranks together; each axis has a byte stride between the indices a rank 
     Axis("head", 8, 256, Contiguous(("tp",), 4))   # 8 heads of 256 B; TP rank r holds 4r..4r+3
     Axis("row", 12, 64, Cyclic(("tp",)))           # TP rank r of n holds rows r, r + n, ...
     Axis("byte", 256, 1)                           # every rank holds all 256 bytes (Whole)
+    Axis("position", 19, 512, Ring())              # token position p in slot p % 19
 
 How two ranks' pages correspond is derived from these alone (``layout_mapping``), so a new kind is
 a class here saying which indices a rank holds, or which token positions a page holds and where;
@@ -52,6 +53,7 @@ __all__ = [
     "PerRequest",
     "Progression",
     "RankTopology",
+    "Ring",
     "ShardDesc",
     "Tensor",
     "Whole",
@@ -70,6 +72,7 @@ __all__ = [
     "owned",
     "replica_ranks",
     "replicated",
+    "ring",
     "sectioned",
     "token_major",
 ]
@@ -211,7 +214,8 @@ class AxisKind:
 
     - A kind spreading indices over ranks gives ``split`` and ``indices``, and ``count`` when every
       rank holds as many; ``Contiguous`` is one.
-    - A kind of token positions sets ``positional`` and gives ``positions`` and ``index_of``.
+    - A kind of token positions sets ``positional`` and gives ``positions`` and ``index_of``;
+      ``Ring`` is one.
 
     A subclass overriding none of these holds every index on every rank, as ``Whole``.
 
@@ -381,6 +385,34 @@ class Cyclic(AxisKind):
 
 
 @dataclass(frozen=True)
+class Ring(AxisKind):
+    """Token positions in a ring: of its page's tokens, position ``p`` lies at index
+    ``p % extent``, so the axis keeps the latest ``extent`` positions the page has written. Every
+    rank holds it whole, and each side sizes it as it keeps, so peers may differ in its extent.
+
+    FP4 MLA's high-precision tail on a generation worker, 19 slots in pages of 32 tokens: of page
+    1 (positions 32..63) written up to position 50, it holds 32..49, position 40 in slot 2.
+    """
+
+    name: ClassVar[str] = "ring"
+    positional: ClassVar[bool] = True
+
+    def positions(self, axis: Axis, page: int, end: int, tokens_per_page: int) -> range:
+        first = page * tokens_per_page
+        written = min(end, first + tokens_per_page)
+        return range(max(first, written - axis.extent), written)
+
+    def index_of(self, axis: Axis, positions, tokens_per_page: int):
+        return positions % axis.extent
+
+    def corresponds(self, axis: Axis, peer: Axis) -> bool:
+        return isinstance(peer.kind, Ring)
+
+    def document(self) -> dict:
+        return {"ring": True}
+
+
+@dataclass(frozen=True)
 class Axis:
     """One dimension of a tensor: its extent over all ranks together, the byte stride between
     consecutive indices a rank holds, and its kind, which says which of its indices a rank holds
@@ -390,9 +422,9 @@ class Axis:
 
     Attributes:
         name: The axis' name; peers match tensors' axes on it.
-        extent: Positive number of indices over all ranks together.
+        extent: Positive number of indices over all ranks together; a ring's slots on this rank.
         stride: Positive bytes between consecutive local indices.
-        kind: How the indices spread (``Whole``, ``Contiguous``, ``Cyclic`` or another
+        kind: How the indices spread (``Whole``, ``Contiguous``, ``Cyclic``, ``Ring`` or another
             ``AxisKind``).
 
     Raises:
@@ -568,6 +600,18 @@ def token_major(
                 Axis("head", total_heads, head, Contiguous(tuple(split), heads)),
                 Axis("byte", head, 1),
             ),
+            dtype=dtype,
+        ),
+    )
+
+
+def ring(slots: int, slot_bytes: int, *, dtype: str | None = None) -> tuple[Tensor, ...]:
+    """A ring of ``slots`` token positions of ``slot_bytes`` each, alike on every rank: position
+    ``p`` of the page's tokens lies in slot ``p % slots`` (FP4 MLA's high-precision tail, sized
+    by the worker's speculative rewind), of elements of type ``dtype``."""
+    return (
+        Tensor(
+            (Axis("position", slots, slot_bytes, Ring()), Axis("byte", slot_bytes, 1)),
             dtype=dtype,
         ),
     )

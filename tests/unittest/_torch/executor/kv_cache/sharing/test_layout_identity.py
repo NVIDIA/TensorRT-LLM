@@ -48,12 +48,14 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     PageLayout,
     PerRequest,
     RankTopology,
+    Ring,
     ShardDesc,
     Tensor,
     Whole,
     content_shard,
     head_major,
     replicated,
+    ring,
     sectioned,
     token_major,
 )
@@ -188,6 +190,7 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         lambda: _replace_buffers(make_layout(), tensors=head_major(20, 4, 8)),
         lambda: _replace_buffers(make_layout(), tensors=token_major(20, 2, 2, 4)),
         lambda: _replace_buffers(make_layout(), tensors=sectioned((15, 5), 2)),
+        lambda: _replace_buffers(make_layout(), tensors=ring(4, 5)),
         lambda: _replace_buffers(make_layout(), transferred=False),
         lambda: _replace_buffers(make_layout(), expansion=2),
         lambda: _replace_buffers(make_layout(), role="scale2"),
@@ -209,6 +212,7 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         "head_size",
         "token_major",
         "sections",
+        "ring",
         "transfer",
         "expansion",
         "role",
@@ -304,7 +308,7 @@ class _Stretched(AxisKind):
 def test_layout_id_hashes_every_axis_and_kind_field():
     """The lender hashes each axis as ``page_layout.axis_document`` writes it: its name, extent
     and stride and its kind's document. The kinds of old encode as the fields ``Axis`` had before
-    it had a kind (split, held, cyclic), so their ids are unchanged; a kind added later, as
+    it had a kind (split, held, cyclic, ring), so their ids are unchanged; a kind added later, as
     one a test defines, reaches ``layout_id`` with its name and every field set away from its
     default, with no change to the lender, and leaves every other document alone.
     """
@@ -314,7 +318,7 @@ def test_layout_id_hashes_every_axis_and_kind_field():
     buffers = (
         dataclasses.replace(key, tensors=head_major(50, 5, 10)),  # split, held
         dataclasses.replace(scale, tensors=(cyclic,)),
-        other,
+        dataclasses.replace(other, tensors=ring(8, 8)),
     )
     document = layout_document(dataclasses.replace(layout, buffers=buffers))
     hashed = {
@@ -324,7 +328,7 @@ def test_layout_id_hashes_every_axis_and_kind_field():
         for axis in tensor["axes"]
         for field in axis
     }
-    assert hashed == {"name", "extent", "stride", "split", "held", "cyclic"}
+    assert hashed == {"name", "extent", "stride", "split", "held", "cyclic", "ring"}
     stretched = (Tensor((Axis("byte", 20, 1, _Stretched(factor=3)),)),)
     novel = layout_document(
         dataclasses.replace(
@@ -2842,6 +2846,7 @@ LAYOUT_KINDS = {
     Whole: "",
     Contiguous: "split=('tp',) held=1",
     Cyclic: "split=('tp',)",
+    Ring: "",
     Paged: "",
     PerRequest: "",
 }
@@ -2881,6 +2886,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
             "owned",
             "replica_ranks",
             "replicated",
+            "ring",
             "sectioned",
             "token_major",
         ]
@@ -2911,6 +2917,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         "whole",
         "contiguous",
         "cyclic",
+        "ring",
         "attention",
         "state",
     ]

@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     map_buffers,
     merge_runs,
     owned_indices,
+    page_runs,
     pair_pages,
     sent_bytes,
 )
@@ -50,11 +51,18 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     PageLayout,
     Progression,
     RankTopology,
+    Ring,
     Tensor,
+    axis_document,
+    axis_from_dict,
+    axis_to_dict,
     grid_place,
     head_major,
     held,
+    layout_from_dict,
+    layout_to_dict,
     replicated,
+    ring,
     sectioned,
     token_major,
 )
@@ -169,7 +177,7 @@ def check(
 ) -> None:
     """Every destination rank of every data-parallel group gets each byte it holds exactly once,
     holding the right element, and only from source ranks of its fan; for page ``page`` of a
-    request reaching token position ``end`` where axes of token positions are concerned. The
+    request reaching token position ``end`` where rings of token positions are concerned. The
     destination's buffers follow ``dst_specs`` where given."""
     sources = [layout(t, src.stages[t.pp_rank], specs) for t in src.ranks(src_dp)]
     destinations = [
@@ -295,6 +303,90 @@ def test_a_cyclic_split_hands_each_rank_every_nth_index():
             with pytest.raises(ValueError, match="no source rank it pairs with"):
                 check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
     assert not fan_holds(rows, 2, 4)
+
+
+def tail(slots: int) -> Callable[[RankTopology], tuple]:
+    """A ring of ``slots`` token positions of one head each, alike on every rank."""
+    return lambda topology: ring(slots, HEAD)
+
+
+RING_SLOTS = (3, 4, 6)  # fewer than, as many as, and more than a page's TOKENS positions
+
+
+@pytest.mark.parametrize("src_slots,dst_slots", list(itertools.product(RING_SLOTS, RING_SLOTS)))
+@pytest.mark.parametrize("src_tp,dst_tp", [(1, 1), (2, 1), (1, 2), (2, 4)])
+@pytest.mark.parametrize("page,end", [(0, 4), (0, 3), (1, 6), (2, 11), (2, 12)])
+def test_a_ring_moves_the_latest_positions_both_rings_keep(
+    src_slots, dst_slots, src_tp, dst_tp, page, end
+):
+    """A ring sized apart on the two sides, as a worker's speculative rewind sizes FP4 MLA's
+    high-precision tail: each of the latest positions of the page that both rings keep lands in
+    its own slot of the destination's ring once, from one source rank, and no other slot is
+    written; the heads beside it reshard as they do without it."""
+    specs = [("key", kv(4), "attention"), ("tail", tail(src_slots), "attention")]
+    dst_specs = [specs[0], ("tail", tail(dst_slots), "attention")]
+    check(
+        Instance(tp=src_tp),
+        Instance(tp=dst_tp),
+        specs,
+        dst_specs=dst_specs,
+        page=page,
+        end=end,
+    )
+
+
+def test_a_ring_moves_by_position_and_sizes_its_page_by_the_positions_both_keep():
+    """Positions 4..7 of page 1 lie in slots p % 3 of the source and p % 6 of the destination,
+    in runs that break where either ring wraps; the most a page moves is the three positions
+    both keep."""
+    src = layout(RankTopology(), (0,), [("tail", tail(3), "attention")])
+    dst = layout(RankTopology(), (0,), [("tail", tail(6), "attention")])
+    (runs,) = map_buffers(src, dst)
+    assert not runs.fixed and runs.page_bytes == 3 * HEAD
+    # Positions 5, 6, 7 (the latest three of the page): source slots 2, 0, 1; destination 5, 0, 1.
+    got = sorted(zip(*(a.tolist() for a in page_runs(runs, 1, TransferWindow(0, 8)))))
+    assert got == [(0, 0, 2 * HEAD), (2 * HEAD, 5 * HEAD, HEAD)]
+    assert sent_bytes(src, dst) == {0: 3 * HEAD}
+    # A page the request has written none of yet moves nothing.
+    assert all(a.size == 0 for a in page_runs(runs, 2, TransferWindow(0, 8)))
+
+
+def test_rings_correspond_whatever_their_sizes_but_not_to_other_tensors():
+    specs = [("tail", tail(3), "attention")]
+    page = layout(RankTopology(), (0,), specs)
+    check_compatible(page, layout(RankTopology(), (0,), [("tail", tail(6), "attention")]))
+    whole_tail = layout(RankTopology(), (0,), [("tail", whole(3 * HEAD), "attention")])
+    with pytest.raises(ValueError, match="axes"):
+        check_compatible(page, whole_tail)
+    with pytest.raises(ValueError, match="token positions"):
+        map_buffers(page, whole_tail)
+
+
+def test_a_ring_of_token_positions_belongs_to_a_paged_layer_group():
+    page = layout(RankTopology(), (0,), [("tail", tail(3), "state")])
+    with pytest.raises(ValueError, match="ring of token positions in a state layer group"):
+        map_buffers(page, page)
+
+
+def test_a_ring_is_whole_on_every_rank_and_alone_in_its_buffer():
+    assert Axis("position", 4, HEAD, Ring()).split == ()
+    with pytest.raises(ValueError, match="more than one indexes token positions"):
+        Tensor((Axis("a", 2, HEAD, Ring()), Axis("b", 2, 2 * HEAD, Ring())))
+    (ring_tensor,) = ring(2, HEAD)
+    other = Tensor((Axis("byte", HEAD, 1),), offset=2 * HEAD, name="other")
+    with pytest.raises(ValueError, match="only tensor"):
+        BufferDesc(0, "tail", 0, 0, 0, 3 * HEAD, (ring_tensor, other))
+    with pytest.raises(ValueError, match="only tensor"):
+        BufferDesc(0, "tail", 0, 0, 0, 2 * HEAD, (ring_tensor,), expansion=2)
+
+
+def test_a_ring_travels_to_peers_in_the_layout():
+    specs = [("key", kv(4), "attention"), ("tail", tail(3), "attention")]
+    page = layout(Instance(tp=2).ranks(0)[1], (0, 1), specs)
+    assert layout_from_dict(layout_to_dict(page)) == page
+    axis = ring(3, HEAD)[0].axes[0]
+    assert axis_from_dict(axis_to_dict(axis)) == axis
+    assert axis_document(axis) == {"name": "position", "extent": 3, "stride": HEAD, "ring": True}
 
 
 def test_runs_merge_where_both_sides_continue():

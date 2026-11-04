@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_bf16_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, ring
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
@@ -939,9 +939,12 @@ class Fp4MlaV2CacheLayoutPolicy:
         self, layer_id: int, role: str, size: int, tokens: int, state: bool
     ) -> tuple[Tensor, ...]:
         """Latents token-major by head, as the FP4 MLA kernels write them; the high-precision
-        tail alike on every rank."""
+        tail a ring of BF16 latent tokens alike on every rank, sized by this worker's speculative
+        rewind, so a context and a generation worker may size it differently."""
         if role == Role.MLA_HP_TAIL:
-            return replicated(size)
+            local_layer = self._fp4_mla_compact_to_local[self._hp_manager_layer_ids.index(layer_id)]
+            slots = self._fp4_mla_hp_pool_size
+            return ring(slots, self._hp_bytes_per_page(local_layer) // slots, dtype="bfloat16")
         return self._page_head_split(layer_id, size, tokens, state, token_major_=True)
 
     def _page_derived_roles(self) -> frozenset[str]:
