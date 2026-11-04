@@ -905,6 +905,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                             f"Deferring context request {req.py_request_id}: its first new "
                             "block is already contributed by a request that runs this iteration"
                         )
+                        self._uncached_context_memo.pop(req.py_request_id, None)
                         deferred_behind_contributor = True
                         continue
                 peft_pages = budget.peft_pages_needed(req)
@@ -1564,11 +1565,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         reserve = self._ctx_append_reserve if self._ctx_append_reserve_active else 0
         if not reserve or budget.num_tokens != 0 or budget.max_num_tokens is None:
-            return self._try_schedule_context_chunked_impl(req, budget, preempt_for_pages)
+            return self._try_schedule_context_chunked_impl(
+                req, budget, preempt_for_pages, token_cap
+            )
         full = budget.max_num_tokens
         budget.max_num_tokens = full - reserve
         try:
-            result = self._try_schedule_context_chunked_impl(req, budget, preempt_for_pages)
+            result = self._try_schedule_context_chunked_impl(
+                req, budget, preempt_for_pages, token_cap, full_token_budget=full
+            )
         finally:
             budget.max_num_tokens = full
         if self._ctx_append_reserve_logged < 3 and result[0] is ScheduleAction.SCHEDULED:
@@ -1584,6 +1589,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         req: LlmRequest,
         budget: BudgetTracker,
         preempt_for_pages: Callable[[LlmRequest], bool],
+        token_cap: Optional[int] = None,
+        full_token_budget: Optional[int] = None,
     ) -> tuple[ScheduleAction, int, bool]:
         """FCFS interleaved chunking for a single context request.
 
@@ -1680,19 +1687,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # a longer chunk would grow the capacity again before the history catches up.
         pregrown = self._pregrown_context_tokens(req)
         if pregrown > 0:
-            if chunk_size < pregrown:
-                return ScheduleAction.SKIP, 0, False
-            chunk_size = pregrown
-
-        if chunk_size <= 0:
-            # Out of token budget rather than out of pages, so releasing pages
-            # would not help; the next iteration gets a fresh budget. Not
-            # suspended either, to avoid pathological suspend/resume cycles.
-            return ScheduleAction.SKIP, 0, False
+            chunk_size = pregrown if chunk_size >= pregrown else 0
 
         # A pre-grown chunk was MM-aligned from this same position when it was
         # first sized, and either snap direction would break the exact replay.
-        if pregrown == 0:
+        if pregrown == 0 and chunk_size > 0:
             chunk_size = self._align_chunk_to_mm_block(
                 req, chunk_size, remaining_budget, context_remaining
             )
@@ -1701,6 +1700,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # than schedule a chunk that would corrupt attention. Next iteration
         # gets a fresh budget; under steady-state load this resolves quickly.
         if chunk_size <= 0:
+            if full_token_budget is not None:
+                # The reserve is optional. Release it once when MM alignment or
+                # exact pre-grown replay cannot advance; token_cap still applies.
+                # No resize/allocation has happened, so prepare_context is safe to repeat.
+                budget.max_num_tokens = full_token_budget
+                return self._try_schedule_context_chunked_impl(
+                    req, budget, preempt_for_pages, token_cap
+                )
             return ScheduleAction.SKIP, 0, False
         budget_chunk_size = chunk_size
         # Decoder queries are a subset of these physical Encoder rows, including

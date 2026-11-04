@@ -5241,6 +5241,26 @@ class TestAppendReserveShortestFirst:
         assert ids(out.context_requests) == [0]
         assert head.context_chunk_size == 8192
 
+    def test_reserve_released_for_indivisible_multimodal_block(self):
+        requests = [
+            TestMultimodalAwareChunkingV2()._make_mm_req(i, 10000, [(0, 7000)]) for i in range(2)
+        ]
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), requests)
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 8192
+
+    def test_reserve_released_for_exact_pregrown_replay(self):
+        manager = make_kv_cache_manager(tokens_per_block=64)
+        manager.enable_swa_scratch_reuse = True
+        requests = [make_ctx_request(i, context_remaining_length=10000) for i in range(2)]
+        for request in requests:
+            manager.kv_cache_map[request.py_request_id].capacity = (
+                7168 + manager.num_extra_kv_tokens
+            )
+        out = self._schedule(manager, requests)
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 7168
+
     def test_short_request_takes_the_reserve_ahead_of_a_second_long_one(self):
         head = make_ctx_request(0, context_remaining_length=20000)
         long_second = make_ctx_request(1, context_remaining_length=6000)
@@ -5917,3 +5937,23 @@ class TestDisaggAdmitBeforeAlloc:
         base, gated = self._both(64, reqs)
         assert ids(base.out.generation_requests) == ids(gated.out.generation_requests) == [2, 4]
         assert gated.admitted == [0] and gated.allocated == [0, 1]
+
+
+@pytest.mark.parametrize("reserve", [0, 2048])
+def test_append_reserve_preserves_starved_context_token_cap(
+    monkeypatch: pytest.MonkeyPatch, reserve: int
+) -> None:
+    monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", str(reserve))
+    scheduler = make_scheduler(
+        make_kv_cache_manager(tokens_per_block=64),
+        max_num_tokens=8192,
+        ctx_chunk_config=(None, 64),
+    )
+    request = make_ctx_request(0, context_remaining_length=20000)
+    budget = BudgetTracker(8192, 8)
+    action, tokens, chunked = scheduler._try_schedule_context(
+        request, budget, lambda req: False, token_cap=512
+    )
+    assert action is ScheduleAction.SCHEDULED
+    assert tokens == 512 and chunked
+    assert budget.max_num_tokens == 8192

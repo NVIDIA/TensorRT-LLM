@@ -16,6 +16,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
+from tensorrt_llm._torch.moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
 
 LAYERS = 4
 
@@ -170,3 +171,18 @@ def test_a_prefill_moe_layer_takes_the_mc_finalize_boundary_when_it_folds(monkey
     assert out == (("normed", 2), ("updated", 2))
     assert seen and seen[0][0] == 2 and seen[0][3] == "in_norm3"
     assert captured == [(2, ("updated", 2), None)]
+
+
+@pytest.mark.cpu_only
+def test_ctx_router_cache_refreshes_in_place_after_refit(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = modeling.MiniMaxM3Tp2ModelingV2.__new__(modeling.MiniMaxM3Tp2ModelingV2)
+    torch.nn.Module.__init__(core)
+    core.w = {"l0_router": torch.ones(8, 64)}
+    core.router_w_tf32 = {0: prepare_router_weight_tf32(core.w["l0_router"])}
+    captured = core.router_w_tf32[0]
+    # Existing storages take post_load_weights' idempotent return; no kernels need rebuilding.
+    monkeypatch.setattr(core, "post_load_weights", lambda: None)
+    core.w["l0_router"].fill_(2.0)
+    core.cache_derived_state()
+    assert core.router_w_tf32[0] is captured
+    torch.testing.assert_close(captured, torch.full((8, 64), 2.0), rtol=0, atol=0)

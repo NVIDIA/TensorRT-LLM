@@ -118,7 +118,11 @@ def _fold_shared_backend(experts: nn.Module) -> bool:
     from ..moe.fused_moe.cutedsl.grouped_gemm import nvfp4 as _cute_moe
 
     backend = getattr(experts, "backend", experts)
-    return _cute_moe._RUBIN_DETERMINISTIC_FC2 and isinstance(backend, _cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl)
+    return (
+        get_sm_version() == 107
+        and _cute_moe._RUBIN_DETERMINISTIC_FC2
+        and isinstance(backend, _cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl)
+    )
 
 
 def _moe_routed_output_is_global(experts: nn.Module) -> bool:
@@ -1075,11 +1079,15 @@ class MiniMaxM3Gate(nn.Module):
 
     def cache_tf32_weight(self) -> None:
         """Build the TF32-rounded weight copy for the fixed-tile router (after every weight load)."""
-        self._weight_tf32 = None
         if _CTX_ROUTER_TF32_FIXED and self._sm107_fp32_cast:
             from ..moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
 
-            self._weight_tf32 = prepare_router_weight_tf32(self.weight.float())
+            refreshed = prepare_router_weight_tf32(self.weight.float())
+            if self._weight_tf32 is None:
+                self._weight_tf32 = refreshed
+            else:
+                # Captures retain this allocation across refit.
+                self._weight_tf32.copy_(refreshed)
         if self._router_tc_gen:
             # Decide the TF32 tensor-core router at load time (cluster query + its log), never inside a CUDA-graph
             # capture of a 9..16-row bucket; a device without 16-CTA clusters keeps the stock router.
@@ -1349,7 +1357,7 @@ class MiniMaxM3MoE(nn.Module):
         pre-scale, no hidden padding) or CuteDSL backend: there quantize_input is exactly fp4_quantize(x,
         fc31_input_scale, 16, False, False) and passes an unswizzled Fp4QuantizedTensor through unchanged.
         """
-        from ..moe.fused_moe import CuteDslFusedMoE
+        from ..moe.fused_moe.cutedsl.grouped_gemm.nvfp4 import TrtllmCutedslGroupedGemmNvfp4Impl
         from ..moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
 
         experts = self.experts
@@ -1361,6 +1369,7 @@ class MiniMaxM3MoE(nn.Module):
             or getattr(experts, "enable_dwdp", False)
             or num_rows > getattr(experts, "moe_max_num_tokens", 0)
             or getattr(backend, "lora_params", None) is not None
+            or getattr(backend, "fc31_act_scale", None) is not None
         ):
             return None
         if type(backend) is TrtllmTrtllmGenNvfp4Impl:
@@ -1372,7 +1381,7 @@ class MiniMaxM3MoE(nn.Module):
                 or w.shape[-1] * 2 != self.hidden_dim
             ):
                 return None
-        elif not (isinstance(backend, CuteDslFusedMoE) and getattr(backend, "has_nvfp4", False)):
+        elif not isinstance(backend, TrtllmCutedslGroupedGemmNvfp4Impl):
             return None
         if getattr(backend, "scaling_vector_size", None) != 16:
             return None

@@ -204,3 +204,18 @@ def test_tile_select_gate(monkeypatch, sm_version, enabled, total_q, num_blocks)
     monkeypatch.setattr(msa_indexer, "_SM107_TILE_SELECT", enabled)
     scores = torch.zeros(4, num_blocks, total_q)
     assert msa_indexer._tile_select(scores, torch.ones(total_q, dtype=torch.int32), 0, 1) is None
+
+
+@sm107
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+@pytest.mark.parametrize("operand", ["n_valid_blocks", "out"])
+def test_tile_select_rejects_mismatched_device(operand: str) -> None:
+    scores = torch.zeros((1, 32, 4), device="cuda:0")
+    n_valid = torch.full((4,), 32, dtype=torch.int32, device="cuda:0")
+    out = torch.empty((4, 1, 16), dtype=torch.int32, device="cuda:0")
+    if operand == "n_valid_blocks":
+        n_valid = n_valid.to("cuda:1")
+    else:
+        out = out.to("cuda:1")
+    with pytest.raises(RuntimeError, match=f"{operand} must use the scores device"):
+        torch.ops.trtllm.minimax_m3_select_prefill_tile(scores, n_valid, out, 0, 1)

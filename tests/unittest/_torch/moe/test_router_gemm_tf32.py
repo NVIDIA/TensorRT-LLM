@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gate a for the batch-invariant TF32 router GEMM at the M3 gate shape ([M, 6144] x [6144, 128]): rows bitwise
 identical for every M (the breakable-prefill buckets included), run to run; error vs fp64 no worse than the stock
-router (fp32 F.linear with TF32 allowed); top-4 (sigmoid + bias) close to stock. The split-K kernel (default) and the
+TF32 F.linear comparison; the actual loaded stock gate and complete routing have a separate test.
+The split-K kernel (default) and the
 single-pass kernel (kill TRTLLM_CTX_ROUTER_TF32_SPLITK=0) each meet all of it."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.models import modeling_minimaxm3
 from tensorrt_llm._torch.moe.fused_moe import router_gemm_tf32 as rgt
 from tensorrt_llm._torch.moe.fused_moe.router_gemm_tf32 import (
     prepare_router_weight_tf32,
@@ -72,14 +74,13 @@ def test_m_invariant_and_deterministic(data) -> None:
         assert torch.equal(o.view(torch.int32), ref[:m].view(torch.int32)), f"rows differ at M={m}"
 
 
-def test_error_and_top4_vs_stock(data) -> None:
+def test_error_and_top4_vs_tf32_linear(data) -> None:
     x, w, wr, bias = data
     ref64 = x.double() @ w.double().t()
     prev = torch.backends.cuda.matmul.allow_tf32
     try:
-        torch.backends.cuda.matmul.allow_tf32 = (
-            True  # stock: NGC TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
-        )
+        # Same-precision comparison; the loaded stock gate is tested separately.
+        torch.backends.cuda.matmul.allow_tf32 = True
         stock = F.linear(x.float(), w)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
@@ -215,3 +216,85 @@ def test_split_k_matches_the_single_pass_kernel_within_the_stated_bound(
 
     flips = int((top4(split) != top4(single)).any(1).sum())
     assert flips <= m // 1000, (m, flips)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 router replay validation",
+)
+def test_gate_tf32_cuda_graph_replay_after_refit(monkeypatch) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_ROUTER_TC_GEN", False)
+    gate = modeling_minimaxm3.MiniMaxM3Gate(H, E, TOP_K, 1.0).cuda()
+    weight = torch.randn(E, H, device="cuda") / H**0.5
+    gate.load_weights([{"weight": weight}])
+    gate.cache_tf32_weight()
+    ptr = gate._weight_tf32.data_ptr()
+    x = torch.randn(128, H, device="cuda").bfloat16()
+    for _ in range(3):
+        gate(x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = gate(x)
+    before = captured.clone()
+    gate.load_weights([{"weight": -weight}])
+    gate.cache_tf32_weight()
+    assert gate._weight_tf32.data_ptr() == ptr
+    graph.replay()
+    torch.testing.assert_close(captured, gate(x), rtol=0, atol=0)
+    assert not torch.equal(captured, before)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 gate validation against the loaded stock router",
+)
+@pytest.mark.parametrize("rows", [48, 2048, 8192, 8193])
+def test_gate_tf32_vs_loaded_split_weight_and_complete_routing(
+    monkeypatch, data, rows: int
+) -> None:
+    """Compare the production gate and full routing against the actual loaded stock path.
+
+    Keep the existing top-k flip budget (at most one per thousand rows), require
+    every flip to lie within the measured score-perturbation tie band, and bound
+    normalized logit and matching-expert routing-weight errors by 5e-4.
+    This is a kernel/gate budget; model-level accuracy qualification is separate.
+    """
+    x, weight, _, bias = data
+    x = x[:rows].contiguous()
+    gate = modeling_minimaxm3.MiniMaxM3Gate(H, E, TOP_K, 1.0).cuda()
+    gate.load_weights([{"weight": weight, "e_score_correction_bias": bias}])
+    assert gate.split_weight is not None
+    assert gate._weight_tf32 is None
+    stock = gate(x)
+    stock_ids, stock_weights = gate.routing_method.apply(stock)
+
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
+    gate.cache_tf32_weight()
+    optimized = gate(x)
+    optimized_ids, optimized_weights = gate.routing_method.apply(optimized)
+    reference = x.double() @ weight.double().t()
+    reference_scale = reference.abs().max().clamp_min(1e-30)
+    normalized_logit_error = float((optimized.double() - reference).abs().max() / reference_scale)
+    stock_logit_error = float((stock.double() - reference).abs().max() / reference_scale)
+    assert normalized_logit_error <= 5e-4, (normalized_logit_error, stock_logit_error)
+
+    stock_order = stock_ids.argsort(dim=1)
+    optimized_order = optimized_ids.argsort(dim=1)
+    matched = (stock_ids.gather(1, stock_order) == optimized_ids.gather(1, optimized_order)).all(1)
+    flips = int((~matched).sum())
+    assert flips <= rows // 1000, flips
+    scores = torch.sigmoid(stock) + bias
+    score_delta = (torch.sigmoid(optimized) - torch.sigmoid(stock)).abs().amax(dim=1)
+    ranked = scores.topk(TOP_K + 1, dim=1).values
+    clear_margin = ranked[:, TOP_K - 1] - ranked[:, TOP_K] > 2 * score_delta
+    assert not bool(((~matched) & clear_margin).any()), "routing changed away from a near-tie"
+    stock_aligned = stock_weights.gather(1, stock_order)[matched]
+    optimized_aligned = optimized_weights.gather(1, optimized_order)[matched]
+    weight_error = float((optimized_aligned - stock_aligned).abs().max())
+    assert weight_error <= 5e-4, weight_error
+    print(
+        f"loaded-stock comparison: rows={rows}, stock_logit_error={stock_logit_error:.8g}, "
+        f"tf32_logit_error={normalized_logit_error:.8g}, complete_routing_flips={flips}, "
+        f"routing_weight_error={weight_error:.8g}"
+    )

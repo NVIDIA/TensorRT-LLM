@@ -1281,9 +1281,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if segments is not None:
             seg_qo, seg_kv, seg_off = segments
             self._msa_prefill_proxy_plan = fmha_sm100.fmha_sm100_plan(
-                seg_qo, seg_kv, qo_offset=seg_off, page_size=page_size,
+                seg_qo,
+                seg_kv,
+                qo_offset=seg_off,
+                page_size=page_size,
                 num_kv_splits=proxy_kv_splits(int(seg_qo.shape[0]), _cache_device(self)),
-                causal=True, num_qo_heads=num_index_heads, num_kv_heads=1,
+                causal=True,
+                num_qo_heads=num_index_heads,
+                num_kv_heads=1,
                 output_maxscore=True,
             )
             self._msa_prefill_proxy_kv_indices = self.msa_proxy_kv_indices
@@ -1303,7 +1308,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                     proxy_rows,
                     num_kv_splits=(
                         proxy_kv_splits(proxy_rows[1] - proxy_rows[0], _cache_device(self))
-                        if proxy_rows is not None and self.msa_proxy_kv_indices is not None else 1
+                        if proxy_rows is not None and self.msa_proxy_kv_indices is not None
+                        else 1
                     ),
                     num_qo_heads=num_index_heads,
                     num_kv_heads=1,

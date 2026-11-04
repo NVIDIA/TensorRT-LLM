@@ -2671,8 +2671,14 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         self._built_for = identity
 
     def cache_derived_state(self) -> None:
-        """The staged loaders' entry to the same build (``post_load_weights``)."""
+        """Build the target and refresh captured router weights after in-place refit."""
         self.post_load_weights()
+        from tensorrt_llm._torch.moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
+
+        # post_load_weights intentionally skips rebuilding unchanged storages;
+        # their contents can still change on refit. Captures retain these buffers.
+        for i, cached in self.router_w_tf32.items():
+            cached.copy_(prepare_router_weight_tf32(self.w[f"l{i}_router"].float()))
 
     def _derive_moe(self, i: int) -> _MoeScalars:
         """The routed experts' kernel scalars from the checkpoint's per-tensor scales (trtllm-gen NVFP4 layout).

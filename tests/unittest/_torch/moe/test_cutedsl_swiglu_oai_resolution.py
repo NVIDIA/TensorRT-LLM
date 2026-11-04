@@ -4,11 +4,14 @@
 NVFP4 with the deterministic FC2 (CTX-7), and must be declined everywhere else: expert biases, the
 non-deterministic FC2, other SMs. Gates the dispatch, not the op."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
 import tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 as cute_moe
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import _canonicalize_rubin_activation_beta
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.activation import SwigluBiasActivation
@@ -21,6 +24,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     infer_swiglu_gptoss_style,
     resolve_moe_impl,
 )
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -74,7 +78,9 @@ def test_m3_swiglu_bias_resolves_to_cutedsl_on_sm107(monkeypatch) -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("case", ["nondeterministic_fc2", "expert_bias", "sm100"])
+@pytest.mark.parametrize(
+    "case", ["nondeterministic_fc2", "expert_bias", "sm100", "locality_domain"]
+)
 def test_swiglu_bias_declined_outside_the_deterministic_rubin_path(monkeypatch, case) -> None:
     monkeypatch.setattr(cute_moe, "_RUBIN_DETERMINISTIC_FC2", case != "nondeterministic_fc2")
     sm, bias = (100, False) if case == "sm100" else (107, case == "expert_bias")
@@ -86,7 +92,8 @@ def test_swiglu_bias_declined_outside_the_deterministic_rubin_path(monkeypatch, 
         activation=_M3_ACT,
         **_SHAPE,
     )
-    verdict = cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, _deployment(sm))
+    deployment = replace(_deployment(sm), locality_domain_requested=case == "locality_domain")
+    verdict = cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, deployment)
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
@@ -109,3 +116,15 @@ def test_m3_create_moe_builds_cutedsl_on_this_gpu() -> None:
             **_SHAPE,
         )
     assert isinstance(moe.backend, cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl), type(moe.backend)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("linear_offset", [0.0, -1.0, -2.5, 1.0])
+def test_rubin_oai_linear_offset_survives_parameter_conversion(linear_offset: float) -> None:
+    assert (
+        _canonicalize_rubin_activation_beta(ActivationType.SwigluBias, linear_offset)
+        == linear_offset
+    )
+    assert _canonicalize_rubin_activation_beta(ActivationType.SiTu, linear_offset) == (
+        linear_offset if linear_offset > 0 else None
+    )

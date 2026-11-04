@@ -8,6 +8,7 @@ against an fp64 reference.
 """
 
 import math
+import sys
 from unittest.mock import create_autospec
 
 import pytest
@@ -174,3 +175,26 @@ def test_dense_prefill_fa4_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert msa_prefill.dense_prefill_fa4_enabled(True, HEAD_DIM, PAGE)
     assert not msa_prefill.dense_prefill_fa4_enabled(False, HEAD_DIM, PAGE)
     assert not msa_prefill.dense_prefill_fa4_enabled(True, HEAD_DIM, 64)
+
+
+@pytest.mark.parametrize("heads,kv_heads", [(32, 2), (16, 1), (8, 1)])
+def test_dense_prefill_fa4_short_tail_band_per_tp_geometry(
+    monkeypatch: pytest.MonkeyPatch, heads: int, kv_heads: int
+) -> None:
+    """Keep a short row's error visible instead of hiding it in a larger batch."""
+    monkeypatch.setattr(sys.modules[__name__], "NUM_HEADS", heads)
+    monkeypatch.setattr(sys.modules[__name__], "NUM_KV_HEADS", kv_heads)
+    rows = [(5, 900)]
+    q, pool, metadata, flat = _case(912, rows, False)
+    reference = _reference(q, pool, rows, flat)
+    fa4 = _run(q, metadata, 0, 1)
+    monkeypatch.setattr(msa_prefill, "dense_prefill_fa4_enabled", lambda *_: False)
+    stock = _run(q, metadata, 0, 1)
+    fa4_error, stock_error = _max_err(fa4, reference), _max_err(stock, reference)
+    assert torch.isfinite(fa4).all()
+    assert fa4_error <= stock_error * 1.05 + 2.0**-9 * float(reference.abs().max()), (
+        heads,
+        kv_heads,
+        fa4_error,
+        stock_error,
+    )

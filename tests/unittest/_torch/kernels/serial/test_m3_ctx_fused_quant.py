@@ -78,3 +78,29 @@ def test_swiglu_mxfp8_is_bitwise_the_quantized_swiglu(
     )
     assert torch.equal(_bits(q), _bits(ref_q)), "MXFP8 values"
     assert torch.equal(sf.view(-1), ref_sf.view(torch.uint8).view(-1)), "MXFP8 swizzled scales"
+
+
+@pytest.mark.parametrize("operand", ["residual", "weight", "fp4_global_scale"])
+@pytest.mark.parametrize("other_device", ["cpu", "cuda:1"])
+def test_ctx_residual_rmsnorm_rejects_mismatched_device(operand: str, other_device: str) -> None:
+    if other_device == "cuda:1" and torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs")
+    inter = torch.zeros((1, 256), dtype=torch.bfloat16, device="cuda:0")
+    args = {
+        "residual": torch.zeros_like(inter),
+        "weight": torch.ones(256, dtype=torch.bfloat16, device=inter.device),
+        "fp4_global_scale": torch.ones(1, device=inter.device),
+    }
+    args[operand] = args[operand].to(other_device)
+    with pytest.raises(RuntimeError, match=f"{operand} must use the inter device"):
+        torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+            inter, args["residual"], args["weight"], EPS, True, args["fp4_global_scale"]
+        )
+
+
+def test_ctx_residual_rmsnorm_rejects_zero_hidden() -> None:
+    inter = torch.empty((1, 0), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="hidden must be positive"):
+        torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+            inter, torch.empty_like(inter), inter.reshape(-1), EPS, True
+        )

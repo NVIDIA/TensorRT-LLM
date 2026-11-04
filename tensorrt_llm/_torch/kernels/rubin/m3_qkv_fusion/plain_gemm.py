@@ -162,6 +162,10 @@ class M3ClcMxfp8Gemm:
             return "operands are not on one CUDA device"
         return ""
 
+    def clear_weight_cache(self) -> None:
+        """Drop DLPack arguments and their source tensors before a refit."""
+        self._weight_args.clear()
+
     def _weight_dl(self, weight, weight_sf, alpha) -> Tuple:
         key = (
             weight.data_ptr(),

@@ -46,6 +46,7 @@ _failed: Dict[Tuple[int, int], str] = {}
 # (the warmup) therefore builds every variant. Kill switch: TRTLLM_CTX_CLC_GEMM_PRECOMPILE=0 compiles each on first use.
 _PRECOMPILE = os.environ.get("TRTLLM_CTX_CLC_GEMM_PRECOMPILE", "1") != "0"
 _precompiled = [False]
+_loaded_gemms: dict[tuple[int, int], object] = {}
 
 
 def ctx_clc_gemm_enabled() -> bool:
@@ -69,7 +70,15 @@ def ctx_clc_heads_per_tile(m: int, n: int, k: int) -> Optional[int]:
 def _get_gemm(n: int, heads_per_tile: int):
     from ..kernels.rubin.m3_qkv_fusion.plain_gemm import get_gemm
 
-    return get_gemm(n, heads_per_tile)
+    gemm = get_gemm(n, heads_per_tile)
+    _loaded_gemms[(n, heads_per_tile)] = gemm
+    return gemm
+
+
+def clear_ctx_clc_weight_cache() -> None:
+    """Release weight generations before Linear replaces its refit parameters."""
+    for gemm in _loaded_gemms.values():
+        gemm.clear_weight_cache()
 
 
 def _precompile_all() -> None:

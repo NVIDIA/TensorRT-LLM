@@ -45,9 +45,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     TORCH_CHECK(inter.is_cuda() && inter.is_contiguous() && inter.scalar_type() == at::kBFloat16 && inter.dim() >= 2);
     TORCH_CHECK(
         residual.is_contiguous() && residual.scalar_type() == at::kBFloat16 && residual.sizes() == inter.sizes());
+    TORCH_CHECK(residual.device() == inter.device(), "residual must use the inter device");
     int64_t const hidden = inter.size(-1);
+    TORCH_CHECK(hidden > 0, "hidden must be positive");
     int64_t const rows = inter.numel() / hidden;
     TORCH_CHECK(weight.is_contiguous() && weight.scalar_type() == at::kBFloat16 && weight.numel() == hidden);
+    TORCH_CHECK(weight.device() == inter.device(), "weight must use the inter device");
     TORCH_CHECK(hidden % 256 == 0 && hidden / 8 <= 1024, "hidden must be a multiple of 256 and at most 8192");
     at::cuda::CUDAGuard const guard(inter.device());
     auto const opts = inter.options();
@@ -58,6 +61,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     bool const fp4 = fp4GlobalScale.has_value();
     if (fp4)
     {
+        TORCH_CHECK(fp4GlobalScale->device() == inter.device(), "fp4_global_scale must use the inter device");
         TORCH_CHECK(
             fp4GlobalScale->is_cuda() && fp4GlobalScale->scalar_type() == at::kFloat && fp4GlobalScale->numel() == 1);
     }

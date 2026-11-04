@@ -22,10 +22,12 @@ the custom-op timings always use the importable ``tensorrt_llm``).
 """
 
 import argparse
+import gc
 import importlib
 import os
 import sys
 import time
+import weakref
 
 import pytest
 import torch
@@ -68,11 +70,8 @@ def _pkg():
 
 
 def _dispatch_module():
-    """The in-model dispatcher (registers trtllm::m3_ctx_clc_mxfp8_gemm), or None if this tensorrt_llm lacks it."""
-    try:
-        return importlib.import_module("tensorrt_llm._torch.modules.m3_ctx_clc_gemm")
-    except ImportError:
-        return None
+    """Import the in-model dispatcher; broken in-tree imports must fail the test."""
+    return importlib.import_module("tensorrt_llm._torch.modules.m3_ctx_clc_gemm")
 
 
 def hpt_for(name, m):
@@ -234,9 +233,6 @@ def gate(name, m, log=print, hpt=None):
 def dispatch(log=print, name="o_proj"):
     """MXFP8 Linear through the real loader: engagement, slot, threshold and kill switch."""
     mod = _dispatch_module()
-    if mod is None:
-        log("DISPATCH SKIP: tensorrt_llm._torch.modules.m3_ctx_clc_gemm not importable")
-        return True
     from tensorrt_llm._torch.modules import linear as linear_module
     from tensorrt_llm._torch.modules.linear import Linear, MXFP8LinearMethod
     from tensorrt_llm.logger import logger as trt_logger
@@ -454,3 +450,31 @@ if __name__ == "__main__":
         for mm in [int(v) for v in a.timing.split(",") if v]:
             timing(nm, mm, log=plog)
     print(f"GATE ALL {'PASS' if all_ok else 'FAIL'}", flush=True)
+
+
+def test_clc_weight_arguments_released_before_linear_refit() -> None:
+    # Import after _pkg establishes CUTE_DSL_ARCH, as in the other dispatch tests.
+    _, pg = _pkg()
+    mod = _dispatch_module()
+    from tensorrt_llm._torch.modules.linear import Linear, MXFP8LinearMethod
+
+    gemm = mod._get_gemm(3072, 2)
+    weight = torch.zeros((3072, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.zeros(pg.swizzled_sf_numel(3072, 128), dtype=torch.uint8, device="cuda")
+    alpha = torch.ones(1, device="cuda")
+    gemm._weight_dl(weight, scales, alpha)
+    refs = [weakref.ref(t) for t in (weight, scales, alpha)]
+    del weight, scales, alpha
+    gc.collect()
+    assert all(ref() is not None for ref in refs)
+
+    # A real Linear executes the refit hook; empty metadata avoids allocating unrelated weights.
+    linear = Linear.__new__(Linear)
+    torch.nn.Module.__init__(linear)
+    linear.quant_method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    linear.rebuild_tensor_metadata = {}
+    linear._locality_domain_weight_shards = None
+    linear.pre_reload_weights()
+    gc.collect()
+    assert not gemm._weight_args
+    assert all(ref() is None for ref in refs)

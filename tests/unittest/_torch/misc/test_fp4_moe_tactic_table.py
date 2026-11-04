@@ -16,8 +16,10 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops as ops
 
@@ -62,3 +64,23 @@ def test_table_path_is_resolved_at_import(table, monkeypatch):
     # The environment is not re-read per call (CUDA-graph capture must see the same tactic as eager steps).
     monkeypatch.delenv(ops.FP4_MOE_TACTIC_TABLE_ENV, raising=False)
     assert ops._pinned_fp4_moe_tactic(_runner(), 1761) == [128, 23]
+
+
+def test_prerouted_lookup_uses_pinned_tile_before_building_tables(table, monkeypatch):
+    # Fields are initialized by the production constructor, not class attributes.
+    runner = ops.FP4BlockScaleMoERunner.__new__(ops.FP4BlockScaleMoERunner)
+    runner.top_k = 4
+    runner.intermediate_size = 3072
+    runner.local_num_experts = 64
+    runner.act_type = 0
+    runner.tuning_config = _runner().tuning_config
+    cache = Mock(spec_set=["search_cache"])
+    cache.search_cache.return_value = (True, None, [256, 99], None)
+    tuner = Mock(spec_set=["profiling_cache"])
+    tuner.profiling_cache = cache
+    monkeypatch.setattr(ops.AutoTuner, "get", lambda: tuner)
+    inputs = [None, None, torch.empty((1761, 1), device="meta")]
+    assert runner.lookup_tactic(inputs) == [128, 23]
+    cache.search_cache.assert_not_called()
+    monkeypatch.setattr(ops, "_FP4_MOE_TACTIC_TABLE_PATH", None)
+    assert runner.lookup_tactic(inputs) == [256, 99]

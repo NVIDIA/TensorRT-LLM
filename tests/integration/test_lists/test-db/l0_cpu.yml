@@ -110,6 +110,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_ctx_stack_route.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_capture_boundary.py::test_ctx_router_cache_refreshes_in_place_after_refit
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -141,6 +142,9 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_fp4_input_scale_rejects_cutedsl_awq_prescale
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_tf32_refit_preserves_allocation
+  - unittest/_torch/models/test_minimax_m3.py::test_cutedsl_shared_fold_backend_is_rubin_only
   # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py

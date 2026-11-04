@@ -696,6 +696,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
         the tuned choice, or None (not tuned yet). A caller that routes the
         tokens itself builds its tables for this tile and passes the tactic as
         ``prerouted_tactic``."""
+        pinned = _pinned_fp4_moe_tactic(self, inputs[2].shape[0])
+        if pinned is not None:
+            return list(pinned)
         shapes = tuple(
             t.size() if isinstance(t, torch.Tensor) else torch.Size((0, ))
             for t in inputs)
@@ -887,7 +890,8 @@ def fp4_block_scale_moe_runner(
             tuning_config_with_hook,
             input_tensors_for_tuner,
         )
-        pinned_tactic = _pinned_fp4_moe_tactic(kernel_runner, hidden_states.shape[0])
+        pinned_tactic = _pinned_fp4_moe_tactic(kernel_runner,
+                                               hidden_states.shape[0])
         if pinned_tactic is not None:
             best_tactic = pinned_tactic
         result = kernel_runner(

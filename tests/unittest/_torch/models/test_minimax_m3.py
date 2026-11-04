@@ -38,6 +38,7 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+import tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 as cutedsl_nvfp4
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -88,6 +89,9 @@ from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForC
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 import (
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
@@ -3280,3 +3284,57 @@ def test_ctx_qkv_fused_skips_autotune_pass(monkeypatch, tuning: bool) -> None:
     assert m3._autotuner_tuning() is tuning
     # The yield is logged once per process, and only when it happens.
     assert m3._CTX_QKV_FUSED_YIELD_LOGGED is tuning
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_prescale", [False, True])
+def test_ctx_fp4_input_scale_rejects_cutedsl_awq_prescale(has_prescale: bool) -> None:
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
+    nn.Module.__init__(backend)
+    backend.scaling_vector_size = 16
+    backend.fc31_input_scale = torch.ones(1, dtype=torch.float32)
+    backend.fc31_act_scale = torch.ones(64) if has_prescale else None
+    experts = nn.Module()
+    experts.backend = backend
+    experts.moe_max_num_tokens = 32
+    block = modeling_minimaxm3.MiniMaxM3MoE.__new__(modeling_minimaxm3.MiniMaxM3MoE)
+    nn.Module.__init__(block)
+    block.experts = experts
+    block.routed_output_is_global = False
+    block.hidden_dim = 64
+
+    scale = block.fp4_input_scale(16)
+    if has_prescale:
+        assert scale is None
+    else:
+        assert scale is backend.fc31_input_scale
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_gate_tf32_refit_preserves_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_ROUTER_TC_GEN", False)
+    # CPU check uses the real bitwise TF32 conversion; captured replay is tested on Rubin.
+    gate = modeling_minimaxm3.MiniMaxM3Gate(64, 8, 2, 1.0)
+    gate.load_weights([{"weight": torch.ones(8, 64)}])
+    gate.cache_tf32_weight()
+    captured_weight = gate._weight_tf32
+    ptr = captured_weight.data_ptr()
+    gate.load_weights([{"weight": torch.full((8, 64), 2.0)}])
+    gate.cache_tf32_weight()
+    assert gate._weight_tf32 is captured_weight
+    assert gate._weight_tf32.data_ptr() == ptr
+    torch.testing.assert_close(captured_weight, torch.full((8, 64), 2.0), rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [100, 103, 107, 110])
+def test_cutedsl_shared_fold_backend_is_rubin_only(
+    monkeypatch: pytest.MonkeyPatch, sm: int
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(cutedsl_nvfp4, "_RUBIN_DETERMINISTIC_FC2", True)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
+    nn.Module.__init__(backend)
+    assert modeling_minimaxm3._fold_shared_backend(backend) is (sm == 107)

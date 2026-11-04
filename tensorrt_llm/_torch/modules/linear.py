@@ -52,7 +52,8 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                          low_m_gemm_dispatcher)
-from .m3_ctx_clc_gemm import ctx_clc_gemm_enabled, try_ctx_clc_mxfp8_gemm
+from .m3_ctx_clc_gemm import (clear_ctx_clc_weight_cache, ctx_clc_gemm_enabled,
+                              try_ctx_clc_mxfp8_gemm)
 
 
 class WeightMode(str, enum.Enum):
@@ -4938,6 +4939,7 @@ class Linear(nn.Module):
         self.transform_weights()
 
     def pre_reload_weights(self):
+        clear_ctx_clc_weight_cache()
         self._output_slice_cache = None
         assert hasattr(
             self.quant_method, "pre_reload_weights"

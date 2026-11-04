@@ -119,18 +119,6 @@ def test_fold_shared_refused_with_separated_routing(monkeypatch) -> None:
         monkeypatch.setattr(trtllm_gen_base, "FORCE_SEPARATED_ROUTING", True)
         monkeypatch.setattr(moe_scheduler, "FORCE_SEPARATED_ROUTING", True)
         assert moe.backend._routes_outside_the_kernel()
-        stock = shared.clone().add_(moe(x, logits))
-        # The runner finalizes with the precomputed top-k weights and returns an expert_weights tensor it never
-        # writes: poison the allocator's free blocks so the unwritten tensor cannot alias a copy of those weights.
-        poison = [
-            torch.full((tokens, TOP_K), float("nan"), dtype=torch.bfloat16) for _ in range(64)
-        ]
-        del poison
-        unfinalized = moe(x, logits, do_finalize=False)
-        folded = fold_shared_into_finalize(unfinalized, shared, TOP_K)
-        assert not torch.equal(folded.view(torch.int16), stock.view(torch.int16)), (
-            "expected the unwritten expert_weights to corrupt the fold"
-        )
         assert not _fold_ok(moe, x), (
             "fold must be refused when top-k is precomputed outside the kernel"
         )

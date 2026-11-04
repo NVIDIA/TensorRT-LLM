@@ -14,15 +14,14 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 from __future__ import annotations
 
 import functools
-from types import ModuleType
 import os
+from types import ModuleType
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_processor_count_for_device
-from tensorrt_llm._utils import async_tensor_h2d
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import async_tensor_h2d, get_sm_version
 from tensorrt_llm.logger import logger
 
 from .kernels.msa_utils import (

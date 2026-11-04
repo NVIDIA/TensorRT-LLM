@@ -95,6 +95,17 @@ def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
     return None if situ_beta <= 0 else float(situ_beta)
 
 
+def _canonicalize_rubin_activation_beta(activation_type: ActivationType,
+                                        value: float) -> Optional[float]:
+    """OAI constants are scalars, including non-positive linear offsets.
+
+    Only SiTU soft-caps use non-positive values as the absent sentinel.
+    """
+    if activation_type == ActivationType.SwigluBias:
+        return float(value)
+    return _canonicalize_situ_beta(value)
+
+
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
 # Both dense MXFP8 wrappers pass a scalar one to the CuTe kernel. Keep one
@@ -16610,8 +16621,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size,
                 scaling_vector_size,
                 activation_type=activation_type,
-                situ_beta=_canonicalize_situ_beta(situ_beta),
-                situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                situ_beta=_canonicalize_rubin_activation_beta(
+                    activation_type, situ_beta),
+                situ_linear_beta=_canonicalize_rubin_activation_beta(
+                    activation_type, situ_linear_beta),
                 swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
                     swiglu_limit_scalar),
                 sf_dtype=sf_dtype,
@@ -16922,8 +16935,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tile_size,
                     scaling_vector_size,
                     activation_type=ActivationType(activation_type),
-                    situ_beta=_canonicalize_situ_beta(situ_beta),
-                    situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                    situ_beta=_canonicalize_rubin_activation_beta(
+                        activation_type, situ_beta),
+                    situ_linear_beta=_canonicalize_rubin_activation_beta(
+                        activation_type, situ_linear_beta),
                     swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
                         swiglu_limit_scalar),
                 ))
@@ -17634,17 +17649,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_cache = dict()
             tuning_config_cache = dict()
 
-            def __init__(
-                    self,
-                    num_experts: int,
-                    top_k: int,
-                    num_local_experts: int,
-                    local_expert_offset: int,
-                    tile_size: int,
-                    output_dtype: torch.dtype,
-                    scaling_vector_size: int = 16,
-                    sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
-                    store_permuted: bool = False):
+            def __init__(self,
+                         num_experts: int,
+                         top_k: int,
+                         num_local_experts: int,
+                         local_expert_offset: int,
+                         tile_size: int,
+                         output_dtype: torch.dtype,
+                         scaling_vector_size: int = 16,
+                         sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
+                         store_permuted: bool = False):
                 super().__init__()
                 # store_permuted: FC2 stores bf16(alpha * acc) at each permuted row of c [m, n] instead of the
                 # fused scatter-add finalize (deterministic route; the finalize runs separately in fixed order).
@@ -17791,8 +17805,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 functools.partial(
                                     fp4_scale_infer_shape,
                                     sf_vec_size=self.scaling_vector_size)),
-                            ConstraintSpec(5, 0, helper.infer_shape_max_num_permuted_tokens
-                                if self.store_permuted else helper.infer_shape_num_tokens),
+                            ConstraintSpec(
+                                5, 0, helper.infer_shape_max_num_permuted_tokens
+                                if self.store_permuted else
+                                helper.infer_shape_num_tokens),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
                             ConstraintSpec(7, 0,
@@ -17932,7 +17948,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (self.scaling_vector_size, self.sf_dtype,
                              self.tile_size, self.top_k, mma_tiler,
                              mma_inst_shape, cluster_shape_mn, raster_along_m,
-                             locality_domain_half_gemm, max_active_clusters, self.store_permuted)
+                             locality_domain_half_gemm, max_active_clusters,
+                             self.store_permuted)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,

@@ -41,6 +41,7 @@ void minimaxM3SelectPrefillTile(torch::Tensor const& scores, torch::Tensor const
     TORCH_CHECK(nValidBlocks.is_cuda() && nValidBlocks.scalar_type() == torch::kInt32 && nValidBlocks.is_contiguous()
             && nValidBlocks.numel() >= scores.size(2),
         "minimax_m3_select_prefill_tile: n_valid_blocks must be contiguous int32 CUDA with at least total_q elements");
+    TORCH_CHECK(nValidBlocks.device() == scores.device(), "n_valid_blocks must use the scores device");
     int64_t const numKvHeads = scores.size(0);
     int64_t const numBlocks = scores.size(1);
     int64_t const totalQ = scores.size(2);
@@ -50,6 +51,8 @@ void minimaxM3SelectPrefillTile(torch::Tensor const& scores, torch::Tensor const
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kInt32 && out.dim() == 3 && out.size(0) == totalQ
             && out.size(1) == numKvHeads && out.size(2) == 16 && out.stride(2) == 1,
         "minimax_m3_select_prefill_tile: out must be int32 [total_q, num_kv_heads, 16] with unit last-dim stride");
+
+    TORCH_CHECK(out.device() == scores.device(), "out must use the scores device");
 
     c10::cuda::CUDAGuard const deviceGuard{scores.device()};
     auto const stream = at::cuda::getCurrentCUDAStream(scores.get_device());
