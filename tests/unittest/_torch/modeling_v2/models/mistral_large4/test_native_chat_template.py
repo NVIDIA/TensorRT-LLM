@@ -14,8 +14,7 @@ mistral-common, not a Jinja template, renders the chat. The serving rules:
 - tools reach the encoder without a null `strict`, and each text part of a content
   list reaches it as its own chunk;
 - a `json_object` or named `json_schema` response format is stated in the prompt's
-  model settings when the installed mistral-common has `JsonSchema`, and otherwise
-  renders nothing;
+  model settings;
 - a named `tool_choice`, whose prefix is text, is a bad request on rendered token ids.
 
 The request-rule tests run on CPU without a checkpoint. The rendering tests need
@@ -286,20 +285,6 @@ def test_a_response_format_reaches_the_renderer(response_format, passed):
     assert (request.chat_template_kwargs or {}).get("response_format") == expected
 
 
-@pytest.mark.parametrize("response_format", [_CITY_FORMAT, {"type": "json_object"}])
-def test_a_response_format_renders_nothing_without_json_schema(monkeypatch, response_format):
-    request_module = pytest.importorskip("mistral_common.protocol.instruct.request")
-    monkeypatch.delattr(request_module, "JsonSchema", raising=False)
-    tokenizer = _RecordingTokenizer()
-    _render(
-        tokenizer,
-        [{"role": "user", "content": "Give a city as JSON."}],
-        chat_template_kwargs={"response_format": response_format},
-    )
-    ((_, kwargs),) = tokenizer.calls
-    assert "response_format" not in kwargs
-
-
 def test_a_named_tool_choice_on_token_ids_is_a_bad_request(monkeypatch):
     from unittest.mock import AsyncMock
 
@@ -499,14 +484,7 @@ def _direct_ids(tokenizer, messages, **kwargs):
 
 
 def test_a_response_format_renders_in_the_model_settings(tokenizer):
-    try:
-        from mistral_common.protocol.instruct.request import (
-            JsonSchema,
-            ResponseFormat,
-            ResponseFormats,
-        )
-    except ImportError:
-        pytest.skip("the installed mistral-common has no JsonSchema")
+    from mistral_common.protocol.instruct.request import JsonSchema, ResponseFormat, ResponseFormats
 
     messages = [{"role": "user", "content": "Give a city as JSON."}]
     named = _CITY_FORMAT["json_schema"]

@@ -742,21 +742,13 @@ def _native_mistral_response_format(response_format):
     """An OpenAI `response_format` as mistral-common's, or None if it renders nothing.
 
     `json_object` and a named `json_schema` render into the prompt's model
-    settings when the installed mistral-common has `JsonSchema`; otherwise, and
-    for other formats, the response format only constrains decoding.
+    settings; other formats only constrain decoding.
     """
     if not isinstance(response_format, dict):
         return None
-    try:
-        from mistral_common.protocol.instruct.request import (JsonSchema,
-                                                              ResponseFormat,
-                                                              ResponseFormats)
-    except ImportError:
-        logger.warning_once(
-            "The installed mistral-common cannot state a response_format in "
-            "the prompt's model settings; the chat renders without it and the "
-            "response format only constrains decoding.")
-        return None
+    from mistral_common.protocol.instruct.request import (JsonSchema,
+                                                          ResponseFormat,
+                                                          ResponseFormats)
     kind = response_format.get("type")
     if kind == "json_object":
         return ResponseFormat(type=ResponseFormats.json_object)

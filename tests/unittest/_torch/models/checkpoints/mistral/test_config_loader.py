@@ -13,14 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
 import json
 
 import pytest
 
+from tensorrt_llm._torch.models.checkpoints.mistral import config_loader
 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import adapt_config_dict
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, TorchLlmArgs
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _installed_mistral_common(monkeypatch, installed: str) -> None:
+    version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: installed if name == "mistral-common" else version(name),
+    )
+
+
+@pytest.mark.parametrize("installed", ["1.10.0", "1.12.0", "1.13.0rc1"])
+def test_mistral_large4_needs_mistral_common_1_13(monkeypatch, installed):
+    _installed_mistral_common(monkeypatch, installed)
+    params = {"dsa": {"topk": 2048}, "kv_lora_rank": 512, "lerope": True}
+    with pytest.raises(ImportError, match=rf"mistral-common>=1\.13\.0.*{installed}"):
+        adapt_config_dict(params)
+
+
+@pytest.mark.parametrize("installed", ["1.13.0", "1.13.1", "1.14.0"])
+def test_mistral_large4_accepts_mistral_common_1_13_or_later(monkeypatch, installed):
+    _installed_mistral_common(monkeypatch, installed)
+    config_loader._require_mistral_common_for_mistral_large4()
 
 
 def test_mistral_large3_vision_config_preserves_max_position_embeddings():

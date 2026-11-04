@@ -4,13 +4,11 @@
 import functools
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Union
 
 from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens
 from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer
 from mistral_common.tokens.tokenizers.tekken import Tekkenizer
-from pydantic import ValidationError
 from transformers.tokenization_mistral_common import (
     MistralCommonTokenizer as TransformersMistralTokenizer,
 )
@@ -27,8 +25,6 @@ if TYPE_CHECKING:
 # https://github.com/vllm-project/vllm/blob/8e67b2557aae7204c697d7a5c61e00754da465be/vllm/transformers_utils/tokenizers/mistral.py#L166
 class MistralTokenizer(TransformersTokenizer):
     def __init__(self, tokenizer: "TransformersMistralTokenizer"):
-        self._compat_tokenizer_dir = None
-        self._compat_tokenizer_path = None
         self.transformers_tokenizer = tokenizer
         self.mistral = tokenizer.tokenizer
         self.instruct = self.mistral.instruct_tokenizer
@@ -64,9 +60,6 @@ class MistralTokenizer(TransformersTokenizer):
         self._all_special_tokens_set = set(self.all_special_tokens)
 
     def __reduce__(self):
-        if self._compat_tokenizer_path is not None:
-            # Workers rebuild their own temporary copy from the original checkpoint.
-            return (self.__class__.from_pretrained, (self._compat_tokenizer_path,))
         # TransformersTokenizer.__reduce__ would rebuild a TransformersTokenizer
         # around ``self.tokenizer``, which here is the raw mistral-common
         # tokenizer. Rebuild this class from the transformers wrapper instead;
@@ -97,59 +90,10 @@ class MistralTokenizer(TransformersTokenizer):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
-        try:
-            if Path(pretrained_model_dir).is_file():
-                tokenizer = TransformersMistralTokenizer(tokenizer_path=pretrained_model_dir)
-            else:
-                tokenizer = TransformersMistralTokenizer.from_pretrained(pretrained_model_dir)
-        except ValidationError as error:
-            # A mistral-common without JSON-schema model settings rejects a tekken.json
-            # whose model_settings_builder declares json_schema; load it without that entry.
-            # TODO: Remove this fallback and its tests: requirements.txt needs mistral-common
-            # 1.13.0, which reads model_settings_builder.json_schema.
-            errors = error.errors()
-            if error.title == "ModelSettingsBuilder" and any(
-                err["loc"][:1] == ("reasoning_effort",) for err in errors
-            ):
-                raise ValueError(
-                    f"The tekken.json of {pretrained_model_dir} declares reasoning efforts the "
-                    "installed mistral-common does not know. Install mistral-common 1.13.0 or "
-                    "later from PyPI."
-                ) from error
-            if (
-                error.title != "ModelSettingsBuilder"
-                or len(errors) != 1
-                or (errors[0]["loc"] != ("json_schema",) or errors[0]["type"] != "extra_forbidden")
-            ):
-                raise
-            tokenizer_path = Path(pretrained_model_dir)
-            if tokenizer_path.is_dir():
-                tokenizer_path /= "tekken.json"
-            with tokenizer_path.open(encoding="utf-8") as source:
-                metadata = json.load(source)
-            settings = metadata.get("model_settings_builder", {})
-            if settings.get("json_schema") != {
-                "type": "json_schema",
-                "accepts_none": False,
-                "default": None,
-            }:
-                raise
-            del settings["json_schema"]
-            # mistral-common keeps the file path for serialization and save_pretrained.
-            temporary_dir = TemporaryDirectory(prefix="trtllm-tekken-")
-            compatible_path = Path(temporary_dir.name) / tokenizer_path.name
-            compatible_path.write_text(json.dumps(metadata), encoding="utf-8")
-            tokenizer = TransformersMistralTokenizer(tokenizer_path=str(compatible_path))
-            tokenizer.name_or_path = str(pretrained_model_dir)
-            result = cls(tokenizer)
-            result._compat_tokenizer_dir = temporary_dir
-            result._compat_tokenizer_path = str(pretrained_model_dir)
-            logger.warning(
-                "Ignoring unsupported model_settings_builder.json_schema metadata for "
-                "text tokenization; JSON-schema model settings remain unsupported by "
-                "the installed mistral-common."
-            )
-            return result
+        if Path(pretrained_model_dir).is_file():
+            tokenizer = TransformersMistralTokenizer(tokenizer_path=pretrained_model_dir)
+        else:
+            tokenizer = TransformersMistralTokenizer.from_pretrained(pretrained_model_dir)
         return cls(tokenizer)
 
     def xgrammar_tokenizer_info(self) -> dict:

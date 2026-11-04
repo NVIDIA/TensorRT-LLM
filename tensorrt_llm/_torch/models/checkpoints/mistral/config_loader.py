@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
 import json
 import os
 from copy import deepcopy
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from packaging.version import Version
 from transformers import PretrainedConfig, WhisperConfig
 
 from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
@@ -113,6 +115,7 @@ def adapt_config_dict(
     defaults: dict[str, Any] = {},
 ) -> PretrainedConfig:
     if _is_mistral_large4(config_dict):
+        _require_mistral_common_for_mistral_large4()
         if config_dict.get("quantization"):
             raise ValueError(
                 "Mistral-Large-4 is served from the ModelOpt MIXED_PRECISION export, whose "
@@ -183,6 +186,19 @@ def adapt_config_dict(
 
 def _is_mistral_large4(config: dict) -> bool:
     return bool(config.get("dsa") and config.get("kv_lora_rank") and config.get("lerope"))
+
+
+_MISTRAL_LARGE4_MISTRAL_COMMON = "1.13.0"
+
+
+def _require_mistral_common_for_mistral_large4() -> None:
+    """Mistral-Large-4's tekken.json and chat settings need mistral-common 1.13.0 or later."""
+    installed = importlib.metadata.version("mistral-common")
+    if Version(installed) < Version(_MISTRAL_LARGE4_MISTRAL_COMMON):
+        raise ImportError(
+            f"Mistral-Large-4 requires mistral-common>={_MISTRAL_LARGE4_MISTRAL_COMMON} "
+            f"(Python 3.11 or later); the installed version is {installed}."
+        )
 
 
 def _adapt_mistral_large4_config(config: dict) -> MistralLarge4Config:
