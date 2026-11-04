@@ -592,6 +592,34 @@ def test_graph_metadata_accepts_additive_call_keywords(kind: str, operation: str
         assert fields["workflow.graph.encoder_hidden_state_rows"] == 5
 
 
+@pytest.mark.parametrize(
+    "features,expected_shape",
+    [
+        pytest.param(torch.ones(2, 8), [2, 8], id="tensor-compatibility"),
+        pytest.param([], None, id="empty-list"),
+        pytest.param([torch.tensor(1)], None, id="scalar"),
+        pytest.param([torch.ones(1, 8), object()], None, id="non-tensor"),
+        pytest.param([torch.ones(1, 8), torch.ones(1, 9)], None, id="different-widths"),
+        pytest.param(
+            [torch.ones(1, 8), torch.ones(1, 8, dtype=torch.float64)],
+            None,
+            id="different-dtypes",
+        ),
+    ],
+)
+def test_encoder_feature_shape_compatibility(
+    features: torch.Tensor | list[object], expected_shape: list[int] | None
+) -> None:
+    owner = SimpleNamespace(padding_enabled=True, WARMUP_STEPS=1)
+    fields = cuda_graph_runner._encoder_graph_workflow_metadata(
+        owner, (4, 12, 3), {"input_features": features}, "replay"
+    )
+    if expected_shape is None:
+        assert "workflow.graph.input_feature_shape" not in fields
+    else:
+        assert fields["workflow.graph.input_feature_shape"] == expected_shape
+
+
 @pytest.mark.parametrize("operation", ["capture", "replay"])
 @pytest.mark.parametrize(
     "source_lengths,has_source_counts",
@@ -637,7 +665,7 @@ def test_encoder_graph_preserves_source_and_key_semantics(
         cuda_graph_runner, "nccl_window_graph_capture", lambda *args, **kwargs: nullcontext()
     )
     inputs = {
-        "input_features": torch.ones(2, 8),
+        "input_features": [torch.ones(1, 8), torch.ones(1, 8)],
         "attn_metadata": object(),
     }
     if source_lengths is not None:

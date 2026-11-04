@@ -143,7 +143,7 @@ Encoder fields remain distinct from decoder generation semantics:
 | `workflow.graph.key.padded_batch_size`, `.padded_total_tokens`, `.max_seq_len_bucket` | The existing three-tuple encoder graph key, including feature-mode fixed-sequence buckets |
 | `workflow.graph.batch_capacity`, `workflow.graph.token_capacity` | First and second encoder key dimensions |
 | `workflow.graph.input_token_rows` | Supplied packed `input_ids.shape[0]`, when present |
-| `workflow.graph.input_feature_shape` | Supplied `input_features.shape`, when present; features are not decoder token rows |
+| `workflow.graph.input_feature_shape` | Logical packed shape of the validated feature list: sum of leading rows followed by common trailing dimensions. A tensor input retains its supplied shape; empty or incompatible lists omit the field. Features are not decoder token rows |
 | `workflow.graph.source_requests`, `workflow.graph.source_tokens` | Length and sum of retained host `_encoder_source_seq_lens`, only when available as an integer list |
 | `workflow.graph.padding_requests`, `workflow.graph.padding_tokens` | Encoder key capacity minus those retained source counts; graph slots/token positions without source work, not live decoder padding |
 

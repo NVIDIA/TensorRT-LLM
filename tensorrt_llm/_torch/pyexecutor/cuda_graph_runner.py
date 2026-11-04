@@ -1924,6 +1924,17 @@ def _encoder_graph_workflow_metadata(
     features = inputs.get("input_features")
     if isinstance(features, torch.Tensor):
         fields["workflow.graph.input_feature_shape"] = list(features.shape)
+    elif isinstance(features, list) and features:
+        first = features[0]
+        if isinstance(first, torch.Tensor) and first.ndim > 0 and all(
+                isinstance(feature, torch.Tensor) and feature.ndim == first.ndim
+                and all(type(extent) is int
+                        for extent in feature.shape) and feature.shape[1:] ==
+                first.shape[1:] and feature.dtype == first.dtype
+                for feature in features):
+            fields["workflow.graph.input_feature_shape"] = [
+                sum(feature.shape[0] for feature in features), *first.shape[1:]
+            ]
     source_lengths = inputs.get(_ENCODER_SOURCE_SEQ_LENS)
     if isinstance(source_lengths, list) and all(
             type(length) is int for length in source_lengths):
