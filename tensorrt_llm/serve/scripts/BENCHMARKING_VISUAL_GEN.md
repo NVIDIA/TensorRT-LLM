@@ -15,7 +15,7 @@ This page repeats no field description. Each lives with its definition:
 |---|---|
 | every flag, with its default | `--help` |
 | what a generation parameter means | `VisualGenParams` in [`visual_gen/params.py`](../../visual_gen/params.py) |
-| which backend accepts which field | `ImageGenerationRequest` · `ImageEditRequest` · `VideoGenerationRequest` in [`openai_protocol.py`](../openai_protocol.py) |
+| which backend accepts which field | `ImageGenerationRequest` · `ImageEditRequest` · `VideoGenerationRequest` in [`api/visual_gen/protocol.py`](../api/visual_gen/protocol.py) |
 | what a result-JSON key holds | `VisualGenBenchResult` and `VisualGenRequestRecord` in [`benchmark_visual_gen.py`](benchmark_visual_gen.py) |
 
 ## Benchmarking args

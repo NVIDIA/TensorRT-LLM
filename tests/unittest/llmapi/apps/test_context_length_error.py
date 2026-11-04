@@ -169,3 +169,19 @@ def test_disagg_route_other_upstream_errors_unchanged():
         _disagg_server()._handle_exception(_upstream_error(worker_body))
     assert excinfo.value.status_code == 400
     assert excinfo.value.detail == "`max_tokens` (0) must be greater than 0"
+
+
+def test_serving_classes_share_the_server_error_factory():
+    """OpenAIServer and the serving classes render errors through one function.
+
+    The one function on BaseServing keeps the envelope and the context-length
+    code rule from drifting between serve/api/ and the composition root.
+    """
+    from tensorrt_llm.serve._base.serving import BaseServing
+
+    assert OpenAIServer.create_error_response is BaseServing.create_error_response
+    msg = context_length_exceeded_message(2048, 4096)
+    response = BaseServing().create_error_response(msg)
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert _body(response) == _body(OpenAIServer.create_error_response(msg))
+    assert _body(response)["code"] == CONTEXT_LENGTH_EXCEEDED_CODE

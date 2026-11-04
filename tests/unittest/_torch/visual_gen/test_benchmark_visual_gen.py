@@ -21,6 +21,10 @@ import unittest.mock
 
 import pytest
 
+from tensorrt_llm.serve.api.visual_gen.metrics import (
+    build_visual_gen_server_timings,
+    build_visual_gen_timing_headers,
+)
 from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     REFERENCE_KEYS,
     SCALAR_PARAM_FIELDS,
@@ -36,10 +40,6 @@ from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     build_payload,
     build_visual_gen_result,
     load_workload,
-)
-from tensorrt_llm.serve.visual_gen_metrics import (
-    build_visual_gen_server_timings,
-    build_visual_gen_timing_headers,
 )
 
 PNG = base64.b64decode(

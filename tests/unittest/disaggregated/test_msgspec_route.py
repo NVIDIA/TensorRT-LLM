@@ -19,8 +19,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
+from tensorrt_llm.serve._base.msgspec_route import _MsgspecRequest, _MsgspecRoute
 from tensorrt_llm.serve.openai_client import MSGPACK_HEADERS, _msgpack_encoder
-from tensorrt_llm.serve.openai_server import _MsgspecRequest, _MsgspecRoute
 
 PAYLOAD = {
     "model": "m",

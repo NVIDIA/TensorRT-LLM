@@ -6,13 +6,13 @@ import array
 import asyncio
 import base64
 import functools
+import importlib
 import json
 import os
 import re
 import signal
 import socket
 import sys
-import tempfile
 import time
 import traceback
 import uuid
@@ -25,12 +25,10 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, Dict, List, Optional, Tuple, Union)
 
-import msgspec
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import (FileResponse, JSONResponse, Response,
-                               StreamingResponse)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -43,8 +41,6 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
-from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
@@ -61,12 +57,13 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.encoding import image_to_bytes
-from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve._base.serving import BaseServing
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -81,6 +78,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -104,15 +102,12 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionToolsParam, ChatMessage, CompletionRequest,
     CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
-    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
-    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse,
-    RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo,
+    MemoryUpdateRequest, PromptTokensDetails, ResponseFormat, ResponsesRequest,
+    ResponsesResponse, RuntimeMemoryUpdateRequest, StartProfileRequest,
+    TokenizeRequest, TokenizeResponse, UpdateWeightsRequest, UsageInfo,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
-from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              build_request_metrics_record)
@@ -145,10 +140,6 @@ from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
 from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
-from tensorrt_llm.serve.visual_gen_metrics import (
-    build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
-                                                 parse_visual_gen_params)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -157,7 +148,6 @@ from .._utils import (AdjustedSteadyClock,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
-from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
@@ -178,33 +168,6 @@ def _is_visual_gen_instance(obj) -> bool:
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
-
-_msgpack_decoder = msgspec.msgpack.Decoder()
-
-
-class _MsgspecRequest(KvHintsRequest):
-    """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
-
-    async def json(self):
-        if not hasattr(self, "_json_body"):
-            body = await self.body()
-            if not body:
-                self._json_body = {}
-            elif self.headers.get("x-trtllm-msgpack") == "1":
-                try:
-                    self._json_body = _msgpack_decoder.decode(body)
-                except msgspec.DecodeError as e:
-                    raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
-            else:
-                self._json_body = json.loads(body)
-        return self.filter_kv_hints(self._json_body)
-
-
-class _MsgspecRoute(KvHintsRoute):
-    """Parse msgpack/JSON and apply hint trust policy before model validation."""
-
-    request_type = _MsgspecRequest
-
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -478,84 +441,6 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
     return begin_prefix, guided
 
 
-def _new_media_dir(root: Path) -> Path:
-    """Create a directory under ``root`` stamped with the current time.
-
-    ``mkdir`` without ``exist_ok`` is what makes this safe: the kernel either
-    creates the directory or raises, so two servers starting in the same
-    second take separate names instead of sharing one.
-    """
-    stamp = datetime.now().strftime("%y%m%d-%H%M%S")
-    root.mkdir(parents=True, exist_ok=True)
-    n = 1
-    while True:
-        candidate = root / (stamp if n == 1 else f"{stamp}-{n}")
-        try:
-            candidate.mkdir()
-            return candidate
-        except FileExistsError:
-            n += 1
-
-
-def _resolve_media_dir() -> Path:
-    """Create and return the directory to store generated media in.
-
-    ``TRTLLM_MEDIA_STORAGE_PATH`` names the directory outright, empty meaning
-    unset. Otherwise it goes beside the working directory, and where that
-    cannot be written it goes to a private temporary one: a shared ``/tmp``
-    holds directories owned by other users, so the fallback takes a name
-    nobody else can hold rather than a fixed one.
-    """
-    explicit = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
-    if explicit:
-        path = Path(explicit)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-    try:
-        return _new_media_dir(Path.cwd() / "trtllm_generated")
-    except OSError:
-        # OSError rather than PermissionError: a read-only mount raises
-        # EROFS, which is not one.
-        stamp = datetime.now().strftime("%y%m%d-%H%M%S")
-        return Path(tempfile.mkdtemp(prefix=f"trtllm_generated-{stamp}-"))
-
-
-def _normalize_image_output(image) -> list:
-    """Normalize image output to a list of individual images.
-
-    Handles single tensors, batched 4D tensors, and lists.
-    """
-    if isinstance(image, list):
-        return image
-    if hasattr(image, "dim") and image.dim() == 4:
-        return [image[i] for i in range(image.shape[0])]
-    return [image]
-
-
-def _image_output_size(image) -> Optional[str]:
-    pil_size = getattr(image, "size", None)
-    if isinstance(pil_size, tuple) and len(pil_size) >= 2:
-        width, height = pil_size[:2]
-        return f"{int(width)}x{int(height)}"
-
-    shape = getattr(image, "shape", None)
-    if shape is None:
-        return None
-
-    dims = tuple(int(dim) for dim in shape)
-    if len(dims) == 2:
-        height, width = dims
-    elif len(dims) == 3:
-        if dims[0] in (1, 3, 4) and dims[1] > 4 and dims[2] > 4:
-            height, width = dims[1], dims[2]
-        else:
-            height, width = dims[0], dims[1]
-    else:
-        return None
-
-    return f"{width}x{height}"
-
-
 def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     """Fixed per-step draft bound to report, or None when there is not one.
 
@@ -571,7 +456,7 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     return getattr(spec_config, "max_draft_len", None)
 
 
-class OpenAIServer(_VideoRoutesMixin):
+class OpenAIServer:
 
     @staticmethod
     def _iteration_stats_buffer_maxlen(
@@ -892,7 +777,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
             if self.server_role is ServerRole.VISUAL_GEN:
-                return self._create_visual_gen_validation_error_response(exc)
+                return self._visual_gen_api.render_visual_gen_validation_error(
+                    exc, self.create_error_response)
             # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
             # response shape that integration tests (e.g.
             # ``test_malformed_json_request``) and existing clients
@@ -906,6 +792,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 detail = detail[:4096] + " ... [truncated %d bytes]" % (
                     len(detail) - 4096)
             return JSONResponse(status_code=400, content={"error": detail})
+
+        # /health, /version and /v1/models for every role. The health
+        # probe stays here, with its private accesses, until the public
+        # health API exists.
+        self.app.state.ops_serving_system = SystemServing(
+            model=self.model, health_probe=self._health_probe)
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -926,6 +818,10 @@ class OpenAIServer(_VideoRoutesMixin):
             self._register_launcher_forwarding_routes()
             self.register_routes()
 
+        # Attach routers after the role switch: every attach_router checks
+        # that its serving objects are on app.state.
+        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
+
         if self._collect_perf_metrics:
             self.app.add_middleware(PerfMetricsMiddleware,
                                     expose_headers=self._expose_perf_metrics,
@@ -937,27 +833,6 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self.media_storage_path = _resolve_media_dir()
-        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
-        self.video_gen_tasks = {}
-
-    def _supports_image_edit(self) -> bool:
-        if not self._is_visual_gen:
-            return False
-
-        executor = getattr(self.generator, "executor", None)
-        if executor is None:
-            return False
-
-        pipeline = getattr(executor, "pipeline", None)
-        if pipeline is not None:
-            return bool(getattr(pipeline, "supports_image_edit", False))
-
-        supports_image_edit = getattr(executor, "supports_image_edit", None)
-        if supports_image_edit is not None:
-            return bool(supports_image_edit)
-
-        return False
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
@@ -1143,22 +1018,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
-    @staticmethod
-    def create_error_response(
-            message: str,
-            err_type: str = "BadRequestError",
-            status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts are detected from the message text because they
-        # cross the executor IPC boundary as plain strings (RequestError), so
-        # no exception type survives to here.
-        code: Union[int, str] = status_code.value
-        if is_context_length_exceeded_message(message):
-            code = CONTEXT_LENGTH_EXCEEDED_CODE
-        error_response = ErrorResponse(message=message,
-                                       type=err_type,
-                                       code=code)
-        return JSONResponse(content=error_response.model_dump(),
-                            status_code=status_code.value)
+    create_error_response = staticmethod(BaseServing.create_error_response)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -1174,43 +1034,6 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.NOT_FOUND,
         )
 
-    def _create_not_supported_error(self, message: str) -> Response:
-        return self.create_error_response(
-            err_type="NotImplementedError",
-            message=message,
-            status_code=HTTPStatus.NOT_IMPLEMENTED,
-        )
-
-    def _create_visual_gen_validation_error_response(
-            self, exc: RequestValidationError) -> Response:
-        """Render a ``RequestValidationError`` as the visual-gen 422 envelope.
-
-        The body has the LLM-style ``{message, type, code}`` shape with
-        HTTP 422. The ``message`` field names the offending field(s) for
-        each error in ``exc.errors()`` so clients can fix the request
-        without parsing the full Pydantic payload.
-        """
-        parts: List[str] = []
-        for err in exc.errors():
-            loc = ".".join(
-                str(seg) for seg in err.get("loc", ()) if seg != "body")
-            etype = err.get("type", "")
-            msg = err.get("msg", "")
-            if etype == "extra_forbidden":
-                parts.append(
-                    f"Unknown request field {loc!r}. Pass model-specific "
-                    "parameters via 'extra_params' instead.")
-            elif loc:
-                parts.append(f"{loc}: {msg}")
-            else:
-                parts.append(msg)
-        message = "; ".join(parts) if parts else str(exc)
-        return self.create_error_response(
-            message=message,
-            err_type="BadRequestError",
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
-        )
-
     def _check_health(self) -> bool:
         # An embedding server's requests flow through the batcher worker; if it
         # has exited the engine is up but every /v1/embeddings request hangs, so
@@ -1223,12 +1046,9 @@ class OpenAIServer(_VideoRoutesMixin):
         return True
 
     def register_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate",
                                self.health_generate,
                                methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/data_transceiver_state",
                                self.data_transceiver_state,
                                methods=["GET"])
@@ -1373,9 +1193,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.routes.append(metrics_route)
 
     def register_mm_encoder_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
@@ -1480,9 +1297,6 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def register_embedding_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/embeddings",
                                self.openai_embedding,
                                methods=["POST"])
@@ -1586,52 +1400,24 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def register_visual_gen_routes(self):
-        """Register routes for diffusion model serving."""
-        # Health and info endpoints
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        """Wire VisualGen serving for the VISUAL_GEN role.
+
+        The VisualGen routes come from their RouterSpec; /metrics is
+        registered here, not by a router.
+        """
+        # The only place outside serve/api/visual_gen/ that loads it, besides
+        # attach_routers through the VisualGen RouterSpec.
+        self._visual_gen_api = importlib.import_module(
+            "tensorrt_llm.serve.api.visual_gen.api_router")
+        self.media_storage_path = self._visual_gen_api.init_serving_state(
+            self.app.state,
+            generator=self.generator,
+            model=self.model,
+            adjusted_clock=self._adjusted_steady_clock)
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
-
-        # Image generation endpoints (OpenAI compatible)
-        self.app.add_api_route("/v1/images/generations",
-                               self.openai_image_generation,
-                               methods=["POST"])
-        self.app.add_api_route("/v1/images/edits",
-                               self.openai_image_edit,
-                               methods=["POST"])
-        self.app.add_api_route("/v1/images/{image_id}/content",
-                               self.get_image_content,
-                               methods=["GET"])
-
-        # Video generation endpoints (Extended OpenAI API)
-        # Asynchronous video generation (returns immediately with job metadata, OpenAI API)
-        self.app.add_api_route("/v1/videos",
-                               self.openai_video_generation_async,
-                               methods=["POST"])
-        # Synchronous video generation (waits for completion, extended API)
-        self.app.add_api_route("/v1/videos/sync",
-                               self.openai_video_generation_sync,
-                               methods=["POST"])
-        # Deprecated alias of /v1/videos/sync, retained for upstream
-        # back-compat after the rename; both hit the same sync handler.
-        self.app.add_api_route("/v1/videos/generations",
-                               self.openai_video_generation_sync,
-                               methods=["POST"],
-                               deprecated=True)
-        # Video management endpoints
-        self.app.add_api_route("/v1/videos", self.list_videos, methods=["GET"])
-        self.app.add_api_route("/v1/videos/{video_id}",
-                               self.get_video_metadata,
-                               methods=["GET"])
-        self.app.add_api_route("/v1/videos/{video_id}/content",
-                               self.get_video_content,
-                               methods=["GET"])
-        self.app.add_api_route("/v1/videos/{video_id}",
-                               self.delete_video,
-                               methods=["DELETE"])
 
     async def data_transceiver_state(self) -> JSONResponse:
         """Return the serialized DataTransceiverState as base64-encoded JSON."""
@@ -1707,9 +1493,9 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
-    async def health(self) -> Response:
+    def _health_probe(self) -> bool:
         if self._check_health():
-            return Response(status_code=200)
+            return True
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
@@ -1727,11 +1513,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         f"server shutdown: {executor._fatal_error}")
                     _record_generator_termination(self.generator)
                     signal.raise_signal(signal.SIGINT)
-            return Response(
-                status_code=503,
-                content=
-                "LLM is unavailable. Please check the server logs for more details."
-            )
+            return False
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
@@ -1781,14 +1563,6 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(f"Health generate check encountered exception: {e}")
             return Response(status_code=500,
                             content=f"Generation health check failed: {str(e)}")
-
-    async def version(self) -> JSONResponse:
-        ver = {"version": VERSION}
-        return JSONResponse(content=ver)
-
-    async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
-        return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
         # Visual-gen deployments use a separate iteration-stats producer
@@ -3885,365 +3659,6 @@ class OpenAIServer(_VideoRoutesMixin):
         content["startup_metrics"] = getattr(self.generator, "startup_metrics",
                                              {})
         return JSONResponse(content=content)
-
-    async def openai_image_generation(self, request: ImageGenerationRequest,
-                                      raw_request: Request) -> Response:
-        """OpenAI-compatible image generation endpoint.
-
-        Follows the OpenAI Images API specification for image generation,
-        with ``request.format`` extended to accept tensor payloads
-        (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
-        """
-        request_received = raw_request.state.server_arrival_time
-        try:
-            image_id = f"image_{uuid.uuid4().hex}"
-
-            path_error = self._reject_disabled_path(request.response_format)
-            if path_error is not None:
-                return path_error
-
-            # Client-side ValueErrors from request translation and
-            # parameter validation are 400. Serialization failures below
-            # (server-side: missing media, inconsistent batch) fall
-            # through to the outer ``except Exception`` → 500 so the
-            # client doesn't get blamed for a server-internal failure.
-            try:
-                params = parse_visual_gen_params(request, self.generator)
-                logger.info(
-                    f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
-                )
-                image_gen_start = time.perf_counter()
-                # Offload the blocking resolve/enqueue off the event loop but
-                # await it (bad params → 400 here); then await generation.
-                handle = await asyncio.to_thread(self.generator.generate_async,
-                                                 request.prompt, params)
-                output = await handle.aresult()
-            except ValueError as exc:
-                logger.error(f"Image request error: {exc}")
-                return self.create_error_response(
-                    message=str(exc),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                )
-
-            if output.image is None:
-                return self.create_error_response(
-                    message="Image generation failed",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-
-            if is_tensor_format(request.format):
-                # Tensor payloads carry every populated modality in a
-                # single file. Match the image-encoder fan-out by
-                # emitting one ``ImageObject`` per batch item.
-                from tensorrt_llm.media.tensor_payload import infer_batch_size
-
-                ext = f".{request.format}"
-                batch_size = infer_batch_size(output)
-                if request.response_format == "b64_json":
-                    data = [
-                        ImageObject(
-                            b64_json=base64.b64encode(
-                                output._save_bytes(
-                                    request.format,
-                                    batch_index=i)).decode("utf-8"),
-                            revised_prompt=request.prompt,
-                        ) for i in range(batch_size)
-                    ]
-                else:
-                    paths_in = [
-                        self.media_storage_path / f"{image_id}_{i}{ext}"
-                        for i in range(batch_size)
-                    ]
-                    # Report the paths save() actually wrote, not paths_in --
-                    # save() may normalize (e.g. fill a missing extension), so
-                    # its return is the on-disk location the client will open().
-                    saved = output.save(paths_in, format=request.format)
-                    data = [
-                        self._image_object(request, raw_request, image_id, i,
-                                           saved[i]) for i in range(batch_size)
-                    ]
-                response = ImageGenerationResponse(
-                    created=int(time.time()),
-                    data=data,
-                    output_format=request.format,
-                    size=f"{params.width}x{params.height}",
-                )
-            else:
-                output_images = _normalize_image_output(output.image)
-                # Pillow's format name is the upper-case form of our
-                # request token. The on-disk extension matches the
-                # request token directly; ``.jpeg`` is interchangeable
-                # with ``.jpg`` for Pillow, the OS, and the OpenAI API.
-                pil_format = request.format.upper()
-                ext = f".{request.format}"
-                if request.response_format == "b64_json":
-                    data = [
-                        ImageObject(
-                            b64_json=base64.b64encode(
-                                image_to_bytes(
-                                    image, format=pil_format)).decode("utf-8"),
-                            revised_prompt=request.prompt,
-                        ) for image in output_images
-                    ]
-                else:
-                    data = []
-                    for i, image in enumerate(output_images):
-                        path = self.media_storage_path / f"{image_id}_{i}{ext}"
-                        path.write_bytes(
-                            image_to_bytes(image, format=pil_format))
-                        data.append(
-                            self._image_object(request, raw_request, image_id,
-                                               i, path))
-                response = ImageGenerationResponse(
-                    created=int(time.time()),
-                    data=data,
-                    output_format=request.format,
-                    size=f"{params.width}x{params.height}",
-                )
-
-            latency = time.perf_counter() - image_gen_start  # seconds
-            metrics = output.metrics
-            generation = metrics.generation if metrics is not None else 0.0
-            denoise = metrics.denoise if metrics is not None else 0.0
-            logger.info(f"Image {image_id} generated and encoded: "
-                        f"latency={latency:.3f}s generation={generation:.3f}s "
-                        f"denoise={denoise:.3f}s")
-            total = self._adjusted_steady_clock.now() - request_received
-            headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics, total=total))
-
-            return JSONResponse(content=response.model_dump(), headers=headers)
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(
-                message=str(e),
-                err_type="InternalServerError",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-
-    async def get_image_content(
-        self,
-        image_id: str,
-        raw_request: Request,
-        i: int = 0,
-    ) -> Response:
-        """Serve a generated image by ID and batch index.
-
-        ``GET /v1/images/{image_id}/content?i=<batch_index>`` returns
-        the image file the corresponding ``POST /v1/images/generations``
-        wrote into ``media_storage_path``. ``i`` defaults to ``0`` for
-        single-image requests; URL responses for ``n > 1`` requests
-        carry ``?i=N`` per item.
-        """
-        for ext in (".png", ".webp", ".jpg", ".jpeg", ".safetensors", ".pt"):
-            candidate = self.media_storage_path / f"{image_id}_{i}{ext}"
-            if candidate.exists():
-                media_type = ("application/octet-stream"
-                              if ext in (".safetensors", ".pt") else
-                              f"image/{ext.lstrip('.').replace('jpg', 'jpeg')}")
-                return FileResponse(
-                    str(candidate),
-                    media_type=media_type,
-                    filename=candidate.name,
-                )
-        return self.create_error_response(
-            message=f"Image {image_id!r} (batch index {i}) not found",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-
-    @staticmethod
-    def _build_image_content_url(raw_request: Request, image_id: str,
-                                 i: int) -> str:
-        """Return a fetchable HTTP URL for a generated image item."""
-        base = str(raw_request.base_url).rstrip("/")
-        return f"{base}/v1/images/{image_id}/content?i={i}"
-
-    def _reject_disabled_path(
-            self, response_format: Optional[str]) -> Optional[Response]:
-        """Return a 400 when ``response_format='path'`` but it is disabled.
-
-        Shares the switch with ``format='path'`` on the request side; see
-        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
-        """
-        if response_format != "path":
-            return None
-        if local_media_path_is_disallowed():
-            return self.create_error_response(
-                "response_format='path' is disabled on this server "
-                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
-                "server-side filesystem paths and is only meaningful for "
-                "co-located clients.",
-                err_type="BadRequestError",
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
-        return None
-
-    def _image_object(self, request: Union[ImageGenerationRequest,
-                                           ImageEditRequest],
-                      raw_request: Request, image_id: str, i: int,
-                      path: Path) -> ImageObject:
-        """Build the per-item ``ImageObject`` for the ``path``/``url`` transports.
-
-        ``b64_json`` is handled separately. Shared by the generation
-        (tensor + encoder) and edit routes so they cannot drift when a
-        transport changes.
-        """
-        if request.response_format == "path":
-            return ImageObject(path=str(path), revised_prompt=request.prompt)
-        return ImageObject(url=self._build_image_content_url(
-            raw_request, image_id, i),
-                           revised_prompt=request.prompt)
-
-    async def _parse_image_edit_request(
-        self,
-        raw_request: Request,
-    ) -> ImageEditRequest:
-        """Parse an image edit request from JSON or multipart form data."""
-        content_type = raw_request.headers.get("content-type", "")
-        normalized_content_type = content_type.lower()
-
-        if "application/json" in normalized_content_type:
-            body = await raw_request.json()
-            if not isinstance(body, dict):
-                raise ValueError(
-                    "JSON image edit request body must be an object")
-            return ImageEditRequest(**body)
-
-        if "multipart/form-data" in normalized_content_type:
-            form = await raw_request.form()
-            data = {}
-            for key in form:
-                values = form.getlist(key)
-                if key == "image":
-                    values = [
-                        value for value in values
-                        if not (isinstance(value, str) and value == "")
-                    ]
-                    if not values:
-                        continue
-                    data[key] = values if len(values) > 1 else values[-1]
-                    continue
-
-                value = values[-1]
-                if key == "extra_params":
-                    if value == "":
-                        continue
-                    if not isinstance(value, str):
-                        raise ValueError(
-                            "'extra_params' must be a JSON object string")
-                    try:
-                        data[key] = json.loads(value)
-                    except (json.JSONDecodeError, TypeError) as exc:
-                        raise ValueError(
-                            f"'extra_params' must be a JSON object string; {exc}"
-                        ) from exc
-                    continue
-                if value == "":
-                    continue
-                data[key] = value
-            return ImageEditRequest(**data)
-
-        raise ValueError(
-            f"Unsupported content-type: {content_type}. Use 'application/json' or 'multipart/form-data'"
-        )
-
-    async def openai_image_edit(self, raw_request: Request) -> Response:
-        """OpenAI-compatible image editing endpoint."""
-        request_received = raw_request.state.server_arrival_time
-        if not self._supports_image_edit():
-            return self._create_not_supported_error(
-                "Image editing is not supported by the loaded visual generation model."
-            )
-
-        try:
-            image_id = f"image_{uuid.uuid4().hex}"
-
-            try:
-                request = await self._parse_image_edit_request(raw_request)
-                path_error = self._reject_disabled_path(request.response_format)
-                if path_error is not None:
-                    return path_error
-                params = parse_visual_gen_params(request, self.generator)
-                logger.info(
-                    f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
-                )
-                image_edit_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
-            except ValidationError as exc:
-                return self._render_pydantic_validation_error(exc)
-            except ValueError as exc:
-                logger.error(f"Image edit request error: {exc}")
-                return self.create_error_response(
-                    message=str(exc),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                )
-
-            if output.image is None:
-                return self.create_error_response(
-                    message="Image editing failed",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-
-            # Model-specific ``extra_params`` stay pipeline-owned. Layered
-            # image-edit models such as Qwen-Image-Layered use
-            # ``save_layers_to_grid`` to pack all layers into one image here.
-            output_images = _normalize_image_output(output.image)
-            output_size = _image_output_size(
-                output_images[0]) if output_images else None
-            pil_format = request.output_format.upper()
-            ext = f".{request.output_format}"
-            if request.response_format == "b64_json":
-                data = [
-                    ImageObject(
-                        b64_json=base64.b64encode(
-                            image_to_bytes(image,
-                                           format=pil_format)).decode("utf-8"),
-                        revised_prompt=request.prompt,
-                    ) for image in output_images
-                ]
-            else:
-                data = []
-                for i, image in enumerate(output_images):
-                    path = self.media_storage_path / f"{image_id}_{i}{ext}"
-                    path.write_bytes(image_to_bytes(image, format=pil_format))
-                    data.append(
-                        self._image_object(request, raw_request, image_id, i,
-                                           path))
-
-            response = ImageGenerationResponse(
-                created=int(time.time()),
-                data=data,
-                output_format=request.output_format,
-                size=output_size,
-            )
-
-            latency = time.perf_counter() - image_edit_start
-            metrics = output.metrics
-            generation = metrics.generation if metrics is not None else 0.0
-            denoise = metrics.denoise if metrics is not None else 0.0
-            logger.info(f"Image {image_id} edited and encoded: "
-                        f"latency={latency:.3f}s generation={generation:.3f}s "
-                        f"denoise={denoise:.3f}s")
-            total = self._adjusted_steady_clock.now() - request_received
-            headers = build_visual_gen_timing_headers(
-                build_visual_gen_server_timings(metrics, total=total))
-
-            return JSONResponse(content=response.model_dump(), headers=headers)
-
-        except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(
-                message=str(e),
-                err_type="InternalServerError",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
 
     async def __call__(self,
                        host,
