@@ -32,6 +32,7 @@ from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.worker import GenerationExecutorWorker
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import LogprobParams, SamplingParams
 
@@ -68,6 +69,36 @@ def test_response_metrics_are_deserialized_only_when_requested(
     else:
         assert wrapped.request_perf_metrics is metrics
         deserialize.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("collective", [False, True])
+def test_shutdown_stops_response_thread_with_admission_closed(collective):
+    """Checkpoint admission does not control ownership of the response thread."""
+    worker = object.__new__(GenerationExecutorWorker)
+    worker.doing_shutdown = False
+    worker.rpc_server = None
+    worker.llm_args = SimpleNamespace(backend="pytorch")
+    worker.engine = MagicMock()
+    worker.engine.can_enqueue_requests.return_value = False
+    worker.await_response_thread = MagicMock()
+    worker.await_response_thread.is_alive.return_value = True
+    worker._handle_background_error = MagicMock()
+    thread = worker.await_response_thread
+    engine = worker.engine
+    with (
+            patch("tensorrt_llm.executor.worker.uses_collective_shutdown",
+                  return_value=collective),
+            patch("tensorrt_llm.executor.worker.mpi_comm") as comm,
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch("torch.cuda.empty_cache"),
+    ):
+        comm.return_value.allgather.side_effect = lambda value: [value]
+        worker.shutdown()
+    thread.stop.assert_called_once()
+    thread.join.assert_called_once()
+    engine.shutdown.assert_called_once()
+    assert worker.engine is None
 
 
 @pytest.mark.cpu_only
@@ -1023,12 +1054,14 @@ def test_worker_enqueues_serializable_python_input_envelope(
         arrival_time=123.0,
     ).set_id(11)
 
+    request._checkpoint_validation_token = "private-probe" if simple else None
     assert worker._enqueue_request(request) == 42
     assert len(captured) == 1
     envelope = captured[0]
     assert isinstance(envelope, ExecutorRequest)
     assert not hasattr(envelope.request, "py_logprobs_mode")
     restored = pickle.loads(pickle.dumps(envelope))
+    assert restored.py_checkpoint_validation_token == request._checkpoint_validation_token
     parent = executor_request_to_llm_request(42, restored, [43, 44], False)
     for translated in (parent, *parent.child_requests):
         assert translated.py_client_id == 11

@@ -111,6 +111,7 @@ class AggConfig:
     # memory_monitor_config.mode="full" + a runtime-control key: registers GET /memory_report
     memory_report: bool = False
     num_serve_frontends: int = 1  # FakeLlmArgs.num_serve_frontends
+    checkpoint: bool = False  # authenticated resident checkpoint lifecycle
     return_perf_metrics: bool = False
     perf_metrics_output_dir: bool = False  # sets args.perf_metrics_output_dir=<tmp>/perf
     env: tuple = ()  # (name, value) pairs applied before construction
@@ -260,8 +261,9 @@ class ServeTestEnv:
             rl_control_api_key="test-key" if config.rl_control else None,
             enable_runtime_control_endpoints=config.runtime_control,
             runtime_control_api_key=(
-                "test-key" if config.runtime_control or config.memory_report else None
+                "test-key" if config.runtime_control or config.memory_report or config.checkpoint else None
             ),
+            enable_checkpoint_mode=config.checkpoint,
             multi_frontend_serving=multi_frontend_serving,
         )
         self._servers.append(server)

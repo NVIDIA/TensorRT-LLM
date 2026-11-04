@@ -77,8 +77,10 @@ __all__ = [
 # point, so routing through the rank-0 RPC shim is correct.
 # get_memory_report() is answered by rank-0, which in the memory monitor's
 # full mode gathers the other ranks' reports over its own communicator.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
-    {"get_memory_report", "get_memory_status", "sleep", "wakeup"})
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({
+    "get_memory_report", "get_memory_status", "sleep", "wakeup", "checkpoint_profile",
+    "checkpoint_step", "checkpoint_fail_closed"
+})
 
 
 def _check_collective_rpc_guard(
