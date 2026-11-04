@@ -115,6 +115,7 @@ from tensorrt_llm.logger import logger
 from ... import dispatch as _tp_agreement
 from ...dispatch import LAUNCH_PDL
 from ...ops.spec import head_sampler as _hs
+from ..pv_logits import gather as _pv_logits
 
 #: The feature ids this module installs.
 
@@ -324,6 +325,18 @@ class TargetHead:
     #: ``head_sampler_coop_fold``'s MAX_ROWS: head calls of at most this many rows run kernel A
     #: with the soft cap computed by the whole CTA (0: never).
     coop_max_rows: int = 0
+    #: ``distributed_head_sampler``'s one-shot logits gather into the final layout (built in
+    #: ``__init__``), or None.
+    pv_gather: Optional["_pv_logits.PvLogitsGather"] = None
+    #: ``distributed_head_sampler``'s interleaved-vocabulary head (``kernels/s2_sampler.sampler.install``
+    #: attaches it); it takes the 8-row decode calls ahead of the one-shot gather once armed.
+    s2 = None
+    #: Whether the samplers' kernel B releases its dependent right after its wait, so the verify
+    #: fold launches under it (``distributed_head_sampler``).
+    verify_pdl = False
+    #: Whether the pending row was produced by ``s2`` (its local shard only; the full row is
+    #: gathered on demand).
+    pending_s2 = False
 
     def __init__(
         self,
@@ -335,12 +348,14 @@ class TargetHead:
         vocab_parallel: bool = False,
         multimem_gather: bool = False,
         coop_max_rows: int = 0,
+        distributed: bool = False,
     ) -> None:
         self.multiplier = float(processor.logit_multiplier)
         self.soft_cap = float(processor.soft_cap)
         self.worker = worker
         self.gather = gather
         self.pdl = LAUNCH_PDL
+        self.verify_pdl = bool(distributed)
         self.device = lm_head.weight.device
         self.coop_max_rows = int(coop_max_rows)
         start = time.perf_counter()
@@ -391,10 +406,26 @@ class TargetHead:
                 if refusal is not None:
                     self.multimem = None
             self.multimem_refusal = refusal
+        # distributed_head_sampler: the one-shot logits gather into the final layout, when every
+        # rank can build it (collective); it takes the 8-row calls ahead of the MULTIMEM gather.
+        self.pv_gather = None
+        if distributed and not gather:
+            refusal = _tp_agreement.agreed_refusal(
+                mapping, _pv_logits.PvLogitsGather.reason(mapping, lm_head)
+            )
+            if refusal is None:
+                self.pv_gather = _pv_logits.PvLogitsGather(
+                    mapping, int(lm_head.weight.shape[0]), self.device
+                )
+            logger.info(
+                "[musespark_open] distributed_head_sampler: one-shot logits gather "
+                + ("into the final layout" if self.pv_gather else f"off ({refusal})")
+            )
         self.load_seconds = time.perf_counter() - start
         self.pending: Optional[torch.Tensor] = None
         self.pending_inbox = False
         self.pending_local = None
+        self.pending_s2 = False
         self._bypass_logged = False
         self._wide_capture_logged = False
         self.hook_handle = None
@@ -497,6 +528,15 @@ class TargetHead:
                 fork.fire("head")
             logits = self.workspace.gathered[:rows]
             self.pending_inbox = True
+        elif self.s2 is not None and self.s2.takes(hidden_states, lm_head):
+            # distributed_head_sampler: the GEMM on the interleaved copy; the row stays on the
+            # ranks (sample / materialize read it).
+            logits = self.s2.produce(lm_head, hidden_states)
+            self.pending_inbox = False
+            self.pending_s2 = True
+        elif self.pv_gather is not None and self.pv_gather.takes(hidden_states, lm_head):
+            logits = self.pv_gather(lm_head, hidden_states)
+            self.pending_inbox = False
         elif self.multimem is not None and self.multimem.takes(hidden_states, lm_head):
             logits = self.multimem(lm_head, hidden_states)
             self.pending_inbox = False
@@ -536,9 +576,24 @@ class TargetHead:
         """The fused sampler's tokens for the pending row; consumes it."""
         local = self.pending_local
         inbox = self.pending_inbox
+        s2_row = self.pending_s2
         self.pending = None
         self.pending_inbox = False
         self.pending_local = None
+        self.pending_s2 = False
+        if s2_row:
+            return self.s2.sample(
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed,
+                offset,
+                self.multiplier,
+                self.soft_cap,
+                self.pdl,
+                verify_pdl=self.verify_pdl,
+            )
         if local is not None:
             return _hs.vocab_parallel_sample(
                 self.vp.view,
@@ -573,6 +628,7 @@ class TargetHead:
                 _hs.INBOX_ROWS,
                 True,
                 self.pdl,
+                verify_pdl=self.verify_pdl,
             )
         return _hs.split_sample(
             logits,
@@ -587,6 +643,7 @@ class TargetHead:
             self.states if logits.shape[0] <= _hs.MAX_ROWS else self.wide_states,
             self.pdl,
             coop_max_rows=self.coop_max_rows,
+            verify_pdl=self.verify_pdl,
         )
 
     def vocab_parallel(self, logits) -> bool:
@@ -604,6 +661,13 @@ class TargetHead:
 
     def _gather_now(self, logits: torch.Tensor) -> Optional[torch.Tensor]:
         """Consume the pending row; returns the gathered BF16 row of a vocab-parallel one."""
+        if self.pending_s2:
+            # distributed_head_sampler: the row in vocabulary order, into the pending object
+            # (the one-shot gather + inverse permutation).
+            self.s2.full_row(self.pv_gather)
+            self.pending = None
+            self.pending_s2 = False
+            return None
         if self.pending_local is not None:
             from tensorrt_llm._torch.distributed import allgather
 
@@ -645,9 +709,13 @@ class TargetHead:
         )
 
     def drain(self) -> None:
-        """Consume a pending row nothing sampled (resets its inbox words; a vocab-parallel row
-        has none, and is dropped without a gather)."""
-        if self.pending_local is not None:
+        """Consume a pending row nothing sampled (resets its inbox words; a vocab-parallel or an
+        ``s2`` row has none, and is dropped without a gather)."""
+        if self.pending_s2:
+            # An s2 row's exchanges run only in sample / materialize, on every rank alike.
+            self.pending = None
+            self.pending_s2 = False
+        elif self.pending_local is not None:
             self.pending = None
             self.pending_local = None
         elif self.pending is not None:
@@ -898,6 +966,7 @@ def install(
     vocab_parallel: bool = False,
     multimem_gather: bool = False,
     coop_max_rows: int = 0,
+    distributed: bool = False,
 ) -> "TargetHead":
     """Install the split sampler on the target's processor and DFlash worker; returns the head.
 
@@ -907,7 +976,10 @@ def install(
     (``head_multimem_gather``), the 8-row steps' logits gathered over MULTIMEM (the head's
     ``multimem``, or its ``multimem_refusal``). ``coop_max_rows``
     (``head_sampler_coop_fold``'s MAX_ROWS, 0 for off) is the largest head call whose
-    kernel A computes the soft cap with the whole CTA.
+    kernel A computes the soft cap with the whole CTA. With ``distributed``
+    (``distributed_head_sampler``) and without ``gather`` the head also builds the one-shot
+    logits gather (``s2_sampler.install`` then attaches the interleaved head), and its
+    samplers release the verify fold early (``verify_pdl``).
 
     Call after the drafter fast paths (``draft_head`` re-classes only the built-in worker
     class; ``fused_accept`` composes with a class derived from it). A fast path that
@@ -939,6 +1011,7 @@ def install(
         vocab_parallel,
         multimem_gather=multimem_gather,
         coop_max_rows=coop_max_rows,
+        distributed=distributed,
     )
     processor.__class__ = SplitSamplerLogitsProcessor
     processor._split_head = head

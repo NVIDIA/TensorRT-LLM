@@ -105,6 +105,10 @@ FOLD_THREADS = 128
 #: early trigger) that ``SplitSample`` runs on calls of at most ``coop_max_rows`` rows
 #: (``head_sampler_coop_fold``): every thread of the CTA computes the soft cap, and the
 #: states are ``fold_plain``'s bit for bit on the 1024-thread virtual block.
+#: With ``verify_pdl=True`` (the ``distributed_head_sampler`` fast path) kernel B releases its
+#: dependent right after its wait (``early_trigger``), so the verify fold (``dflash_verify_fold``
+#: with ``pre_wait``) launches under it; the noise gather after the fold launches with PDL too.
+#: Same tokens.
 COOP_FOLD_SHAPE = (32, 512)
 #: A poll waiting longer than this traps: a peer that never published. The trap ends the
 #: CUDA context (where the built-in NCCL all-gather would keep waiting), so any skew between
@@ -302,6 +306,7 @@ class SplitSample(OpWrapper):
         states: torch.Tensor,
         pdl: bool = False,
         coop_max_rows: int = 0,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         m, inv, cap = cap_constants(multiplier, soft_cap)
         if logits.shape[0] <= min(coop_max_rows, MAX_ROWS):
@@ -315,7 +320,19 @@ class SplitSample(OpWrapper):
                 logits, temperatures, states, m, inv, cap, FOLD_THREADS, pdl
             )
         return torch.ops.musespark_open_head_sampler.draw(
-            logits, temperatures, top_ks, top_ps, min_ps, seed, offset, states, m, inv, cap, pdl
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            states,
+            m,
+            inv,
+            cap,
+            pdl,
+            verify_pdl and pdl,
         )
 
     def reference(
@@ -332,10 +349,11 @@ class SplitSample(OpWrapper):
         states: torch.Tensor,
         pdl: bool = False,
         coop_max_rows: int = 0,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         """The built-in head: the processor's soft cap, then the shipped fused sampler.
 
-        ``states``, ``pdl`` and ``coop_max_rows`` are ignored.
+        ``states``, ``pdl``, ``coop_max_rows`` and ``verify_pdl`` are ignored.
         """
         capped = reference_capped(logits, multiplier, soft_cap)
         return torch.ops.trtllm.fused_sample_from_logits(
@@ -356,6 +374,7 @@ class SplitSample(OpWrapper):
         states: torch.Tensor,
         pdl: bool = False,
         coop_max_rows: int = 0,
+        verify_pdl: bool = False,
     ) -> None:
         if logits.dtype != torch.bfloat16 or logits.dim() != 2:
             raise ValueError("logits must be BF16 [rows, vocab]")
@@ -418,6 +437,7 @@ class GatherSplitSample(OpWrapper):
         slot_rows: int,
         sample: bool = True,
         pdl: bool = False,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         m, inv, cap = cap_constants(multiplier, soft_cap)
         torch.ops.musespark_open_head_sampler.fold_gather(
@@ -439,7 +459,19 @@ class GatherSplitSample(OpWrapper):
         if not sample:
             return gathered
         return torch.ops.musespark_open_head_sampler.draw(
-            gathered, temperatures, top_ks, top_ps, min_ps, seed, offset, states, m, inv, cap, pdl
+            gathered,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            states,
+            m,
+            inv,
+            cap,
+            pdl,
+            verify_pdl and pdl,
         )
 
     def reference(
@@ -460,11 +492,12 @@ class GatherSplitSample(OpWrapper):
         slot_rows: int,
         sample: bool = True,
         pdl: bool = False,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         """The built-in: concatenate the shards in rank order, cap, sample (no inbox side effects).
 
         ``inbox`` must hold the published words (read, not reset); ``gathered``,
-        ``states``, ``status`` and ``pdl`` are ignored.
+        ``states``, ``status``, ``pdl`` and ``verify_pdl`` are ignored.
         """
         rows = gathered.shape[0]
         ranks = gathered.shape[1] // shard
@@ -495,6 +528,7 @@ class GatherSplitSample(OpWrapper):
         slot_rows: int,
         sample: bool = True,
         pdl: bool = False,
+        verify_pdl: bool = False,
     ) -> None:
         if gathered.dtype != torch.bfloat16 or gathered.dim() != 2:
             raise ValueError("gathered must be BF16 [rows, vocab]")
