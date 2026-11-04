@@ -682,6 +682,37 @@ def test_context_fallback_skips_requests_given_up_earlier_in_the_pass() -> None:
     assert first_recompute_paused == (4, 2)
 
 
+def test_context_fallback_skips_a_request_given_up_earlier_with_no_active_victim() -> None:
+    """As above, but prompt 2 is left out of the active list, so every
+    candidate behind prompt 1 is suspended and the context path falls back to
+    suspended victims. Decode 3 cannot resume and the generation path
+    recompute-pauses decode 4; the context path must then take decode 3, not
+    decode 4 a second time.
+    """
+    scenario = SUSPENDED_DECODES_BEHIND_PREFILLS
+    ranks = [
+        _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
+        for cp_rank in range(CP_SIZE)
+    ]
+    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    decisions = [
+        _step(cp_rank, manager, scheduler, [rank_requests[3], rank_requests[4]], scenario)
+        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
+    ]
+    assert all(d == decisions[0] for d in decisions), decisions
+    for (_, scheduler), rank_requests in zip(ranks, requests):
+        for request_id in (3, 4):
+            scheduler._suspend_request(rank_requests[request_id])
+    _fill_pool_with_prefills(ranks, scenario, requests)
+
+    decisions = [
+        _step(cp_rank, manager, scheduler, [rank_requests[i] for i in (1, 3, 4)], scenario)
+        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
+    ]
+    assert all(d == decisions[0] for d in decisions), decisions
+    assert decisions[0][3] == (4, 3)
+
+
 # Request 2 fills most of the pool and decodes while the older request 1 is
 # still mid-prefill; request 1's later chunks need more pages than the
 # four-page host tier can take from request 2.

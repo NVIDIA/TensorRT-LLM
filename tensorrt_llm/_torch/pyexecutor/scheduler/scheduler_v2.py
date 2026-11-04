@@ -1433,10 +1433,10 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> bool:
         """Free GPU pages for a suspended mid-prefill request that could not resume.
 
-        Under helix with a tier below GPU, a suspended request's pages can sit on
-        that tier, and bringing them back fails once newer requests have taken
-        the GPU pages. Like a failed resize, give up a newer started request so
-        the older one is not left waiting behind it.
+        Under helix, bringing a suspended request's pages back can fail once
+        newer requests have taken the GPU pages, for example after its pages
+        moved to a tier below GPU. Like a failed resize, give up a newer
+        started request so the older one is not left waiting behind it.
         """
         return self.has_cp_helix and not req.is_first_context_chunk and preempt_for_pages(req)
 
