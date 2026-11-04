@@ -47,6 +47,9 @@ class _MpiGroup:
         ranks1: Sequence[int],
         group2: "_MpiGroup | None" = None,
     ) -> list[int]:
+        """Validate both MPI groups before delegating the scripted rank
+        translation.
+        """
         if not isinstance(group1, cls) or not isinstance(group2, cls):
             raise TypeError("Expected MPI.Group source and destination")
         return cast(list[int], group1.translate(group1, ranks1, group2))
@@ -96,6 +99,9 @@ def test_inactive_scope_inspects_neither_group_rank_nor_payload(
     selected: bool,
     enabled: bool,
 ) -> None:
+    """Verify inactive MPI scopes leave communicator and payload metadata
+    untouched.
+    """
     group = Mock(side_effect=AssertionError("group inspected"))
     rank = Mock(side_effect=AssertionError("rank inspected"))
     payload = MagicMock()
@@ -162,6 +168,9 @@ def test_payload_description_is_shallow(
     payload: object,
     want: dict[str, profiler.MetadataValue],
 ) -> None:
+    """Verify payload metadata describes containers without inspecting their
+    contents.
+    """
     record, _, _ = active
     with profiler.record_mpi_function(
         "send", communicator="world", group=lambda: [3], rank=3, payload=payload
@@ -175,6 +184,7 @@ def test_payload_description_is_shallow(
 
 
 def test_tensor_metadata_does_not_read_values(active: tuple[Mock, MagicMock, Mock]) -> None:
+    """Verify layout and payload descriptors for a noncontiguous tensor."""
     record, _, _ = active
     payload = torch.ones((3, 2)).transpose(0, 1)
     with profiler.record_mpi_function(
@@ -366,6 +376,9 @@ def test_p2p_arguments_results_and_exception_identity(
     helper: str,
     direction: str,
 ) -> None:
+    """Verify point-to-point wrapping preserves arguments and original
+    exceptions.
+    """
     record, scope, _ = active
     failure = RuntimeError("transport failed")
     transport = Mock(side_effect=failure)
@@ -402,6 +415,9 @@ def test_p2p_returns_preserve_submission_handle_or_receive_result(
     operation: str,
     helper: str,
 ) -> None:
+    """Verify point-to-point calls return the exact native handle or receive
+    result.
+    """
     transport = Mock(return_value=object())
     monkeypatch.setattr(communicator, helper, transport)
     payload = np.ones(4, dtype=np.uint8)
@@ -419,6 +435,7 @@ def test_small_payload_retains_native_or_chunked_collective(
     group_name: str,
     small: bool,
 ) -> None:
+    """Verify small-payload selection preserves the existing collective path."""
     record, _, _ = active
     mpi_dist = _dist()
     subcomm = Mock()
@@ -450,6 +467,7 @@ def test_small_payload_retains_native_or_chunked_collective(
 def test_typed_broadcast_retains_tp_then_cp_and_int64_buffer(
     active: tuple[Mock, MagicMock, Mock],
 ) -> None:
+    """Verify typed broadcast retains TP-then-CP order and MPI int64 buffers."""
     record, _, _ = active
     mpi_dist = _dist()
     calls: list[tuple[str, int, str]] = []
@@ -493,6 +511,9 @@ def test_chunked_collective_preserves_arguments_and_result(
     group_name: str,
     helper: str,
 ) -> None:
+    """Verify profiled chunked collectives preserve their native call
+    contract.
+    """
     record, _, parent = active
     mpi_dist = _dist()
     subcomm = Mock()
@@ -529,6 +550,9 @@ def test_direct_collective_preserves_reduction_and_root(
     operation: str,
     group_name: str,
 ) -> None:
+    """Verify direct collectives retain reduction operators, roots, and
+    results.
+    """
     record, _, parent = active
     mpi_dist = _dist()
     subcomm = Mock()
