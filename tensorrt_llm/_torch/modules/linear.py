@@ -4570,6 +4570,13 @@ class Linear(nn.Module):
         )
 
     @property
+    def has_r128c4_weight_scale(self):
+        """Whether ``weight_scale`` holds FP8 block scales in the UE8M0 K32
+        R128c4 layout of the SM107 CuTe DSL MXFP8 GEMM."""
+        return (self.has_fp8_block_scales
+                and _fp8_block_scales_uses_cute_dsl_sm107(self))
+
+    @property
     def has_nvfp4(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(

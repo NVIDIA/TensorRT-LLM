@@ -1343,6 +1343,12 @@ class _Fp8BlockScaleWeightReadLinear(
         return False
 
     @property
+    def has_r128c4_weight_scale(self) -> bool:
+        """Match the ``Linear`` interface: ``_prepare_weights`` packs R128c4 scales where the
+        Rubin MXFP8 GEMM runs."""
+        return _rubin_mxfp8_is_available()
+
+    @property
     def output_all_reduce(self) -> Optional[AllReduce]:
         return self._output_all_reduce
 
