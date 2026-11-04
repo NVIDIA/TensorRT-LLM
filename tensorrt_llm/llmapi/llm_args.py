@@ -5091,8 +5091,8 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
-# Mixed-precision KV dtype: "mixed_<history dtype>_<retained dtype>". The
-# first/last retained tokens and the attention inputs use the second dtype;
+# Mixed-precision KV dtype: "mixed_<low dtype>_<high dtype>". The
+# first/last tokens and the attention inputs use the second dtype;
 # the full history is stored in the first. Requires KV cache manager V2.
 _MIXED_PRECISION_KV_DTYPE = re.compile(
     r"^mixed_(?P<low>nvfp4)_(?P<high>fp8|float16|bfloat16)$")
@@ -5242,14 +5242,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "Mixed-precision KV only: number of leading tokens per sequence kept at the "
-        "retained dtype. Retention follows the cache page granularity.")
+        "mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept in "
+        "whole cache pages.")
 
     mixed_precision_last_n: NonNegativeInt = Field(
         default=256,
         status="prototype",
         description=
         "Mixed-precision KV only: number of most recent tokens per sequence kept at "
-        "the retained dtype. Retention follows the cache page granularity.")
+        "the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept "
+        "in whole cache pages.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -5645,7 +5647,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
-        """A mixed-precision cache must retain at least one token per sequence."""
+        """Require at least one token per sequence in the mixed-precision high dtype."""
         if (self.mixed_precision_kv is not None and self.mixed_precision_first_n
                 == self.mixed_precision_last_n == 0):
             raise ValueError(
@@ -7424,22 +7426,32 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
                 f"backends; got attn_backend={self.attn_backend!r}.")
-        if self.sparse_attention_config is not None:
-            raise ValueError(
-                "Mixed-precision KV is not supported together with sparse attention."
-            )
         # The connector layout maps every cache layer to one model layer; the
-        # retained-token layers break that mapping.
+        # mixed-precision high layers break that mapping.
         if self.kv_connector_config is not None:
             raise ValueError(
                 "Mixed-precision KV is not supported together with a KV connector."
             )
-        if (self.speculative_config is not None
-                or self.kv_cache_compression_config is not None
+        if self.sleep_config is not None:
+            raise ValueError(
+                "Mixed-precision KV requires KVCacheManagerV2, which does not support "
+                "sleep_config.")
+        sparse = self.sparse_attention_config
+        if sparse is not None and sparse.algorithm not in ("dsa",
+                                                           "deepseek_v4"):
+            raise ValueError(
+                "Mixed-precision KV supports the dsa and deepseek_v4 sparse "
+                f"attention algorithms; got {sparse.algorithm!r}.")
+        if (self.kv_cache_compression_config is not None
                 or self.max_beam_width != 1):
             raise ValueError(
                 "Mixed-precision KV currently requires single-beam execution "
-                "without speculative decoding or cold-page compression.")
+                "without cold-page compression.")
+        if getattr(self.speculative_config, "use_dynamic_tree", False):
+            raise ValueError(
+                "Mixed-precision KV does not support dynamic-tree speculative "
+                "decoding, which moves accepted KV rows inside the cache pools."
+            )
         return self
 
     @model_validator(mode="after")
@@ -8269,7 +8281,7 @@ class TorchLlmArgs(BaseLlmArgs):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
         elif self.kv_cache_config.dtype in ('mixed_nvfp4_float16',
                                             'mixed_nvfp4_bfloat16'):
-            # Retained tokens stay in the model dtype: no KV quantization.
+            # The first/last tokens stay in the model dtype: no KV quantization.
             self.quant_config.kv_cache_quant_algo = None
         else:
             logger.warning(
