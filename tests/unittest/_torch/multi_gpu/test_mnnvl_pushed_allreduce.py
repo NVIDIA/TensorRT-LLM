@@ -1038,7 +1038,7 @@ def test_attn_res_finishes_one_shot_call(world, m, early_poll):
     state = flags.cpu().long().tolist()
     assert state == [(cur + 1) % 3, cur, nbytes, 1, m * world * h * 2, 0, 0, 0, 0]
     rearmed = workspace[dirty * nbytes : dirty * nbytes + 4096].view(torch.int32)
-    assert bool((rearmed == -(2**31)).all())
+    assert bool((rearmed == _SENTINEL).all())
 
 
 @mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
