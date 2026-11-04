@@ -4374,6 +4374,13 @@ def create_py_executor_resources(
     max_num_sequences: Optional[int] = None,
 ) -> PyExecutorResources:
     """Build the resource graph shared by initial execution and rebinding."""
+    # Reject a live phase before changing global dispatch state, mutating the
+    # resource bundle or allocating LoRA state.
+    seq_slot_manager = resources.get(ResourceManagerType.SEQ_SLOT_MANAGER)
+    if seq_slot_manager is not None and seq_slot_manager.slot_manager.slot_mapping:
+        raise RuntimeError(
+            "Sequence slots must be released before resource rebinding")
+
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
 
@@ -4387,12 +4394,6 @@ def create_py_executor_resources(
         max_batch_size,
         llm_args,
         max_num_sequences=max_num_sequences)
-
-    # Reject a live phase before mutating the resource bundle or allocating LoRA state.
-    seq_slot_manager = resources.get(ResourceManagerType.SEQ_SLOT_MANAGER)
-    if seq_slot_manager is not None and seq_slot_manager.slot_manager.slot_mapping:
-        raise RuntimeError(
-            "Sequence slots must be released before resource rebinding")
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
