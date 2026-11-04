@@ -38,6 +38,7 @@ except ImportError:
     TemplateLM = object
 
 from .. import LLM as PyTorchLLM
+from ..checkpoint_format import CheckpointFormat
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
@@ -46,6 +47,7 @@ from ..inputs.utils import NATIVE_MISTRAL_MODEL_TYPES, _resolve_content_format
 from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
 from ..llmapi import RequestOutput
+from ..llmapi.reasoning_parser import ReasoningParserFactory
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .interface import (Evaluator, dump_inference_results,
@@ -194,6 +196,11 @@ def _parse_partial_scores_env() -> Optional[int]:
     return value if value > 0 else None
 
 
+# lm-eval caches contexts as strings. Keep native control IDs in a lossless,
+# versioned envelope rather than decoding them to text and encoding again.
+_NATIVE_CHAT_TOKENS_PREFIX = "__trtllm_native_chat_tokens_v1__:"
+
+
 class LmEvalWrapper(TemplateLM):
 
     def __init__(self,
@@ -210,6 +217,9 @@ class LmEvalWrapper(TemplateLM):
                  partial_scoring_task_dict: Optional[dict] = None):
         super().__init__()
         self.llm = llm
+        self._native_chat_tokens = (getattr(
+            getattr(llm, "args", None), "checkpoint_format",
+            None) == CheckpointFormat.MISTRAL_LARGE_4)
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
@@ -257,6 +267,16 @@ class LmEvalWrapper(TemplateLM):
         """
         chat_template_kwargs = get_chat_template_kwargs(
             self.llm.tokenizer, self.chat_template_kwargs)
+        if self._native_chat_tokens:
+            token_ids = self.llm.tokenizer.apply_chat_template(
+                chat_history,
+                tokenize=True,
+                return_dict=False,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=not add_generation_prompt,
+                **chat_template_kwargs,
+            )
+            return _NATIVE_CHAT_TOKENS_PREFIX + json.dumps(token_ids)
         return self.llm.tokenizer.apply_chat_template(
             chat_history,
             tokenize=False,
@@ -269,8 +289,17 @@ class LmEvalWrapper(TemplateLM):
     def tokenizer_name(self) -> str:
         return self.llm.tokenizer.name_or_path.replace("/", "__")
 
+    def _prepare_prompt(self, prompt):
+        if (self._native_chat_tokens and isinstance(prompt, str)
+                and prompt.startswith(_NATIVE_CHAT_TOKENS_PREFIX)):
+            return json.loads(prompt[len(_NATIVE_CHAT_TOKENS_PREFIX):])
+        return prompt
+
     def tok_encode(self, string: str, **kwargs) -> List[int]:
-        return self.llm.tokenizer.encode(string, **kwargs)
+        prompt = self._prepare_prompt(string)
+        if isinstance(prompt, list):
+            return prompt
+        return self.llm.tokenizer.encode(prompt, **kwargs)
 
     def _loglikelihood_tokens(self, requests,
                               **kwargs) -> List[Tuple[float, bool]]:
@@ -329,7 +358,27 @@ class LmEvalWrapper(TemplateLM):
             # populated when perf metrics are requested. Small per-request
             # overhead, opted into together with the stats themselves.
             sampling_params.return_perf_metrics = True
+        if self._native_chat_tokens:
+            # Mistral-Large-4's reasoning delimiters are control tokens: keep
+            # them in the text for _response_text, as trtllm-serve does for its
+            # mistral_large_4 reasoning parser.
+            sampling_params.skip_special_tokens = False
         return sampling_params
+
+    def _response_text(self, output: RequestOutput) -> str:
+        """The text lm-eval scores for one output.
+
+        Mistral-Large-4 reasons between ``[THINK]`` and ``[/THINK]`` before it
+        answers. Its output is scored on the content the mistral_large_4
+        reasoning parser separates from the reasoning, the response a
+        trtllm-serve chat client reads; a reasoning block that never closes
+        leaves no response. Every other model is scored on its text.
+        """
+        text = output.outputs[0].text
+        if not self._native_chat_tokens:
+            return text
+        return ReasoningParserFactory.create_reasoning_parser(
+            "mistral_large_4").parse(text).content
 
     def _log_spec_stats(self, outputs: List[RequestOutput]) -> None:
         """Log corpus-aggregate speculative-decoding stats (TLLM_EVAL_SPEC_STATS=1).
@@ -427,7 +476,7 @@ class LmEvalWrapper(TemplateLM):
             next_idx += 1
             prompt, gen_kwargs = requests[idx].args
             sampling_params = self._get_sampling_params(gen_kwargs)
-            output = self.llm.generate_async(prompt,
+            output = self.llm.generate_async(self._prepare_prompt(prompt),
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
             return pool.submit(lambda: (idx, output.result()))
@@ -456,7 +505,8 @@ class LmEvalWrapper(TemplateLM):
                     done_count += 1
                     pbar.update(1)
                     if scorer is not None:
-                        scorer.update(requests[idx], output.outputs[0].text)
+                        scorer.update(requests[idx],
+                                      self._response_text(output))
                         scorer.maybe_log(done_count, total)
                     if next_idx < total:
                         pending.add(_submit_next(pool))
@@ -500,7 +550,7 @@ class LmEvalWrapper(TemplateLM):
                 prompt, gen_kwargs = request.args
                 sampling_params = self._get_sampling_params(gen_kwargs)
                 output = self.llm.generate_async(
-                    prompt,
+                    self._prepare_prompt(prompt),
                     sampling_params=sampling_params,
                     streaming=self.streaming)
                 results.append(output)
@@ -512,7 +562,7 @@ class LmEvalWrapper(TemplateLM):
                          disable=disable_tqdm), requests):
                 outputs.append(output.result())
                 if scorer is not None:
-                    scorer.update(request, outputs[-1].outputs[0].text)
+                    scorer.update(request, self._response_text(outputs[-1]))
                     scorer.maybe_log(len(outputs), len(requests))
 
         if self.output_dir:
@@ -527,7 +577,7 @@ class LmEvalWrapper(TemplateLM):
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        return [output.outputs[0].text for output in outputs]
+        return [self._response_text(output) for output in outputs]
 
 
 class MultimodalLmEvalWrapper(LmEvalWrapper):
@@ -614,6 +664,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
     def _get_model_type(self, llm: PyTorchLLM) -> str:
         """Extract model type from the model configuration."""
+        if getattr(llm.args, "checkpoint_format",
+                   None) == CheckpointFormat.MISTRAL_LARGE_4:
+            return "mistral_large_4"
         config_path = os.path.join(llm._hf_model_dir, 'config.json')
 
         if not os.path.exists(config_path):
@@ -855,7 +908,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             # Kimi K2.5 passes strip_thinking_and_extract_mmmu_answer to
             # recover answers from <think>...</think>-wrapped outputs that
             # lm-eval's default extractor cannot parse.
-            raw = outputs[-1].outputs[0].text
+            raw = self._response_text(outputs[-1])
             text = self.post_process_fn(
                 raw) if self.post_process_fn is not None else raw
             results_text.append(text)

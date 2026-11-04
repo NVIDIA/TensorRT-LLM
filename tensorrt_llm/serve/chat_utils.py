@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import secrets
+import string
 import uuid
 from functools import lru_cache, partial
 from pathlib import Path
@@ -593,6 +595,10 @@ def parse_chat_messages_coroutines(
 def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
     if id_type == "kimi_k2":
         return f"functions.{func_name}:{idx}"
+    elif id_type == "mistral":
+        # The ids mistral-common writes: nine ASCII letters or digits.
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(9))
     else:
         # by default return random
         return f"chatcmpl-tool-{uuid.uuid4().hex}"

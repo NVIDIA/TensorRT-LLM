@@ -814,6 +814,12 @@ models:
         default: true
         status: stable
         required: false
+      continue_final_message:
+        kind: extension
+        type: bool
+        default: false
+        status: prototype
+        required: false
       add_special_tokens:
         kind: extension
         type: bool

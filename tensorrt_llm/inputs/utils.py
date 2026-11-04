@@ -669,9 +669,9 @@ def resolve_hf_chat_template(
 
 # Model types whose chats mistral-common renders: the checkpoints the
 # Mistral-native format (checkpoint_format "mistral" or "mistral_large_3")
-# loads. Their tokenizer is a MistralTokenizer, and the renderer returns
-# token ids.
-NATIVE_MISTRAL_MODEL_TYPES = frozenset(("mistral_common", ))
+# loads, and Mistral Large 4, whose config names its own model type. Their
+# tokenizer is a MistralTokenizer, and the renderer returns token ids.
+NATIVE_MISTRAL_MODEL_TYPES = frozenset(("mistral_common", "mistral_large_4"))
 
 
 class _RenderDispatch(NamedTuple):

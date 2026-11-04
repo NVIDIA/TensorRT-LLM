@@ -3,6 +3,7 @@
 
 import copy
 import hashlib
+import json
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
@@ -22,6 +23,7 @@ from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     import llguidance
+    from mistral_common.guidance.grammar_factory import GrammarFactory
     from mistral_common.tokens.tokenizers.mistral import MistralTokenizer as MistralCommonTokenizer
 
 
@@ -82,6 +84,7 @@ class MistralTokenizer(TransformersTokenizer):
 
         self._encoding_identity: Optional[dict] = None
         self._grid_only_mistral: Optional["MistralCommonTokenizer"] = None
+        self._grammar_factory_and_template: Optional[tuple["GrammarFactory", str]] = None
 
     def __reduce__(self):
         # TransformersTokenizer.__reduce__ would rebuild a TransformersTokenizer
@@ -211,6 +214,74 @@ class MistralTokenizer(TransformersTokenizer):
         # n_vocab: pad it with empty tokens, which a grammar never selects.
         wrapper.tokens = wrapper.tokens + [b""] * (n_vocab - len(wrapper.tokens))
         return llguidance.LLTokenizer(wrapper, n_vocab=n_vocab, eos_token=self.eos_token_id)
+
+    def llguidance_json_schema_lark(self, json_schema: str) -> str:
+        """The Lark grammar of a JSON response, as mistral-common's grammar factory writes it.
+
+        With the ``[THINK]`` and ``[/THINK]`` control tokens in the vocabulary, the
+        response may open with one reasoning section, ``[THINK]`` text ``[/THINK]``,
+        before the JSON: the model reasons there when the request turns reasoning on.
+        Otherwise the response is the JSON alone.
+
+        Args:
+            json_schema: The JSON schema of the response, serialized.
+
+        Returns:
+            The Lark grammar an llguidance matcher compiles against
+            `llguidance_tokenizer`, which references the control tokens by id.
+        """
+        factory, template = self._grammar_factory
+        return factory.get_lark_for_json_schema(template, json.loads(json_schema))
+
+    def llguidance_tool_grammar(
+        self, tools: list[dict], tool_choice, parallel_tool_calls=None
+    ) -> str:
+        """Render native tool calls, including their reasoning and control tokens.
+
+        A named tool choice is resolved as mistral-common's
+        `GrammarFactory.get_grammar_for_chat_request` resolves it: the grammar
+        offers that tool alone, requires a call, and pins the call to its name.
+        """
+        from mistral_common.protocol.instruct.tool_calls import (
+            NamedToolChoice,
+            Tool,
+            ToolChoiceEnum,
+        )
+
+        native_tools = [Tool.from_openai(tool) for tool in tools]
+        if isinstance(tool_choice, dict):
+            name = NamedToolChoice.model_validate(tool_choice).function.name
+            native_tools = [tool for tool in native_tools if tool.function.name == name]
+            if not native_tools:
+                raise ValueError(f"Named tool {name!r} is not declared in tools.")
+            mode, force_tool_names = ToolChoiceEnum.required, True
+        else:
+            mode, force_tool_names = ToolChoiceEnum(tool_choice), False
+        factory, template = self._grammar_factory
+        return factory.get_lark_from_jinja(
+            template=template,
+            mode=mode,
+            tools=native_tools,
+            json_schema=None,
+            parallel_tool_calls=parallel_tool_calls,
+            json_only=False,
+            force_tool_names=force_tool_names,
+        )
+
+    @property
+    def _grammar_factory(self) -> tuple["GrammarFactory", str]:
+        """mistral-common's grammar factory and its chat template, built on first use."""
+        if self._grammar_factory_and_template is None:
+            from mistral_common.guidance.grammar_factory import GrammarFactory
+
+            if not GrammarFactory.is_supported(self.mistral):
+                raise ValueError(
+                    "mistral-common renders no grammars for this tokenizer "
+                    f"(version v{self.version})."
+                )
+            factory = GrammarFactory(self.mistral)
+            self._grammar_factory_and_template = (factory, factory.select_jinja_template())
+        return self._grammar_factory_and_template
 
     def _get_special_token_ids(self) -> list[int]:
         from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer

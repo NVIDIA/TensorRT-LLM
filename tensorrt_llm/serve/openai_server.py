@@ -1028,7 +1028,8 @@ class OpenAIServer(_VideoRoutesMixin):
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
         if checkpoint_format in (CheckpointFormat.MISTRAL,
-                                 CheckpointFormat.MISTRAL_LARGE_3):
+                                 CheckpointFormat.MISTRAL_LARGE_3,
+                                 CheckpointFormat.MISTRAL_LARGE_4):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
             self.processor = None
@@ -1056,6 +1057,11 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model_config = None
 
         self.chat_template = load_chat_template(chat_template)
+        if checkpoint_format == CheckpointFormat.MISTRAL_LARGE_4 and self.chat_template:
+            logger.warning(
+                "Mistral Large 4 renders chats with mistral-common; ignoring "
+                "the server chat template.")
+            self.chat_template = None
 
         # Enable response storage for Responses API
         self.enable_store = (len(
@@ -1089,6 +1095,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
+            elif self.model_config.model_type == "mistral_large_4":
+                self.tool_call_id_type = "mistral"
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
@@ -2310,6 +2318,10 @@ class OpenAIServer(_VideoRoutesMixin):
             extension = render_resources.extension
             tool_dicts = prepare_chat_request(request,
                                               render_resources).tool_dicts
+            extension.validate_chat_request(request,
+                                            max_seq_len=getattr(
+                                                self.generator.args,
+                                                "max_seq_len", None))
             required_mode = extension.required_tool_choice_mode()
             required_tool_grammar = (request.tool_choice == "required"
                                      and required_mode == "grammar")
@@ -2333,6 +2345,27 @@ class OpenAIServer(_VideoRoutesMixin):
                     guided_decoding_backend,
                     tool_parser=self.tool_parser,
                     reasoning_parser=self.generator.args.reasoning_parser)
+            # A model whose own grammar forces a required or named call takes
+            # it here, in place of the begin prefix and the required-tool modes
+            # below.
+            forced_tool_decoding = extension.forced_tool_call_decoding(
+                request,
+                self.tokenizer,
+                tool_parser=self.tool_parser,
+                guided_decoding_backend=self.generator.args.
+                guided_decoding_backend)
+            if forced_tool_decoding is not None:
+                if sampling_params.guided_decoding is not None:
+                    raise ValueError(
+                        "Required or named tool calls cannot be combined with "
+                        "response_format.")
+                sampling_params.guided_decoding = forced_tool_decoding
+            elif (request.tool_choice == "required"
+                  and required_mode == "native"):
+                # Only the extension's grammar enforces "required" here; without
+                # it the request would silently degrade to "auto".
+                raise ValueError(
+                    "tool_choice='required' is not supported for this model.")
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2355,8 +2388,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # the tool call.
             forced_tool_name = None
             forced_tool_begin_prefix = None
-            if isinstance(request.tool_choice,
-                          ChatCompletionNamedToolChoiceParam):
+            if forced_tool_decoding is None and isinstance(
+                    request.tool_choice, ChatCompletionNamedToolChoiceParam):
                 if not request.tools:
                     return self.create_error_response(
                         message=("tool_choice with a named function requires "
