@@ -270,6 +270,9 @@ At runtime:
 * The mode composes with [attention data parallelism](#attention-data-parallelism) when both
   classes also declare `supports_attention_dp`.
 
+The [`mooncake-store`](#mooncake-store) connector declares the mode; see
+[its notes](#attention-data-parallelism-and-speculative-prefill).
+
 ##### `RequestData` fields that may not be populated
 
 Two `RequestData` fields can be reported empty depending on the cache configuration. A connector must tolerate both.
@@ -390,7 +393,8 @@ connector that transfers KV leaves no such tier, because the host tier is droppe
 the others are refused at bring-up (see
 [KV cache tiers](#kv-cache-tiers-are-gpu-only-under-a-connector)), so its declaration is enough. A
 server with neither keeps its existing admission, `host_cache_size=0` included, whether it has no
-connector, a capacity-only one, or one that does not declare it. The reservation covers
+connector, a capacity-only one, or one that does not declare it. The Mooncake store connector
+declares it. The reservation covers
 full-attention models only, without beam search or pipeline
 parallelism. Recurrent layers and attention windows smaller than the maximum sequence
 length, including mixed-precision tail windows, disable this policy.
@@ -610,7 +614,9 @@ or disk tiers and Mamba/hybrid state remain unsupported. Speculative decoding
 is supported only in the
 [speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server),
 for which both classes declare `supports_speculative_prefill` as well.
-This change adds no Mooncake backend, deployment configuration or capacity tuning.
+The [`mooncake-store`](#mooncake-store) connector declares `supports_attention_dp` and
+`supports_speculative_prefill`; see
+[its notes on attention data parallelism and speculative prefill](#attention-data-parallelism-and-speculative-prefill).
 
 Select a connector through `connector_module`, `connector_scheduler_class`,
 and `connector_worker_class` as usual. Both classes must opt in; enabling ADP
@@ -735,6 +741,10 @@ and `org-b/model` share a directory name while meaning different weights. `segme
 rank against a per-node memory limit, so a node's demand is `ranks_on_node × segment_size` and is
 checked against available memory at startup.
 
+A server publishes a block only once the forward pass that computes its last token has been queued
+for saving, so pages it allocates ahead of computation, such as those of a context chunk trimmed to
+the token budget, never reach the pool.
+
 ### Roles
 
 Capacity and traffic are separate: every role lends the memory its config asks for, and the role
@@ -755,6 +765,39 @@ keeps its own host and disk cache tiers, including the host tier
 [`MAX_UTILIZATION` suspends pages into](#kv-cache-tiers-are-gpu-only-under-a-connector), and pays
 no per-request or per-layer connector cost.
 
+### Pool eviction
+
+A full pool evicts on the master, and two settings shape what it evicts. Both apply only to a role
+that writes the pool (`both` or `producer`), both need `mooncake-transfer-engine-cuda13` 0.3.13 or
+newer, and both are off by default.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    model_key: qwen2-1.5b-instruct
+    soft_pin_ttl_ms: 86400000   # 24 h, the master's default ceiling
+    group_blocks: true
+```
+
+* `soft_pin_ttl_ms` soft-pins every page the server writes for that many milliseconds. Mooncake
+  0.3.13's first eviction pass makes up a shortfall from the shard-ordered rest of the pool when
+  lookups re-lease part of its oldest frontier mid-eviction, which leaves holes in prefixes still in
+  use: a prefix is replayed only up to its first missing block, so every stored block behind a hole
+  is recomputed. Soft-pinned pages are evicted only by the second, age-ordered pass. The TTL must not
+  exceed the master's `--max_kv_soft_pin_ttl` (24 h by default), or the master refuses every put,
+  which the server logs once; and the master must allow evicting soft-pinned objects, which is
+  Mooncake's default.
+* `group_blocks` puts every page a hit on a block needs (all its layer groups and tensor-parallel
+  shards) into one eviction group, `<namespace>/<model_key>/w<world>/<block hash>`, so the master
+  evicts a block whole and never keeps a shard that holds space but can no longer hit. It matters
+  most under tensor parallelism, where a block has one page per rank.
+
+Both are per-server settings like `transfer_batch_size`, rendered into the client config and read
+back from an inherited `MOONCAKE_CONFIG_PATH`. Servers sharing a pool should agree on
+`soft_pin_ttl_ms`, since the master evicts unpinned pages first.
+
 ### Settings this connector overrides
 
 For a role that transfers KV, the pool *is* the deployment's offload tier, so the server's own
@@ -771,17 +814,120 @@ Both are settled in the `LLM` constructor, before the ranks are spawned and befo
 reads the arguments, so `trtllm-serve`, `trtllm-bench` and a direct `LLM(...)` all see the same
 settings. A `capacity` server keeps both as configured.
 
+### Attention data parallelism and speculative prefill
+
+Both classes declare `supports_attention_dp`, so `enable_attention_dp=True` runs a scheduler
+adapter and a worker on every owner, each deciding and moving pages for its own requests only.
+
+* A stored page is one attention shard's KV. Under tensor parallelism each rank keys its own shard
+  and a prefix is a hit only once every shard of it is in the pool. Every attention-DP owner holds
+  all heads, so all owners key their pages as shard 0 of 1 (`w1r0` in the key): a prefix one owner
+  saved is a hit for every other owner, and for a single-rank server with the same `model_key`,
+  `tokens_per_block` and page size. Tensor-parallel keys are unchanged.
+* Under attention DP a save in flight counts against `kv_connector_config.transfer_timeout_sec`
+  (see [Attention data parallelism](#attention-data-parallelism)); size it for the save backlog a
+  congested fabric can build up.
+* A page that is gone between lookup and load restarts only the affected request, on its owner,
+  as on a single-rank server; see [Restrictions](#restrictions).
+* A `role: capacity` server may run with attention DP; it transfers nothing either way.
+
+Both classes also declare `supports_speculative_prefill`, so a disaggregated context server can run
+one-model MTP or EAGLE3 next to this connector in the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server), with or
+without attention DP.
+
+* A block's key also covers the prompt tokens the draft reads past the block: one for MTP-Eagle and
+  EAGLE3, `max_draft_len` for vanilla MTP. Pages a speculative server writes are therefore never
+  shared with a server without a draft or with a different lookahead, and the keys of a server
+  without a draft are unchanged. A block whose lookahead runs past the prompt is neither offered
+  nor saved.
+* Only the blocks a pass has computed are saved, although one-model speculation allocates pages
+  past every context chunk.
+* Loads and saves move whole pages of every layer group, which includes the draft layers sharing
+  the target KV cache. Any other drafter, and draft layers in a separate KV cache, are refused at
+  startup, since their KV would be missing or stale after a restored prefix. A `role: capacity`
+  server is exempt, since it addresses no page.
+* A disaggregated generation server should run `role: capacity`, which may itself run one-model MTP
+  or EAGLE3, with or without attention DP. A generation server whose role transfers KV refuses
+  every generation-only request in this mode.
+
+`mooncake_store.local_reuse_backoff` sets how a server that reads the pool (`role: both` or
+`consumer`) treats its local prefix match under one-model speculative decoding. The draft backs
+every local match off by its prompt lookahead, which leaves a match of whole blocks short of the
+block boundary the pool serves from.
+
+* `off`, the default, has the worker declare
+  [`drops_reuse_match_backoff`](#2-worker-interface-kvcacheconnectorworker): local hits are used
+  whole. The draft KV at the tail of a reused block may belong to a different next token, which can
+  lower draft acceptance but never changes the output.
+* `align` keeps the backoff, and `KVCacheManagerV2` aligns the match down to a block instead
+  (`requires_block_aligned_reuse`, which a role that reads the pool always declares). The pool then
+  serves the trimmed block along with the rest of the prefix, at the cost of that block's transfer.
+
+It is an engine setting read from the `mooncake_store` block on every rank rather than part of the
+rendered client config, so a deployment that inherits `MOONCAKE_CONFIG_PATH` without the block gets
+`off`. A `producer` or `capacity` server keeps the cache manager's own reuse either way, and a
+server without a one-model draft has no backoff for the setting to act on.
+
+### Diagnostics
+
+`mooncake_store.stats_interval: 60` has every rank of a server that reads the pool (`role: both` or
+`consumer`) log two info-level lines at most once per 60 seconds, each covering the interval since
+its last line and skipped when there is nothing to report:
+
+* `mooncake-store prefix-hole stats` counts lookups (`lookups`, `lookup_blocks`, `hit_blocks`) and
+  the holes they stopped at. A hole is a missing block followed by still-stored blocks of the same
+  chain, which the pool evicted from the middle of a prefix it otherwise holds: `holes` counts the
+  lookups that met one, `hole_blocks` the missing blocks inside them, and `holed_tokens` and
+  `max_holed_tokens` the stored tokens behind a hole that are recomputed anyway. They come from the
+  lookup's own existence probe, so they cost no extra store call. Only a rank that looks prefixes
+  up reports them: rank 0 under tensor parallelism, every owner under attention DP. Frequent holes
+  are what [`soft_pin_ttl_ms` and `group_blocks`](#pool-eviction) address.
+* `mooncake-store load stats` counts loads (`start_load_kv` passes that moved pages, or with
+  [`async_load`](#asynchronous-loads) each parked request's load), their `pages`, store calls
+  (`batches`), `loaded_gib` and `failed_pages`, the transfer time from the destinations being ready
+  to the last page landing (`transfer_ms`), and each load's mean wall and CPU milliseconds for
+  `fence`, `resolve`, `describe`, `get`, `unstage` and `sync`. With `async_load` it also reports
+  the time a load waited for a load thread and the allocation fence (`wait_ms`), and, at the time
+  of the line, the load threads (`workers`) and the loads waiting for one (`queue`) or running
+  (`active`); a line is then logged while loads are waiting even if none finished.
+
+Both are flushed at shutdown. Unset, the default, counts nothing and costs nothing. The lines are
+logged at info level, so a log level above info hides them. Like the eviction settings, the
+interval is rendered into the client config and read back from an inherited `MOONCAKE_CONFIG_PATH`.
+
 ### Restrictions
 
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-Beam search and Mamba/hybrid models are rejected for every connector. Attention data parallelism
-and speculative prefill require the declarations and restrictions described above.
-This connector also rejects KV cache manager V1, context parallelism, pipeline parallelism,
-sliding-window attention, and `sparse_attention_config` with an index-V cache unless
-`sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
-multimodal content without hashes, leaving the rest of the deployment served.
+Beyond beam search, Mamba/hybrid models and speculative decoding outside the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server), which are
+rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
+this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
+sliding-window attention, `sparse_attention_config` with an index-V cache unless
+`sparse_disable_index_value=True`, and, in a role that transfers KV, any drafter other than
+one-model MTP or EAGLE3 sharing the target KV cache; it bypasses individual requests that carry a
+LoRA adapter or multimodal content without hashes, leaving the rest of the deployment served.
+
+A page offered at lookup can still be gone at load time, evicted from a full pool or left behind by
+a put that never completed, whether the load runs synchronously or on a
+[load thread](#asynchronous-loads). The worker declares
+[`reports_failed_loads`](#2-worker-interface-kvcacheconnectorworker), so on a single-rank server or
+an attention-DP owner only the affected request restarts, without the offered prefix, and the rest
+of its batch runs. Under tensor parallelism every rank holds a shard of the same page and cannot
+restart the request alone, so a missing page fails the executor there.
+
+Aggregated serving under attention data parallelism rejects saving roles (`producer`, `both`)
+at startup. When the attention-DP gate skips a forward pass after the batch was prepared, the
+executor shrinks each generation request's KV capacity again, and a page the connector was already
+told about can go to another request without the connector hearing of it; a later save could then
+publish that request's bytes under this one's key. A disaggregated context server never runs
+generation requests and is unaffected, as is a role that saves nothing (`consumer`, `capacity`).
+
+When upgrading from a version that could publish uncomputed pages, stop or drain the old writers
+and reset the affected Mooncake pool before reusing its entries. Stored keys retain their format,
+so the new publication checks cannot distinguish invalid pages already written by an older server.
 
 ### GPUDirect RDMA
 
@@ -828,3 +974,44 @@ A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, whic
 selects on its own where it can. When neither path is available, set `stage_through_host: true` to
 copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
 needs neither, since it registers no pages.
+
+Each direction a role drives (loads, saves) pins `staging_buffer_bytes` of host memory per rank,
+1 GiB by default, given as a binary size (`512MiB`) or a byte count. It bounds how many pages one
+store call stages, not how large a page may be: a budget below one page still pins one page, with
+a warning. The startup node memory check counts it per rank and direction, next to
+`segment_size`.
+
+### Asynchronous loads
+
+By default a prefix the pool serves is loaded inside the executor iteration that schedules the
+request, before its forward pass. With `async_load: true`, a server that reads the pool
+(`role: both` or `consumer`) parks such a request outside the batch instead, and
+`async_load_workers` background threads per rank (default 1) load its pages while other requests
+keep computing. The request rejoins the batch once every rank holds its pages. Every hit is
+offered this way, including a one-block offer under `local_reuse_backoff: align`, and parking a
+request costs it at least one iteration.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    model_key: qwen2-1.5b-instruct
+    async_load: true
+    async_load_workers: 2
+disable_overlap_scheduler: true
+```
+
+| Path | How a load thread fills the pages |
+|---|---|
+| Zero copy (default) | The NIC writes into the registered KV pools, from the load thread. |
+| `stage_through_host` | Each load thread has its own CUDA stream and `staging_buffer_bytes / async_load_workers` of pinned slots, and scatters each batch on that stream. No separate synchronous load buffer is pinned. |
+
+A load thread first waits for the KV cache manager's allocation fence for the request's pages,
+so the executor never blocks on it. A page that is gone by load time restarts only that request,
+without the offered prefix, on a single-rank server or an attention-DP owner, and fails the
+server under tensor parallelism, as for synchronous loads. An exception raised by Mooncake on a
+load thread always fails the server, at the next executor call. Under attention DP a parked load
+counts toward `kv_connector_config.transfer_timeout_sec` (see
+[Attention data parallelism](#attention-data-parallelism)). Asynchronous loads are validated with
+`disable_overlap_scheduler: true`.
