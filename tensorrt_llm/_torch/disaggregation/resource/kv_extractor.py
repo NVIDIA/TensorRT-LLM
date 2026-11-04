@@ -429,7 +429,6 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     }
 
     def _kv_heads_for_layer(internal_layer_id: int) -> int:
-        local_layer_id = internal_layer_id
         if internal_layer_id in local_layer_by_mixed_precision_high_layer:
             local_layer_id = local_layer_by_mixed_precision_high_layer[internal_layer_id]
         elif virtual_layer_mapping is not None:
@@ -445,6 +444,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
                     f"model layer {model_layer} is not local to this rank"
                 )
+        else:
+            # Without a virtual layer mapping, the internal id is the layer offset.
+            local_layer_id = internal_layer_id
         heads = manager.num_kv_heads_per_layer
         if not 0 <= local_layer_id < len(heads):
             raise ValueError(
