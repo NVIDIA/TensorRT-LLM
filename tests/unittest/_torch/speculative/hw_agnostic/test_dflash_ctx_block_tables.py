@@ -201,10 +201,12 @@ def test_dspark_block_width_tracks_checkpoint_slot_convention(
     assert get_draft_block_width(worker.spec_config, shift_label=shift_label) == expected
 
 
-def test_dspark_missing_shift_label_preserves_unshifted_runtime_width() -> None:
+def test_dspark_unshifted_drafter_preserves_unshifted_runtime_width() -> None:
+    """A drafter declaring shift_label False (DFlashForCausalLM's default) keeps K + 1 slots; the
+    config-only width without a drafter assumes the shifted DSpark heads."""
     worker = _dspark_worker()
 
-    assert worker._draft_block_width(SimpleNamespace()) == 8
+    assert worker._draft_block_width(SimpleNamespace(shift_label=False)) == 8
     assert DSparkWorker.block_width_for(worker.spec_config) == 7
     assert get_draft_block_width(worker.spec_config) == 7
 
