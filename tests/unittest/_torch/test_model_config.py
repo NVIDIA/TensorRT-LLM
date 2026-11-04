@@ -825,6 +825,24 @@ def test_mistral_large4_native_checkpoint(tmp_path, kv_cache_dtype):
     checkpoint_loader = _construct_checkpoint_loader(None, "mistral_large_4")
     assert checkpoint_loader.checkpoint_format == "mistral_large_4"
     assert isinstance(checkpoint_loader.config_loader, MistralConfigLoader)
+    # The format's own weight loader keeps the checkpoint mmapped and its mapper renames
+    # nothing; the HF loader does not recognize a params.json-only directory.
+    from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
+    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
+    from tensorrt_llm._torch.models.checkpoints.mistral.weight_loader import (
+        MistralLarge4WeightLoader,
+    )
+    from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import (
+        MistralLarge4WeightMapper,
+    )
+
+    assert type(checkpoint_loader.weight_loader) is MistralLarge4WeightLoader
+    assert checkpoint_loader.weight_loader._requires_lazy_safetensors(str(tmp_path))
+    assert not HfWeightLoader._requires_lazy_safetensors(str(tmp_path))
+    assert (
+        type(AutoCheckpointMapper.get("mistral_large_4", "MistralLarge4ForCausalLM"))
+        is MistralLarge4WeightMapper
+    )
     model_config = checkpoint_loader.load_config(
         str(tmp_path),
         mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),

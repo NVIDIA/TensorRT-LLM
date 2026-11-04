@@ -23,7 +23,6 @@ from ..base_weight_mapper import BaseWeightMapper
 
 
 @register_mapper("MX")
-@register_mapper("mistral_large_4")
 @register_mapper("HF")
 class HfWeightMapper(BaseWeightMapper):
 
