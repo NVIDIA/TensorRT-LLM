@@ -304,8 +304,8 @@ def _event_data(frame):
     return json.loads(frame.split("data: ", 1)[1])
 
 
-def _processor():
-    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+def _processor(request=None):
+    request = request or ResponsesRequest(model="test-model", input="hi", stream=True)
     return ResponsesStreamingProcessor(
         request=request,
         sampling_params=request.to_sampling_params(),
@@ -1072,18 +1072,20 @@ async def test_the_first_token_time_is_taken_at_the_first_result(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_single_result_from_a_postprocessing_worker_is_streamed(monkeypatch):
     """With postprocessing workers the route streams the frames a worker made for the one result."""
-    worker = _processor()
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    # The worker serves the route's own request.
+    worker = _processor(request)
     result = _step("Hello", "Hello", done=True)
     frames = worker.process_single_output(result) + [worker.get_final_response_non_store(result)]
+    first = SimpleNamespace(outputs=[SimpleNamespace(_postprocess_result=frames)])
 
     async def generation():
         # Only the frames the worker made: the server must not post-process the result itself.
-        yield SimpleNamespace(outputs=[SimpleNamespace(_postprocess_result=frames)])
+        yield first
 
     server = _server_streaming(monkeypatch, steps=[])
     server.generator.args.num_postprocess_workers = 1
     server.generator.generate_async = lambda **kwargs: generation()
-    request = ResponsesRequest(model="test-model", input="hi", stream=True)
     raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
 
     response = await server.openai_responses(request, raw_request)
@@ -1094,4 +1096,7 @@ async def test_a_single_result_from_a_postprocessing_worker_is_streamed(monkeypa
     assert sent[2:] == frames
     assert "response.output_text.delta" in types
     assert types[-1] == "response.completed"
-    server._extract_metrics.assert_awaited_once()
+    # The worker's terminal event completes the response the route opened.
+    ids = {_event_data(sent[i])["response"]["id"] for i in (0, -1)}
+    assert ids == {request.request_id}
+    server._extract_metrics.assert_awaited_once_with(first, raw_request)
