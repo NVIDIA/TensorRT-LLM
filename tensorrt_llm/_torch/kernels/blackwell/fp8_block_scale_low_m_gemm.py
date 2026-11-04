@@ -4661,6 +4661,7 @@ __all__ = [
     "run_low_m_gemm_nvfp4",
     "run_low_m_gemm_all_reduce_push",
     "run_low_m_gemm_prequantized",
+    "run_low_m_gemm_prequantized_all_reduce_push",
     "precompile_prequantized",
     "split_tactic",
     "staged_prequantized_tactic",
