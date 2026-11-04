@@ -33,6 +33,7 @@ from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
 from ...cute_dsl_utils import sm_reserve
 from ...distributed import AllReduce, AllReduceStrategy, MnnvlWorkspaceResult
+from ...flashinfer_utils import get_env_enable_pdl
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
@@ -415,6 +416,8 @@ class KimiKDALinearAttention(nn.Module):
         # The optimized decode/verify kernels specialize the Kimi K3
         # K == V == 128 shape. Other shapes must use the portable fallback.
         kernel_shape_ok = self.head_k_dim == 128 and self.head_dim == 128
+        # The fused verify kernels launch as programmatic dependents of their producer.
+        self._use_pdl = get_env_enable_pdl()
         self._dispatch = KDAKernelDispatch(
             use_optimized_prefill=(
                 os.getenv("TLLM_KDA_ENABLE_OPT_PREFILL", "1") == "1"
@@ -1722,7 +1725,7 @@ class KimiKDALinearAttention(nn.Module):
                 onorm_g=onorm_g.view(1, T_total, H, self.head_dim),
                 onorm_weight=self._onorm_w_f32,
                 onorm_eps=self.o_norm.eps,
-                use_pdl=True,
+                use_pdl=self._use_pdl,
             )
             return self._store_core(out, output)
 
@@ -1738,7 +1741,8 @@ class KimiKDALinearAttention(nn.Module):
                 onorm_eps=self.o_norm.eps,
                 fuse_output_norm=True,
                 mxfp8_output=mxfp8_output,
-                use_pdl=not mxfp8_output,
+                # The MXFP8-output kernel has no PDL launch.
+                use_pdl=self._use_pdl and not mxfp8_output,
             )
             if mxfp8_output:
                 return _KdaPrequantizedCore(*out)

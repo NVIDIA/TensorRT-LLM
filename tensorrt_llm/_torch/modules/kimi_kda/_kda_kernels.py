@@ -627,7 +627,8 @@ class KDAKernelDispatch:
         if mxfp8_output:
             if not kwargs.pop("fuse_output_norm", True):
                 raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
-            kwargs.pop("use_pdl", None)
+            if kwargs.pop("use_pdl", False):
+                raise ValueError("the MXFP8-output KDA MTP op has no PDL launch")
             return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
 
