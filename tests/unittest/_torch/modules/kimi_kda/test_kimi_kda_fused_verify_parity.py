@@ -39,6 +39,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.projection_capabilities import PrequantizedInputProjection
+
 _HAVE_DEPS = True
 _DEP_ERR = None
 try:
@@ -554,7 +556,7 @@ def test_fused_verify_multi_wave_runs_two_cta_kernel(monkeypatch, state_dtype):
             world_cache.prev_num_accepted_tokens.copy_(accept)
 
 
-class _PrequantizedProjectionStub(torch.nn.Module):
+class _PrequantizedProjectionStub(PrequantizedInputProjection):
     """o_proj stand-in that records the prequantized pair it receives."""
 
     supports_prequantized_input = True
