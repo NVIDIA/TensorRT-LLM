@@ -410,12 +410,20 @@ def test_exclude_from_cache_op_is_reprofiled_until_every_profile_is_cached(
                                **kwargs)
 
     monkeypatch.setattr(tuner, "_profile_runners", fail_first_profile)
+    generated = []
+    optimization_profiles = tuner._optimization_profiles
+    monkeypatch.setattr(
+        tuner, "_optimization_profiles",
+        lambda config, inputs: generated.append(op) or optimization_profiles(
+            config, inputs))
+    counts = []
     with autotune():
         for _ in range(3):
             tuner.choose_one(op, [GemmRunner()], tuning_config, [x, w])
+            counts.append((len(generated), len(profiled)))
     # Call 1 profiles all 3 buckets (the first fails), call 2 retries only the
-    # failed one, call 3 is served from the cache.
-    assert len(profiled) == 4
+    # failed one, call 3 is served from the cache without generating profiles.
+    assert counts == [(1, 3), (2, 4), (2, 4)]
 
 
 @torch.library.custom_op("autotuner_test::get_best_gemm_tactic",
