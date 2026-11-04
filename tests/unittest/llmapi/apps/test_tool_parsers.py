@@ -5334,6 +5334,19 @@ class TestMiniMaxM2ToolParser:
                 "label": '"42"',
             }
 
+    def test_complete_invoke_collapses_repeated_parameters(self, sample_tools):
+        """A complete unstreamed invoke keeps the last value for each name."""
+        parser = MiniMaxM2ToolParser()
+        result = parser.parse_streaming_increment(
+            '<minimax:tool_call><invoke name="get_weather">'
+            '<parameter name="location">Paris</parameter>'
+            '<parameter name="location">Berlin</parameter>'
+            '</invoke></minimax:tool_call>', sample_tools)
+        arguments = "".join(call.parameters for call in result.calls)
+        assert json.loads(arguments,
+                          object_pairs_hook=list) == [("location", "Berlin")]
+        assert parser.finish(sample_tools).calls == []
+
     def test_finish_hides_unstarted_call_markup(self, sample_tools):
         """An incomplete invoke header is never exposed as ordinary text."""
         parser = MiniMaxM2ToolParser()

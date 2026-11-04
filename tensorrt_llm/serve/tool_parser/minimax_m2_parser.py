@@ -69,15 +69,22 @@ def _parse_param_value(value_str: str, param_type: Optional[str]) -> Any:
 
 
 def _serialize_streamed_params(
-    params: list[tuple[str, str]], func_name: str, tools: List[Tool]
+    params: list[tuple[str, str]],
+    func_name: str,
+    tools: List[Tool],
+    *,
+    collapse_repeated: bool = False,
 ) -> str:
     """Keep the streamed JSON prefix stable, including for repeated names."""
-    pairs = []
+    arguments = []
     for param_name, param_value in params:
         param_name = param_name.strip()
         param_type = _get_param_types(param_name, func_name, tools)
         value = _parse_param_value(param_value, param_type)
-        pairs.append(json.dumps({param_name: value}, ensure_ascii=False)[1:-1])
+        arguments.append((param_name, value))
+    if collapse_repeated:
+        return json.dumps(dict(arguments), ensure_ascii=False)
+    pairs = [json.dumps({name: value}, ensure_ascii=False)[1:-1] for name, value in arguments]
     return "{" + ", ".join(pairs) + "}"
 
 
@@ -247,7 +254,9 @@ class MiniMaxM2ToolParser(BaseToolParser):
                 params_text = match.group(2)
 
                 params = self.param_regex.findall(params_text)
-                args_json = _serialize_streamed_params(params, func_name, tools)
+                args_json = _serialize_streamed_params(
+                    params, func_name, tools, collapse_repeated=not self.current_tool_name_sent
+                )
                 if self.current_tool_name_sent:
                     # The name and an argument prefix were already streamed
                     # while this invoke was partial; send only the remainder.
