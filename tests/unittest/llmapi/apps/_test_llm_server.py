@@ -5,7 +5,7 @@ import pytest
 
 import tensorrt_llm.profiler as profiler
 
-from ..test_llm import llama_model_path
+from ..model_paths import llama_model_path
 
 __extra_import_path__ = ["~/examples"]
 from apps.fastapi_server import LLM, LlmServer

@@ -81,7 +81,7 @@ from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
-from .test_llm import llama_model_path
+from .model_paths import llama_model_path
 
 
 @pytest.mark.cpu_only

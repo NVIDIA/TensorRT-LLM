@@ -27,9 +27,10 @@ l0_dgx_b300:
   - unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
-  - unittest/_torch/modeling -k "modeling_llama"
-  - unittest/_torch/modeling -k "modeling_gpt_oss"
-  - unittest/_torch/multi_gpu_modeling -k "deepseek"
+  - unittest/_torch/modeling/test_modeling_llama.py
+  - unittest/_torch/modeling/test_modeling_llama_min_latency.py
+  - unittest/_torch/modeling/test_modeling_gpt_oss.py
+  - unittest/_torch/multi_gpu_modeling/test_deepseek.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True]

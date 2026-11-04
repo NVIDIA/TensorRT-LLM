@@ -56,7 +56,7 @@ import re
 import pytest
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 NUM_DISTINCT_TAGS = 100

@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 import pytest
 import yaml
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 # Configure logging

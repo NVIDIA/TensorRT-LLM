@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
@@ -13,7 +13,7 @@ import openai
 import pytest
 import yaml
 from llmapi.apps.openai_server import RemoteOpenAIServer
-from llmapi.test_llm import get_model_path
+from llmapi.model_paths import get_model_path
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceResponse
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2_grpc import (
     TraceServiceServicer,

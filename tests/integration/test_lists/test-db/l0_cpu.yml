@@ -380,7 +380,7 @@ l0_cpu:
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_kv_hints.py
   - unittest/llmapi/test_llm_args.py
-  - unittest/llmapi/test_llm.py::test_startup_metrics_by_server_info
+  - unittest/llmapi/test_llm_serving.py
   - unittest/llmapi/test_gms_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
