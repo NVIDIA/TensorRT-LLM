@@ -69,6 +69,12 @@ class _SplitDomainMemory:
             err, handle = localization.try_create_localized_allocation_handle(
                 size, domain, _HANDLE_TYPES, False, _USAGE
             )
+            if err == int(cuda.CUresult.CUDA_ERROR_OUT_OF_MEMORY):
+                # Bytes freed by earlier re-homed tensors sit in PyTorch's cache, not the driver's.
+                torch.cuda.empty_cache()
+                err, handle = localization.try_create_localized_allocation_handle(
+                    size, domain, _HANDLE_TYPES, False, _USAGE
+                )
             if err != 0:
                 raise RuntimeError(f"localized allocation on domain {domain} failed: {err}")
             handles.append(handle)
