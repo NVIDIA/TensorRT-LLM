@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Beam StairCase implementation
 
 This directory implements Beam using the experimental ModelingV2/StairCase architecture:
@@ -10,7 +13,7 @@ checkpoint is included. Router projection and selection use FP32; packed NVFP4 e
 weights execute with the native GEMM path. Diagnostic host checks are opt-in through
 the shared ModelingV2 validation setting and must agree across ranks.
 
-This extraction includes production code only. The accompanying test suite is staged
-separately for review. Standard serving registration and documentation are separate
-integration changes. Speculative decoding, FP8 KV cache, disaggregated serving, CUDA
+This extraction includes operator certification tests and CPU contract tests. Broader
+component tests are staged separately for review. Standard serving registration and
+documentation are separate integration changes. Speculative decoding, FP8 KV cache, disaggregated serving, CUDA
 graphs and overlap scheduling are not supported by this extracted target.

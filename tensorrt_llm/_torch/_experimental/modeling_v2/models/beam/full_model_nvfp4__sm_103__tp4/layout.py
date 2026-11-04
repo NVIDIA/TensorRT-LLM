@@ -41,12 +41,12 @@ the four scalars ``input_scale``, ``weight_scale_2``, ``g`` and ``alpha`` ``[256
 from __future__ import annotations
 
 import dataclasses
-import fnmatch
 import json
 import os
-import re
 from collections import OrderedDict
 from typing import Any, Mapping, Optional
+
+from tensorrt_llm.quantization.modelopt_config import read_modelopt_quant_config
 
 from . import layout_bf16 as bf16_layout
 from .layout_bf16 import (
@@ -301,15 +301,15 @@ def _module_names(specs: Mapping[str, Any]) -> tuple:
 def check_recipe(quant_config: Any, specs: Mapping[str, Any]) -> dict:
     """Raise ValueError unless ``hf_quant_config.json`` is the recipe this layout computes.
 
-    ModelOpt NVFP4, group size 16, no KV-cache quantization, and an exclusion list (``fnmatch``
-    patterns over module names) that excludes every higher-precision Linear module of ``specs``
+    ModelOpt NVFP4, group size 16, no KV-cache quantization, and the shared QuantConfig
+    exclusion semantics for every higher-precision Linear module of ``specs``
     (attention, router, dense feed-forward, head) and no expert projection. Returns a summary.
     """
     if not isinstance(quant_config, Mapping):
         raise ValueError("hf_quant_config.json must be a JSON object")
-    q = quant_config.get("quantization")
-    if not isinstance(q, Mapping):
-        raise ValueError("hf_quant_config.json has no 'quantization' object")
+    if quant_config.get("kv_cache_scheme") is not None:
+        raise ValueError("kv_cache_scheme is not supported; this target requires BF16 KV cache")
+    q = read_modelopt_quant_config(dict(quant_config))
     if q.get("quant_algo") != QUANT_ALGO:
         raise ValueError(f"unsupported quant_algo {q.get('quant_algo')!r}; expected {QUANT_ALGO}")
     if q.get("group_size") != GROUP or type(q.get("group_size")) is not int:
@@ -321,12 +321,14 @@ def check_recipe(quant_config: Any, specs: Mapping[str, Any]) -> dict:
     patterns = q.get("exclude_modules")
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
         raise ValueError("exclude_modules must be a list of strings")
-    excluded = re.compile("|".join(f"(?:{fnmatch.translate(p)})" for p in patterns) or "(?!)")
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    excluded = QuantConfig(exclude_modules=patterns).is_module_excluded_from_quantization
     quantized, kept = _module_names(specs)
-    wrongly_excluded = [m for m in quantized if excluded.match(m)]
+    wrongly_excluded = [m for m in quantized if excluded(m)]
     if wrongly_excluded:
         raise ValueError(f"exclude_modules excludes quantized experts: {wrongly_excluded[:4]}")
-    not_excluded = [m for m in kept if not excluded.match(m)]
+    not_excluded = [m for m in kept if not excluded(m)]
     if not_excluded:
         raise ValueError(f"higher-precision modules are not excluded: {not_excluded[:4]}")
     return {
@@ -361,16 +363,28 @@ def read_config(directory: Any, name: str = CONFIG_FILE) -> dict:
     return data
 
 
+def read_quant_config(checkpoint_dir: Any, config: Mapping[str, Any]) -> dict:
+    """Use the separate ModelOpt file when present, otherwise the inline recipe."""
+    if os.path.exists(os.path.join(os.fspath(checkpoint_dir), QUANT_CONFIG_FILE)):
+        return read_config(checkpoint_dir, QUANT_CONFIG_FILE)
+    inline = config.get("quantization_config")
+    if not isinstance(inline, dict):
+        raise ValueError(
+            "checkpoint has neither hf_quant_config.json nor an inline quantization_config"
+        )
+    return inline
+
+
 def check_checkpoint(checkpoint_dir: Any) -> dict:
     """Raise ValueError unless this target computes the checkpoint; return its config.json.
 
     The one validator of what the target serves, used by routing (a refusal there is the
     ``NoTarget`` reason) and by the target's construction, so the two cannot disagree: the
     checkpoint's ``config.json`` is what the layout computes (``check_config``) and its
-    ``hf_quant_config.json`` the NVFP4 recipe of the whole model (``check_recipe``). Reads
-    the two files; allocates nothing.
+    separate or inline quantization config the NVFP4 recipe of the whole model
+    (``check_recipe``). Reads configuration files; allocates nothing.
     """
     config = read_config(checkpoint_dir)
     check_config(config)
-    check_recipe(read_config(checkpoint_dir, QUANT_CONFIG_FILE), tensor_specs(config))
+    check_recipe(read_quant_config(checkpoint_dir, config), tensor_specs(config))
     return config

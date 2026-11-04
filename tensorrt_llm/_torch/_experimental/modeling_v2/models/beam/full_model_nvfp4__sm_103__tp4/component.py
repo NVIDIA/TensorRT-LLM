@@ -64,13 +64,13 @@ from .component_bf16 import (
 from .layout import (
     EMBED,
     PROJECTIONS,
-    QUANT_CONFIG_FILE,
     WORLD_SIZE,
     QuantSpec,
     check_config,
     check_partition,
     check_recipe,
     ownership_ledger,
+    read_quant_config,
     stored_entries,
     swizzled_numel,
     tensor_specs,
@@ -323,8 +323,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
                 raise CheckpointFormatError(
                     f"config.json differs from the constructed configuration: {differing[:8]}"
                 )
-            with open(os.path.join(checkpoint_dir, QUANT_CONFIG_FILE)) as f:
-                quant = json.load(f)
+            quant = read_quant_config(checkpoint_dir, stored)
             full = tensor_specs(self.config)
             recipe = check_recipe(quant, full)
             catalog = SafetensorsCatalog(checkpoint_dir)
