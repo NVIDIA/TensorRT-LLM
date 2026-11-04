@@ -1063,6 +1063,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
+    # One mixed-precision high layer per compressed layer.
+    _supports_mixed_precision_kv = True
+    _own_pool_is_mixed_precision_low = True
+
+    def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
+        return super()._is_mixed_precision_layer(local_layer_idx) and compress_ratio_has_attention(
+            self._compress_ratios[self.pp_layers[local_layer_idx]], DeepseekV4AttentionType.COMPRESS
+        )
+
+    def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
+        # A compressed page holds tokens_per_block // ratio rows.
+        return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
+
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
         Add DeepSeek-V4 layers and warmup constraints to the cache config.

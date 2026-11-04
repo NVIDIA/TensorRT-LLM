@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import json
+import operator
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, make_dataclass
 from typing import Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -375,6 +377,12 @@ class SamplingParams:
 
         self._validate()
 
+    def __reduce_ex__(self, protocol):
+        # Pickle the field values in field order; subclasses may add fields.
+        if type(self) is not SamplingParams:
+            return object.__reduce_ex__(self, protocol)
+        return _restore_sampling_params, (_get_sampling_params_state(self),)
+
     def _validate(self):
         """Verify the sampling parameters.
 
@@ -669,7 +677,7 @@ class SamplingParams:
         # | Sampling    | use_beam_search | beam_width == 1        |
         # | Sampling    | n               | num_return_sequences   |
         # | Sampling    | best_of         | no corresponding param |
-        fields = {f for f in dir(tllme.SamplingConfig) if not f.startswith("__")}
+        fields = _sampling_config_fields()
         unmatched_params = [
             "num_return_sequences",
             "beam_width",
@@ -688,12 +696,7 @@ class SamplingParams:
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(self) -> tllme.OutputConfig:
-        sampling_param_fields = set(dir(SamplingParams))
-        fields = [
-            f
-            for f in dir(tllme.OutputConfig)
-            if not f.startswith("__") and f in sampling_param_fields
-        ]
+        fields = _output_config_fields()
 
         config_kwargs = {f: getattr(self, f) for f in fields}
 
@@ -751,3 +754,35 @@ class SamplingParams:
             )
         else:
             return None
+
+
+_SAMPLING_PARAMS_FIELDS = tuple(f.name for f in fields(SamplingParams))
+_get_sampling_params_state = operator.attrgetter(*_SAMPLING_PARAMS_FIELDS)
+# Only its generated ``__init__`` is used: one store per field, no ``__post_init__``.
+_set_sampling_params_state = make_dataclass(
+    "_SamplingParamsState", _SAMPLING_PARAMS_FIELDS, repr=False, eq=False
+).__init__
+
+
+def _restore_sampling_params(state: tuple) -> "SamplingParams":
+    sampling_params = object.__new__(SamplingParams)
+    _set_sampling_params_state(sampling_params, *state)
+    return sampling_params
+
+
+@functools.cache
+def _sampling_config_fields() -> frozenset[str]:
+    """Return the ``tllme.SamplingConfig`` field names.
+
+    They are fixed by the bindings, so the ``dir()`` scan runs once instead of once per request.
+    """
+    return frozenset(f for f in dir(tllme.SamplingConfig) if not f.startswith("__"))
+
+
+@functools.cache
+def _output_config_fields() -> tuple[str, ...]:
+    """Return the ``tllme.OutputConfig`` field names that ``SamplingParams`` also defines."""
+    sampling_param_fields = set(dir(SamplingParams))
+    return tuple(
+        f for f in dir(tllme.OutputConfig) if not f.startswith("__") and f in sampling_param_fields
+    )

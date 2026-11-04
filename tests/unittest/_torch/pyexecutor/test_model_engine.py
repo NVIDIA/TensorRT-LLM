@@ -109,7 +109,10 @@ def _install_graph_runner_stub(runner: DecoderRunner, key: KeyType | None = None
     stub.replayed_inputs = []
 
     def replay(
-        key: KeyType, inputs: dict[str, Any], position_id_offsets: torch.Tensor | None = None
+        key: KeyType,
+        inputs: dict[str, Any],
+        position_id_offsets: torch.Tensor | None = None,
+        static_inputs_staged: int = 0,
     ) -> dict[str, torch.Tensor]:
         stub.replayed_inputs.append(_clone_tensors(inputs))
         return {"logits": torch.zeros((inputs["input_ids"].shape[0], 10), device="cuda")}
@@ -912,6 +915,17 @@ class ModelEngineTestCase(unittest.TestCase):
             execution_stream.cuda_stream,
             "KVCacheManagerV2 should still use the provided execution_stream after forward",
         )
+
+
+@pytest.mark.cpu_only
+def test_spec_decode_fast_paths_follow_the_models_flag() -> None:
+    """A model that builds its own speculative branch, such as a Modeling V2
+    target, opts into the one-engine speculative fast paths by setting
+    `spec_decode_fast_paths`; a model that does not set it stays off."""
+    model = torch.nn.Module()
+    assert not model_engine_module._spec_decode_fast_paths(model)
+    model.spec_decode_fast_paths = True
+    assert model_engine_module._spec_decode_fast_paths(model)
 
 
 @pytest.mark.cpu_only

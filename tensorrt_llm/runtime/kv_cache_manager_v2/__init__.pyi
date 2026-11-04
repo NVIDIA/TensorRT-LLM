@@ -413,6 +413,7 @@ class ReusePolicy(enum.IntEnum):
     REQUIRED = 0
     PRIVATE = 1
     OPTIONAL = 2
+    SINK_REQUIRED_ONLY = 3
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -585,6 +586,8 @@ class StreamingBlockRemovedData:
     @property
     def block_hashes(self) -> list[int]: ...
 
+class StreamingAllBlocksClearedData: ...
+
 class StreamingEventStats:
     @property
     def stored_blocks(self) -> int: ...
@@ -606,7 +609,9 @@ class StreamingEventSink:
     def set_target_life_cycle(self, life_cycle_id: int) -> None: ...
     def drain_iteration_events(
         self,
-    ) -> list[StreamingBlockStoredData | StreamingBlockRemovedData]: ...
+    ) -> list[
+        StreamingBlockStoredData | StreamingBlockRemovedData | StreamingAllBlocksClearedData
+    ]: ...
     @property
     def stats(self) -> StreamingEventStats: ...
 

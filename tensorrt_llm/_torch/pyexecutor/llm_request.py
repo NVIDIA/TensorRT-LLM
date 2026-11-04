@@ -17,6 +17,7 @@ from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
+from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig
@@ -789,10 +790,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
         self.py_min_length = self.sampling_config.min_tokens
-        self.py_helix_is_inactive_rank = False
-        # Manager-owned helix decode-step counter; see
-        # KVCacheManagerV2._set_helix_rank_fields.
-        self.py_helix_decode_group_index = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
@@ -865,6 +862,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_original_end_id = self.py_end_id
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None
+        self.py_kv_hints: Optional[KvHintsSnapshot] = None
+
+        # In-forward Mamba snapshot point P the scheduler let this context
+        # chunk run past (MambaHybridCacheManagerV2 consumes it).
+        self.py_mamba_inforward_snapshot_point: Optional[int] = None
+        # Whether the first GEN step of a generation-only request was streamed.
+        self.py_gen_first_emitted = False
+        # KVCacheV2Scheduler context ordering: the scheduler iteration the
+        # request was first pending.
+        self.py_ctx_sched_since_iter: Optional[int] = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -958,6 +965,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # CP sequence lengths are relevant to helix parallelism.
         self.seqlen_this_rank_cp = self.prompt_len
         self.total_input_len_cp = self.prompt_len
+        self.py_helix_is_inactive_rank = False
+        # Manager-owned helix decode-step counter; see
+        # KVCacheManagerV2._set_helix_rank_fields.
+        self.py_helix_decode_group_index = 0
         self.py_batch_idx = None
         # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
@@ -1256,6 +1267,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child.py_original_end_id = self.py_original_end_id
         child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
         child.py_conversation_params = deepcopy(self.py_conversation_params)
+        child.py_kv_hints = self.py_kv_hints
         child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
@@ -1571,7 +1583,12 @@ def executor_request_to_llm_request(
         position_ids: Optional[List] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if input_token_ids is not None:
+        input_tokens = input_token_ids
+    else:
+        # Owned int32 ndarray: the LlmRequest ctor memcpys it, where
+        # `input_token_ids` would build O(ISL) PyLongs to be cast back one by one.
+        input_tokens = executor_request.get_input_token_ids_array()
     if position_ids is None:
         position_ids = executor_request.position_ids
 
@@ -1666,10 +1683,6 @@ def executor_request_to_llm_request(
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
-        prompt_embedding_table=None if executor_request.prompt_tuning_config
-        is None else executor_request.prompt_tuning_config.embedding_table,
-        prompt_vocab_size=None if executor_request.prompt_tuning_config is None
-        else executor_request.prompt_tuning_config.embedding_table.shape[0],
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
@@ -1753,6 +1766,7 @@ def executor_request_to_llm_request(
     # Published by the attention-DP router before this conversion, if at all.
     llm_request.py_uncached_prefill_tokens = getattr(
         executor_request, "py_uncached_prefill_tokens", None)
+    llm_request.py_kv_hints = getattr(executor_request, "py_kv_hints", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
