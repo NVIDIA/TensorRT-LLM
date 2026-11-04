@@ -657,6 +657,8 @@ class PyExecutorProfileManager:
         env_torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         env_enable_execution_trace = os.environ.get("ENABLE_PYTORCH_EXECUTION_TRACE", "0") == "1"
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME, None)
+        env_start_iters, _ = load_iteration_indexes(PROFILE_START_STOP_ENV_VAR_NAME)
+        env_multiple_ranges = len(env_start_iters) > 1
         env_enable_torch_trace = bool(
             (env_torch_trace_path or env_enable_execution_trace) and profile_start_stop
         )
@@ -730,7 +732,7 @@ class PyExecutorProfileManager:
                             executor.global_rank,
                             active_profile_start_iter,
                             executor.iter_counter,
-                            len(executor.profile_start_iters) > 1,
+                            env_multiple_ranges,
                         )
                     attempt(lambda: torch_profiler.export_chrome_trace(trace_path))
                     if error is None:

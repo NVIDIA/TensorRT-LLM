@@ -88,6 +88,7 @@ def cpu_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Moc
         "ENABLE_PYTORCH_EXECUTION_TRACE_EXTRAS",
     ):
         monkeypatch.delenv(name, raising=False)
+    profiling.load_iteration_indexes.cache_clear()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(torch.cuda, "Event", _CpuEvent)
     original_profile = torch.profiler.profile
@@ -119,16 +120,21 @@ def cpu_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Moc
     calibrator = Mock()
     monkeypatch.setattr(profiling, "get_calibrator", lambda: calibrator)
     monkeypatch.setattr(profiling, "get_global_profiler", lambda: None)
-    yield calibrator
+    try:
+        yield calibrator
+    finally:
+        profiling.load_iteration_indexes.cache_clear()
 
 
 def _execution_trace(directory: Path) -> dict:
+    """Read the one observer output produced by a capture context."""
     paths = list(directory.glob("*.et.json"))
     assert len(paths) == 1, paths
     return json.loads(paths[0].read_text())
 
 
 def _run(executor: _Executor, stop: int = 3) -> None:
+    """Drive selected iteration boundaries with real CPU tensor operations."""
     with profiling.PyExecutorProfileManager(executor).profile_step() as step:
         for index in range(stop + 1):
             executor.iter_counter = index
@@ -511,6 +517,7 @@ def test_removed_trt_execution_flag_does_not_enable_capture(
 def test_environment_window_retains_future_runtime_claim(
     cpu_runtime: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cancel: bool
 ) -> None:
+    """A pending runtime window must not rename a single environment trace."""
     monkeypatch.setenv("TLLM_PROFILE_START_STOP", "10-12")
     monkeypatch.setenv("TLLM_TORCH_PROFILE_TRACE", str(tmp_path / "environment.json"))
     executor = _Executor("10-12")
@@ -540,7 +547,7 @@ def test_environment_window_retains_future_runtime_claim(
                     assert 15 not in executor.profile_start_iters
             if index == 15:
                 assert executor._profile_enabled is (not cancel)
-    assert (tmp_path / "environment-rank-7-iterations-10-12.json").is_file()
+    assert (tmp_path / "environment-rank-7.json").is_file()
     assert bool(list(tmp_path.glob("trtllm-trace-future-rank-7.json"))) is (not cancel)
 
 
@@ -630,3 +637,33 @@ def test_capture_paths_and_runtime_only_flag_logs(
     assert all(any(str(path) in message for message in messages) for path in paths)
     execution_path = next(path for path in paths if path.name.endswith(".et.json"))
     assert f"Execution trace saved to {execution_path}" in messages
+
+
+def test_environment_filename_ignores_completed_runtime_window(
+    cpu_runtime: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Completed runtime markers must not add a suffix to one environment range."""
+    monkeypatch.setenv("TLLM_PROFILE_START_STOP", "10-12")
+    monkeypatch.setenv("TLLM_TORCH_PROFILE_TRACE", str(tmp_path / "environment.json"))
+    executor = _Executor("10-12")
+    manager = profiling.PyExecutorProfileManager(executor)
+    with manager.profile_step() as step:
+        manager.apply_start_config(
+            {
+                "output_dir": str(tmp_path),
+                "profile_id": "completed",
+                "num_steps": 2,
+                "activities": ["CPU"],
+            }
+        )
+        for index in range(13):
+            executor.iter_counter = index
+            step()
+            torch.ones(2) + 1
+            if index == 3:
+                assert executor._runtime_profile_pending_start_iter is None
+                assert not executor._profile_enabled
+    trace = json.loads((tmp_path / "environment-rank-7.json").read_text())
+    assert any(event.get("name") == "aten::add" for event in trace["traceEvents"])
+    assert (tmp_path / "trtllm-trace-completed-rank-7.json").is_file()
+    assert not list(tmp_path.glob("environment-rank-7-iterations-*.json"))
