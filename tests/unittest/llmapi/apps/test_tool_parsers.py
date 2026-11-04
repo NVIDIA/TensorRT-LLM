@@ -6792,6 +6792,29 @@ K3_CORPUS = {
         "Answer.",
         [("exec", '{"input": "ls"}')],
     ),
+    # Tags a think block quotes, where they are not structure, are its text.
+    "think_in_section_quotes_the_tools_opener": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_exec(1, "ls"),
+            f"{K3_OPEN}think{K3_SEP}A section opens with {K3_BOT} and a call."
+            f"{K3_CLOSE}think{K3_SEP}") + K3_MESSAGE_END,
+        True,
+        f"tA section opens with {K3_BOT} and a call.",
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
+    "think_in_section_quotes_closing_tags": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_exec(1, "ls"),
+            f"{K3_OPEN}think{K3_SEP}It ends with {K3_CLOSE}response{K3_SEP}, "
+            f"{K3_MESSAGE_END} and {K3_EOM} in that order."
+            f"{K3_CLOSE}think{K3_SEP}") + K3_MESSAGE_END,
+        True,
+        f"tIt ends with {K3_CLOSE}response{K3_SEP}, {K3_MESSAGE_END} and "
+        f"{K3_EOM} in that order.",
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
     "prose_between_calls": (
         _k3_think("t") + _k3_response("") + _k3_section(
             _k3_exec(1, "ls"), "\nNow the second call:\n", _k3_exec(2, "pwd")) +

@@ -1308,6 +1308,9 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                        CLOSE + "response" + SEP, MESSAGE_END, EOM)
     _SECTION_ENDS = (TOOLS_END, ) + _SECTION_BREAKS
     _LONGEST_SECTION_END = max(len(tag) for tag in _SECTION_ENDS)
+    # Section ends that end a think block inside a section wherever they
+    # appear; the others do only where they are structure (see _scan_think).
+    _THINK_BODY_ENDS = (_THINK_CLOSE, TOOLS_END, OPEN + "response" + SEP)
     # What may follow the close tag of an argument value: the next element,
     # the end of the call, or an enclosing tag.
     _VALUE_FOLLOWER_OPENS = ("argument", "json", "call", "tools", "think",
@@ -1737,31 +1740,45 @@ class KimiK3ReasoningParser(BaseReasoningParser):
     def _scan_think(cls, text: str, pos: int, final: bool) -> Optional[Any]:
         """An ``XtmlItem`` for the think block at `pos`; None/False.
 
-        The body runs to the first tag that can end a section. That is
-        normally the block's own close tag; a block the model left open ends
-        at ``<|close|>tools<|sep|>`` or message-level structure, which is
-        left to the section. With none of them, the text ending inside the
-        block leaves it undecided, or ends it once the text is complete.
+        The body runs to its close tag. A block the model left open ends
+        where the section does, and the tag is left to the section: at
+        ``<|close|>tools<|sep|>`` or ``<|open|>response<|sep|>``, at an
+        ``<|open|>tools<|sep|>`` that opens a section, or at a run of close
+        tags that ends the generation. Anywhere else those tags are text of
+        the body. With none of them, the text ending inside the block leaves
+        it undecided, or ends it once the text is complete.
         """
         opened = cls._match_prefix(text, pos, cls._THINK_OPEN, final)
         if not opened:
             return opened
         body_start = pos + len(cls._THINK_OPEN)
-        found = [
-            at for at in (text.find(tag, body_start)
-                          for tag in cls._SECTION_ENDS) if at != -1
-        ]
-        if not found:
-            if not final:
+        search = body_start
+        while True:
+            found = [(at, tag) for at, tag in ((text.find(tag, search), tag)
+                                               for tag in cls._SECTION_ENDS)
+                     if at != -1]
+            if not found:
+                if not final:
+                    return None
+                return cls.XtmlItem("think",
+                                    pos,
+                                    len(text),
+                                    body_start=body_start,
+                                    body_end=len(text))
+            body_end, tag = min(found)
+            if tag in cls._THINK_BODY_ENDS:
+                ends = True
+            elif tag == cls.TOOLS_OPEN:
+                ends = cls.tools_section_opens(text, body_end + len(tag), final)
+            else:
+                ends = cls._close_run(text, body_end, final)
+            if ends is None:
                 return None
-            return cls.XtmlItem("think",
-                                pos,
-                                len(text),
-                                body_start=body_start,
-                                body_end=len(text))
-        body_end = min(found)
+            if ends:
+                break
+            search = body_end + 1
         end = body_end
-        if text.startswith(cls._THINK_CLOSE, body_end):
+        if tag == cls._THINK_CLOSE:
             end += len(cls._THINK_CLOSE)
         return cls.XtmlItem("think",
                             pos,
