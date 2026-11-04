@@ -118,6 +118,10 @@ def _spawn_attached_frontends(
     # once consumed (GenerationExecutor.create).
     attach_env = json.dumps(attach_info)
     hide_gpus = _input_processor_runs_without_gpu(llm)
+    child_argv = [sys.executable, *sys.argv]
+    if hide_gpus:
+        # The frontend takes the launcher's GPU count instead of counting its own.
+        child_argv += ["--gpus_per_node", str(llm.args.gpus_per_node)]
 
     children, ready_fds = [], []
     try:
@@ -130,8 +134,7 @@ def _spawn_attached_frontends(
             env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
             env["TLLM_DISABLE_MPI"] = "1"
             if hide_gpus:
-                # No CUDA context on top of the sized KV cache; the frontend takes the
-                # launcher's GPU count (--gpus_per_node below) instead of counting its own.
+                # No CUDA context on top of the sized KV cache.
                 env["CUDA_VISIBLE_DEVICES"] = ""
             read_fd, write_fd = os.pipe()
             ready_fds.append(read_fd)
@@ -142,11 +145,7 @@ def _spawn_attached_frontends(
                 env["TLLM_FRONTEND_AFFINITY_FD"] = str(affinity_sock.fileno())
                 pass_fds.append(affinity_sock.fileno())
             try:
-                child = subprocess.Popen(  # nosec B603
-                    [sys.executable, *sys.argv, "--gpus_per_node", str(llm.args.gpus_per_node)],
-                    env=env,
-                    pass_fds=pass_fds,
-                )
+                child = subprocess.Popen(child_argv, env=env, pass_fds=pass_fds)  # nosec B603
             finally:
                 # The child now holds the only write end; its exit before
                 # READY surfaces as EOF on read_fd.
