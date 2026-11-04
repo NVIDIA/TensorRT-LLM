@@ -251,7 +251,7 @@ def _q_bytes(md, num_tokens):
     )
 
 
-def _scatter(md, latent, rot, q_pe, q_rope_out, q_input, external):
+def _scatter(md, latent, rot, q_pe, q_rope_out, q_input, external_q_heads=None):
     from tensorrt_llm._torch.attention.backends.fp4_mla import scatter_fp4_mla_kv_cache
 
     assert scatter_fp4_mla_kv_cache(
@@ -268,15 +268,12 @@ def _scatter(md, latent, rot, q_pe, q_rope_out, q_input, external):
         q_quant_input=q_input,
         helix_position_offsets=md.helix_position_offsets,
         helix_is_inactive_rank=md.helix_is_inactive_rank,
-        q_rows_external=external,
+        external_q_heads=external_q_heads,
     )
 
 
 def _external_scatter(md, latent, rot):
-    stub = latent.new_empty(1)
-    num_tokens = latent.shape[0]
-    q_pe = stub.expand(num_tokens, H, ROPE)
-    _scatter(md, latent, rot, q_pe, q_pe, stub.expand(num_tokens, H, LORA + ROPE), True)
+    _scatter(md, latent, rot, None, None, None, external_q_heads=H)
 
 
 def _run_fused(md, w, x, rot, norm=None):
@@ -393,7 +390,7 @@ def test_kv_append_without_query_rows_is_bitwise(n):
         before = [p.clone() for p in _pools(mgr)]
         q_input = torch.randn(num_tokens, H, LORA + ROPE, device="cuda").bfloat16()
         q_pe = torch.randn(num_tokens, H, ROPE, device="cuda").bfloat16()
-        _scatter(md, latent, rot, q_pe, q_input[..., LORA:], q_input, False)
+        _scatter(md, latent, rot, q_pe, q_input[..., LORA:], q_input)
         full = [p.clone() for p in _pools(mgr)]
         for p, p0 in zip(_pools(mgr), before):
             p.copy_(p0)
@@ -426,7 +423,7 @@ def test_query_quantization_matches_cache_update(n, rope):
         q_input[..., :LORA] = absorbed
         q_rope_out = torch.empty(num_tokens, H, ROPE, device="cuda", dtype=torch.bfloat16)
         q_pe = qb.view(num_tokens, H, 192)[..., 128:]
-        _scatter(md, latent, rot, q_pe, q_rope_out, q_input, False)
+        _scatter(md, latent, rot, q_pe, q_rope_out, q_input)
         torch.cuda.synchronize()
         q_ref, sf_ref = _q_bytes(md, num_tokens)
         assert torch.equal(q_fused, q_ref)
@@ -610,7 +607,7 @@ def test_forward_generation_fused_query_matches_default_chain(n, gate_behind_kv)
         qv = qb.view(num_tokens, H, 192)
         torch.bmm(qv[..., :128].transpose(0, 1), w.w_uk.transpose(1, 2),
                   out=fused_q[..., :LORA].transpose(0, 1))  # fmt: skip
-        _scatter(md, latent, rot, qv[..., 128:], fused_q[..., LORA:], fused_q, False)
+        _scatter(md, latent, rot, qv[..., 128:], fused_q[..., LORA:], fused_q)
         md.fp4_mla_state.generation_cache_scattered = True
         ref_out = _DecodeAsAttention(md)(None, fused_q.view(num_tokens, -1), None, None, None,
                                          md, helix_v_up=True, latent_cache=latent)  # fmt: skip

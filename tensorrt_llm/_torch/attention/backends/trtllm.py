@@ -3573,12 +3573,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             raise RuntimeError(
                 "FP4 MLA generation requires a BF16 latent cache and an FP32 "
                 "rotary table.")
-        num_tokens = latent_cache.shape[0]
-        # Shape-only stand-ins for the query tensors the KV-only update never reads.
-        stub = latent_cache.new_empty(1)
-        q_pe = stub.expand(num_tokens, num_q_heads, self.qk_rope_head_dim)
-        q_input = stub.expand(num_tokens, num_q_heads,
-                              self.kv_lora_rank + self.qk_rope_head_dim)
         hp_pool_updated = scatter_fp4_mla_kv_cache(
             metadata,
             latent_cache,
@@ -3588,12 +3582,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             local_layer=self.get_fp4_mla_local_layer_idx(metadata),
             v_head_dim=self.kv_lora_rank,
             rotary_cos_sin=self.rotary_cos_sin,
-            q_pe=q_pe,
-            q_rope_out=q_pe,
-            q_quant_input=q_input,
             helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
-            q_rows_external=True,
+            external_q_heads=num_q_heads,
         )
         if not hp_pool_updated:
             raise RuntimeError(
