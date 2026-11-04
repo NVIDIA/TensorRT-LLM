@@ -40,7 +40,7 @@ def _make_metadata() -> VanillaAttentionMetadata:
     )
 
 
-def test_base_update_helix_param_accepts_plain_helix():
+def test_base_update_helix_param_accepts_plain_helix() -> None:
     """Omitted or None owned counts keep the base hook a no-op."""
     metadata = _make_metadata()
     metadata.update_helix_param(
@@ -54,7 +54,7 @@ def test_base_update_helix_param_accepts_plain_helix():
     )
 
 
-def test_base_update_helix_param_rejects_owned_new_tokens():
+def test_base_update_helix_param_rejects_owned_new_tokens() -> None:
     """Non-None owned counts must raise instead of being silently dropped."""
     metadata = _make_metadata()
     with pytest.raises(NotImplementedError, match="helix_owned_new_tokens"):
