@@ -619,26 +619,34 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
 
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):
-        """Test streaming parser handles multiple tool calls."""
+        """Test streaming parser handles multiple tool calls.
+
+        Each call goes out whole, with its arguments, in the increment that
+        completes it.
+        """
 
         # First tool
         parser.parse_streaming_increment('<|tool_calls_section_begin|>',
                                          sample_tools)
-        parser.parse_streaming_increment(
+        result = parser.parse_streaming_increment(
             '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|>',
             sample_tools)
+        assert [(call.tool_index, call.name, call.parameters)
+                for call in result.calls] == [(0, "get_weather",
+                                               '{"location":"NYC"}')]
 
         # Second tool
-        parser.parse_streaming_increment(
+        result = parser.parse_streaming_increment(
             '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"arg": "any value"}<|tool_call_end|>',
             sample_tools)
+        assert [(call.tool_index, call.name, call.parameters)
+                for call in result.calls] == [(1, "search_web",
+                                               '{"arg": "any value"}')]
 
         result = parser.parse_streaming_increment('<|tool_calls_section_end|>',
                                                   sample_tools)
-        # Should have started second tool
-        assert result.calls[0].name == "search_web"
-        assert result.calls[0].parameters == ""
-        assert result.calls[0].tool_index == 1
+        assert result.calls == []
+        assert result.normal_text == ""
 
     def test_structure_info_function(self):
         """Test structure_info returns correct lambda function."""
@@ -720,6 +728,287 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
 
         assert len(result.calls) == 1
         assert result.calls[0].name == "get-weather"
+
+    def test_integer_too_long_to_convert_is_not_streamed_as_text(
+            self, sample_tools):
+        """Arguments json.loads cannot convert do not reach the text.
+
+        Past Python's integer digit limit json.loads raises a ValueError that
+        is not a JSONDecodeError. The call is then read like arguments that do
+        not parse yet, whether the number arrives whole or split.
+        """
+        text = ('<|tool_calls_section_begin|><|tool_call_begin|>'
+                'functions.get_weather:0<|tool_call_argument_begin|>'
+                '{"location": ' + "9" * 5000 + '}<|tool_call_end|>'
+                '<|tool_calls_section_end|>')
+
+        for chunks in ([text], _kimi_k2_split_after(text, "9" * 4400)):
+            parser = KimiK2ToolParser()
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+
+            assert "".join(result.normal_text for result in results) == ""
+            assert [
+                call.name for result in results for call in result.calls
+                if call.name
+            ] == ["get_weather"]
+
+
+_KIMI_K2_WEATHER_CALL = (
+    '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>'
+    '{"location": "San Francisco, CA", "unit": "celsius"}<|tool_call_end|>')
+_KIMI_K2_SEARCH_CALL = (
+    '<|tool_call_begin|>functions.search_web:1<|tool_call_argument_begin|>'
+    '{"query": "SF \\"weather\\" {today} <b>"}<|tool_call_end|>')
+_KIMI_K2_OUTPUTS = {
+    "one_call": ("<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+                 "<|tool_calls_section_end|>"),
+    "two_calls": ("<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+                  _KIMI_K2_SEARCH_CALL + "<|tool_calls_section_end|>"),
+    "text_before_a_call":
+    ("Sure, checking.<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+     "<|tool_calls_section_end|>"),
+    "text_around_calls": ("Let me check both.\n<|tool_calls_section_begin|>" +
+                          _KIMI_K2_WEATHER_CALL + "\n" + _KIMI_K2_SEARCH_CALL +
+                          "<|tool_calls_section_end|>\nDone."),
+    "call_without_arguments":
+    ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+     "<|tool_call_argument_begin|>{}<|tool_call_end|>"
+     "<|tool_calls_section_end|>"),
+    # Neither parse reads a call whose id lacks the ":<index>" suffix.
+    "id_without_index_then_a_call":
+    ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather"
+     "<|tool_call_argument_begin|>{}<|tool_call_end|>" + _KIMI_K2_SEARCH_CALL +
+     "<|tool_calls_section_end|>"),
+}
+
+
+def _kimi_k2_split_after(text, prefix_end):
+    """Two increments: up to the end of `prefix_end`, then the rest."""
+    cut = text.index(prefix_end) + len(prefix_end)
+    return [text[:cut], text[cut:]]
+
+
+# The outputs above, and ones that stop inside a call's arguments and inside
+# the token that ends the calls.
+_KIMI_K2_TEXT_CASES = dict(
+    _KIMI_K2_OUTPUTS,
+    stream_cut_inside_a_call=_kimi_k2_split_after(
+        _KIMI_K2_OUTPUTS["text_around_calls"], '"unit": "cel')[0],
+    stream_cut_inside_the_end_token=_kimi_k2_split_after(
+        _KIMI_K2_OUTPUTS["text_around_calls"], "<|tool_calls_section_e")[0],
+)
+
+
+class TestKimiK2StreamingMatchesWholeTextParse:
+    """Streamed Kimi K2 calls and text end equal to the whole-text parse.
+
+    Whatever the increments, a client assembling the streamed calls by index
+    must end with the calls ``detect_and_parse`` finds in the whole text,
+    including when a call arrives in the last increment, after which nothing
+    can release it, and when an increment ends inside one of the format's
+    tokens.
+    """
+
+    @staticmethod
+    def _decoded_arguments(parameters):
+        """Decode streamed arguments; text that is not JSON stays visible."""
+        try:
+            return json.loads(parameters)
+        except json.JSONDecodeError:
+            return f"<not JSON: {parameters!r}>"
+
+    @classmethod
+    def _whole_text_calls(cls, text, tools):
+        result = KimiK2ToolParser().detect_and_parse(text, tools)
+        return [(index, call.name, cls._decoded_arguments(call.parameters))
+                for index, call in enumerate(result.calls)]
+
+    @classmethod
+    def _streamed_calls(cls, chunks, tools):
+        """Assemble the calls by tool index, as a streaming client does."""
+        parser = KimiK2ToolParser()
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(parser.finish(tools))
+        calls = {}
+        for result in results:
+            indices = [call.tool_index for call in result.calls]
+            assert len(indices) == len(set(indices)), (
+                f"one increment repeats a tool index: {indices}")
+            for call in result.calls:
+                name, arguments = calls.get(call.tool_index, (None, ""))
+                calls[call.tool_index] = (name or call.name,
+                                          arguments + call.parameters)
+        return [(index, name, cls._decoded_arguments(arguments))
+                for index, (name, arguments) in sorted(calls.items())]
+
+    @pytest.mark.parametrize("output", sorted(_KIMI_K2_OUTPUTS))
+    def test_streamed_calls_match_whole_text_parse(self, sample_tools, output):
+        """Whole output, one character, fixed sizes, every two-way split.
+
+        The per-character and two-way chunkings end an increment at every
+        position inside each of the format's tokens.
+        """
+        text = _KIMI_K2_OUTPUTS[output]
+        expected = self._whole_text_calls(text, sample_tools)
+        assert expected and all(
+            isinstance(arguments, dict) for _, _, arguments in expected)
+
+        chunkings = list(_chunkings(text))
+        differing = [
+            label for label, chunks in chunkings
+            if self._streamed_calls(chunks, sample_tools) != expected
+        ]
+
+        assert not differing, (
+            f"{len(differing)} of {len(chunkings)} chunkings end with other "
+            f"calls than the whole-text parse, e.g. {differing[:8]}")
+
+    @pytest.mark.parametrize("output", sorted(_KIMI_K2_TEXT_CASES))
+    def test_streamed_text_matches_whole_text_parse(self, sample_tools, output):
+        """The streamed text is the whole-text parse's, for every chunking.
+
+        That is the text before the tool calls, with no part of them: also
+        when that text shares an increment with a call, when text follows the
+        calls, and from finish() when the stream stops inside a call or a
+        token.
+        """
+        text = _KIMI_K2_TEXT_CASES[output]
+        expected = KimiK2ToolParser().detect_and_parse(text,
+                                                       sample_tools).normal_text
+        assert "<|" not in expected and "functions." not in expected
+
+        chunkings = list(_chunkings(text))
+        differing = []
+        for label, chunks in chunkings:
+            parser = KimiK2ToolParser()
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+            streamed_text = "".join(result.normal_text for result in results)
+            if streamed_text != expected:
+                differing.append((label, streamed_text))
+
+        assert not differing, (
+            f"{len(differing)} of {len(chunkings)} chunkings stream other "
+            f"text than {expected!r}, e.g. {differing[:4]}")
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            _kimi_k2_split_after(
+                "Let me check.\n" + _KIMI_K2_OUTPUTS["one_call"],
+                "<|tool_calls_section_begin|>"),
+            _kimi_k2_split_after(_KIMI_K2_OUTPUTS["one_call"],
+                                 "functions.get_wea"),
+        ],
+        ids=["whole_call_in_last_increment", "last_increment_has_the_rest"],
+    )
+    def test_last_increment_sends_the_arguments_with_the_name(
+            self, sample_tools, chunks):
+        """A call first named by the last increment comes with its arguments."""
+        parser = KimiK2ToolParser()
+        for chunk in chunks[:-1]:
+            assert parser.parse_streaming_increment(chunk,
+                                                    sample_tools).calls == []
+
+        last = parser.parse_streaming_increment(chunks[-1], sample_tools)
+
+        assert [(call.tool_index, call.name,
+                 self._decoded_arguments(call.parameters))
+                for call in last.calls] == [(0, "get_weather", {
+                    "location": "San Francisco, CA",
+                    "unit": "celsius"
+                })]
+        assert parser.finish(sample_tools).calls == []
+
+    def test_two_calls_in_last_increment_are_both_sent(self, sample_tools):
+        """Both whole calls of one increment are released, one item each."""
+        parser = KimiK2ToolParser()
+
+        last = parser.parse_streaming_increment(_KIMI_K2_OUTPUTS["two_calls"],
+                                                sample_tools)
+
+        assert [(call.tool_index, call.name,
+                 self._decoded_arguments(call.parameters))
+                for call in last.calls] == [
+                    (0, "get_weather", {
+                        "location": "San Francisco, CA",
+                        "unit": "celsius"
+                    }),
+                    (1, "search_web", {
+                        "query": 'SF "weather" {today} <b>'
+                    }),
+                ]
+        assert parser.finish(sample_tools).calls == []
+
+    def test_text_that_ends_like_a_token_is_kept(self, sample_tools):
+        """Text held back as the possible start of a token is released.
+
+        An increment that ends like the start of a token waits for the next
+        one, or for finish() when the stream ends there.
+        """
+        text = "Is a < b? See <|tool_hint|> and <|tool"
+        for label, chunks in _chunkings(text):
+            parser = KimiK2ToolParser()
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+
+            assert "".join(result.normal_text
+                           for result in results) == text, label
+            assert not any(result.calls for result in results), label
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            [_KIMI_K2_OUTPUTS["text_around_calls"]],
+            _kimi_k2_split_after(_KIMI_K2_OUTPUTS["text_around_calls"],
+                                 "Let me check both.\n"),
+            _kimi_k2_split_after(_KIMI_K2_OUTPUTS["two_calls"],
+                                 "functions.sea"),
+        ],
+        ids=[
+            "whole_output_in_one_step", "calls_in_last_step",
+            "last_step_has_the_rest"
+        ],
+    )
+    def test_chat_stream_carries_the_arguments_to_the_end(
+            self, sample_tools, chunks):
+        """The chat stream assembles to the whole-text calls in each case."""
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="kimi_k2", stream=True)
+
+        payloads = TestForcedToolChoicePostprocessing._stream_deltas(
+            args, chunks)
+
+        calls = {}
+        for payload in payloads:
+            for choice in payload["choices"]:
+                tool_calls = choice["delta"].get("tool_calls") or []
+                indices = [tool_call["index"] for tool_call in tool_calls]
+                assert len(indices) == len(set(indices)), (
+                    f"one chunk repeats a tool index: {indices}")
+                for tool_call in tool_calls:
+                    function = tool_call["function"]
+                    name, arguments = calls.get(tool_call["index"], (None, ""))
+                    calls[tool_call["index"]] = (
+                        name or function.get("name"),
+                        arguments + (function.get("arguments") or ""))
+        streamed = [(index, name, self._decoded_arguments(arguments))
+                    for index, (name, arguments) in sorted(calls.items())]
+
+        assert streamed == self._whole_text_calls("".join(chunks), sample_tools)
+        assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
 class TestQwen3ToolParser(BaseToolParserTestClass):
