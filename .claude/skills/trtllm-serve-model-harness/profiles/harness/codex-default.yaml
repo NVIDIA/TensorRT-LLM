@@ -21,7 +21,8 @@ tools:
   declared_in: [tools]                      # top-level JSON functions
   namespaces: true                          # multi_agent_v1.*
   custom_tools: false
-  known: [exec_command, write_stdin, view_image, web_search]
+  known: [exec_command, write_stdin, request_user_input, view_image, get_goal, create_goal,
+          update_goal, web_search]
   nested: null
   tolerated_payload: [additionalProperties]  # an argument a tool does not declare: codex-rs ignores it
                                             # (exec_command: no deny_unknown_fields) and runs the call; a

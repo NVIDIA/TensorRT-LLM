@@ -41,16 +41,19 @@
 #                NO_PROXY and no_proxy, to cut other egress
 # Relative paths (arguments, CODEX_BIN, source dirs) are taken from where the runner is started.
 #
-# Every session runs under `env -i` and sees only PATH, its own HOME and CODEX_HOME, the endpoint
-# key TRTLLM_API_KEY, and TERM and the proxy variables above when they are set. So the user's
-# ~/.codex (config, auth, history) is never read or written, and nothing else from the calling
-# shell leaks in. PATH is the caller's: Codex's npm launcher runs `node` from it, and the commands
-# Codex runs find their tools on it. The endpoint key is a dummy unless TRTLLM_API_KEY is set.
+# Every session runs under `env -i` and sees only PATH, its own HOME, CODEX_HOME and TMPDIR, the
+# endpoint key TRTLLM_API_KEY, and TERM and the proxy variables above when they are set. So the
+# user's ~/.codex (config, auth, history) is never read or written, nothing else from the calling
+# shell leaks in, and Codex's temporary files stay in the session's directory. PATH is the
+# caller's: Codex's npm launcher runs `node` from it, and the commands Codex runs find their tools
+# on it. The endpoint key is a dummy unless TRTLLM_API_KEY is set.
 # Flags were checked against codex-cli 0.155.1: re-check `codex exec --help` for other versions.
 #
-# Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,last_message.txt,workspace/} and <out_dir>/sessions.tsv
-# (index, exit code, seconds). Harness-side signals come from the SERVER's request trace:
-# run the endpoint with TRTLLM_REQUEST_TRACE_DIR set, then harness_signals.py and the conformance checks.
+# Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,last_message.txt,workspace/,tmp/} and
+# <out_dir>/sessions.tsv (index, exit code, seconds, sandbox failures: the lines of events.jsonl
+# with "bwrap: " in them, i.e. commands Codex's sandbox could not start). A session that exited 101
+# or has sandbox failures ran none of its commands: the runner then warns and exits 3.
+# Judge the run from the trace of the recorder BASE_URL points at (references/smoke.md section 1).
 set -u
 TASKS=${1:?tasks.tsv}
 OUT=${2:?out_dir}
@@ -78,14 +81,14 @@ run_one() {
   local index=$1 src=$2 prompt=$3
   local dir
   dir=$(printf '%s/s%04d' "$OUT" "$index")
-  mkdir -p "$dir/home" "$dir/workspace"
+  mkdir -p "$dir/home" "$dir/workspace" "$dir/tmp"
   if [ "$src" != "-" ]; then cp -a "$src/." "$dir/workspace/"; fi
   local extra=()
   [ -n "${CONTEXT_WINDOW:-}" ] && extra+=(-c "model_context_window=${CONTEXT_WINDOW}")
   [ -n "${EFFORT:-}" ] && extra+=(-c "model_reasoning_effort=\"${EFFORT}\"")
   local start=$SECONDS
   # shellcheck disable=SC2086
-  timeout "$TIMEOUT_S" env -i PATH="$PATH" HOME="$dir/home" CODEX_HOME="$dir/home" \
+  timeout "$TIMEOUT_S" env -i PATH="$PATH" HOME="$dir/home" CODEX_HOME="$dir/home" TMPDIR="$dir/tmp" \
     TRTLLM_API_KEY="$TRTLLM_API_KEY" "${PASS_ENV[@]}" \
     "$CODEX_BIN" exec --json --skip-git-repo-check \
     -C "$dir/workspace" -s "$SANDBOX" -m "$MODEL" \
@@ -94,7 +97,10 @@ run_one() {
     "${extra[@]}" ${EXTRA_ARGS:-} -o "$dir/last_message.txt" "$prompt" \
     > "$dir/events.jsonl" 2> "$dir/stderr.log" < /dev/null
   local rc=$?
-  printf '%d\t%d\t%d\n' "$index" "$rc" "$((SECONDS - start))" >> "$OUT/sessions.tsv"
+  # Counted, never printed: the lines are the agent's tool output.
+  local sandbox_failures
+  sandbox_failures=$(grep -c 'bwrap: ' "$dir/events.jsonl")
+  printf '%d\t%d\t%d\t%d\n' "$index" "$rc" "$((SECONDS - start))" "$sandbox_failures" >> "$OUT/sessions.tsv"
 }
 
 index=0
@@ -107,3 +113,9 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$TASKS"
 wait
 echo "sessions: $index; exit codes: $(cut -f2 "$OUT/sessions.tsv" | sort | uniq -c | tr '\n' ' ')"
+broken=$(awk -F'\t' '$2 == 101 || $4 > 0' "$OUT/sessions.tsv" | wc -l)
+if [ "$broken" -gt 0 ]; then
+  echo "WARNING: Codex's sandbox did not start in $broken session(s) (exit 101, or 'bwrap: ' in" \
+    "events.jsonl), so their commands never ran. See SANDBOX above and references/smoke.md section 0." >&2
+  exit 3
+fi

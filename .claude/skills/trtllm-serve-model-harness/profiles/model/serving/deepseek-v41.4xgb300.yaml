@@ -5,7 +5,7 @@
 # shipped DeepSeek-V4.1 profile's cells were served with (production settings: full context, chunked
 # prefill with 8192-token chunks, block reuse on). Serve with:
 #
-#   TRTLLM_RAW_OUTPUT_DIR=<run>/raw trtllm-serve <checkpoint> --backend pytorch \
+#   TRTLLM_RAW_OUTPUT_DIR=<run>/raw trtllm-serve <checkpoint> \
 #       --tp_size 4 --ep_size 4 --max_seq_len 1048576 --custom_tokenizer deepseek_v41 \
 #       --tool_parser deepseek_v41 --reasoning_parser deepseek_v41 \
 #       --served_model_name <name the harness sends> \

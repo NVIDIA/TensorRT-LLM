@@ -18,12 +18,15 @@ CPU only: no TensorRT-LLM import, no docker.
 """
 
 import asyncio
+import http.server
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -39,6 +42,7 @@ for _path in (SCRIPTS, os.path.join(SCRIPTS, "pi_kit", "bin"),
 
 import build_replay_corpus  # noqa: E402
 import pikit  # noqa: E402
+import probe_recall  # noqa: E402
 import replay_requests  # noqa: E402
 import summarize  # noqa: E402
 
@@ -470,7 +474,9 @@ def test_a_case_without_a_final_message_is_summarized(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- session runners
 
 # A stand-in harness: it records its arguments, working directory and environment as exec passed
-# them (from /proc: Python adds variables of its own), then prints one event.
+# them (from /proc: Python adds variables of its own), then prints one event. A prompt with
+# "no-namespaces" adds the event Codex writes when its sandbox cannot start a command; one with
+# "panic" exits as Codex does when it panics.
 STUB = """#!{python}
 import json, os, sys
 with open("/proc/self/environ", "rb") as fh:
@@ -478,6 +484,11 @@ with open("/proc/self/environ", "rb") as fh:
 with open(os.path.join({records!r}, "%d.json" % os.getpid()), "w") as fh:
     json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "env": env}}, fh)
 print(json.dumps({{"type": "stub"}}))
+if "no-namespaces" in sys.argv[-1]:
+    print(json.dumps({{"type": "item.completed", "item": {{"type": "command_execution", "exit_code": 1,
+                     "aggregated_output": "bwrap: No permissions to create a new namespace"}}}}))
+if "panic" in sys.argv[-1]:
+    sys.exit(101)
 """
 # runner: (script, the variable naming the harness executable, required settings)
 RUNNERS = {
@@ -487,11 +498,12 @@ RUNNERS = {
 }
 # What a session's environment holds besides the proxy variables.
 ALLOWED = {
-    "claude": {"PATH", "HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-               "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "DISABLE_AUTOUPDATER",
-               "CLAUDE_CODE_GATEWAY_HINT_HEADERS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"},
-    "codex": {"PATH", "HOME", "CODEX_HOME", "TRTLLM_API_KEY", "TERM"},
-    "pi": {"PATH", "HOME", "PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK",
+    "claude": {"PATH", "HOME", "CLAUDE_CONFIG_DIR", "TMPDIR", "ANTHROPIC_BASE_URL",
+               "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+               "DISABLE_AUTOUPDATER", "CLAUDE_CODE_GATEWAY_HINT_HEADERS",
+               "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"},
+    "codex": {"PATH", "HOME", "CODEX_HOME", "TMPDIR", "TRTLLM_API_KEY", "TERM"},
+    "pi": {"PATH", "HOME", "PI_CODING_AGENT_DIR", "TMPDIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK",
            "PI_TELEMETRY"},
 }  # fmt: skip
 PROXIES = {"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
@@ -550,7 +562,10 @@ def test_a_runner_takes_relative_paths_from_where_it_started(tmp_path, runner):
     assert (session / "events.jsonl").read_text() == '{"type": "stub"}\n'
     assert (session / "workspace" / "a.txt").read_text() == "a\n"
     ((argv, cwd, env),) = [(r["argv"], r["cwd"], r["env"]) for r in records]
-    given = [("HOME", env.get("HOME"), session / "home")]
+    given = [
+        ("HOME", env.get("HOME"), session / "home"),
+        ("TMPDIR", env.get("TMPDIR"), session / "tmp"),
+    ]
     if runner == "claude":
         given += [("CLAUDE_CONFIG_DIR", env.get("CLAUDE_CONFIG_DIR"), session / "home" / ".claude"),
                   ("cwd", cwd, session / "workspace")]  # fmt: skip
@@ -593,3 +608,78 @@ def test_a_tasks_file_starts_exactly_its_tasks(tmp_path, runner):
     rows = (tmp_path / "out" / "sessions.tsv").read_text().splitlines()
     assert sorted(row.split("\t")[:2] for row in rows) == [["1", "0"], ["2", "0"]]
     assert sorted(_prompt(runner, r["argv"]) for r in records) == ["first task", "second task"]
+
+
+@needs_proc
+def test_a_codex_run_whose_sandbox_did_not_start_fails(tmp_path):
+    """A command Codex's sandbox could not start, or a panic, fails the run: no tool of it ran."""
+    tasks = "src\tsay hi\nsrc\tno-namespaces\n-\tpanic\n"
+    result, records = _run_sessions(tmp_path, "codex", tasks=tasks)
+
+    rows = (tmp_path / "out" / "sessions.tsv").read_text().splitlines()
+    # index, exit code and sandbox failures; the seconds vary
+    got = sorted((r[0], r[1], r[3]) for r in (row.split("\t") for row in rows))
+    assert got == [("1", "0", "0"), ("2", "0", "1"), ("3", "101", "0")]
+    assert result.returncode == 3 and "did not start in 2 session(s)" in result.stderr
+    assert "No permissions" not in result.stdout + result.stderr  # counted, never printed
+
+
+# --------------------------------------------------------------------------- recall probe
+
+
+class _Model(http.server.BaseHTTPRequestHandler):
+    """A served model that recalls in short prompts, forgets in long ones, refuses past its window."""
+
+    seen = []
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        type(self).seen.append((self.path, self.headers.get("anthropic-version"), body))
+        prompt = body["messages"][0]["content"]
+        if len(prompt) > 20000:
+            self.send_response(400)
+            self.end_headers()
+            return
+        answer = re.search(r"TANGERINE-\d{4}", prompt)[0] if len(prompt) < 5000 else "Unknown."
+        if self.path == "/v1/messages":
+            reply = {"content": [{"type": "text", "text": answer}], "usage": {"input_tokens": 7}}
+        else:
+            reply = {"choices": [{"message": {"content": answer}}], "usage": {"prompt_tokens": 7}}
+        data = json.dumps(reply).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_a_recall_probe_reports_each_probe_and_never_the_answer(capsys):
+    """Each size at both depths: recalled, forgotten or refused, with the server's prompt count."""
+    _Model.seen = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Model)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        chat = probe_recall.main(["--base-url", base, "--model", "m", "--sizes", "200,3000,6000",
+                                  "--extra", '{"chat_template_kwargs": {"enable_thinking": false}}'])  # fmt: skip
+        chat_lines = capsys.readouterr().out.splitlines()
+        messages = probe_recall.main(["--base-url", base + "/", "--model", "m", "--sizes", "200",
+                                      "--route", "messages"])  # fmt: skip
+        messages_lines = capsys.readouterr().out.splitlines()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert (chat, messages) == (1, 0)
+    assert [re.search(r"recalled (\w+)", line)[1] for line in chat_lines] == [
+        "yes", "yes", "no", "no", "no", "no"]  # fmt: skip
+    assert all("refused: HTTP 400" in line for line in chat_lines[4:])
+    assert all("prompt_tokens        7" in line for line in chat_lines[:4] + messages_lines)
+    assert "TANGERINE" not in "\n".join(chat_lines + messages_lines)
+    routes = [(path, version, body.get("chat_template_kwargs"), body["temperature"])
+              for path, version, body in _Model.seen]  # fmt: skip
+    assert routes == [("/v1/chat/completions", None, {"enable_thinking": False}, 0)] * 6 + [
+        ("/v1/messages", "2023-06-01", None, 0)] * 2  # fmt: skip

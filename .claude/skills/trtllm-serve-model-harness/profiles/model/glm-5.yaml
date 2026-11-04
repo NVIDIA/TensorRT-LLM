@@ -14,10 +14,14 @@ checkpoints:
   # rank).
   - {name: GLM-5.3-NVFP4, model_type: glm_moe_dsa, size_gb: 464, template_sha256: 3740abcea51c4583}
 upstream: "main has glm_moe_dsa and glm5_next. Its glm4/glm47 parsers were rewritten in #19935.
-  glm5_next has no automatic tool-parser mapping on main. Later glm parser fixes (arguments as
-  the model wrote them; one document whether streamed or read whole; a close before any content
-  is residue; a fresh call inside an open call's arguments abandons it; a nameless call is text on
-  both views) may not all be on main: check main and open PRs before relying on its parsers."
+  glm5_next has no automatic tool-parser mapping on main. Merged since: #21108 (a fresh call
+  inside an open call's arguments abandons it) and #21109 (the owed </think> after a tool call is
+  dropped; the thinking mode is read off the prompt). A GLM-5.3-NVFP4 x Codex cell passed
+  (2026-11) on main plus #19665 (Responses asks for logprobs by default, so every request fails
+  under MTP), the capture changes and the harness's own items (contracts/codex-default.md). Its
+  audit also found #21449 (a tool result's image reaches a text-only model as a text note), which
+  its run did not exercise. Check their state before composing a build (references/smoke.md
+  section 3d)."
 
 renderer:
   kind: chat_template
@@ -46,8 +50,11 @@ format_card:
 
 native:                                     # the raw view (C-13); grammar of chat_template.jinja
   # The reader's goldens (scripts/validate/native_goldens.py --glm) were rendered with the
-  # GLM-5.3-Flash template. Render them again from the checkpoint you serve when its
-  # template_sha256 differs, and compare before trusting C-13 on it.
+  # GLM-5.3-Flash template. template_sha256 is the first 16 hex digits of the SHA-256 of
+  # chat_template.jinja. Before trusting C-13 on a checkpoint whose hash differs, run
+  # `native_goldens.py --glm <checkpoint> --check`: GLM-5.3 (0e2b6268ac54f04d) read back 5 of 5,
+  # equal to the goldens. GLM-5.3-NVFP4 was not checked this way; C-13 read its replies in the
+  # cells it served.
   kind: glm_xml
   prompt_opens: think                       # GLM-5.3 always prefills <think>
   stop_markers: ["<|user|>", "<|observation|>", "<|endoftext|>"]

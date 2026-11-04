@@ -53,6 +53,12 @@ inputs and the right checks. That is what this skill provides:
     error mapping, the rewrites the harness applies to what it sends back.
 
   Both are derived from S0 and S1 outputs, and the validator reads them.
+
+  A profile's `status` says how far it is proven. `harness-outcome` is judged only on a harness
+  profile that is `measured` (its fields measured for the version it names); `partial` or `draft`
+  leaves it BLOCKED. A model profile's `status` is for the reader (`draft` until the served
+  checkpoint's renders read back, `native_goldens.py --check`); the validator does not read it.
+  In any profile, a field still `TODO` leaves the checks that read it BLOCKED.
 - **Adding a model or a harness is adding files.** No procedure step and no check names a
   specific model or harness; the shipped profiles and contracts are examples.
 
@@ -73,6 +79,16 @@ inputs and the right checks. That is what this skill provides:
 | investigator (on demand) | Runtime/kernel root causes with env-gated diagnostics | Restarts serving |
 | human | Resources, thresholds, external actions (pushes, PRs, issues), policy choices, entering S5 | — |
 
+- **On your own, you are the human.** With one developer and one agent, the agent proposes and
+  the developer decides. Before the first GPU run, decide and record in the run's matrix and the
+  cell log, with who and when:
+  - the scope and the checkpoints;
+  - the thresholds (the template proposes 0.02 per turn);
+  - the budget;
+  - the S0 sign-off;
+  - who runs the full tier.
+
+  Until the thresholds are set, every rate reads BLOCKED, by design.
 - **The validator should be a different session, ideally a different vendor's model.** It
   catches what the operator cannot see, e.g.:
   - a test count that came from a filtered subset;
@@ -122,7 +138,7 @@ what stands in for each skipped stage, and what nothing covers:
 
 | Stage | Stands in | Not covered |
 |---|---|---|
-| S1 | The full tier's raw view of every reply: C-13 compares what was delivered with what the model wrote, read in its own format by a reader qualified on the checkpoint encoder's renders. USG-07: the billed input equals the server's own prompt count | Prompt fidelity: no check compares the served prompt render with the encoder's (S3's render-level A/B does). Shapes the traffic did not produce: the parser fault matrix, stop rules on rare tokens |
+| S1 | The full tier's raw view of every reply: C-13 compares what was delivered with what the model wrote, read in its own format by a reader qualified on the served checkpoint encoder's renders (`scripts/validate/native_goldens.py --check`, CPU only). USG-07: the billed input equals the server's own prompt count | Prompt fidelity: no check compares the served prompt render with the encoder's (S3's render-level A/B does). Shapes the traffic did not produce: the parser fault matrix, stop rules on rare tokens |
 | S2 | Each PR's own tests and CI | The other models a shared layer serves (a parser base class, the chat route, a shared serializer). When a PR changes such a layer, run S2 for them |
 | S3 | Nothing: the first real traffic is S4 or S5 | A render-level A/B on identical requests, one turn at a time |
 
@@ -131,7 +147,9 @@ what stands in for each skipped stage, and what nothing covers:
 - **A fast-path PASS is a PASS on its trial build.** Report it with the build's provenance file.
   It becomes a PASS on main only after a run on a main build that has every item merged. Until
   the capture changes are in main too, that run has no raw view (C-13 reads NOT_APPLICABLE),
-  and the report says so.
+  and the report says so. A model profile that names its degenerate tokens by id only (e.g.
+  GLM-5.x) also leaves M-02, and so `model-behavior`, BLOCKED without the raw view: such a cell
+  cannot PASS on a build without the raw-output hook.
 - **Name the evidence by the stage the run was.** Local tasks are S4
   (`cells/<cell>/S4/<iteration>/`); a large run is S5.
 - **Record the S0 sign-off** in the cell log: who signed, the harness version and configuration,
@@ -261,7 +279,7 @@ way, a deploy or a run wakes it when its job ends, not a timer. Take one step pe
 |---|---|---|
 | `scripts/validate/verdict.py` | all | **The validator.** Responses, Anthropic Messages and Chat Completions; claims, rate bounds, exit codes 0/1/2/3 |
 | `scripts/validate/sdk_diff.py` | all | A second reading of every reply by the official `anthropic` and `openai` SDKs (check C-12); run by `verdict.py` |
-| `scripts/validate/native.py`, `native_goldens.py` | all | The raw view (C-13): the model's own text read in its own format; goldens rendered by each checkpoint's encoder |
+| `scripts/validate/native.py`, `native_goldens.py` | all | The raw view (C-13): the model's own text read in its own format; goldens rendered by each checkpoint's encoder, and `--check` on the checkpoint you serve |
 | `scripts/validate/usage.py` | all | Usage rules (C-14): wire fields, totals, `count_tokens`, the engine's and the server's own counts |
 | `scripts/validate/requirements.txt` | all | The validator's environment, SDK versions pinned: `python3 -m venv <dir> && <dir>/bin/pip install -r requirements.txt` |
 | `scripts/validate/controls.py` | qualification | Control matrix for all three protocols plus cross cases; writes `controls.json` bound to the validator tree |
@@ -278,6 +296,7 @@ way, a deploy or a run wakes it when its job ends, not a timer. Take one step pe
 | `scripts/run_codex_sessions.sh`, `scripts/run_claude_sessions.sh`, `scripts/run_pi_sessions.sh` | S4 | Session runners for the shipped harnesses (`env -i`, an isolated configuration each). On the host: for wiring runs against the fake servers |
 | `scripts/pi_kit/` | S4 | pi on local tasks: one throwaway container and one recorder per session, `run`/`resume`/`stop`/`status`, model presets for pi's thinking level, re-measuring a pi version (`scripts/pi_kit/README.md`) |
 | `scripts/compose_trial_build.sh` | S4, S5 | The build under test: a base plus open PRs and the capture changes, one commit each, with a provenance file (`references/smoke.md` section 3d) |
+| `scripts/probe_recall.py` | S4, S5 | Long-context recall at chosen sizes and depths, before any agent run (`references/smoke.md` section 3c) |
 | `scripts/validate/protocol_diff.py` | S4 | One harness and task over several wires, compared turn by turn; attributes each difference to the harness or to the server's protocol path |
 
 - **Tests.** `tests/` holds CPU-only tests of the skill's own tools. Run them from a scratch

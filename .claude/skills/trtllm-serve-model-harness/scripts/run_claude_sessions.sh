@@ -40,15 +40,16 @@
 #
 # Every session runs under `env -i`: nothing from the calling shell leaks in but the proxy
 # variables above (a Claude Code parent session exports CLAUDE_CODE_* variables, including a
-# messaging socket and token). Each session gets its own HOME and CLAUDE_CONFIG_DIR, so the
-# user's ~/.claude (credentials, settings, hooks, plugins) is never read. The endpoint credential
+# messaging socket and token). Each session gets its own HOME, CLAUDE_CONFIG_DIR and TMPDIR, so
+# the user's ~/.claude (credentials, settings, hooks, plugins) is never read, and Claude Code's
+# temporary files stay in the session's directory. The endpoint credential
 # is a dummy unless ANTHROPIC_AUTH_TOKEN is set. Gateway hint headers are on, so the trace carries
 # request class, prompt id and compaction marks. Flags were checked against Claude Code 2.1.289:
 # re-check `claude --help` for other versions.
 #
-# Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,workspace/} and <out_dir>/sessions.tsv
-# (index, exit code, seconds). Judge the run from the SERVER side trace (request trace or
-# record_requests.py) with scripts/validate/verdict.py --population smoke.
+# Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,workspace/,tmp/} and <out_dir>/sessions.tsv
+# (index, exit code, seconds). Judge the run from the trace of the recorder BASE_URL points at
+# (record_requests.py) with scripts/validate/verdict.py --population smoke.
 set -u
 TASKS=${1:?tasks.tsv}
 OUT=${2:?out_dir}
@@ -77,14 +78,14 @@ run_one() {
   local index=$1 src=$2 prompt=$3
   local dir
   dir=$(printf '%s/s%04d' "$OUT" "$index")
-  mkdir -p "$dir/home/.claude" "$dir/workspace"
+  mkdir -p "$dir/home/.claude" "$dir/workspace" "$dir/tmp"
   if [ "$src" != "-" ]; then cp -a "$src/." "$dir/workspace/"; fi
   local env_extra=()
   [ -n "${ATTRIBUTION:-}" ] && env_extra+=("CLAUDE_CODE_ATTRIBUTION_HEADER=${ATTRIBUTION}")
   local start=$SECONDS
   # shellcheck disable=SC2086
   (cd "$dir/workspace" && timeout "$TIMEOUT_S" env -i PATH=/usr/local/bin:/usr/bin:/bin \
-    HOME="$dir/home" CLAUDE_CONFIG_DIR="$dir/home/.claude" \
+    HOME="$dir/home" CLAUDE_CONFIG_DIR="$dir/home/.claude" TMPDIR="$dir/tmp" \
     ANTHROPIC_BASE_URL="$BASE_URL" ANTHROPIC_AUTH_TOKEN="$TOKEN" \
     ANTHROPIC_MODEL="$MODEL" ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL" \
     CLAUDE_CODE_GATEWAY_HINT_HEADERS=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \

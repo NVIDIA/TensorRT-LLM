@@ -29,6 +29,7 @@ codex exec --json --skip-git-repo-check -C <workdir> -s workspace-write -m <mode
 | `model_auto_compact_token_limit` | Related compaction setting |
 | `model_reasoning_effort` | Codex otherwise sends whatever its config has. With no value, the endpoint's default applies |
 | `CODEX_HOME=<dir>` | Per run, so nothing reads or writes the user's `~/.codex`. Codex warns that it cannot create helper binaries under `/tmp`; that is harmless |
+| `-m <model>` | A name Codex does not know logs "Model metadata for `<name>` not found" in every session, and Codex falls back to defaults. Harmless: the declared tools were the same for every name tried, and `model_context_window` gives it the window |
 
 ## What changes with the configuration
 
@@ -40,7 +41,7 @@ harness profile. codex-cli 0.155.1 with the default configuration sends:
 
 | Field | Default config |
 |---|---|
-| Tools | Top-level `tools`: `exec_command`, `write_stdin`, `view_image`, `multi_agent_v1.*`, goal tools, `web_search` (all JSON functions) |
+| Tools | Top-level `tools`: `exec_command`, `write_stdin`, `request_user_input`, `view_image`, `multi_agent_v1.*`, goal tools, `web_search` (all JSON functions) |
 | Instructions | `instructions` field |
 | `parallel_tool_calls` | `true` |
 | Reasoning | `reasoning.summary: "auto"` |
@@ -99,4 +100,15 @@ On main, a streamed `/v1/responses` request over the window is answered with an 
 in-stream with code `server_error`. PR #21060 answers it in-stream with
 `context_length_exceeded`; add it to the trial build of a Codex cell until it merges
 (`references/smoke.md` section 3d). A smoke run at the full window rarely gets there, so probe it
-on purpose: one session against a server whose `max_seq_len` is below Codex's opening prompt.
+on purpose (`references/smoke.md` section 2, step 4).
+
+## Trial build items (2026-11)
+
+The GLM-5.3 and Kimi-K3 Codex cells passed on main plus, besides the capture changes and the
+model's own items (its profile's `upstream`):
+- #21060: over-length answered in-stream (above);
+- #21058: reasoning round-trips through `encrypted_content`, which Codex sends back on every turn.
+
+#20868 (the final snapshot keeps the status the stream reported) and #21065 (a `web_search` tool
+the server cannot honour is served, not refused) were in those builds and have merged since.
+Check each item's state before composing a build (`references/smoke.md` section 3d).

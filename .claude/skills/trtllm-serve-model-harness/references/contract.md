@@ -37,8 +37,7 @@ The human signs off once per harness version and configuration.
   python scripts/record_requests.py --out-dir capture/ --port 8398 --forward http://127.0.0.1:8000
   ```
 
-- **Or** run trtllm-serve with `TRTLLM_REQUEST_TRACE_DIR=<dir>`. Its request trace also records
-  the requests it rejects. That trace writer is not on main yet.
+- The recorder records the requests the server rejects too, with the server's answer.
 - **The recorder records every route.** That covers `/v1/responses`, `/v1/messages` (plus
   `count_tokens`, `HEAD /api/hello`) and `/v1/chat/completions`.
 - **Credentials.** The recorder redacts credential headers and forwards them only with

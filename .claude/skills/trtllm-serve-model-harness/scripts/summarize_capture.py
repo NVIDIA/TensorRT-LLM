@@ -15,8 +15,9 @@
 # limitations under the License.
 """Summarize what an agent harness actually sends and receives -- the skeleton of its contract.
 
-Reads request-trace records (trtllm-serve's ``TRTLLM_REQUEST_TRACE_DIR`` output, or
-record_requests.py output) and reports the wire surface the harness uses:
+Reads request-trace records (record_requests.py output, or the trace of a server-side trace
+writer, ``TRTLLM_REQUEST_TRACE_DIR``, that is not on main) and reports the wire surface the
+harness uses:
 
   routes            method/path counts
   body keys         per key: how often present and the JSON types seen

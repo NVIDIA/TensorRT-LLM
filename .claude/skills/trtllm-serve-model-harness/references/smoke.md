@@ -20,7 +20,9 @@ For a harness with no recorded traffic yet, S4's wiring run is also how its firs
 ## 0. Isolation and safety
 
 - **Agents run model-generated commands.** Use a disposable container or VM per run, with no
-  access to the user's home, shared workspaces or cluster credentials.
+  access to the user's home, shared workspaces or cluster credentials. `scripts/pi_kit/` makes one
+  container per pi session. For Codex and Claude Code, start the session runner inside your own
+  disposable container or VM.
 - **One configuration home per session,** never the user's:
 
   | Harness | Variable |
@@ -35,7 +37,9 @@ For a harness with no recorded traffic yet, S4's wiring run is also how its firs
   needs Linux namespaces; in a container that forbids them every command fails (a panic with exit
   101, or `bwrap: No permissions to create a new namespace`). When the session already runs in a
   disposable container, let that container be the sandbox: `SANDBOX=danger-full-access` for
-  `run_codex_sessions.sh`.
+  `run_codex_sessions.sh`. The trace cannot show this: the failed commands go back to the model as
+  ordinary tool results. `run_codex_sessions.sh` counts them per session in `sessions.tsv`, and
+  exits 3 with a warning when any session had one.
 - **No real credentials in the environment the agent sees.** Agents print their environment and
   headers (e.g. with `curl -v`), so any credential in reach ends up in the trace.
 - **Restrict egress.** A harness's own calls to its vendor fail under no egress, and that is
@@ -82,10 +86,16 @@ BLOCKED, which is expected here):
 | `model-behavior` | BLOCKED | No thresholds in a fresh matrix; a fake model is not worth rating |
 | `harness-outcome` | BLOCKED | No thresholds, or a profile that is not yet `measured`. Tool errors the fake server's calls cause are flagged, not rated |
 
+And from the runner: every session exited 0, and no sandbox warning (exit 3). The fake server's
+call to Codex is `echo hi`, so on a host without user namespaces, where Codex's default sandbox
+cannot start any command, wire it up with `SANDBOX=danger-full-access`.
+
 How it behaves:
 - The fake server answers with a call to the first declared tool, and with `--max-tool-turns`
   it ends the turn.
 - Codex executes the call and finishes.
+- A wiring run proves the wiring, nothing about a model. Keep it with the cell's evidence
+  (`cells/<cell>/S4/wiring-<n>/`) and note it in the cell log.
 
 Verified with codex-cli 0.155.1: every session exited 0, and every stream and call was
 conformant.
@@ -198,6 +208,19 @@ spending GPU time.
      counted per session, it takes 133 sessions.
    - Set concurrency to reflect real load, since prefill under load is what trips harness
      timeouts.
+4. **Probe over-length on purpose.** A run at the full window seldom sends a request past
+   `max_seq_len`, so C-10 (the shape of the over-length answer) and H-04 (the harness compacts
+   after it) read NOT_APPLICABLE. One short iteration exercises both:
+   - serve the same build with a `max_seq_len` above the harness's opening prompt plus the output
+     it asks for per request, and below what `tasks/t05-log-audit` grows to (over 52k tokens).
+     E.g. 32,768 for Codex, which opens with about 13k to 15k tokens and sends no output cap;
+   - set the harness's own window far above it (`CONTEXT_WINDOW=1048576`), so the server's answer,
+     not the harness's own count, is what the session meets;
+   - run t05 a few times.
+
+   C-10 FAIL: the answer is not the one the harness profile's `errors.overlength` names (e.g.
+   Codex on main: `contracts/codex-default.md`). H-04 FAIL: the harness resent instead of
+   compacting. Either way, the session ends early; that is the probe working.
 
 ## 3. Judge both sides
 
@@ -362,6 +385,20 @@ chunked prefill on:
   sizes on both sides of every size the model or the configuration fixes (a chunk, a candidate
   pool, a RoPE table), up to the served maximum. Filler that repeats the passphrase's words tests
   distractors, not recall.
+- `scripts/probe_recall.py` runs it over Chat Completions or Messages, one line per probe, exit 0
+  when every probe recalled. Take the sizes from the serving configuration and the checkpoint's
+  `config.json`, e.g. GLM-5.3: the DSA candidate pool (`index_topk`, 2,048), the prefill chunk
+  (`max_num_tokens`, 8,192), and up to the served `max_seq_len`:
+
+  ```bash
+  $PY "$SKILL/scripts/probe_recall.py" --base-url http://127.0.0.1:8000 --model <served name> \
+      --sizes 1500,3000,7000,10000,60000,250000,900000 --max-tokens 4096 \
+      --extra '{"chat_template_kwargs": {"reasoning_effort": "low"}}'
+  ```
+
+  GLM-5.3 always thinks (its template reads only `reasoning_effort`), so the answer needs room
+  after the reasoning. For a template that reads `enable_thinking` (e.g. Qwen3), turn thinking
+  off instead and keep the default `--max-tokens`.
 - Replay the first request an agent derailed on, at temperature 0, against each candidate build
   or configuration. A coherent answer there is the end-to-end check of a fix.
 - Read the trace by agent run: the prompt size at each request (`input_tokens` plus
@@ -396,7 +433,16 @@ scripts/compose_trial_build.sh -p <run>/provenance.txt <worktree> <branch> origi
     raw-hook=pr:21605 responses-ids=pr:21602 messages-ids=pr:20936 <label>=pr:<number> ...
 ```
 
-Each source is a `pr:<number>` or any commit-ish (a branch, a commit) that carries the change.
+- Each source is a `pr:<number>` or any commit-ish (a branch, a commit) that carries the change.
+- `pr:<number>` heads come from the remote `-r` names, `origin` by default, and each item's diff is
+  taken against `-m`, `origin/main` by default. In a clone of a fork, add NVIDIA's repository and
+  use it for both:
+  `git remote add upstream https://github.com/NVIDIA/TensorRT-LLM.git` and
+  `-r upstream -m upstream/main`, with `upstream/main` as the base.
+- **Check each item's state first.** `gh pr view <number> -R NVIDIA/TensorRT-LLM --json state`:
+  drop a `MERGED` item when the base is a main that has it, and find what replaced a `CLOSED` one.
+  The items an earlier cell needed are named in the model profile's `upstream` and in the harness
+  contract.
 
 **The capture changes make the evidence joinable.** Until their PRs merge, add them by number; once
 one is in main, drop its item:

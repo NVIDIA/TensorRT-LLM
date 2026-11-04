@@ -53,15 +53,15 @@
 # Relative paths (arguments, WORKSPACE, PI_BIN, NODE_BIN, source dirs) are taken from where the
 # runner is started.
 #
-# Every session runs under `env -i` with its own HOME and PI_CODING_AGENT_DIR, so ~/.pi is never
-# read, and of the caller's variables only the proxy variables above reach it. Startup network
+# Every session runs under `env -i` with its own HOME, PI_CODING_AGENT_DIR and TMPDIR, so ~/.pi is
+# never read, and of the caller's variables only the proxy variables above reach it. Startup network
 # activity, version checks and telemetry are off. Extensions, MCP, skills, prompt templates and
 # context files are disabled, so the request carries only pi's own prompt.
 # Flags were checked against @earendil-works/pi-coding-agent 1.4.0: re-check `pi --help`.
 #
-# Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,workspace/,agent/models.json} and
-# <out_dir>/sessions.tsv (index, exit code, seconds). Judge the run from the SERVER side trace
-# (record_requests.py in front of the server) with scripts/validate/verdict.py --population smoke.
+# Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,workspace/,agent/models.json,tmp/} and
+# <out_dir>/sessions.tsv (index, exit code, seconds). Judge the run from the trace of the recorder
+# BASE_URL points at (record_requests.py) with scripts/validate/verdict.py --population smoke.
 set -u
 TASKS=${1:?tasks.tsv}
 OUT=${2:?out_dir}
@@ -101,7 +101,7 @@ run_one() {
   dir=$(printf '%s/s%04d' "$OUT" "$index")
   local ws="$dir/workspace"
   if [ -n "${WORKSPACE:-}" ]; then ws=$(printf '%s/s%04d' "$WORKSPACE" "$index"); rm -rf "$ws"; fi
-  mkdir -p "$dir/home" "$dir/agent" "$dir/sessions" "$ws"
+  mkdir -p "$dir/home" "$dir/agent" "$dir/sessions" "$dir/tmp" "$ws"
   if [ "$src" != "-" ]; then cp -a "$src/." "$ws/"; fi
   cat > "$dir/agent/models.json" <<JSON
 {"providers": {"trtllm": {"baseUrl": "$BASE_URL", "api": "$API", "apiKey": "dummy-local-key",
@@ -115,7 +115,8 @@ JSON
   local start=$SECONDS
   # shellcheck disable=SC2086
   (cd "$ws" && timeout "$TIMEOUT_S" env -i PATH=/usr/local/bin:/usr/bin:/bin \
-    HOME="$dir/home" PI_CODING_AGENT_DIR="$dir/agent" PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 \
+    HOME="$dir/home" PI_CODING_AGENT_DIR="$dir/agent" TMPDIR="$dir/tmp" \
+    PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 \
     "${PROXY_ENV[@]}" \
     "$NODE_BIN" "$PI_BIN" -p --mode json --provider trtllm --model "$MODEL" "${thinking[@]}" \
     --tools "$TOOLS" --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files \

@@ -20,20 +20,21 @@ like production traffic.
 
 ## 1. What the traces hold
 
-The trace writer is `tensorrt_llm/serve/request_trace.py`, enabled with
-`TRTLLM_REQUEST_TRACE_DIR`. It is not on main yet: port it before relying on it. It writes
-UTC-hour directories:
+Two writers make a trace:
 
-| File | Contents |
-|---|---|
-| `requests-<pid>.jsonl` | One line per request: `body` as sent, `headers`, `route`, `session`, `thread`, `sampling`, `body_sha256`, `build_id` |
-| `responses-<pid>.jsonl` | One line per reply: `response.kind = sse_text` with the raw SSE text, byte-exact; `prompt_tokens` (length and SHA-256 only); `input_replay`; `termination`; `build_id` |
-| `raw-<pid>.jsonl` | One line per native generation: `disagg_request_id`, `frames[]` (real chunk boundaries), `text`, `streaming`, `aborted`, `output_index` |
+| Writer | File | Contents |
+|---|---|---|
+| `scripts/record_requests.py`, in front of the server (`references/contract.md`) | `requests-capture.jsonl` | One line per request: `body` as sent, `headers`, `route`, `trace_id`, `build_id` |
+| | `responses-capture.jsonl` | One line per reply: `response.kind = sse_text` with the SSE text, byte-exact; `status`; `timing` with per-chunk arrival; `build_id` |
+| The raw-output hook (`TRTLLM_RAW_OUTPUT_DIR`, `references/smoke.md` section 3d) | `<UTC hour>/raw-<pid>.jsonl` | One line per generation: `request_id`, `disagg_request_id`, `frames[]` (the real chunk boundaries), `text`, `token_ids`, `streaming`, `aborted`, `output_index` |
+
+`replay_requests.py` writes the same request and reply shapes. The readers also take the trace of
+a server-side trace writer (`TRTLLM_REQUEST_TRACE_DIR`) that is not on main.
 
 - **Joins.**
   - Request ↔ response on `trace_id`.
-  - Response ↔ raw on `disagg_request_id`, compared as an exact decimal string (the values
-    exceed 2^53).
+  - Response ↔ raw on the engine request id the reply carries, or on `disagg_request_id`,
+    compared as an exact decimal string (the values exceed 2^53).
 - **Raw frames may sit in more than one place,** e.g. in the per-attempt directories of a
   deployment that restarted. Look in all of them before calling a reply unjoined.
 - **Handle traces as sensitive.**
@@ -45,11 +46,14 @@ UTC-hour directories:
 
 ## 2. L1: frame replay (CPU only)
 
-- **Tool.** A frame replayer: `responses_replay.py`, plus `raw_vs_parsed.py` for the raw ↔
-  response join. Neither is on main yet.
-  - It loads the real serving modules and stubs the rest.
-  - It feeds each record's `frames` through the event generator with the chosen parsers.
-  - It fails on any reply whose `done` payload differs from its deltas.
+- **What it does.** It feeds each raw record's `frames` through the real serving modules (the
+  event generator with the chosen parsers, the rest stubbed) and fails on any reply whose `done`
+  payload differs from its deltas.
+- **Tool.** No frame replayer ships with this skill. Cover the same ground with:
+  - `scripts/chunk_equivalence.py`: each raw record's `text` (one `{"id", "text"}` line of
+    `--samples` per record) through the real tool parser, split at every point that matters,
+    stream against whole;
+  - L2 below: the real handler and event generator at real token boundaries.
 - **When.** After any change to `responses_utils.py`, the Chat/Messages streaming path or a
   parser, over every model's recorded frames.
 - **New models.** A new model has no frames until it has served. Collect its first raw output in
