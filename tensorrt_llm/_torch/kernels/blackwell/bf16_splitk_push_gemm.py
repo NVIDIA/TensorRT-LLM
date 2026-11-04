@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashInfer's low-M BF16 split-K GEMM with an all-reduce push epilogue (SM100 / SM103 / SM107).
+"""The low-M BF16 split-K GEMM (``dense_bf16_gemm_splitk``, vendored from FlashInfer) with an
+all-reduce push epilogue (SM100 / SM103 / SM107).
 
 ``out[M, N] = A[M, K] @ W[N, K]^T`` for a TP partial sum that an MNNVL all-reduce reduces next:
 instead of storing its BF16 tile, the owner CTA of each cluster (after the split-K reduction)
@@ -46,22 +47,17 @@ import torch as _torch
 from cutlass import Int32, Int64
 from cutlass.cute import experimental as cute_ext
 from cutlass.cutlass_dsl import T, dsl_user_op
-from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
-    _AB_BUFFER_ALIGN_BYTES,
-    _MAILBOX_ALIGN_BYTES,
-    _MBARRIER_BYTES,
-    _SMEM_CAPACITY_BYTES,
-    _TMEM_POINTER_BYTES,
-    OWNER_RANK,
-    SplitKDenseGemmKernel,
-    SplitKTactic,
-    _align_up,
-    _from_dlpack_dynamic,
-    _smem_bytes,
-    _store_shared_remote_v4,
-    validate_tactic,
-)
 
+from .dense_bf16_gemm_splitk import AB_BUFFER_ALIGN_BYTES as _AB_BUFFER_ALIGN_BYTES
+from .dense_bf16_gemm_splitk import MAILBOX_ALIGN_BYTES as _MAILBOX_ALIGN_BYTES
+from .dense_bf16_gemm_splitk import MBARRIER_BYTES as _MBARRIER_BYTES
+from .dense_bf16_gemm_splitk import OWNER_RANK, SplitKDenseGemmKernel, SplitKTactic, validate_tactic
+from .dense_bf16_gemm_splitk import SMEM_CAPACITY_BYTES as _SMEM_CAPACITY_BYTES
+from .dense_bf16_gemm_splitk import TMEM_POINTER_BYTES as _TMEM_POINTER_BYTES
+from .dense_bf16_gemm_splitk import align_up as _align_up
+from .dense_bf16_gemm_splitk import from_dlpack_dynamic as _from_dlpack_dynamic
+from .dense_bf16_gemm_splitk import smem_bytes as _smem_bytes
+from .dense_bf16_gemm_splitk import store_shared_remote_v4 as _store_shared_remote_v4
 from .raw_ptx import asm as _asm
 from .raw_ptx import iv as _iv
 from .raw_ptx import ld_nc_u64 as _ld_nc_u64
