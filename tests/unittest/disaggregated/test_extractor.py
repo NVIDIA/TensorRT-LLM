@@ -324,6 +324,7 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         pp_layers=[0, 1],
         layer_offsets={0: 0, 1: 1},
         num_kv_heads_per_layer=[1, 1],
+        mixed_precision_high_layers={},
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
     )
@@ -484,13 +485,19 @@ def test_v2_builder_resolves_virtual_layer_heads(
 
 
 @pytest.mark.cpu_only
-def test_v2_builder_resolves_mixed_precision_twin_heads() -> None:
+@pytest.mark.parametrize("virtual_layers", [False, True])
+def test_v2_builder_resolves_mixed_precision_high_layer_heads(virtual_layers: bool) -> None:
+    """A mixed-precision high layer takes the KV-head count of the layer it belongs to.
+
+    The manager records the high layers in ``mixed_precision_high_layers`` and names them through
+    ``get_disagg_global_layer_ids``; with ``virtual_layers`` the manager also has the virtual
+    layer mapping of its own layers, as DeepSeek-V4 does.
+    """
     from enum import IntEnum
     from types import SimpleNamespace
 
     class AttentionKind(IntEnum):
         PRIMARY = 0
-        HIGH_PRECISION = 1
 
     attrs = {
         (3, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
@@ -504,12 +511,13 @@ def test_v2_builder_resolves_mixed_precision_twin_heads() -> None:
     manager.pp_layers = [20, 22]
     manager.layer_offsets = {20: 0, 22: 1}
     manager.num_kv_heads_per_layer = [8, 2]
-    manager._layer_attn_to_layer_id = {
-        (20, AttentionKind.PRIMARY): 0,
-        (22, AttentionKind.PRIMARY): 1,
-        (20, AttentionKind.HIGH_PRECISION): 2,
-        (22, AttentionKind.HIGH_PRECISION): 3,
-    }
+    manager.mixed_precision_high_layers = {0: 2, 1: 3}
+    manager.get_disagg_global_layer_ids = lambda _: [2 * 22 + 1]
+    if virtual_layers:
+        manager._layer_attn_to_layer_id = {
+            (20, AttentionKind.PRIMARY): 0,
+            (22, AttentionKind.PRIMARY): 1,
+        }
 
     layer_group = build_page_table_from_manager(manager).layer_groups[0]
 
