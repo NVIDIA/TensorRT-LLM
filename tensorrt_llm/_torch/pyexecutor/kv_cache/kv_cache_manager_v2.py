@@ -3039,6 +3039,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._next_locality_domain = 0
         # Live KV caches per locality domain, the load that prefix-aware placement balances against.
         self._locality_domain_load = [0] * self.num_locality_domains
+        # Placed requests whose KV cache does not exist yet: a burst of arrivals is placed before any is scheduled.
+        self._locality_domain_pending = [0] * self.num_locality_domains
         self.can_evict = len(config.cache_tiers) > 1
         if self._sparse_kv_offload is not None and not self.can_evict:
             logger.warning(
@@ -5763,26 +5765,32 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> int | None:
         """Locality domain placement for a newly-created request.
 
-        Prefixes are reused only within a domain, so a request goes to the domain
-        holding the longest cached prefix of its prompt when that match covers at
-        least one block and the domain is not already carrying clearly more live
-        requests than the others. Otherwise placement is round-robin over arrival
-        order rather than by request id: ids that advance in even steps (a parent
-        and its child per request, or round-robin disagg ids) would pin every
-        request to one domain.
+        A request goes to the domain holding most of its cached prefix's GPU
+        pages when that match covers at least one block and the domain is not
+        already carrying clearly more requests, live or placed, than the others.
+        Prefixes are reused from any domain, so following one buys only locality
+        and the allowed imbalance is small. Otherwise placement is round-robin
+        over arrival order rather than by request id: ids that advance in even
+        steps (a parent and its child per request, or round-robin disagg ids)
+        would pin every request to one domain.
         """
         if self.num_locality_domains <= 1:
             return None
         if input_tokens is not None and self.enable_block_reuse:
             matches = self._prefix_match_per_domain(input_tokens, lora_task_id, cache_salt)
             best = max(range(self.num_locality_domains), key=matches.__getitem__)
-            load = self._locality_domain_load
+            load = [
+                live + pending
+                for live, pending in zip(self._locality_domain_load, self._locality_domain_pending)
+            ]
             if matches[best] >= self.tokens_per_block and load[best] - min(load) <= max(
-                8, sum(load) // 4
+                8, sum(load) // 16
             ):
+                self._locality_domain_pending[best] += 1
                 return best
         locality_domain_id = self._next_locality_domain
         self._next_locality_domain = (locality_domain_id + 1) % self.num_locality_domains
+        self._locality_domain_pending[locality_domain_id] += 1
         return locality_domain_id
 
     def get_locality_domain(self, request_id: int) -> int:
@@ -6343,11 +6351,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_block_reuse or req.py_request_id in self.kv_cache_map:
             return None
         return self.impl.probe_reuse(
-            ReuseScope(
-                lora_id=req.lora_task_id,
-                salt=self._derive_reuse_salt(req.cache_salt),
-                locality_domain_id=self._request_locality_domain_id(req),
-            ),
+            ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)),
             self._context_reuse_tokens(req),
         )
 
@@ -8544,7 +8548,11 @@ class KVCacheManagerV2(BaseResourceManager):
             if locality_domain_ids is not None:
                 request_locality_domain_id = locality_domain_ids[i]
             if request_locality_domain_id is None and self.num_locality_domains > 1:
-                request_locality_domain_id = self.pick_locality_domain()
+                # Dummies are freed within the iteration, so they take no part in the placement load.
+                request_locality_domain_id = self._next_locality_domain
+                self._next_locality_domain = (
+                    request_locality_domain_id + 1
+                ) % self.num_locality_domains
             req = LlmRequest(
                 request_id=req_id,
                 max_new_tokens=1,
@@ -8819,6 +8827,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocation_ready.pop(request.py_request_id, None)
         if self._host_history_reservations is not None:
             self._host_history_reservations.release(request.py_request_id)
+        if self.num_locality_domains > 1 and request.py_request_id not in self.kv_cache_map:
+            # Placed but terminated before it was ever scheduled.
+            locality_domain_id = getattr(request, "py_locality_domain_id", None)
+            if (
+                locality_domain_id is not None
+                and self._locality_domain_pending[locality_domain_id] > 0
+            ):
+                self._locality_domain_pending[locality_domain_id] -= 1
         self._remove_kv_cache(request.py_request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
@@ -10005,19 +10021,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(
-                lora_id=lora_task_id, salt=reuse_salt, locality_domain_id=locality_domain_id
-            ),
+            ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
+            locality_domain_id=locality_domain_id,
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
         if locality_domain_id is not None:
             self._locality_domain_load[locality_domain_id] += 1
+            if not is_dummy and self._locality_domain_pending[locality_domain_id] > 0:
+                self._locality_domain_pending[locality_domain_id] -= 1
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
@@ -10044,30 +10061,26 @@ class KVCacheManagerV2(BaseResourceManager):
             return 0
         if len(input_tokens) == 0:
             return 0
-        # The router has no request yet, so no domain: blocks are keyed per
-        # domain and placement sends the request to the best-matching one.
-        return max(self._prefix_match_per_domain(input_tokens, lora_task_id, cache_salt))
+        reuse_salt = self._derive_reuse_salt(cache_salt)
+        return self.impl.probe_reuse(
+            ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
+            input_tokens,
+        )
 
     def _prefix_match_per_domain(
         self, input_tokens, lora_task_id=None, cache_salt=None
     ) -> list[int]:
-        """Cached prefix length of *input_tokens* in each locality domain (one entry if not localized)."""
-        if not self.enable_block_reuse or len(input_tokens) == 0:
-            return [0] * max(1, self.num_locality_domains)
-        reuse_salt = self._derive_reuse_salt(cache_salt)
-        if self.num_locality_domains <= 1:
-            return [
-                self.impl.probe_reuse(
-                    ReuseScope(lora_id=lora_task_id, salt=reuse_salt), input_tokens
-                )
-            ]
-        return [
-            self.impl.probe_reuse(
-                ReuseScope(lora_id=lora_task_id, salt=reuse_salt, locality_domain_id=domain),
-                input_tokens,
-            )
-            for domain in range(self.num_locality_domains)
-        ]
+        """Cached prefix length of *input_tokens*, credited to each locality domain by its share of the
+        matched prefix's GPU-resident pages."""
+        if len(input_tokens) == 0:
+            return [0] * self.num_locality_domains
+        scope = ReuseScope(lora_id=lora_task_id, salt=self._derive_reuse_salt(cache_salt))
+        matched = self.impl.probe_reuse(scope, input_tokens)
+        resident = self.impl.probe_reuse_domains(scope, input_tokens)
+        total = sum(resident)
+        if matched == 0 or total == 0:
+            return [0] * self.num_locality_domains
+        return [matched * count // total for count in resident]
 
     def probe_first_new_block_key(self, req: LlmRequest) -> bytes | None:
         """Key of the first block whose pages *req* would commit, or None.
@@ -10109,11 +10122,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # A 1-token prompt marshals to an empty sequence: the last token is
             # excluded, so there is nothing to look up and nothing to contribute.
             return None
-        scope = ReuseScope(
-            lora_id=req.lora_task_id,
-            salt=self._derive_reuse_salt(req.cache_salt),
-            locality_domain_id=self._request_locality_domain_id(req),
-        )
+        scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
         return self.impl.probe_first_new_block_key(scope, tokens)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
@@ -10133,13 +10142,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # cache hits the same radix-tree blocks.
             reuse_salt = self._derive_reuse_salt(req.cache_salt)
             prefetched = self.impl.prefetch_reuse(
-                ReuseScope(
-                    lora_id=req.lora_task_id,
-                    salt=reuse_salt,
-                    locality_domain_id=self._request_locality_domain_id(req),
-                ),
-                tokens,
-                CACHE_LEVEL1,
+                ReuseScope(lora_id=req.lora_task_id, salt=reuse_salt), tokens, CACHE_LEVEL1
             )
             if not prefetched:
                 logger.warning("prefetch failed for request %s", req.py_request_id)

@@ -638,6 +638,46 @@ std::optional<LocalityDomainId> StorageManager::localityDomainFilter(
     return resolveLocalityDomain(level, localityDomainId);
 }
 
+bool StorageManager::localityDomainHint(CacheLevel level) const
+{
+    return level == kHotLevel && mNumLocalityDomains > 1;
+}
+
+SlotCount StorageManager::allocatableSlots(CacheLevel level, PoolGroupBase const& pg, LocalityDomainId domain) const
+{
+    if (!localityDomainHint(level))
+    {
+        return pg.numFreeSlots(domain);
+    }
+    SlotCount total = 0;
+    for (LocalityDomainId d{0}; d < pg.numLocalityDomains(); ++d)
+    {
+        total += pg.numFreeSlots(d);
+    }
+    return total;
+}
+
+std::vector<Slot> StorageManager::allocatePreferring(
+    CacheLevel level, PoolGroupBase& pg, SlotCount numSlots, LocalityDomainId domain)
+{
+    if (!localityDomainHint(level))
+    {
+        return pg.allocateMultiple(numSlots, domain);
+    }
+    std::vector<Slot> slots = pg.allocateMultiple(std::min(numSlots, pg.numFreeSlots(domain)), domain);
+    for (LocalityDomainId d{0}; d < pg.numLocalityDomains(); ++d)
+    {
+        SlotCount const missing = numSlots - slotCountValueFromSize(slots.size());
+        if (d == domain || missing == 0)
+        {
+            continue;
+        }
+        auto more = pg.allocateMultiple(std::min(missing, pg.numFreeSlots(d)), d);
+        std::move(more.begin(), more.end(), std::back_inserter(slots));
+    }
+    return slots;
+}
+
 TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel level,
     TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
     DropRecorder const& dropRecorder, std::optional<LocalityDomainId> localityDomainId)
@@ -678,7 +718,7 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel lev
     // A14: post-condition — free-slot counts satisfy requirements.
     for (PoolGroupIndex pgIdx{0}; pgIdx < pgNumSlots.size(); ++pgIdx)
     {
-        TLLM_CHECK_DEBUG_WITH_INFO(pgNumSlots[pgIdx] <= storage.numFreeSlots(pgIdx, domain),
+        TLLM_CHECK_DEBUG_WITH_INFO(pgNumSlots[pgIdx] <= allocatableSlots(level, poolGroup(level, pgIdx), domain),
             "Free slot count does not satisfy requirement after prepareFreeSlots");
     }
 
@@ -689,7 +729,7 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel lev
         for (LifeCycleId lcId{0}; lcId < ret.size(); ++lcId)
         {
             PoolGroupIndex pg = grouping[lcId];
-            ret[lcId] = storage.allocateMultiple(pg, numSlotsPerLc[lcId], domain);
+            ret[lcId] = allocatePreferring(level, poolGroup(level, pg), numSlotsPerLc[lcId], domain);
         }
     }
     catch (...)
@@ -728,8 +768,8 @@ std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGro
         requirements.at(pgIdx) = numSlots;
         prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder, localityDomainId);
     }
-    TLLM_CHECK_DEBUG(numSlots <= storage.numFreeSlots(pgIdx, domain));
-    return storage.allocateMultiple(pgIdx, numSlots, domain);
+    TLLM_CHECK_DEBUG(numSlots <= allocatableSlots(level, poolGroup(level, pgIdx), domain));
+    return allocatePreferring(level, poolGroup(level, pgIdx), numSlots, domain);
 }
 
 Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const
@@ -1058,6 +1098,33 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
     std::optional<LocalityDomainId> localityDomainId)
 {
     refreshRetention();
+    if (localityDomainHint(level) && localityDomainId.has_value())
+    {
+        // Evict the domain's own pages before taking another domain's slots, so pages land remote only once the
+        // domain is full of live pages.
+        LocalityDomainId const domain = resolveLocalityDomain(level, localityDomainId);
+        auto const& storage = *mLevels.at(level).storage;
+        auto const& ctrl = mLevels.at(level).controller;
+        TypedVec<PoolGroupIndex, SlotCount> local(requirements.size(), 0);
+        bool evictLocal = false;
+        bool spill = false;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < requirements.size(); ++pgIdx)
+        {
+            SlotCount const free = storage.numFreeSlots(pgIdx, domain);
+            local.at(pgIdx) = std::min(requirements.at(pgIdx), free + ctrl.numEvictablePages(pgIdx, domain));
+            evictLocal = evictLocal || local.at(pgIdx) > free;
+            spill = spill || requirements.at(pgIdx) > local.at(pgIdx);
+        }
+        if (evictLocal)
+        {
+            _prepareFreeSlots(level, local, migrationRecorder, dropRecorder, domain);
+        }
+        if (!spill)
+        {
+            return;
+        }
+        localityDomainId = std::nullopt;
+    }
     _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder, localityDomainId);
 }
 
@@ -1198,8 +1265,15 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     auto& ctrl = lvl.controller;
     bool const isLast = isLastLevel(lvlId);
     auto const& grouping = poolGroupMapping(lvlId);
-    LocalityDomainId const domain = resolveLocalityDomain(lvlId, localityDomainId);
-    std::optional<LocalityDomainId> const domainFilter = localityDomainFilter(lvlId, localityDomainId);
+    // No domain on a localized tier: free and evict across every domain.
+    bool const anyDomain = !localityDomainId.has_value() && localityDomainHint(lvlId);
+    LocalityDomainId const domain = anyDomain ? LocalityDomainId{0} : resolveLocalityDomain(lvlId, localityDomainId);
+    std::optional<LocalityDomainId> const domainFilter
+        = anyDomain ? std::nullopt : localityDomainFilter(lvlId, localityDomainId);
+    auto const freeSlots = [&](PoolGroupIndex pgIdx) {
+        return anyDomain ? allocatableSlots(lvlId, poolGroup(lvlId, pgIdx), domain)
+                         : storage.numFreeSlots(pgIdx, domain);
+    };
 
     auto countPages = [&](PoolGroupIndex pgIdx, PagesByLifeCycle const& pagesByLifeCycle)
     {
@@ -1216,7 +1290,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     {
         SlotCount const goal = goals.at(lvlId).at(pgIdx);
         SlotCount const fallen = countPages(pgIdx, fallenPages);
-        SlotCount const oldFree = storage.numFreeSlots(pgIdx, domain);
+        SlotCount const oldFree = freeSlots(pgIdx);
         SlotCount const evictableCount = ctrl.numEvictablePages(pgIdx, domainFilter);
         SlotCount const required = goal + fallen;
         SlotCount const shortage = required > oldFree ? required - oldFree : 0;
@@ -1296,7 +1370,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
     {
         auto& ev = evicted.at(pgIdx);
-        SlotCount const oldFree = storage.numFreeSlots(pgIdx, domain);
+        SlotCount const oldFree = freeSlots(pgIdx);
         SlotCount const numEvicted = slotCountValueFromSize(ev.size());
         SlotCount freeAfterEviction{};
 
@@ -1311,7 +1385,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             }
             ev.clear();
 
-            freeAfterEviction = storage.numFreeSlots(pgIdx, domain);
+            freeAfterEviction = freeSlots(pgIdx);
             TLLM_CHECK_DEBUG(freeAfterEviction >= numEvicted + oldFree);
             TLLM_CHECK_DEBUG_WITH_INFO(
                 countPages(pgIdx, heldPages) <= freeAfterEviction, "held_pages count exceeds new free slot count");
@@ -1458,10 +1532,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     auto& dstPoolGroup = poolGroup(dstLevel, dstPgIdx);
     LocalityDomainId const dstDomain = resolveLocalityDomain(dstLevel, dstLocalityDomainId);
 
-    if (dstPoolGroup.numFreeSlots(dstDomain) < numSlots)
+    if (allocatableSlots(dstLevel, dstPoolGroup, dstDomain) < numSlots)
         throw OutOfPagesError("Not enough free slots for migration");
 
-    auto dstSlots = dstPoolGroup.allocateMultiple(numSlots, dstDomain);
+    auto dstSlots = allocatePreferring(dstLevel, dstPoolGroup, numSlots, dstDomain);
     // A15: allocated slot count must match the request.
     TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(dstSlots.size()) == numSlots, "dst_slots size mismatch");
     try

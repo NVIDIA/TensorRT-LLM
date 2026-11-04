@@ -519,23 +519,21 @@ void KvCacheManager::clearReusableBlocks()
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats,
-    std::optional<executor::KvCacheRetentionConfig> retentionConfig)
+    std::optional<executor::KvCacheRetentionConfig> retentionConfig, std::optional<LocalityDomainId> localityDomainId)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     if (numLocalityDomains() > 1)
     {
-        TLLM_CHECK_WITH_INFO(reuseScope.localityDomainId.has_value(),
+        TLLM_CHECK_WITH_INFO(localityDomainId.has_value(),
             "locality_domain_id is required when the KV cache manager has %d locality domains", numLocalityDomains());
-        LocalityDomainId const localityDomainId = *reuseScope.localityDomainId;
-        TLLM_CHECK_WITH_INFO(localityDomainId >= 0 && localityDomainId < numLocalityDomains(),
-            "locality_domain_id %d out of range for %d locality domain(s)", localityDomainId.value(),
+        TLLM_CHECK_WITH_INFO(*localityDomainId >= 0 && *localityDomainId < numLocalityDomains(),
+            "locality_domain_id %d out of range for %d locality domain(s)", localityDomainId->value(),
             numLocalityDomains());
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(
-            !reuseScope.localityDomainId.has_value(), "locality_domain_id is set but locality domains are off");
+        TLLM_CHECK_WITH_INFO(!localityDomainId.has_value(), "locality_domain_id is set but locality domains are off");
     }
     if (!priorityCb)
     {
@@ -556,8 +554,9 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
         reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
     }
 
-    return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
+    return std::make_shared<KvCache>(*this, std::move(reuseScope), localityDomainId, std::move(reuseMatch),
+        std::move(id), std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats,
+        std::move(retentionConfig));
 }
 
 void KvCacheManager::refreshRetention()
@@ -574,8 +573,8 @@ bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens,
     if (target < kHotLevel || target >= mStorage->numCacheLevels())
         throw std::out_of_range("Prefetch target is outside the configured cache tiers");
     auto reuseMatch = matchReuse(reuseScope, inputTokens, knownNoDigest);
-    auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::nullopt,
-        KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
+    auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::nullopt, std::move(reuseMatch),
+        std::nullopt, KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
     auto close = FuncGuard([&cache]() { cache->close(); });
     return cache->prefetch(target);
 }
@@ -593,6 +592,31 @@ int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, boo
     // Shared: the traversal is read-only and the matched Block* never escape this call.
     auto const apiLock = lockShared();
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
+}
+
+std::vector<int> KvCacheManager::probeReuseDomains(
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    std::vector<int> counts(static_cast<size_t>(numLocalityDomains()), 0);
+    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    for (Block const* block : match.blocks)
+    {
+        for (LifeCycleId lifeCycle{0}; lifeCycle < block->storage.size(); ++lifeCycle)
+        {
+            CommittedPage const* page = block->getPage(lifeCycle);
+            if (page == nullptr || page->cacheLevel != kHotLevel)
+            {
+                continue;
+            }
+            if (auto const domain = page->localityDomainId(); domain.has_value())
+            {
+                ++counts.at(static_cast<size_t>(domain->value()));
+            }
+        }
+    }
+    return counts;
 }
 
 std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(

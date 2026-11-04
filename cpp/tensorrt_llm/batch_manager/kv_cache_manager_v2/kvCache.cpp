@@ -58,13 +58,14 @@ int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleI
 // KvCache constructor
 // ---------------------------------------------------------------------------
 
-KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
-    std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly, bool enableRequestStats,
+KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<LocalityDomainId> localityDomainId,
+    std::optional<BlockRadixTree::ReuseMatch> reuseMatch, std::optional<RequestIdType> mId, PriorityCb priorityCb,
+    std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
     std::optional<executor::KvCacheRetentionConfig> retentionConfig, bool isPrefetch)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
+    , mLocalityDomainId(localityDomainId)
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
     , mRetentionConfig(std::move(retentionConfig))
     , mStatus(Status::SUSPENDED)
@@ -552,8 +553,8 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
         throw std::invalid_argument("OPTIONAL reuse selection is only valid before the first resume");
     }
 
-    // Check utilization against threshold. Allocation is per domain, so the guard is too.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel, localityDomainId());
+    // Check utilization against threshold.
+    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
     {

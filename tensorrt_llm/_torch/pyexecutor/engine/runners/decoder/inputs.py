@@ -12,7 +12,10 @@ from typing import Any
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
@@ -363,8 +366,10 @@ class DecoderInputPreparer:
         use_beam_search: bool,
         steady_gen_cache_supported: bool,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
+        attention_runtime_features: AttentionRuntimeFeatures | None = None,
     ) -> None:
         self._buffers = buffers
+        self._attention_runtime_features = attention_runtime_features or AttentionRuntimeFeatures()
         self._pinned_host_cache = {}
         self._pinned_host_active = {}
         self._mm_item_scheduler = mm_item_scheduler
@@ -1273,10 +1278,7 @@ class DecoderInputPreparer:
 
         # Chunked prefill keeps the scheduler order: MLA context then runs on
         # the single-kernel path and the context splits fall back to positional.
-        if (
-            host.locality_domain_reorder
-            and not self._config.attention_runtime_features.chunked_prefill
-        ):
+        if host.locality_domain_reorder and not self._attention_runtime_features.chunked_prefill:
             scheduled_requests.reset_context_requests(
                 sorted(scheduled_requests.context_requests, key=lambda r: r.py_locality_domain_id)
             )

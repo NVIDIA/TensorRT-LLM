@@ -184,7 +184,7 @@ public:
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
     // Ensure the requested free slots exist at this level (evicting pages as needed). On a
-    // localized GPU tier only pages of localityDomainId are evicted and counted as free.
+    // localized GPU tier the pages of localityDomainId are evicted first; other domains cover the rest.
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {},
         std::optional<LocalityDomainId> localityDomainId = std::nullopt);
@@ -489,6 +489,12 @@ private:
     LocalityDomainId resolveLocalityDomain(CacheLevel level, std::optional<LocalityDomainId> localityDomainId) const;
     std::optional<LocalityDomainId> localityDomainFilter(
         CacheLevel level, std::optional<LocalityDomainId> localityDomainId) const;
+    // The domain of a localized GPU tier is a preference: allocation for it may draw on every domain's slots once
+    // its own free and evictable slots run out.
+    [[nodiscard]] bool localityDomainHint(CacheLevel level) const;
+    [[nodiscard]] SlotCount allocatableSlots(CacheLevel level, PoolGroupBase const& pg, LocalityDomainId domain) const;
+    std::vector<Slot> allocatePreferring(
+        CacheLevel level, PoolGroupBase& pg, SlotCount numSlots, LocalityDomainId domain);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,

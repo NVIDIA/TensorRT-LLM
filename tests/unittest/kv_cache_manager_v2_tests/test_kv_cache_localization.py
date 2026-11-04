@@ -17,7 +17,7 @@
 Localized tests opt in with GpuCacheTierConfig(enable_locality_domains=True) and set
 TRT_LLM_MOCK_LOCALIZATION_SUPPORT=1, so the manager reports two domains backed by
 ordinary device memory. Physical placement is therefore not verified here; the
-metadata, addressing, reuse isolation and per-domain capacity are.
+metadata, addressing, cross-domain reuse and per-domain capacity are.
 """
 
 import gc
@@ -129,10 +129,6 @@ def _make_non_localized_manager(**kwargs) -> KVCacheManager:
         return KVCacheManager(config)
 
 
-def _scope(locality_domain_id: int | None) -> ReuseScope:
-    return ReuseScope(locality_domain_id=locality_domain_id)
-
-
 def _valid_page_indices(kv_cache: _KVCache, layer_group_id: int = 0) -> list[int]:
     return [idx for idx in kv_cache.get_base_page_indices(layer_group_id) if idx != BAD_PAGE_INDEX]
 
@@ -168,9 +164,9 @@ class TestLocalityDomainId(_ManagerTestCase):
     def test_stored_on_creation(self) -> None:
         self.manager = _make_localized_manager()
         for domain in (0, 1):
-            kv_cache = self.manager.create_kv_cache(_scope(domain))
+            kv_cache = self.manager.create_kv_cache(locality_domain_id=domain)
             self.assertEqual(kv_cache.locality_domain_id, domain)
-            self.assertEqual(kv_cache.reuse_scope.locality_domain_id, domain)
+            self.assertEqual(kv_cache.reuse_scope, ReuseScope())
             kv_cache.close()
 
     def test_none_when_not_localized(self) -> None:
@@ -183,10 +179,10 @@ class TestLocalityDomainId(_ManagerTestCase):
     def test_out_of_range_rejected(self) -> None:
         self.manager = _make_localized_manager()
         with self.assertRaises(Exception):
-            self.manager.create_kv_cache(_scope(2))
+            self.manager.create_kv_cache(locality_domain_id=2)
         self.manager = _make_non_localized_manager()
         with self.assertRaises(Exception):
-            self.manager.create_kv_cache(_scope(0))
+            self.manager.create_kv_cache(locality_domain_id=0)
 
 
 class TestLocalizedQueries(_ManagerTestCase):
@@ -204,7 +200,7 @@ class TestLocalizedQueries(_ManagerTestCase):
         self.assertGreater(before[0], 0)
         self.assertEqual(before[0], before[1])
 
-        kv_cache = self.manager.create_kv_cache(_scope(1))
+        kv_cache = self.manager.create_kv_cache(locality_domain_id=1)
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
             self.assertTrue(kv_cache.resume(stream))
@@ -224,7 +220,7 @@ class TestLocalizedQueries(_ManagerTestCase):
 
     def test_page_index_upper_bound_covers_both_domains(self) -> None:
         self.manager = _make_localized_manager()
-        caches = [self.manager.create_kv_cache(_scope(domain)) for domain in (0, 1)]
+        caches = [self.manager.create_kv_cache(locality_domain_id=domain) for domain in (0, 1)]
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
             for kv_cache in caches:
@@ -254,23 +250,23 @@ class TestLocalizedReuse(_ManagerTestCase):
     def test_same_domain_reuses_blocks(self) -> None:
         self.manager = _make_localized_manager()
         tokens = list(range(64))
-        kv_a = self.manager.create_kv_cache(_scope(0), tokens[:-1])
+        kv_a = self.manager.create_kv_cache(None, tokens[:-1], locality_domain_id=0)
         self._commit_and_close(kv_a, tokens, 128)
-        kv_b = self.manager.create_kv_cache(_scope(0), tokens[:-1])
+        kv_b = self.manager.create_kv_cache(None, tokens[:-1], locality_domain_id=0)
         self.assertGreater(kv_b.num_committed_tokens, 0)
         self._commit_and_close(kv_b, tokens, 128)
 
-    def test_other_domain_does_not_reuse_blocks(self) -> None:
+    def test_other_domain_reuses_blocks(self) -> None:
         self.manager = _make_localized_manager()
         tokens = list(range(64))
-        kv_a = self.manager.create_kv_cache(_scope(0), tokens[:-1])
+        kv_a = self.manager.create_kv_cache(None, tokens[:-1], locality_domain_id=0)
         self._commit_and_close(kv_a, tokens, 128)
-        kv_b = self.manager.create_kv_cache(_scope(1), tokens[:-1])
-        self.assertEqual(kv_b.num_committed_tokens, 0)
-        self._commit_and_close(kv_b, tokens, 128)
-        kv_c = self.manager.create_kv_cache(_scope(1), tokens[:-1])
-        self.assertGreater(kv_c.num_committed_tokens, 0)
-        kv_c.close()
+        resident = self.manager.probe_reuse_domains(ReuseScope(), tokens[:-1])
+        self.assertGreater(resident[0], 0)
+        self.assertEqual(resident[1], 0)
+        kv_b = self.manager.create_kv_cache(None, tokens[:-1], locality_domain_id=1)
+        self.assertGreater(kv_b.num_committed_tokens, 0)
+        kv_b.close()
 
     def test_non_localized_reuse_unaffected(self) -> None:
         self.manager = _make_non_localized_manager()
@@ -285,7 +281,7 @@ class TestLocalizedReuse(_ManagerTestCase):
 class TestLocalizedSuspendResume(_ManagerTestCase):
     def test_suspend_resume_preserves_domain_and_pages(self) -> None:
         self.manager = _make_localized_manager()
-        kv_cache = self.manager.create_kv_cache(_scope(1))
+        kv_cache = self.manager.create_kv_cache(locality_domain_id=1)
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
             self.assertTrue(kv_cache.resume(stream))

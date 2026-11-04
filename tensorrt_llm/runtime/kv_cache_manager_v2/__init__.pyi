@@ -140,14 +140,11 @@ class ReuseScope:
         self,
         lora_id: int | None = None,
         salt: str | None = None,
-        locality_domain_id: int | None = None,
     ) -> None: ...
     @property
     def lora_id(self) -> int | None: ...
     @property
     def salt(self) -> str | None: ...
-    @property
-    def locality_domain_id(self) -> int | None: ...
     def __len__(self) -> int: ...
     def __getitem__(self, index: int) -> int | str | None: ...
     def __iter__(self) -> Iterator[int | str | None]: ...
@@ -1826,6 +1823,7 @@ class KVCacheManager:
         text_only: bool | None = None,
         enable_request_stats: bool = False,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        locality_domain_id: int | None = None,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -1847,6 +1845,10 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
+    def probe_reuse_domains(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+    ) -> list[int]:
+        """GPU-resident pages of the reuse match for input_tokens, counted per locality domain."""
     def probe_first_new_block_key(
         self,
         reuse_scope: ReuseScope | None = None,
