@@ -611,7 +611,10 @@ def test_moe_observation_is_fullgraph_compile_safe() -> None:
 
     logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     compiled = torch.compile(forward, backend="eager", fullgraph=True)
-    torch.testing.assert_close(compiled(logits), forward(logits))
+    expected = forward(logits)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        actual = compiled(logits)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.cpu_only
