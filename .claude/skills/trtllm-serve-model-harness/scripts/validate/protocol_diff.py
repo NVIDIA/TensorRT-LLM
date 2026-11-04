@@ -46,7 +46,9 @@ attributed: serve the differential deterministically (no KV-cache block reuse,
 one request at a time) to settle it.
 
 Exit code: 0 no server-side difference; 1 a server-side difference; 2 not
-conclusive (no turns to compare, or only divergent generations); 3 usage error.
+conclusive (no turns to compare, only divergent generations, or a shard that
+cannot be read to its end: the message names it, and no report is written);
+3 usage error.
 Nothing in the report carries content: lengths and SHA-256 prefixes only.
 """
 
@@ -61,7 +63,7 @@ import proto_anthropic  # noqa: E402
 import proto_chat  # noqa: E402
 import proto_responses  # noqa: E402
 import usage as usage_mod  # noqa: E402
-from tracelib import expand_shards, iter_lines, load_json_line  # noqa: E402
+from tracelib import ShardError, expand_shards, iter_lines, load_json_line  # noqa: E402
 from turnlib import _canonical, content_text, sha256_text  # noqa: E402
 
 ADAPTERS = {"/v1/chat/completions": proto_chat, "/v1/responses": proto_responses,
@@ -373,7 +375,11 @@ def main(argv=None) -> int:
         if not path:
             print(f"protocol_diff.py: expected LABEL=TRACE_DIR, got {spec!r}", file=sys.stderr)
             return 3
-        runs[label] = load_run(path)
+        try:
+            runs[label] = load_run(path)
+        except ShardError as error:  # turns from part of a shard would compare as all of them
+            print(f"protocol_diff.py: {error}", file=sys.stderr)
+            return 2
     report = compare(runs)
     report["protocols"] = {
         label: sorted({t["protocol"] for t in turns}) for label, turns in runs.items()

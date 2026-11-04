@@ -60,6 +60,10 @@ usage: check_tool_calls.py --out report.json [--workers N] [--requests PATH ...]
 PATH: shards or directories. Request shards are read from --requests when
 given, else from the same paths. Output carries tool names, classes, schema
 keywords and JSON paths -- never argument values or text.
+
+Exit code: 0 no check FAILs; 1 a check FAILs; 2 nothing could be judged, as a
+shard cannot be read to its end (cut short or corrupt: the message names it, and
+no report is written) or the arguments are wrong.
 """
 
 import argparse
@@ -76,6 +80,7 @@ from collections import Counter, defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tracelib import (  # noqa: E402
     CALL_TYPES,
+    ShardError,
     expand_shards,
     group_of,
     item_texts,
@@ -527,4 +532,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ShardError as error:  # nothing is judged on a shard that cannot be read to its end
+        print(error, file=sys.stderr)
+        sys.exit(2)

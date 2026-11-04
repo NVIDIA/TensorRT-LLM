@@ -143,6 +143,35 @@ def test_check_stream_judges_nothing_in_a_trace_without_streams(tmp_path):
     assert result.returncode == 2, result.stderr
 
 
+def _write_cut_gz(path, records):
+    """A ``.gz`` shard of ``records`` cut in half: it cannot be read to its end."""
+    import gzip
+
+    packed = gzip.compress("".join(json.dumps(r) + "\n" for r in records).encode())
+    path.write_bytes(packed[: len(packed) // 2])
+
+
+@pytest.mark.parametrize("side,workers", [("requests", 1), ("responses", 2)])
+def test_check_tool_calls_cannot_judge_a_cut_shard(tmp_path, side, workers):
+    """A cut shard is no FAIL, read in-process or by a worker: exit 2 and no report."""
+    import subprocess
+
+    request = {"event": "request", "route": "/v1/responses", "body": {"model": "m", "input": "go"}}
+    response = {"event": "response", "response": {"kind": "json", "body": {"output": []}}}
+    records = {"requests": [dict(request, trace_id=f"t{i}") for i in range(20)],
+               "responses": [dict(response, trace_id=f"t{i}") for i in range(20)]}  # fmt: skip
+    for kind, rows in records.items():
+        (tmp_path / f"{kind}-1.jsonl").write_text(json.dumps(rows[0]) + "\n")
+    cut = tmp_path / f"{side}-2.jsonl.gz"
+    _write_cut_gz(cut, records[side])
+    out = tmp_path / "report.json"
+    result = subprocess.run([sys.executable, os.path.join(VALIDATE, "check_tool_calls.py"),
+                             "--workers", str(workers), "--out", str(out), str(tmp_path)],
+                            capture_output=True, text=True)  # fmt: skip
+    assert (result.returncode, out.exists()) == (2, False), result.stdout + result.stderr
+    assert str(cut) in result.stderr and "Traceback" not in result.stderr
+
+
 def test_harness_signals_refuses_a_file_it_cannot_read(tmp_path):
     """A shard's name says which side it holds: a file named otherwise is an error, not a crash."""
     import harness_signals
@@ -404,6 +433,23 @@ def test_protocol_diff_turns_leave_the_tools_out(tmp_path):
     row = protocol_diff.compare(runs)["rows"][0]["messages"]
     assert row["attribution"] == "harness_literal"
     assert row["request_equal"]["turns"] is True
+
+
+@pytest.mark.parametrize("damage", ["cut_gz", "cut_last_line"])
+def test_protocol_diff_cannot_judge_a_cut_shard(tmp_path, capsys, damage):
+    """A shard that cannot be read to its end is not conclusive (exit 2), not a difference."""
+    chat, anth = controls.diff_runs(str(tmp_path), billed=9)
+    runs = [f"chat={chat}", f"messages={anth}"]
+    assert protocol_diff.main(["--out", str(tmp_path / "whole.json")] + runs) == 1
+    if damage == "cut_gz":
+        cut = tmp_path / "anth" / "requests-y.jsonl.gz"
+        _write_cut_gz(cut, [{"event": "request", "trace_id": f"a{i}"} for i in range(20)])
+    else:
+        cut = tmp_path / "chat" / "responses-y.jsonl"
+        cut.write_text('{"event": "response", "trace_id": "c9", "resp')
+    out = tmp_path / "report.json"
+    assert protocol_diff.main(["--out", str(out)] + runs) == 2
+    assert not out.exists() and str(cut) in capsys.readouterr().err
 
 
 def test_verdict_names_the_matrix_bytes_it_read(tmp_path):
