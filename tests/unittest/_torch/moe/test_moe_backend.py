@@ -6820,6 +6820,9 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         routing_method=SimpleNamespace(
             experts_per_token=1, requires_separated_routing=True, apply=route
         ),
+        # The scheduler reads this before asking for a sorted route; the stub's
+        # backends never produce one, so it must decline.
+        sort_routing_applies=False,
         calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
         split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
         determine_communication_method=no_op,

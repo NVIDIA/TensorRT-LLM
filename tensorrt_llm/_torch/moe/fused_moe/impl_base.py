@@ -319,11 +319,13 @@ class MoEImplBase(
 
     def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
         """Keep ``num_sms`` SMs free of ``run_moe``'s persistent grid for kernels another
-        stream runs beside it; returns the SMs kept free from now on.
+        stream runs beside it; returns the SMs the count applied.
 
-        Called once by a model that runs other work (e.g. a shared expert) on a side stream
-        while the routed experts run. Declining (0, the default) means the backend does not
-        size a persistent grid it could shrink; overriding this is how a backend opts in.
+        Asked per forward by a model that runs other work (e.g. a shared expert) beside the
+        routed experts: it declares the count only while that work truly overlaps, and hands
+        0 for an in-order launch so the grid keeps every SM. Declining (0, the default)
+        means the backend does not size a persistent grid it could shrink; overriding this
+        is how a backend opts in.
         """
         return 0
 

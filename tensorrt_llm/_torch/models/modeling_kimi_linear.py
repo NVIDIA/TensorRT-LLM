@@ -96,6 +96,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     List,
     Literal,
     NamedTuple,
@@ -185,14 +186,21 @@ _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS = 80
 # Largest token count for which the router GEMM is issued before latent_down.
 _ROUTER_FIRST_MAX_TOKENS = 64
+# The router-logits kernel pays where the K3 latent stream lets its result be consumed
+# early: measured on GB300 (SM103) and VR200 (SM107). SM100 keeps ``dsv3_router_gemm_op``:
+# without the overlap the shorter launch only shortens the route tail it replaced.
+_ROUTER_LOGITS_KERNEL_SMS = ((10, 3), (10, 7))
 # SMs the shared expert's GEMMs keep to while they run beside routed experts whose backend leaves
 # that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``;
 # the fused FC12 kernel on Rubin does). 16 of the R200's SMs is the measured split.
 _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID = 16
+# The prequantized low-M kernel's folded scale load does not advance to a second R128c4
+# row block, so ``takes_prequantized_input`` serves at most one such block of rows.
+_PREQUANTIZED_INPUT_MAX_ROWS = 128
 
 
 @contextmanager
-def _cublas_sm_limit(num_sms: int):
+def _cublas_sm_limit(num_sms: int) -> Iterator[None]:
     """Run the cuBLAS GEMMs issued inside on ``num_sms`` SMs (no limit for 0).
 
     Uses torch's SM carveout, which cuBLAS reads when a GEMM is issued, so CUDA graph capture
@@ -275,7 +283,12 @@ class KimiK3MoEGate(nn.Module):
                 from ..moe.kernels.blackwell import kimi_k3_router_logits
 
                 x = hidden_2d.contiguous()
-                if kimi_k3_router_logits.can_run(x, self.weight):
+                if (
+                    kimi_k3_router_logits.can_run(x, self.weight)
+                    # Measured SMs only (_ROUTER_LOGITS_KERNEL_SMS): an unmeasured SM keeps
+                    # the kernel it replaces.
+                    and torch.cuda.get_device_capability(x.device) in _ROUTER_LOGITS_KERNEL_SMS
+                ):
                     return torch.ops.trtllm.kimi_k3_router_logits(x, self.weight)
             return torch.ops.trtllm.dsv3_router_gemm_op(
                 hidden_2d.contiguous(),
@@ -1154,8 +1167,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         ``num_rows`` rows instead of the BF16 rows: where :meth:`forward` runs the low-M kernel,
         so an operand quantized with its arithmetic
         (``fp8_block_scale_low_m_gemm.mxfp8_quantize_reference``) projects bitwise like
-        :meth:`forward` and the kernel skips the quantization."""
-        return 1 <= num_rows <= self._low_m.kernel_max_m
+        :meth:`forward` and the kernel skips the quantization.
+
+        At most one 128-row R128c4 scale block: the kernel's folded scale load does not
+        advance to the next row block, so a wider forward takes the BF16 rows."""
+        return 1 <= num_rows <= min(self._low_m.kernel_max_m, _PREQUANTIZED_INPUT_MAX_ROWS)
 
     @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1672,6 +1688,15 @@ class KimiK3MoERuntime(nn.Module):
         )
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
+        # The router-logits kernel pays where the K3 latent stream lets its result be
+        # consumed early (CuteDSL / CuteDSL-FC12); elsewhere (the default TRTLLM backend,
+        # no-graph forwards) the shorter launch only shortens the route tail, so those
+        # keep ``trtllm::dsv3_router_gemm_op``.
+        if self.gate.logits_kernel:
+            self.gate.logits_kernel = routed_moe_model_config.moe_backend in (
+                "CUTEDSL",
+                "CUTEDSL_FC12",
+            )
         routed_quant_config = self._resolve_routed_quant_config(model_config, layer_idx)
         # Resolved here so ``load_weights`` reads the checkpoint layout off the
         # module instead of re-deriving it at each of its three call sites.
@@ -1814,17 +1839,19 @@ class KimiK3MoERuntime(nn.Module):
             and not self._defer_shared_allreduce
             and not (isinstance(shared_down, TrtllmLinear) and shared_down.use_fused_gemm_allreduce)
         )
-        # A persistent routed grid that leaves SMs free (CUTEDSL_FC12) runs beside the shared
-        # expert, whose GEMMs keep to those SMs, instead of waiting for them. MoE modules and
-        # backends outside the ``MoEImplBase`` contract do not offer it.
-        reserve_sms = getattr(
-            getattr(self.routed_experts, "backend", None),
-            "reserve_sms_for_concurrent_kernels",
-            None,
-        )
+        # A persistent routed grid that leaves SMs free (CUTEDSL_FC12) can run beside the
+        # shared expert, whose GEMMs keep to those SMs while they go through torch's cuBLAS
+        # (``F.linear``); a CuTe DSL shared GEMM (``use_cute_dsl_bf16_gemm`` /
+        # ``use_custom_cublas_mm``) ignores the carveout, and reserving SMs for it only shrinks
+        # the routed grid. The backend is asked per forward (_routed_output): an in-order
+        # launch has nothing beside its grid and keeps every SM.
         self._shared_sms = (
-            reserve_sms(_SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID)
-            if reserve_sms is not None and not self._defer_shared_allreduce
+            _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID
+            if not self._defer_shared_allreduce
+            and not (
+                getattr(shared_down, "use_cute_dsl_bf16_gemm", False)
+                or getattr(shared_down, "use_custom_cublas_mm", False)
+            )
             else 0
         )
         self.routed_expert_down_proj = nn.Linear(
@@ -2121,7 +2148,10 @@ class KimiK3MoERuntime(nn.Module):
           logits is the gate's choice, see ``KimiK3MoEGate``.)
         - When the routed experts take an NVFP4 input as is (``nvfp4_input_scale``), latent_down
           emits it from its GEMM epilogue where the projection serves this many rows
-          (``_Fp8BlockScaleWeightReadLinear.emits_nvfp4``).
+          (``_Fp8BlockScaleWeightReadLinear.emits_nvfp4`` -- the weight-read swap itself is the
+          existing ``KIMI_K3_FP8_WEIGHT_READ_MOE_MLP`` opt-in, so a default deployment never
+          takes this branch), and only when the sorting kernel routes this batch
+          (``routes_with_sort_tables``): the epilogue's route tactics were tuned beside it.
         - When the routing kernel also writes the experts' ``moe_sort`` tables
           (``routes_with_sort_tables``), the routing chain is short enough that the persistent
           routed grid, which holds every SM, launches while the shared expert's GEMMs or
@@ -2151,6 +2181,9 @@ class KimiK3MoERuntime(nn.Module):
                 nvfp4_scale is not None
                 and isinstance(down, _Fp8BlockScaleWeightReadLinear)
                 and down.emits_nvfp4(num_tokens)
+                # The fused epilogue's route tactics were tuned with the routing kernel
+                # beside them; without it (e.g. a locality-domain policy) it is a loss.
+                and moe.routes_with_sort_tables(num_tokens)
             ),
         )
 
@@ -2274,6 +2307,13 @@ class KimiK3MoERuntime(nn.Module):
                 routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             if isinstance(routed_in, Fp4QuantizedTensor):
                 moe_kwargs["output_dtype"] = hidden_states.dtype
+            # Only a launch with the shared expert beside it (multi-stream) gives up SMs;
+            # an in-order launch keeps the full grid. Re-asked per forward: eager forwards
+            # launch here, a captured graph bakes the launch's reserve in.
+            if not torch.compiler.is_compiling():
+                self.routed_experts.backend.reserve_sms_for_concurrent_kernels(
+                    self._shared_sms if do_multi_stream() else 0
+                )
             y = self.routed_experts(
                 routed_in,
                 router_logits,
@@ -2978,10 +3018,34 @@ class KimiLinearModel(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
+    def _prewarm_k3_moe_front_kernels(self) -> int:
+        """Compile the MoE front's kernels (sorting routing, router logits) ahead of serving,
+        so no first 65-256-token forward compiles them; returns the kernels compiled (0 when
+        this deployment keeps the front on the ops the kernels replace)."""
+        from ..moe.kernels.blackwell import kimi_k3_router_logits, kimi_k3_routing
+
+        runtime = next(
+            (
+                getattr(layer, "block_sparse_moe", None)
+                for layer in self.layers
+                if getattr(layer, "block_sparse_moe", None) is not None
+            ),
+            None,
+        )
+        if runtime is None:
+            return 0
+        compiled = 0
+        if runtime.gate.logits_kernel:
+            compiled += kimi_k3_router_logits.precompile()
+        if runtime.routed_experts.sort_routing_applies:
+            compiled += kimi_k3_routing.precompile(self.num_experts)
+        return compiled
+
     def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
-        """JIT-compile the decode attention-residual kernel variants (``kimi_k3_attn_res``) and
-        the prequantized FP8 low-M GEMMs that forwards of up to ``max_num_tokens`` tokens reach,
-        so no served step compiles them; returns the number of kernels compiled.
+        """JIT-compile the decode attention-residual kernel variants (``kimi_k3_attn_res``), the
+        MoE front's sorting-routing and router-logits kernels, and the prequantized FP8 low-M
+        GEMMs that forwards of up to ``max_num_tokens`` tokens reach, so no served step compiles
+        them; returns the number of kernels compiled.
 
         The decode-kernel prewarm hook ``DecoderWarmup`` calls on every module that defines it.
         Depends only on the model layout, the device and the attention-residual settings, so
@@ -2989,8 +3053,9 @@ class KimiLinearModel(DecoderModel):
         batches, which hand the KDA projections MXFP8 operands.
         """
         device_index = torch.cuda.current_device()
+        compiled = self._prewarm_k3_moe_front_kernels()
         if not _FUSED_ATTN_RES_ENABLED or not _decode_attn_res_on_device(device_index):
-            return 0
+            return compiled
         from ..kernels.blackwell import fp8_block_scale_low_m_gemm, kimi_k3_attn_res
 
         cfg = self._text_cfg
@@ -3012,7 +3077,7 @@ class KimiLinearModel(DecoderModel):
                 variant.mxfp8,
                 variant.snapshots_after_wait,
             )
-        compiled = len(variants)
+        compiled += len(variants)
         if not verify_batches:
             return compiled
         # Prequantized GEMMs: the KDA q/k/v/g projections fed by the mix's MXFP8 output, and the

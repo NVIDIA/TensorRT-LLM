@@ -57,7 +57,12 @@ from ..interface import MoESchedulerKind, _reject
 from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from ..routing import BaseMoeRoutingMethod
 from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
-from .kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from .kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    prequantized_nvfp4_input_scale,
+    quantize_input_nvfp4,
+)
 from .runners import CuteDslFusedMoENvfp4Runner
 
 
@@ -250,16 +255,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # all-to-all combine workspace.
         return True
 
-    def prequantized_nvfp4_input_scale(self) -> torch.Tensor | None:
-        """``quantize_input`` passes an unswizzled ``Fp4QuantizedTensor`` through, except on a
-        layer with a pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC)."""
-        if getattr(self, "fc31_act_scale", None) is not None:
-            return None
-        return self.fc31_input_scale
-
     def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
         """The fused kernel's persistent grid launches enough whole clusters fewer to leave
-        ``num_sms`` SMs without an FC12 CTA (``sm_reserve`` of the op)."""
+        ``num_sms`` SMs without an FC12 CTA (``reserved_sms`` of the op)."""
         if num_sms < 0:
             raise ValueError(f"num_sms must be non-negative, got {num_sms}")
         self._concurrent_sm_reserve = num_sms
@@ -295,7 +293,10 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # Input quantization and dispatch (NVFP4 only)
     # ------------------------------------------------------------------
+    # Shared NVFP4 input handling: the passthrough rule and its prequant
+    # exception live once in kernel_inputs.py, bound like quantize_input.
     quantize_input = quantize_input_nvfp4
+    prequantized_nvfp4_input_scale = prequantized_nvfp4_input_scale
 
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
         del workspace  # the fused kernel allocates its own intermediates
@@ -482,6 +483,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             activation_type=int(self.activation_type),
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            sm_reserve=self._concurrent_sm_reserve,
+            reserved_sms=self._concurrent_sm_reserve,
         )
         return moe_output

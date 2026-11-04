@@ -37,6 +37,7 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
 from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
                                         nvmmh_enabled_for_nvfp4, nvmmh_fields,
                                         nvmmh_max_tactics, rank_configs)
+from .fast_custom_op import fast_custom_op
 
 try:
     from cuda.bindings import driver as cuda
@@ -5715,8 +5716,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scales = torch.empty((m * n // 16, ),
                              dtype=torch.uint8,
                              device=input.device)
-        return fp8_low_m.run_low_m_gemm_nvfp4(input, weight, weight_scale,
-                                              global_sf, codes, scales)
+        return fp8_low_m.run_low_m_gemm_nvfp4(
+            input,
+            weight,
+            weight_scale,
+            global_sf,
+            codes,
+            scales,
+            use_pdl=fp8_low_m.TRTLLM_ENABLE_PDL)
 
     @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm_nvfp4")
     def _(input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
@@ -5886,11 +5893,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 *_kimi_k3_attn_res_mxfp8_outputs(residual))
 
     # Ungrouped ``noaux_tc_op`` top-16 + ``moe_sort`` (128-row tiles) of one
-    # expert-parallel rank in one launch (``kimi_k3_routing.py``); inputs as
-    # ``kimi_k3_routing.can_run`` accepts them.
-    @torch.library.custom_op("trtllm::noaux_tc_route_sort",
-                             mutates_args=(),
-                             device_types="cuda")
+    # expert-parallel rank in one launch (``kimi_k3_routing.py``). Direct callers
+    # that bypass the scheduler cannot read the kernel's limits off a decline,
+    # so the op re-raises ``kimi_k3_routing.can_run``'s rejection.
+    @fast_custom_op("trtllm::noaux_tc_route_sort",
+                    mutates_args=(),
+                    device_types="cuda")
     def noaux_tc_route_sort(
         logits: torch.Tensor, e_score_correction_bias: torch.Tensor,
         routed_scaling_factor: float, local_expert_offset: int,
@@ -5904,6 +5912,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         entries are written (as in ``moe_sort``), and the rows of an expert are in ascending
         token order.
         """
+        if not kimi_k3_routing.can_run(logits, e_score_correction_bias,
+                                       local_expert_offset, local_num_experts):
+            raise ValueError(
+                "noaux_tc_route_sort: unsupported operands (needs contiguous "
+                "16-byte-aligned FP32 logits "
+                f"[1, {kimi_k3_routing.MAX_M}] x a multiple of 128 experts up to "
+                f"{kimi_k3_routing.MAX_EXPERTS} on an SM100/SM103/SM107 CUDA device, and a "
+                "matching FP32 bias on the same device; got "
+                f"shape={tuple(logits.shape)}, dtype={logits.dtype}, "
+                f"device={logits.device})")
         m = logits.shape[0]
         topk_ids = torch.empty((m, kimi_k3_routing.TOP_K),
                                dtype=torch.int32,
@@ -5922,7 +5940,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     @torch.library.register_fake("trtllm::noaux_tc_route_sort")
     def _(logits: torch.Tensor, e_score_correction_bias: torch.Tensor,
           routed_scaling_factor: float, local_expert_offset: int,
-          local_num_experts: int):
+          local_num_experts: int) -> Tuple[torch.Tensor, ...]:
         m = logits.shape[0]
         max_tiles, max_permuted = kimi_k3_routing.sort_buffer_sizes(
             m, local_num_experts)
@@ -5945,9 +5963,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # weight, bit-identical to ``dsv3_router_gemm_op(hidden_states, weight.t())``
     # (``kimi_k3_router_logits.py``); inputs as ``kimi_k3_router_logits.can_run``
     # accepts them.
-    @torch.library.custom_op("trtllm::kimi_k3_router_logits",
-                             mutates_args=(),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::kimi_k3_router_logits",
+                    mutates_args=(),
+                    device_types="cuda")
     def kimi_k3_router_logits_op(hidden_states: torch.Tensor,
                                  weight: torch.Tensor) -> torch.Tensor:
         if not kimi_k3_router_logits.can_run(hidden_states, weight):
@@ -19112,7 +19130,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             runs 1-CTA (mma_tiler 128x{128,256}, cluster (1,1)) and
             tile_size=256 runs 2-CTA (mma_tiler 256x{128,256}, cluster (2,1));
             the autotuner picks between them per shape.  scheduler="l2_atomic".
-            ``sm_reserve`` SMs are left without an FC12 CTA (whole clusters fewer,
+            ``reserved_sms`` SMs are left without an FC12 CTA (whole clusters fewer,
             at least one launched): one CTA fills an SM's register file, so kernels
             another stream issues while FC12 runs otherwise get SMs only as its CTAs
             exit. FC12 hands tiles out through atomic counters, so fewer CTAs change
@@ -19136,7 +19154,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type: ActivationType = ActivationType.Swiglu,
                     situ_beta: Optional[float] = None,
                     situ_linear_beta: Optional[float] = None,
-                    sm_reserve: int = 0):
+                    reserved_sms: int = 0):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -19148,10 +19166,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.activation_type = ActivationType(int(activation_type))
                 self.situ_beta = situ_beta
                 self.situ_linear_beta = situ_linear_beta
-                if sm_reserve < 0:
+                if reserved_sms < 0:
                     raise ValueError(
-                        f"sm_reserve must be non-negative, got {sm_reserve}")
-                self.sm_reserve = sm_reserve
+                        f"reserved_sms must be non-negative, got {reserved_sms}"
+                    )
+                self.reserved_sms = reserved_sms
                 # Used only by the in-op output memset (moved here so the memset
                 # is the fused kernel's immediate stream predecessor).
                 self.ep_size = ep_size
@@ -19179,7 +19198,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     int(self.activation_type),
                     self.situ_beta,
                     self.situ_linear_beta,
-                    self.sm_reserve,
+                    self.reserved_sms,
                 )
 
             def get_valid_tactics(
@@ -19467,7 +19486,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
                 max_active_clusters = reserved_max_active_clusters(
                     get_max_activate_clusters(cluster_size), cluster_size,
-                    self.sm_reserve)
+                    self.reserved_sms)
 
                 # The fused kernel exposes only ``__call__`` (cute.Tensor args),
                 # no ptr-based wrapper. ``make_ordered_layout`` needs an MLIR
@@ -19735,7 +19754,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: ActivationType = ActivationType.Swiglu,
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
-            sm_reserve: int = 0,
+            reserved_sms: int = 0,
         ) -> torch.Tensor:
             tuner = AutoTuner.get()
             runner = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
@@ -19751,7 +19770,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 activation_type=ActivationType(activation_type),
                 situ_beta=_canonicalize_situ_beta(situ_beta),
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
-                sm_reserve=sm_reserve,
+                reserved_sms=reserved_sms,
             )
             # Input order matches Fc12FusedInputsHelper (FC1 prefix 0..9 mirrors
             # GatherGroupedGemmInputsHelper; FC2 tensors 10..14; expanded_idx 15
@@ -19791,7 +19810,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "str? precomputed_tactic=None, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
             "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
-            "SymInt sm_reserve=0) -> ()",
+            "SymInt reserved_sms=0) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_fc12_fused_rubin(
             input: torch.Tensor,
@@ -19823,7 +19842,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
-            sm_reserve: int = 0,
+            reserved_sms: int = 0,
         ) -> None:
             # In-place: finalize scatter-adds into ``output`` (mutates_args);
             # the op returns nothing so it does not alias its own input.
@@ -19838,7 +19857,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ep_size, enable_alltoall,
                 "trtllm::cute_dsl_nvfp4_fc12_fused_rubin",
                 ActivationType(activation_type), situ_beta, situ_linear_beta,
-                sm_reserve)
+                reserved_sms)
 
         @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
         def _(
@@ -19871,6 +19890,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
-            sm_reserve: int = 0,
+            reserved_sms: int = 0,
         ) -> None:
             return None
