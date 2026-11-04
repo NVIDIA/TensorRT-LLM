@@ -10,12 +10,12 @@
 # Checkpoint/download policy is recorded in run artifacts such as
 # validation/container_cache_preflight.json and baseline/baseline_manifest.yaml;
 # this YAML intentionally contains only VisualGenArgs-supported runtime fields.
-# The native transformer/scheduler run in TRTLLM; the image VAE currently uses
+# The native transformer runs in TRTLLM; the scheduler uses Diffusers and the VAE uses
 # the declared Diffusers AutoencoderKLQwenImage21 fallback recorded in the model
 # enablement manifest and M8 performance evidence.
 # Production wiring coverage:
 # - examples/visual_gen/models/qwen_image_21.py
-# - docs/source/examples/visual_gen/qwen-image-2.1.md
+# - docs/source/models/visual-generation.md
 # - tests/unittest/visual_gen/test_qwen_image_21_production_artifacts.py
 # - tests/unittest/_torch/visual_gen/test_qwen_image_21_*.py
 # - tests/scripts/perf-sanity/visual_gen/qwen_image_21_blackwell.yaml
