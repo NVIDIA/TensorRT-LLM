@@ -65,7 +65,9 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16).
+    # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16),
+    # capture (False): run the call inside a captured CUDA graph, replayed over two steps'
+    # logits, rather than eagerly.
     # The default target's HC mixers run this form at every row count, on the fresh
     # fp32 `cublas_mm` output over the first `hc_first_cols` = ceil((320 + 4) / 32) * 32
     # = 352 columns of the first projection: hence the 352-wide cells.
@@ -93,6 +95,25 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
             why="default stack-final mixer (no inject): one decode token",
             spec=dict(rows=1, inject=False, logits_width=352),
         ),
+        # The FP8 unified target's HC mixers (`modeling._hc_mixer`) inside its captured
+        # decode graph, at the batches its engines captured (runtime_facts.yaml): 1..128 rows
+        # at tp1/tp2/tep2/tp4/tep4, 1..64 a dep2 rank, 1..32 a dep4 rank.
+        Cell(
+            why="FP8 unified captured HC mixer, batch 2: 352-wide logits",
+            spec=dict(rows=2, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured HC mixer, batch 72: 352-wide logits",
+            spec=dict(rows=72, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured HC mixer, batch 120: 352-wide logits",
+            spec=dict(rows=120, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured HC mixer, batch 128 (the largest): 352-wide",
+            spec=dict(rows=128, logits_width=352, capture=True),
+        ),
     )
 
     note = """
@@ -103,7 +124,14 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     128 x 8 = 1024 rows (tep4, draft 7), prefill one chunk of up to 8192 rows
     (`max_num_tokens`). Preconditions: `logits` fp32, unit column stride, at
     least `rank (+ hc_count)` columns; `hc_count` a power of two.
-    Graph-capturable.
+
+    CUDA-graph capture (the `capture` cells): the call is captured over private
+    copies of a step's logits after an eager warmup; the replay is bitwise the
+    eager call it captured, and a second step's logits written into the
+    captured buffer replay bitwise their own eager call and inside the gate
+    against the reference. Certified at 2, 72, 120 and 128 rows, 352 wide,
+    with the injection: the FP8 unified target's captured decode batches
+    (largest 128).
 
     Source: a Triton kernel JIT-compiled at first call for the running device;
     the cells ran on sm_103. One program per row with an int64 row offset;
@@ -118,7 +146,9 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     Not certified: zero rows; rows past 8192; hc_count other than 4; rank
     other than 320; float16 outputs. The kernel has no row-count switch, so row
     counts between the cells take the same path, and the logits width enters
-    only as the row stride (128 rows is driven at 384 wide only).
+    only as the row stride. Not driven under capture: the stack-final mixer's
+    form without the injection (every captured decode step runs it, at the
+    same rows), and the other captured batches (1, 4..64, 80..112).
     """
 
     def __call__(

@@ -41,19 +41,18 @@ _WRITE_BLOCK = 1024
 _NUM_WARPS = 4
 
 
-def _cell(why: str, rows, windows, logits: str, tail: str = "nan", **extra) -> Cell:
-    return Cell(
-        why=why,
-        spec=dict(
-            rows=rows,
-            cols=extra.pop("cols", _SCORE_COLUMNS),
-            index_topk=_BLOCK_TOPK,
-            windows=windows,
-            logits=logits,
-            tail=tail,
-            selection=extra.pop("selection", "random"),
-            **extra,
-        ),
+def _spec(rows, windows, logits: str, tail: str = "nan", **extra) -> dict:
+    """One cell's spec: `rows` score rows of `cols` columns, selected at this checkpoint's
+    block budget, each row's window drawn by `windows`."""
+    return dict(
+        rows=rows,
+        cols=extra.pop("cols", _SCORE_COLUMNS),
+        index_topk=_BLOCK_TOPK,
+        windows=windows,
+        logits=logits,
+        tail=tail,
+        selection=extra.pop("selection", "random"),
+        **extra,
     )
 
 
@@ -398,38 +397,30 @@ class QsaCanonicalSelection(OpWrapper):
     # `random` is an exact top-k that keeps a random subset of the tie class at the k-th
     # value, in a random order (the adversary); `radix` is the engine the target calls.
     CELLS: tuple[Cell, ...] = (
-        _cell(
-            "decode: 1, 128 and 256 rows (MTP3 and MTP7 at batch 32)",
-            (1, 128, 256),
-            ("positions_random", 2051, 8191),
-            "relu",
+        Cell(
+            why="decode: 1, 128 and 256 rows (MTP3 and MTP7 at batch 32)",
+            spec=_spec((1, 128, 256), ("positions_random", 2051, 8191), "relu"),
         ),
-        _cell(
-            "prefill: 8192 rows from position 0",
-            8192,
-            ("chunk", 0),
-            "relu",
+        Cell(
+            why="prefill: 8192 rows from position 0",
+            spec=_spec(8192, ("chunk", 0), "relu"),
         ),
-        _cell(
-            "input from the radix engine (qsa_topk_select), zero ties",
-            64,
-            ("positions_random", 2051, 8191),
-            "relu_sparse",
-            selection="radix",
+        Cell(
+            why="input from the radix engine (qsa_topk_select), zero ties",
+            spec=_spec(64, ("positions_random", 2051, 8191), "relu_sparse", selection="radix"),
         ),
-        _cell(
-            "decode at up to 256k context: 65536-wide table, relu-zero ties",
-            (1, 16, 64),
-            ("positions_random", 2051, 262143),
-            "relu_sparse",
-            cols=_LONG_SCORE_COLUMNS,
+        Cell(
+            why="decode at up to 256k context: 65536-wide table, relu-zero ties",
+            spec=_spec(
+                (1, 16, 64),
+                ("positions_random", 2051, 262143),
+                "relu_sparse",
+                cols=_LONG_SCORE_COLUMNS,
+            ),
         ),
-        _cell(
-            "prefill: a 2048-row chunk ending at the 256k context",
-            2048,
-            ("chunk", 262144 - 2048),
-            "relu",
-            cols=_LONG_SCORE_COLUMNS,
+        Cell(
+            why="prefill: a 2048-row chunk ending at the 256k context",
+            spec=_spec(2048, ("chunk", 262144 - 2048), "relu", cols=_LONG_SCORE_COLUMNS),
         ),
     )
 

@@ -69,6 +69,8 @@ class Fp8Quantize1x128(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    # spec: tokens, hidden, use_ue8m0, capture (False): run the call inside a captured
+    # CUDA graph, replayed over two steps' activations, rather than eagerly.
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTPLayer._moe decode: one token at hidden 2560", spec=dict(tokens=1, **_CKPT)),
         Cell(
@@ -91,6 +93,23 @@ class Fp8Quantize1x128(OpWrapper):
             why="8192 rows: the MTP layer over one max_num_tokens context chunk",
             spec=dict(tokens=8192, **_CKPT),
         ),
+        # The FP8 unified target's routed experts (`modeling._routed_experts`) inside its
+        # captured decode graph, at the batches its engines captured (runtime_facts.yaml):
+        # a TP rank's rows 1..128 (tp1/tp2/tep2/tp4/tep4), an attention-DP group's gathered
+        # rows 2 x 1..64 (dep2) or 4 x 1..32 (dep4).
+        Cell(
+            why="FP8 unified captured decode: 8 rows (batch 8; dep2 2 x 4, dep4 4 x 2)",
+            spec=dict(tokens=8, **_CKPT, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured decode: 72 rows (batch 72)",
+            spec=dict(tokens=72, **_CKPT, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
+            "dep4 4 x 32 gathered)",
+            spec=dict(tokens=128, **_CKPT, capture=True),
+        ),
     )
 
     note = """
@@ -109,7 +128,15 @@ class Fp8Quantize1x128(OpWrapper):
     rows -- the padded rows are uninitialized, so a raw-pointer reader must
     stop at `T`. At a `T` that is a multiple of 4 (128, 1024, 8192) nothing is
     padded and `scales` is the kernel's own buffer, not a compacting copy.
-    CUDA-graph capture and replay are certified at 64, 128 and 1024 rows.
+
+    CUDA-graph capture (the `capture` cells): the call is captured over a
+    private copy of a step's activations after an eager warmup; the replay is
+    bitwise the eager call it captured, and a second step's activations written
+    into the captured buffer replay bitwise their own eager call and inside the
+    gate against the reference. Certified at 8, 72 and 128 rows, H 2560, plain
+    scales: the FP8 unified target's captured decode (largest 128 rows, a TP
+    rank's batch or an attention-DP group's gathered rows). Every captured
+    count is a multiple of 4, so no padded-row copy is captured.
 
     Source: compiled-in C++, `torch.ops.trtllm.fp8_quantize_1x128` from
     `thop/fp8Quantize.cpp` (`fp8_1x128_cs` -> `launch_scale_1x128`). The
@@ -126,17 +153,21 @@ class Fp8Quantize1x128(OpWrapper):
     of its rounding midpoint; scales within the 4-ulp gate.
 
     Hard limits
-      T   certified at 1, 20, 128, 1024, 8192 and 16384 at H 2560 (128: the
-          drafter's decode at max_batch_size 128; 1024: the first draft over
-          mtp7's 128 x 8 verify rows; 8192: a max_num_tokens context chunk;
-          16384: max_num_tokens of the tuned config); above that not probed
+      T   certified eager at 1, 20, 128, 1024, 8192 and 16384 at H 2560 (128:
+          the drafter's decode at max_batch_size 128; 1024: the first draft
+          over mtp7's 128 x 8 verify rows; 8192: a max_num_tokens context
+          chunk; 16384: max_num_tokens of the tuned config), captured at 8, 72
+          and 128; above 16384 not probed
       H   multiple of 16 (raises otherwise); certified at 2560, the draft layer's
           width
 
     Not certified: `T == 0` (the op accepts it and returns `[0, H]` /
     `[NB, 0]`); a short tail block (`H % 128 != 0`); all-zero blocks (the
     `AMAX_FLOOR` scale), `inf` / NaN inputs and saturation; `use_ue8m0=True`;
-    the element-wise fallback kernel; the registered fake.
+    the element-wise fallback kernel; the registered fake. Not driven under
+    capture: the other captured row counts (1, 2, 4, 16..64, 80..120) and a
+    count that is not a multiple of 4 (the compacting copy); the MTP verify and
+    draft steps' captured rows.
     """
 
     def __call__(
