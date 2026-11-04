@@ -172,6 +172,7 @@ def _loop_executor(monkeypatch, decoder, batches, log):
     # The setter mirrors the flag into the model engine, so it needs one.
     executor.is_warmup = False
     executor.previous_batch = None
+    executor._disagg_pp_termination_handler = None
     executor.has_previous_draft_tokens = False
     executor.active_requests = []
     executor.waiting_queue = []
@@ -226,6 +227,7 @@ def _loop_executor(monkeypatch, decoder, batches, log):
         "_prepare_disagg_gen_transmission_complete",
         "_handle_dynamic_draft_len",
         "_kv_connector_terminate_requests",
+        "_remove_inflight_ids",
         "_finalize_adp_dummy_allocation",
         "_commit_kv_cache_stats",
         "_flush_pending_transfer_responses",
@@ -307,3 +309,24 @@ def test_executor_loop_fails_the_request_once_its_batch_is_synchronized(monkeypa
     _between(log, ("fail", (7,), False), after=("synchronize", 1), before=("responses", 1))
     assert log.index(("responses", 1)) < log.index(("forward", 2))
     assert decoder.completed_batch_ids == [1, 2]
+
+
+def test_pp_executed_batch_fails_the_request_once_its_batch_is_synchronized(monkeypatch):
+    """With pipeline parallelism, the last rank handles an executed batch's
+    failure after synchronizing on that batch and before its responses."""
+    log = []
+    decoder = _FakeCapturableDecoder({1: [(7, _ERROR)]})
+    batch = _batch(_request(7), _request(8), batch_no=1)
+    executor = _loop_executor(monkeypatch, decoder, [batch], log)
+    executor._handle_responses = lambda **kwargs: log.append(("responses", 1)) or []
+    executed_batch = SimpleNamespace(
+        scheduled_requests=batch,
+        sample_state=SimpleNamespace(batch_no=1, device=None),
+        guided_batch_id=1,
+        microbatch_id=0,
+    )
+
+    PyExecutor._handle_executed_batch(executor, executed_batch)
+
+    _between(log, ("fail", (7,), False), after=("synchronize", 1), before=("responses", 1))
+    assert decoder.completed_batch_ids == [1]
