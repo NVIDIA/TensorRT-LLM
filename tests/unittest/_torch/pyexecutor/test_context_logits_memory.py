@@ -188,7 +188,10 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
 ) -> None:
     from tensorrt_llm._torch.modules.context_logits import context_logits_scope
     from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
-    from tensorrt_llm.executor.base_worker import _compute_pytorch_prompt_logprobs
+    from tensorrt_llm.executor.base_worker import (
+        IncompleteContextLogitsError,
+        _compute_pytorch_prompt_logprobs,
+    )
 
     # Compare chunk boundaries with full FP32 accumulation on every GEMM shape.
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
@@ -261,7 +264,8 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
     # Rows that skip a reused prefix cannot be aligned with the prompt.
     response.result.context_prompt_logprob_rows = request.py_result.context_prompt_logprob_rows[1:]
     generation._cached_prompt_logprobs = None
-    assert _compute_pytorch_prompt_logprobs(generation, response).prompt is None
+    with pytest.raises(IncompleteContextLogitsError, match="all 91 prompt tokens"):
+        _compute_pytorch_prompt_logprobs(generation, response)
     assert request.py_result.context_logits is None
     assert request.py_result._context_logits._storage is None
 
