@@ -197,3 +197,79 @@ def test_real_pool_shares_one_cuda_block():
     tb.fill_(1.5)
     torch.cuda.synchronize()
     assert torch.equal(ta.flatten(), tb.flatten()[: ta.numel()])
+
+
+def test_bounded_caller_upgrades_a_request_sized_block(pool):
+    a, b, c = _metadata(), _metadata(), _metadata()
+    ta = layout._ensure_workspace_tensor(a, "ws", (10,), dtype=torch.float32, device=CPU)
+    assert pool.allocations == 1
+    # a caller that knows the capacity bound replaces the request-sized block once ...
+    tb = layout._ensure_workspace_tensor(
+        b, "ws", (5,), dtype=torch.float32, device=CPU, capacity_numel=100
+    )
+    assert pool.allocations == 2 and tb.data_ptr() != ta.data_ptr()
+    (key,) = pool.buffers
+    assert sorted(block.buffer.numel() for block in pool.buffers[key]) == [10 * 4, 100 * 4]
+    # ... and everybody after it fits in the capacity block
+    tc = layout._ensure_workspace_tensor(
+        c, "ws", (64,), dtype=torch.float32, device=CPU, capacity_numel=100
+    )
+    assert pool.allocations == 2 and tc.data_ptr() == tb.data_ptr()
+    assert layout._workspace_capacity_numel(c, "ws", torch.float32, CPU) == 100
+    assert layout._workspace_capacity_numel(c, "missing", torch.float32, CPU) == 0
+
+
+def test_capture_hit_ignores_a_larger_bound(pool, monkeypatch):
+    a, b = _metadata(), _metadata()
+    layout._ensure_workspace_tensor(
+        a, "ws", (8,), dtype=torch.float32, device=CPU, capacity_numel=8
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    # inside capture a request that fits is served from the existing block even if its bound is larger
+    tb = layout._ensure_workspace_tensor(
+        b, "ws", (4,), dtype=torch.float32, device=CPU, capacity_numel=4096
+    )
+    assert tb.shape == (4,) and pool.allocations == 1
+
+
+def test_latest_request_shape_is_cached_per_state(pool):
+    a = _metadata()
+    big = layout._ensure_workspace_tensor(
+        a, "ws", (4, 8), dtype=torch.float32, device=CPU, capacity_numel=64
+    )
+    small = layout._ensure_workspace_tensor(a, "ws", (2, 3), dtype=torch.float32, device=CPU)
+    assert small.shape == (2, 3) and small.data_ptr() == big.data_ptr()
+    assert a.fp4_mla_state.workspaces["ws"].shape == (
+        4,
+        8,
+    )  # the cached view keeps the larger request
+    again = layout._ensure_workspace_tensor(a, "ws", (8, 8), dtype=torch.float32, device=CPU)
+    assert again.shape == (8, 8) and again.data_ptr() == big.data_ptr() and pool.allocations == 1
+
+
+def test_unshared_capacity_is_the_per_state_entry(pool):
+    a = _metadata()
+    layout._ensure_workspace_tensor(a, "vp", (6, 7), dtype=torch.uint8, device=CPU, shared=False)
+    assert layout._workspace_capacity_numel(a, "vp", torch.uint8, CPU) == 42
+    assert layout._workspace_capacity_numel(a, "vp", torch.float32, CPU) == 0
+
+
+@pytest.mark.parametrize("max_requests", [64, 128, 256, 576])
+def test_packed_split_scratch_bound_covers_every_query_width(monkeypatch, max_requests):
+    monkeypatch.setenv("TRTLLM_FP4_MLA_PACKED_Q", "1")
+    monkeypatch.delenv(packed_plan._FP4_MLA_SPLIT_KV_ENV, raising=False)
+    monkeypatch.setattr(packed_plan, "_get_sm_count", lambda device: 212)
+    meta = SimpleNamespace(max_num_sequences=max_requests, max_total_draft_tokens=3)
+    slots, slot_rows = packed_plan.packed_split_scratch_bound(
+        meta, 128, 4, CPU, max_requests=max_requests
+    )
+    per_width = []
+    for q in (1, 2, 3, 4):
+        rows = packed_plan._fp4_mla_packed_rows_per_seq(128, q)
+        bound_q = packed_plan.packed_split_task_bound(max_requests, rows // 128, CPU)
+        per_width.append((bound_q, bound_q * rows))
+    assert slots == max(b for b, _ in per_width)
+    assert slot_rows == max(r for _, r in per_width)
+    # q = 1 asks for more slots than q = 4 at small engines: the bound must not depend on which call comes first
+    if max_requests <= 256:
+        assert per_width[0][0] > per_width[3][0]
