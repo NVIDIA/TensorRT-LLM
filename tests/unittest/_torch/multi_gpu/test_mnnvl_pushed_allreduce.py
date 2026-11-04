@@ -257,9 +257,10 @@ def _run_rank(world_size):
                     res.append(allreduce(ys[i]))
             return res
 
-        # A C++ call grows the workspace; the capture follows without an eager pushed call on
-        # the new workspace, whose device view is built with it.
+        # A C++ call grows the workspace; as in the CUDA graph runners, one eager run of the
+        # captured calls precedes the capture and builds the new workspace's push view.
         allreduce(torch.zeros(2048, n, device="cuda", dtype=torch.bfloat16))
+        calls()
         torch.cuda.synchronize()
         comm.Barrier()
         graph = torch.cuda.CUDAGraph()
