@@ -1229,14 +1229,14 @@ dev = ["hypothesis (>=6.70.0)", "pytest (>=7.1.0)"]
 
 [[package]]
 name = "timm"
-version = "1.0.30"
+version = "1.0.31"
 description = "PyTorch Image Models"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "timm-1.0.30-py3-none-any.whl", hash = "sha256:c8e27adf6801a2fdfb570dbbdd171f2f084756eefc673df8cfaab06bd14864f3"},
-    {file = "timm-1.0.30.tar.gz", hash = "sha256:1444a3af7e17fdba5440ac2bcf6e4b728da96dd62289ed9e1bcba31a545f5935"},
+    {file = "timm-1.0.31-py3-none-any.whl", hash = "sha256:5bd50f7d0fe6d09bf9285ac2523234a1b7e6bf075c0be3e7aed09139fcb617c7"},
+    {file = "timm-1.0.31.tar.gz", hash = "sha256:baa0b333339c46d3d6d4965d99b69f5053afed71210e8f433d7ea5ee6a18f0ec"},
 ]
 
 [package.dependencies]
@@ -1472,4 +1472,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "1b34d294e422cdd0487fa2b81a4b125c353904c7a8077dddcfadc7a2497eb7a1"
+content-hash = "e860b4c60cf6329db7e2baa5c2d6409852c71af0dfa6c00a42009d8a3fc86dba"
