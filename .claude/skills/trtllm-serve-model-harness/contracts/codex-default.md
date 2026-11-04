@@ -44,6 +44,7 @@ harness profile. codex-cli 0.155.1 with the default configuration sends:
 | Instructions | `instructions` field |
 | `parallel_tool_calls` | `true` |
 | Reasoning | `reasoning.summary: "auto"` |
+| Echo | **[measured]** The next request carries each reply back unchanged: its text, its reasoning items with their `encrypted_content`, and its calls (codex-cli 0.155.1 against `fake_responses_server.py`: 12 sessions, 24 calls, 24 texts and 24 reasoning items, all equal) |
 | Model id | as configured |
 
 Smoke-test the configuration that production will use. A pass on one says little about another:
@@ -84,3 +85,18 @@ What the platform itself changes:
 - Agents print their environment (`env`, `curl -v`), so the platform's credentials can appear in
   tool outputs. Treat traces as secret and scan them for credentials
   (`scripts/validate/scan_credentials.py`).
+
+## Over-length on main
+
+Codex reads an over-length answer only as an in-stream failure with code
+`context_length_exceeded` (the profile's `errors.overlength`, C-10), which the profiles list as a
+compaction trigger next to reaching `model_context_window`. An HTTP 400 is resent as it was and then
+ends the session. Against `fake_responses_server.py`, which reports tiny token counts, codex-cli 0.155.1
+ended the session after either answer without compacting, so measure compaction (H-04) against a
+real server.
+
+On main, a streamed `/v1/responses` request over the window is answered with an HTTP 400, or
+in-stream with code `server_error`. PR #21060 answers it in-stream with
+`context_length_exceeded`; add it to the trial build of a Codex cell until it merges
+(`references/smoke.md` section 3d). A smoke run at the full window rarely gets there, so probe it
+on purpose: one session against a server whose `max_seq_len` is below Codex's opening prompt.

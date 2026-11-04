@@ -31,26 +31,56 @@ For a harness with no recorded traffic yet, S4's wiring run is also how its firs
 
   A dev host holds harness credentials (e.g. `~/.codex/auth.json`, Claude MCP credentials). None
   of it may be visible to a session.
+- **A harness's own sandbox may not run inside yours.** E.g. Codex's `workspace-write` sandbox
+  needs Linux namespaces; in a container that forbids them every command fails (a panic with exit
+  101, or `bwrap: No permissions to create a new namespace`). When the session already runs in a
+  disposable container, let that container be the sandbox: `SANDBOX=danger-full-access` for
+  `run_codex_sessions.sh`.
 - **No real credentials in the environment the agent sees.** Agents print their environment and
   headers (e.g. with `curl -v`), so any credential in reach ends up in the trace.
 - **Restrict egress.** A harness's own calls to its vendor fail under no egress, and that is
   expected noise. E.g. Claude Code's fast-mode check and WebFetch domain check call
   `api.anthropic.com` directly.
+  - Best: a container without a network, the endpoint reached through a socket (`scripts/pi_kit/`
+    does this for pi).
+  - On a host: the session runners pass `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and `ALL_PROXY`
+    through when you set them. Point them at a closed local port (`http://127.0.0.1:9`) and put the
+    endpoint's host in `NO_PROXY`. This is best effort: a tool that ignores proxy settings still
+    reaches out.
 
 ## 1. Wire it up without a model first (minutes, no GPU)
 
 The same four parts for every harness: a fake server of the harness's protocol, the recorder in
 forward mode in front of it, the harness's session runner, and a verdict over the recorded trace.
-Codex over Responses:
+Work in a run directory outside the repository and pass every path absolute. Codex over Responses:
 
 ```bash
-python scripts/validate/fake_responses_server.py --port 8399 --max-tool-turns 2 &
-python scripts/record_requests.py --out-dir run/trace --port 8397 --forward http://127.0.0.1:8399 &
-printf '%s\t%s\n' ./task_src "Run hello.py and tell me what it prints." > tasks.tsv
-BASE_URL=http://127.0.0.1:8397/v1 MODEL=fake scripts/run_codex_sessions.sh tasks.tsv run/out
-python scripts/validate/verdict.py --harness profiles/harness/codex-default.yaml \
-    --model profiles/model/<id>.yaml --population smoke --out-dir run/verdict run/trace
+SKILL=$PWD/.claude/skills/trtllm-serve-model-harness     # from the repository root
+RUN=$(mktemp -d "$HOME/mh-wiring.XXXX")                  # outside the repository
+PY=<the validator environment>/bin/python                # scripts/validate/requirements.txt
+mkdir -p "$RUN/task_src" && printf 'print("hello")\n' > "$RUN/task_src/hello.py"
+cp "$SKILL/templates/matrix.yaml" "$RUN/matrix.yaml"
+$PY "$SKILL/scripts/validate/fake_responses_server.py" --port 8399 --max-tool-turns 2 &
+$PY "$SKILL/scripts/record_requests.py" --out-dir "$RUN/trace" --port 8397 \
+    --forward http://127.0.0.1:8399 --build-id wiring &
+printf '%s\t%s\n' "$RUN/task_src" "Run hello.py and tell me what it prints." > "$RUN/tasks.tsv"
+BASE_URL=http://127.0.0.1:8397/v1 MODEL=fake "$SKILL/scripts/run_codex_sessions.sh" \
+    "$RUN/tasks.tsv" "$RUN/out"
+$PY "$SKILL/scripts/validate/verdict.py" --harness "$SKILL/profiles/harness/codex-default.yaml" \
+    --model "$SKILL/profiles/model/<id>.yaml" --matrix "$RUN/matrix.yaml" --population smoke \
+    --build-id wiring --out-dir "$RUN/verdict" "$RUN/trace"
 ```
+
+What a wiring run must show, read from `verdict.json` (the exit code is 2 while any claim is
+BLOCKED, which is expected here):
+
+| Claim | Expected | Otherwise |
+|---|---|---|
+| `inventory` | PASS | Requests without a reply: the recorder or the runner is wired wrong |
+| `conformance` | PASS | The fake server is conformant, so a FAIL is the harness configuration, the recorder, or a profile field still TODO (its `claim_blockers` name it) |
+| `runtime` | PASS | Needs `--build-id` on both the recorder and the verdict |
+| `model-behavior` | BLOCKED | No thresholds in a fresh matrix; a fake model is not worth rating |
+| `harness-outcome` | BLOCKED | No thresholds, or a profile that is not yet `measured`. Tool errors the fake server's calls cause are flagged, not rated |
 
 How it behaves:
 - The fake server answers with a call to the first declared tool, and with `--max-tool-turns`
@@ -63,12 +93,15 @@ conformant.
 **Claude Code.** Same wiring, with `fake_agent_server.py` and `run_claude_sessions.sh`:
 
 ```bash
-python scripts/validate/fake_agent_server.py --port 8400 --max-tool-turns 1 &
-python scripts/record_requests.py --out-dir run/trace --port 8397 --forward http://127.0.0.1:8400 &
-printf '%s\t%s\n' - "Read the file named x and summarize it." > tasks.tsv
-BASE_URL=http://127.0.0.1:8397 MODEL=fake-model scripts/run_claude_sessions.sh tasks.tsv run/out
-python scripts/validate/verdict.py --harness profiles/harness/claude-code.yaml \
-    --model profiles/model/<id>.yaml --population smoke --out-dir run/verdict run/trace
+$PY "$SKILL/scripts/validate/fake_agent_server.py" --port 8400 --max-tool-turns 1 &
+$PY "$SKILL/scripts/record_requests.py" --out-dir "$RUN/trace" --port 8397 \
+    --forward http://127.0.0.1:8400 --build-id wiring &
+printf '%s\t%s\n' - "Read the file named x and summarize it." > "$RUN/tasks.tsv"
+BASE_URL=http://127.0.0.1:8397 MODEL=fake-model "$SKILL/scripts/run_claude_sessions.sh" \
+    "$RUN/tasks.tsv" "$RUN/out"
+$PY "$SKILL/scripts/validate/verdict.py" --harness "$SKILL/profiles/harness/claude-code.yaml" \
+    --model "$SKILL/profiles/model/<id>.yaml" --matrix "$RUN/matrix.yaml" --population smoke \
+    --build-id wiring --out-dir "$RUN/verdict" "$RUN/trace"
 ```
 
 - **Run every session under `env -i`.** A parent agent session exports variables a child must
@@ -84,10 +117,11 @@ own `HOME` and `PI_CODING_AGENT_DIR` (a generated `models.json`), and startup ne
 version checks, telemetry, extensions, MCP, skills and context files off. `API` picks the wire.
 
 ```bash
-python scripts/record_requests.py --out-dir run/trace --port 8397 --forward http://127.0.0.1:8400 \
+$PY "$SKILL/scripts/record_requests.py" --out-dir "$RUN/trace" --port 8397 \
+    --forward http://127.0.0.1:8400 --build-id wiring \
     --session pi-s1 &                    # pi sends no session identity over Chat or Messages
 API=openai-completions MODEL=fake-model BASE_URL=http://127.0.0.1:8397/v1 TOOLS=read \
-    scripts/run_pi_sessions.sh tasks.tsv run/out
+    "$SKILL/scripts/run_pi_sessions.sh" "$RUN/tasks.tsv" "$RUN/out"
 ```
 
 - **Verified with @earendil-works/pi-coding-agent 1.4.0** over all three APIs against the fake
@@ -101,15 +135,24 @@ spending GPU time.
 
 ## 2. The real run
 
-1. **Serve the model with tracing on:**
+1. **Serve the model, with the recorder in front:**
 
    ```bash
-   TRTLLM_REQUEST_TRACE_DIR=run/trace trtllm-serve <model> --tool_parser <name> \
-       --reasoning_parser <name> [--custom_tokenizer <name>] ...
+   TRTLLM_RAW_OUTPUT_DIR="$RUN/raw" trtllm-serve <checkpoint> --port 8000 \
+       --tool_parser <name> --reasoning_parser <name> [--custom_tokenizer <name>] \
+       --served_model_name <the name the harness sends> --config <serving config> \
+       --post_processor_hook tensorrt_llm.executor.raw_output_hook.RawOutputDump &
+   BUILD_ID=$(pip show tensorrt_llm | sed -n 's/^Version: //p')     # <version>+<commit>
+   $PY "$SKILL/scripts/record_requests.py" --out-dir "$RUN/trace" --port 8397 \
+       --forward http://127.0.0.1:8000 --build-id "$BUILD_ID" &
    ```
 
-   - The server's request trace is not on main yet (`contract.md` section 1). Without it, put
-     `scripts/record_requests.py` in forward mode in front of the server, as in section 1.
+   - The model profile names the parsers and the serving configuration. `profiles/model/serving/`
+     holds complete configs, with their serve commands, for the shipped models.
+   - The hook flag and `TRTLLM_RAW_OUTPUT_DIR` need a build with the raw-output hook (section 3d);
+     drop both on a build without it, and the raw view is then not judged.
+   - The harness talks to the recorder's port, never to the server directly. Pass the same
+     `--build-id` to the verdict.
    - Put a gateway in front of it if the run should look like production. Keep session affinity,
      and serve the model name the harness sends.
    - Configure the harness's context window to the served `max_seq_len`:
@@ -140,8 +183,9 @@ spending GPU time.
      every Claude Code request with HTTP 400. Turn chunked prefill on rather than raise
      `max_num_tokens` to fit the prompt: a larger chunk can break long context (section 3c:
      DeepSeek-V4.1 at 65,536).
-2. **Choose tasks the agent can complete locally.** Small repositories with scripted bugs work.
-   Include tasks that force:
+2. **Choose tasks the agent can complete locally.** `tasks/` ships a small set for every runner
+   (`tasks/README.md`); bring more of your own the same way. Small repositories with scripted bugs
+   work. Include tasks that force:
    - several tool calls;
    - a failing tool;
    - long outputs;
@@ -149,6 +193,9 @@ spending GPU time.
    - a sub-agent, where the harness has them.
 3. **Run enough sessions to see rates, not anecdotes.**
    - Tens of sessions for wiring; hundreds before a large run (S5).
+   - A rate passes only on enough units: with zero events, 133 at a 2% threshold (the matrix
+     template lists the others). Counted per turn, a dozen multi-turn sessions usually get there;
+     counted per session, it takes 133 sessions.
    - Set concurrency to reflect real load, since prefill under load is what trips harness
      timeouts.
 
@@ -345,23 +392,22 @@ plus the capture changes. `scripts/compose_trial_build.sh` builds it:
 
 ```bash
 scripts/compose_trial_build.sh -p <run>/provenance.txt <worktree> <branch> origin/main \
-    raw-hook=<ref> engine-id=<ref> disagg-id=<ref> <label>=pr:<number> ...
+    raw-hook=pr:21605 responses-ids=pr:21602 messages-ids=pr:20936 <label>=pr:<number> ...
 ```
 
-Each `<ref>` is a `pr:<number>` or any commit-ish (a branch, a commit) that carries the change.
+Each source is a `pr:<number>` or any commit-ish (a branch, a commit) that carries the change.
 
-**The capture changes make the evidence joinable.** Until they are in main, add each one from
-wherever it is carried:
+**The capture changes make the evidence joinable.** Until their PRs merge, add them by number; once
+one is in main, drop its item:
 
-| Item | What it adds | Without it |
-|---|---|---|
-| `raw-hook` | The raw-output hook (section 3c) | No raw view: C-13 and M-02 cannot be judged |
-| `engine-id` | Responses replies name their engine request: `/v1/responses` replies carry its id in `x-trtllm-engine-request-id`, which the recorder stores | A Responses reply joins no raw record: its id is a random `resp_` id |
-| `disagg-id` | Disaggregated `/v1/responses` replies are named `resp_<disagg_request_id>_<hex>`, which the validator reads first | Generation workers number their requests independently, so an engine id names a request on each worker |
+| Item | PR | What it adds | Without it |
+|---|---|---|---|
+| `raw-hook` | #21605 | The raw-output hook (section 3c): per output, the text, the streamed frames and the generated token ids | No raw view: C-13 cannot be judged, and M-02 cannot see a degenerate token the model profile names only by id |
+| `responses-ids` | #21602 | `/v1/responses` replies carry their engine request id in `x-trtllm-engine-request-id`, which the recorder stores; disaggregated ones are named `resp_<disagg_request_id>_<hex>`, which the validator reads first | A Responses reply joins no raw record: its id is a random `resp_` id, and generation workers number their requests independently |
+| `messages-ids` | #20936 | Messages replies and non-streamed Chat Completions replies are named after their engine request | Those replies join no raw record. A streamed Chat Completions reply is already named `chatcmpl-<engine id>` on main |
 
-On main, a streamed Chat Completions reply is already named `chatcmpl-<engine id>`. A non-streamed
-one is named `chatcmpl-<random>`, and a Messages reply `msg_<random>`. PR #20936 names both after
-the engine request; until it merges, add it to a build that serves either.
+Add only what the cell serves: `messages-ids` for a Messages or non-streamed Chat harness,
+`responses-ids` for a Responses one.
 
 **Order and conflicts.**
 - Apply the capture changes first, then the PRs in the order they stack.
@@ -371,12 +417,18 @@ the engine request; until it merges, add it to a build that serves either.
   the cell log and on both PRs. It is not a serving defect.
 
 **Install, test, name.**
-- **Install.** Python-only items share the base's C++. Install with
-  `TRTLLM_PRECOMPILED_LOCATION=<a wheel whose C++ matches the base>` and `pip install -e .`. An item
-  that changes C++ needs a full build. Each concurrent job gets its own checkout (section 5).
-- **Test.** Run on the trial build, CPU only:
+- **Install.** Python-only items share the base's C++, so build the C++ once per base and reuse it:
+  - get a wheel whose C++ matches the base: build it from the base commit
+    (`python3 scripts/build_wheel.py`, see `docs/source/installation/build-from-source.md`), or take
+    a nightly or CI wheel of a commit with the same `cpp/` sources;
+  - in the trial build's checkout, `TRTLLM_PRECOMPILED_LOCATION=<that wheel> pip install -e .`.
+
+  An item that changes C++ needs a full build. Each concurrent job gets its own checkout (section 5).
+- **Test.** Run on the trial build, CPU only, from `tests/unittest` with `TLLM_DISABLE_MPI=1`:
   - every item's own tests;
-  - the serve, tool-parser, reasoning-parser and executor suites.
+  - `llmapi/apps/test_tool_parsers.py`, `llmapi/test_reasoning_parser.py`,
+    `llmapi/apps/test_responses_*.py`, `llmapi/apps/test_anthropic_adapter.py`, and
+    `executor/test_postprocessor_hook.py`.
 
   A failure the base shares is not the items'.
 - **Name.** The installed version (`pip show tensorrt_llm`: `<version>+<commit>`) is the recorder's

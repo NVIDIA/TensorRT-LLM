@@ -42,6 +42,9 @@ write. Mark each line [measured], [source] or [doc].
   What the server must do with a carrier it did not write.
 - Message roles and content part types (developer, system, images, files).
 - Thread/session identity fields, and which one groups a conversation versus routes the cache.
+- **Echo:** what the next request carries back of each reply: its text, its reasoning and its calls,
+  unchanged or rewritten (and how). Measure it against a fake server: the profile's `echo` section
+  needs it, and C-03 stays BLOCKED while it is TODO.
 
 ## 5. Stream semantics
 
@@ -76,6 +79,6 @@ PASS.
 | `identity` | 4 Conversation state |
 | `request.must_accept`, `request.model_field` | 2 Wire |
 | `tools`, `parallel_tool_calls`, `outcomes` | 3 Tools |
-| `reasoning` | 4 Conversation state |
+| `reasoning`, `echo` | 4 Conversation state |
 | `stream`, `timeouts` | 5 Stream semantics |
 | `errors`, `context_window`, `compaction` | 5 and 6 |

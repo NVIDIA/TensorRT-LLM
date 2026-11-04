@@ -45,6 +45,9 @@ format_card:
   qualified_prefix: "functions."
 
 native:                                     # the raw view (C-13); grammar of chat_template.jinja
+  # The reader's goldens (scripts/validate/native_goldens.py --glm) were rendered with the
+  # GLM-5.3-Flash template. Render them again from the checkpoint you serve when its
+  # template_sha256 differs, and compare before trusting C-13 on it.
   kind: glm_xml
   prompt_opens: think                       # GLM-5.3 always prefills <think>
   stop_markers: ["<|user|>", "<|observation|>", "<|endoftext|>"]
@@ -91,7 +94,8 @@ reasoning:
 context:
   model_max: 1048576
   serving: "The production serving configuration (references/smoke.md 3c): max_seq_len 1048576,
-    chunked prefill, max_num_tokens 8192, block reuse on."
+    chunked prefill, max_num_tokens 8192, block reuse on. The full config and serve command for one
+    node of 4 GB300 GPUs: profiles/model/serving/glm-5.3-nvfp4.4xgb300.yaml."
 
 known_findings:
   - "A tool name the model malformed is delivered as text, on both views."

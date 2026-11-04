@@ -78,7 +78,8 @@ reasoning:
 context:
   model_max: 1048576                        # max_position_embeddings; the served window is max_seq_len
   serving: "The production serving configuration (references/smoke.md 3c): max_seq_len 1048576,
-    chunked prefill, max_num_tokens 8192."
+    chunked prefill, max_num_tokens 8192. The full config and serve command for one node of 4 GB300
+    GPUs: profiles/model/serving/deepseek-v41.4xgb300.yaml."
 
 known_findings:
   - "Long context (GB300, chunked prefill): with max_num_tokens 65,536 or 131,072, a prompt

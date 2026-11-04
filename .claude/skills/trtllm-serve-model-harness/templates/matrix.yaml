@@ -6,7 +6,8 @@
 schema: trtllm-serve-model-harness/matrix@1
 run_id: null                       # e.g. <name>-<yyyymmdd>; reused across sessions, never reset
 run_dir: null                      # evidence lives in <run_dir>/cells/<cell>/<stage>/<iteration>/,
-                                   # and cells/<cell>/log.md has one line per iteration (SKILL.md 4a)
+                                   # <cell> = <model id>__<harness id> (e.g. glm-5__codex-default), and
+                                   # cells/<cell>/log.md has one line per iteration (SKILL.md 4a)
 integration_branch: null           # the code under test, e.g. a trial build (references/smoke.md 3d);
                                    # every verdict binds a build_id from it
 
@@ -24,21 +25,22 @@ cells: []                          # one entry per (model, harness); protocol co
                                    # its model entry and thinking level, contracts/pi.md section 12)
 
 thresholds:                        # validator-owned; unknown -> the claim is BLOCKED
-  conformance: zero                # any confirmed violation fails
-  views_equal: 1.0
-  model_behavior:                  # one-sided 95% Wilson upper bound must be <= value
-    undeclared_call_rate: null
-    payload_invalid_rate: null
-    degenerate_rate: null
-    markup_leak_rate: null
-    empty_turn_rate: null
+  # Conformance checks are hard: any confirmed violation fails, so they take no threshold.
+  # Each rate passes when the one-sided 95% Wilson upper bound of its rate is <= its threshold.
+  # A starting proposal for the human to accept or change: 0.02 for every rate below, counted per
+  # turn. With zero events a rate needs at least this many units to pass: 52 at 0.05, 133 at 0.02,
+  # 268 at 0.01, 539 at 0.005, 2703 at 0.001 (references/validate.md section 3).
+  model_behavior:
+    undeclared_call_rate: null     # calls to a tool the request did not declare (M-01)
+    payload_invalid_rate: null     # call arguments that break the tool's schema (M-01)
+    degenerate_rate: null          # degenerate runs, e.g. a repeated pad token (M-02)
+    markup_leak_rate: null         # the model's own markup in delivered text (M-03)
+    empty_turn_rate: null          # replies with nothing in them (M-06)
   harness_outcome:
-    aborted_rate: null
-    arguments_rejected_rate: null
-    resends_caused_by_us: zero
-    unattributed_disconnects: zero
-  unit_for_rates: session          # session | turn: each check's own unit, a reply or a call
-                                   # (references/validate.md section 3)
+    aborted_rate: null             # calls the harness cancelled (H-01)
+    arguments_rejected_rate: null  # calls the harness refused for their arguments (H-01)
+  unit_for_rates: turn             # turn | session: each check's own unit (a reply or a call), or
+                                   # whole sessions (references/validate.md section 3)
 
 budget:                            # human-owned; unknown is not unlimited
   repair_cycles_per_finding_class: 3

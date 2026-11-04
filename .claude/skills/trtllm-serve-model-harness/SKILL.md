@@ -248,7 +248,10 @@ way, a deploy or a run wakes it when its job ends, not a timer. Take one step pe
 | `references/turn-ir.md` | Writing or reading a protocol adapter |
 | `references/protocols.md` | Wire rules for Responses, Anthropic Messages and Chat Completions |
 | `references/acceptance-cases.md` | Controls that qualify the validator itself |
-| `profiles/`, `templates/matrix.yaml` | Model and harness profiles; the run's matrix, thresholds and budget |
+| `profiles/`, `templates/matrix.yaml` | Model and harness profiles; the run's matrix, thresholds (with a starting proposal) and budget |
+| `profiles/model/serving/` | Complete serving configs, with their serve commands, for the shipped models |
+| `tasks/` | A small public task set for real harness runs, in every runner's format (`tasks/README.md`) |
+| `templates/full-tier-report.md` | The full tier's steps and the five files it writes |
 | `tests/test_validator.py` | Checking the validator after a change (`MH_RUN_CONTROLS=1` for the matrix) |
 | `tests/test_validator_properties.py`, `tests/validator_properties.mutations` | The worked example of `references/verify-logic.md`: the validator's own properties and their gate |
 
@@ -277,8 +280,16 @@ way, a deploy or a run wakes it when its job ends, not a timer. Take one step pe
 | `scripts/compose_trial_build.sh` | S4, S5 | The build under test: a base plus open PRs and the capture changes, one commit each, with a provenance file (`references/smoke.md` section 3d) |
 | `scripts/validate/protocol_diff.py` | S4 | One harness and task over several wires, compared turn by turn; attributes each difference to the harness or to the server's protocol path |
 
-- **Tests.** `tests/test_validator.py` holds CPU-only tests. Set `MH_RUN_CONTROLS=1` to run
-  the full control matrix.
+- **Tests.** `tests/` holds CPU-only tests of the skill's own tools. Run them from a scratch
+  directory, so nothing is written into the checkout:
+  `PYTHONDONTWRITEBYTECODE=1 <venv>/bin/python -m pytest -q -p no:cacheprovider --basetemp=<scratch> <skill>/tests`.
+- **The controls receipt** that a full tier needs:
+  `<venv>/bin/python scripts/validate/controls.py --out-dir <dir>` writes `<dir>/controls.json`,
+  bound to the validator tree it ran on (`MH_RUN_CONTROLS=1` runs the same matrix inside pytest,
+  but keeps no receipt).
+- **The mutation gate** (`scripts/mutate.py`) writes each planted bug into the real file and
+  restores it. Give it no short time limit (tens of minutes for the validator's 62 bugs), and
+  check that every `find` still matches once after any run that did not print its `SUMMARY`.
 - **Run the validator in its own environment** (`scripts/validate/requirements.txt`). The SDK
   versions are part of what a verdict means: without an SDK, C-12 is BLOCKED for its protocols,
   and a control receipt qualifies only the SDK versions it was produced with.

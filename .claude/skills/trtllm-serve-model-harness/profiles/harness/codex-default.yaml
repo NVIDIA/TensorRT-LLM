@@ -44,8 +44,8 @@ timeouts:
   idle_s: 120
 
 echo:
-  text: TODO
-  reasoning: TODO
+  text: exact                 # measured (codex-cli 0.155.1, contracts/codex-default.md): a reply's text
+  reasoning: exact            # and reasoning items come back unchanged in the next request
 
 reasoning:
   carrier: encrypted_content
