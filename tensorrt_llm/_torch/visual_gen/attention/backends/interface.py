@@ -97,6 +97,11 @@ class AttentionBackend(ABC):
     ) -> torch.Tensor:
         """Attention over ``q``, ``k``, ``v`` in the backend's ``preferred_layout``.
 
+        Inputs may alias transient communication buffers not owned by PyTorch's
+        caching allocator. Do not retain them after this call. Join any side-stream
+        reads back to the caller's stream before returning, and do not rely on
+        allocator APIs such as ``record_stream`` to track these buffers' lifetime.
+
         Keyword contract shared by every backend (unknown keywords are ignored):
 
         * ``batch_size``, ``seq_len``, ``seq_len_kv``: the batch and the query and

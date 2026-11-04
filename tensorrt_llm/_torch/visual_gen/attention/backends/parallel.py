@@ -819,20 +819,15 @@ class UlyssesAttention(AttentionBackend):
                 process_group=self.process_group,
             )
 
-        # Fast path: one fused kernel replaces the eager post-A2A chain
-        # (6 ops for HND target: permute+reshape+contig + transpose+contig
-        # per Q/K/V; 3 ops for NHD target). bf16-only because the kernel is
-        # only instantiated for __nv_bfloat16.
+        # The fused kernel replaces the materializing post-A2A chain for HND
+        # and batch > 1 NHD. Batch-one NHD receives use views instead.
+        # The kernel is only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
         # These views may alias the receive-slot ring. Every rank consumes them
         # before the reverse collective in _output_a2a, whose completion orders
         # the next call's slot reuse after all peers' reads on the caller stream.
-        post_unscatter_is_view = (
-            not is_hnd
-            and B_q == 1
-            and all(receive_buffer.is_contiguous() for receive_buffer in (q_5d, k_5d, v_5d))
-        )
+        post_unscatter_is_view = not is_hnd and B_q == 1
         use_fused_post_unscatter = (
             self.world_size > 1 and q_5d.dtype == torch.bfloat16 and not post_unscatter_is_view
         )

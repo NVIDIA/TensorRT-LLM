@@ -221,10 +221,10 @@ def _multi_pg_logic(rank: int, world_size: int):
         )
 
 
-def _run(world_size: int, test_fn: Callable):
+def _run(world_size: int, test_fn: Callable[..., None], *args: object) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    run_distributed(world_size, test_fn, preload=("tensorrt_llm",))
+    run_distributed(world_size, test_fn, *args, preload=("tensorrt_llm",))
 
 
 @pytest.mark.cpu_only
@@ -466,13 +466,4 @@ def _receive_view_lifetime_logic(
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("with_gates", [False, True])
 def test_batch_one_receive_view_lifetime(capture: bool, with_gates: bool) -> None:
-    if torch.cuda.device_count() < 2:
-        pytest.skip("Test requires two GPUs")
-    run_distributed(
-        2,
-        _receive_view_lifetime_logic,
-        capture,
-        with_gates,
-        dist_backend="nccl",
-        preload=("tensorrt_llm",),
-    )
+    _run(2, _receive_view_lifetime_logic, capture, with_gates)
