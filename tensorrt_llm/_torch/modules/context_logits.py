@@ -132,11 +132,15 @@ class ContextLogitsWorkspace:
         return local, gathered, converted
 
     def acquire(
-        self, rows: int, *, host_storage: bool
+        self, rows: int, *, host_storage: bool, local_ok: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Agree on the smallest successful capacity, including CPU-storage fallback."""
+        """Agree on the smallest successful capacity, including CPU-storage fallback.
+
+        ``local_ok`` False reports a local failure since the previous vote as a
+        zero capacity, so every TP rank raises together.
+        """
         buffers = self.resident
-        if not host_storage:
+        if local_ok and not host_storage:
             for _ in range(self.MAX_ALLOCATION_ATTEMPTS):
                 if rows <= self.MIN_ROWS:
                     break
@@ -145,7 +149,11 @@ class ContextLogitsWorkspace:
                     break
                 except torch.OutOfMemoryError:
                     rows = max(self.MIN_ROWS, rows // 2)
-        capacity = self._min_capacity(buffers[0].shape[0])
+        capacity = self._min_capacity(buffers[0].shape[0] if local_ok else 0)
+        if capacity == 0:
+            raise torch.OutOfMemoryError(
+                "Insufficient memory for context-logits projection or storage on a TP rank"
+            )
         if capacity == self.MIN_ROWS:
             return self.resident
         local, gathered, converted = buffers

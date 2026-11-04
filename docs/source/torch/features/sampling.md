@@ -52,8 +52,8 @@ storage on one rank cannot change the collective sequence independently. The
 all-gather writes directly into the reserved receive buffer; vocabulary assembly
 and padding removal copy into the conversion buffer without allocating a second
 gathered output. Allocation failures for required sampling rows, CPU result
-storage and GEMM failures, as well as failures storing or reducing a chunk, are
-reported on all TP ranks before the next logits collective. These failures
+storage, batched final rows and GEMM failures, as well as failures storing or
+reducing a chunk, are reported on all TP ranks before the next logits collective. These failures
 abort the operation; they do not trigger an independent per-rank retry. TP
 capacity and failure agreement introduces additional synchronization.
 

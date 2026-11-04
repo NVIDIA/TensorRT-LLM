@@ -44,28 +44,30 @@ def _check_bounded_context(lm_head: LMHead, hidden: torch.Tensor, rank: int) -> 
     reference = lm_head(hidden).float()
     vocab_size = lm_head.num_embeddings
 
+    def make_request(length: int, full: bool, k: int | None) -> SimpleNamespace:
+        tokens = [index % vocab_size for index in range(length)]
+        return SimpleNamespace(
+            request_id=length,
+            prepopulated_prompt_len=0,
+            context_chunk_size=length,
+            context_current_position=0,
+            py_prompt_len=length,
+            py_return_context_logits=full or k is not None,
+            py_context_logits_explicit=full,
+            py_prompt_logprobs=k,
+            py_prompt_logprobs_simple_format=True,
+            is_last_context_chunk=True,
+            get_tokens=lambda beam: tokens,
+            py_result=PyResult(
+                prompt_len=length,
+                max_new_tokens=2,
+                return_context_logits=full or k is not None,
+            ),
+        )
+
     for host_storage in (False, True):
-        requests = []
-        for length, full, k in ((70, True, None), (70, False, 0), (5, False, None)):
-            tokens = [index % vocab_size for index in range(length)]
-            requests.append(
-                SimpleNamespace(
-                    context_chunk_size=length,
-                    context_current_position=0,
-                    py_prompt_len=length,
-                    py_return_context_logits=full or k is not None,
-                    py_context_logits_explicit=full,
-                    py_prompt_logprobs=k,
-                    py_prompt_logprobs_simple_format=True,
-                    is_last_context_chunk=True,
-                    get_tokens=lambda beam, tokens=tokens: tokens,
-                    py_result=PyResult(
-                        prompt_len=length,
-                        max_new_tokens=2,
-                        return_context_logits=full or k is not None,
-                    ),
-                )
-            )
+        requests = [make_request(70, True, None), make_request(70, False, 0)]
+        requests.append(make_request(5, False, None))
         allocate = workspace._allocate
         empty = torch.empty
         project = workspace.project
@@ -120,6 +122,24 @@ def _check_bounded_context(lm_head: LMHead, hidden: torch.Tensor, rank: int) -> 
         )
         assert actual == pytest.approx(expected.prompt, abs=1e-5)
         torch.testing.assert_close(compact.context_prompt_last_logits, reference[139:140].cpu())
+
+    # A rank-local failure preparing the final rows of contexts without
+    # requested logits must fail the batch on every rank, not strand the peers
+    # in the next capacity all-gather.
+    index_select = torch.Tensor.index_select
+
+    def fail_tail_rows(tensor, *args, **kwargs):
+        if rank == 1:
+            raise torch.OutOfMemoryError("injected rank-local tail-row OOM")
+        return index_select(tensor, *args, **kwargs)
+
+    requests = [make_request(70, False, 0), make_request(5, False, None)]
+    plan = ContextLogitsPlan(SimpleNamespace(context_requests=requests))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.Tensor, "index_select", fail_tail_rows)
+        with context_logits_scope(plan), pytest.raises(torch.OutOfMemoryError):
+            model.logits_processor(hidden, lm_head, None, return_context_logits=True)
+    assert not plan.handled
 
 
 @torch.inference_mode()
