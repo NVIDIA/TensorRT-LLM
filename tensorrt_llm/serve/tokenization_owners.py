@@ -33,7 +33,7 @@ import zlib
 from array import array
 from typing import Any, Optional
 
-from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache
+from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache, RouteFailed
 from tensorrt_llm.logger import logger
 
 SOCKET_NAME = "tokenize-{}.sock"
@@ -41,6 +41,11 @@ SOCKET_NAME = "tokenize-{}.sock"
 ENABLE_ENV_VAR = "TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION"
 
 _LENGTH = struct.Struct("!q")
+# Sent in place of a token count when the owner could not tokenize the prompt.
+_FAILED = -1
+# Lone surrogates, which JSON can carry, survive the trip and fail in the
+# tokenizer as they would locally.
+_TEXT_ERRORS = "surrogatepass"
 
 
 def routing_enabled() -> bool:
@@ -57,8 +62,8 @@ class TokenizationOwners:
     """Route ``cache``'s prompts to the frontend that owns their conversation.
 
     Serves this frontend's ``cache`` to the other frontends and installs
-    ``cache.route``. A prompt the owner cannot tokenize, for example because it
-    has not started or has died, is tokenized locally.
+    ``cache.route``. A prompt the owner does not tokenize within ``timeout_s``,
+    for example because it has not started or has died, is tokenized locally.
     """
 
     def __init__(
@@ -68,7 +73,7 @@ class TokenizationOwners:
         num_frontends: int,
         cache: PrefixTokenCache,
         tokenizer: Any,
-        timeout_s: float = 30.0,
+        timeout_s: float = 5.0,
     ):
         self._ipc_dir = ipc_dir
         self._frontend_id = frontend_id
@@ -104,14 +109,15 @@ class TokenizationOwners:
             return self._request(owner, text)
         except OSError as e:
             self._drop(owner)
-            logger.debug(f"Tokenizing locally, frontend {owner} did not answer: {e!r}")
-            return None
+            raise RouteFailed(f"frontend {owner} did not answer: {e!r}") from e
 
     def _request(self, owner: int, text: str) -> list[int]:
         conn = self._connection(owner)
-        data = text.encode()
+        data = text.encode(errors=_TEXT_ERRORS)
         conn.sendall(_LENGTH.pack(len(data)) + data)
         (count,) = _LENGTH.unpack(_recv_exactly(conn, _LENGTH.size))
+        if count == _FAILED:
+            raise RouteFailed(f"frontend {owner} could not tokenize the prompt")
         ids = array("i")
         ids.frombytes(_recv_exactly(conn, count * ids.itemsize))
         return ids.tolist()
@@ -142,6 +148,9 @@ class TokenizationOwners:
 
 class _Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
+    # Every tokenizing thread of every other frontend may connect at once, and a
+    # Unix-socket connect to a full backlog fails at once instead of waiting.
+    request_queue_size = socket.SOMAXCONN
 
     def __init__(self, path: str, cache: PrefixTokenCache, tokenizer: Any):
         self.cache = cache
@@ -184,8 +193,15 @@ class _Handler(socketserver.BaseRequestHandler):
     def _answer_one(self) -> None:
         conn = self.request
         (size,) = _LENGTH.unpack(_recv_exactly(conn, _LENGTH.size))
-        text = _recv_exactly(conn, size).decode()
-        ids = array("i", self.server.cache.encode(self.server.tokenizer, text))
+        text = _recv_exactly(conn, size).decode(errors=_TEXT_ERRORS)
+        try:
+            ids = array("i", self.server.cache.encode(self.server.tokenizer, text))
+        except Exception as e:
+            # The asking frontend tokenizes the prompt itself and reports the
+            # error with its request.
+            logger.debug(f"Could not tokenize a prompt for another frontend: {e!r}")
+            conn.sendall(_LENGTH.pack(_FAILED))
+            return
         conn.sendall(_LENGTH.pack(len(ids)) + ids.tobytes())
 
 
