@@ -130,6 +130,7 @@ class CompletionOutput:
         routed_experts (Optional[torch.Tensor]): Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3), or None when not requested.
         spec_dec_counters (tensorrt_llm.executor.result.SpecDecCounters, optional): This sequence's speculative-decoding counters, or None.
         text_diff_offset (int): Offset in text at which text_diff starts.
+        postprocess_result (Any): What the post-processor returned for this output when post-processing ran in a postproc worker; None otherwise.
     """
     index: int
     text: str = ""
@@ -227,6 +228,14 @@ class CompletionOutput:
     @property
     def logprobs_diff(self) -> TokenLogprobs | SimpleTokenLogprobs:
         return self.logprobs[self._last_logprobs_len:]
+
+    @property
+    def postprocess_result(self) -> Any:
+        """The post-processor's return value stored by a postproc worker.
+
+        None when post-processing did not run in a postproc worker.
+        """
+        return self._postprocess_result
 
 
 class GenerationResultBase:

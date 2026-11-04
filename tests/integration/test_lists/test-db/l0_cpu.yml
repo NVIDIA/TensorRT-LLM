@@ -351,6 +351,7 @@ l0_cpu:
   # (with the trailing slash).
   - unittest/serve/api/visual_gen/
   - unittest/serve/api/visual_gen/test_private_access_lint_visual_gen.py
+  - unittest/serve/test_postproc_strategy.py
   - unittest/serve/test_private_access_lint.py
   - unittest/serve/test_serve_health.py
   - unittest/serve/test_serve_runtime_api_calls.py

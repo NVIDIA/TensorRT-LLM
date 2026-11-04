@@ -41,3 +41,6 @@ properties:
   text_diff_offset:
     annotation: int
     default: inspect._empty
+  postprocess_result:
+    annotation: Any
+    default: inspect._empty
