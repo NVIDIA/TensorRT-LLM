@@ -200,8 +200,9 @@ static_assert(kIdxPageBytes % 128 == 0 && kIdxRows == 128 * kIdxQUnitRows, "inde
 constexpr int kIdxMaxPages = 16;                            // pages per IdxSel round (its K region's)
 constexpr int kSelBatchPages = kIdxMaxPages / 2;            // the row shard's page batches (half the K region each)
 #if GLM52_TOPK_UNION
-constexpr int kCandList = 1 << 20;                          // candidates per row (list A): any row's keys (kIdxMaxKeys)
-constexpr int kCandCap = kCandList + 8192;                  // per row: list A, then the union's 13,568 words
+// Reserve one page for speculative lookahead beyond a 1M-token logical context.
+constexpr int kCandList = (1 << 20) + kIdxPageKeys;
+constexpr int kCandCap = kCandList + 8192; // per row: list A, then the union's 13,568 words
 #else
 constexpr int kCandList = 1 << 18;      // candidates per list (list A, then list B): any row's keys
 constexpr int kCandCap = 2 * kCandList; // top-k candidates per row: list A, then list B
