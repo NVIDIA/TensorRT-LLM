@@ -18,8 +18,8 @@ Model and attention-backend code declares what persistent memory exists as
 regions. A region names its planes, one entry per model layer it covers, and
 one life cycle that says when its memory is allocated, released early and
 handed off to the shared prefix index. The cache manager lays every region out
-on the V2 storage primitives and records which region owns each storage layer;
-it never needs to know what a region holds.
+on the V2 storage primitives and records which region owns each buffer; it
+never needs to know what a region holds.
 
 V2 storage offers two allocation shapes, both backed by the same paged pools:
 
@@ -27,13 +27,30 @@ V2 storage offers two allocation shapes, both backed by the same paged pools:
   (an attention life cycle), and
 * one slot per request, earlier states of which leave only as snapshots in the
   prefix index (an SSM life cycle).
+
+A life cycle binds to a buffer, not to a layer. Every region covering a model
+layer stores its planes as buffers of that layer's one V2 layer config, each
+buffer with its region's reuse policy, so a layer covered by regions of several
+life cycles spans several V2 layer groups while keeping its id.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Dict, Iterable, Optional, Protocol, Sequence, Tuple, Union, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    Union,
+    runtime_checkable,
+)
 
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
@@ -43,6 +60,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReusePolicy,
     SsmLayerConfig,
 )
+
+if TYPE_CHECKING:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager
 
 LayerConfig = Union[AttentionLayerConfig, SsmLayerConfig]
 
@@ -178,31 +198,6 @@ class Region:
         if len(set(model_layers)) != len(model_layers):
             raise ValueError(f"Region {self.name!r} covers a model layer twice: {model_layers}")
 
-    def layer_config(self, layer_id: int, layer: RegionLayer) -> LayerConfig:
-        """Return the V2 layer config storing ``layer`` under ``layer_id``."""
-        buffers = [
-            BufferConfig(
-                role=plane.role,
-                size=plane.page_bytes,
-                coalescing_group=plane.coalescing_group,
-            )
-            for plane in layer.planes
-        ]
-        life_cycle = self.life_cycle
-        if life_cycle.allocation == AllocationUnit.REQUEST:
-            return SsmLayerConfig(
-                layer_id=LayerId(layer_id),
-                buffers=buffers,
-                reuse_policy=life_cycle.reuse_policy,
-            )
-        return AttentionLayerConfig(
-            layer_id=LayerId(layer_id),
-            buffers=buffers,
-            sliding_window_size=life_cycle.window,
-            num_sink_tokens=None,
-            reuse_policy=life_cycle.reuse_policy,
-        )
-
 
 @runtime_checkable
 class RegionProvider(Protocol):
@@ -214,40 +209,27 @@ class RegionProvider(Protocol):
 
 
 @dataclass(frozen=True)
-class StorageOwner:
-    """The region a storage layer belongs to and the model layer it serves."""
-
-    region: str
-    model_layer: int
-
-
-@dataclass(frozen=True)
 class RegionLayout:
-    """Which region owns each storage layer of the manager's V2 layer list.
+    """Which region owns each buffer of the manager's V2 layer list.
 
-    Storage layer ids below ``num_model_layers`` coincide with rank-local model
-    layer indices. A model layer covered by more than one region is stored under
-    its own id only for the first region that declares it; each later region
-    gets a storage layer appended after the model layers, so storage ids at or
-    above ``num_model_layers`` never index per-model-layer tables.
+    Region storage takes the ids of the model layers it covers, so every
+    storage id also indexes the manager's per-model-layer tables. A layer
+    covered by several regions holds the buffers of all of them; ownership is
+    therefore recorded per buffer, ``(layer id, role)``.
 
     Attributes:
-        num_model_layers: Number of rank-local model layers.
-        owners: Storage layer id to owning region, for region storage only.
-        regions: The laid-out regions, in declaration order.
+        regions: The declared regions, in declaration order.
+        owners: The ``(layer id, role)`` of every buffer that region storage
+            holds, to the name of its region, layer by layer in buffer order.
+            Empty until the regions are laid out.
     """
 
-    num_model_layers: int
-    owners: Dict[int, StorageOwner] = field(default_factory=dict)
     regions: Tuple[Region, ...] = ()
+    owners: Mapping[Tuple[int, DataRole], str] = field(default_factory=dict)
 
-    def owner(self, layer_id: int) -> Optional[StorageOwner]:
-        """Return the region storing ``layer_id``, or None for a manager-built layer."""
-        return self.owners.get(int(layer_id))
-
-    def is_model_layer(self, layer_id: int) -> bool:
-        """Whether ``layer_id`` also indexes the manager's per-model-layer tables."""
-        return 0 <= int(layer_id) < self.num_model_layers
+    def __contains__(self, name: object) -> bool:
+        """Whether a region named ``name`` is declared."""
+        return any(region.name == name for region in self.regions)
 
     def region(self, name: str) -> Region:
         """Return the region declared under ``name``."""
@@ -256,20 +238,39 @@ class RegionLayout:
                 return region
         raise KeyError(f"No region named {name!r}")
 
+    def owner(self, layer_id: int, role: DataRole) -> Optional[Region]:
+        """Return the region storing ``role`` on ``layer_id``; None for a manager-built buffer."""
+        name = self.owners.get((int(layer_id), role))
+        return None if name is None else self.region(name)
+
     def layer_ids(self, region: str) -> Tuple[LayerId, ...]:
-        """Storage layer ids of ``region``, in ascending order."""
+        """Storage layer ids holding buffers of ``region``, in ascending order."""
+        layer_ids = {layer_id for (layer_id, _), name in self.owners.items() if name == region}
+        return tuple(LayerId(layer_id) for layer_id in sorted(layer_ids))
+
+    def roles(self, region: str, layer_id: int) -> Tuple[DataRole, ...]:
+        """Buffer roles ``region`` stores on ``layer_id``, in buffer order."""
         return tuple(
-            LayerId(layer_id)
-            for layer_id, owner in sorted(self.owners.items())
-            if owner.region == region
+            role
+            for (owner_layer, role), name in self.owners.items()
+            if owner_layer == int(layer_id) and name == region
         )
 
-    def model_layer_of(self, layer_id: int) -> Optional[int]:
-        """Model layer served by ``layer_id``: itself for a model layer id, else its owner's."""
-        owner = self.owner(layer_id)
-        if owner is not None:
-            return owner.model_layer
-        return int(layer_id) if self.is_model_layer(layer_id) else None
+    def group_ids(self, region: str, cache: "KVCacheManager") -> Tuple[int, ...]:
+        """V2 layer group ids of ``region``'s buffers in ``cache``, ascending.
+
+        Each group is one life cycle; a region whose buffers share a life
+        cycle across its layers has a single group.
+        """
+        return tuple(
+            sorted(
+                {
+                    int(cache.get_buffer_group_id(LayerId(layer_id), role))
+                    for (layer_id, role), name in self.owners.items()
+                    if name == region
+                }
+            )
+        )
 
     def renumbered(self, retained_layer_ids: Sequence[int]) -> "RegionLayout":
         """Return the layout after the manager compacts its layer list.
@@ -278,19 +279,68 @@ class RegionLayout:
             retained_layer_ids: For each new storage id, the old id it came from.
         """
         old_to_new = {old: new for new, old in enumerate(retained_layer_ids)}
-        num_model_layers = sum(1 for old in retained_layer_ids if old < self.num_model_layers)
         owners = {}
-        for old, owner in self.owners.items():
-            if old not in old_to_new:
-                continue
-            model_layer = old_to_new.get(owner.model_layer)
-            if model_layer is None:
+        for (old, role), name in self.owners.items():
+            new = old_to_new.get(old)
+            if new is None:
                 raise ValueError(
-                    f"Region {owner.region!r} serves model layer {owner.model_layer}, "
-                    "which the manager dropped"
+                    f"Region {name!r} stores {role} on layer {old}, which the manager dropped"
                 )
-            owners[old_to_new[old]] = StorageOwner(owner.region, model_layer)
-        return RegionLayout(num_model_layers=num_model_layers, owners=owners, regions=self.regions)
+            owners[new, role] = name
+        return RegionLayout(regions=self.regions, owners=owners)
+
+
+def _layer_config(layer_id: int, entries: Sequence[Tuple[Region, RegionLayer]]) -> LayerConfig:
+    """Merge the planes every region stores on one model layer into its V2 layer config.
+
+    The layer takes the life cycle of the first region that covers it, whose
+    buffers inherit the layer's reuse policy; a buffer of a region whose policy
+    differs overrides it, which places the buffer in that life cycle's group.
+    """
+    first = entries[0][0].life_cycle
+    for region, _ in entries[1:]:
+        life_cycle = region.life_cycle
+        if life_cycle.allocation != first.allocation:
+            raise ValueError(
+                f"Regions on model layer {layer_id} mix {first.allocation} and "
+                f"{life_cycle.allocation} allocation: one layer is one V2 layer config"
+            )
+        if life_cycle.window != first.window:
+            raise ValueError(
+                f"Token-block regions on model layer {layer_id} declare different windows "
+                f"({first.window} and {life_cycle.window}): a window is a layer property"
+            )
+    layer_policy = first.reuse_policy
+    buffers: List[BufferConfig] = []
+    roles: Dict[DataRole, str] = {}
+    for region, region_layer in entries:
+        policy = region.life_cycle.reuse_policy
+        for plane in region_layer.planes:
+            if plane.role in roles:
+                raise ValueError(
+                    f"Regions {roles[plane.role]!r} and {region.name!r} both store "
+                    f"{plane.role} on model layer {layer_id}"
+                )
+            roles[plane.role] = region.name
+            buffers.append(
+                BufferConfig(
+                    role=plane.role,
+                    size=plane.page_bytes,
+                    coalescing_group=plane.coalescing_group,
+                    reuse_policy=None if policy == layer_policy else policy,
+                )
+            )
+    if first.allocation == AllocationUnit.REQUEST:
+        return SsmLayerConfig(
+            layer_id=LayerId(layer_id), buffers=buffers, reuse_policy=layer_policy
+        )
+    return AttentionLayerConfig(
+        layer_id=LayerId(layer_id),
+        buffers=buffers,
+        sliding_window_size=first.window,
+        num_sink_tokens=None,
+        reuse_policy=layer_policy,
+    )
 
 
 def lay_out_regions(
@@ -299,26 +349,28 @@ def lay_out_regions(
     """Lay regions out over the manager's per-model-layer configs.
 
     Args:
-        regions: The regions to store, in declaration order. Their order fixes
-            which region keeps a shared model layer's id and the order of the
-            appended storage layers.
+        regions: The regions to store, in declaration order. The order fixes
+            each covered layer's buffer order and its own reuse policy (the
+            first covering region's).
         model_layers: The manager's config for each rank-local model layer,
             indexed by layer id.
 
     Returns:
-        The V2 layer list that replaces ``model_layers`` -- region storage in
-        place of the layers it covers, then the appended region storage -- and
-        the ownership map of that list.
+        The V2 layer list that replaces ``model_layers`` -- a covered layer's
+        config holds the planes of every region covering it, an uncovered
+        layer keeps the manager's config -- and the ownership of its buffers.
+
+    Raises:
+        ValueError: If region names repeat, a region covers a layer this rank
+            does not have, two regions store one role on a layer, or the
+            regions on one layer differ in allocation unit or window.
     """
     regions = tuple(regions)
     names = [region.name for region in regions]
     if len(set(names)) != len(names):
         raise ValueError(f"Region names must be unique, got {names}")
     num_model_layers = len(model_layers)
-    layers = list(model_layers)
-    appended = []
-    owners: Dict[int, StorageOwner] = {}
-    claimed = set()
+    covering: Dict[int, List[Tuple[Region, RegionLayer]]] = {}
     for region in regions:
         for region_layer in region.layers:
             model_layer = region_layer.model_layer
@@ -327,16 +379,16 @@ def lay_out_regions(
                     f"Region {region.name!r} covers model layer {model_layer}, but this "
                     f"rank has {num_model_layers} model layers"
                 )
-            if model_layer not in claimed:
-                claimed.add(model_layer)
-                layer_id = model_layer
-                layers[layer_id] = region.layer_config(layer_id, region_layer)
-            else:
-                layer_id = num_model_layers + len(appended)
-                appended.append(region.layer_config(layer_id, region_layer))
-            owners[layer_id] = StorageOwner(region.name, model_layer)
-    layout = RegionLayout(num_model_layers=num_model_layers, owners=owners, regions=regions)
-    return tuple(layers + appended), layout
+            covering.setdefault(model_layer, []).append((region, region_layer))
+    layers = list(model_layers)
+    owners: Dict[Tuple[int, DataRole], str] = {}
+    for layer_id in sorted(covering):
+        entries = covering[layer_id]
+        layers[layer_id] = _layer_config(layer_id, entries)
+        for region, region_layer in entries:
+            for plane in region_layer.planes:
+                owners[layer_id, plane.role] = region.name
+    return tuple(layers), RegionLayout(regions=regions, owners=owners)
 
 
 __all__ = [
@@ -349,6 +401,5 @@ __all__ = [
     "RegionLayout",
     "RegionLifeCycle",
     "RegionProvider",
-    "StorageOwner",
     "lay_out_regions",
 ]

@@ -28,7 +28,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     RegionLayout,
     RegionLifeCycle,
     RegionProvider,
-    StorageOwner,
     lay_out_regions,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -48,8 +47,10 @@ KEY = DataRole("key")
 SSM = DataRole("ssm_state")
 CONV = DataRole("conv_state")
 RING = DataRole("ring")
+HISTORY = DataRole("history")
 
 SLOT_WITH_SNAPSHOTS = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.DECLARED_POINTS)
+PRIVATE_SLOT = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER)
 FULL_HISTORY = RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES)
 RING_OF_19 = RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES, window=19)
 
@@ -80,7 +81,7 @@ def _base_layers(num_layers):
 
 
 def _hybrid_regions():
-    """Recurrent state on layers 0 and 2; a latent and a ring on layers 1 and 3."""
+    """Recurrent state on layers 0 and 2 with its private history; a latent on layers 1 and 3."""
     return [
         Region(
             "state",
@@ -88,7 +89,9 @@ def _hybrid_regions():
             tuple(RegionLayer(i, (Plane(SSM, 512), Plane(CONV, 96))) for i in (0, 2)),
         ),
         Region("latent", FULL_HISTORY, tuple(RegionLayer(i, (Plane(KEY, 128),)) for i in (1, 3))),
-        Region("ring", RING_OF_19, tuple(RegionLayer(i, (Plane(RING, 76),)) for i in (1, 3))),
+        Region(
+            "history", PRIVATE_SLOT, tuple(RegionLayer(i, (Plane(HISTORY, 64),)) for i in (0, 2))
+        ),
     ]
 
 
@@ -124,53 +127,114 @@ def test_no_regions_keeps_the_manager_layers():
 
     assert [_layer_summary(layer) for layer in layers] == [_layer_summary(layer) for layer in base]
     assert layout.owners == {}
-    assert layout.owner(1) is None
-    assert layout.model_layer_of(2) == 2
+    assert layout.owner(1, KEY) is None
+    assert "state" not in layout
 
 
-def test_regions_take_their_model_layers_and_append_shared_ones():
+def test_regions_on_one_layer_become_buffers_of_that_layer():
     layers, layout = lay_out_regions(_hybrid_regions(), _base_layers(4))
 
-    assert [_layer_summary(layer) for layer in layers] == [
-        (
-            "ssm",
-            0,
-            [("ssm_state", 512, 0, None), ("conv_state", 96, 0, None)],
-            ReusePolicy.REQUIRED,
-        ),
-        ("attention", 1, [("key", 128, 0, None)], None, None, ReusePolicy.REQUIRED),
-        (
-            "ssm",
-            2,
-            [("ssm_state", 512, 0, None), ("conv_state", 96, 0, None)],
-            ReusePolicy.REQUIRED,
-        ),
-        ("attention", 3, [("key", 128, 0, None)], None, None, ReusePolicy.REQUIRED),
-        # The ring shares model layers 1 and 3 with the latent, so it is stored
-        # after the model layers, in its own declaration order.
-        ("attention", 4, [("ring", 76, 0, None)], 19, None, ReusePolicy.REQUIRED),
-        ("attention", 5, [("ring", 76, 0, None)], 19, None, ReusePolicy.REQUIRED),
+    # The private history shares the recurrent-state layers: its buffers join
+    # them and override the layer's policy, so no layer is added.
+    ssm_buffers = [
+        ("ssm_state", 512, 0, None),
+        ("conv_state", 96, 0, None),
+        ("history", 64, 0, ReusePolicy.PRIVATE),
     ]
-    assert layout.owner(0) == StorageOwner("state", 0)
-    assert layout.owner(3) == StorageOwner("latent", 3)
-    assert layout.owner(5) == StorageOwner("ring", 3)
-    assert layout.layer_ids("ring") == (LayerId(4), LayerId(5))
-    assert layout.is_model_layer(3) and not layout.is_model_layer(4)
-    assert layout.model_layer_of(4) == 1
-    assert layout.region("ring").life_cycle.window == 19
+    assert [_layer_summary(layer) for layer in layers] == [
+        ("ssm", 0, ssm_buffers, ReusePolicy.REQUIRED),
+        ("attention", 1, [("key", 128, 0, None)], None, None, ReusePolicy.REQUIRED),
+        ("ssm", 2, ssm_buffers, ReusePolicy.REQUIRED),
+        ("attention", 3, [("key", 128, 0, None)], None, None, ReusePolicy.REQUIRED),
+    ]
+    assert layout.owner(0, SSM).name == "state"
+    assert layout.owner(2, HISTORY).name == "history"
+    assert layout.owner(3, KEY).name == "latent"
+    assert layout.owner(1, SSM) is None
+    assert layout.layer_ids("history") == (LayerId(0), LayerId(2))
+    assert layout.roles("state", 2) == (SSM, CONV)
+    assert layout.roles("history", 2) == (HISTORY,)
+    assert layout.roles("latent", 2) == ()
+    assert "history" in layout and "ring" not in layout
+    # Ownership lists every buffer layer by layer, in buffer order.
+    assert list(layout.owners) == [
+        (0, SSM),
+        (0, CONV),
+        (0, HISTORY),
+        (1, KEY),
+        (2, SSM),
+        (2, CONV),
+        (2, HISTORY),
+        (3, KEY),
+    ]
+
+
+def test_first_region_on_a_layer_sets_its_policy():
+    regions = [
+        Region("history", PRIVATE_SLOT, (RegionLayer(0, (Plane(HISTORY, 64),)),)),
+        Region("state", SLOT_WITH_SNAPSHOTS, (RegionLayer(0, (Plane(SSM, 512),)),)),
+    ]
+
+    layers, _ = lay_out_regions(regions, _base_layers(1))
+
+    assert _layer_summary(layers[0]) == (
+        "ssm",
+        0,
+        [("history", 64, 0, None), ("ssm_state", 512, 0, ReusePolicy.REQUIRED)],
+        ReusePolicy.PRIVATE,
+    )
 
 
 def test_private_regions_never_reach_the_prefix_index():
-    private_slot = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER)
     private_span = RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.NEVER, window=8)
     regions = [
-        Region("slot", private_slot, (RegionLayer(0, (Plane(SSM, 32),)),)),
+        Region("slot", PRIVATE_SLOT, (RegionLayer(0, (Plane(SSM, 32),)),)),
         Region("span", private_span, (RegionLayer(1, (Plane(KEY, 32),)),)),
     ]
 
     layers, _ = lay_out_regions(regions, _base_layers(2))
 
     assert [layer.reuse_policy for layer in layers] == [ReusePolicy.PRIVATE] * 2
+
+
+def test_layout_rejects_regions_one_layer_config_cannot_hold():
+    state = Region("state", SLOT_WITH_SNAPSHOTS, (RegionLayer(0, (Plane(SSM, 32),)),))
+    with pytest.raises(ValueError, match="both store"):
+        lay_out_regions(
+            [state, Region("other", PRIVATE_SLOT, (RegionLayer(0, (Plane(SSM, 16),)),))],
+            _base_layers(1),
+        )
+    with pytest.raises(ValueError, match="mix"):
+        lay_out_regions(
+            [state, Region("latent", FULL_HISTORY, (RegionLayer(0, (Plane(KEY, 16),)),))],
+            _base_layers(1),
+        )
+    # A window is a property of the V2 layer, so token-block regions sharing a
+    # layer must agree on it.
+    with pytest.raises(ValueError, match="windows"):
+        lay_out_regions(
+            [
+                Region("latent", FULL_HISTORY, (RegionLayer(0, (Plane(KEY, 16),)),)),
+                Region("ring", RING_OF_19, (RegionLayer(0, (Plane(RING, 16),)),)),
+            ],
+            _base_layers(1),
+        )
+    private_ring = RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.NEVER, window=19)
+    layers, _ = lay_out_regions(
+        [
+            Region("ring", RING_OF_19, (RegionLayer(0, (Plane(RING, 16),)),)),
+            Region("scratch", private_ring, (RegionLayer(0, (Plane(KEY, 16),)),)),
+        ],
+        _base_layers(1),
+    )
+    assert _layer_summary(layers[0]) == (
+        "attention",
+        0,
+        [("ring", 16, 0, None), ("key", 16, 0, ReusePolicy.PRIVATE)],
+        19,
+        None,
+        ReusePolicy.REQUIRED,
+    )
 
 
 def test_layout_rejects_unknown_layers_and_duplicate_names():
@@ -185,19 +249,35 @@ def test_layout_rejects_unknown_layers_and_duplicate_names():
 
 def test_renumbering_follows_the_compacted_layer_list():
     regions = [
-        Region("latent", FULL_HISTORY, (RegionLayer(1, (Plane(KEY, 128),)),)),
-        Region("ring", RING_OF_19, (RegionLayer(1, (Plane(RING, 76),)),)),
+        Region("state", SLOT_WITH_SNAPSHOTS, (RegionLayer(3, (Plane(SSM, 128),)),)),
+        Region("history", PRIVATE_SLOT, (RegionLayer(3, (Plane(HISTORY, 76),)),)),
     ]
     _, layout = lay_out_regions(regions, _base_layers(4))
-    assert layout.owners == {1: StorageOwner("latent", 1), 4: StorageOwner("ring", 1)}
+    assert layout.owners == {(3, SSM): "state", (3, HISTORY): "history"}
 
-    # Model layer 3 had no buffers and was dropped; the ring moves down with it.
-    renumbered = layout.renumbered([0, 1, 2, 4])
+    # Model layer 1 had no buffers and was dropped; layer 3 moves down with it.
+    renumbered = layout.renumbered([0, 2, 3])
 
-    assert renumbered.num_model_layers == 3
-    assert renumbered.owners == {1: StorageOwner("latent", 1), 3: StorageOwner("ring", 1)}
+    assert renumbered.owners == {(2, SSM): "state", (2, HISTORY): "history"}
+    assert renumbered.regions == layout.regions
     with pytest.raises(ValueError, match="dropped"):
-        layout.renumbered([0, 2, 3, 4])
+        layout.renumbered([0, 1, 2])
+
+
+class _Cache:
+    """Stand-in for the V2 runtime: the history buffers form their own group."""
+
+    def get_buffer_group_id(self, layer_id, role):
+        return 2 if role == HISTORY else int(layer_id) % 2
+
+
+def test_layout_resolves_a_region_to_its_layer_groups():
+    _, layout = lay_out_regions(_hybrid_regions(), _base_layers(4))
+
+    assert layout.group_ids("history", _Cache()) == (2,)
+    assert layout.group_ids("state", _Cache()) == (0,)
+    assert layout.group_ids("latent", _Cache()) == (1,)
+    assert layout.group_ids("missing", _Cache()) == ()
 
 
 @dataclass
@@ -230,7 +310,7 @@ def test_manager_without_regions_keeps_its_config():
     assert mgr._lay_out_regions(config) is config
     assert not config.commit_min_snapshot
     assert mgr.region_layout.owners == {}
-    assert mgr.region_layout.num_model_layers == 4
+    assert mgr.region_layout.regions == ()
 
 
 def test_manager_stores_its_providers_regions():
@@ -240,35 +320,33 @@ def test_manager_stores_its_providers_regions():
 
     config = mgr._lay_out_regions(_config(_base_layers(4)))
 
-    assert [int(layer.layer_id) for layer in config.layers] == [0, 1, 2, 3, 4, 5]
+    assert [int(layer.layer_id) for layer in config.layers] == [0, 1, 2, 3]
     assert isinstance(config.layers[2], SsmLayerConfig)
     # The runtime rejects per-request storage without minimum-snapshot commits.
     assert config.commit_min_snapshot
-    assert config.layers[4].sliding_window_size == 19
     assert isinstance(mgr.region_layout, RegionLayout)
-    assert mgr.region_layout.owner(4) == StorageOwner("ring", 1)
+    assert mgr.region_layout.owner(2, HISTORY).name == "history"
 
 
 def test_dropping_an_empty_layer_keeps_region_ownership_consistent():
     regions = [
-        Region("latent", FULL_HISTORY, (RegionLayer(1, (Plane(KEY, 128),)),)),
-        Region("ring", RING_OF_19, (RegionLayer(1, (Plane(RING, 76),)),)),
+        Region("latent", FULL_HISTORY, (RegionLayer(2, (Plane(KEY, 128),)),)),
+        Region("ring", RING_OF_19, (RegionLayer(0, (Plane(RING, 76),)),)),
     ]
     mgr = _manager_stub([_Provider(regions)])
     base = _base_layers(3)
-    # Model layer 2 has no cache storage on this rank.
-    base[2] = AttentionLayerConfig(layer_id=LayerId(2), buffers=[BufferConfig(role=KEY, size=0)])
+    # Model layer 1 has no cache storage on this rank.
+    base[1] = AttentionLayerConfig(layer_id=LayerId(1), buffers=[BufferConfig(role=KEY, size=0)])
     mgr.num_local_layers = 3
     mgr.pp_layers = [10, 11, 12]
-    mgr.num_kv_heads_per_layer = [1, 1, 0]
+    mgr.num_kv_heads_per_layer = [1, 0, 1]
     mgr.head_dim_per_layer = [64, 64, 64]
     mgr.max_attention_window_vec = [256, 256, 256]
 
     config = mgr._remove_zero_size_buffers(mgr._lay_out_regions(_config(base)))
 
-    assert [int(layer.layer_id) for layer in config.layers] == [0, 1, 2]
-    assert [str(layer.buffers[0].role) for layer in config.layers] == ["key", "key", "ring"]
-    assert mgr.pp_layers == [10, 11]
+    assert [int(layer.layer_id) for layer in config.layers] == [0, 1]
+    assert [str(layer.buffers[0].role) for layer in config.layers] == ["ring", "key"]
+    assert mgr.pp_layers == [10, 12]
     assert mgr.num_local_layers == 2
-    assert mgr.region_layout.num_model_layers == 2
-    assert mgr.region_layout.owner(2) == StorageOwner("ring", 1)
+    assert mgr.region_layout.owners == {(0, RING): "ring", (1, KEY): "latent"}

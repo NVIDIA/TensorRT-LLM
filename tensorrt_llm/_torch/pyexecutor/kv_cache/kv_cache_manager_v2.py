@@ -1865,7 +1865,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
-    # Ownership of region storage, set while the cache config is built; see region_layout.
+    # Ownership of region buffers, set while the cache config is built; see region_layout.
     _region_layout: Optional[RegionLayout] = None
 
     def __init__(
@@ -4027,8 +4027,9 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager.
 
-        Runs after the regions are laid out; a layer that ``region_layout``
-        assigns to a region is the region's and must be left as declared.
+        Runs after the regions are laid out; a layer holding buffers that
+        ``region_layout`` assigns to a region is the regions' and must be left
+        as declared.
         """
         return config
 
@@ -4041,7 +4042,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return ()
 
     def _lay_out_regions(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Replace the base layer configs with the declared regions' storage."""
+        """Replace the base config of every layer a region covers with the regions' buffers."""
         regions = [
             region for provider in self._region_providers() for region in provider.declare_regions()
         ]
@@ -4059,9 +4060,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @property
     def region_layout(self) -> RegionLayout:
-        """Which region owns each storage layer; empty when no region is declared."""
+        """Which region owns each buffer; empty when no region is declared."""
         if self._region_layout is None:
-            return RegionLayout(num_model_layers=self.num_local_layers)
+            return RegionLayout()
         return self._region_layout
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -4101,12 +4102,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
 
-        layout = self._region_layout
-        if layout is not None and layout.owners:
-            # Region storage appended after the model layers has no entry in
-            # the per-model-layer views below.
-            self._region_layout = layout.renumbered(retained_layer_ids)
-            retained_layer_ids = [i for i in retained_layer_ids if layout.is_model_layer(i)]
+        if self._region_layout is not None and self._region_layout.owners:
+            self._region_layout = self._region_layout.renumbered(retained_layer_ids)
         # Runtime layer IDs are local offsets. Compact every per-layer view
         # together while preserving the model's global layer IDs and count.
         self.pp_layers = [self.pp_layers[i] for i in retained_layer_ids]
