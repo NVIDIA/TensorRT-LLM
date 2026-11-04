@@ -51,6 +51,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def _events(path: Path) -> list[dict[str, "MetadataValue"]]:
+    """Decode NCCL metadata records from an exported execution-trace file."""
     trace = json.loads(path.read_text())
     result = []
     for node in trace["nodes"]:
@@ -62,6 +63,9 @@ def _events(path: Path) -> list[dict[str, "MetadataValue"]]:
 
 
 def _enabled() -> bool:
+    """Require compiled NCCL probes and a current selection that includes
+    nccl.
+    """
     assert type(BuildInfo.ENABLE_NCCL_PROFILING) is bool
     return BuildInfo.ENABLE_NCCL_PROFILING and profiler.custom_region_enabled("nccl")
 
@@ -74,6 +78,9 @@ def _profile(
     before_run: Callable[[], None] | None = None,
 ) -> list[dict[str, "MetadataValue"]]:
     # Initialize communicators and allocator state outside capture and profiling.
+    """Warm up, execute, and validate a distributed operation under real
+    profiler capture.
+    """
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -158,6 +165,7 @@ def _assert_fields(
     strategy: str,
     graph: bool,
 ) -> None:
+    """Check native NCCL fields or the absence of omitted build-time probes."""
     if not _enabled():
         assert fields == []
         return
@@ -177,6 +185,9 @@ def _assert_fields(
 def _run_collective(
     case: Literal["allreduce", "equal", "uneven", "list", "helix"], graph: bool
 ) -> bool:
+    """Run the selected two-rank collective and validate its profiler
+    metadata.
+    """
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     group = [0, 1]
@@ -195,6 +206,9 @@ def _run_collective(
     elif case in {"equal", "list"}:
 
         def operation() -> list[torch.Tensor]:
+            """Execute the selected tensor or list allgather for profiler
+            validation.
+            """
             if case == "list":
                 return list(torch.ops.trtllm.allgather_list([local, local], None, group))
             return [torch.ops.trtllm.allgather(local, None, group)]
@@ -236,6 +250,7 @@ def _run_collective(
 
 
 def _run_point_to_point(graph: bool) -> bool:
+    """Validate fresh two-rank send/receive payloads and native metadata."""
     import torch
 
     rank = tensorrt_llm.mpi_rank()
@@ -244,6 +259,7 @@ def _run_point_to_point(graph: bool) -> bool:
     local = torch.full((2, 4), 17.0 if rank == 0 else 0.0, device="cuda")
 
     def operation() -> list[torch.Tensor]:
+        """Send from rank zero or receive in place on its peer."""
         if rank == 0:
             communicator.send(local, 1)
         else:
@@ -252,6 +268,9 @@ def _run_point_to_point(graph: bool) -> bool:
 
     def before_run() -> None:
         # Warmup sends 17; every measured run must transfer the new payload.
+        """Refresh the measured payload so warmup data cannot satisfy
+        validation.
+        """
         if rank == 0:
             local.fill_(31)
         else:
@@ -268,6 +287,9 @@ def _run_point_to_point(graph: bool) -> bool:
 
 
 def _run_process_group() -> bool:
+    """Verify the process-group dispatcher path does not claim native probe
+    metadata.
+    """
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     port = None

@@ -15,6 +15,7 @@
 """CPU contract tests for the shared profiler primitives."""
 
 import builtins
+import hashlib
 import inspect
 import json
 import logging
@@ -181,6 +182,81 @@ def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
     )
     assert completed.returncode == 0
     assert completed.stderr.count("Invalid TLLM_PROFILE_CUSTOM_REGIONS") == 1
+
+
+@pytest.mark.parametrize("selector", ["none", "unknown", "nccl"])
+def test_native_module_initialization_warnings_do_not_require_cuda(
+    selector: str, tmp_path: Path
+) -> None:
+    """Initialize the actual extension without the separate package/MPI bootstrap."""
+    import tensorrt_llm.bindings as bindings
+
+    parent_extension = Path(bindings.__file__).resolve()
+    expected_hash = hashlib.sha256(parent_extension.read_bytes()).hexdigest()
+    script = """
+import hashlib
+import importlib
+import importlib.machinery
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import torch
+assert torch.cuda.device_count() == 0
+print('visible_cuda_devices=0', flush=True)
+package = importlib.machinery.PathFinder.find_spec('tensorrt_llm')
+spec = importlib.machinery.PathFinder.find_spec(
+    'tensorrt_llm.bindings', package.submodule_search_locations
+)
+assert isinstance(spec.loader, importlib.machinery.ExtensionFileLoader)
+bindings = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = bindings
+spec.loader.exec_module(bindings)
+assert importlib.import_module(spec.name) is bindings
+assert bindings.QuantMode.none().value == 0
+print(json.dumps({
+    'file': bindings.__file__,
+    'sha256': hashlib.sha256(Path(bindings.__file__).read_bytes()).hexdigest(),
+    'enable_nccl_profiling': bindings.BuildInfo.ENABLE_NCCL_PROFILING,
+    'visible_cuda_devices': torch.cuda.device_count(),
+}))
+"""
+    environment = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        TLLM_PROFILE_CUSTOM_REGIONS=selector,
+        TLLM_LOG_LEVEL="INFO",
+        TLLM_LOG_FIRST_RANK_ONLY="ON",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    (tmp_path / "native-extension-init.stdout.txt").write_text(result.stdout)
+    (tmp_path / "native-extension-init.stderr.txt").write_text(result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    info = json.loads(result.stdout.strip().splitlines()[-1])
+    (tmp_path / "native-extension-init.json").write_text(
+        json.dumps({"selector": selector, "scope": "native-extension initialization", **info})
+    )
+    assert info["visible_cuda_devices"] == 0
+    assert Path(info["file"]).resolve() == parent_extension
+    assert info["sha256"] == expected_hash
+    assert type(info["enable_nccl_profiling"]) is bool
+    assert info["enable_nccl_profiling"] == bindings.BuildInfo.ENABLE_NCCL_PROFILING
+    assert result.stderr.count("Invalid TLLM_PROFILE_CUSTOM_REGIONS region:") == int(
+        selector == "unknown"
+    )
+    assert result.stderr.count("ENABLE_NCCL_PROFILING=OFF") == int(
+        selector == "nccl" and not info["enable_nccl_profiling"]
+    )
+    if selector == "none":
+        assert "TLLM_PROFILE_CUSTOM_REGIONS" not in result.stderr
 
 
 @pytest.mark.parametrize(
