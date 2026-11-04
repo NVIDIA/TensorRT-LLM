@@ -936,8 +936,8 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
                         _st_v4(stage + c * Int64(16), neg0, neg0, neg0, neg0)
                         c = c + tot
         else:
-            # Its size in BF16 elements.
-            clear_vecs = clear_size // Int64(VEC)
+            # Its size in bytes (every Lamport kernel on the workspace), as whole 16-byte stores.
+            clear_vecs = (clear_size + Int64(15)) // Int64(16)
             c = idx
             while c < clear_vecs:
                 _st_v4(own + clear_off + c * Int64(16), neg0, neg0, neg0, neg0)
@@ -1015,5 +1015,5 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
                     while arrived != grid:
                         arrived = _ld_volatile_s32(flag_addr)
                     _st_s32(flag_addr + Int64(8), (flag + 1) % 3)
-                    _st_s64(layout_addr, Int64(m) * Int64(self.hidden * nranks))
+                    _st_s64(layout_addr, Int64(m) * Int64(self.hidden * nranks * 2))
                     _st_s32(flag_addr, Int32(0))
