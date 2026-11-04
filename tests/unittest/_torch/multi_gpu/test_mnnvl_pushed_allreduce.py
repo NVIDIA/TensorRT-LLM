@@ -665,6 +665,13 @@ def _run_rank_k3_attention(world_size):
 _SENTINEL = -(2**31)  # 0x80000000 as int32: an empty Lamport word
 
 
+def _trtllm_ops():
+    """``torch.ops.trtllm`` looked up by name: cloudpickle ships the functions of this module to
+    the MPI workers by value, and one whose code names ``torch.ops`` captures that namespace,
+    which cannot be pickled."""
+    return getattr(torch, "ops").trtllm
+
+
 def _small_batch_moe_operands(world, rank, m, owners, seed):
     """Operands of the small-batch MoE kernel on ``rank`` of an expert-parallel group: the same
     top-k on every rank, drawn from the experts of the ``owners`` ranks only (the other ranks then
@@ -680,7 +687,7 @@ def _small_batch_moe_operands(world, rank, m, owners, seed):
     scales, ids = logits.masked_fill(~owned, float("-inf")).topk(top_k, dim=-1)
     ids = ids.to(torch.int32)
     scales = scales.softmax(dim=-1).float()
-    t2g, t2lim, e2p, p2e, _, nnet = torch.ops.trtllm.moe_sort(
+    t2g, t2lim, e2p, p2e, _, nnet = _trtllm_ops().moe_sort(
         token_selected_experts=ids,
         token_final_scales=scales,
         num_experts=num_experts,
@@ -691,7 +698,7 @@ def _small_batch_moe_operands(world, rank, m, owners, seed):
     )
     xb = torch.randn(m, hidden, device="cuda", dtype=torch.bfloat16, generator=gen)
     x_gsf = xb.abs().max().float() / (448 * 6)
-    x, x_sf = torch.ops.trtllm.fp4_quantize(xb, 1 / x_gsf, 16, False, False)
+    x, x_sf = _trtllm_ops().fp4_quantize(xb, 1 / x_gsf, 16, False, False)
     wgen = torch.Generator(device="cuda").manual_seed(seed * 1000 + rank)
 
     def experts(rows, cols):
@@ -737,7 +744,7 @@ def _small_batch_moe(d, out, counters, mode, push=None, num_ctas=0):
     if published:
         small_batch_moe_route_word(counters).fill_(d["ids"].size(0))
         tables, e2p = (None,) * 4, d["ids"].reshape(-1)
-    torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
+    _trtllm_ops().cute_dsl_nvfp4_small_batch_moe_rubin(
         input=d["x"].view(torch.float4_e2m1fn_x2),
         input_scale=d["x_sf"].view(torch.uint8),
         fc1_weight=d["w1"].view(torch.float4_e2m1fn_x2),
