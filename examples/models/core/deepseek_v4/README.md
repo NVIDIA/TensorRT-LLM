@@ -539,24 +539,23 @@ A table from another TensorRT LLM version only warns. Tables in the earlier sing
 A vector longer than `K` is truncated, so one file fitted at the checkpoint's block size serves
 every `K`. Without it the raw sigmoid confidence is used.
 
-### Device re-ranking (optional)
+### Device re-ranking
 
-By default the host chooses which drafted positions to verify from a copy of the previous step's
-confidence, so it never waits for the GPU. With `enable_fused_confidence_scheduler` the host still
-chooses the verifier budget, but the GPU re-ranks the positions using the confidence of the block
-being verified:
+The host chooses the verifier budget from a copy of the previous step's confidence, so it never
+waits for the GPU. The GPU then re-ranks which drafted positions to verify, using the confidence of
+the block being verified. This is on by default with confidence scheduling; it costs compact steps
+a full input rebuild and a small extra GPU pass. To rank on the host only:
 
 ```yaml
 speculative_config:
   enable_confidence_scheduling: true
-  enable_fused_confidence_scheduler: true   # device re-ranking, off by default
+  enable_fused_confidence_scheduler: false   # host ranking only
 ```
 
-Compact steps then rebuild their inputs in full and run a small extra GPU pass, so the gain depends
-on the workload; run your batch size with and without it and keep the faster. On DeepSeek-V4-Pro
-(8x B300, attention DP) it raised throughput over confidence scheduling alone in 13 of 15 dataset
-and batch-size settings, by up to 5.5%, and lowered it in two (-2.2% and -0.4%), without changing
-GSM8K accuracy. It has been validated with attention DP only.
+On DeepSeek-V4-Pro (8x B300) with attention DP, re-ranking raised throughput over host ranking in
+13 of 15 dataset and batch-size settings, by up to 5.5%, without changing GSM8K accuracy; the larger
+of its two losses (-2.2%) measured +0.4% when repeated on a later main. With TP8 attention and no
+attention DP it raised throughput in 14 of 16 settings at batch sizes 8 to 64, by up to 6.4%.
 
 ### Limitations
 

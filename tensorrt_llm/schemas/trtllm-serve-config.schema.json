@@ -1110,8 +1110,8 @@
           "type": "boolean"
         },
         "enable_fused_confidence_scheduler": {
-          "default": false,
-          "description": "Re-rank which draft positions are verified on the GPU, using the confidence of the block being verified rather than the previous step's host copy. The verifier budget is still chosen on the host. Compact steps gain a device pass and a full input rebuild, so measure it on your workload. Only used when enable_confidence_scheduling=True; validated with attention data parallelism.",
+          "default": true,
+          "description": "Re-rank which draft positions are verified on the GPU, using the confidence of the block being verified rather than the previous step's host copy. The verifier budget is still chosen on the host. On by default; set False to rank on the host only, which drops a device pass and a full input rebuild on compact steps. Only used when enable_confidence_scheduling=True.",
           "status": "prototype",
           "title": "Enable Fused Confidence Scheduler",
           "type": "boolean"
