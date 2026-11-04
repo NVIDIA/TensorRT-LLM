@@ -20,7 +20,7 @@ in.
 3. **Run the verdict:**
 
    ```bash
-   verdict.py --tier full --controls-receipt <dir>/controls.json \
+   python scripts/validate/verdict.py --tier full --controls-receipt <dir>/controls.json \
        --harness <profile> --model <profile> --matrix <matrix> --population <kind> \
        --build-id <the recorder's id> [--raw <raw dir>] --out-dir <snapshot>/full-tier <trace>
    ```
