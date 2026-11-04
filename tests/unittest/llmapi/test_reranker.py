@@ -14,6 +14,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -225,6 +226,63 @@ async def test_v1_rerank_forwards_instruction():
 
     assert response.status_code == 200
     assert f"<Instruct>: {instruction}\n" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_tokens_per_doc", [None, 4])
+async def test_v1_rerank_reuses_query_tokenization(max_tokens_per_doc: int | None) -> None:
+    documents = ["first document", "second document", "third document"]
+    server = _server([0.0] * len(documents))
+    tokenizer = Mock(wraps=CharacterTokenizer())
+    server.tokenizer = tokenizer
+    request = RerankRequest(
+        query="query",
+        documents=documents,
+        instruction="custom task",
+        max_tokens_per_doc=max_tokens_per_doc,
+    )
+
+    response = await server._rerank(request)
+
+    assert response.status_code == 200
+    texts = [call.args[0] for call in tokenizer.encode.call_args_list]
+    assert texts.count(_QWEN3_RERANK_SUFFIX) == 1
+    assert texts.count(format_qwen3_rerank_prompt("query", "", "custom task")) == 1
+    overhead = 2 if max_tokens_per_doc is None else 3
+    assert len(texts) == len(documents) + overhead
+    for document, token_ids in zip(documents, server.encode_batcher.inputs):
+        expected_document = (
+            document if max_tokens_per_doc is None else document[:max_tokens_per_doc]
+        )
+        assert server.tokenizer.decode(token_ids) == format_qwen3_rerank_prompt(
+            "query", expected_document, "custom task"
+        )
+
+
+@pytest.mark.asyncio
+async def test_v1_rerank_transfers_logits_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _server([-1000.0, 1000.0, 0.0])
+    request = RerankRequest(query="query", documents=["low", "high", "middle"])
+    transferred_shapes = []
+
+    def scalar_sync_is_forbidden(*args, **kwargs) -> None:
+        pytest.fail("logits must be transferred together rather than with item()")
+
+    original_tolist = torch.Tensor.tolist
+
+    def record_tolist(tensor: torch.Tensor) -> list[float]:
+        transferred_shapes.append(tuple(tensor.shape))
+        return original_tolist(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "item", scalar_sync_is_forbidden)
+    monkeypatch.setattr(torch.Tensor, "tolist", record_tolist)
+
+    response = await server._rerank(request)
+    body = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert transferred_shapes == [(3,)]
+    assert [result["relevance_score"] for result in body["results"]] == [1.0, 0.5, 0.0]
 
 
 @pytest.mark.asyncio

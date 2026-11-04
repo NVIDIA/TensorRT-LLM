@@ -54,19 +54,33 @@ def test_unknown_architecture_is_rejected(tmp_path):
         _resolve_rerank_architecture_override(model, trust_remote_code=False)
 
 
-def test_config_load_failure_is_best_effort(monkeypatch):
+@pytest.mark.parametrize("error_type", [OSError, ValueError, RuntimeError])
+def test_config_load_failure_rejects_startup(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
     from transformers import AutoConfig
 
-    from tensorrt_llm.commands.serve import _resolve_rerank_architecture_override
+    from tensorrt_llm.commands import serve
 
-    def fail_to_load_config(*args, **kwargs):
-        raise RuntimeError("custom config failed")
+    error = error_type("custom config failed")
+
+    def fail_to_load_config(*args, **kwargs) -> None:
+        raise error
 
     monkeypatch.setattr(AutoConfig, "from_pretrained", fail_to_load_config)
+    monkeypatch.setattr(
+        serve,
+        "PyTorchLLM",
+        lambda **kwargs: pytest.fail("config failure must stop before model loading"),
+    )
 
-    override = _resolve_rerank_architecture_override("reranker", trust_remote_code=True)
+    with pytest.raises(click.BadParameter, match="Could not read model config") as raised:
+        serve.launch_rerank_server(
+            "localhost", 8000, {"model": "reranker", "trust_remote_code": True}, 0.005, 2048
+        )
 
-    assert override is None
+    assert raised.value.__cause__ is error
+    assert "custom config failed" in str(raised.value)
 
 
 def test_supported_user_architecture_override_wins(monkeypatch):

@@ -26,6 +26,7 @@ from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, Dict, List, Optional, Tuple, Union)
 
 import msgspec
+import torch
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -131,7 +132,7 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
                                        render_conversation)
-from tensorrt_llm.serve.reranker import (build_qwen3_rerank_input,
+from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
@@ -1617,17 +1618,19 @@ class OpenAIServer(_VideoRoutesMixin):
             max_prompt_length = min(engine.max_seq_len, engine.max_num_tokens)
             loop = asyncio.get_running_loop()
             try:
+                input_builder = await loop.run_in_executor(
+                    self._input_proc_executor,
+                    functools.partial(
+                        Qwen3RerankInputBuilder,
+                        tokenizer=self.tokenizer,
+                        query=request.query,
+                        max_seq_len=max_prompt_length,
+                        instruction=request.instruction,
+                        max_tokens_per_doc=request.max_tokens_per_doc))
                 token_ids_list = await asyncio.gather(*[
                     loop.run_in_executor(
                         self._input_proc_executor,
-                        functools.partial(
-                            build_qwen3_rerank_input,
-                            tokenizer=self.tokenizer,
-                            query=request.query,
-                            document=document,
-                            max_seq_len=max_prompt_length,
-                            instruction=request.instruction,
-                            max_tokens_per_doc=request.max_tokens_per_doc))
+                        functools.partial(input_builder.build, document))
                     for document in documents
                 ])
             except ValueError as e:
@@ -1648,15 +1651,17 @@ class OpenAIServer(_VideoRoutesMixin):
                 return self.create_error_response(
                     str(e), status_code=HTTPStatus.TOO_MANY_REQUESTS)
 
-            scored = []
-            for index, output in enumerate(outputs):
-                logits = output.logits.flatten()
-                if logits.numel() != 1:
+            logits = []
+            for output in outputs:
+                if output.logits.numel() != 1:
                     raise RuntimeError(
                         "Reranker model must return exactly one logit per "
                         f"document; got shape {tuple(output.logits.shape)}.")
-                score = rerank_probability(float(logits.item()))
-                scored.append((index, score))
+                logits.append(output.logits.reshape(()))
+            scored = [
+                (index, rerank_probability(logit))
+                for index, logit in enumerate(torch.stack(logits).tolist())
+            ]
             scored.sort(key=lambda item: item[1], reverse=True)
             if request.top_n is not None and request.top_n > 0:
                 scored = scored[:request.top_n]

@@ -130,6 +130,10 @@ preprocessing and scoring implementation currently supports the
 - `Qwen3-Reranker-4B`
 - `Qwen3-Reranker-8B`
 
+Only unquantized checkpoints are supported. Quantized checkpoints, including
+FP8 and NVFP4, are not supported: the scalar scoring head is derived directly
+from unquantized language-model or tied embedding weights.
+
 Qwen3-Reranker checkpoints are published as causal language models that score
 the tokens `yes` and `no`. TensorRT-LLM selects `Qwen3ForTextReranking` for
 these checkpoints, reads the token IDs from `1_LogitScore/config.json` when
@@ -151,11 +155,13 @@ replaces its default web-search instruction.
 | Condition | HTTP status |
 |---|---|
 | Invalid request body or unsupported `priority` | 400 |
-| Input longer than the model or batch token limit | 400 |
+| Instruction and query alone exceed the model or batch token limit | 400 |
 | Request queue full | 429 |
 | Model does not return one scalar per pair | 500 |
 
-Reranking responses are unary and non-streaming.
+Over-long documents are truncated to fit the smaller of the model's sequence
+limit and the batch token limit, while preserving the instruction, query, and
+assistant suffix. Reranking responses are unary and non-streaming.
 
 ## Deployment scope
 

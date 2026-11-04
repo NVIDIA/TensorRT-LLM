@@ -917,10 +917,10 @@ def _resolve_rerank_architecture_override(
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision)
         architectures = getattr(hf_config, "architectures", None) or []
-    except Exception as e:  # noqa: BLE001 - config read is best-effort
-        logger.warning(
-            f"Could not read model config for rerank routing ({model}): {e}")
-        return None
+    except Exception as e:  # noqa: BLE001 - custom config errors
+        raise click.BadParameter(
+            f"Could not read model config for rerank routing ({model}): {e}",
+            param_hint="model") from e
 
     if not architectures:
         raise click.BadParameter(

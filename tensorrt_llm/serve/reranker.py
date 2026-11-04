@@ -49,6 +49,66 @@ def format_qwen3_rerank_prompt(
     return _format_qwen3_rerank_prefix(query, instruction) + document + _QWEN3_RERANK_SUFFIX
 
 
+class Qwen3RerankInputBuilder:
+    """Reuse query-specific tokenization across documents in one request."""
+
+    def __init__(
+        self,
+        tokenizer: _Tokenizer,
+        query: str,
+        max_seq_len: int,
+        instruction: str | None = None,
+        max_tokens_per_doc: int | None = None,
+    ) -> None:
+        if max_seq_len <= 0:
+            raise ValueError("max_seq_len must be greater than zero.")
+        if max_tokens_per_doc is not None and max_tokens_per_doc <= 0:
+            raise ValueError("max_tokens_per_doc must be greater than zero.")
+
+        self._tokenizer = tokenizer
+        self._prompt_prefix = _format_qwen3_rerank_prefix(query, instruction)
+        self._suffix_ids = tokenizer.encode(_QWEN3_RERANK_SUFFIX, add_special_tokens=False)
+        if not self._suffix_ids:
+            raise ValueError("Tokenizer did not preserve the Qwen3 reranker suffix.")
+
+        empty_prompt = self._prompt_prefix + _QWEN3_RERANK_SUFFIX
+        minimum_length = len(tokenizer.encode(empty_prompt, add_special_tokens=False))
+        if minimum_length > max_seq_len:
+            raise ValueError(
+                "The reranker instruction and query exceed the model's maximum "
+                f"sequence length of {max_seq_len} tokens."
+            )
+
+        self._max_content_length = max_seq_len - len(self._suffix_ids)
+        self._max_tokens_per_doc = max_tokens_per_doc
+        self._prefix_ids = (
+            tokenizer.encode(self._prompt_prefix, add_special_tokens=False)
+            if max_tokens_per_doc is not None
+            else []
+        )
+
+    def build(self, document: str) -> list[int]:
+        """Tokenize one complete prompt and truncate only its document."""
+        full_prompt = self._prompt_prefix + document + _QWEN3_RERANK_SUFFIX
+        full_ids = self._tokenizer.encode(full_prompt, add_special_tokens=False)
+        if full_ids[-len(self._suffix_ids) :] != self._suffix_ids:
+            raise ValueError("Tokenizer did not preserve the Qwen3 reranker suffix.")
+
+        content_length = len(full_ids) - len(self._suffix_ids)
+        if self._max_tokens_per_doc is not None:
+            document_start = 0
+            for full_token, prefix_token in zip(full_ids, self._prefix_ids):
+                if full_token != prefix_token:
+                    break
+                document_start += 1
+            content_length = min(content_length, document_start + self._max_tokens_per_doc)
+        content_length = min(content_length, self._max_content_length)
+
+        if content_length + len(self._suffix_ids) >= len(full_ids):
+            return full_ids
+        return full_ids[:content_length] + self._suffix_ids
+
+
 def build_qwen3_rerank_input(
     tokenizer: _Tokenizer,
     query: str,
@@ -59,7 +119,7 @@ def build_qwen3_rerank_input(
 ) -> list[int]:
     """Tokenize the official Qwen3 prompt, truncating only the document.
 
-    The prompt is first tokenized as one string so token boundaries match the
+    The complete prompt is tokenized as one string so token boundaries match the
     reference implementation. If it is too long, tokens are removed immediately
     before the fixed assistant suffix, keeping both the query and suffix intact.
 
@@ -79,40 +139,13 @@ def build_qwen3_rerank_input(
             required suffix, or the instruction and query alone exceed the
             sequence limit.
     """
-    if max_seq_len <= 0:
-        raise ValueError("max_seq_len must be greater than zero.")
-    if max_tokens_per_doc is not None and max_tokens_per_doc <= 0:
-        raise ValueError("max_tokens_per_doc must be greater than zero.")
-
-    prompt_prefix = _format_qwen3_rerank_prefix(query, instruction)
-    full_prompt = prompt_prefix + document + _QWEN3_RERANK_SUFFIX
-    full_ids = tokenizer.encode(full_prompt, add_special_tokens=False)
-    suffix_ids = tokenizer.encode(_QWEN3_RERANK_SUFFIX, add_special_tokens=False)
-    if not suffix_ids or full_ids[-len(suffix_ids) :] != suffix_ids:
-        raise ValueError("Tokenizer did not preserve the Qwen3 reranker suffix.")
-
-    empty_prompt = prompt_prefix + _QWEN3_RERANK_SUFFIX
-    minimum_length = len(tokenizer.encode(empty_prompt, add_special_tokens=False))
-    if minimum_length > max_seq_len:
-        raise ValueError(
-            "The reranker instruction and query exceed the model's maximum "
-            f"sequence length of {max_seq_len} tokens."
-        )
-
-    content_length = len(full_ids) - len(suffix_ids)
-    if max_tokens_per_doc is not None:
-        prefix_ids = tokenizer.encode(prompt_prefix, add_special_tokens=False)
-        document_start = 0
-        for full_token, prefix_token in zip(full_ids, prefix_ids):
-            if full_token != prefix_token:
-                break
-            document_start += 1
-        content_length = min(content_length, document_start + max_tokens_per_doc)
-    content_length = min(content_length, max_seq_len - len(suffix_ids))
-
-    if content_length + len(suffix_ids) >= len(full_ids):
-        return full_ids
-    return full_ids[:content_length] + suffix_ids
+    return Qwen3RerankInputBuilder(
+        tokenizer,
+        query,
+        max_seq_len,
+        instruction=instruction,
+        max_tokens_per_doc=max_tokens_per_doc,
+    ).build(document)
 
 
 def rerank_probability(logit: float) -> float:

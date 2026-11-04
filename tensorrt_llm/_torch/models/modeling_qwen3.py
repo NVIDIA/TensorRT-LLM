@@ -442,13 +442,13 @@ class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     @staticmethod
     def _derive_score_weight(
             weights: dict,
+            tie_word_embeddings: bool,
             yes_token_id: int = _YES_TOKEN_ID,
             no_token_id: int = _NO_TOKEN_ID) -> tuple[str, torch.Tensor]:
         """Build the scalar head from the checkpoint's yes/no token rows."""
-        source_names = (
-            "lm_head.weight",
-            "model.embed_tokens.weight",
-        )
+        source_names = ["lm_head.weight"]
+        if tie_word_embeddings:
+            source_names.append("model.embed_tokens.weight")
         for source_name in source_names:
             if source_name in weights:
                 source = weights[source_name]
@@ -456,12 +456,14 @@ class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
                 no = source[no_token_id:no_token_id + 1]
                 return source_name, yes - no
         raise ValueError(
-            "Qwen3 reranker checkpoint must contain lm_head.weight or "
-            "model.embed_tokens.weight for a tied language-model head.")
+            "Qwen3 reranker checkpoint must contain lm_head.weight unless "
+            "tie_word_embeddings is enabled and model.embed_tokens.weight "
+            "is present.")
 
     def load_weights(self, weights: dict, **kwargs) -> None:
         source_name, score_weight = self._derive_score_weight(
-            weights, self._yes_token_id, self._no_token_id)
+            weights, self.model_config.pretrained_config.tie_word_embeddings,
+            self._yes_token_id, self._no_token_id)
         weights["score.weight"] = score_weight
         # An untied LM head is not otherwise consumed by this model. Releasing
         # it here keeps peak host memory bounded for the 8B checkpoint.

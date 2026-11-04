@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -41,7 +42,7 @@ def test_qwen3_reranker_is_registered_and_non_generation():
 def test_derived_head_matches_yes_minus_no_logits():
     lm_head = _vocab_weight()
     source_name, score_weight = Qwen3ForTextReranking._derive_score_weight(
-        {"lm_head.weight": lm_head}
+        {"lm_head.weight": lm_head}, tie_word_embeddings=False
     )
     hidden = torch.randn(3, lm_head.shape[1])
 
@@ -54,13 +55,45 @@ def test_derived_head_matches_yes_minus_no_logits():
 def test_derived_head_uses_tied_embedding_weight():
     embedding = _vocab_weight()
     source_name, score_weight = Qwen3ForTextReranking._derive_score_weight(
-        {"model.embed_tokens.weight": embedding}
+        {"model.embed_tokens.weight": embedding}, tie_word_embeddings=True
     )
 
     assert source_name == "model.embed_tokens.weight"
     torch.testing.assert_close(
         score_weight,
         embedding[_YES_TOKEN_ID : _YES_TOKEN_ID + 1] - embedding[_NO_TOKEN_ID : _NO_TOKEN_ID + 1],
+    )
+
+
+def test_derived_head_rejects_untied_checkpoint_without_lm_head() -> None:
+    with pytest.raises(ValueError, match="must contain lm_head.weight"):
+        Qwen3ForTextReranking._derive_score_weight(
+            {"model.embed_tokens.weight": _vocab_weight()}, tie_word_embeddings=False
+        )
+
+
+def test_load_weights_respects_untied_checkpoint_config() -> None:
+    model = Qwen3ForTextReranking.__new__(Qwen3ForTextReranking)
+    torch.nn.Module.__init__(model)
+    model.model_config = SimpleNamespace(pretrained_config=Qwen3Config(tie_word_embeddings=False))
+    model._yes_token_id = _YES_TOKEN_ID
+    model._no_token_id = _NO_TOKEN_ID
+
+    with pytest.raises(ValueError, match="must contain lm_head.weight"):
+        model.load_weights({"model.embed_tokens.weight": _vocab_weight()})
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_derived_head_prefers_lm_head_when_both_weights_exist(tie_word_embeddings: bool) -> None:
+    lm_head = _vocab_weight()
+    _, score_weight = Qwen3ForTextReranking._derive_score_weight(
+        {"lm_head.weight": lm_head, "model.embed_tokens.weight": _vocab_weight()},
+        tie_word_embeddings=tie_word_embeddings,
+    )
+
+    torch.testing.assert_close(
+        score_weight,
+        lm_head[_YES_TOKEN_ID : _YES_TOKEN_ID + 1] - lm_head[_NO_TOKEN_ID : _NO_TOKEN_ID + 1],
     )
 
 
@@ -75,7 +108,9 @@ def test_derived_head_supports_lazy_slices():
             return self.tensor[index]
 
     lazy = LazySlice(_vocab_weight())
-    _, score_weight = Qwen3ForTextReranking._derive_score_weight({"lm_head.weight": lazy})
+    _, score_weight = Qwen3ForTextReranking._derive_score_weight(
+        {"lm_head.weight": lazy}, tie_word_embeddings=False
+    )
 
     assert len(lazy.requests) == 2
     assert score_weight.shape == (1, lazy.tensor.shape[1])
@@ -94,7 +129,10 @@ def test_score_token_ids_are_loaded_from_checkpoint_config(tmp_path):
     yes_token_id, no_token_id = Qwen3ForTextReranking._load_score_token_ids(config)
     vocab_weight = torch.randn(5, 8)
     _, score_weight = Qwen3ForTextReranking._derive_score_weight(
-        {"lm_head.weight": vocab_weight}, yes_token_id, no_token_id
+        {"lm_head.weight": vocab_weight},
+        tie_word_embeddings=False,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
     )
 
     assert (yes_token_id, no_token_id) == (3, 1)
@@ -129,7 +167,7 @@ def test_score_token_ids_reject_incomplete_checkpoint_config(tmp_path):
 
 def test_derived_head_rejects_checkpoint_without_lm_head_or_embeddings():
     with pytest.raises(ValueError, match="must contain lm_head.weight"):
-        Qwen3ForTextReranking._derive_score_weight({})
+        Qwen3ForTextReranking._derive_score_weight({}, tie_word_embeddings=False)
 
 
 def test_sigmoid_matches_official_two_token_softmax():

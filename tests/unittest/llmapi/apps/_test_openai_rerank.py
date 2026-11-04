@@ -22,7 +22,7 @@ from .openai_server import RemoteRerankServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-MODEL = "Qwen/Qwen3-Reranker-0.6B"
+MODEL = "Qwen3/Qwen3-Reranker-0.6B"
 SERVED_MODEL = MODEL.rsplit("/", 1)[-1]
 QUERY = "What is the capital of China?"
 DOCUMENTS = [
