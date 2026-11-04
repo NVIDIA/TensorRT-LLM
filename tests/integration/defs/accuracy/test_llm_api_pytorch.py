@@ -1354,6 +1354,79 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(60000)
+    @pytest.mark.parametrize("mode", ["no_reuse", "reuse", "reuse_preempt"])
+    def test_bfloat16_agg_helix_cp2(self, mode: str) -> None:
+        """GSM8K on aggregated Helix (TP1 x CP2) with and without block reuse.
+
+        Aggregated because no cache transceiver is configured: one executor
+        runs both the context and generation phases on the CP ranks. Pure MLA
+        with no recurrent layers, so block reuse under Helix is not rejected.
+        Every CP rank must claim the same reuse depth in whole ledger blocks
+        (tokens_per_block x cp_size = 128 tokens). max_num_tokens=512 chunks
+        the few-shot prompts, so reused prefixes reach the cross-rank
+        cached-KV gather. reuse_preempt caps the KV pool at a few requests'
+        worth of tokens, so requests are suspended and resumed while reused
+        blocks are claimed and evicted. Set TLLM_HELIX_AGG_CHECK_SCHEDULE=1 on
+        every rank to also compare the per-rank schedules each iteration.
+        """
+        enable_block_reuse = mode != "no_reuse"
+        kv_cache_kwargs = {}
+        llm_kwargs = {}
+        if mode == "reuse_preempt":
+            # max_tokens counts global ledger tokens under Helix. A GSM8K
+            # request needs at most 4096 + 256 tokens, so one always fits, but
+            # 32 concurrent requests do not.
+            kv_cache_kwargs["max_tokens"] = 6144
+            llm_kwargs["max_seq_len"] = 4352
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=1,
+                context_parallel_size=2,
+                moe_expert_parallel_size=2,
+                cp_config={
+                    "cp_type": "HELIX",
+                    "tokens_per_block": 64
+                },
+                max_batch_size=32,
+                max_num_tokens=512,
+                enable_chunked_prefill=True,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=enable_block_reuse,
+                    tokens_per_block=64,
+                    use_kv_cache_manager_v2=True,
+                    free_gpu_memory_fraction=0.6,
+                    **kv_cache_kwargs,
+                ),
+                enable_iter_perf_stats=True,
+                max_stats_len=-1,
+                **llm_kwargs,
+        ) as llm:
+            transceiver = llm.args.cache_transceiver_config
+            assert transceiver is None or transceiver.backend is None
+            assert llm.args.kv_cache_config.enable_block_reuse is enable_block_reuse
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            # Count reuse and preemption so a pass is not vacuous: a reuse run
+            # that never hit the cache, or a small-pool run that never
+            # suspended a request, would pass without exercising either.
+            stats = llm.get_stats(timeout=2)
+            reused_blocks = sum(
+                window.get("iterReusedBlocks", 0) for s in stats
+                for window in (s.get("kvCacheIterationStats") or {}).values())
+            suspended = sum(s.get("iterSuspendedRequests", 0) for s in stats)
+            resumed = sum(s.get("iterResumedRequests", 0) for s in stats)
+            print(f"[reuse] reused_blocks = {reused_blocks}, "
+                  f"suspended = {suspended}, resumed = {resumed}")
+            if enable_block_reuse:
+                assert reused_blocks > 0
+            else:
+                assert reused_blocks == 0
+            if mode == "reuse_preempt":
+                assert suspended > 0 and resumed > 0
+
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
