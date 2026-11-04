@@ -7612,7 +7612,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             }
 
             if (checkPipStage) {
-                stage("Run LLMAPI Test") {
+                stage("[${toStageName(values[1], key)}] Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
