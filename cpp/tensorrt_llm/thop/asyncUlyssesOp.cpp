@@ -104,8 +104,9 @@ public:
     // Cross-layer hazard (Layer N+1 V reusing Layer N V's slot): _join_async
     // orders local reads after incoming writes, but local stream order alone
     // does not prevent a peer from overwriting a recv view. Peers' next pushes
-    // are ordered only by the caller's reverse collective on the same group
-    // (_output_a2a), so every recv-view reader must finish before that collective.
+    // follow the same-group collective/wait ordering in UlyssesAttention::_output_a2a:
+    // every recv-view reader must finish before that collective, whose wait must
+    // precede the next _issue_async in eager and compiled execution.
     // With this ordering, kNumSlots = 3 is the tight minimum.
     static constexpr int kNumSlots = 3;
 

@@ -323,7 +323,8 @@ def _compiled_attention_with_replicated_kv_fake(
 
 def post_permute_5d_to_4d(out_5d, P):
     """5D [P, B, Sp, H/P, D] → 4D [B, P*Sp, H/P, D] (block-by-rank gather).
-    For contiguous batch-one inputs this is a view; other layouts need a copy.
+    For contiguous inputs this is a view when B == 1: the permute only moves a
+    size-one dimension. Otherwise the contiguous call copies the permuted data.
     Inductor can fuse layout normalization with downstream SDPA input prep.
     """
     _P, Bt, Spt, HpP, Dt = out_5d.shape
@@ -819,14 +820,12 @@ class UlyssesAttention(AttentionBackend):
                 process_group=self.process_group,
             )
 
-        # The fused kernel replaces the materializing post-A2A chain for HND
-        # and batch > 1 NHD. Opted-in backends use views for batch-one NHD.
+        # BF16 receives use the fused kernel except batch-one NHD for an opted-in
+        # backend, which reads receive-slot views.
         # The kernel is only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        # These views may alias the receive-slot ring. Every rank consumes them
-        # before the reverse collective in _output_a2a, whose completion orders
-        # the next call's slot reuse after all peers' reads on the caller stream.
+        # Receive-slot views follow the cross-rank lifetime rule in _output_a2a.
         post_unscatter_is_view = (
             not is_hnd
             and B_q == 1
@@ -877,9 +876,10 @@ class UlyssesAttention(AttentionBackend):
     ) -> torch.Tensor:
         """Reverse all-to-all: [B, S, H/P, D] → [B, S/P, H, D].
 
-        For receive views, keep this the first same-group cross-rank boundary
-        after all backend reads, before the next forward_async can reuse slots.
-        Preserve that ordering if moving this exchange into the caller's compile region.
+        For async receive views, every rank must finish its backend reads before
+        entering this same-group collective. Keep the collective and its wait
+        ahead of the next _issue_async in eager and compiled execution, ordering
+        peers' next writes after these reads.
         """
         inner_layout = self.inner_backend.preferred_layout
 

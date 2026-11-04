@@ -3,8 +3,8 @@
 """Multi-rank tests for the async Ulysses A2A op.
 
 Exercises the production ``ulysses_a2a_async_prepare`` / ``ulysses_a2a_async_push``
-/ ``ulysses_a2a_async_barrier`` chain end-to-end across multiple ranks. Two test
-surfaces:
+/ ``ulysses_a2a_async_barrier`` chain end-to-end across multiple ranks, plus
+CPU-only dispatch coverage. Test surfaces:
 
 1. ``test_slot_ring_wraparound`` — eager mode (cudaMemcpyBatchAsync path).
    Loops the pair more than ``kNumSlots`` times so the slot ring wraps multiple
@@ -16,7 +16,12 @@ surfaces:
    containing one prepare+async pair, replays it K times with fresh inputs.
    Smoke-tests the cuda_graph path used by the e2e production benchmark.
 
-3. ``test_batch_one_receive_view_lifetime`` — batch-one NHD receive views,
+3. ``test_multi_pg`` — independent process groups and their slot rings.
+
+4. ``test_forward_async_receive_view_gate`` — seven CPU dispatch cases covering
+   opt-in receive views and the default/denied fused-copy path.
+
+5. ``test_batch_one_receive_view_lifetime`` — batch-one NHD receive views,
    repeated slot reuse with a delayed reader, in eager and CUDA graph modes.
 
 Run with:
@@ -27,7 +32,6 @@ import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
-from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -41,6 +45,8 @@ from ._worker_pool import run_distributed
 # Loop count must comfortably exceed kNumSlots so the ring wraps at least
 # twice. kNumSlots is 3 today; 8 iterations = ~2.67 full rotations.
 NUM_ITERS = 8
+K_NUM_SLOTS = 3
+READ_DELAY_GPU_CYCLES = 2_000_000
 
 
 def _slot_ring_logic(rank: int, world_size: int):
@@ -122,7 +128,6 @@ def _capture_smoke_logic(rank: int, world_size: int):
     # _prepare advances mNextIdx and would hit an unallocated slot. So warm up
     # >= kNumSlots times. Mirror production's stream pattern (Phase 2 on side
     # stream) so cudaMemcpyBatchAsync sees the steady-state stream context.
-    K_NUM_SLOTS = 3  # mirrors AsyncUlyssesOp::kNumSlots
     for _ in range(K_NUM_SLOTS):
         recv_w, sh_w = torch.ops.trtllm.ulysses_a2a_async_prepare(x_static, pg_boxed)
         ev_w = torch.cuda.Event()
@@ -231,16 +236,16 @@ def _run(world_size: int, test_fn: Callable[..., None], *args: object) -> None:
 @pytest.mark.parametrize(
     "batch_size,layout_name,expect_fused_copy,local_sequence_length,local_kv_sequence_length,issue_order,accepts_unowned_inputs",
     [
-        (1, "NHD", False, 3, 3, ("v", "q", "k"), True),
-        (2, "NHD", True, 3, 3, ("v", "q", "k"), True),
-        (1, "HND", True, 3, 3, ("v", "q", "k"), True),
-        (1, "NHD", False, 3, 5, ("q", "k", "v"), True),
-        (1, "NHD", True, 3, 3, ("v", "q", "k"), None),
-        (1, "NHD", True, 3, 3, ("v", "q", "k"), False),
-        (1, "NHD", True, 3, 5, ("q", "k", "v"), False),
+        pytest.param(1, "NHD", False, 3, 3, ("v", "q", "k"), True, id="nhd-b1-optin-view"),
+        pytest.param(2, "NHD", True, 3, 3, ("v", "q", "k"), True, id="nhd-b2-optin-copy"),
+        pytest.param(1, "HND", True, 3, 3, ("v", "q", "k"), True, id="hnd-b1-optin-copy"),
+        pytest.param(1, "NHD", False, 3, 5, ("q", "k", "v"), True, id="nhd-b1-cross-optin-view"),
+        pytest.param(1, "NHD", True, 3, 3, ("v", "q", "k"), None, id="nhd-b1-default-copy"),
+        pytest.param(1, "NHD", True, 3, 3, ("v", "q", "k"), False, id="nhd-b1-denied-copy"),
+        pytest.param(1, "NHD", True, 3, 5, ("q", "k", "v"), False, id="nhd-b1-cross-denied-copy"),
     ],
 )
-def test_async_post_unscatter_avoids_redundant_copy(
+def test_forward_async_receive_view_gate(
     monkeypatch: pytest.MonkeyPatch,
     batch_size: int,
     layout_name: str,
@@ -300,6 +305,7 @@ def test_async_post_unscatter_avoids_redundant_copy(
         is_hnd: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fused_calls.append(True)
+        # The native op allocates owned outputs; clones model that boundary here.
         return (
             reference_layout(query_receive, is_hnd).clone(),
             reference_layout(key_receive, is_hnd).clone(),
@@ -327,21 +333,23 @@ def test_async_post_unscatter_avoids_redundant_copy(
 
     class RecordingBackend(parallel.AttentionBackend):
         preferred_layout = layout
+        num_heads = local_heads
+        head_dim = receive_buffers[0].shape[-1]
 
         def forward(self, **forward_kwargs: object) -> torch.Tensor:
             return record_backend(**forward_kwargs)
 
     if accepts_unowned_inputs is not None:
         RecordingBackend.accepts_unowned_inputs = accepts_unowned_inputs
-    attention = SimpleNamespace(
-        world_size=world_size,
-        inner_backend=RecordingBackend(),
-        _issue_async=issue_async,
-        _join_async=lambda: None,
-        _output_a2a=lambda output, batch_argument, sequence_argument: output,
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: world_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    attention = parallel.UlyssesAttention(RecordingBackend(), object())
+    monkeypatch.setattr(attention, "_issue_async", issue_async)
+    monkeypatch.setattr(attention, "_join_async", lambda: None)
+    monkeypatch.setattr(
+        attention, "_output_a2a", lambda output, batch_argument, sequence_argument: output
     )
-    output = parallel.UlyssesAttention.forward_async(
-        attention,
+    output = attention.forward_async(
         lambda: local_inputs[0],
         lambda: local_inputs[1],
         lambda: local_inputs[2],
@@ -360,7 +368,11 @@ def test_async_post_unscatter_avoids_redundant_copy(
     )
     assert torch.equal(output, expected_output)
     assert issued_inputs[0] is local_inputs[("q", "k", "v").index(issue_order[0])]
+    assert [id(local_input) for local_input in issued_inputs] == [
+        id(local_inputs[("q", "k", "v").index(name)]) for name in issue_order
+    ]
     assert bool(fused_calls) == expect_fused_copy
+    assert len(fused_calls) == int(expect_fused_copy)
     assert recorded["batch_size"] == batch_size
     assert recorded["seq_len"] == world_size * local_sequence_length
     assert recorded["seq_len_kv"] == world_size * local_kv_sequence_length
@@ -413,8 +425,8 @@ def _receive_view_lifetime_logic(
     batch, seq, local_heads, head_dim = 1, 128, 4, 32
     shape = (batch, seq, world_size * local_heads, head_dim)
     pg = dist.group.WORLD
-    # One call issues all three slots; each following call reuses all of them.
-    layers, repeats = 8, 4
+    # Keep enough layers to wrap the receive-slot ring repeatedly.
+    layers, repeats = 2 * K_NUM_SLOTS + 2, 4
     received = []
 
     class DelayedNHDBackend:
@@ -422,7 +434,7 @@ def _receive_view_lifetime_logic(
         preferred_layout = AttentionTensorLayout.NHD
         num_heads = local_heads
         num_kv_heads = local_heads
-        head_dim = 32
+        head_dim = shape[-1]
 
         def forward(
             self,
@@ -431,7 +443,7 @@ def _receive_view_lifetime_logic(
             v: torch.Tensor,
             **kwargs: torch.Tensor | int,
         ) -> torch.Tensor:
-            # Confirm that this really exercises receive aliases, not the old copy path.
+            # Confirm receive aliases, not the default fused-copy path.
             recv_v, recv_q, recv_k = received[-3:]
             assert q.data_ptr() == recv_q.data_ptr()
             assert k.data_ptr() == recv_k.data_ptr()
@@ -442,7 +454,7 @@ def _receive_view_lifetime_logic(
             # Delay the READ, not just the next issue. Without the reverse collective's
             # ordering, the faster peer can push the next layer into these same slots.
             if rank == 0:
-                torch.cuda._sleep(2_000_000)
+                torch.cuda._sleep(READ_DELAY_GPU_CYCLES)
             out = q + k + v
             if with_gates:
                 out = out + kwargs["gate_compress"] + kwargs["gate_fine"]
@@ -492,7 +504,7 @@ def _receive_view_lifetime_logic(
         return outputs
 
     # Warm every IPC slot, the shared side stream, all NCCL collectives, and tensor ops
-    # before capture. Synchronization is intentionally OUTSIDE the eight-layer chain.
+    # before capture. Synchronization is intentionally OUTSIDE the layer chain.
     for _ in range(2):
         run_chain()
     torch.cuda.synchronize()
@@ -513,7 +525,7 @@ def _receive_view_lifetime_logic(
         else:
             graph.replay()
         # No intermediate synchronize, clone, reference collective, or host tensor read
-        # occurs between the eight real forward_async calls.
+        # occurs between the real forward_async calls.
         torch.cuda.synchronize()
         for layer, (got, want) in enumerate(zip(outputs, expected)):
             assert torch.equal(got, want), (
