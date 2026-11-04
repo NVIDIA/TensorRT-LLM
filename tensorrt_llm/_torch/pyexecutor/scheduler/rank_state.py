@@ -130,15 +130,9 @@ class RankState:
                 rank_values.append(field_info.default_factory())
             else:
                 raise ValueError(f"RankState payload is missing required field {field_info.name}")
-        # The compact/full stats payloads have 13/16 fields; forward-work
-        # counters follow them. Also accept the 9/12-field payloads without
-        # spec stats, including legacy messages without forward-work counters.
-        if len(values) in (17, 19):
-            stats_field_count = 13
-        elif len(values) >= 20:
-            stats_field_count = 16
-        else:
-            stats_field_count = 12 if len(values) >= 16 else 9
+        # The compact/full stats payloads have 13/16 fields; the forward-work
+        # counters, when present, follow them.
+        stats_field_count = 16 if len(values) >= prefix_field_count + 16 else 13
         stats_end = prefix_field_count + stats_field_count
         return cls(
             rank=rank_values[0],

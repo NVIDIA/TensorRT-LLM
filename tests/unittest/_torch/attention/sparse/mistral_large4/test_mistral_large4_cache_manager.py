@@ -10,10 +10,7 @@ import pytest
 from tensorrt_llm._torch.attention.backends.sparse import get_sparse_attn_kv_cache_manager
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
 from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4.cache_manager import (
-    TOKEN_BYTES,
-    kv_source_layers,
-)
+from tensorrt_llm._torch.attention.backends.sparse.mistral_large4.cache_manager import TOKEN_BYTES
 from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 
@@ -54,20 +51,6 @@ def test_bytes_per_token_are_owners_times_656_plus_full_indexers_times_132():
     assert (owners, full, TOKEN_BYTES) == (63, 44, 656)
     mapping = SimpleNamespace(pp_size=1)
     assert MistralLarge4CacheManager.get_cache_size_per_token(mc, mapping) == 63 * 656 + 44 * 132
-
-
-@pytest.mark.parametrize(
-    "sources, match",
-    [
-        ([0, 2, 2], "earlier"),  # a source later than its reader
-        ([0, 0, 1], "own its latent"),  # a source that is itself a sharer
-        ([0, 1], "entries"),  # a length other than num_hidden_layers
-    ],
-)
-def test_kv_source_layers_are_validated(sources, match):
-    cfg = SimpleNamespace(kv_source_layers=sources, num_hidden_layers=3)
-    with pytest.raises(ValueError, match=match):
-        kv_source_layers(cfg)
 
 
 def test_registry_selects_the_manager_from_the_config_class():

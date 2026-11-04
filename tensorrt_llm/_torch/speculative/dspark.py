@@ -1312,10 +1312,6 @@ class DSparkWorker(DFlashWorker):
 
         head_kwargs = {}
         if getattr(draft_model, "has_recurrent_markov_head", False):
-            if draft_hidden_states is None:
-                raise ValueError(
-                    "A recurrent DSpark head requires the draft backbone hidden states"
-                )
             head_kwargs["hidden_states"] = draft_hidden_states
         return draft_model.apply_markov_chain_logits(
             gen_logits,

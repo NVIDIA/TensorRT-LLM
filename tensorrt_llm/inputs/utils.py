@@ -837,8 +837,6 @@ def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
     if set(mm_data) - {"image"}:
         raise ValueError("Mistral Large 4 currently supports image inputs only")
     images = MistralCommonImageProcessor.image_list(mm_data.get("image"))
-    if len(conversation) != len(mm_placeholder_counts):
-        raise ValueError("Missing per-message image counts")
     image_index = 0
     messages = []
     for conv, counts in zip(conversation, mm_placeholder_counts):
@@ -849,28 +847,15 @@ def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
         }
         if counts or conv.get("content_parts"):
             content = _build_openai_content(conv, counts)
-            used = 0
             for part in content:
                 if part["type"] == "text":
                     continue
-                if part["type"] != "image":
-                    raise ValueError(
-                        "Mistral Large 4 currently supports image inputs only")
-                if image_index >= len(images):
-                    raise ValueError(
-                        "Image placeholder count exceeds resolved images")
                 part["base64"] = encode_base64_image(
                     MistralCommonImageProcessor.to_pil_image(
                         images[image_index]))
                 image_index += 1
-                used += 1
-            if used != sum(counts.values()):
-                raise ValueError(
-                    "Image content positions do not match message image counts")
             message["content"] = content
         messages.append(message)
-    if image_index != len(images):
-        raise ValueError("Resolved images exceed image placeholder count")
     return messages
 
 

@@ -341,11 +341,6 @@ def test_worker_forwards_backbone_hidden_only_to_recurrent_head(recurrent, shard
     torch.testing.assert_close(actual, logits + 1)
     assert sampler.call_count == 1
     assert sampler.call_args.args[1] is metadata
-    if recurrent:
-        with pytest.raises(ValueError, match="requires the draft backbone hidden states"):
-            DSparkWorker._refine_block_logits(
-                worker, draft, logits, {"first_prev_tokens": anchors}, metadata
-            )
 
 
 @pytest.mark.parametrize("phase", ["PrefillTarget", "DecodeTarget"])

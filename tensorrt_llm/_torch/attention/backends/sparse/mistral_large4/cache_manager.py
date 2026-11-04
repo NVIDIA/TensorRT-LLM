@@ -61,21 +61,11 @@ _INDEXER_QUANT_BLOCK = 128
 
 
 def kv_source_layers(pretrained_config) -> Optional[List[int]]:
-    """The checkpoint's per-layer KV source, validated, or None when it shares nothing."""
+    """The checkpoint's per-layer KV source, or None when it shares nothing."""
     sources = getattr(pretrained_config, "kv_source_layers", None)
     if sources is None:
         return None
-    sources = [int(s) for s in sources]
-    num_layers = int(pretrained_config.num_hidden_layers)
-    if len(sources) != num_layers:
-        raise ValueError(f"kv_source_layers has {len(sources)} entries for {num_layers} layers")
-    for layer, source in enumerate(sources):
-        if not 0 <= source <= layer or sources[source] != source:
-            raise ValueError(
-                f"kv_source_layers[{layer}] = {source}: a source must be an earlier or the "
-                "same layer, and must own its latent"
-            )
-    return sources
+    return [int(s) for s in sources]
 
 
 def latent_cache_bytes_per_token(
@@ -123,8 +113,25 @@ class MistralLarge4CacheManager(DSACacheManagerV2):
         **kwargs,
     ) -> None:
         sources = kv_source_layers(pretrained_config)
-        if sources is None:
-            raise ValueError(f"{type(self).__name__} needs the checkpoint's kv_source_layers")
+        if sparse_attention_config is None and model_config is not None:
+            sparse_attention_config = model_config.sparse_attention_config
+        indexer_mask = derive_indexer_k_cache_layer_mask(
+            sparse_attention_config, pretrained_config, num_layers
+        )
+        # The routed targets fix this structure (mistral_large4/routing.py): one SELFKONLY
+        # 512+64 MLA latent per layer at pp_size 1, sources that own their latent, and an
+        # indexer K-cache on every latent-sharing layer.
+        assert (
+            sources is not None
+            and len(sources) == num_layers
+            and all(sources[source] == source <= layer for layer, source in enumerate(sources))
+            and all(indexer_mask[layer] for layer, source in enumerate(sources) if source != layer)
+            and mapping.pp_size == 1
+            and kv_cache_type == CacheTypeCpp.SELFKONLY
+            and num_kv_heads
+            in (1, [1] * num_layers, [1 if s == i else None for i, s in enumerate(sources)])
+            and head_dim == DIM_NOPE + DIM_ROPE
+        ), "the Mistral-Large-4 latent cache needs the routed targets' layer structure"
         # Separate-draft allocation passes an all-target-layer mask. Physical
         # latent ownership still comes exclusively from kv_source_layers.
         if layer_mask is not None and layer_mask != [True] * len(sources):
@@ -139,19 +146,7 @@ class MistralLarge4CacheManager(DSACacheManagerV2):
             raise NotImplementedError(
                 f"{type(self).__name__} supports DSpark with a separate draft KV pool only"
             )
-        if mapping.pp_size != 1:
-            raise NotImplementedError(f"{type(self).__name__} supports pp_size 1 only")
         owner_heads = [1 if source == layer else None for layer, source in enumerate(sources)]
-        if num_layers != len(sources):
-            raise ValueError("num_layers must match the checkpoint's kv_source_layers")
-        if kv_cache_type != CacheTypeCpp.SELFKONLY or num_kv_heads not in (
-            1,
-            [1] * num_layers,
-            owner_heads,
-        ):
-            raise ValueError("the latent cache is one SELFKONLY MLA head per layer")
-        if head_dim != DIM_NOPE + DIM_ROPE:
-            raise ValueError(f"expected a {DIM_NOPE}+{DIM_ROPE} latent, got head_dim {head_dim}")
         requested = getattr(kv_cache_config, "dtype", "auto")
         if dtype != DataType.FP8 or requested not in ("auto", "fp8", "fp8_ds_mla"):
             raise ValueError(
@@ -169,17 +164,10 @@ class MistralLarge4CacheManager(DSACacheManagerV2):
             # 656-byte layout itself and takes any page size, so hand the base the plain
             # FP8 element type.
             kv_cache_config = kv_cache_config.model_copy(update={"dtype": "fp8"})
-        if sparse_attention_config is None and model_config is not None:
-            sparse_attention_config = model_config.sparse_attention_config
 
         self.kv_source_layers = sources
         self.kv_owner_layers = [i for i, s in enumerate(sources) if s == i]
         self.kv_sharer_layers = [i for i, s in enumerate(sources) if s != i]
-        indexer_mask = derive_indexer_k_cache_layer_mask(
-            sparse_attention_config, pretrained_config, len(sources)
-        )
-        if any(not indexer_mask[layer] for layer in self.kv_sharer_layers):
-            raise ValueError("Every latent-sharing layer must own an indexer K-cache")
 
         super().__init__(
             kv_cache_config,
@@ -201,9 +189,6 @@ class MistralLarge4CacheManager(DSACacheManagerV2):
             pretrained_config=pretrained_config,
             **kwargs,
         )
-        # The generic flag names the SM120 FlashInfer inline-scale path, which the DSA
-        # metadata keys extra work on; this pool is read through `latent_layout`.
-        self.use_fp8_ds_mla = False
         actual_owners = [
             layer for local, layer in enumerate(self.pp_layers) if self.has_buffer(local, Role.KEY)
         ]

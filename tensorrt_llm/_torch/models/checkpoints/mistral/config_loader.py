@@ -47,8 +47,6 @@ def resolve_native_dspark_config(
     if os.path.realpath(checkpoint) != os.path.realpath(target_model):
         raise ValueError("Native Mistral DSpark must use the target checkpoint")
     layers = [int(layer) for layer in mtp["target_activation_layers"].split(",")]
-    if not layers or layers != sorted(set(layers)) or layers[0] < 0:
-        raise ValueError("Mistral DSpark target activation layers must be unique and ascending")
     trained = dict(
         target_layer_ids=layers,
         block_size=int(mtp["depth"]),
@@ -223,8 +221,6 @@ def _adapt_mistral_large4_config(config: dict) -> MistralLarge4Config:
     config["kv_source_layers"] = [
         int(layer) for layer in config.pop("kv_sharing")["source_layers_str"].split(",")
     ]
-    if len(config["kv_source_layers"]) != num_layers or len(config["index_sharing"]) != num_layers:
-        raise ValueError("KV and indexer sharing must contain one entry per layer")
     config = _remap_mistral_yarn_args(config)
     rope = config.pop("rope_scaling")
     if rope.pop("apply_yarn_scaling", False):

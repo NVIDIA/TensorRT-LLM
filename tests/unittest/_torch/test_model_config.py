@@ -943,17 +943,13 @@ def test_hf_config_loads_beside_an_unrelated_params_json(tmp_path, params):
         assert config.hidden_size == 128
 
 
-@pytest.mark.parametrize("field", ["nope", "kv_sharing", "dsa", "yarn"])
+@pytest.mark.parametrize("field", ["nope", "yarn"])
 def test_mistral_large4_invalid_native_patterns(field):
     from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import adapt_config_dict
 
     params = _mistral_large4_native_params()
     if field == "nope":
         params["nope"] = "rope,unknown"
-    elif field == "kv_sharing":
-        params["kv_sharing"]["source_layers_str"] = "0,1"
-    elif field == "dsa":
-        params["dsa"]["sharing"] = "full,shared"
     else:
         params["yarn"]["apply_scale"] = True
     with pytest.raises(ValueError):

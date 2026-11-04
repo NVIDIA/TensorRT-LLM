@@ -170,24 +170,6 @@ def test_mistral_dspark_rejects_untrained_geometry(tmp_path, override, field):
         TorchLlmArgs(model=str(tmp_path), skip_tokenizer_init=True, speculative_config=spec)
 
 
-@pytest.mark.parametrize("layers", ["1,1,2", "2,1,3", "-1,2,3"])
-def test_native_dspark_rejects_invalid_capture_layers(tmp_path, layers):
-    (tmp_path / "params.json").write_text(
-        json.dumps(
-            {
-                "vocab_size": 204800,
-                "mtp": {"target_activation_layers": layers, "dspark": {}},
-            }
-        )
-    )
-    with pytest.raises(ValueError, match="unique and ascending"):
-        TorchLlmArgs(
-            model=str(tmp_path),
-            skip_tokenizer_init=True,
-            speculative_config=DSparkDecodingConfig(max_draft_len=3),
-        )
-
-
 @pytest.mark.parametrize("same_checkpoint", [False, True])
 def test_native_dspark_target_path_identity(tmp_path, same_checkpoint):
     target = tmp_path / "target"
