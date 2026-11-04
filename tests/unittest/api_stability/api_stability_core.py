@@ -20,7 +20,7 @@ import torch
 import transformers
 import yaml
 from annotated_types import Gt
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 
 import tensorrt_llm
 from tensorrt_llm import LLM, DisaggregatedParams

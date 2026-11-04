@@ -25,8 +25,8 @@ def _worker(req_to_slot):
         _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long)),
         _write_ctx_len=lambda updates: None,
     )
-    # Generation requests are already assigned in these tests; prepare assigns nothing.
-    worker._assign_slot = lambda rid: worker._req_to_slot.get(rid)
+    # Slot allocation is outside these copy tests; missing IDs use the dummy slot.
+    worker._assign_slot = lambda rid, updates=None: worker._req_to_slot.get(rid)
     return worker
 
 

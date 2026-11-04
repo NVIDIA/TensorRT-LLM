@@ -72,7 +72,6 @@
 /docker @NVIDIA/trt-llm-infra-devs
 /enroot @NVIDIA/trt-llm-infra-devs
 /jenkins @NVIDIA/trt-llm-infra-devs
-/jenkins/config/maintenance_stages.txt @chzblych @yiqingy0 @tburt-nv @hanjingtian
 /jenkins/scripts/cbts @NVIDIA/trt-llm-devs
 /ruff-legacy-baseline.json @NVIDIA/trt-llm-infra-devs
 /ruff-legacy.toml @NVIDIA/trt-llm-infra-devs
@@ -99,8 +98,8 @@
 /tests/unittest/docs @NVIDIA/trt-llm-doc-owners
 
 # ===== QA =====
-/tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
-/tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf @NVIDIA/trt-llm-infra-devs
+/tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
 /tests/integration/test_lists/qa/llm_perf_* @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa/llm_function_* @NVIDIA/trt-llm-qa-function
@@ -446,9 +445,8 @@
 /.github/CODEOWNERS @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /.github/tava_architecture_diagram.md @NVIDIA/trt-llm-TAVA-design-change
 /3rdparty/** @NVIDIA/trt-llm-oss-compliance
-/3rdparty/vendor_patches/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_patches/flashinfer-prims-ts.patch @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
-/3rdparty/vendor_sources.lock.yaml @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/3rdparty/vendor_sources.lock.yaml @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
 /ATTRIBUTIONS-*.md @NVIDIA/trt-llm-oss-compliance
 /LICENSE @NVIDIA/trt-llm-oss-compliance
 /constraints.txt @NVIDIA/trt-llm-oss-compliance
@@ -461,7 +459,7 @@
 /requirements-grpc-smg.txt @NVIDIA/trt-llm-oss-compliance
 /requirements-openengine.txt @NVIDIA/trt-llm-oss-compliance
 /requirements.txt @NVIDIA/trt-llm-oss-compliance
-/scripts/vendor/ @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/scripts/vendor/ @NVIDIA/trt-llm-oss-compliance
 /setup.py @NVIDIA/trt-llm-oss-compliance
 /tensorrt_llm/_torch/attention/backends/prims_ts/** @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee

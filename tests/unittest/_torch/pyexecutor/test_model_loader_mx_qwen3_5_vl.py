@@ -501,7 +501,6 @@ def test_qwen3_5_vl_profile_qualifies_tp2_rank_lifecycle(
     monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
     monkeypatch.setattr(distributed_mod, "AllReduce", AllReduceStub)
     monkeypatch.setattr(modeling_qwen3_next_mod, "AllReduce", AllReduceStub)
-    monkeypatch.setattr(modeling_qwen3_next_mod, "MoEAllReduce", AllReduceStub)
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
 
     producer, _receiver = assert_post_transform_lifecycle_equivalent(

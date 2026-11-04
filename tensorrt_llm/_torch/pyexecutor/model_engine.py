@@ -88,6 +88,20 @@ from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
+
+def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
+    """``spec_decode_fast_paths`` of the language model (the model itself, or a
+    multimodal model's language model): the one-engine speculative language
+    model's, or that of a model that builds its own speculative branch, such as
+    a Modeling V2 target; False for a model that does not set it."""
+    if isinstance(model, MultimodalModelMixin):
+        try:
+            model = model.language_model
+        except NotImplementedError:
+            return False
+    return bool(getattr(model, "spec_decode_fast_paths", False))
+
+
 # Refit only needs the compile wrapper removed before weights are loaded: the
 # wrapper inserts "_orig_mod" into every parameter path, and load_weights()
 # matches checkpoint tensors by dotted path (modeling_utils.py:1141-1160). With
@@ -293,6 +307,7 @@ class ModelEngine:
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
+        self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
         self._validate_breakable_cuda_graph_compatibility()
 
     def _init_from_model(self) -> None:
@@ -473,6 +488,12 @@ class ModelEngine:
         )
 
         self._torch_compile_prefill_only = False
+        self._nccl_window_tensor_scope_hooks = []
+        # A forward without peers cannot allocate NCCL window leases. DWDP
+        # peers are separate from the model-parallel communicator's world size.
+        window_scopes_enabled = self.dist is not None and (
+            self.dist.world_size > 1 or self.mapping.dwdp_enabled
+        )
 
         backend_num_streams = None
         try:
@@ -534,7 +555,10 @@ class ModelEngine:
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
-                install_eager_nccl_window_tensor_scopes(self.model)
+                if window_scopes_enabled:
+                    self._nccl_window_tensor_scope_hooks = install_eager_nccl_window_tensor_scopes(
+                        self.model
+                    )
 
             # Capture local encoders after their metadata is sized and before
             # KV-cache estimation, so graph memory is included in the profile.
@@ -554,6 +578,7 @@ class ModelEngine:
             compile_backend=self._torch_compile_backend,
             aux_streams=backend_num_streams,
             prefill_compile_only=self._torch_compile_prefill_only,
+            nccl_window_scopes_enabled=window_scopes_enabled,
         )
 
     def _init_execution_services(self) -> None:
@@ -760,6 +785,7 @@ class ModelEngine:
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
+            spec_decode_fast_paths=self.spec_decode_fast_paths,
             **extra_fields,
         )
 

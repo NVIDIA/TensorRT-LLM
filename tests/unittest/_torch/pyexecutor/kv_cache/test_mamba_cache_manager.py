@@ -52,6 +52,7 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
     ReplayStateUpdateMetadata,
     _advance_replay_state,
 )
+from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -70,6 +71,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
+    InforwardSnapshotEntry,
     MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
@@ -768,6 +770,16 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         pretrained_config=pretrained_config,
         quant_config=None,
     )
+    # A model whose GDN layer verifies drafts with the fused kernels.
+    gdn = Qwen3NextGatedDeltaNet.__new__(Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(gdn)
+    gdn.fused_verify = True
+    model_engine = SimpleNamespace(
+        model=torch.nn.ModuleList([gdn]),
+        attn_runtime_features=SimpleNamespace(chunked_prefill=False),
+        max_cuda_graph_batch_size=None,
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
+    )
     mamba_params = MambaKVCacheParams(
         state_size=8,
         conv_kernel=4,
@@ -794,7 +806,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     )
 
     common_kwargs = dict(
-        model_engine=None,
+        model_engine=model_engine,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         tokens_per_block=32,
         max_seq_len=2048,
@@ -826,6 +838,9 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     )
 
     assert captured_cpp["use_replay_state_update"] is None
+    assert captured_cpp["gdn_fused_verify"] is True
+    assert "gdn_fused_verify" not in captured_mixed
+    assert captured_v2["gdn_fused_verify"] is True
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_cpp["max_num_tokens"] == 256
     assert "vocab_size" not in captured_cpp
@@ -847,6 +862,9 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert isinstance(mgr._speculative_state, GDNReplayState)
     assert captured_v2["max_num_tokens"] == 256
     assert captured_v2["vocab_size"] == pretrained_config.vocab_size
+    assert captured_v2["pretrained_config"] is pretrained_config
+    assert "pretrained_config" not in captured_cpp
+    assert "pretrained_config" not in captured_mixed
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.legacy import (
@@ -928,8 +946,11 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
 
     if manager_cls is MambaHybridCacheManagerV2:
         assert captured["vocab_size"] == 131072
+        # The manager tells its draft layers apart by the model's layer count.
+        assert captured["pretrained_config"] is config
     else:
         assert "vocab_size" not in captured
+        assert "pretrained_config" not in captured
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
@@ -1861,6 +1882,65 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     assert kwargs["dummy_request_mask"].tolist() == [False, True]
     assert kwargs["replay_step_width"] == 4
     assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
+
+
+@skip_no_cuda
+def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
+    """The one-launch promotion leaves the conv states and replay bookkeeping of the
+    per-step reference (_advance_replay_state, then per-layer promotion)."""
+    from tensorrt_llm._torch.modules.fla import cache_manager as fla_cache_manager
+
+    num_layers, batch_size = 3, 4
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=batch_size,
+        num_mamba_layers=num_layers,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        speculative_state=GDNReplayState(4),
+        conv_state_layout="q_k_v",
+    )
+    try:
+        state = mgr._speculative_state
+        assert isinstance(state, GDNReplayState)
+        assert state._stacked_conv is not None
+        torch.manual_seed(0)
+        state.intermediate_conv.normal_()
+        for conv in mgr.all_conv_states:
+            conv.normal_()
+        slots = torch.tensor([1, 3, 0, 2], dtype=torch.int32, device="cuda")
+        state.prev_num_accepted_tokens.copy_(
+            torch.randint(0, state.replay_history_size, state.prev_num_accepted_tokens.shape)
+        )
+        state.cache_buf_idx.copy_(torch.randint(0, 2, state.cache_buf_idx.shape))
+        mgr._dummy_request_mask[:batch_size] = torch.tensor([False, False, True, False])
+        num_accepted = torch.tensor([1, 4, 2, 3], dtype=torch.int32, device="cuda")
+
+        ref_conv = [conv.clone() for conv in mgr.all_conv_states]
+        ref_meta = fla_cache_manager.ReplayStateUpdateMetadata(
+            state.prev_num_accepted_tokens.clone(),
+            state.cache_buf_idx.clone(),
+            state.replay_step_width,
+            state.replay_history_size,
+        )
+        fla_cache_manager._advance_replay_state(
+            ref_meta, slots, num_accepted, mgr._dummy_request_mask[:batch_size].clone()
+        )
+        for layer, dst in enumerate(ref_conv):
+            for g in range(batch_size):
+                dst[slots[g]] = state.intermediate_conv[layer, g, num_accepted[g] - 1]
+
+        state.commit_all_layers = MagicMock()
+        mgr.update_mamba_states(
+            SimpleNamespace(num_seqs=batch_size, num_contexts=0),
+            num_accepted,
+            state_indices=slots,
+        )
+        torch.cuda.synchronize()
+        for conv, ref in zip(mgr.all_conv_states, ref_conv):
+            assert torch.equal(conv, ref)
+        assert torch.equal(state.prev_num_accepted_tokens, ref_meta.prev_num_accepted_tokens)
+        assert torch.equal(state.cache_buf_idx, ref_meta.cache_buf_idx)
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda
@@ -3340,7 +3420,7 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
         is_dummy_request=False,
         is_dummy=False,
         py_request_id=0,
-        get_tokens=lambda beam_idx: token_ids,
+        get_tokens_view=lambda beam_idx: token_ids,
     )
     kv_cache = SimpleNamespace(
         num_committed_tokens=0,
@@ -3640,9 +3720,11 @@ def _build_v2_hybrid_with_mamba_layer(
     max_batch_size=4,
     num_mamba_layers=1,
     num_attention_layers=1,
+    num_draft_layers=0,
     num_kv_heads=4,
     mapping=None,
     spec_config=None,
+    pretrained_config=None,
     use_replay_state_update=False,
     enable_block_reuse=False,
     enable_partial_reuse=True,
@@ -3671,14 +3753,16 @@ def _build_v2_hybrid_with_mamba_layer(
     is_disagg=False,
     enable_stats=False,
     model_manager_cls=None,
+    supports_inforward_snapshot=None,
     kv_cache_config: KvCacheConfig | None = None,
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
     max_num_tokens: int = 8192,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
-    mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
-    attn_mask = [False] * num_mamba_layers + [True] * num_attention_layers
+    # Draft layers of a combined speculative manager follow the model's layers in both masks.
+    mamba_mask = [True] * num_mamba_layers + [False] * (num_attention_layers + num_draft_layers)
+    attn_mask = [False] * num_mamba_layers + [True] * (num_attention_layers + num_draft_layers)
     if mapping is None:
         mapping = Mapping(
             world_size=1,
@@ -3739,6 +3823,8 @@ def _build_v2_hybrid_with_mamba_layer(
                 validate_gdn_layout(self, speculative_state)
             return speculative_state
 
+    if supports_inforward_snapshot is not None:
+        ModelStateManager._supports_inforward_snapshot = supports_inforward_snapshot
     manager_cls = ModelStateManager
     return manager_cls(
         mamba_d_state=mamba_d_state,
@@ -3752,7 +3838,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=num_attention_layers,
+        num_layers=num_attention_layers + num_draft_layers,
         num_kv_heads=num_kv_heads,
         head_dim=64,
         tokens_per_block=32,
@@ -3762,6 +3848,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mapping=mapping,
         spec_config=spec_config,
         layer_mask=attn_mask,
+        **({"pretrained_config": pretrained_config} if pretrained_config is not None else {}),
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
@@ -3833,6 +3920,100 @@ def _run_v2_hybrid_context(
     manager.update_context_resources(batch)
 
 
+def _build_v2_inforward_snapshot_manager():
+    return _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=2,
+        num_mamba_layers=2,
+        enable_block_reuse=True,
+        block_reuse_policy="per_request",
+        additional_snapshot_offsets_from_end=[2],
+        conv_state_layout="q_k_v",
+        supports_inforward_snapshot=True,
+    )
+
+
+def _make_v2_prompt_request(request_id: int, tokens: list[int]) -> LlmRequest:
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+
+
+@skip_no_cuda
+def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state():
+    # The snapshot at P = prompt_len - 2 holds the state the GDN layers left in the live slot;
+    # the live slot gets the staged prompt-end state.
+    mgr = _build_v2_inforward_snapshot_manager()
+    try:
+        assert mgr.inforward_snapshot_rows == 2  # max_batch_size
+        request = _make_v2_prompt_request(1, list(range(1, 67)))
+        mgr.prepare_expect_snapshot_points([request])
+        assert request.expect_snapshot_points == [64]
+        assert mgr.prepare_context(request)
+        assert mgr.resize_context(request, num_tokens=66)
+        request.context_chunk_size = 66
+        request.py_mamba_inforward_snapshot_point = 64
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        mgr.prepare_resources(batch)
+        assert mgr.inforward_snapshot_plan == {1: InforwardSnapshotEntry(0, 64, 64, 2)}
+        assert request.py_mamba_inforward_snapshot_point is None
+
+        # The forward: live slot = state at P, staging row 0 = state at the prompt end.
+        slot = mgr.state_index(1)
+        for layer in range(2):
+            mgr.get_ssm_states(layer)[slot].fill_(1.0)
+            mgr.get_conv_states(layer)[slot].fill_(1.0)
+            stage_ssm, stage_conv = mgr.inforward_snapshot_stage_views(layer)
+            stage_ssm[0].fill_(2.0)
+            stage_conv[0].fill_(2.0)
+        mgr.finish_inforward_snapshots(batch)
+        assert mgr.inforward_snapshot_plan == {}
+        torch.cuda.synchronize()
+        request.context_current_position = 66
+        mgr.update_context_resources(batch)
+        assert mgr.kv_cache_map[1].num_committed_tokens == 64
+        for layer in range(2):
+            assert torch.all(mgr.get_ssm_states(layer)[slot] == 2.0)
+            assert torch.all(mgr.get_conv_states(layer)[slot] == 2.0)
+
+        # A sibling that shares the first 64 tokens resumes from the snapshot at P.
+        sibling = _make_v2_prompt_request(2, list(range(1, 65)) + [500, 501, 502, 503])
+        mgr.prepare_expect_snapshot_points([sibling])
+        assert mgr.prepare_context(sibling)
+        assert sibling.context_current_position == 64
+        batch = ScheduledRequests()
+        batch.append_context_request(sibling)
+        mgr.prepare_resources(batch)
+        torch.cuda.synchronize()
+        sibling_slot = mgr.state_index(2)
+        assert sibling_slot != slot
+        for layer in range(2):
+            assert torch.all(mgr.get_ssm_states(layer)[sibling_slot] == 1.0)
+            assert torch.all(mgr.get_conv_states(layer)[sibling_slot] == 1.0)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_inforward_snapshot_plan_drops_a_mark_in_a_mixed_batch():
+    mgr = _build_v2_inforward_snapshot_manager()
+    try:
+        request = _make_v2_prompt_request(1, list(range(1, 67)))
+        request.expect_snapshot_points = [64]
+        request.context_chunk_size = 66
+        request.py_mamba_inforward_snapshot_point = 64
+        batch = SimpleNamespace(context_requests=[request], generation_requests=[object()])
+        mgr._plan_inforward_snapshots(batch)
+        assert mgr.inforward_snapshot_plan == {}
+        assert request.py_mamba_inforward_snapshot_point is None
+    finally:
+        mgr.shutdown()
+
+
 def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
     assert layer_cache.old_x is not None
     assert layer_cache.old_B is not None
@@ -3896,6 +4077,59 @@ def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales(kv_cache_dtype: str) 
 
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[ssm_pool_id, :, 1]) == 0
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[attention_pool_id, :, 1]) > 0
+    finally:
+        mgr.shutdown()
+
+
+def _mixed_precision_kv_cache_config() -> KvCacheConfig:
+    """A small mixed-precision NVFP4 cache whose leading and trailing 32 tokens keep FP16."""
+    return KvCacheConfig(
+        max_tokens=512,
+        enable_block_reuse=False,
+        dtype="mixed_nvfp4_float16",
+        mixed_precision_first_n=32,
+        mixed_precision_last_n=32,
+    )
+
+
+@skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_appends_high_group():
+    """The attention layer's mixed-precision high layer comes after the SSM and attention layers.
+
+    Disaggregated transfer gives it its own layer id.
+    """
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+    )
+    try:
+        # Layer 0: recurrent state, layer 1: attention, layer 2: its mixed-precision high layer.
+        assert mgr.mixed_precision_high_layers == {1: 2}
+        assert not mgr._is_local_mamba_layer(2)
+        assert mgr.get_buffers(0) is None
+        low = mgr.get_buffers(1, mixed_precision_pool="low")
+        high = mgr.get_buffers(1, mixed_precision_pool="high")
+        assert low.dtype == torch.uint8
+        assert high.dtype == torch.float16
+        assert high.shape[1:] == (2, 32, 4, 64)
+        mgr.add_dummy_requests([123], token_nums=[128], is_gen=False)
+        low_pages, high_pages = mgr.get_mixed_precision_page_tables([123], 1)
+        assert len(low_pages[0]) == len(high_pages[0]) == 4
+        assert min(low_pages[0]) >= 0
+        # The leading (sink) and trailing (window) pages are always in the mixed-precision high pool.
+        assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
+        assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
+        # Model layer L -> 2L, the mixed-precision high layer of layer L -> 2L + 1.
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in build_page_table_from_manager(mgr).layer_groups
+            for layer in group.local_layers
+        }
+        assert ids == {0: 0, 1: 2, 2: 3}
     finally:
         mgr.shutdown()
 
@@ -4475,12 +4709,14 @@ def _fake_context_request(
     context_current_position=0,
     is_dummy_request=False,
     expect_snapshot_points=None,
+    is_disagg_generation_init_state=False,
 ):
     return SimpleNamespace(
         py_request_id=rid,
         prompt_len=prompt_len,
         context_current_position=context_current_position,
         is_dummy_request=is_dummy_request,
+        is_disagg_generation_init_state=is_disagg_generation_init_state,
         expect_snapshot_points=list(expect_snapshot_points or []),
     )
 
@@ -4643,14 +4879,17 @@ def test_branch_snapshot_points_match_on_attention_only_pp_rank():
     assert attention_mgr._page_pruned_tokens_total == 0
 
 
-def test_branch_snapshot_skipped_for_dummy_requests():
+# A disagg generation request receives its prompt state and never prefills here.
+@pytest.mark.parametrize("flag", ["is_dummy_request", "is_disagg_generation_init_state"])
+def test_branch_snapshot_skipped_for_requests_without_prefill(flag):
     mgr = _branch_snapshot_manager()
-    request = _fake_context_request(prompt_len=256, is_dummy_request=True)
+    request = _fake_context_request(prompt_len=256, **{flag: True})
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
 
     assert mgr._branch_snapshot_points == {}
+    assert request.expect_snapshot_points == []
     assert mgr._branch_snapshots_taken_total == 0
     assert mgr._branch_snapshots_skipped_total == {}
     assert mgr._snapshot_pruned_tokens_total == 0
@@ -4693,7 +4932,7 @@ def test_branch_snapshot_taken_counts_successful_commit_once():
     mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
     request = _fake_context_request(prompt_len=256, context_current_position=64)
     request.context_remaining_length = 192
-    request.get_tokens = lambda beam_idx: list(range(256))
+    request.get_tokens_view = lambda beam_idx: list(range(256))
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
     def commit(tokens):
@@ -4889,7 +5128,7 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
         expect_snapshot_points=[128],
         prompt_len=128,
         is_last_context_chunk=True,
-        get_tokens=lambda beam_idx: list(range(128)),
+        get_tokens_view=lambda beam_idx: list(range(128)),
     )
     kv_cache = SimpleNamespace(
         is_active=True,
@@ -7442,11 +7681,9 @@ def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
 def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
     """A context server without replay caches and a generation server with them describe the same transferable
     recurrent state, and the generation server seeds its replay caches from the transferred conv state."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-        MambaPolicy,
-        mamba_receiver_payload_bytes,
-    )
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     ctx = _build_kda_replay_manager(is_disagg=True)
@@ -7467,7 +7704,12 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
         dst_group = next(g for g in dst_table.layer_groups if isinstance(g, MambaLayerGroup))
         for group in (src_group, dst_group):
             assert {pv.pool_role for pv in group.pool_views} == {MAMBA_CONV_ROLE, MAMBA_SSM_ROLE}
-        assert mamba_receiver_payload_bytes(src_table, dst_table, dst_slot) == sum(
+        # A generation slot receives each view's bytes for every layer the view covers: the conv
+        # and temporal state, without the replay caches.
+        assert sum(
+            len(get_pool_view_global_layer_ids(view, dst_group)) * view.bytes_per_layer
+            for view in dst_group.pool_views
+        ) == sum(
             gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2
             + gen.mamba_layer_cache(i).temporal[dst_slot].numel() * 4
             for i in range(2)
@@ -7712,3 +7954,51 @@ def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
         stacked_replay["kda_conv_k"][1, 3, :, :4], stacked._conv_states[1][3, 2:4, :]
     )
     assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_disagg_ids_of_a_recurrent_only_rank():
+    """A pipeline rank holding only recurrent layers still names model layer L as 2L."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_mamba_layers=2,
+        num_attention_layers=0,
+    )
+    try:
+        assert mgr.mixed_precision_high_layers == {}
+        page_table = build_page_table_from_manager(mgr)
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in page_table.layer_groups
+            for layer in group.local_layers
+        }
+        assert ids == {0: 0, 1: 2}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain():
+    """An Eagle3 layer in the hybrid manager keeps a normal KV cache, unlike an MTP layer."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_draft_layers=1,
+        spec_config=Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model"),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    try:
+        # Layer 0: recurrent state, layer 1: attention, layer 2: the Eagle3 layer.
+        assert mgr.draft_layer_ids == (2,)
+        assert mgr.mixed_precision_high_layers == {1: 3}
+    finally:
+        mgr.shutdown()

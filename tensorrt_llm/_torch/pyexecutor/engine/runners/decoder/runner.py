@@ -67,6 +67,7 @@ from tensorrt_llm.llmapi.llm_args import (
     PrefillCudaGraphBackend,
     SeqLenAwareSparseAttentionConfig,
 )
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
@@ -83,6 +84,7 @@ from .metadata import (
     get_spec_managers,
     sync_group_all_greedy_sample,
     update_spec_metadata,
+    validate_dspark_draft_sampling,
 )
 from .warmup import DecoderWarmup, WarmupAgreement
 
@@ -248,7 +250,9 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._inputs.decode_prologue = self.runtime_hooks.decode_prologue
         self._graphs = self._make_cuda_graphs()
-        self._inputs.cuda_graph_runner = self.cuda_graph_runner
+        self._inputs.attach_cuda_graph_runners(
+            self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
+        )
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -524,6 +528,10 @@ class DecoderRunner(ScheduledModelRunner):
         )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
+        logger.info(
+            f"Breakable prefill CUDA graphs on {type(decoder_model.model).__name__} "
+            f"for num_tokens={self._config.prefill_cuda_graph_num_tokens}"
+        )
         return BreakableCUDAGraphRunner(decoder_model.model)
 
     @property
@@ -628,7 +636,16 @@ class DecoderRunner(ScheduledModelRunner):
             # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(padded_graph_requests.all_requests())
-                sync_group_all_greedy_sample(spec_metadata, self._mapping, self._dist)
+                sync_group_all_greedy_sample(
+                    spec_metadata,
+                    self._mapping,
+                    self._dist,
+                    confidence_enabled=self._dspark_confidence_enabled,
+                )
+                validate_dspark_draft_sampling(
+                    spec_metadata,
+                    confidence_enabled=self._dspark_confidence_enabled,
+                )
 
             selection = self._graphs.select(
                 padded_graph_requests,
@@ -766,6 +783,7 @@ class DecoderRunner(ScheduledModelRunner):
                 moe_load_balancer=moe_load_balancer,
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
+                static_inputs_staged=prepared.static_inputs_staged,
                 position_id_offsets=(
                     self._buffers.previous_pos_id_offsets_cuda
                     if enable_spec_decode

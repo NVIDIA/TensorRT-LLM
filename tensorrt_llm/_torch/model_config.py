@@ -308,6 +308,13 @@ class ModelConfig(Generic[TConfig]):
         default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+    # Lossy: the model's two-shot MNNVL all-reduces fused with a residual
+    # RMSNorm exchange E4M3 (AllReduceParams.fp8_payload).
+    mnnvl_allreduce_fp8_payload: bool = False
+    # Every tensor-parallel rank holds the whole embedding table.
+    replicate_embedding: bool = False
+    # Batch sizes of the generation CUDA graphs (empty without them).
+    cuda_graph_batch_sizes: Tuple[int, ...] = ()
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
@@ -793,7 +800,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
         # MXFP4 checkpoints.
@@ -811,7 +818,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
 
@@ -1076,7 +1083,9 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        exclude_modules = set()
+        # Keyed by module name in checkpoint order; a set would order the
+        # names by string hash, which varies between processes.
+        exclude_modules: dict[str, None] = {}
         has_mxfp4 = False
         is_dynamic_quant = False
         with open(dtypes_json_file) as f:
@@ -1085,7 +1094,7 @@ class ModelConfig(Generic[TConfig]):
                 if layer.endswith("weight"):
                     if dtype == "BF16" or dtype == "FP16":
                         names = layer.split(".")
-                        exclude_modules.add('.'.join(names[:-1]))
+                        exclude_modules.setdefault('.'.join(names[:-1]))
                     elif dtype == "MXFP4":
                         # This is the path for the fp8 checkpoint which requires dynamic quantization.
                         is_dynamic_quant = True
