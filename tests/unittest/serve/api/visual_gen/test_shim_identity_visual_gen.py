@@ -14,22 +14,18 @@
 # limitations under the License.
 """Identity rows of VisualGen names re-exported from moved serve modules.
 
-``VISUAL_GEN_SHIM_ROWS`` starts empty. No kept shim has a VisualGen path, so
-this table only ever receives interface rows (``warns=False``,
-``ban_old_path=False``): names a package facade keeps re-exporting as its own
-interface, checked for identity only. Lives under a ``visual_gen/`` path so that
-VisualGen-only pull requests still run it; the machinery's self-tests are in
+No kept shim has a VisualGen path, so this table holds interface rows only
+(``warns=False``, ``ban_old_path=False``, ``retire_in="not retired"``): names a
+package facade keeps re-exporting as its own interface, checked for identity
+only. Lives under a ``visual_gen/`` path so that VisualGen-only pull requests
+still run it; the machinery's self-tests are in
 ``tests/unittest/serve/test_shim_identity.py``.
 """
 
-from pathlib import Path
-
 import pytest
-from test_common.serve.shims import ShimRow, check_identity, check_warnings, find_old_path_imports
+from test_common.serve.shims import ShimRow, check_identity
 
 pytestmark = pytest.mark.cpu_only
-
-REPO_ROOT = Path(__file__).resolve().parents[5]
 
 # The VisualGen request and response models live in
 # ``tensorrt_llm.serve.api.visual_gen.protocol``; ``tensorrt_llm.serve.openai_protocol``
@@ -107,9 +103,15 @@ def test_visual_gen_shim_identity():
     assert check_identity(VISUAL_GEN_SHIM_ROWS) == []
 
 
-def test_visual_gen_shim_warnings():
-    assert check_warnings(VISUAL_GEN_SHIM_ROWS) == []
-
-
-def test_visual_gen_no_old_path_imports():
-    assert find_old_path_imports(VISUAL_GEN_SHIM_ROWS, REPO_ROOT) == []
+def test_visual_gen_rows_are_interface_rows():
+    kept_shims = [
+        f"{row.old_module}.{row.name}"
+        for row in VISUAL_GEN_SHIM_ROWS
+        if row.warns or row.ban_old_path or row.retire_in != "not retired"
+    ]
+    assert kept_shims == [], (
+        f"{kept_shims} are kept-shim rows, but this table checks identity only. A kept shim "
+        "also needs its FutureWarning and old-path ban checked: call check_warnings and "
+        "find_old_path_imports from test_common.serve.shims on this table here, and delete "
+        "this test."
+    )
