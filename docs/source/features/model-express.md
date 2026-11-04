@@ -111,9 +111,12 @@ The Qwen3 MoE identity covers Hugging Face-format checkpoints that resolve to
 the exact `Qwen3MoeForCausalLM` / `qwen3_moe` pair; Qwen3-30B-A3B is the
 qualified canary. Its Instruct-2507 and Thinking-2507 releases declare the same
 identity with BF16 weights, default RoPE, and untied embeddings. The
-Qwen3-235B-A22B checkpoints share the identity but do not fit TP=2 on H100,
-H200, or B200. Quantized checkpoints, such as the FP8, GPTQ, and NVFP4 variants,
-fail the quantization constraints. Qwen3-VL-MoE checkpoints use another root:
+Qwen3-235B-A22B checkpoints share the identity and the per-layer tensor layout,
+so they qualify too wherever TP=2 holds their roughly 470 GB of BF16 weights,
+which takes GPUs with more than about 240 GB of memory each, such as B300 or
+GB300. The Qwen3-30B-A3B rows exercise that layout; no row loads Qwen3-235B-A22B
+itself. Quantized checkpoints, such as the FP8 and NVFP4 variants, fail the
+quantization constraints. Qwen3-VL-MoE checkpoints use another root:
 `Qwen3VLMoeForConditionalGeneration` builds a `Qwen3MoeForCausalLM` internally,
 but qualification matches the outer root, so these checkpoints fall back. The
 profile pins the CUTLASS MoE backend, which `moe_config.backend: AUTO` selects
@@ -154,11 +157,8 @@ configuration. The Mistral profile additionally pins the realized attention
 window: every attention layer must run without a sliding window, so
 sliding-window checkpoints such as Ministral fall back to the Hugging Face path
 until they are qualified separately. The dense profiles do not constrain
-MoE-only backend and mapping settings because dense roots do not consume them.
-The Qwen3 MoE profile pins them: the CUTLASS MoE backend, MoE TP and MoE EP
-sizes of 1 or 2 whose product equals TP, and a MoE cluster size of 1. The MoE
-load balancer (EPLB) and DWDP change which experts a rank stores without
-changing those sizes, so no profile supports them and they fall back.
+MoE-only backend and mapping settings because dense roots do not consume them;
+the Qwen3 MoE profile pins them as the table above lists.
 `SourceIdentity` still requires donor and receiver configurations to match.
 
 The Qwen3.5 dense vision-language profile carries the vision encoder together
@@ -178,7 +178,10 @@ Support for another model family requires a focused qualification change:
    `cache_derived_state()`.
 2. Verify that every one-time transform is guarded by `_weights_transformed`
    and that the staged receiver can skip `transform_weights()` without
-   changing aliases, derived state, tensor layout, or outputs.
+   changing aliases, derived state, tensor layout, or outputs. Declare the
+   guard before any weight load: staged receivers mark only modules that
+   already carry it, and a later transform walk would run any module left
+   unmarked on already transformed bytes.
 3. Add an exact qualification profile only after the reusable harness in
    `tests/unittest/utils/post_transform_qualification.py` proves tensor,
    alias, transform-guard, derived-state, and deterministic output
@@ -204,9 +207,15 @@ Support for another model family requires a focused qualification change:
    layouts differ per MoE implementation and each needs its own
    transform-layout ABI. The pinned backend and quantization must name exactly
    one implementation. Also pin every MoE partition dimension (`moe_tp_sizes`,
-   `moe_ep_sizes`, and `moe_cluster_sizes`). Keep the MoE load balancer and
-   DWDP unsupported unless they are qualified separately, and add one
-   donor/receiver row per admitted MoE partition.
+   `moe_ep_sizes`, and `moe_cluster_sizes`); the qualification harness rejects
+   a profile that qualifies a model with routed experts but leaves any of them
+   unconstrained. The size pins cannot exclude the MoE load balancer (EPLB) or
+   DWDP: EPLB changes which experts a rank stores without changing the MoE TP
+   or EP size, and DWDP forces the MoE TP and EP sizes to 1, which a TP=1 or
+   TP=2 profile admits, while each rank stores its own expert range.
+   `ModelLoader` reports both as features instead. Keep them unsupported
+   unless they are qualified separately, and add one donor/receiver row per
+   admitted MoE partition.
 
 ### Qualification Test
 
@@ -283,7 +292,10 @@ and `qwen3-moe-bf16-tp2-ep2` (MoE EP=2), with `TRTLLM_MX_QWEN3_MOE_MODEL`
 overriding the default `Qwen3/Qwen3-30B-A3B` checkpoint. All three roles of
 these rows set `moe_config.disable_finalize_fusion=True`: the CUTLASS
 FC2+finalize fusion is not deterministic for top-k greater than 2, and the test
-requires exact token equality.
+requires exact token equality. MoE rows also require every rank's routed-expert
+tensor shapes in the final manifests to match the row's MoE EP x MoE TP
+partition, so the comparisons cannot pass on a partition that all roles share
+but the row did not request.
 `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
@@ -528,9 +540,6 @@ path.
   decoding (MTP or DFlash), without a local vision encoder (`disable_mm_encoder`
   or multimodal encoder/prefill disaggregation), as encoder-only workers, with
   tied embeddings, or with quantized weights.
-- For Qwen3 MoE, MoE backends other than CUTLASS, the MoE load balancer, MoE
-  cluster parallelism, DWDP, quantized checkpoints, the Qwen3-VL-MoE root, and
-  TP greater than 2 are not qualified and use the Hugging Face fallback.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.

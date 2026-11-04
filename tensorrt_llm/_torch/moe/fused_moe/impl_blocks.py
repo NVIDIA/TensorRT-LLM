@@ -206,7 +206,7 @@ class MoEWeightOwnerMixin:
         self.quant_method.load_weights(self, weights[0], self.weight_loading_mode, **kargs)
 
     def transform_weights(self) -> None:
-        if getattr(self, "_weights_transformed", False):
+        if self._weights_transformed:
             return
         self.quant_method.transform_weights(self)
         self._weights_transformed = True

@@ -182,7 +182,8 @@ _MX_CASES = (
             moe_disable_finalize_fusion=True,
         ),
         id="qwen3-moe-bf16-tp1",
-        marks=pytest.mark.skip_less_device(2),
+        # Each role holds all of the roughly 57 GiB of BF16 weights on one GPU.
+        marks=[pytest.mark.skip_less_device(2), pytest.mark.skip_less_device_memory(80000)],
     ),
     pytest.param(
         MxE2ECase(

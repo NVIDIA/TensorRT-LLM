@@ -63,7 +63,7 @@ pytestmark = pytest.mark.cpu_only
         ),
     ],
 )
-@pytest.mark.parametrize("role", ["baseline", "donor", "receiver"])
+@pytest.mark.parametrize("role", ROLES)
 def test_moe_row_settings_reach_every_role(
     case_overrides: dict[str, object],
     expected_args: tuple[str, ...],
@@ -189,12 +189,33 @@ def test_moe_partition_rejects_a_partition_the_row_did_not_name(
         )
 
 
-def test_moe_partition_rejects_an_ep_size_that_does_not_divide_tp(tmp_path: Path) -> None:
-    with pytest.raises(AssertionError, match="MoE EP size 2 does not divide TP size 1"):
+@pytest.mark.parametrize("tp_size, moe_ep_size", [(1, 2), (2, 0), (2, 3)])
+def test_moe_row_rejects_an_ep_size_that_does_not_divide_tp(tp_size: int, moe_ep_size: int) -> None:
+    """A row's MoE split is checked when the row is defined, before any worker runs."""
+    with pytest.raises(
+        ValueError, match=f"MoE EP size {moe_ep_size} does not divide TP size {tp_size}"
+    ):
+        _moe_row(tp_size, moe_ep_size)
+
+
+def test_moe_partition_asks_to_be_extended_for_another_moe_layout(tmp_path: Path) -> None:
+    """A routed-expert layout other than the 3-D CUTLASS one fails as unknown, not as mismatched."""
+    block_major_shapes = ((8, 4, 32, 32), (8, 32, 2, 32))
+    with pytest.raises(AssertionError, match="teach `assert_moe_partition` this MoE layout"):
         assert_moe_partition(
-            _moe_row(1, moe_ep_size=2),
-            _final_manifests(1, _TP1_SHAPES),
+            _moe_row(2),
+            _final_manifests(2, block_major_shapes),
             _checkpoint(tmp_path, _MOE_CONFIG),
+        )
+
+
+def test_moe_partition_asks_to_be_extended_for_another_moe_config(tmp_path: Path) -> None:
+    config = {"num_experts": 8, "intermediate_size": 64, "hidden_size": 32}
+    with pytest.raises(AssertionError, match="teach `assert_moe_partition` this MoE config"):
+        assert_moe_partition(
+            _moe_row(2),
+            _final_manifests(2, _MOE_TP2_SHAPES),
+            _checkpoint(tmp_path, config),
         )
 
 

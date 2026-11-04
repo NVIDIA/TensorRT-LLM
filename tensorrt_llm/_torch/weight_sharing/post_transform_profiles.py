@@ -558,6 +558,24 @@ class PostTransformQualificationDecision:
             self.profile.transform_abi_id if self.qualified and self.profile is not None else None
         )
 
+    def describe(self) -> str:
+        """Render the reason and the details this decision reports, for logs and errors.
+
+        For example `reason=feature_not_supported; unsupported_features=dwdp`.
+        Empty details are omitted: `qualify()` stops at a runtime mismatch
+        before it checks features, so an empty feature set there does not mean
+        that no unsupported feature is active.
+        """
+
+        parts = [f"reason={self.reason.value}"]
+        if self.unsupported_runtime_dimensions:
+            dimensions = ",".join(sorted(self.unsupported_runtime_dimensions))
+            parts.append(f"unsupported_runtime_dimensions={dimensions}")
+        if self.unsupported_features:
+            features = ",".join(sorted(feature.value for feature in self.unsupported_features))
+            parts.append(f"unsupported_features={features}")
+        return "; ".join(parts)
+
 
 @dataclass(frozen=True)
 class PostTransformProfileRegistry:

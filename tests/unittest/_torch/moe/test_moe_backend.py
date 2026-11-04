@@ -1632,7 +1632,7 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
 
 
 @pytest.mark.cpu_only
-def test_moe_weight_owner_declares_transform_guard_before_load():
+def test_moe_weight_owner_declares_transform_guard_before_load() -> None:
     """A staged receiver can mark a never-loaded expert-weight owner transformed.
 
     Post-transform receivers install already transformed expert bytes without

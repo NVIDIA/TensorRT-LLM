@@ -27,6 +27,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformFeature,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformQualificationDecision,
     PostTransformQualificationReason,
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
@@ -210,31 +211,8 @@ def test_registry_selects_exact_speculative_mode_profile() -> None:
     assert decision.profile is mtp_profile
 
 
-def test_optional_feature_requires_explicit_profile_support() -> None:
-    profile = _profile()
-    registry = PostTransformProfileRegistry((profile,))
-
-    decision = registry.qualify(
-        root_model_class=_Model,
-        architecture="ModelForCausalLM",
-        model_type="model",
-        speculative_mode=None,
-        protocol_version=1,
-        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        enabled_features=frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL}),
-    )
-
-    assert not decision.qualified
-    assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
-    assert decision.profile is profile
-    assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
-
-
-@pytest.mark.parametrize(
-    "feature",
-    [PostTransformFeature.MOE_LOAD_BALANCER, PostTransformFeature.DWDP],
-)
-def test_moe_lifecycle_features_require_explicit_profile_support(
+@pytest.mark.parametrize("feature", list(PostTransformFeature))
+def test_optional_feature_requires_explicit_profile_support(
     feature: PostTransformFeature,
 ) -> None:
     profile = _profile()
@@ -252,7 +230,45 @@ def test_moe_lifecycle_features_require_explicit_profile_support(
 
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
+    assert decision.profile is profile
     assert decision.unsupported_features == frozenset({feature})
+
+
+@pytest.mark.parametrize(
+    "decision, expected",
+    [
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+            ),
+            "reason=root_model_class_not_registered",
+            id="reason-only",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED,
+                unsupported_runtime_dimensions=frozenset({"tp_size", "moe_backend"}),
+            ),
+            "reason=runtime_config_not_supported; "
+            "unsupported_runtime_dimensions=moe_backend,tp_size",
+            id="runtime-dimensions",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.FEATURE_NOT_SUPPORTED,
+                unsupported_features=frozenset(
+                    {PostTransformFeature.MOE_LOAD_BALANCER, PostTransformFeature.DWDP}
+                ),
+            ),
+            "reason=feature_not_supported; unsupported_features=dwdp,moe_load_balancer",
+            id="features",
+        ),
+    ],
+)
+def test_decision_describes_only_the_details_it_reports(
+    decision: PostTransformQualificationDecision, expected: str
+) -> None:
+    assert decision.describe() == expected
 
 
 def test_explicitly_supported_optional_feature_is_qualified() -> None:
