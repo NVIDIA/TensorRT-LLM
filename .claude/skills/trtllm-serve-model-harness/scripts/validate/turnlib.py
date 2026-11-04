@@ -32,9 +32,16 @@ try:
 except ImportError:  # payloads are then not schema-checked, and that is reported
     jsonschema = None
 try:
+    from referencing.exceptions import Unresolvable  # jsonschema 4.18+: a $ref it cannot resolve
+except ImportError:
+    Unresolvable = None
+try:
     import lark
 except ImportError:
     lark = None
+
+# A declared schema no payload can be checked against: invalid, or a $ref that does not resolve.
+SCHEMA_UNUSABLE = tuple(e for e in (getattr(jsonschema, "SchemaError", None), Unresolvable) if e)
 
 NESTED_HEADER = re.compile(r"^### `([A-Za-z0-9_.-]+)`", re.M)
 QUALIFIED_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$")
@@ -526,7 +533,7 @@ def payload_check(
                 validator = jsonschema.validators.validator_for(tool.schema)
                 validator.check_schema(tool.schema)
                 errors = list(validator(tool.schema).iter_errors(args))
-            except jsonschema.SchemaError:
+            except SCHEMA_UNUSABLE:
                 return True, {"reason": "declared_schema_invalid"}
             if errors:
                 error = jsonschema.exceptions.best_match(errors)
@@ -537,8 +544,12 @@ def payload_check(
                 if all(e.validator in tolerate for e in errors):
                     return True, dict(detail, reason="tolerated")
                 if "pi_edit_normalize" in tolerate and tool.name == PI_EDIT_TOOL:
-                    repaired = validator(tool.schema).iter_errors(pi_edit_prepared(args))
-                    if next(repaired, None) is None:
+                    try:  # the repaired arguments can reach a $ref the original ones did not
+                        repaired = validator(tool.schema).iter_errors(pi_edit_prepared(args))
+                        repaired_valid = next(repaired, None) is None
+                    except SCHEMA_UNUSABLE:
+                        return True, {"reason": "declared_schema_invalid"}
+                    if repaired_valid:
                         return True, dict(detail, reason="tolerated", repair="pi_edit_normalize")
                 return False, dict(detail, reason="schema")
         return True, None

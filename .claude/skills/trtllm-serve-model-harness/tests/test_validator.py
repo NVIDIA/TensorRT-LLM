@@ -584,6 +584,25 @@ def test_verdict_that_cannot_be_written_is_no_verdict(tmp_path, capsys):
     assert "verdict.py: " in capsys.readouterr().err
 
 
+def test_a_schema_ref_that_does_not_resolve_leaves_the_payload_unjudged():
+    """A declared $ref nothing resolves makes the schema unusable, in the repair re-check too."""
+    import check_tool_calls
+    from turnlib import PI_EDIT_TOOL, payload_check
+
+    missing = {"$ref": "#/$defs/missing"}
+    schema = {"type": "object", "properties": {"a": missing}}
+    assert payload_check('{"a": 1}', Tool(name="t", schema=schema)) == (
+        True, {"reason": "declared_schema_invalid"})  # fmt: skip
+    assert check_tool_calls.payload_check('{"a": 1}', {"type": "function", "parameters": schema}) == (
+        True, {"reason": "declared_schema_invalid"})  # fmt: skip
+    # The arguments as written miss `edits`; pi's repair adds it, and only then is the $ref reached.
+    edit = {"type": "object", "required": ["path", "edits"], "additionalProperties": False,
+            "properties": {"path": {"type": "string"}, "edits": {"type": "array", "items": missing}}}  # fmt: skip
+    args = '{"path": "x", "oldText": "a", "newText": "b"}'
+    assert payload_check(args, Tool(name=PI_EDIT_TOOL, schema=edit), ("pi_edit_normalize",)) == (
+        True, {"reason": "declared_schema_invalid"})  # fmt: skip
+
+
 def test_scan_credentials_reports_an_unreadable_shard_and_goes_on(tmp_path):
     """A .zst shard that is not zstd is an error in its own row, not the end of the scan."""
     import subprocess

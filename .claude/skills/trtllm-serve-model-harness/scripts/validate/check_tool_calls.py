@@ -95,9 +95,16 @@ try:
 except ImportError:  # schema validation is skipped and reported as such
     jsonschema = None
 try:
+    from referencing.exceptions import Unresolvable  # jsonschema 4.18+: a $ref it cannot resolve
+except ImportError:
+    Unresolvable = None
+try:
     import lark
 except ImportError:
     lark = None
+
+# A declared schema no payload can be checked against: invalid, or a $ref that does not resolve.
+SCHEMA_UNUSABLE = tuple(e for e in (getattr(jsonschema, "SchemaError", None), Unresolvable) if e)
 
 NESTED_HEADER = re.compile(r"^### `([A-Za-z0-9_.-]+)`", re.M)
 # A dotted identifier: what a qualified spelling of a declared tool looks like. A
@@ -203,7 +210,7 @@ def payload_check(payload, spec):
                     "validator": error.validator,
                     "path": "/".join(str(p) for p in error.absolute_path),
                 }
-            except jsonschema.SchemaError:
+            except SCHEMA_UNUSABLE:
                 return True, {"reason": "declared_schema_invalid"}
         return True, None
     if spec["type"] == "custom":
