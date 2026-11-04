@@ -1662,7 +1662,11 @@ def test_moe_weight_owner_declares_transform_guard_before_load():
 
     assert backend._weights_transformed is True
     assert wrapper._weights_transformed is False
+    # The walk itself must skip the marked backend; the backend's own guard
+    # would also stop the quantization transform, so spy on the hook it calls.
+    backend.transform_weights = MagicMock(wraps=backend.transform_weights)
     ModelLoader._walk_transform(model)
+    backend.transform_weights.assert_not_called()
     backend.quant_method.transform_weights.assert_not_called()
 
 
