@@ -230,18 +230,16 @@ def test_spec_resource_manager_is_the_prompt_tracker_for_dflash():
     from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
     from tensorrt_llm._torch.speculative.utils import get_spec_resource_manager
 
-    def engine(sa_config):
-        return SimpleNamespace(
-            spec_config=SimpleNamespace(
-                spec_dec_mode=SpeculativeDecodingMode.DFLASH, sa_config=sa_config
-            ),
-            model=SimpleNamespace(config=SimpleNamespace()),
-            batch_size=MAX_BATCH,
-            max_seq_len=CAPACITY,
-            max_num_tokens=CAPACITY,
-        )
+    # DFlashDecodingConfig has no sa_config attribute, so the stub doesn't either.
+    engine = SimpleNamespace(
+        spec_config=SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH),
+        model=SimpleNamespace(config=SimpleNamespace()),
+        batch_size=MAX_BATCH,
+        max_seq_len=CAPACITY,
+        max_num_tokens=CAPACITY,
+    )
 
-    manager = get_spec_resource_manager(engine(None))
+    manager = get_spec_resource_manager(engine)
     assert isinstance(manager, DFlashPromptTracker)
     assert manager.max_num_requests == MAX_BATCH and manager.active
 
