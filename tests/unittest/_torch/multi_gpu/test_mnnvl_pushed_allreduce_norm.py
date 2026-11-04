@@ -96,6 +96,7 @@ def _run_rank(world_size):
     )
     from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
     from tensorrt_llm._torch.kernels.blackwell import bf16_splitk_push_gemm as push_gemm
+    from tensorrt_llm._torch.kernels.blackwell.mnnvl_pushed_allreduce_norm import norm_finish_config
     from tensorrt_llm.mapping import Mapping
 
     comm = MPI.COMM_WORLD
@@ -121,14 +122,19 @@ def _run_rank(world_size):
 
         # A pushed input finished with the residual + RMSNorm against the C++ fused all-reduce,
         # one-shot and two-shot sizes, with C++ calls in between.
+        transports = set()
         for m in (1, 7, 8, 14, 16, 21, 28, 32, 56, 64, 112, 128):
             for special in (False, True):
                 x = _input(m, HIDDEN, 7 * m + special, rank, special)
                 res = _input(m, HIDDEN, 11 * m + special, 0, special)
                 ref_out, ref_res = allreduce(x, all_reduce_params=params(res))
                 target = allreduce.push_target(m, HIDDEN, all_reduce_params=params(res))
-                if target is None:
+                # Pushed exactly where the finish kernel has a single-load launch shape.
+                served = norm_finish_config(m, HIDDEN, x.device)[0] > 0
+                assert (target is not None) == served, m
+                if not served:
                     continue
+                transports.add(target.one_shot)
                 assert target.norm_params is not None
                 # The fusion composes only with a finish kernel that writes both outputs.
                 for option in ({"in_place": True}, {"consumer_finishes": True}):
@@ -142,6 +148,7 @@ def _run_rank(world_size):
                 bad += _differ(ref_out, out) + _differ(ref_res, res_out)
                 again_out, again_res = allreduce(x, all_reduce_params=params(res))
                 bad += _differ(ref_out, again_out) + _differ(ref_res, again_res)
+        assert transports == {True, False}, "both transports must be finished with the fusion"
 
         # The BF16 split-K GEMM's push epilogue against its own store-only variant followed by
         # the C++ fused all-reduce (the drafter's o_proj and down_proj shapes).
