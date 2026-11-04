@@ -75,7 +75,9 @@ def test_locality_domains_reject_sparse_attention_at_manager_creation():
 
 
 def test_placement_round_robins_over_arrival_order():
-    manager = SimpleNamespace(num_locality_domains=2, _next_locality_domain=0)
+    manager = SimpleNamespace(
+        num_locality_domains=2, _next_locality_domain=0, _locality_domain_pending=[0, 0]
+    )
     picks = [KVCacheManagerV2.pick_locality_domain(manager) for _ in range(4)]
     assert picks == [0, 1, 0, 1]
 
@@ -87,6 +89,7 @@ def _placer(matches, load=(0, 0)):
         tokens_per_block=32,
         _next_locality_domain=0,
         _locality_domain_load=list(load),
+        _locality_domain_pending=[0, 0],
         _prefix_match_per_domain=lambda *args: list(matches),
     )
 
@@ -105,9 +108,15 @@ def test_placement_round_robins_without_a_full_block_match():
 
 
 def test_placement_does_not_pile_a_hot_prefix_onto_a_loaded_domain():
-    # Domain 1 already holds 30 more live requests than domain 0, past max(8, total // 4).
+    # Domain 1 already holds 30 more live requests than domain 0, past max(8, total // 16).
     manager = _placer(matches=(0, 96), load=(10, 40))
     assert KVCacheManagerV2.pick_locality_domain(manager, list(range(128))) == 0
+
+
+def test_placement_counts_a_burst_placed_before_any_kv_cache_exists():
+    manager = _placer(matches=(0, 96))
+    picks = [KVCacheManagerV2.pick_locality_domain(manager, list(range(128))) for _ in range(256)]
+    assert 0 <= picks.count(1) - picks.count(0) <= 256 // 16
 
 
 def _manager(num_locality_domains, is_draft):
@@ -116,6 +125,7 @@ def _manager(num_locality_domains, is_draft):
     manager.is_draft = is_draft
     manager.enable_block_reuse = False
     manager._next_locality_domain = 0
+    manager._locality_domain_pending = [0] * num_locality_domains
     return manager
 
 
