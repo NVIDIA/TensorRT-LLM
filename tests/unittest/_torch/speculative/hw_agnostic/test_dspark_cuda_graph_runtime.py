@@ -372,12 +372,41 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
 
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FULL)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FULL, None)
     assert exchanges == [[True, 4, 16, 5, SampleType.FAST.value]]
     runner.enable_in_graph_sampling = False
     exchanges.clear()
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, None)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, None, None)
     assert exchanges == []
+
+
+def test_shape_agreement_carries_the_kv_regime_when_graphs_are_keyed_by_it():
+    runner = _runner_stub()
+    batch = _Batch([SimpleNamespace(py_verify_len=3, py_draft_tokens=[0] * 5)] * 4)
+    runner.adp_shape_agreement = None
+    runner.agreed_ragged_bucket = 16
+    runner.enabled = True
+    runner.enable_in_graph_sampling = False
+    runner.kv_regime_resolver = lambda batch_size, draft_len: (8192, 16384)
+    runner._kv_regime_for_batch = lambda *_args: 8192
+    exchanges = []
+
+    def allgather(payload):
+        exchanges.append(payload)
+        peer = list(payload)
+        peer[-1] = 16384
+        return torch.tensor([payload, peer])
+
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=2),
+        dist=SimpleNamespace(tp_allgather_int64=allgather),
+    )
+    runner._resolve_sample_type = lambda *_args: SampleType.FULL
+
+    # the regime is the sixth field of the one shape exchange; the largest regime wins
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FULL, 16384)
+    assert exchanges == [[True, 4, 16, 5, SampleType.FULL.value, 8192]]
 
 
 def test_cached_shape_agreement_rejects_a_changed_ragged_key():
