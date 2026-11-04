@@ -71,7 +71,7 @@ tables, and writes every element of the routed output.
 * Output push (``output_push_world``, slice combine): the task that combines an m-tile also
   stores its BF16 rows into slot ``(token, rank)`` of every rank's current buffer of a one-shot
   MNNVL all-reduce (``mnnvl_pushed_allreduce.push_slot``, ``-0`` sent as ``+0``), for a consumer
-  that finishes that all-reduce.
+  that finishes that all-reduce. Without a local expert the token warps push zero rows.
 * PDL: barrier setup and TMEM allocation run before ``griddepcontrol.wait``; the dependents are
   released right after it (every consumer of the output waits for the whole grid).
 """
@@ -1116,6 +1116,8 @@ class RubinSmallBatchFusedMoeKernel:
                 ns,
                 w1,
                 bid,
+                nctas,
+                (push_mc, push_flags, push_rank),
             )
         elif warp_idx == self.mma_warp:
             self._mma(st, tiled_mma, a_layout, b_layout, sfa_layout, sfb_layout, w1, nt, ns)
@@ -1482,6 +1484,8 @@ class RubinSmallBatchFusedMoeKernel:
         ns: Int32,
         w1: Int32,
         bid,
+        nctas: Int32,
+        push,
     ):
         """The step's tokens (FC1's token operand) once; then, for every tile of every FC2 task,
         once FC1 has stored all of the tile's rows, its rows and scales of each k-tile into the
@@ -1524,6 +1528,9 @@ class RubinSmallBatchFusedMoeKernel:
                 out_base = out_ptr.toint()
                 for off in cutlass.range(lane * 16, out_bytes, 32 * 16, unroll=1):
                     _stg_v4_zero(out_base + Int64(off))
+            if cutlass.const_expr(self.output_push_world > 0):
+                # nor pushes it: the consumer polls every rank's slot of every token
+                self._push_zero_rows(push, orig_m, Int32(bid) * 32 + lane, nctas * 32)
 
         slice_bytes = (out_bytes + _ZERO_SLICES * 16 - 1) // (_ZERO_SLICES * 16) * 16
         e = Int32(0)
@@ -2331,6 +2338,30 @@ class RubinSmallBatchFusedMoeKernel:
                     True,
                 )
                 pushed_ar.push_v4(dst, words[0], words[1], words[2], words[3], True)
+
+    @cute.jit
+    def _push_zero_rows(self, push, orig_m: Int32, gtid: Int32, nthreads: Int32):
+        """Output push without a local expert: the vectors :meth:`_push_rows` stores for an
+        all-zero output (``+0`` words), grid-strided over the token warps."""
+        push_mc, push_flags, push_rank = push
+        cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push_flags)
+        vecs = self.n2 // 8
+        zero = Int32(0)
+        for i in cutlass.range(gtid, orig_m * vecs, nthreads, unroll=1):
+            tk = i // vecs
+            dst = pushed_ar.push_slot(
+                push_mc,
+                push_mc,
+                cur,
+                nbytes,
+                tk,
+                push_rank,
+                (i - tk * vecs) * 8,
+                self.output_push_world,
+                self.n2,
+                True,
+            )
+            pushed_ar.push_v4(dst, zero, zero, zero, zero, True)
 
     # ------------------------------------------------------------------ wrapper
     @cute.jit

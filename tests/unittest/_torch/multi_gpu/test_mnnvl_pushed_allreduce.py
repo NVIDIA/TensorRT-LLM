@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Pushed MNNVL all-reduce (``AllReduce.push_target`` / ``finish_push``, the FP8 block-scale
-low-M GEMM's push epilogue, the copy push): bitwise equal to the C++ MNNVL all-reduce, with
-pushed and C++ calls interleaved on one workspace, eagerly and in CUDA graph replays; also where
-the decode attention-residual mix finishes the call itself (``MnnvlPendingResult``)."""
+low-M GEMM's push epilogue, the copy push, the small-batch MoE kernel's output push): bitwise
+equal to the C++ MNNVL all-reduce, with pushed and C++ calls interleaved on one workspace, eagerly
+and in CUDA graph replays; also where the decode attention-residual mix finishes the call itself
+(``MnnvlPendingResult``)."""
 
 import pickle
 import sys
@@ -661,6 +662,179 @@ def _run_rank_k3_attention(world_size):
     return True
 
 
+_SENTINEL = -(2**31)  # 0x80000000 as int32: an empty Lamport word
+
+
+def _small_batch_moe_operands(world, rank, m, owners, seed):
+    """Operands of the small-batch MoE kernel on ``rank`` of an expert-parallel group: the same
+    top-k on every rank, drawn from the experts of the ``owners`` ranks only (the other ranks then
+    have no local expert), and this rank's NVFP4 tokens and experts."""
+    hidden, inter, num_experts, top_k = 1024, 256, 64, 8
+    num_local = num_experts // world
+    offset = rank * num_local
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    logits = torch.randn(m, num_experts, device="cuda", generator=gen)
+    owned = torch.zeros(num_experts, dtype=torch.bool, device="cuda")
+    for r in owners:
+        owned[r * num_local : (r + 1) * num_local] = True
+    scales, ids = logits.masked_fill(~owned, float("-inf")).topk(top_k, dim=-1)
+    ids = ids.to(torch.int32)
+    scales = scales.softmax(dim=-1).float()
+    t2g, t2lim, e2p, p2e, _, nnet = torch.ops.trtllm.moe_sort(
+        token_selected_experts=ids,
+        token_final_scales=scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=offset,
+        local_num_experts=num_local,
+        tile_tokens_dim=128,
+    )
+    xb = torch.randn(m, hidden, device="cuda", dtype=torch.bfloat16, generator=gen)
+    x_gsf = xb.abs().max().float() / (448 * 6)
+    x, x_sf = torch.ops.trtllm.fp4_quantize(xb, 1 / x_gsf, 16, False, False)
+    wgen = torch.Generator(device="cuda").manual_seed(seed * 1000 + rank)
+
+    def experts(rows, cols):
+        w = torch.randint(0, 256, (num_local, rows, cols // 2), dtype=torch.uint8, device="cuda",
+                          generator=wgen)  # fmt: skip
+        sf = torch.rand((num_local, rows, cols // 16), device="cuda", generator=wgen) + 0.5
+        return w, sf.to(torch.float8_e4m3fn).view(torch.uint8)
+
+    w1, w1_sf = experts(2 * inter, hidden)
+    w2, w2_sf = experts(hidden, inter)
+    global_sf = torch.tensor([448 * 6 / 64.0], dtype=torch.float32, device="cuda")
+    ramp = torch.linspace(0.5, 1.5, num_local, device="cuda")
+    return dict(
+        hidden=hidden,
+        top_k=top_k,
+        offset=offset,
+        ids=ids,
+        scales=scales,
+        tables=(t2g, t2lim, p2e, nnet),
+        e2p=e2p,
+        x=x,
+        x_sf=x_sf.view(m, hidden // 16),
+        w1=w1,
+        w1_sf=w1_sf,
+        w2=w2,
+        w2_sf=w2_sf,
+        alpha1=(ramp * x_gsf * 0.004).float(),
+        alpha2=(ramp * 0.003 / global_sf[0]).float(),
+        global_sf=global_sf,
+    )
+
+
+def _small_batch_moe(d, out, counters, mode, push=None, num_ctas=0):
+    """The small-batch MoE kernel (slice combine) in ``mode``: ``permuted`` / ``token_indexed``
+    on the moe_sort tables, ``published`` on the top-k (the routing word set before the launch);
+    ``push``: the ``LamportWorkspaceView`` of a one-shot call it pushes its output into."""
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import (
+        small_batch_moe_route_word,
+    )
+
+    published = mode == "published"
+    tables, e2p = d["tables"], d["e2p"]
+    if published:
+        small_batch_moe_route_word(counters).fill_(d["ids"].size(0))
+        tables, e2p = (None,) * 4, d["ids"].reshape(-1)
+    torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
+        input=d["x"].view(torch.float4_e2m1fn_x2),
+        input_scale=d["x_sf"].view(torch.uint8),
+        fc1_weight=d["w1"].view(torch.float4_e2m1fn_x2),
+        fc1_weight_scale=d["w1_sf"],
+        fc1_alpha=d["alpha1"],
+        fc2_weight=d["w2"].view(torch.float4_e2m1fn_x2),
+        fc2_weight_scale=d["w2_sf"],
+        fc2_alpha=d["alpha2"],
+        output=out,
+        tile_idx_to_group_idx=tables[0],
+        tile_idx_to_mn_limit=tables[1],
+        permuted_idx_to_expanded_idx=tables[2],
+        expanded_idx_to_permuted_idx=e2p,
+        num_non_exiting_tiles=tables[3],
+        global_sf=d["global_sf"],
+        token_final_scales=d["scales"],
+        counters=counters,
+        top_k=d["top_k"],
+        situ_beta=2.5,
+        situ_linear_beta=0.7,
+        token_indexed=mode != "permuted",
+        num_ctas=num_ctas,
+        deterministic_combine=True,
+        published_routing=published,
+        expert_offset=d["offset"],
+        push_mc=push.mc_base if push is not None else 0,
+        push_flags=push.flags if push is not None else None,
+        push_rank=push.rank if push is not None else 0,
+        push_world=push.world if push is not None else 0,
+    )
+
+
+def _unpushed_ranks(target, m, h):
+    """Ranks with a slot of some token still empty in this rank's buffer of the one-shot call
+    ``target`` (its finish would poll them forever)."""
+    view = target.view
+    cur, _, nbytes = (int(v) for v in view.flags.cpu().tolist()[:3])
+    words = view.buffer.view(torch.uint8)[cur * nbytes : cur * nbytes + m * view.world * h * 2]
+    words = words.view(torch.int32).view(m, view.world, h // 2)
+    return sorted(set((words == _SENTINEL).any(-1).nonzero()[:, 1].tolist()))
+
+
+@mpi_worker_env(TLLM_TEST_MNNVL="1", TRTLLM_FORCE_MNNVL_AR="1")
+def _run_rank_small_batch_moe_push(world_size):
+    """The small-batch MoE kernel's output push on every rank of an expert-parallel group,
+    finished by the finish kernel, against the C++ all-reduce of its unpushed outputs; with the
+    experts of every rank and of rank 0 only (the others push the rows of a rank without a local
+    expert), every routing mode, the default and a single CTA."""
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import (
+        new_small_batch_moe_counters,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    torch.cuda.set_device(rank)
+    try:
+        mapping = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        allreduce = AllReduce(
+            mapping=mapping, strategy=AllReduceStrategy.MNNVL, dtype=torch.bfloat16
+        )
+        counters = new_small_batch_moe_counters(torch.device("cuda"))
+        bad = 0
+        for m in (3, 8):
+            for owners in ((0,), tuple(range(world_size))):
+                d = _small_batch_moe_operands(world_size, rank, m, owners, 41 * m + len(owners))
+                if owners == (0,):
+                    assert (int(d["tables"][3].item()) == 0) == (rank != 0)
+                h = d["hidden"]
+                for mode in ("permuted", "token_indexed", "published"):
+                    out = torch.full((m, h), float("nan"), dtype=torch.bfloat16, device="cuda")
+                    _small_batch_moe(d, out, counters, mode)
+                    ref = allreduce(out)
+                    for num_ctas in (0, 1):
+                        target = allreduce.push_target(m, h)
+                        assert target is not None and target.one_shot
+                        pushed = torch.full_like(out, float("nan"))
+                        _small_batch_moe(d, pushed, counters, mode, target.view, num_ctas)
+                        torch.cuda.synchronize()
+                        comm.Barrier()
+                        missing = _unpushed_ranks(target, m, h)
+                        assert not missing, (
+                            f"m={m} owners={owners} {mode} ctas={num_ctas}: "
+                            f"slots of ranks {missing} never pushed"
+                        )
+                        bad += _differ(out, pushed)
+                        bad += _differ(ref, allreduce.finish_push(target))
+                        torch.cuda.synchronize()
+                        assert int(counters.abs().sum().item()) == 0, "counters not reset"
+        assert comm.allreduce(bad) == 0, f"rank {rank}: {bad} values differ"
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
 def _finish_reference(slots, chunk):
     """The one-shot sum of ``slots [m, W, h]`` (BF16) in the C++ order: FP32 partial sums of
     ``chunk`` ranks from zero, added to an FP32 accumulator from zero, rounded to BF16."""
@@ -714,6 +888,21 @@ def test_o_proj_pushed_allreduce_finished_by_mix(mpi_pool_executor):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
     results = mpi_pool_executor.map(_run_rank_o_proj, *zip(*[(world_size,)] * world_size))
+    for r in results:
+        assert r is True
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_small_batch_moe_output_push_without_local_experts(mpi_pool_executor):
+    world_size = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the small-batch MoE kernel targets the SM100 family")
+    results = mpi_pool_executor.map(
+        _run_rank_small_batch_moe_push, *zip(*[(world_size,)] * world_size)
+    )
     for r in results:
         assert r is True
 
