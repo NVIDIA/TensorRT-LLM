@@ -143,10 +143,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._config = config
         self._client_factory = client_factory
         self._metadata_config = metadata_config
-        # The coordinator owns routing state, so it builds the owner routers here
-        # (is_delegating_client=False): one shared namespace-aware core + a single
-        # ZMQ ingest server. Sole place owner routers are created (fleet workers
-        # hold only a CoordinatorClient's delegating surfaces).
+        # The coordinator owns routing state, so it builds the owner routers here:
+        # one shared namespace-aware core + a single ZMQ ingest server. Sole place
+        # owner routers are created (fleet workers hold only a CoordinatorClient's
+        # delegating surfaces).
         self._metadata_server = create_metadata_server(metadata_config)
         ctx_servers, gen_servers = get_ctx_gen_server_addrs(config.server_configs)
         self._ctx_router, self._gen_router = build_disagg_routers(
@@ -158,7 +158,6 @@ class DisaggCoordinatorService(DisaggCoordinator):
             self._metadata_server,
             server_preparation_func,
             disagg_node_id=config.node_id,
-            is_delegating_client=False,
         )
         # The coordinator owns the disagg cluster storage (auto-scaling backend):
         # it drives the DisaggClusterManager below and, when the storage is an
@@ -564,7 +563,6 @@ class CoordinatorClient(DisaggCoordinator):
             metadata_config,
             create_metadata_server(metadata_config),
             disagg_node_id=config.node_id,
-            is_delegating_client=True,
         )
         self._ctx_router = self._maybe_delegate(ctx_router, "context")
         self._gen_router = self._maybe_delegate(gen_router, "generation")
