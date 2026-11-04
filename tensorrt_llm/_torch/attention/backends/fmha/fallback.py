@@ -17,33 +17,27 @@ from __future__ import annotations
 
 from dataclasses import fields
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, ClassVar, Mapping, Optional
+from typing import Mapping, Optional
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
-    CustomAttentionMask,
     PredefinedAttentionMask,
     RopeParams,
 )
-from tensorrt_llm._utils import get_sm_version, is_sm_120f
-from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.logger import logger
 
 from ..sparse.params import SparseRuntimeParams
-from .interface import FmhaPhase
-from .phased import FmhaParams, PhasedFmha
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.trtllm import (
-        TrtllmAttention,
-        TrtllmAttentionMetadata,
-    )
-
+from .flash_mla import FlashMlaFmha
+from .fmha_v2 import FmhaV2Fmha
+from .mmha import MmhaFmha
+from .native import NativeFmha
+from .phased import FmhaParams
+from .trtllm_gen import TrtllmGenFmha
+from .unfused import UnfusedFmha
+from .xqa import XqaFmha
 
 _FORWARD_ARG_NAMES = frozenset(field.name for field in fields(AttentionForwardArgs))
 _SPARSE_ARG_NAMES = frozenset(field.name for field in fields(SparseRuntimeParams))
@@ -78,246 +72,59 @@ def _legacy_forward_args(
     return AttentionForwardArgs(**values)
 
 
-class FallbackFmha(PhasedFmha):
-    """Fallback FMHA implementation over the phased TRT-LLM thop ops."""
+# The native op's library priorities. They agree phase by phase with the registry order,
+# which serves both variants: fmha_v2 serves no MHA generation and XQA no context phase.
+_MHA_LIBRARIES: tuple[type[NativeFmha], ...] = (
+    TrtllmGenFmha,
+    FmhaV2Fmha,
+    XqaFmha,
+    MmhaFmha,
+    UnfusedFmha,
+)
+_MLA_LIBRARIES: tuple[type[NativeFmha], ...] = (
+    TrtllmGenFmha,
+    FlashMlaFmha,
+    XqaFmha,
+    FmhaV2Fmha,
+)
 
-    REQUIRES_PAGED_KV = False
-    # Native attention consumes pool pointers directly; sparse managers may have
-    # no Role.KEY buffer from which to query a dense block extent.
-    NEEDS_BLOCK_EXTENT = False
-    supports_skip_correction = True
-    supports_workspace_reclamation = True
 
-    # Head sizes whose fused context FMHA kernel is proven absent for at
-    # least one KV cache dtype, per SM version. This is a blocklist of
-    # proven-problematic cells, not a support matrix: sourced from the
-    # runtime fallback warning "Fall back to unfused MHA ... headSize = 64
-    # ... in sm_103" and the silent-wrong-answer incident it caused. Inside
-    # a blocklisted cell, the ``fused_context_fmha_kernel_exists`` native
-    # lookup decides per KV dtype and page size which configurations the
-    # running build can serve. Outside it, no probe runs: the lookup is a
-    # fixed-convention diagnostic (dense causal Q_PAGED_KV, Q and output
-    # precision inferred from the KV precision) that does not model every
-    # configuration the op can run (MLA, cross attention, 16-bit context
-    # math over an FP8 KV cache), so probing unconditionally would refuse
-    # configurations the op serves correctly. The authoritative
-    # exact-parameter check is the context preparation check in
-    # thop/attentionOp.cpp; this gate exists to move the
-    # proven-problematic cells to FMHA dispatch with a remedial error.
-    # Extend as further combinations are proven.
-    CONTEXT_FMHA_ABSENT_HEAD_DIMS: ClassVar[dict[int, tuple[int, ...]]] = {
-        103: (64,),
-    }
+def _select_native_library(params: FmhaParams, is_gen: bool) -> type[NativeFmha]:
+    """The first native library that serves this phase call."""
+    libraries = _MLA_LIBRARIES if params.attn.is_mla_enable else _MHA_LIBRARIES
+    for library in libraries:
+        serves_phase = library.SERVES_GENERATION if is_gen else library.SERVES_CONTEXT
+        if serves_phase and library.native_is_supported(params, is_gen):
+            return library
+    raise RuntimeError(
+        f"No native FMHA library supports this {'generation' if is_gen else 'context'} call."
+    )
 
-    @classmethod
-    def _validate_paged_context_fmha(cls, metadata: "TrtllmAttentionMetadata") -> None:
-        """Refuse paged-context FMHA when no kernel exists for this config.
 
-        When ``use_paged_context_fmha`` is enabled but the fused context FMHA
-        kernel is absent for this SM/head-size combination, attentionOp.cpp
-        falls back to unfused MHA whose context path builds K/V from the
-        current chunk only: the cached prefix is DROPPED from attention and
-        then OVERWRITTEN by the chunk's write-back. Any request with a
-        non-zero cached length -- block reuse, partial reuse, chunked
-        prefill, speculative draft tokens -- returns a plausible wrong answer
-        with no error. That fallback happens inside the C++ op, after
-        selection has already committed to this library, so ``_is_supported``
-        calls this check for every batch with a context phase and raises
-        instead of returning False: this library is last in the registry, so
-        the raise skips no other library, and it replaces the silent wrong
-        answer with an error naming the cause and the remedy.
+class FallbackFmha(NativeFmha):
+    """The native libraries as one library: each phase call runs the first that serves it.
 
-        Inside a blocklisted (SM, head_dim) cell the decision is per KV
-        dtype and page size, made by asking the build what it contains via
-        the ``fused_context_fmha_kernel_exists`` native lookup: a present
-        kernel admits the configuration, an absent one refuses it. Nothing
-        about kernel presence is hand-maintained. The check fails closed
-        wherever it cannot be made: managers without a ``dtype`` or
-        ``tokens_per_block`` attribute, and builds whose bindings predate
-        the lookup (which also predate the op-level refusal, so passing
-        unverified would reintroduce the silent corruption there).
-        """
-        if not metadata.use_paged_context_fmha:
-            return
-        manager = metadata.kv_cache_manager
-        head_dim = getattr(manager, "head_dim", None) if manager else None
-        if head_dim is None:
-            return
-        head_dims = head_dim if isinstance(head_dim, list) else [head_dim]
-        sm = get_sm_version()
-        absent = [dim for dim in head_dims if dim in cls.CONTEXT_FMHA_ABSENT_HEAD_DIMS.get(sm, ())]
-        if not absent:
-            return
-        kv_dtype = getattr(manager, "dtype", None)
-        tokens_per_block = getattr(manager, "tokens_per_block", None)
-        if kv_dtype is not None and tokens_per_block is not None:
-            kernel_exists = getattr(thop, "fused_context_fmha_kernel_exists", None)
-            if kernel_exists is None:
-                raise RuntimeError(
-                    f"Paged-context FMHA with head_dim {absent} on SM {sm} "
-                    f"requires confirming the fused context kernel against "
-                    f"this build via the fused_context_fmha_kernel_exists "
-                    f"lookup, but this build's bindings predate it. Bindings "
-                    f"that old also predate the op-level paged-context "
-                    f"refusal, so an unverified pass would risk a silent "
-                    f"fall back to unfused MHA that corrupts the cached "
-                    f"prefix; the configuration stays refused. Rebuild the "
-                    f"bindings, or use the FlashInfer attention backend."
-                )
-            # Probe with every output precision the op can pair with this
-            # KV precision. For an FP8 KV cache the op quantizes Q to FP8
-            # but keeps dataTypeOut at the activation dtype (BF16/FP16)
-            # unless FP8 attention output is enabled, and neither the
-            # activation dtype nor that per-module flag is visible to this
-            # metadata-only check, so one present variant admits the
-            # cell; if the variant the model actually needs is the absent
-            # one, the exact-parameter refusal in the AttentionOp constructor still
-            # raises. An NVFP4 KV cache is read by the FP8-output kernels,
-            # and a 16-bit KV cache runs matched output, mirroring the
-            # binding's probe convention in
-            # test_context_fmha_kernel_presence.py. Dtypes the lookup does
-            # not model report absent, so they stay refused.
-            if kv_dtype == DataType.FP8:
-                probe_output_dtypes = (DataType.BF16, DataType.HALF, DataType.FP8)
-            elif kv_dtype == DataType.NVFP4:
-                probe_output_dtypes = (DataType.FP8,)
-            else:
-                probe_output_dtypes = (kv_dtype,)
-            if all(
-                any(
-                    kernel_exists(
-                        head_size=dim,
-                        kv_cache_dtype=kv_dtype,
-                        tokens_per_block=tokens_per_block,
-                        output_dtype=probe_output_dtype,
-                    )
-                    for probe_output_dtype in probe_output_dtypes
-                )
-                for dim in absent
-            ):
-                logger.info_once(
-                    f"Paged-context FMHA enabled for head_dim {absent} on SM "
-                    f"{sm}: this build's fused context FMHA kernel is present "
-                    f"for KV cache dtype {kv_dtype} at {tokens_per_block} "
-                    f"tokens per block.",
-                    key=f"paged_context_fmha_present_{sm}_{absent}_{kv_dtype}_{tokens_per_block}",
-                )
-                return
-            cause = (
-                f"this build contains no fused context FMHA kernel for that "
-                f"combination with KV cache dtype {kv_dtype} at "
-                f"{tokens_per_block} tokens per block"
-            )
-        else:
-            missing = [
-                name
-                for name, value in (("dtype", kv_dtype), ("tokens_per_block", tokens_per_block))
-                if value is None
-            ]
-            cause = (
-                f"the KV cache manager exposes no {' or '.join(missing)}, so "
-                f"the fused context FMHA kernel cannot be confirmed present "
-                f"(the check fails closed)"
-            )
-        features = [
-            name
-            for name in ("chunked_prefill", "cache_reuse", "has_speculative_draft_tokens")
-            if getattr(metadata.runtime_features, name, False)
-        ]
-        raise RuntimeError(
-            f"{'/'.join(features)} requires attending to cached KV during "
-            f"the context phase (use_paged_context_fmha), but for head_dim "
-            f"{absent} on SM {sm} {cause}. The unfused fallback silently "
-            f"drops and corrupts the cached prefix, producing plausible "
-            f"wrong answers, so the configuration is refused. A build whose "
-            f"--cuda_architectures does not name SM {sm} carries no kernels "
-            f"for SM {sm} at all and lands here too; check the architecture "
-            f"list first. Otherwise use the FlashInfer attention backend, or "
-            f"disable KV block reuse, chunked prefill and speculative "
-            f"decoding for this model."
-        )
+    The order is the native op's own priority for the layer's attention variant.
+    """
 
-    @classmethod
-    def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
-        if sparse_algorithm in ("deepseek_v4", "dsa"):
-            if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
-                return False
-            if is_sm_120f():
-                return False
-        return True
+    SERVES_CONTEXT = True
+    SERVES_GENERATION = True
 
-    def _is_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        *,
-        phase: Optional[FmhaPhase] = None,
-    ) -> bool:
-        del k, v
-        # A context phase served by the thop op with use_paged_context_fmha
-        # enabled would silently corrupt the cached prefix wherever the fused
-        # context kernel is absent. Raise rather than return False: no
-        # library follows this one, and the error names the cause and the
-        # remedy instead of the generic no-library message. Generation-only
-        # batches never run the context path, so they pass; whether a batch
-        # has a context phase is part of the FMHA cache key
-        # (``context_batch_size``), so the admitted result cannot be reused
-        # for a context batch.
-        if metadata.num_contexts > 0:
-            # Extra page sizes are supported by TRTLLM-Gen, not the thop
-            # paged-context kernel. Refuse before the kernel can read KV.
-            extra_page_sizes = getattr(
-                metadata.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()
-            )
-            if (
-                extra_page_sizes
-                and phase != FmhaPhase.GENERATION
-                and metadata.use_paged_context_fmha
-                and metadata.tokens_per_block in extra_page_sizes
-            ):
-                raise RuntimeError(
-                    f"FallbackFmha cannot serve paged prefill with "
-                    f"{metadata.tokens_per_block}-token KV pages. "
-                    "Use a supported TRTLLM-Gen configuration or disable "
-                    "chunked prefill, KV reuse and speculative decoding."
-                )
-            self._validate_paged_context_fmha(metadata)
-        # A verify group may straddle a page boundary onto two CP ranks, so
-        # its KV ownership is per-token. The fused thop path cannot express
-        # that: its spec-dec mask and the per-sequence helix_is_inactive_rank
-        # gate both assume the new KV entries are the trailing slots of one
-        # rank's kv_len. Reject rather than run it silently wrong; being last
-        # in the library list, this makes dispatch raise.
-        if (
-            metadata.helix_position_offsets is not None
-            and metadata._helix_spec_tokens_valid
-            and metadata.num_generations > 0
-            # Count generation tokens only: in a mixed batch ``q`` also holds
-            # the context tokens, which would otherwise trip this on a batch
-            # that has exactly one query token per generation sequence.
-            and q.shape[0] - metadata.num_ctx_tokens > metadata.num_generations
-        ):
-            return False
-        if q is not None and q.dtype == torch.float8_e4m3fn:
-            return False
-        if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
-            return False
-        if not (
-            self.attn.is_mla_enable
-            or forward_args.is_fused_qkv
-            or metadata.is_cross
-            or forward_args.sage_attn_num_elts_per_blk_q > 0
-            or forward_args.sage_attn_num_elts_per_blk_k > 0
-            or forward_args.sage_attn_num_elts_per_blk_v > 0
-        ):
-            return False
-        if not forward_args.update_kv_cache and not metadata.is_cross:
+    @staticmethod
+    def native_is_supported(params: FmhaParams, is_gen: bool) -> bool:
+        try:
+            _select_native_library(params, is_gen)
+        except RuntimeError:
             return False
         return True
+
+    @staticmethod
+    def native_run_context(params: FmhaParams) -> None:
+        _select_native_library(params, False).native_run_context(params)
+
+    @staticmethod
+    def native_run_generation(params: FmhaParams) -> None:
+        _select_native_library(params, True).native_run_generation(params)
 
     @classmethod
     def attention(
@@ -442,9 +249,9 @@ class FallbackFmha(PhasedFmha):
     ) -> None:
         """Shared MHA/MLA replacement for the removed monolithic ``thop.attention``.
 
-        Builds native FMHA parameters and dispatches to the phased
-        ``AttentionOp.run_context`` / ``run_generation`` / ``run_mla_generation``
-        ops. Direct callers supply the flat attention arguments and workspace.
+        Builds native FMHA parameters and runs each phase on the first native
+        library that serves it. Direct callers supply the flat attention
+        arguments and workspace.
         """
         arguments = locals().copy()
         del host_request_types
@@ -610,7 +417,7 @@ class FallbackFmha(PhasedFmha):
             params.max_past_kv_length = max_past_kv_len
             # The context call reserves the generation phase's workspace as well.
             params.num_gen_tokens = num_gen_tokens if has_generation else 0
-            thop.run_context(params)
+            cls.native_run_context(params)
 
         if has_generation:
             params = phase_params(num_ctx_tokens, num_tokens, num_contexts, total_seqs)
@@ -622,39 +429,4 @@ class FallbackFmha(PhasedFmha):
             )
             params.num_requests = num_generations // effective_beam_width
             params.num_gen_tokens = num_gen_tokens
-            thop.run_generation(params)
-
-    def prepare_workspace(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
-    ) -> None:
-        """The native op sizes and grows the workspace itself, inside each phase call."""
-        if forward_args.sage_attn_smooth_v:
-            logger.warning_once(
-                "The attention op quantizes V without the V smoothing this SageAttention "
-                "recipe requests.",
-                key="fallback_fmha_sage_attn_smooth_v",
-            )
-
-    # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.
-    @torch.compiler.disable
-    def run_context(self, params: FmhaParams) -> None:
-        thop.run_context(params)
-
-    @torch.compiler.disable
-    def run_mla_context(self, params: FmhaParams) -> None:
-        thop.run_context(params)
-
-    @torch.compiler.disable
-    def run_generation(self, params: FmhaParams) -> None:
-        thop.run_generation(params)
-
-    @torch.compiler.disable
-    def run_mla_generation(self, params: FmhaParams) -> None:
-        # The native op dispatches to the MLA generation path from the layer configuration.
-        thop.run_generation(params)
+            cls.native_run_generation(params)

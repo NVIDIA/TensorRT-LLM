@@ -406,12 +406,12 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
 
     monkeypatch.setattr(model.backend, "prepare_sparse_inputs", record_prepare)
     if implementation != "auto":
-        from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+        from tensorrt_llm._torch.attention.backends.fmha.native import NativeFmha
 
         def unexpected_native(*args, **kwargs):
             pytest.fail("Module Flash helper fell through to native attention")
 
-        monkeypatch.setattr(FallbackFmha, "forward", unexpected_native)
+        monkeypatch.setattr(NativeFmha, "forward", unexpected_native)
         assert model._flash_attention is not None
     native_rope = torch.ops.trtllm.mla_rope_inplace
     rope_rows = []

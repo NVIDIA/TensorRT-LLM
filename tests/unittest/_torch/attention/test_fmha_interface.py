@@ -24,6 +24,7 @@ from fmha_test_utils import FakeAttention
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
+from tensorrt_llm._torch.attention.backends.fmha.native import NativeFmha
 from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -59,7 +60,7 @@ def test_fallback_support_matches_thop_kv_update_contract(
     fmha = FallbackFmha(attn)
     metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None, num_contexts=0)
     forward_args = AttentionForwardArgs(is_fused_qkv=True, update_kv_cache=update_kv_cache)
-    assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
+    assert fmha._is_call_supported(None, None, None, metadata, forward_args) is expected
 
 
 def test_fallback_rejects_raw_fp8_input() -> None:
@@ -67,7 +68,9 @@ def test_fallback_rejects_raw_fp8_input() -> None:
     fmha = FallbackFmha(attn)
     metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None, num_contexts=0)
     q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
-    assert not fmha.is_supported(q, None, None, metadata, AttentionForwardArgs(is_fused_qkv=True))
+    assert not fmha._is_call_supported(
+        q, None, None, metadata, AttentionForwardArgs(is_fused_qkv=True)
+    )
 
 
 @pytest.mark.parametrize("mode", ["ordinary", "mla", "cross", "sage"])
@@ -82,7 +85,7 @@ def test_fallback_separate_qkv_support(mode: str) -> None:
         is_fused_qkv=False, sage_attn_num_elts_per_blk_q=2 if mode == "sage" else 0
     )
     q = torch.empty((1, 128), dtype=torch.bfloat16)
-    assert fmha.is_supported(q, q, q, metadata, forward_args) is (mode != "ordinary")
+    assert fmha._is_call_supported(q, q, q, metadata, forward_args) is (mode != "ordinary")
 
 
 @pytest.mark.parametrize("initial_fused_qkv", [False, True])
@@ -173,7 +176,7 @@ def test_availability_checks_capabilities_before_implementation(
 ) -> None:
     attn = cast(TrtllmAttention, FakeAttention())
     attn.skip_correction_threshold = threshold
-    capability_supported = threshold == 0.0 or fmha_cls is FallbackFmha
+    capability_supported = threshold == 0.0 or issubclass(fmha_cls, NativeFmha)
 
     with patch.object(fmha_cls, "_is_available", return_value=implementation_available) as hook:
         assert fmha_cls.is_available(attn) is (capability_supported and implementation_available)

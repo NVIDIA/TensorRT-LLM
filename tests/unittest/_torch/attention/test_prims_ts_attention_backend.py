@@ -1415,11 +1415,11 @@ def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPat
 
 
 def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.native import NativeFmha
     from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 
     calls = {"fallback": 0, "prims_context": 0}
-    fallback_forward = FallbackFmha.forward
+    fallback_forward = NativeFmha.forward
     prims_context = PrimsTSFmha.run_context
 
     def counted_fallback(self, *args, **kwargs):
@@ -1430,7 +1430,7 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
         calls["prims_context"] += 1
         return prims_context(self, *args, **kwargs)
 
-    monkeypatch.setattr(FallbackFmha, "forward", counted_fallback)
+    monkeypatch.setattr(NativeFmha, "forward", counted_fallback)
     monkeypatch.setattr(PrimsTSFmha, "run_context", counted_prims_context)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts,fallback")
     case = BackendCase(

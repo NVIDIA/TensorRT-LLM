@@ -39,6 +39,7 @@ from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
+from .xqa import XqaFmha
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -121,6 +122,10 @@ _FMHA_CACHE_SEQ_LEN_Q_GRID: tuple[int, ...] = _make_fmha_cache_grid(
     _FMHA_CACHE_SEQ_LEN_Q_CANDIDATES
 )
 _FMHA_CACHE_SANITY_CHECK_ENV = "TRTLLM_FMHA_CACHE_SANITY_CHECK"
+# DecoderXQARunner::mayHavePerfGain enables MHA XQA generation when
+# num_kv_heads * batch_size * max(1, max_past_kv_length // 128) * 4 >= SM count.
+_XQA_KV_TOKENS_PER_BLOCK = 128
+_XQA_MIN_BLOCK_FACTOR = 4
 
 
 class _FmhaCacheKey(NamedTuple):
@@ -132,6 +137,7 @@ class _FmhaCacheKey(NamedTuple):
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
+    xqa_may_have_perf_gain: bool
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
     has_block_sparse_inputs: bool
@@ -343,6 +349,10 @@ class FmhaManager:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)
+        self._xqa_min_block_count: int | None = None
+        if any(isinstance(fmha, XqaFmha) for fmha in self.fmha_libs) and not attn.is_mla_enable:
+            sm_count = torch.cuda.get_device_properties().multi_processor_count
+            self._xqa_min_block_count = -(-sm_count // (_XQA_MIN_BLOCK_FACTOR * attn.num_kv_heads))
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
         # One line per library per layer is enough to tell which kernel
@@ -372,7 +382,8 @@ class FmhaManager:
         TRTLLM-Gen JIT warmup candidates. Each candidate and its predecessor
         are separate grid points so a support boundary at the candidate cannot
         alias with the interval below it. Generation Q lengths are uniform in
-        the executor, including padded speculative-decoding batches.
+        the executor, including padded speculative-decoding batches. MHA XQA
+        support also depends on its block-count heuristic, keyed as a boolean.
 
         The batch fields describe the complete source scheduler batch, even
         when ``q`` contains only one compacted phase. Ordinary attention
@@ -403,6 +414,7 @@ class FmhaManager:
             metadata.num_generations, _FMHA_CACHE_BATCH_SIZE_GRID
         )
         generation_seq_len_q = 0
+        xqa_may_have_perf_gain = False
         if attention_input_type != AttentionInputType.context_only and metadata.num_generations > 0:
             generation_num_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
@@ -411,12 +423,24 @@ class FmhaManager:
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
             )
+            if self._xqa_min_block_count is not None:
+                num_contexts = metadata.num_contexts
+                max_past_kv_len = int(
+                    metadata.kv_lens_runtime[
+                        num_contexts : num_contexts + metadata.num_generations
+                    ].max()
+                )
+                xqa_may_have_perf_gain = (
+                    metadata.num_generations * max(1, max_past_kv_len // _XQA_KV_TOKENS_PER_BLOCK)
+                    >= self._xqa_min_block_count
+                )
 
         block_sparse_inputs = forward_args.sparse_runtime_params.block_sparse_inputs
         return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
+            xqa_may_have_perf_gain=xqa_may_have_perf_gain,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
             has_block_sparse_inputs=block_sparse_inputs is not None,

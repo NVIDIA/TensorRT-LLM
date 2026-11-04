@@ -129,9 +129,9 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
     for phase in phases:
         if paged_context and num_contexts and phase != FmhaPhase.GENERATION:
             with pytest.raises(RuntimeError, match="128-token KV pages"):
-                fallback.is_supported(q, None, None, metadata, forward_args, phase=phase)
+                fallback._is_call_supported(q, None, None, metadata, forward_args, phase=phase)
         else:
-            assert fallback.is_supported(q, None, None, metadata, forward_args, phase=phase)
+            assert fallback._is_call_supported(q, None, None, metadata, forward_args, phase=phase)
 
 
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])

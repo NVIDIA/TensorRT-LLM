@@ -42,7 +42,7 @@ from tensorrt_llm.bindings.internal import thop
 # that predate the kernel-lookup path.
 _ABSENT = object()
 
-_FALLBACK_SM_VERSION_TARGET = "tensorrt_llm._torch.attention.backends.fmha.fallback.get_sm_version"
+_FALLBACK_SM_VERSION_TARGET = "tensorrt_llm._torch.attention.backends.fmha.native.get_sm_version"
 
 
 def _make_metadata(head_dim, features, kv_dtype=_ABSENT, tokens_per_block=32):
@@ -202,7 +202,7 @@ def test_dispatch_admits_generation_only_batch_in_blocked_cell():
     attn = mock.Mock()  # held: the library keeps only a weak reference
     fmha = FallbackFmha(attn)
     with mock.patch(_FALLBACK_SM_VERSION_TARGET, return_value=103) as sm_lookup:
-        assert fmha.is_supported(q, None, None, metadata, forward_args)
+        assert fmha._is_call_supported(q, None, None, metadata, forward_args)
     sm_lookup.assert_not_called()
 
 

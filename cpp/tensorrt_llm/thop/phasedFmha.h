@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
@@ -106,6 +107,15 @@ public:
     [[nodiscard]] static bool isAvailable(AttentionBase const& key);
     /// Whether a trtllm-gen context kernel exists for \p fixedParams.
     [[nodiscard]] static bool isContextSupported(kernels::MHARunnerFixedParams const& fixedParams);
+    /// Bytes of the multi-CTA KV scratch: the partial softmax statistics and partial outputs
+    /// of one 256-row block per SM.
+    [[nodiscard]] static std::size_t getMultiCtasKvScratchSize(std::size_t headDimV, int multiProcessorCount) noexcept;
+
+    /// Whether init built a runner for the phase of this configuration.
+    [[nodiscard]] bool hasKernels(bool isGen) const
+    {
+        return isGen ? mGenerationRunner != nullptr : mContextRunner != nullptr;
+    }
 
     [[nodiscard]] bool isSupported(FmhaParams const& p, bool isGen) const override;
     void initContext(AttentionVariant const& op) override;
@@ -116,8 +126,6 @@ public:
     void runGeneration(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream) override;
 
 private:
-    friend class MHA;
-
     template <typename T>
     void runGenerationImpl(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream);
     void launchContext(kernels::MHARunnerParams const& runnerParams);
@@ -143,6 +151,12 @@ public:
     /// Whether an fmha_v2 context kernel exists for \p fixedParams.
     [[nodiscard]] static bool isContextSupported(kernels::MHARunnerFixedParams fixedParams);
 
+    /// Whether init built a runner for the phase of this configuration.
+    [[nodiscard]] bool hasKernels(bool isGen) const
+    {
+        return isGen ? mGenerationRunner != nullptr : mContextRunner != nullptr;
+    }
+
     [[nodiscard]] bool isSupported(FmhaParams const& p, bool isGen) const override;
     void initContext(AttentionVariant const& op) override;
     void initGeneration(AttentionVariant const& op) override;
@@ -152,8 +166,6 @@ public:
     void runGeneration(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream) override;
 
 private:
-    friend class MHA;
-
     template <typename T>
     void runGenerationImpl(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream);
 
@@ -173,15 +185,21 @@ public:
 
     [[nodiscard]] static bool isAvailable(AttentionBase const& key);
 
+    /// Whether init built a runner for the phase of this configuration.
+    [[nodiscard]] bool hasKernels(bool isGen) const
+    {
+        return isGen && mRunner != nullptr;
+    }
+
     [[nodiscard]] bool isSupported(FmhaParams const& p, bool isGen) const override;
     void initGeneration(AttentionVariant const& op) override;
+    /// Generation bytes of the XQA kernels, sized from the batch bound (sum of beam widths),
+    /// num_gen_tokens and the block-table width.
     [[nodiscard]] std::size_t getWorkspaceSize(
         AttentionVariant const& op, FmhaParams const& p, bool isGen) const override;
     void runGeneration(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream) override;
 
 private:
-    friend class MHA;
-
     /// The XQA parameters of this call; false when T has no XQA kernels.
     template <typename T>
     bool fillParams(
@@ -207,6 +225,8 @@ public:
     }
 
     [[nodiscard]] static bool isAvailable(AttentionBase const& key);
+    /// The number of SM partitions the FlashMLA tile scheduler splits the work into.
+    [[nodiscard]] static int getNumSmParts(int s_q, int numHeads, int numKvHeads, int multiProcessorCount);
 
     [[nodiscard]] bool isSupported(FmhaParams const& p, bool isGen) const override;
     [[nodiscard]] std::size_t getWorkspaceSize(MLA const& op, FmhaParams const& p, bool isGen) const override;
@@ -260,6 +280,10 @@ public:
     void runContext(MHA const& op, FmhaParams const& p, cudaStream_t stream) override;
 
 private:
+    /// The op's fused context layout with the fused kernels' staging buffers replaced by the
+    /// unfused path's: Q/K/V, QK and QKV staging, the attention mask and the padding offsets.
+    [[nodiscard]] tensorrt_llm::common::op::AttentionContextWorkspaceLayout contextWorkspaceLayout(
+        MHA const& op, FmhaParams const& p) const;
     template <typename T>
     void runContextImpl(MHA const& op, FmhaParams const& p, cudaStream_t stream);
 

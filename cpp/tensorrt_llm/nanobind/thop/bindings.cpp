@@ -25,6 +25,7 @@
 #include <tensorrt_llm/common/tllmDataType.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
+#include <tensorrt_llm/thop/attentionVariant.h>
 #include <tensorrt_llm/thop/moe/communication/moeAlltoAllMeta.h>
 #include <tensorrt_llm/thop/outputTensor.h>
 #include <tensorrt_llm/thop/phasedFmha.h>
@@ -158,28 +159,249 @@ void prepare(torch_ext::FmhaParams& params, nb::handle source)
     params.num_requests = params.meta.is_cross ? params.batch_size : params.num_requests;
 }
 
-// Each phase entry builds the native parameters for this call on the stack, so every
-// tensor reference is released when the call returns, on success or on a throw.
-void runContext(nb::handle source)
+/// Calls \p fn with the native parameters of this call, with the GIL released and the query's
+/// device current. The parameters live on the stack, so every tensor reference is released
+/// when the call returns, on success or on a throw.
+template <typename Fn>
+auto callFmha(nb::handle source, Fn&& fn)
 {
     torch_ext::FmhaParams params{};
     prepare(params, source);
-    auto const key = torch_ext::AttentionBase::getCacheKey(params);
 
     nb::gil_scoped_release const gil;
     c10::cuda::CUDAGuard const device(params.getQueryInput().device());
-    torch_ext::AttentionBase::getCached(key)->runContext(params);
+    return fn(params);
 }
 
-void runGeneration(nb::handle source)
+/// The op for the call's key from the calling thread's cache, built outside CUDA graph
+/// capture on first use.
+template <typename Op>
+Op& getOp(torch_ext::FmhaParams const& p)
 {
-    torch_ext::FmhaParams params{};
-    prepare(params, source);
-    auto const key = torch_ext::AttentionBase::getCacheKey(params);
+    return dynamic_cast<Op&>(*torch_ext::AttentionBase::getCached(torch_ext::AttentionBase::getCacheKey(p)));
+}
 
-    nb::gil_scoped_release const gil;
-    c10::cuda::CUDAGuard const device(params.getQueryInput().device());
-    torch_ext::AttentionBase::getCached(key)->runGeneration(params);
+// One set of entry points per FMHA library. `*IsSupported` prepares the call without
+// launching and is false for a variant the library does not serve or a library the key
+// does not admit; `*Run*` launches the phase and throws in those cases.
+
+bool trtllmGenIsSupported(nb::handle source, bool isGen)
+{
+    return callFmha(source,
+        [isGen](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                return op.isFmhaSupported(op.trtllmGen(), p, isGen);
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            return op.isFmhaSupported(op.trtllmGen(), p, isGen);
+        });
+}
+
+void trtllmGenRunContext(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                op.runContext(op.trtllmGen(), p);
+            }
+            else
+            {
+                auto& op = getOp<torch_ext::MHA>(p);
+                op.runContext(op.trtllmGen(), p);
+            }
+        });
+}
+
+void trtllmGenRunGeneration(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                op.runGeneration(op.trtllmGen(), p);
+            }
+            else
+            {
+                auto& op = getOp<torch_ext::MHA>(p);
+                op.runGeneration(op.trtllmGen(), p);
+            }
+        });
+}
+
+bool fmhaV2IsSupported(nb::handle source, bool isGen)
+{
+    return callFmha(source,
+        [isGen](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                return op.isFmhaSupported(op.fmhaV2(), p, isGen);
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            return op.isFmhaSupported(op.fmhaV2(), p, isGen);
+        });
+}
+
+void fmhaV2RunContext(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                op.runContext(op.fmhaV2(), p);
+            }
+            else
+            {
+                auto& op = getOp<torch_ext::MHA>(p);
+                op.runContext(op.fmhaV2(), p);
+            }
+        });
+}
+
+void fmhaV2RunGeneration(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                op.runGeneration(op.fmhaV2(), p);
+            }
+            else
+            {
+                auto& op = getOp<torch_ext::MHA>(p);
+                op.runGeneration(op.fmhaV2(), p);
+            }
+        });
+}
+
+bool xqaIsSupported(nb::handle source, bool isGen)
+{
+    return callFmha(source,
+        [isGen](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                return op.isFmhaSupported(op.xqa(), p, isGen);
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            return op.isFmhaSupported(op.xqa(), p, isGen);
+        });
+}
+
+void xqaRunGeneration(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                op.runGeneration(op.xqa(), p);
+            }
+            else
+            {
+                auto& op = getOp<torch_ext::MHA>(p);
+                op.runGeneration(op.xqa(), p);
+            }
+        });
+}
+
+bool flashMlaIsSupported(nb::handle source, bool isGen)
+{
+    return callFmha(source,
+        [isGen](torch_ext::FmhaParams& p)
+        {
+            if (!p.attn.is_mla_enable)
+            {
+                return false;
+            }
+            auto& op = getOp<torch_ext::MLA>(p);
+            return op.isFmhaSupported(op.flashMla(), p, isGen);
+        });
+}
+
+void flashMlaRunGeneration(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (!p.attn.is_mla_enable)
+            {
+                TLLM_THROW("The FlashMLA FMHA library does not serve this attention variant.");
+            }
+            auto& op = getOp<torch_ext::MLA>(p);
+            op.runGeneration(op.flashMla(), p);
+        });
+}
+
+bool mmhaIsSupported(nb::handle source, bool isGen)
+{
+    return callFmha(source,
+        [isGen](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                return false;
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            return op.isFmhaSupported(op.mmha(), p, isGen);
+        });
+}
+
+void mmhaRunGeneration(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                TLLM_THROW("The MMHA FMHA library does not serve this attention variant.");
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            op.runGeneration(op.mmha(), p);
+        });
+}
+
+bool unfusedIsSupported(nb::handle source, bool isGen)
+{
+    return callFmha(source,
+        [isGen](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                return false;
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            return op.isFmhaSupported(op.unfused(), p, isGen);
+        });
+}
+
+void unfusedRunContext(nb::handle source)
+{
+    callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                TLLM_THROW("The unfused FMHA library does not serve this attention variant.");
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            op.runContext(op.unfused(), p);
+        });
 }
 
 } // namespace
@@ -198,11 +420,36 @@ void initBindings(nb::module_& m)
         m.attr(kv.first) = kv.second;
     }
 
-    m.def("run_context", &runContext, nb::arg("params"),
-        "Phased attention context pass. Reads the Python FmhaParams into native parameters, resolves the op "
-        "for the layer's configuration from a per-thread cache (building it outside CUDA graph capture on "
-        "first use), and launches.");
-    m.def("run_generation", &runGeneration, nb::arg("params"), "Phased attention generation pass, MLA or not.");
+    // One set of entry points per FMHA library. Each reads the Python FmhaParams into native
+    // parameters and resolves the op for the layer's configuration from a per-thread cache,
+    // building it outside CUDA graph capture on first use. `*_is_supported` prepares the call
+    // without launching; `*_run_*` launches the phase on that library.
+    m.def("trtllm_gen_is_supported", &trtllmGenIsSupported, nb::arg("params"), nb::arg("is_gen"),
+        "Whether the trtllm-gen kernels serve this phase call.");
+    m.def(
+        "trtllm_gen_run_context", &trtllmGenRunContext, nb::arg("params"), "Context phase on the trtllm-gen kernels.");
+    m.def("trtllm_gen_run_generation", &trtllmGenRunGeneration, nb::arg("params"),
+        "Generation phase on the trtllm-gen kernels.");
+    m.def("fmha_v2_is_supported", &fmhaV2IsSupported, nb::arg("params"), nb::arg("is_gen"),
+        "Whether the fmha_v2 kernels serve this phase call.");
+    m.def("fmha_v2_run_context", &fmhaV2RunContext, nb::arg("params"), "Context phase on the fmha_v2 kernels.");
+    m.def("fmha_v2_run_generation", &fmhaV2RunGeneration, nb::arg("params"),
+        "MLA generation phase on the fmha_v2 kernels.");
+    m.def("xqa_is_supported", &xqaIsSupported, nb::arg("params"), nb::arg("is_gen"),
+        "Whether the XQA kernels serve this phase call.");
+    m.def("xqa_run_generation", &xqaRunGeneration, nb::arg("params"), "Generation phase on the XQA kernels.");
+    m.def("flash_mla_is_supported", &flashMlaIsSupported, nb::arg("params"), nb::arg("is_gen"),
+        "Whether the FlashMLA kernels serve this phase call.");
+    m.def("flash_mla_run_generation", &flashMlaRunGeneration, nb::arg("params"),
+        "MLA generation phase on the FlashMLA kernels.");
+    m.def("mmha_is_supported", &mmhaIsSupported, nb::arg("params"), nb::arg("is_gen"),
+        "Whether masked multi-head attention serves this phase call.");
+    m.def("mmha_run_generation", &mmhaRunGeneration, nb::arg("params"),
+        "Generation phase on masked multi-head attention.");
+    m.def("unfused_is_supported", &unfusedIsSupported, nb::arg("params"), nb::arg("is_gen"),
+        "Whether unfused attention serves this phase call.");
+    m.def("unfused_run_context", &unfusedRunContext, nb::arg("params"),
+        "Context phase on unfused attention over cuBLAS.");
 
     m.def(
         "get_helix_workspace_size_per_rank",

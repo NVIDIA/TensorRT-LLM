@@ -560,10 +560,11 @@ class SparseMlaFeature;
 ///   of the key.
 ///
 /// For every phase call, the binding builds a key from the call's parameters, looks up
-/// the op for it, and runs the phase:
+/// the op for it, and runs the phase on the library the caller chose:
 ///
 ///     auto const key = AttentionBase::getCacheKey(params);
-///     AttentionBase::getCached(key)->runContext(params);
+///     auto& op = dynamic_cast<MHA&>(*AttentionBase::getCached(key));
+///     op.runContext(op.trtllmGen(), params);
 ///
 /// On a cache miss, `getCached()` constructs the concrete op (`MHA` or `MLA`, both built on
 /// `TrtllmAttention`) from the key. New objects are created only by `getCacheKey()` and by
@@ -591,11 +592,6 @@ public:
     AttentionBase& operator=(AttentionBase&&) = delete;
 
     [[nodiscard]] bool operator==(AttentionBase const& other) const;
-
-    /// Runs the context or generation phase of one call. Derived ops override both; on a
-    /// key built by `getCacheKey()` they throw.
-    virtual void runContext(FmhaParams& p);
-    virtual void runGeneration(FmhaParams& p);
 
     /// Builds the cache key of one call from its parameters. Reads tensor metadata (data
     /// type, device, presence and sizes), so call it while the tensors are still attached.
