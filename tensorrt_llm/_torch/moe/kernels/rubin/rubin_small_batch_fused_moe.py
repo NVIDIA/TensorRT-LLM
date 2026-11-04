@@ -1529,7 +1529,8 @@ class RubinSmallBatchFusedMoeKernel:
                 for off in cutlass.range(lane * 16, out_bytes, 32 * 16, unroll=1):
                     _stg_v4_zero(out_base + Int64(off))
             if cutlass.const_expr(self.output_push_world > 0):
-                # nor pushes it: the consumer polls every rank's slot of every token
+                # No FC2 task pushes the output either, so every CTA pushes zero rows: the
+                # consumer polls every rank's slot of every token.
                 self._push_zero_rows(push, orig_m, Int32(bid) * 32 + lane, nctas * 32)
 
         slice_bytes = (out_bytes + _ZERO_SLICES * 16 - 1) // (_ZERO_SLICES * 16) * 16
