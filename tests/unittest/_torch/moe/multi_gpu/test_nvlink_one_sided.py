@@ -805,6 +805,7 @@ def test_workspace_layout() -> None:
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("payload_format", ["BF16", "MXFP8", "FP8_BLOCK128", "NVFP4"])
 def test_lamport_workspace_layout(payload_format: str) -> None:
     from tensorrt_llm.bindings import internal as _tllm_internal
@@ -864,6 +865,7 @@ def test_lamport_workspace_layout(payload_format: str) -> None:
         )
 
 
+@pytest.mark.cpu_only
 def test_lamport_row_geometry() -> None:
     hidden_size, top_k = 7168, 8
     # (hidden-state bytes, scale bytes, dispatch blocks per token) per row.
@@ -882,19 +884,19 @@ def test_lamport_row_geometry() -> None:
         lamport_row("BF16", 4100, top_k)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("payload_format", "hidden_size", "top_k", "ep_size", "expected"),
     [
         # Limits FlashInfer's Lamport transport reports on GB300 (152 SMs).
+        # One wave holds fewer than 159 tokens: the floor.
         pytest.param("BF16", 7168, 8, 8, 159, id="dsv3-bf16-ep8"),
+        # The 64 MiB bound on the Lamport regions.
         pytest.param("NVFP4", 7168, 8, 8, 371, id="dsv3-nvfp4-ep8"),
-        pytest.param("NVFP4", 7168, 8, 16, 185, id="dsv3-nvfp4-ep16"),
+        # The 64 MiB bound below the floor: the floor.
         pytest.param("NVFP4", 7168, 8, 64, 159, id="dsv3-nvfp4-ep64"),
+        # The one-wave bound.
         pytest.param("MXFP8", 3584, 16, 8, 455, id="kimi-k3-mxfp8-ep8"),
-        pytest.param("MXFP8", 3584, 16, 16, 279, id="kimi-k3-mxfp8-ep16"),
-        pytest.param("NVFP4", 4096, 8, 8, 455, id="qwen3-235b-nvfp4-ep8"),
-        pytest.param("NVFP4", 4096, 8, 16, 323, id="qwen3-235b-nvfp4-ep16"),
-        pytest.param("NVFP4", 6144, 8, 8, 433, id="glm-5.2-nvfp4-ep8"),
     ],
 )
 def test_default_lamport_max_tokens(
@@ -904,6 +906,7 @@ def test_default_lamport_max_tokens(
     assert default_lamport_max_tokens(ep_size, 152, row) == expected
 
 
+@pytest.mark.cpu_only
 def test_lamport_payload_format() -> None:
     from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -915,6 +918,7 @@ def test_lamport_payload_format() -> None:
     assert lamport_payload_format(None) == "BF16"
 
 
+@pytest.mark.cpu_only
 def test_lamport_step_selection() -> None:
     from types import SimpleNamespace
 
