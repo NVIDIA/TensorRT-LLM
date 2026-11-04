@@ -891,13 +891,17 @@ class DecoderCudaGraphs:
             return _kv_regime_length_passes(max_seq_len_list, kv_regime_resolver(bs, draft_len))
 
         if kv_regime_resolver is not None:
-            shapes = [
-                entry[:2] for entry in graphs_to_capture if entry[0] <= self._config.max_batch_size
-            ]
-            families = sum(len(_length_passes(bs, draft_len)) for bs, draft_len in shapes)
+            shapes = sorted(
+                {
+                    entry[:2]
+                    for entry in graphs_to_capture
+                    if entry[0] <= self._config.max_batch_size
+                }
+            )
+            families = sum(len(kv_regime_resolver(bs, draft_len)) for bs, draft_len in shapes)
             logger.info(
-                f"FP4 MLA decode graphs keyed by KV regime: {families} (shape, regime) families "
-                f"over {len(shapes)} generation graph shapes."
+                f"FP4 MLA decode graphs keyed by KV regime: {families} (shape, regime) families over "
+                f"{len(shapes)} generation graph shapes, {len(max_seq_len_list)} warm-up length(s) each."
             )
 
         def _run_capture_pass(

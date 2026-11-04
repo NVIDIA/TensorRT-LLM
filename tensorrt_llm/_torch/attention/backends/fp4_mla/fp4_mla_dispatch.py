@@ -20,8 +20,10 @@ B128/q4, KV 4K                          101         102          102            
 ======================================  ==========  ===========  ===================  ===================
 
 Graph-replay medians throughout (the 2x kernel's first replays at 8K are faster, 158 us cold, which is the only
-sense in which 2x "wins" there); on the main tree's slower 2x packed kernel (#20576) the 8K row reads 190 / 191 /
-192 and 4K 106 / 107 / 107.
+sense in which 2x "wins" there); on the main tree's slower 2x packed kernel (#20576) the 8K row read 190 / 191 /
+192 and 4K 106 / 107 / 107 on 2026-11-02 (hecate0358) and 182 / 178 / 178 and 110 / 116 / 116 on 2026-11-03
+(hecate0341, the matrix below): B128 at 8K is a tie within the node-to-node spread either way, which is why the
+many-wave floor sits there.
 
 Below the batch's KV floor (``four_x_floor_kv``) the 2x packed kernel keeps the call: the 4x kernel pays ~13 us of
 fixed cost per 256-row item (task identity, barrier init, exposed Q load, pipeline fill and drain) and every wave
@@ -153,7 +155,7 @@ def four_x_floor_kv(num_requests: int, rows_per_seq: int, sm_count: int) -> int:
 
 
 def kv_regime_grid() -> tuple[int, ...]:
-    """Extra regime ceilings between a shape's floor and the capacity (``TRTLLM_FP4_MLA_KV_REGIME_GRID``; default none)."""
+    """Extra regime ceilings between floor and capacity: ``TRTLLM_FP4_MLA_KV_REGIME_GRID`` (default none)."""
     value = os.getenv(KV_REGIME_GRID_ENV)
     if value is None or value.strip() == "":
         return DEFAULT_KV_REGIME_GRID
@@ -180,8 +182,11 @@ def kv_regimes_for_batch(
     the 4x paths can never take (a forced ``2x`` / ``4x`` path, a shape outside the static envelope on the capacity,
     among them every ``query_len`` whose rows are no multiple of 256 and every batch over the split-mode pair bound)
     or always may (floor 0) has the single regime of the capacity; otherwise the 2x regime ends right under the
-    shape's KV floor, ``kv_regime_grid`` adds points between the floor and the capacity (the two-stream plan is taken
-    on the regime ceiling), and the capacity closes the list.  ``envelope_reason`` as in ``choose_decode_strategy``.
+    shape's KV floor, the 4x-eligible span above it is split wherever the two-stream plan changes (the plan is taken
+    on the regime ceiling, and ``plan_two_stream`` drops the split at long KV where its gain fades below the gate:
+    B48/q4 keeps r2 = 2 up to ~50K and runs plain 4x beyond, so a 160K page table gets a two-stream regime for the
+    short steps), ``kv_regime_grid`` adds its points, and the capacity closes the list.  ``envelope_reason`` as in
+    ``choose_decode_strategy``.
     """
     capacity = int(kv_capacity)
     if _env_path() in (PATH_2X, PATH_4X):
@@ -198,9 +203,66 @@ def kv_regimes_for_batch(
     floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
     if floor <= 1 or capacity < floor:
         return (capacity,)
-    ceilings = [floor - 1]
-    ceilings += [ceiling for ceiling in kv_regime_grid() if floor < ceiling < capacity]
-    return tuple(ceilings) + (capacity,)
+    ceilings = {floor - 1}
+    ceilings.update(ceiling for ceiling in kv_regime_grid() if floor < ceiling < capacity)
+    ceilings.update(
+        _plan_flip_ceilings(
+            num_requests=num_requests,
+            rows_per_seq=rows_per_seq,
+            floor=floor,
+            capacity=capacity,
+            sm_count=sm_count,
+        )
+    )
+    return tuple(sorted(ceilings)) + (capacity,)
+
+
+# Candidate KV lengths (tokens) the two-stream plan is probed at between a shape's floor and its capacity: a power
+# of two and its midpoint per octave, enough to place a plan flip within ~30 % of where the planner moves.
+_PLAN_PROBE_KVS = tuple(
+    sorted({1 << e for e in range(10, 21)} | {3 << (e - 1) for e in range(10, 21)})
+)
+# A plan flip earns a regime boundary only when the plan it protects is worth it: the modelled two-stream gain of
+# the lower regime's plan at one of its probes must reach this much (the planner's own gate is 3 %; B48/q4 is
+# ~20 % at 4K, B64/q4's r2 = 1 and B96/q4's r2 = 4 are 4-6 %, which the matrix measured as a wash).
+PLAN_FLIP_MIN_GAIN = 0.08
+
+
+def _plan_flip_ceilings(
+    *, num_requests: int, rows_per_seq: int, floor: int, capacity: int, sm_count: int
+) -> list[int]:
+    """Regime ceilings that keep one two-stream plan per regime: the last probe KV before ``plan_two_stream`` changes
+    its ``r2`` on the way from ``floor`` up to ``capacity``, when the plan being left behind is worth
+    ``PLAN_FLIP_MIN_GAIN`` (probes start at the floor and stay inside (floor, capacity); the capacity's own plan is
+    the one of the last regime)."""
+    probes = [floor] + [kv for kv in _PLAN_PROBE_KVS if floor < kv < capacity]
+
+    def plan_at(kv: int) -> TwoStreamPlan:
+        return plan_two_stream(
+            num_requests=num_requests,
+            rows_per_request=rows_per_seq,
+            max_kv_len=kv,
+            sm_count=sm_count,
+        )
+
+    def gain(plan: TwoStreamPlan) -> float:
+        if plan.r2 == 0 or plan.model_plain_us <= 0:
+            return 0.0
+        return 1.0 - plan.model_us / plan.model_plain_us
+
+    flips = []
+    previous = plan_at(probes[0])
+    regime_gain = gain(previous)
+    for kv, next_kv in zip(probes, probes[1:] + [capacity]):
+        current = plan_at(next_kv)
+        if current.r2 != previous.r2:
+            if regime_gain >= PLAN_FLIP_MIN_GAIN and kv > floor:
+                flips.append(kv)
+            regime_gain = gain(current)
+        else:
+            regime_gain = max(regime_gain, gain(current))
+        previous = current
+    return flips
 
 
 def kv_regime_for_step(max_kv_len: int, ceilings: Sequence[int]) -> int:
@@ -254,9 +316,13 @@ def choose_decode_strategy(
         )
     floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
     if forced == "auto" and kv_decision < floor:
+        if min_kv_4x() is not None:
+            source = f"{MIN_KV_4X_ENV} flat floor"
+        else:
+            waves = four_x_waves(num_requests, rows_per_seq, sm_count)
+            source = f"floor of {waves:.1f} 4x waves; {MIN_KV_4X_ENV} overrides"
         return two_x(
-            f"KV {kv_decision} < {floor} (floor of {four_x_waves(num_requests, rows_per_seq, sm_count):.1f} 4x "
-            f"waves): the 2x packed kernel has the lower fixed cost ({MIN_KV_4X_ENV} overrides)"
+            f"KV {kv_decision} < {floor} ({source}): the 2x packed kernel has the lower fixed cost"
         )
     reason = envelope_reason(
         num_heads=num_heads,

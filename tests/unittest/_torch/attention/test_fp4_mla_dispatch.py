@@ -162,7 +162,12 @@ def test_min_kv_knob(monkeypatch):
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "4096")
     assert dp.min_kv_4x() == 4096 and dp.four_x_floor_kv(16, ROWS_Q4, SM) == 4096
     assert _choose(128, 4, 30080, live=4096).path != dp.PATH_2X
-    assert _choose(16, 4, 30080, live=2048).path == dp.PATH_2X
+    s = _choose(16, 4, 30080, live=2048)
+    assert s.path == dp.PATH_2X and "flat floor" in s.reason and "waves" not in s.reason
+    monkeypatch.delenv(dp.MIN_KV_4X_ENV)
+    s = _choose(128, 4, 30080, live=2048)
+    assert s.path == dp.PATH_2X and "5.6 4x waves" in s.reason
+    monkeypatch.setenv(dp.MIN_KV_4X_ENV, "4096")
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "40000")
     assert _choose(128, 4, 30080).path == dp.PATH_2X
     assert _choose(16, 4, 30080).path == dp.PATH_2X
@@ -211,6 +216,27 @@ def test_kv_regimes_for_batch(monkeypatch):
     # the capacity at the floor keeps both regimes; under the floor the capacity alone
     assert _regimes(128, 4, 8192) == (8191, 8192)
     assert _regimes(32, 4, 2047) == (2047,)
+    # the 4x-eligible span splits where the two-stream plan changes: B48/q4 keeps r2 = 2 into the tens of K and
+    # runs plain 4x at 160K, so a 160K page table gets a two-stream regime for the short steps
+    regimes_160k = _regimes(48, 4, 163840)
+    assert regimes_160k[0] == 4095 and regimes_160k[-1] == 163840 and len(regimes_160k) == 3, (
+        regimes_160k
+    )
+    assert 16384 <= regimes_160k[1] < 163840
+    assert _choose(48, 4, 163840, live=regimes_160k[1]).path == dp.PATH_TWO_STREAM
+    assert _choose(48, 4, 163840, live=163840).path == dp.PATH_4X
+    # every interior boundary separates two different plans, so each regime's graph bakes the plan of its own steps
+    for num_requests, query_len in ((48, 4), (96, 4), (128, 4), (255, 4), (128, 2)):
+        regimes = _regimes(num_requests, query_len, 163840)
+        plans = [
+            _choose(num_requests, query_len, 163840, live=ceiling).r2 for ceiling in regimes[1:]
+        ]
+        assert all(a != b for a, b in zip(plans, plans[1:])), (
+            num_requests,
+            query_len,
+            regimes,
+            plans,
+        )
     # the grid adds points between the floor and the capacity; 0 adds none
     monkeypatch.setenv(dp.KV_REGIME_GRID_ENV, "4096,12288,16384,40000")
     assert _regimes(128, 4, 30080) == (8191, 12288, 16384, 30080)
