@@ -1,0 +1,406 @@
+{
+ "schema": "trtllm-serve-model-harness/native-goldens@1",
+ "sources": {
+  "kimi_k3": "Kimi-K3-NVFP4",
+  "glm": "GLM-5.3-Flash",
+  "deepseek_v41": "DeepSeek-V4.1-Flash"
+ },
+ "goldens": [
+  {
+   "model": "kimi-k3",
+   "case": "text_only",
+   "text": "Plan the answer.<|close|>think<|sep|><|open|>response<|sep|>The answer is 4.<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>",
+   "expected": {
+    "reasoning": "Plan the answer.",
+    "content": "The answer is 4.",
+    "calls": []
+   }
+  },
+  {
+   "model": "kimi-k3",
+   "case": "one_call",
+   "text": "Read the file first.<|close|>think<|sep|><|open|>response<|sep|>Reading it.<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"read\" index=\"1\"<|sep|><|open|>argument key=\"path\" type=\"string\"<|sep|>/tmp/a.txt<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>",
+   "expected": {
+    "reasoning": "Read the file first.",
+    "content": "Reading it.",
+    "calls": [
+     {
+      "name": "read",
+      "args": [
+       [
+        "path",
+        "/tmp/a.txt",
+        "string"
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "model": "kimi-k3",
+   "case": "typed_args",
+   "text": "Two calls.<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"exec\" index=\"1\"<|sep|><|open|>argument key=\"cmd\" type=\"string\"<|sep|>echo \"a & b\" <c>\nline 2 é<|close|>argument<|sep|><|open|>argument key=\"timeout\" type=\"number\"<|sep|>30<|close|>argument<|sep|><|open|>argument key=\"dry\" type=\"boolean\"<|sep|>false<|close|>argument<|sep|><|open|>argument key=\"env\" type=\"object\"<|sep|>{\"K\": \"v\"}<|close|>argument<|sep|><|open|>argument key=\"argv\" type=\"array\"<|sep|>[\"x\", 1]<|close|>argument<|sep|><|open|>argument key=\"none\" type=\"null\"<|sep|>null<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"wait\" index=\"2\"<|sep|><|open|>argument key=\"ms\" type=\"number\"<|sep|>1.5<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>",
+   "expected": {
+    "reasoning": "Two calls.",
+    "content": "",
+    "calls": [
+     {
+      "name": "exec",
+      "args": [
+       [
+        "cmd",
+        "echo \"a & b\" <c>\nline 2 é",
+        "string"
+       ],
+       [
+        "timeout",
+        "30",
+        "number"
+       ],
+       [
+        "dry",
+        "false",
+        "boolean"
+       ],
+       [
+        "env",
+        "{\"K\": \"v\"}",
+        "object"
+       ],
+       [
+        "argv",
+        "[\"x\", 1]",
+        "array"
+       ],
+       [
+        "none",
+        "null",
+        "null"
+       ]
+      ]
+     },
+     {
+      "name": "wait",
+      "args": [
+       [
+        "ms",
+        "1.5",
+        "number"
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "model": "kimi-k3",
+   "case": "empty_reasoning",
+   "text": "<|close|>think<|sep|><|open|>response<|sep|>Done.<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>",
+   "expected": {
+    "reasoning": "",
+    "content": "Done.",
+    "calls": []
+   }
+  },
+  {
+   "model": "kimi-k3",
+   "case": "no_args",
+   "text": "Just list.<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"ls\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>",
+   "expected": {
+    "reasoning": "Just list.",
+    "content": "",
+    "calls": [
+     {
+      "name": "ls",
+      "args": []
+     }
+    ]
+   }
+  },
+  {
+   "model": "glm-5",
+   "case": "text_only",
+   "text": "Plan the answer.</think>The answer is 4.",
+   "expected": {
+    "reasoning": "Plan the answer.",
+    "content": "The answer is 4.",
+    "calls": []
+   }
+  },
+  {
+   "model": "glm-5",
+   "case": "one_call",
+   "text": "Read the file first.</think>Reading it.<tool_call>read<arg_key>path</arg_key><arg_value>/tmp/a.txt</arg_value></tool_call>",
+   "expected": {
+    "reasoning": "Read the file first.",
+    "content": "Reading it.",
+    "calls": [
+     {
+      "name": "read",
+      "args": [
+       [
+        "path",
+        "/tmp/a.txt",
+        null
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "model": "glm-5",
+   "case": "typed_args",
+   "text": "Two calls.</think><tool_call>exec<arg_key>cmd</arg_key><arg_value>echo \"a & b\" <c>\nline 2 é</arg_value><arg_key>timeout</arg_key><arg_value>30</arg_value><arg_key>dry</arg_key><arg_value>false</arg_value><arg_key>env</arg_key><arg_value>{\"K\": \"v\"}</arg_value><arg_key>argv</arg_key><arg_value>[\"x\", 1]</arg_value><arg_key>none</arg_key><arg_value>null</arg_value></tool_call><tool_call>wait<arg_key>ms</arg_key><arg_value>1.5</arg_value></tool_call>",
+   "expected": {
+    "reasoning": "Two calls.",
+    "content": "",
+    "calls": [
+     {
+      "name": "exec",
+      "args": [
+       [
+        "cmd",
+        "echo \"a & b\" <c>\nline 2 é",
+        null
+       ],
+       [
+        "timeout",
+        "30",
+        null
+       ],
+       [
+        "dry",
+        "false",
+        null
+       ],
+       [
+        "env",
+        "{\"K\": \"v\"}",
+        null
+       ],
+       [
+        "argv",
+        "[\"x\", 1]",
+        null
+       ],
+       [
+        "none",
+        "null",
+        null
+       ]
+      ]
+     },
+     {
+      "name": "wait",
+      "args": [
+       [
+        "ms",
+        "1.5",
+        null
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "model": "glm-5",
+   "case": "empty_reasoning",
+   "text": "</think>Done.",
+   "expected": {
+    "reasoning": "",
+    "content": "Done.",
+    "calls": []
+   }
+  },
+  {
+   "model": "glm-5",
+   "case": "no_args",
+   "text": "Just list.</think><tool_call>ls</tool_call>",
+   "expected": {
+    "reasoning": "Just list.",
+    "content": "",
+    "calls": [
+     {
+      "name": "ls",
+      "args": []
+     }
+    ]
+   }
+  },
+  {
+   "model": "deepseek-v41",
+   "case": "text_only",
+   "text": "Plan the answer.</think>The answer is 4.<｜end▁of▁sentence｜>",
+   "expected": {
+    "reasoning": "Plan the answer.",
+    "content": "The answer is 4.",
+    "calls": []
+   },
+   "vendor": {
+    "reasoning": "Plan the answer.",
+    "content": "The answer is 4.",
+    "calls": []
+   }
+  },
+  {
+   "model": "deepseek-v41",
+   "case": "one_call",
+   "text": "Read the file first.</think>Reading it.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">/tmp/a.txt</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "expected": {
+    "reasoning": "Read the file first.",
+    "content": "Reading it.",
+    "calls": [
+     {
+      "name": "read",
+      "args": [
+       [
+        "path",
+        "/tmp/a.txt",
+        "string"
+       ]
+      ]
+     }
+    ]
+   },
+   "vendor": {
+    "reasoning": "Read the file first.",
+    "content": "Reading it.",
+    "calls": [
+     {
+      "name": "read",
+      "arguments": {
+       "path": "/tmp/a.txt"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "model": "deepseek-v41",
+   "case": "typed_args",
+   "text": "Two calls.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"exec\">\n<｜DSML｜ parameter name=\"cmd\" string=\"true\">echo \"a & b\" <c>\nline 2 é</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"timeout\" string=\"false\">30</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"dry\" string=\"false\">false</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"env\" string=\"false\">{\"K\": \"v\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"argv\" string=\"false\">[\"x\", 1]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"none\" string=\"false\">null</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"wait\">\n<｜DSML｜ parameter name=\"ms\" string=\"false\">1.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "expected": {
+    "reasoning": "Two calls.",
+    "content": "",
+    "calls": [
+     {
+      "name": "exec",
+      "args": [
+       [
+        "cmd",
+        "echo \"a & b\" <c>\nline 2 é",
+        "string"
+       ],
+       [
+        "timeout",
+        "30",
+        "json"
+       ],
+       [
+        "dry",
+        "false",
+        "json"
+       ],
+       [
+        "env",
+        "{\"K\": \"v\"}",
+        "json"
+       ],
+       [
+        "argv",
+        "[\"x\", 1]",
+        "json"
+       ],
+       [
+        "none",
+        "null",
+        "json"
+       ]
+      ]
+     },
+     {
+      "name": "wait",
+      "args": [
+       [
+        "ms",
+        "1.5",
+        "json"
+       ]
+      ]
+     }
+    ]
+   },
+   "vendor": {
+    "reasoning": "Two calls.",
+    "content": "",
+    "calls": [
+     {
+      "name": "exec",
+      "arguments": {
+       "cmd": "echo \"a & b\" <c>\nline 2 é",
+       "timeout": 30,
+       "dry": false,
+       "env": {
+        "K": "v"
+       },
+       "argv": [
+        "x",
+        1
+       ],
+       "none": null
+      }
+     },
+     {
+      "name": "wait",
+      "arguments": {
+       "ms": 1.5
+      }
+     }
+    ]
+   }
+  },
+  {
+   "model": "deepseek-v41",
+   "case": "empty_reasoning",
+   "text": "</think>Done.<｜end▁of▁sentence｜>",
+   "expected": {
+    "reasoning": "",
+    "content": "Done.",
+    "calls": []
+   },
+   "vendor": {
+    "reasoning": "",
+    "content": "Done.",
+    "calls": []
+   }
+  },
+  {
+   "model": "deepseek-v41",
+   "case": "no_args",
+   "text": "Just list.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ls\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "expected": {
+    "reasoning": "Just list.",
+    "content": "",
+    "calls": [
+     {
+      "name": "ls",
+      "args": []
+     }
+    ]
+   },
+   "vendor": {
+    "reasoning": "Just list.",
+    "content": "",
+    "calls": [
+     {
+      "name": "ls",
+      "arguments": {}
+     }
+    ]
+   }
+  }
+ ]
+}

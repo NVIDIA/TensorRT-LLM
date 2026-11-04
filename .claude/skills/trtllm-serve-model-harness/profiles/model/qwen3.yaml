@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model profile: Qwen3 (dense and MoE). Not a matrix model: a small, fast stand-in that serves the
+# protocol differential (scripts/validate/protocol_diff.py) on one GPU. Derived from the
+# checkpoint's chat_template (Hermes-style tool calls, <think> reasoning).
+schema: trtllm-serve-model-harness/model-profile@1
+id: qwen3
+status: draft
+checkpoints:
+  - {name: Qwen3-14B, model_type: qwen3, size_gb: 28}
+upstream: "main maps model_type qwen3 to the qwen3 tool parser and the qwen3 reasoning parser"
+
+renderer:
+  kind: chat_template
+  reference: tokenizer_config.json chat_template
+  notes:
+    - "Tool calls render as <tool_call>\\n{\"name\": ..., \"arguments\": {...}}\\n</tool_call>."
+    - "enable_thinking defaults to true; false prefills an empty <think></think>."
+
+parsers:
+  tool: qwen3
+  reasoning: qwen3
+
+format_card:
+  call_open: "<tool_call>"
+  call_close: "</tool_call>"
+  block_open: null
+  block_close: null
+  name_end: null                            # JSON body: name and arguments are JSON fields
+  value_open: null
+  value_close: null
+  qualified_prefix: "functions."
+
+native: TODO                                # main writes no raw output; add a hermes_json reader with it
+
+markers:
+  - "<tool_call>"
+  - "</tool_call>"
+  - "<think>"
+  - "</think>"
+  - "<|im_start|>"
+  - "<|im_end|>"
+  - "<|endoftext|>"
+
+degenerate: []
+
+reasoning:
+  channel: think tags
+
+context:
+  model_max: 40960
