@@ -40,7 +40,7 @@ from unittest.mock import Mock
 import aiohttp
 import pytest
 from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import tensorrt_llm.serve.openai_server as openai_server_module
 from tensorrt_llm.executor.executor import GenerationExecutor
@@ -139,8 +139,8 @@ def _upstream_error(worker_body: str, status: int = 400) -> aiohttp.ClientRespon
     )
 
 
-def _disagg_server() -> OpenAIDisaggServer:
-    server = object.__new__(OpenAIDisaggServer)
+def _disagg_server(cls: type = OpenAIDisaggServer) -> OpenAIDisaggServer:
+    server = object.__new__(cls)
     server._perf_metrics_collector = SimpleNamespace(
         http_exceptions=SimpleNamespace(inc=Mock()),
         internal_errors=SimpleNamespace(inc=Mock()),
@@ -329,12 +329,29 @@ def _context_worker_rejection() -> aiohttp.ClientResponseError:
     return _upstream_error(OpenAIServer.create_error_response(_MSG).body.decode())
 
 
+async def _rejected_by_the_context_worker(req, hooks):
+    raise _context_worker_rejection()
+
+
+_RAW_ROUTE_REQUEST = SimpleNamespace(state=SimpleNamespace(server_arrival_time=0.0), headers={})
+
+
+def _disagg_route(server: OpenAIDisaggServer, entry_point, request_type):
+    """The route ``register_routes`` registers over ``entry_point``."""
+    server._perf_metrics_collector = Mock()
+    server._allow_request_chat_template = False
+    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
+    server._collect_perf_metrics = False
+    return server._wrap_entry_point(entry_point, request_type)
+
+
 @pytest.mark.asyncio
 async def test_disagg_route_fails_a_streamed_responses_request_in_stream():
     """The context phase never streams, so its worker answers with the 400."""
+    route = _disagg_route(_disagg_server(), _rejected_by_the_context_worker, ResponsesRequest)
     request = ResponsesRequest(model="client-model", input="hi", stream=True)
 
-    response = _disagg_server()._handle_exception(_context_worker_rejection(), request)
+    response = await route(request, _RAW_ROUTE_REQUEST)
 
     assert isinstance(response, StreamingResponse)
     events = await _events(response)
@@ -350,28 +367,107 @@ async def test_disagg_route_fails_a_streamed_responses_request_in_stream():
     ],
     ids=["responses_non_streamed", "chat_streamed"],
 )
-def test_disagg_route_keeps_the_400_for_other_requests(request_):
-    response = _disagg_server()._handle_exception(_context_worker_rejection(), request_)
+@pytest.mark.asyncio
+async def test_disagg_route_keeps_the_400_for_other_requests(request_):
+    route = _disagg_route(_disagg_server(), _rejected_by_the_context_worker, type(request_))
+
+    response = await route(request_, _RAW_ROUTE_REQUEST)
 
     assert response.status_code == HTTPStatus.BAD_REQUEST
     assert _body(response)["code"] == CONTEXT_LENGTH_EXCEEDED_CODE
 
 
+# ---------------------------------------------------------------------------
+# A subclass keeps its one-argument exception handler
+# ---------------------------------------------------------------------------
+
+
+class _Adaptor(OpenAIDisaggServer):
+    """Overrides the handler with one argument, as NeMo-RL's OpenAIDisaggServerAdaptor does."""
+
+    def _handle_exception(self, exception):
+        self.handled.append(exception)
+        return super()._handle_exception(exception)
+
+
+def _adaptor() -> _Adaptor:
+    server = _disagg_server(_Adaptor)
+    server.handled = []
+    return server
+
+
+@pytest.mark.parametrize(
+    "failure, status",
+    [
+        (_upstream_error(json.dumps({"message": "`max_tokens` (0) must be greater than 0"})), 400),
+        (ValueError("boom"), 500),
+    ],
+    ids=["worker_400", "internal_error"],
+)
 @pytest.mark.asyncio
-async def test_disagg_route_hands_the_request_to_its_failure_path():
-    async def rejected(req, hooks):
-        raise _context_worker_rejection()
+async def test_a_subclass_handler_is_called_for_an_ordinary_failure(failure, status):
+    async def failing(req, hooks):
+        raise failure
 
-    server = _disagg_server()
-    server._perf_metrics_collector = Mock()
-    server._allow_request_chat_template = False
-    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
-    server._collect_perf_metrics = False
-    route = server._wrap_entry_point(rejected, ResponsesRequest)
+    server = _adaptor()
+    route = _disagg_route(server, failing, ResponsesRequest)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await route(ResponsesRequest(model="m", input="hi", stream=True), _RAW_ROUTE_REQUEST)
+
+    assert excinfo.value.status_code == status
+    assert server.handled == [failure]
+
+
+@pytest.mark.asyncio
+async def test_a_subclass_handler_is_called_for_a_streamed_over_length_request():
+    """The handler rules on every failure; the in-stream answer is shaped from its verdict."""
+    server = _adaptor()
+    route = _disagg_route(server, _rejected_by_the_context_worker, ResponsesRequest)
     request = ResponsesRequest(model="client-model", input="hi", stream=True)
-    raw_request = SimpleNamespace(state=SimpleNamespace(server_arrival_time=0.0), headers={})
 
-    response = await route(request, raw_request)
+    response = await route(request, _RAW_ROUTE_REQUEST)
 
+    assert [type(failure) for failure in server.handled] == [aiohttp.ClientResponseError]
     assert isinstance(response, StreamingResponse)
     _assert_failed_in_stream(await _events(response), request)
+
+
+@pytest.mark.asyncio
+async def test_a_subclass_that_answers_the_over_length_failure_itself_keeps_its_answer():
+    class _Answering(OpenAIDisaggServer):
+        def _handle_exception(self, exception):
+            raise HTTPException(status_code=413, detail="too long")
+
+    route = _disagg_route(
+        _disagg_server(_Answering), _rejected_by_the_context_worker, ResponsesRequest
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await route(ResponsesRequest(model="m", input="hi", stream=True), _RAW_ROUTE_REQUEST)
+
+    assert excinfo.value.status_code == 413
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        JSONResponse({"code": CONTEXT_LENGTH_EXCEEDED_CODE, "message": "not a rejection"}),
+        JSONResponse({"code": "invalid_request_error", "message": "x"}, status_code=400),
+        Response(status_code=418),
+    ],
+    ids=["envelope_with_200", "other_400_envelope", "plain_418"],
+)
+@pytest.mark.asyncio
+async def test_a_subclass_that_returns_its_own_answer_keeps_it(answer):
+    class _Returning(OpenAIDisaggServer):
+        def _handle_exception(self, exception):
+            return answer
+
+    route = _disagg_route(
+        _disagg_server(_Returning), _rejected_by_the_context_worker, ResponsesRequest
+    )
+
+    response = await route(ResponsesRequest(model="m", input="hi", stream=True), _RAW_ROUTE_REQUEST)
+
+    assert response is answer

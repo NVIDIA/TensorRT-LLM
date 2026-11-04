@@ -213,6 +213,43 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
     return f"context worker rejected the request with status {error.status}"
 
 
+def _context_length_exceeded_message(
+        response: Optional[Response]) -> Optional[str]:
+    """The message of a worker's ``context_length_exceeded`` envelope, else None.
+
+    ``_handle_exception`` answers that rejection, and only that one, with the
+    worker's 4xx error envelope as a JSONResponse; every other failure raises,
+    or returns None for a ``CppExecutorError``.
+    """
+    if not isinstance(response, JSONResponse):
+        return None
+    if not 400 <= response.status_code < 500:
+        return None
+    body = json.loads(response.body)
+    if isinstance(body, dict) and body.get(
+            "code") == CONTEXT_LENGTH_EXCEEDED_CODE:
+        return str(body.get("message", ""))
+    return None
+
+
+def _context_length_exceeded_stream(request: ResponsesRequest,
+                                    message: str) -> StreamingResponse:
+    """Fail a streamed Responses request in-stream, as an aggregated server does.
+
+    The context phase never streams, so its worker rejects an over-length
+    prompt with a 400. The snapshot names the model the client asked for; the
+    frontend does not know the served name.
+    """
+    processor = ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name=request.model,
+        use_harmony=False)
+    return StreamingResponse(content=rejected_responses_stream(
+        processor, STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, message),
+                             media_type="text/event-stream")
+
+
 class OpenAIDisaggServer:
     def __init__(self,
                  config: DisaggServerConfig,
@@ -461,7 +498,16 @@ class OpenAIDisaggServer:
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
-                return self._handle_exception(e, req)
+                error_response = self._handle_exception(e)
+                if isinstance(req, ResponsesRequest) and req.stream:
+                    # The handler, which a subclass may override, has ruled
+                    # on the failure. Only its context-length envelope is
+                    # re-shaped: a streamed Responses request is answered
+                    # in-stream, as on an aggregated server.
+                    message = _context_length_exceeded_message(error_response)
+                    if message is not None:
+                        return _context_length_exceeded_stream(req, message)
+                return error_response
         return wrapper
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
@@ -550,8 +596,7 @@ class OpenAIDisaggServer:
             return anthropic_error_response(str(error), "api_error", 503)
         return JSONResponse(content=response.model_dump())
 
-    def _handle_exception(self, exception: Exception,
-                          request: Optional[UCompletionRequest] = None) -> Response:
+    def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
             record_termination_observation(
@@ -576,21 +621,6 @@ class OpenAIDisaggServer:
             # /v1/chat/completions, so those get the same treatment.
             message = _upstream_error_message(exception)
             if is_context_length_exceeded_message(message):
-                if isinstance(request, ResponsesRequest) and request.stream:
-                    # The context phase never streams, so its worker rejected
-                    # the request with a 400. A streamed Responses request
-                    # fails in-stream instead, as on an aggregated server.
-                    processor = ResponsesStreamingProcessor(
-                        request=request,
-                        sampling_params=request.to_sampling_params(),
-                        model_name=request.model,
-                        use_harmony=False)
-                    return StreamingResponse(
-                        content=rejected_responses_stream(
-                            processor,
-                            STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED,
-                            message),
-                        media_type="text/event-stream")
                 # The worker tagged this rejection with the machine-readable
                 # code "context_length_exceeded" (openai_server.py,
                 # create_error_response). HTTPException would flatten it to
