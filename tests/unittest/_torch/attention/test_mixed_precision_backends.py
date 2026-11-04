@@ -661,7 +661,7 @@ def test_mixed_precision_high_row_indices_point_at_the_high_pool():
     requests = torch.zeros(1, dtype=torch.int32, device="cuda")
     rows = mixed_precision_high_row_indices(metadata, attention, topk, pool_rows, requests)
     # High page 8 holds position 0 at row 8 * 4 + 1 * 4 + 0; the high pool released block 1.
-    assert rows.tolist() == [[36, 101, 53, -1]]
+    assert rows is pool_rows and rows.tolist() == [[36, 101, 53, -1]]
 
 
 @pytest.mark.cpu_only

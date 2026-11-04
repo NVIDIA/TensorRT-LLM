@@ -7442,6 +7442,11 @@ class TorchLlmArgs(BaseLlmArgs):
         if not hot and not cold:
             return self
         feature = "Mixed-precision KV" if hot else "Mixed-precision cold pages"
+        if cold and self.kv_cache_config.dtype == "fp8_ds_mla":
+            # The sparse backends return the inline-scale layout's indices
+            # before the cold-page read path runs.
+            raise ValueError(
+                f"{feature} do not support kv_cache_config.dtype='fp8_ds_mla'.")
         if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
             raise ValueError(
                 f"{feature} requires kv_cache_config.use_kv_cache_manager_v2=True."

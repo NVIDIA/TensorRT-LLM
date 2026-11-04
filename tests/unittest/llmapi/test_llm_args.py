@@ -4719,6 +4719,11 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                      kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
                                                    dtype="mixed_nvfp4_fp8"),
                      kv_cache_compression_config=cold_window)
+    with pytest.raises(ValueError, match="fp8_ds_mla"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                                   dtype="fp8_ds_mla"),
+                     kv_cache_compression_config=cold_window)
     # Speculative decoding is allowed, except dynamic-tree drafting.
     TorchLlmArgs(model="/tmp/dummy_model",
                  kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
