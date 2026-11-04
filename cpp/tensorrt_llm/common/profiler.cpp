@@ -172,6 +172,7 @@ std::string ProfilerMetadata::take() &&
 }
 
 #if TRTLLM_ENABLE_NCCL_PROFILING
+//! Append logical NCCL payload and rank fields, optionally querying capture state without synchronization.
 void addNcclMetadata(ProfilerMetadata& metadata, std::string_view operation, std::vector<std::int64_t> const& group,
     std::int64_t rank, std::string_view parallelismDimension, std::string_view kind, std::int64_t logicalBytes,
     std::optional<cudaStream_t> stream)
