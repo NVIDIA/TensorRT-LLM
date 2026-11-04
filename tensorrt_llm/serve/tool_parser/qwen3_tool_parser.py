@@ -244,18 +244,17 @@ class Qwen3ToolParser(BaseToolParser):
         """Return whether `text` is a prefix of some valid JSON value."""
         try:
             partial_json_loads(text, Allow.ALL)
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, AssertionError):
             return False
         return True
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """Flush model text still held when the stream ends.
 
-        A stream that ends inside a `{` or `[` prefix that never became a
-        complete JSON value (for example, output cut off by `max_tokens`)
-        leaves that text in the undecided buffer. In wrapped mode, a trailing
-        prefix of `</tool_call>` waits in the normal-text buffer. Both are
-        model content, so return them as normal text.
+        Bare JSON is classified as a tool call only after a complete value
+        decodes. An incomplete value, including a truncated tool-call-shaped
+        object, remains content. Wrapped calls use the base incremental path;
+        only a held normal-text suffix is flushed here.
         """
         if self._stream_mode != self._STREAM_MODE_UNDECIDED:
             result = super().finish(tools)

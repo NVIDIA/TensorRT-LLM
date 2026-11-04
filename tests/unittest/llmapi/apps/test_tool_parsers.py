@@ -1114,6 +1114,8 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
     @pytest.mark.parametrize("text", [
         '["apple", "banana", "cherry"]',
         "[1, 2, 3]",
+        "[1, 2, 3}",
+        '{"a": [1, 2}',
         "[" + "9" * 4500 + "]",
         "[Note] The weather in Paris is sunny today.",
         "{greeting} Hello there, how can I help?",
@@ -1163,6 +1165,31 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
 
         assert result.normal_text == ""
         assert result.calls == []
+
+    @pytest.mark.parametrize("text", [
+        '{"name":"get_weather"',
+        '{"name":"get_weather","arguments":{"location":"Par',
+    ])
+    def test_streaming_truncated_bare_tool_call_is_content(
+            self, sample_tools, parser, text):
+        """An incomplete bare object remains content until a call is confirmed."""
+        for i in range(0, len(text), 3):
+            result = parser.parse_streaming_increment(text[i:i + 3],
+                                                      sample_tools)
+            assert result.calls == []
+            assert result.normal_text == ""
+
+        result = parser.finish(sample_tools)
+        assert result.calls == []
+        assert result.normal_text == text
+
+        oneshot = parser.detect_and_parse(text, sample_tools)
+        assert oneshot.calls == []
+        assert oneshot.normal_text == text
+
+        repeated = parser.finish(sample_tools)
+        assert repeated.calls == []
+        assert repeated.normal_text == ""
 
     def test_streaming_wrapped_form_unregressed(self, sample_tools, parser):
         """The pre-existing wrapped-form streaming path continues to work."""
