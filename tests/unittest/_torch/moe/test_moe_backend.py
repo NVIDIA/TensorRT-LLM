@@ -1710,7 +1710,7 @@ def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_
         leaf_cls.run_moe(backend, ctx)
 
 
-# The CuteDSL NVFP4 leaves all bind the shared ``quantize_input_nvfp4``.
+# The CuteDSL NVFP4 leaves use ``quantize_input_nvfp4`` directly or through a wrapper.
 _CUTEDSL_NVFP4_LEAVES = pytest.mark.parametrize(
     "leaf_cls",
     [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, TrtllmCutedslDenseGemmNvfp4Impl],
