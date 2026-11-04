@@ -218,13 +218,14 @@ private:
 void allgatherIntoTensor(
     torch::Tensor input, torch::Tensor output, torch::List<int64_t> ranks, torch::optional<std::string> groupName)
 {
+    auto const numRanks = static_cast<int64_t>(ranks.size());
     TLLM_CHECK_WITH_INFO(input.is_cuda() && output.is_cuda(), "All-gather buffers must be CUDA tensors");
     TLLM_CHECK_WITH_INFO(input.is_contiguous() && output.is_contiguous(), "All-gather buffers must be contiguous");
     TLLM_CHECK_WITH_INFO(input.device() == output.device() && input.scalar_type() == output.scalar_type(),
         "All-gather buffers must have the same device and dtype");
-    TLLM_CHECK_WITH_INFO(!ranks.empty() && output.numel() == input.numel() * ranks.size(),
-        "All-gather output must hold one input per rank");
-    if (ranks.size() == 1)
+    TLLM_CHECK_WITH_INFO(
+        numRanks > 0 && output.numel() == input.numel() * numRanks, "All-gather output must hold one input per rank");
+    if (numRanks == 1)
     {
         output.view_as(input).copy_(input);
         return;
@@ -233,7 +234,7 @@ void allgatherIntoTensor(
     if (groupName.has_value())
     {
         auto pg = c10d::resolve_process_group(groupName.value());
-        TLLM_CHECK_WITH_INFO(pg->getSize() == ranks.size(), "All-gather process-group size mismatch");
+        TLLM_CHECK_WITH_INFO(pg->getSize() == numRanks, "All-gather process-group size mismatch");
         PgHelper pgh{pg};
         auto work = pgh.allgather(input, output, {});
         PGCHECK_THROW_WITH_INFO(work, "ProcessGroup: allgather into tensor");
