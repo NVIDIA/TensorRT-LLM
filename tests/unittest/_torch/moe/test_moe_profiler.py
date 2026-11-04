@@ -54,6 +54,9 @@ def trace_routing(tmp_path: Path) -> Iterator[TraceRouting]:
     index = 0
 
     def capture(operation: Callable[[], object]) -> TraceRecords:
+        """Capture routing records and check execution/Chrome event counts
+        agree.
+        """
         nonlocal index
         index += 1
         execution = tmp_path / f"execution-{index}.json"
@@ -130,6 +133,9 @@ class _Backend:
     def run_moe(
         self, context: MoERunContext, *, workspace: dict[str, object] | None = None
     ) -> torch.Tensor:
+        """Record scheduler inputs and preserve any configured backend
+        failure.
+        """
         self.ledger.append("run")
         self.contexts.append(context)
         if self.error is not None:
@@ -195,6 +201,9 @@ class _Moe:
 
     @staticmethod
     def split_chunk(count: int, chunks: int) -> list[int]:
+        """Distribute token counts evenly while retaining empty trailing
+        chunks.
+        """
         quotient, remainder = divmod(count, chunks)
         return [quotient + (index < remainder) for index in range(chunks)]
 
@@ -234,6 +243,9 @@ class TestMoeProfilerCPU:
         weights_available: bool,
         trace_routing: TraceRouting,
     ) -> None:
+        """Verify routing metadata preserves noncontiguous IDs and optional
+        weights.
+        """
         ids = torch.tensor([[3, 99, 1, 99], [0, 99, 2, 99]], dtype=torch.int32)[:, ::2]
         weights = torch.tensor([[0.125, 99, 0.75, 99], [0.5, 99, 0.25, 99]])[:, ::2]
         records = trace_routing(
@@ -258,6 +270,9 @@ class TestMoeProfilerCPU:
     def test_inactive_never_inspects_tensors_or_cuda(
         self, selected: bool, active: bool, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Verify inactive routing observation never reads tensors or queries
+        CUDA.
+        """
         ids = torch.tensor([[1, 0]], dtype=torch.int32)
         monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"moe"} if selected else {}))
         monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: active)
@@ -302,6 +317,9 @@ class TestMoeProfilerCPU:
         monkeypatch: pytest.MonkeyPatch,
         trace_routing: TraceRouting,
     ) -> None:
+        """Verify pre-EPLB observation preserves replay buffers and scheduler
+        ordering.
+        """
         x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
         logits = torch.tensor([[4.0, 1.0, 3.0, 0.0], [0.0, 5.0, 2.0, 4.0]])
         replay = _replay_buffer()
@@ -386,6 +404,9 @@ class TestMoeProfilerCPU:
         monkeypatch: pytest.MonkeyPatch,
         trace_routing: TraceRouting,
     ) -> None:
+        """Verify prerouted observations match the inputs consumed by the
+        backend.
+        """
         moe = _Moe()
         monkeypatch.setattr(moe.backend, "_supports_load_balancer", lambda: False)
         monkeypatch.setattr(moe_scheduler, "FORCE_SEPARATED_ROUTING", force_separated)
@@ -474,6 +495,9 @@ class TestMoeProfilerCPU:
         monkeypatch: pytest.MonkeyPatch,
         trace_routing: TraceRouting,
     ) -> None:
+        """Verify fused ADP strips padding while retaining empty launches and
+        EP rank.
+        """
         moe = _Moe(eplb=True)
         replay = _replay_buffer()
         monkeypatch.setattr(moe_scheduler, "get_active_route_capture", lambda: replay)
@@ -545,6 +569,9 @@ class TestMoeProfilerCPU:
     def test_optional_helper_weights_do_not_relax_scheduler_contract(
         self, fused: bool, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Verify optional profiler weights do not relax scheduler weight
+        requirements.
+        """
         moe = _Moe()
 
         def missing_weights(
@@ -611,12 +638,16 @@ def test_moe_observation_is_fullgraph_compile_safe() -> None:
 
     logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     compiled = torch.compile(forward, backend="eager", fullgraph=True)
-    torch.testing.assert_close(compiled(logits), forward(logits))
+    expected = forward(logits)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        actual = compiled(logits)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("selected", [False, True])
 def test_unsupported_moe_paths_warn_once(monkeypatch: pytest.MonkeyPatch, selected: bool) -> None:
+    """Verify unsupported routing paths emit one warning per selected path."""
     from tensorrt_llm.logger import logger
 
     monkeypatch.setattr(
@@ -638,6 +669,7 @@ def test_unsupported_moe_paths_warn_once(monkeypatch: pytest.MonkeyPatch, select
 def test_step3p7_warns_only_for_python_expert_path(
     monkeypatch: pytest.MonkeyPatch, quant_algo: str, clamp: float | None
 ) -> None:
+    """Verify Step3p7 warns only when Python executes the routed experts."""
     from transformers import PretrainedConfig
 
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -682,6 +714,9 @@ def test_step3p7_warns_only_for_python_expert_path(
 def test_create_moe_backend_warns_for_standalone_subclasses(
     monkeypatch: pytest.MonkeyPatch, backend_name: str
 ) -> None:
+    """Verify unsupported standalone backend subclasses warn before
+    construction.
+    """
     factory = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
     backend_cls = type(f"Test{backend_name}", (getattr(factory, backend_name),), {})
     warnings: list[str] = []
