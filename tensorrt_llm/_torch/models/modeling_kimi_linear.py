@@ -127,7 +127,7 @@ from ..distributed import (
     MnnvlWorkspaceResult,
     allgather,
 )
-from ..distributed.ops import MnnvlOwnWorkspace, mnnvl_allreduce_transport
+from ..distributed.ops import MnnvlOwnWorkspace
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
@@ -2077,7 +2077,6 @@ class KimiK3MoERuntime(nn.Module):
         # The routed latent all-reduce on its own MNNVL workspace (``_latent_all_reduce_workspace``)
         # for the sizes it runs one-shot (``_latent_all_reduce``); None: the routed experts'.
         self._own_latent_all_reduce: Optional[AllReduce] = None
-        self._own_latent_one_shot_max_bytes = 0
         # The sharded decode front (``kimi_k3_moe_front``): the routed all-reduce group's
         # workspace and this layer's operands on this rank, built after loading where it applies.
         self._moe_front_ws = None
@@ -2324,7 +2323,6 @@ class KimiK3MoERuntime(nn.Module):
             )
             if own.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM, self.moe_hidden_size):
                 self._own_latent_all_reduce = own
-                self._own_latent_one_shot_max_bytes = own.mnnvl_allreduce.one_shot_max_bytes
         # Stock fused RMSNorm (flashinfer kernel; the no-flashinfer
         # fallback is the same fp32-variance eager math as KimiK3RMSNorm).
         self.routed_expert_norm = RMSNorm(
@@ -2336,16 +2334,7 @@ class KimiK3MoERuntime(nn.Module):
         runs one-shot (the size rule of ``_latent_all_reduce_workspace``), else the routed
         experts' all-reduce (on the group's shared workspace)."""
         own = self._own_latent_all_reduce
-        if (
-            own is not None
-            and mnnvl_allreduce_transport(
-                num_tokens,
-                self.moe_hidden_size,
-                own.mapping.tp_size,
-                torch.bfloat16,
-                self._own_latent_one_shot_max_bytes,
-            )[0]
-        ):
+        if own is not None and own.mnnvl_runs_one_shot(num_tokens, self.moe_hidden_size):
             return own
         return self.routed_experts.all_reduce
 
@@ -2380,12 +2369,7 @@ class KimiK3MoERuntime(nn.Module):
             self._column_parallel_tail_supported
             and not torch.compiler.is_compiling()
             and self.routed_expert_up_proj.serves_output_rows(num_tokens)
-            and mnnvl_allreduce_transport(
-                num_tokens,
-                self.moe_hidden_size,
-                self.routed_experts.all_reduce.mapping.tp_size,
-                torch.bfloat16,
-            )[0]
+            and self.routed_experts.all_reduce.mnnvl_runs_one_shot(num_tokens, self.moe_hidden_size)
         )
 
     def _column_parallel_tail(

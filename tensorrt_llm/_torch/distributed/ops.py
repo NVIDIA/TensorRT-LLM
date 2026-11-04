@@ -1904,6 +1904,12 @@ class AllReduce(nn.Module):
                 and (fusion_op != AllReduceFusionOp.RMS_NORM_QUANT_MXFP8
                      or hidden_size % 256 == 0))
 
+    def mnnvl_runs_one_shot(self, num_tokens: int, hidden_dim: int) -> bool:
+        """Whether the MNNVL kernel of ``[num_tokens, hidden_dim]`` rows is the one-shot one
+        (all ranks' input within this all-reduce's MNNVL workspace one-shot size)."""
+        return (self.mnnvl_allreduce is not None
+                and self.mnnvl_allreduce._transport(num_tokens, hidden_dim)[0])
+
     @staticmethod
     def push_input(target: MnnvlPushTarget,
                    input: torch.Tensor,
