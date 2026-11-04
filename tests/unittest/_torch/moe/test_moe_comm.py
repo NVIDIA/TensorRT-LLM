@@ -72,10 +72,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-    FORCE_CFT_ENV,
-    NVLinkOneSided,
-)
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
     MnnvlMoe,
     NVLinkTwoSided,
@@ -296,8 +293,8 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
@@ -335,8 +332,8 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
 
@@ -1192,8 +1189,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         traceback.print_exc()
         raise
     finally:
-        # A CFT workspace holds a process-global binding only destroy() frees,
-        # and the cache does not survive to the next pool task.
+        # The cache does not survive to the next pool task.
         _destroy_cached_worker_comm()
 
 
@@ -2691,11 +2687,7 @@ def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
         moe_ep_size=config.ep_size,
         world_size=config.ep_size,
     )
-    with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
-        communication = create_comm_object(config.comm_type, mapping, config)
+    communication = create_comm_object(config.comm_type, mapping, config)
     try:
         return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
     finally:
@@ -2728,11 +2720,7 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
         moe_ep_size=world_size,
         world_size=world_size,
     )
-    with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
-        communication = create_comm_object(config.comm_type, mapping, config)
+    communication = create_comm_object(config.comm_type, mapping, config)
     sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
     control_comm = MPI.COMM_WORLD.Dup()
 

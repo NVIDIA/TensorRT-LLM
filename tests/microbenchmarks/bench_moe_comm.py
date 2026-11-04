@@ -823,7 +823,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "NVLINK_ONE_SIDED Lamport transport for small steps (sets "
             "TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT): auto = on where supported, on = ask for it, "
-            "off = fence/CFT only."
+            "off = fence only."
         ),
     )
     return parser.parse_args()

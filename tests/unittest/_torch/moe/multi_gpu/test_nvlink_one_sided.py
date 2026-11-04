@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVLinkOneSided path selection and model-shaped round trips with independent references.
 
-Every round trip runs with the fence, CFT and Lamport transports (``Case.mode``); the Lamport
+Every round trip runs with the fence and Lamport transports (``Case.mode``); the Lamport
 transport places received rows at (source rank, token) instead of compacting them, which the
 dispatch check accepts because it identifies tokens by their encoded routing weights.
 """
@@ -25,13 +25,9 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-    FORCE_CFT_ENV,
     FORCE_LAMPORT_ENV,
     LAMPORT_MAX_TOKENS_ENV,
     NVLinkOneSided,
-    _cft_device_support_reason,
-    _get_nvidia_driver_version,
-    cft_driver_is_supported,
     default_lamport_max_tokens,
     lamport_payload_format,
     lamport_row,
@@ -148,10 +144,10 @@ class Case:
         model: Expert layout, hidden width, and dispatch payload format.
         rounds: Ordered iterations with no host synchronization between them.
             All token-count tuples must describe the same EP group size.
-        mode: Automatic transport selection (Lamport for small steps, then CFT),
-            forced fence, requested CFT (Lamport off), or requested Lamport with
-            fence for the steps it cannot carry; platform and payload
-            restrictions still apply to CFT and Lamport.
+        mode: Automatic transport selection (Lamport for small steps, fence for
+            the rest), forced fence, or requested Lamport with fence for the steps
+            it cannot carry; platform and payload restrictions still apply to
+            Lamport.
         payload_in_workspace: Copy simulated expert outputs into the communication workspace
             before combine, instead of passing an external tensor.
         fp8_combine: Use FP8 on the combine wire; the returned output remains BF16.
@@ -163,7 +159,7 @@ class Case:
 
     model: ModelShape
     rounds: tuple[Round, ...]
-    mode: Literal["auto", "fence", "cft", "lamport"]
+    mode: Literal["auto", "fence", "lamport"]
     payload_in_workspace: bool
     fp8_combine: bool
     graph: bool
@@ -288,8 +284,7 @@ def _run_worker(case: Case) -> dict:
     import torch
 
     # Selection is read by each communicator constructor, not cached by the MPI pool.
-    os.environ[FORCE_CFT_ENV] = {"auto": "", "fence": "0", "cft": "1", "lamport": "0"}[case.mode]
-    os.environ[FORCE_LAMPORT_ENV] = {"auto": "", "fence": "0", "cft": "", "lamport": "1"}[case.mode]
+    os.environ[FORCE_LAMPORT_ENV] = {"auto": "", "fence": "0", "lamport": "1"}[case.mode]
     os.environ[LAMPORT_MAX_TOKENS_ENV] = (
         "" if case.lamport_max_tokens is None else str(case.lamport_max_tokens)
     )
@@ -298,29 +293,19 @@ def _run_worker(case: Case) -> dict:
     torch.cuda.set_device(rank)
     MnnvlMemory.initialize()
     supported = MnnvlMemory.supports_mnnvl()
-    cft_reason = None
-    if case.mode != "fence":
-        if not cft_driver_is_supported(_get_nvidia_driver_version()):
-            cft_reason = "CFT requires driver 615 or newer"
-        else:
-            cft_reason = _cft_device_support_reason()
     sm_major = torch.cuda.get_device_capability()[0]
     quant_supported = (
         case.model.dispatch_dtype == "bf16"
         or (case.model.dispatch_dtype == "blockwise_fp8" and sm_major >= 9)
         or sm_major >= 10
     )
-    reasons = MPI.COMM_WORLD.allgather((supported, cft_reason, quant_supported))
+    reasons = MPI.COMM_WORLD.allgather((supported, quant_supported))
     if not all(item[0] for item in reasons):
         return {"skip": "NVLink one-sided is not supported on every participating GPU"}
-    if case.mode == "cft" and any(item[1] for item in reasons):
-        return {"skip": str(reasons)}
-    if not all(item[2] for item in reasons):
+    if not all(item[1] for item in reasons):
         return {
             "skip": f"{case.model.dispatch_dtype} payload generation is unsupported on a participating GPU"
         }
-    if case.mode == "auto" and len({item[1] is None for item in reasons}) != 1:
-        return {"skip": "automatic CFT selection requires consistent capability across ranks"}
 
     mapping = Mapping(
         rank=rank, world_size=case.ep_size, tp_size=case.ep_size, moe_ep_size=case.ep_size
@@ -369,15 +354,15 @@ def _run_worker(case: Case) -> dict:
 
         def record_dispatch(*args, **kwargs):
             # Record the actual op arguments, not just the wrapper's capability.
-            use_lamport = args[15] if len(args) > 15 else kwargs.get("use_lamport", False)
-            launches.append(("dispatch", bool(args[10]), bool(use_lamport)))
+            use_lamport = args[14] if len(args) > 14 else kwargs.get("use_lamport", False)
+            launches.append(("dispatch", bool(use_lamport)))
             result = dispatch_op(*args, **kwargs)
             combine_offsets.append(result[1])
             return result
 
         def record_combine(*args, **kwargs):
-            use_lamport = args[14] if len(args) > 14 else kwargs.get("use_lamport", False)
-            launches.append(("combine", bool(args[11]), bool(use_lamport)))
+            use_lamport = args[13] if len(args) > 13 else kwargs.get("use_lamport", False)
+            launches.append(("combine", bool(use_lamport)))
             return combine_op(*args, **kwargs)
 
         def sequence() -> list[dict]:
@@ -447,7 +432,6 @@ def _run_worker(case: Case) -> dict:
                 for o in outputs
             ],
             "launches": launches,
-            "cft_capable": comm.can_use_cft_counted_writes,
             "lamport_max_tokens": comm.lamport_max_tokens,
             "lamport_expected": lamport_expected,
         }
@@ -545,29 +529,12 @@ def _assert_results(case: Case, results: list[dict]) -> None:
             )
         expected_launches = []
         for i, spec in enumerate(case.rounds):
-            payload, sf, slots, weights = result["inputs"][i]
             verify_combine(case, results, rank, i)
             if result["outputs"][i]["dispatch"] is not None:
                 verify_dispatch(case, results, rank, i)
-            # The Lamport transport takes every step it can carry, ahead of CFT.
+            # The Lamport transport takes every step it can carry; fence takes the rest.
             lamport = max(spec.tokens) <= lamport_max_tokens and not case.eplb
-            requested = (
-                not lamport
-                and result["cft_capable"]
-                and case.mode not in ("fence", "lamport")
-                and (case.mode == "cft" or max(spec.tokens) <= 128)
-            )
-            # Calculate wire eligibility independently from the production helper.
-            payloads = (payload, slots, weights) if sf is None else (payload, sf, slots, weights)
-            dispatch_cft = requested and all(
-                t.shape[1] * t.element_size() % 16 == 0 for t in payloads
-            )
-            combine_cft = (
-                requested and case.model.hidden_size * (1 if case.fp8_combine else 2) % 16 == 0
-            )
-            expected_launches.extend(
-                (("dispatch", dispatch_cft, lamport), ("combine", combine_cft, lamport))
-            )
+            expected_launches.extend((("dispatch", lamport), ("combine", lamport)))
             if case.eplb:
                 expected = torch.stack(
                     [
@@ -594,10 +561,8 @@ def _run(case: Case, pools: dict[tuple[int, bool], MPIPoolExecutor]) -> None:
     if torch.cuda.device_count() < case.ep_size:
         pytest.skip(f"requires {case.ep_size} GPUs")
     # PDL may be cached in native code, so different settings need separate workers.
-    # CFT mode is Python-side and is set on every worker before constructing the comm.
+    # The transport mode is Python-side and is set on every worker before constructing the comm.
     env = {
-        "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH": "128",
-        "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE": "128",
         "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB": "",
         "TRTLLM_ENABLE_PDL": "1" if case.pdl else "0",
         "TRTLLM_MOE_COMM_TIMEOUT_SEC": "30",
@@ -696,8 +661,8 @@ CASES = [
         for payload_in_workspace in (False, True)
     ],
     # Reuse one four-rank communicator across changing token counts and peer dependencies,
-    # including zero-token ranks and delayed ranks. Counts 128/129 straddle the
-    # automatic CFT threshold; graph cases replay the entire sequence.
+    # including zero-token ranks and delayed ranks. Counts 128/129 straddle a Lamport
+    # limit of 128; graph cases replay the entire sequence.
     *[
         pytest.param(
             Case(
@@ -731,10 +696,9 @@ CASES = [
         for mode, graph, lamport_max_tokens in (
             ("auto", False, None),
             ("auto", True, None),
-            ("cft", True, None),
             ("fence", True, None),
-            # A Lamport limit of 128 hands the 129-token rounds to CFT (auto) or fence
-            # (lamport), so one sequence and one graph mix the transports.
+            # A Lamport limit of 128 hands the 129-token rounds to fence, so one
+            # sequence and one graph mix the transports.
             ("auto", True, 128),
             ("lamport", False, 128),
             ("lamport", True, 128),
@@ -806,8 +770,7 @@ def test_nvlink_one_sided(case: Case, mpi_pools: dict[tuple[int, bool], MPIPoolE
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("cft,fp8_combine", [(False, False), (True, False), (True, True)])
-def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
+def test_workspace_layout() -> None:
     from tensorrt_llm.bindings import internal as _tllm_internal
 
     thop = _tllm_internal.thop
@@ -817,7 +780,7 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
 
     ep_size, top_k, capacity, hidden_size = 8, 6, 128, 7168
     layout = NVLinkOneSided._make_workspace_layout(
-        ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0, cft, fp8_combine
+        ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0
     )
     dispatch_start = field(layout, "DISPATCH_PAYLOAD_OFFSET_INDEX")
     dispatch_end = dispatch_start + field(layout, "DISPATCH_PAYLOAD_SIZE_INDEX")
@@ -828,32 +791,17 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
     assert dispatch_end <= field(layout, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX") < combine_start
     assert field(layout, "COMBINE_INPUT_SIZE_INDEX") == ep_size * capacity * hidden_size * 2
     assert dispatch_start % 256 == combine_start % 256 == total % 256 == 0
-    if cft:
-        recv_start = field(layout, "COMBINE_RECV_OFFSET_INDEX")
-        recv_bytes = field(layout, "COMBINE_RECV_SIZE_INDEX")
-        assert combine_end <= recv_start and recv_start % 256 == 0
-        assert recv_bytes == ep_size * capacity * hidden_size * (1 if fp8_combine else 2)
-        assert recv_start + recv_bytes == total
-        assert (
-            dispatch_end
-            <= field(layout, "COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX")
-            < combine_start
-        )
-    else:
-        assert field(layout, "COMBINE_RECV_OFFSET_INDEX") == 0
-        assert field(layout, "COMBINE_RECV_SIZE_INDEX") == 0
-        assert field(layout, "COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX") == 0
-        assert combine_end == total
+    assert combine_end == total
 
     # Routing metadata reserves the configured top-k, not the maximum supported top-k.
     routes_start = field(layout, "TOPK_TARGET_RANKS_OFFSET_INDEX")
     indices_start = field(layout, "TOPK_TARGET_INDICES_OFFSET_INDEX")
     assert indices_start - routes_start == capacity * top_k * 4
     with pytest.raises(RuntimeError, match="capacity"):
-        torch.ops.trtllm.moe_a2a_get_workspace_layout(ep_size, capacity, top_k, -1, 256, 0)
+        torch.ops.trtllm.moe_a2a_get_workspace_layout(ep_size, capacity, top_k, -1, 256)
     with pytest.raises(RuntimeError, match="overflows"):
         torch.ops.trtllm.moe_a2a_get_workspace_layout(
-            ep_size, capacity, top_k, (1 << 63) - 512, 1024, 0
+            ep_size, capacity, top_k, (1 << 63) - 512, 1024
         )
 
 
@@ -868,7 +816,7 @@ def test_lamport_workspace_layout(payload_format: str) -> None:
 
     ep_size, top_k, capacity, hidden_size, lamport_tokens = 8, 8, 256, 7168, 160
     base = NVLinkOneSided._make_workspace_layout(
-        ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0, False, False
+        ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0
     )
     for name in ("LAMPORT_MAX_NUM_TOKENS_INDEX", "LAMPORT_RECV_SIZE_INDEX"):
         assert field(base, name) == 0
@@ -998,123 +946,20 @@ def test_lamport_step_selection() -> None:
     assert not carries(1, hidden, sf, weights, None)
 
 
-def test_lamport_refused_with_forced_cft(monkeypatch) -> None:
-    from types import SimpleNamespace
-
-    monkeypatch.setenv("TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT", "1")
-    comm = SimpleNamespace(_force_cft=True)
-    with pytest.raises(ValueError, match="both ask for every eligible step"):
-        NVLinkOneSided._setup_lamport(
-            comm, None, 7168, torch.bfloat16, "BF16", fault_tolerant=False
-        )
-
-
 # ============================================================================
-# CFT path selection and capability checks
-# ============================================================================
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("force_env", "driver_version", "num_tokens", "device_supported", "expected"),
-    [
-        pytest.param(None, "615.00", 128, True, True, id="auto-at-threshold"),
-        pytest.param(None, "615.00", 129, True, False, id="auto-above-threshold"),
-        pytest.param("0", "615.00", 128, True, False, id="force-fence"),
-        pytest.param("1", "615.00", 129, True, True, id="force-cft-above-threshold"),
-        pytest.param("1", b"614.99", 128, True, False, id="force-cft-old-driver"),
-        pytest.param("1", None, 128, True, False, id="force-cft-nvml-error"),
-        pytest.param("1", "615.00", 128, False, False, id="force-cft-unsupported-device"),
-        pytest.param("invalid", "615.00", 129, True, False, id="invalid-env-uses-auto"),
-    ],
-)
-def test_cft_selection(
-    monkeypatch: pytest.MonkeyPatch,
-    force_env: str | None,
-    driver_version: str | bytes | None,
-    num_tokens: int,
-    device_supported: bool,
-    expected: bool,
-) -> None:
-    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
-
-    if force_env is None:
-        monkeypatch.delenv(FORCE_CFT_ENV, raising=False)
-    else:
-        monkeypatch.setenv(FORCE_CFT_ENV, force_env)
-
-    def query_driver_version() -> str | bytes:
-        if driver_version is None:
-            raise nvlink_one_sided.pynvml.NVMLError(nvlink_one_sided.pynvml.NVML_ERROR_UNKNOWN)
-        return driver_version
-
-    monkeypatch.setattr(nvlink_one_sided.pynvml, "nvmlDeviceGetCount", lambda: 1)
-    monkeypatch.setattr(nvlink_one_sided.pynvml, "nvmlSystemGetDriverVersion", query_driver_version)
-    force_cft = nvlink_one_sided.get_force_cft()
-    version = nvlink_one_sided._get_nvidia_driver_version()
-    assert version == (
-        driver_version.decode() if isinstance(driver_version, bytes) else driver_version
-    )
-    can_use_cft = (
-        nvlink_one_sided.resolve_cft_counted_writes(force_cft, version) and device_supported
-    )
-    assert nvlink_one_sided.should_use_cft(can_use_cft, force_cft, 128, num_tokens) is expected
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("capability", "unsupported_index"),
-    [
-        pytest.param((9, 0), None, id="hopper"),
-        pytest.param((10, 3), None, id="supported"),
-        pytest.param((10, 3), 0, id="no-fabric-handle"),
-        pytest.param((10, 3), 1, id="no-unicast-endpoint"),
-        pytest.param((10, 3), 2, id="no-counted-ops"),
-    ],
-)
-def test_cft_device_support(
-    monkeypatch: pytest.MonkeyPatch,
-    capability: tuple[int, int],
-    unsupported_index: int | None,
-) -> None:
-    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
-
-    cuda = nvlink_one_sided.cuda
-    attributes = (
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
-    )
-    unsupported = None if unsupported_index is None else attributes[unsupported_index]
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        cuda,
-        "cuDeviceGetAttribute",
-        lambda attribute, device: (cuda.CUresult.CUDA_SUCCESS, int(attribute != unsupported)),
-    )
-    reason = nvlink_one_sided._cft_device_support_reason()
-    if capability[0] < 10:
-        assert "SM90" in reason
-    elif unsupported is None:
-        assert reason is None
-    else:
-        assert unsupported.name in reason
-
-
-# ============================================================================
-# CFT dispatch health flags for the host watchdog
+# Dispatch completion flags for the host watchdog
 # ============================================================================
 
 
 def _run_watchdog_worker(_unused: int) -> dict:
-    """Dispatch once under CFT with a watchdog armed, and report what it saw."""
+    """Dispatch once with a watchdog armed, and report what it saw."""
     # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
     import os
 
     import torch
 
-    os.environ[FORCE_CFT_ENV] = "1"
+    # Pin the policy: a rank-mask communicator keeps the Lamport transport off anyway.
+    os.environ[FORCE_LAMPORT_ENV] = "0"
 
     from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import EPGroupHealth
 
@@ -1123,20 +968,8 @@ def _run_watchdog_worker(_unused: int) -> dict:
     torch.cuda.set_device(rank)
     MnnvlMemory.initialize()
 
-    from tensorrt_llm.bindings import BuildInfo
-
-    cft_reason = None
-    if not BuildInfo.CFT_COUNTED_WRITES:
-        cft_reason = "build was compiled against CUDA below 13.4"
-    elif not cft_driver_is_supported(_get_nvidia_driver_version()):
-        cft_reason = "CFT requires driver 615 or newer"
-    else:
-        cft_reason = _cft_device_support_reason()
-    reasons = MPI.COMM_WORLD.allgather((MnnvlMemory.supports_mnnvl(), cft_reason))
-    if not all(item[0] for item in reasons):
+    if not all(MPI.COMM_WORLD.allgather(MnnvlMemory.supports_mnnvl())):
         return {"skip": "NVLink one-sided is not supported on every participating GPU"}
-    if any(item[1] for item in reasons):
-        return {"skip": str(reasons)}
 
     timeouts: list = []
     mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
@@ -1153,10 +986,6 @@ def _run_watchdog_worker(_unused: int) -> dict:
         alltoall_watchdog_on_timeout=timeouts.append,
     )
     try:
-        # Every input to the selection is uniform across an MNNVL domain and was
-        # screened above, so a disabled CFT here is a defect, not a skip.
-        assert comm.can_use_cft_counted_writes, "CFT was screened as available but not selected"
-
         num_tokens = 4
         slots = torch.randint(0, ep_size * 2, (num_tokens, 1), dtype=torch.int32, device="cuda")
         payload = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
@@ -1191,12 +1020,11 @@ def _run_watchdog_worker(_unused: int) -> dict:
 
 
 @pytest.mark.parametrize("ep_size", [2, 4])
-def test_cft_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
-    """CFT dispatch must publish completion flags so the watchdog sees live peers.
+def test_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
+    """Dispatch must publish completion flags so the watchdog sees live peers.
 
-    CFT signals data arrival through counted-write counters, but the host
-    watchdog can only observe the completion flag table. Without the flags a
-    healthy collective is reported as every peer missing.
+    The host watchdog observes only the completion flag table. Without the
+    flags a healthy collective is reported as every peer missing.
     """
     if torch.cuda.device_count() < ep_size:
         pytest.skip(f"requires {ep_size} GPUs")
