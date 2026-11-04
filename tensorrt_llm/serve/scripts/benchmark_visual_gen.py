@@ -52,7 +52,7 @@ from pydantic import Field, PrivateAttr, ValidationError, create_model, model_va
 from tqdm.asyncio import tqdm
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
-from tensorrt_llm.serve.openai_protocol import (
+from tensorrt_llm.serve.api.visual_gen.protocol import (
     ImageEditRequest,
     ImageGenerationRequest,
     MediaReferenceItem,
