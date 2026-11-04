@@ -205,6 +205,23 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertFalse(promoted_ids)
         self.assertEqual(batch.context_requests_last_chunk, [one_token, two_tokens])
 
+    def test_context_restoring_its_last_n_falls_back_with_its_batch(self) -> None:
+        restoring = _make_request_stub(1)
+        other = _make_request_stub(2)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [restoring, other]
+
+        graph_batch, promoted_ids = _make_single_token_context_graph_batch(
+            batch, restoring_request_ids={1}
+        )
+
+        self.assertIs(graph_batch, batch)
+        self.assertFalse(promoted_ids)
+        graph_batch, promoted_ids = _make_single_token_context_graph_batch(
+            batch, restoring_request_ids={3}
+        )
+        self.assertEqual(promoted_ids, frozenset({1, 2}))
+
     def test_mrope_delta_is_supported_by_decode_provider(self) -> None:
         context = _make_request_stub(1)
         context.py_mrope_position_delta = object()
