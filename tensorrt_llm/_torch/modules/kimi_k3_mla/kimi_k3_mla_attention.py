@@ -339,9 +339,7 @@ class KimiK3MLAAttention(MLA):
             if isinstance(self.q_b_proj, Linear):
                 r128c4 = _fp8_block_scales_uses_cute_dsl_sm107(self.q_b_proj)
             else:
-                # The K3 FP8 weight-read q_b packs R128c4 whenever the Rubin MXFP8 GEMM runs; the
-                # post-load walk reaches this module before q_b, so pack its scales first.
-                self.q_b_proj.transform_weights()
+                # The K3 FP8 weight-read q_b packs R128c4 whenever the Rubin MXFP8 GEMM runs.
                 r128c4 = get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
             if r128c4:
                 from_scale = k3_mla_q_fused.block_exponents_from_r128c4
