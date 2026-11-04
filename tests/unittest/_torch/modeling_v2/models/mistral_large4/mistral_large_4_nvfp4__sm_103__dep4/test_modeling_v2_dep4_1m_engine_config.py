@@ -762,7 +762,7 @@ def test_max_seq_len_is_not_capped(dep4):
 def test_quantization_is_the_anchor_key(dep4_1m):
     """At 1M as at 32K and at tep4: MIXED_PRECISION with the fp8 KV cache, the GSM8K anchor row's
     key, and the router handed params.json's quantization_config with its 475 quantized_layers
-    intact."""
+    intact plus the FP8 KV-cache algorithm the native loader records from fp8_kv_cache."""
     resolved = dep4_1m
     assert resolved.prequantized is True
     for quant in (resolved.llm_args.quant_config, resolved.model_config.quant_config):
@@ -773,10 +773,12 @@ def test_quantization_is_the_anchor_key(dep4_1m):
     assert _anchor(resolved.llm_args) == 91.926
 
     on_disk = json.loads((resolved.path / "params.json").read_text())["quantization_config"]
+    assert len(on_disk["quantized_layers"]) == 475
+    routed = dict(on_disk, kv_cache_quant_algo="FP8")
     assert len(resolved.routed) == 1
     seen = resolved.routed[0]
-    assert seen.quantization_config == on_disk and len(on_disk["quantized_layers"]) == 475
-    assert resolved.model_config.pretrained_config.quantization_config == on_disk
+    assert seen.quantization_config == routed
+    assert resolved.model_config.pretrained_config.quantization_config == routed
     assert seen.pretrained_config is resolved.model_config.pretrained_config
     assert resolved.model_config.modeling_v2_target is _Routed
     assert seen.compute_capability == _SM103 and seen.spec_config is None
@@ -862,9 +864,10 @@ def test_kv_cache_dtype_auto_and_fp8_build_the_fp8_ds_mla_pool(dep4, dep4_quicks
     bytes a token on every rank; and the manager builds its base over all 72 layers, a 656-byte
     head on the 63 KV owners only, as FP8, with the dtype it was asked for. A latent dtype the
     layout cannot hold, bf16, is refused at construction. The CI class's engine is the gates'
-    in everything else but where the FP8 KV algo is recorded: fp8 writes it onto each of the 475
-    per-layer quant configs as well, auto leaves it on the global one, which the latent's dtype is
-    read from."""
+    in everything else but how the FP8 KV algo is recorded: fp8 writes the requested dtype onto
+    the global and each of the 475 per-layer quant configs, auto takes both from the checkpoint's
+    quantization_config, where the native loader records fp8_kv_cache. Every layer reads FP8
+    either way, and the latent's dtype is read from the global one."""
     for resolved, requested in ((dep4, "fp8"), (dep4_quickstart, "fp8"), (dep4_ci, "auto")):
         model_config, llm_args = resolved.model_config, resolved.llm_args
         assert llm_args.kv_cache_config.dtype == requested
@@ -893,10 +896,10 @@ def test_kv_cache_dtype_auto_and_fp8_build_the_fp8_ds_mla_pool(dep4, dep4_quicks
 
     gate, ci = _summary(dep4), _summary(dep4_ci)
     assert {key for key in gate if gate[key] != ci[key]} == {"kv_cache", "quant", "layers"}
-    for resolved, layer_algo in ((dep4, QuantAlgo.FP8), (dep4_ci, None)):
+    for resolved in (dep4, dep4_ci):
         layers = resolved.model_config.quant_config_dict
         assert len(layers) == 475
-        assert all(quant.kv_cache_quant_algo == layer_algo for quant in layers.values())
+        assert all(quant.kv_cache_quant_algo == QuantAlgo.FP8 for quant in layers.values())
     assert {key for key in gate["kv_cache"] if gate["kv_cache"][key] != ci["kv_cache"][key]} == {
         "dtype"
     }
@@ -1537,6 +1540,8 @@ def test_an_idle_rank_steps_with_a_one_token_generation_dummy(dep4):
         """The executor state `_pad_attention_dp_dummy_request` reads, with its own helpers."""
         executor = SimpleNamespace(
             enable_attention_dp=mapping.enable_attention_dp,
+            # The attention-DP group: a single-rank group skips dummy padding.
+            dist=SimpleNamespace(tp_size=mapping.tp_size),
             _enable_remote_tail_adp=False,
             # No speculative decoding: no draft KV cache joins the target's reuse.
             enable_joint_kv_cache_reuse=False,

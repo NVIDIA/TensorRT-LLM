@@ -1826,16 +1826,17 @@ def test_router_reads_the_quantization_config_intact(resolved):
     """`route`, which `ModelLoader._load_and_validate_config` (pyexecutor/model_loader.py) asks
     through `_router_index` for a target, is handed the checkpoint's `quantization_config`
     exactly as the native loader reads it from params.json -- params.json's own, the whole
-    `quantized_layers` map in its ModelOpt spelling -- and it stays so on the ModelConfig the
-    target is built from, on the tep4 mapping. The copies the LLM API and ModelConfig normalise
-    (and pop `quantized_layers` from) are their own."""
+    `quantized_layers` map in its ModelOpt spelling, plus the FP8 KV-cache algorithm the loader
+    records from `fp8_kv_cache` -- and it stays so on the ModelConfig the target is built from,
+    on the tep4 mapping. The copies the LLM API and ModelConfig normalise (and pop
+    `quantized_layers` from) are their own."""
     assert len(resolved.routed) == 1
     seen = resolved.routed[0]
-    on_disk = resolved.native.quantization_config
+    native = resolved.native.quantization_config
     params = json.loads((resolved.path / "params.json").read_text())
-    assert on_disk == params["quantization_config"]
-    assert seen.quantization_config == on_disk
-    assert resolved.model_config.pretrained_config.quantization_config == on_disk
+    assert native == dict(params["quantization_config"], kv_cache_quant_algo="FP8")
+    assert seen.quantization_config == native
+    assert resolved.model_config.pretrained_config.quantization_config == native
     assert seen.pretrained_config is resolved.model_config.pretrained_config
     assert resolved.model_config.modeling_v2_target is _Routed
     assert seen.compute_capability == _SM103 and seen.spec_config is None
@@ -2662,12 +2663,13 @@ def test_tep8_llm_api_admits_the_envelope_prompt(tep8, tep8_gate, tep8_32k):
 def test_tep8_quantization_is_the_anchor_key(deployment):
     """At tep8 as at tep4, at the 1M config as delivered: MIXED_PRECISION with the FP8 KV
     cache, the GSM8K anchor row's key, and the router handed params.json's quantization_config
-    with its 475 quantized_layers intact, on the tep8 mapping -- from core.yaml and from the boot
-    gate's command alike, whether they spell the latent fp8 (1M) or leave it at auto
-    (delivered)."""
+    with its 475 quantized_layers intact plus the FP8 KV-cache algorithm the native loader
+    records from fp8_kv_cache, on the tep8 mapping -- from core.yaml and from the boot gate's
+    command alike, whether they spell the latent fp8 (1M) or leave it at auto (delivered)."""
     resolved, _, _, kv_dtype = deployment
     on_disk = json.loads((resolved.path / "params.json").read_text())["quantization_config"]
     assert len(on_disk["quantized_layers"]) == 475
+    routed = dict(on_disk, kv_cache_quant_algo="FP8")
     assert resolved.prequantized is True
     for quant in (resolved.llm_args.quant_config, resolved.model_config.quant_config):
         assert quant.quant_algo == QuantAlgo.MIXED_PRECISION
@@ -2678,8 +2680,8 @@ def test_tep8_quantization_is_the_anchor_key(deployment):
 
     assert len(resolved.routed) == 1
     seen = resolved.routed[0]
-    assert seen.quantization_config == on_disk
-    assert resolved.model_config.pretrained_config.quantization_config == on_disk
+    assert seen.quantization_config == routed
+    assert resolved.model_config.pretrained_config.quantization_config == routed
     assert seen.pretrained_config is resolved.model_config.pretrained_config
     assert resolved.model_config.modeling_v2_target is _Routed
     assert seen.compute_capability == _SM103 and seen.spec_config is None
