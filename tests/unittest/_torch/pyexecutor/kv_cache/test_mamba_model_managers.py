@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for model-owned hybrid managers and shared recurrent state."""
 
+import math
 from dataclasses import replace
 from types import FunctionType, SimpleNamespace
 from unittest.mock import Mock
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaHybridCacheManager,
     MambaLayerCache,
+    MambaReplayState,
     MambaRole,
     MambaStateLayout,
 )
@@ -57,6 +59,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
+    DataRole,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheManagerConfig,
@@ -328,11 +331,12 @@ def test_k3_initializes_only_the_selected_state(
     else:
         selector.assert_not_called()
 
-    # The replay state declares its buffers through the common replay hook and receives their views from it.
+    # The replay state declares its buffers to the manager and receives their views from it.
     manager._replay_layouts = {
         layer_id: replay_layout
         for layer_id in (0, 1)
-        if (replay_layout := manager._get_replay_layout(layer_id))
+        if isinstance(state, MambaReplayState)
+        and (replay_layout := state.replay_layout(manager._state_layout, layer_id))
     }
     assert bool(manager._replay_layouts) == (num_spec is not None)
     replay_views = [{}, {}]
@@ -547,6 +551,38 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     assert manager.intermediate_ssm_states is None and state.intermediate_conv is None
     if mode == "replay":
         assert state.intermediate_ssm is None
+
+
+@pytest.mark.parametrize(
+    "state, shares_state_slot, shared_row",
+    [
+        (ReplayHistory(3), False, "mamba2_replay_meta"),
+        (GDNReplayState(3), False, "gdn_replay_meta"),
+        (GDNReplayState(3, use_flashinfer_ring=True), True, "gdn_replay_meta"),
+        (KDAReplayState(2), False, "prev_num_accepted_tokens"),
+        (KDAReplayState(2, draft_records=True), True, "prev_num_accepted_tokens"),
+    ],
+    ids=["mamba2", "gdn_triton", "gdn_ring", "kda", "kda_draft_records"],
+)
+def test_replay_states_declare_their_buffers_to_the_manager(state, shares_state_slot, shared_row):
+    """A replay state tells the hybrid manager its buffers per layer and whether its kernels address them by the
+    recurrent-state slot; the manager declares them as the replay-state region or as recurrent-state planes."""
+    layout = _layout()
+    assert isinstance(state, MambaReplayState)
+    assert state.replay_shares_state_slot == shares_state_slot
+    first, second = state.replay_layout(layout, 0), state.replay_layout(layout, 1)
+    # The first local layer also holds the per-request row every layer shares.
+    assert set(first) - set(second) == {DataRole(shared_row)}
+    assert all(math.prod(shape) > 0 for _, shape in first.values())
+
+
+@pytest.mark.parametrize(
+    "state",
+    [Mamba2State(), GDNIntermediateState(), KDAIntermediateState()],
+    ids=["mamba2", "gdn", "kda"],
+)
+def test_states_without_replay_declare_no_replay_buffers(state):
+    assert not isinstance(state, MambaReplayState)
 
 
 def test_ple_adds_buffers_without_overriding_snapshot_or_budget_solver():
@@ -782,7 +818,7 @@ def test_kda_pool_allocation_includes_replay_in_native_quota(
     manager._replay_layouts = {
         layer_id: replay_layout
         for layer_id in manager.mamba_pp_layers
-        if (replay_layout := manager._get_replay_layout(layer_id))
+        if replay and (replay_layout := manager._kda_replay.replay_layout(layout, layer_id))
     }
     manager._declare_regions()
     assert (REPLAY_STATE_REGION in manager.region_layout) == replay

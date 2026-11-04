@@ -158,7 +158,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
-    ReusePolicy,
     SsmLayerConfig,
     _introspection,
 )
@@ -2803,6 +2802,7 @@ def test_v2_hybrid_fp4_disagg_ignores_derived_mla_and_kda_replay_roles(
     mgr._state_layout = None
     # What __init__ declares for the KDA replay buffers, which the manager keeps out of transfers.
     mgr._replay_layouts = {0: {DataRole("kda_conv_q"): (torch.bfloat16, [8])}} if kda_replay else {}
+    mgr._speculative_state = KDAReplayState(2) if kda_replay else None
     mgr._declare_regions()
 
     ignored = mgr.get_disagg_ignored_roles()
@@ -5669,7 +5669,7 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     # leases per sequence with the overlap scheduler, plus the dummy slot), or planes of the recurrent-state region
     # with the drafts' records.
     mgr.layer_offsets = {0: 0, 1: 1}
-    mgr._replay_layouts = {0: mgr._get_replay_layout(0)}
+    mgr._replay_layouts = {0: mgr._kda_replay.replay_layout(mgr._state_layout, 0)}
     mgr._declare_regions()
     mgr._index_mapper_capacity = 2 * mgr.max_batch_size + mgr._num_reserved_dummy_slots
     return mgr
@@ -6614,12 +6614,18 @@ def test_v2_steady_state_index_upload_tracks_private_replay_slots():
 
 @skip_no_cuda
 def test_v2_replay_buffers_can_share_the_recurrent_state_slot():
-    """A manager can declare its replay buffers with the layer's REQUIRED policy instead: they join the recurrent-state
-    group and slot, use the state index, count in every state slot, and bound no living caches."""
+    """A replay state whose kernels address its buffers by the recurrent-state slot declares them as planes of the
+    recurrent-state region: they join the recurrent-state group and slot, use the state index, count in every state
+    slot, and bound no living caches."""
+
+    class CoupledReplayHistory(ReplayHistory):
+        replay_shares_state_slot = True
 
     class CoupledReplayManager(NemotronHybridCacheManager):
-        def _replay_reuse_policy(self):
-            return None
+        def _initialize_spec_state(self):
+            state = CoupledReplayHistory(self.spec_config.tokens_per_gen_step)
+            state.validate(self._state_layout)
+            return state
 
     mgr = _build_v2_mamba2_replay_manager(model_manager_cls=CoupledReplayManager)
     try:
@@ -8146,8 +8152,11 @@ def test_v2_kda_draft_records_share_the_state_slot(pool_sizing):
     plain = _v2_kda_draft_record_manager(
         kda_draft_records=False, enable_block_reuse=enable_block_reuse
     )
-    assert mgr._replay_reuse_policy() is None
-    assert plain._replay_reuse_policy() == ReusePolicy.PRIVATE
+    assert mgr._kda_replay.replay_shares_state_slot
+    assert not plain._kda_replay.replay_shares_state_slot
+    # With the records, the replay buffers are planes of the recurrent-state region.
+    assert REPLAY_STATE_REGION not in mgr.region_layout
+    assert REPLAY_STATE_REGION in plain.region_layout
     records = 3 * 2 * 8 * 256 * 4
     replay_bytes = sum(
         dtype.itemsize * math.prod(shape) for dtype, shape in mgr._replay_layouts[0].values()

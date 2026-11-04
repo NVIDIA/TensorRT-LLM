@@ -377,16 +377,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_state_layout=conv_state_layout,
         )
         self._speculative_state: MambaState | None = self._initialize_spec_state()
-        # Typed per-slot views of the replay buffers, keyed by global layer; the
-        # regions declare their bytes (declare_regions).
+        # Typed per-slot views of the model state's replay buffers, keyed by
+        # global layer; declare_regions declares their bytes.
+        state = self._speculative_state
         self._replay_layouts: Dict[int, ReplayLayout] = (
-            {}
-            if self._disagg_context_only
-            else {
+            {
                 layer_id: layout
                 for layer_id in self.mamba_pp_layers
-                if (layout := self._get_replay_layout(layer_id))
+                if (layout := state.replay_layout(self._state_layout, layer_id))
             }
+            if isinstance(state, MambaReplayState) and not self._disagg_context_only
+            else {}
         )
 
         if isinstance(num_kv_heads, int):
@@ -678,27 +679,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             BufferConfig(role=MambaRole.CONV_STATE, size=self.conv_bytes),
         ]
 
-    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
-        """Typed per-slot views of one local recurrent layer's replay buffers.
-
-        By default those the model state declares, when it is a
-        ``MambaReplayState``.
-        """
-        state = self._speculative_state
-        if isinstance(state, MambaReplayState):
-            return state.replay_layout(self._state_layout, global_layer_id)
-        return {}
-
-    def _replay_reuse_policy(self) -> Optional[ReusePolicy]:
-        """Where the replay buffers live: PRIVATE in a region of their own, None in the state slot.
-
-        By default the model state's ``replay_shares_state_slot`` decides.
-        """
-        state = self._speculative_state
-        if isinstance(state, MambaReplayState) and state.replay_shares_state_slot:
-            return None
-        return ReusePolicy.PRIVATE
-
     @override
     def _region_providers(self) -> Sequence[RegionProvider]:
         return (self,)
@@ -709,16 +689,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         ``RECURRENT_STATE_REGION`` is the state that requests snapshot into the
         prefix index at their declared points: SSM and convolution state, and
         the planes a model adds through ``_get_recurrent_buffer_configs``. The
-        model's replay buffers form ``REPLAY_STATE_REGION``, which never leaves
-        its request and holds one slot per living cache, or, when the kernels
-        address them by the recurrent-state slot, are planes of the
+        replay buffers of a ``MambaReplayState`` (``replay_layout``) form
+        ``REPLAY_STATE_REGION``, which never leaves its request and holds one
+        slot per living cache, or, when its kernels address them by the
+        recurrent-state slot (``replay_shares_state_slot``), are planes of the
         recurrent-state region and share its life cycle. Replay buffers are
         never transferred between disaggregated workers: the receiving worker
         starts them afresh. A disaggregated context server declares none.
         """
         if not self.mamba_pp_layers:
             return []
-        in_state_slot = bool(self._replay_layouts) and self._replay_reuse_policy() is None
+        # Replay layouts come from a MambaReplayState (see __init__).
+        in_state_slot = (
+            bool(self._replay_layouts) and self._speculative_state.replay_shares_state_slot
+        )
         recurrent_layers = []
         replay_layers = []
         for layer_id in self.mamba_pp_layers:

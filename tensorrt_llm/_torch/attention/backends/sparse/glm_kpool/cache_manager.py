@@ -40,9 +40,6 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _host_slots_to_device
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
-    ReplayLayout,
-)
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
@@ -129,12 +126,6 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
-
-    @override
-    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
-        if self._kda_replay is None:
-            return {}
-        return self._kda_replay.replay_layout(self._state_layout, global_layer_id)
 
     @override
     def _build_cache_config(self, config):

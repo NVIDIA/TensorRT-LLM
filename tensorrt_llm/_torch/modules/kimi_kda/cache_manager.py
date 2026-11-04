@@ -34,7 +34,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole, ReusePolicy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -477,6 +477,18 @@ class KDAReplayState:
             context.conv_state_shape[1],
             draft_records=self.draft_records,
         )
+
+    @property
+    def replay_shares_state_slot(self) -> bool:
+        """Whether the replay buffers live in the recurrent-state slot.
+
+        Without the drafts' records the replay buffers have replay slots of
+        their own. The kernels that read and write the records (the
+        experimental Kimi K3 engine's ``k3_kda_verify`` and ``k3_kda_attn``)
+        address the replay caches by the recurrent-state slot, so with the
+        records they share it.
+        """
+        return self.draft_records
 
     def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
         """Per-slot shapes of one local KDA layer's replay buffers.
@@ -1027,24 +1039,6 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay.pool_layout(self._state_layout)
 
     @override
-    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
-        if self._kda_replay is None:
-            return {}
-        return self._kda_replay.replay_layout(self._state_layout, global_layer_id)
-
-    @override
-    def _replay_reuse_policy(self) -> ReusePolicy | None:
-        """PRIVATE, except with the drafts' records.
-
-        The kernels that read and write the records (the experimental Kimi K3
-        engine's ``k3_kda_verify`` and ``k3_kda_attn``) address the replay
-        caches by the recurrent-state slot, so those replay buffers share it.
-        """
-        if self._kda_replay is not None and self._kda_replay.draft_records:
-            return None
-        return super()._replay_reuse_policy()
-
-    @override
     def _build_cache_config(self, config):
         if (
             self._kda_replay is not None
@@ -1168,7 +1162,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
         seed_bytes = KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
         if kwargs.get("kda_draft_records", False):
-            # See _replay_reuse_policy: the records' replay state shares every recurrent-state slot.
+            # With the records, the replay state shares every recurrent-state slot
+            # (KDAReplayState.replay_shares_state_slot).
             return seed_bytes + KDAReplayState.estimate_bytes_per_slot(
                 model_config, mapping, **kwargs
             )

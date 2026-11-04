@@ -2343,7 +2343,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
 
         ``replay_slot_indices`` are the requests' slots in the replay caches (``slot_indices`` when ``None``). The
         decode kernels address the replay caches by the state slot, so the cache manager keeps the per-token states
-        in the recurrent-state slot (see ``KimiK3HybridCacheManager._replay_reuse_policy``)."""
+        in the recurrent-state slot (see ``KDAReplayState.replay_shares_state_slot``)."""
         if not (self._has_kda_replay_caches(layer_cache) and layer_cache.kda_state_tok is not None):
             return super().forward_verify(
                 x2d,
