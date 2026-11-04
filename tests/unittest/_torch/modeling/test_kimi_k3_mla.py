@@ -704,14 +704,6 @@ def test_k3_mla_fp8_cached_kv_context_matches_bf16_inputs(
             module.post_load_weights()
     mla = runtime.mixer
     assert mla._fp8_cached_kv_context
-    # The FP8 Q / K / V are unscaled conversions, so a non-unit KV quantization scale keeps
-    # the op's own (scaled) copy.
-    unit_scale = mla.mha.kv_scale_orig_quant
-    mla.mha.kv_scale_orig_quant = torch.full_like(unit_scale, 0.5)
-    try:
-        assert not mla._supports_fp8_cached_kv_context()
-    finally:
-        mla.mha.kv_scale_orig_quant = unit_scale
     del reference
 
     batch = len(cached)

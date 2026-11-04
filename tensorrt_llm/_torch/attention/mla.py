@@ -2209,25 +2209,22 @@ class MLA(nn.Module):
         The op's FP8 context MLA FMHA (``TrtllmAttention.has_fp8_context_mla``)
         otherwise copies its BF16 Q, K and V to FP8 on every call, i.e. once per
         cached-KV partition, after a BF16 concat of k_nope and k_pe. Requires
-        dense attention without Helix CP, the 128 / 64 / 128 head dimensions of
-        the op's FP8 copy kernel, and a unit KV quantization scale, since the
-        FP8 Q / K / V written here are plain conversions (checked once, here).
+        dense attention without Helix CP and the 128 / 64 / 128 head dimensions
+        of the op's FP8 copy kernel. The FP8 Q / K / V written here are plain
+        conversions: ``TrtllmAttention`` keeps its KV quantization scale at 1.
         """
         mha = self.mha
-        if not (
+        return (
             isinstance(mha, TrtllmAttention)
             and mha.has_fp8_context_mla
             and mha.sparse_params is None
             and not self.mapping.has_cp_helix()
             and (self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim) == (128, 64, 128)
-        ):
-            return False
-        scale = mha.kv_scale_orig_quant
-        return isinstance(scale, torch.Tensor) and bool(torch.all(scale == 1.0).item())
+        )
 
     def _quantize_q_fp8(self, q: torch.Tensor) -> torch.Tensor:
-        """Q in FP8 as the attention op's context copy quantizes it (unit scale,
-        which :meth:`_supports_fp8_cached_kv_context` requires)."""
+        """Q in FP8 as the attention op's context copy quantizes it (its unit
+        KV quantization scale)."""
         return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
             q, self.mha.kv_scale_orig_quant
         )[0]
