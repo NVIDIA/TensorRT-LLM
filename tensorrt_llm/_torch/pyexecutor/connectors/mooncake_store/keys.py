@@ -19,15 +19,26 @@ is derived here. A block's hash covers its own tokens and every token before it,
 so a key can only be reused by a request whose prefix is byte-identical. The
 chain is seeded with a `ReuseScope` covering what the tokens do not record.
 
+Under one-model speculative decoding the draft layers write the KV at a position
+from the prompt tokens after it, so a block's hash then also covers the prompt
+lookahead the draft reads past the block's end, and the chain is seeded apart
+from the one a server without that lookahead uses. Pages a speculative server
+writes are therefore never served to a server whose draft reads differently,
+and the keys of a server without a draft are unchanged.
+
 A key is `<namespace>/<block hash>`. The namespace pins down everything else
-that decides what the stored bytes mean: the model, the shard that produced
-them, the layer group inside that shard, the tokens each page holds and how many
-bytes a page is. A change to any of those reads as a miss rather than as garbage.
+that decides what the stored bytes mean: the model, the attention shard that
+produced them, the layer group inside that shard, the tokens each page holds and
+how many bytes a page is. A change to any of those reads as a miss rather than
+as garbage. With `group_blocks`, the pages of one block also share an eviction
+group named by `KeyNamespace.group`.
 """
 
 import hashlib
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
 
 __all__ = [
     "BlockHashChain",
@@ -88,19 +99,58 @@ class BlockHashChain:
 
     Extended in place as the token list grows, so a generation step costs one
     digest per newly completed block rather than a rehash of the prompt.
+
+    With a prompt lookahead of `L` tokens, block `b` is hashed over its own
+    tokens and the `L` that follow it, `tokens[b * T : (b + 1) * T + L]` for `T`
+    tokens per block, so a block exists only once the `L` tokens after it do.
     """
 
-    def __init__(self, tokens_per_block: int, scope: Optional[ReuseScope] = None):
+    def __init__(
+        self,
+        tokens_per_block: int,
+        scope: Optional[ReuseScope] = None,
+        *,
+        prompt_lookahead: int = 0,
+    ):
+        """Start an empty chain.
+
+        Args:
+            tokens_per_block: Tokens each block, and so each hash, covers.
+            scope: What besides the tokens decides whose KV a hash names.
+            prompt_lookahead: Prompt tokens past a block's end that its KV
+                depends on: the `draft_prompt_lookahead` of a one-model draft
+                sharing the KV cache, 0 without one. A non-zero value seeds the
+                chain apart from the lookahead-0 one, whose keys it leaves as
+                they are.
+
+        Raises:
+            ValueError: When `tokens_per_block` is not positive or
+                `prompt_lookahead` is negative.
+        """
         if tokens_per_block <= 0:
             raise ValueError(f"tokens_per_block must be > 0, got {tokens_per_block}")
+        if prompt_lookahead < 0:
+            raise ValueError(f"prompt_lookahead must be >= 0, got {prompt_lookahead}")
         self._tokens_per_block = int(tokens_per_block)
+        self._prompt_lookahead = int(prompt_lookahead)
         self._seed = (scope or ReuseScope()).seed()
+        if self._prompt_lookahead:
+            # Mixed in only when non-zero, so every lookahead-0 key stays the one
+            # pools already hold.
+            self._seed = _digest(
+                self._seed, b"prompt-lookahead", self._prompt_lookahead.to_bytes(8, "little")
+            )
         self._hashes: List[bytes] = []
 
     @property
     def tokens_per_block(self) -> int:
         """Tokens covered by each entry in the chain."""
         return self._tokens_per_block
+
+    @property
+    def prompt_lookahead(self) -> int:
+        """Tokens past each block's end that its hash also covers."""
+        return self._prompt_lookahead
 
     @property
     def hashes(self) -> Sequence[bytes]:
@@ -110,6 +160,8 @@ class BlockHashChain:
     def extend(self, tokens: Sequence[int]) -> Sequence[bytes]:
         """Grow the chain to cover every full block of `tokens`.
 
+        A block counts as full only once its prompt lookahead is there too.
+
         Args:
             tokens: The request's complete token list, prompt first. Must
                 extend what was passed previously; a shorter list means the
@@ -118,20 +170,39 @@ class BlockHashChain:
         Returns:
             The full chain, indexed by block ordinal.
         """
-        num_full_blocks = len(tokens) // self._tokens_per_block
-        if num_full_blocks < len(self._hashes):
+        tokens_per_block = self._tokens_per_block
+        lookahead = self._prompt_lookahead
+        num_full_blocks = max(0, len(tokens) - lookahead) // tokens_per_block
+        first_new = len(self._hashes)
+        if num_full_blocks < first_new:
             raise ValueError(
-                f"token list shrank from {len(self._hashes)} to {num_full_blocks} "
+                f"token list shrank from {first_new} to {num_full_blocks} "
                 "full blocks; a hash chain belongs to exactly one request"
             )
-        for ordinal in range(len(self._hashes), num_full_blocks):
-            start = ordinal * self._tokens_per_block
-            block = tokens[start : start + self._tokens_per_block]
-            parent = self._hashes[-1] if self._hashes else self._seed
-            # Fixed-width little-endian token ids: a delimiter-free encoding
-            # would let two different token sequences serialize identically.
-            payload = b"".join(int(token).to_bytes(8, "little", signed=True) for token in block)
-            self._hashes.append(_digest(parent, payload))
+        if num_full_blocks == first_new:
+            return self._hashes
+        # Fixed-width little-endian token ids: a delimiter-free encoding would
+        # let two different token sequences serialize identically. '<i8' is the
+        # signed 8-byte little-endian encoding `int.to_bytes` produces, so the
+        # keys are unchanged; it is done in one call for every new block because
+        # per-token encoding dominated the lookup of a long prompt. A token
+        # outside int64 raises OverflowError before any block is appended.
+        # Windows of a block plus its lookahead start one block apart, so the
+        # payload runs `lookahead` tokens past the last new block.
+        payload = memoryview(
+            np.asarray(
+                tokens[
+                    first_new * tokens_per_block : num_full_blocks * tokens_per_block + lookahead
+                ],
+                dtype="<i8",
+            ).tobytes()
+        )
+        block_bytes = 8 * tokens_per_block
+        window_bytes = block_bytes + 8 * lookahead
+        parent = self._hashes[-1] if self._hashes else self._seed
+        for offset in range(0, (num_full_blocks - first_new) * block_bytes, block_bytes):
+            parent = _digest(parent, payload[offset : offset + window_bytes])
+            self._hashes.append(parent)
         return self._hashes
 
 
@@ -141,9 +212,10 @@ class KeyNamespace:
 
     namespace: str
     model_key: str
-    #: Global rank of the shard whose KV these bytes are, and the world size it
-    #: was produced under. Both are needed: rank 3 of 8 holds different heads
-    #: than rank 3 of 4.
+    #: The attention shard whose KV these bytes are, and the shard count it was
+    #: produced under: the global rank and world size under tensor parallelism,
+    #: 0 of 1 under attention DP, where every owner holds all heads. Both are
+    #: needed: rank 3 of 8 holds different heads than rank 3 of 4.
     rank: int
     world_size: int
     layer_group_id: int
@@ -163,3 +235,20 @@ class KeyNamespace:
     def key(self, block_hash: bytes) -> str:
         """The store key holding one page of this namespace."""
         return f"{self.prefix}/{block_hash.hex()}"
+
+    def group(self, block_hash: bytes) -> str:
+        """The Mooncake eviction group every page of one block is put into.
+
+        It leaves out the attention shard, the layer group, the tokens per
+        block and the page size, so every page a hit on this block needs (all
+        layer groups, all tensor-parallel shards) shares one group and the
+        master evicts them together. It keeps the shard count, so deployments
+        sharded differently never share a group.
+
+        Args:
+            block_hash: The block's hash, as its keys carry it.
+
+        Returns:
+            The group id to put the block's pages under.
+        """
+        return f"{self.namespace}/{self.model_key}/w{self.world_size}/{block_hash.hex()}"
