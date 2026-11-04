@@ -1725,8 +1725,14 @@ def _whole_text_tool_calls(
         output.text,
         streaming=False,
         chat_template_kwargs=reasoning_chat_template_kwargs(request))
-    normal_text, calls = _apply_tool_parser(tool_parser_id, tools, output.index,
-                                            content, False)
+    normal_text, calls = _apply_tool_parser(tool_parser_id,
+                                            tools,
+                                            output.index,
+                                            content,
+                                            False,
+                                            truncated=getattr(
+                                                output, "finish_reason",
+                                                None) == "length")
     streamed = "".join(item.text for item in helper.emitted_item_ids
                        if item.item_type == "message")
     if normal_text.startswith(streamed):
@@ -1764,7 +1770,15 @@ def _apply_tool_parser(
     tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
     finished: bool = False,
     partial: bool = False,
+    truncated: Optional[bool] = None,
 ) -> Tuple[str, list[ToolCallItem]]:
+    """Run the tool parser over ``text``.
+
+    ``truncated`` applies to a whole-text parse: when it is not None, ``text``
+    is a finished generation and ``truncated`` says whether it was cut off, so
+    the parser can recover a call the output ended inside, as ``finish`` does
+    for a stream.
+    """
     tool_parser: Optional[BaseToolParser] = None
     if tool_parser_id is not None and tools is not None:
         if tool_parser_dict is not None:
@@ -1779,8 +1793,14 @@ def _apply_tool_parser(
 
     if tool_parser is not None and tools is not None:
         if not streaming:
-            result = (tool_parser.parse_partial(text, tools)
-                      if partial else tool_parser.detect_and_parse(text, tools))
+            if partial:
+                result = tool_parser.parse_partial(text, tools)
+            elif truncated is not None:
+                result = tool_parser.parse_finished(text,
+                                                    tools,
+                                                    truncated=truncated)
+            else:
+                result = tool_parser.detect_and_parse(text, tools)
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
@@ -1874,8 +1894,14 @@ def _create_output_content(
         reasoning_texts.append(reasoning_text or "")
 
         if text:
-            text, calls = _apply_tool_parser(tool_parser, available_tools,
-                                             output.index, text, False)
+            text, calls = _apply_tool_parser(tool_parser,
+                                             available_tools,
+                                             output.index,
+                                             text,
+                                             False,
+                                             truncated=getattr(
+                                                 output, "finish_reason",
+                                                 None) == "length")
 
         stored_text: Optional[str] = None
         stored_reasoning: Optional[str] = None

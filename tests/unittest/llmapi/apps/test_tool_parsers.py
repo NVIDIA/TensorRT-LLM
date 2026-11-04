@@ -1645,6 +1645,29 @@ class TestQwen3CoderRequiredTools:
             args, [text], "length")
         assert streamed[-1]["choices"][0]["finish_reason"] == "length"
 
+    def test_eos_after_function_returns_the_call(self, sample_tools):
+        """EOS between </function> and </tool_call>: whole and streamed agree."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        text = self._call("get_weather", "location", "Denver")[:-12]
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="qwen3_coder")
+        args.tool_choice = "required"
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(text, "stop"),
+            args)
+        assert whole.choices[0].finish_reason == "tool_calls"
+        [call] = whole.choices[0].message.tool_calls
+        assert call.function.name == "get_weather"
+        assert json.loads(call.function.arguments) == {"location": "Denver"}
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="qwen3_coder")
+        args.tool_choice = "required"
+        streamed = TestForcedToolChoicePostprocessing._stream_deltas(
+            args, [text], "stop")
+        assert streamed[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
 
 class TestQwen3CoderParameterRecovery:
     FIRST = "<tool_call><function=f><parameter=x>abc</function></tool_call>"
@@ -1872,6 +1895,63 @@ class TestQwen3CoderStreamEnd:
         calls = self._stream(Qwen3CoderToolParser(), tools, text, chunk_size)
         assert [(item["name"], json.loads(item["arguments"]))
                 for item in calls] == [("f", expected)]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n"
+            "</function>",
+            "<tool_call>\n<function=f>\n</function>",
+            "<tool_call>\n<function=f>\n",
+            "<tool_call>\n<function=f>\n<parameter=x>\nabc\n</function>",
+            "<tool_call>\n<function=f>\n<parameter=scale>\n42\n</function>",
+            "<tool_call><function=f><parameter=x>abc</function></tool_call",
+            "<tool_call><function=f><parameter=x>abc",
+            "<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n"
+            "<parameter=b>\n2\n</param",
+            "<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n"
+            "</func",
+            # A complete call before the unterminated one.
+            "<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n"
+            "</function>\n</tool_call>\n<tool_call>\n<function=f>\n"
+            "<parameter=b>\n2\n</function>",
+        ])
+    def test_finished_whole_parse_matches_stream(self, tools, text):
+        """A finished, untruncated output parses to the calls its stream sends."""
+        result = Qwen3CoderToolParser().parse_finished("Sure. " + text,
+                                                       tools,
+                                                       truncated=False)
+        streamed = self._stream(Qwen3CoderToolParser(), tools, "Sure. " + text,
+                                10000)
+        assert result.normal_text.strip() == "Sure."
+        assert [
+            (call.name, json.loads(call.parameters)) for call in result.calls
+        ] == [(item["name"], json.loads(item["arguments"]))
+              for item in streamed]
+
+    @pytest.mark.parametrize("truncated", [True, None])
+    def test_unterminated_call_stays_content_unless_finished(
+            self, tools, truncated):
+        """Truncated output, or a parse that does not know, keeps the old reading."""
+        text = ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n"
+                "</function>\n")
+        parser = Qwen3CoderToolParser()
+        result = (parser.detect_and_parse(text, tools) if truncated is None else
+                  parser.parse_finished(text, tools, truncated=truncated))
+        assert result.normal_text == text
+        assert result.calls == []
+
+    @pytest.mark.parametrize("text", [
+        "<tool_call>\n<function=",
+        "<tool_call>\n<function=f",
+        "<tool_call>\n<function=>\n<parameter=x>\nabc\n</function>",
+    ])
+    def test_unterminated_call_without_name_stays_content(self, tools, text):
+        result = Qwen3CoderToolParser().parse_finished(text,
+                                                       tools,
+                                                       truncated=False)
+        assert result.normal_text == text
+        assert result.calls == []
 
 
 class TestQwen3CoderToolParser(BaseToolParserTestClass):
