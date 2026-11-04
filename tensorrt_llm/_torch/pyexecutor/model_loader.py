@@ -56,7 +56,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
@@ -70,7 +70,7 @@ _KV_CACHE_MAP = {
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto",
-    # Mixed-precision KV: the retained tokens and attention use the second
+    # Mixed-precision KV: the first/last tokens and attention use the second
     # dtype. float16/bfloat16 leave the KV cache unquantized and must equal
     # the model dtype (checked in validate_and_set_kv_cache_quant).
     "mixed_nvfp4_fp8": QuantAlgo.FP8.value,
@@ -121,6 +121,19 @@ _MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
     rope_types=frozenset({"mrope"}),
     rope_fusion=frozenset({False}),
 )
+
+# TorchLlmArgs fields that only the model classes listing them in
+# `model_specific_llm_args` implement.
+_MODEL_SPECIFIC_LLM_ARGS = ("replicate_embedding",
+                            "mnnvl_allreduce_fp8_payload")
+
+
+def _reject_unsupported_model_llm_args(llm_args: TorchLlmArgs,
+                                       model_cls: type) -> None:
+    supported = getattr(model_cls, "model_specific_llm_args", frozenset())
+    for name in _MODEL_SPECIFIC_LLM_ARGS:
+        if getattr(llm_args, name) and name not in supported:
+            raise ValueError(f"{name} is not supported by {model_cls.__name__}")
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -188,6 +201,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # PyTorch configuration quantization
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+    unquantized_mixed_precision_high_dtype = mapped_pyt_quant is None
+    sparse_attention_config = model_config.sparse_attention_config
+    if (pyt_kv_cache_dtype.startswith("mixed_")
+            and sparse_attention_config is not None
+            and sparse_attention_config.algorithm in ("dsa", "deepseek_v4")):
+        # These backends keep the history in their own pool, in the mixed-precision low
+        # format; a drafter inherits this KV dtype from the model, as for every KV dtype.
+        # TODO: keep drafters that are not MTP in the mixed-precision high dtype on every backend.
+        mapped_pyt_quant = _KV_CACHE_MAP[pyt_kv_cache_dtype.split("_")[1]]
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
@@ -200,6 +222,10 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             and not supports_fp4_mla_attention(model_config)
             and not uses_minimax_m3_msa and torch.cuda.is_available()
             and get_sm_version() == 107):
+        if pyt_kv_cache_dtype.startswith("mixed_"):
+            raise ValueError(
+                f'kv_cache_config.dtype="{pyt_kv_cache_dtype}" keeps the history '
+                "in NVFP4, which sparse MLA does not support on SM107.")
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
@@ -224,15 +250,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    # An unquantized retained dtype has to be the model dtype; KVCacheManagerV2
+    # An unquantized mixed-precision high dtype has to be the model dtype; KVCacheManagerV2
     # would otherwise reject it after the weights are loaded.
-    if mapped_pyt_quant is None:
-        retained_dtype = str_dtype_to_torch(
+    if unquantized_mixed_precision_high_dtype:
+        mixed_precision_high_dtype = str_dtype_to_torch(
             pyt_kv_cache_dtype.rsplit("_", 1)[1])
-        if model_config.torch_dtype != retained_dtype:
+        if model_config.torch_dtype != mixed_precision_high_dtype:
             raise ValueError(
                 f'llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" keeps '
-                f"the retained tokens in {retained_dtype}, but the model dtype "
+                f"the first/last tokens in {mixed_precision_high_dtype}, but the model dtype "
                 f"is {model_config.torch_dtype}.")
 
     # If we get to this point we have a valid explicit quantization setting.
@@ -947,6 +973,8 @@ class ModelLoader:
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
+        if model_cls is not None:
+            _reject_unsupported_model_llm_args(llm_args, model_cls)
         original_kv_cache_manager_setting = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
@@ -1070,7 +1098,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
+    ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -1595,7 +1623,7 @@ class ModelLoader:
                 # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
                 # follow-up, drop the validator gate AFTER moving these calls
                 # into the pool scope.
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()
@@ -2118,6 +2146,12 @@ class ModelLoader:
             moe_load_balancer=self.llm_args.moe_config.load_balancer,
             lora_config=self.lora_config,
             allreduce_strategy=self.llm_args.allreduce_strategy,
+            mnnvl_allreduce_fp8_payload=self.llm_args.
+            mnnvl_allreduce_fp8_payload,
+            replicate_embedding=self.llm_args.replicate_embedding,
+            cuda_graph_batch_sizes=tuple(
+                self.llm_args.cuda_graph_config.batch_sizes or
+                ()) if self.llm_args.cuda_graph_config else (),
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
