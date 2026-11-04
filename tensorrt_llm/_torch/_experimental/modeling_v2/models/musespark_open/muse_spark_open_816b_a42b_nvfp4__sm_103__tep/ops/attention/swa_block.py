@@ -33,6 +33,21 @@ cache bytes, the attention output and the gated o_proj input.
 Each program of the split grid owns exactly one 32-key block (``num_splits``
 must cover the window's largest block count, which ``window_splits`` does);
 that is what lets its cached K/V be read before the wait.
+
+``blocks_per_program`` > 1 runs the split as fewer programs: each owns that
+many consecutive key blocks, reads the cached K/V of all of them before the
+wait, prepares its query rows once, then runs each block with the
+one-block program's statements from a fresh online-softmax state and stores
+that block's partial in the block's own slot. The partials, the combine and
+every output bit are the ones of ``blocks_per_program = 1``; what changes is
+how many programs the grid has (``ceil(num_splits / blocks_per_program)`` per
+head and row group), which decides how many rounds of resident programs a
+step of several sequences needs.
+
+``split_max_registers`` (with ``blocks_per_program`` > 1) compiles that split
+kernel under a register cap per thread (Triton's ``maxnreg``): register
+allocation only, so the same instructions on the same values and the same
+bits, with more programs resident per SM (``SPLIT_REGISTER_CAP``: three).
 """
 
 from __future__ import annotations
@@ -67,6 +82,14 @@ from .preattn_prep import preattn_prep as _preattn_prep
 HEAD_DIM = _HEAD_DIM
 #: Stages of the split kernel's key loop: it runs at most once per program.
 NUM_STAGES = 1
+#: The key blocks one split program may own (``blocks_per_program``).
+MAX_BLOCKS_PER_PROGRAM = 4
+#: Registers per thread at which three 128-thread split programs fit an SM's 64K registers
+#: (65536 / 384 = 170, rounded down to the allocation granule of 8).
+SPLIT_REGISTER_CAP = 168
+#: The register caps ``split_max_registers`` takes.
+MIN_SPLIT_REGISTERS = 128
+MAX_SPLIT_REGISTERS = 255
 
 #: The split kernel takes 144 registers: 3 CTAs of 4 warps per SM.
 _SPLIT_CTAS_PER_SM = 3
@@ -1207,6 +1230,532 @@ def _swa_split_kernel(
 
 
 @triton.jit
+def _block_kv(
+    pool_ptr,
+    bt_ptr,
+    bt_stride_kv,
+    h,
+    base,
+    blk,
+    n_blocks,
+    lo,
+    past,
+    L,
+    D: tl.constexpr,
+    P: tl.constexpr,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Key block ``blk``'s keys ``j``, its step-key mask and its cached K/V (zeros elsewhere).
+
+    ``_swa_split_kernel``'s pre-wait statements for a program whose block is ``blk``: the
+    block-table entries and the FP8 K/V of the cached keys ``lo <= j < past``; a block at or
+    past ``n_blocks`` is empty and loads nothing.
+    """
+    d = tl.arange(0, D)
+    j = base + blk * BLOCK + tl.arange(0, BLOCK)
+    live = blk < n_blocks
+    cached = (j >= lo) & (j < past) & live
+    new = (j >= past) & (j < L) & live
+    page_k = tl.load(bt_ptr + j // P, mask=cached, other=0).to(tl.int64)
+    page_v = tl.load(bt_ptr + bt_stride_kv + j // P, mask=cached, other=0).to(tl.int64)
+    in_page = (h * P + j % P) * D
+    k_old = tl.load(
+        pool_ptr + (page_k * PAGE + in_page)[:, None] + d[None, :],
+        mask=cached[:, None],
+        other=0.0,
+    )
+    v_old = tl.load(
+        pool_ptr + (page_v * PAGE + in_page)[:, None] + d[None, :],
+        mask=cached[:, None],
+        other=0.0,
+    )
+    return j, new, k_old, v_old
+
+
+@triton.jit
+def _block_attend(
+    m_i,
+    l_i,
+    acc,
+    q,
+    qk_scale,
+    q_pos,
+    j,
+    new,
+    k_old,
+    v_old,
+    blk,
+    n_blocks,
+    base,
+    lo,
+    past,
+    qkv_ptr,
+    qkv_stride,
+    k_col,
+    v_col,
+    cos_sin_ptr,
+    positions_ptr,
+    prep_eps,
+    scale_bf16,
+    D: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FUSED_PREP: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+):
+    """One key block's online-softmax update of ``(m_i, l_i, acc)``: ``_swa_split_kernel``'s
+    key loop for a program whose block is ``blk``, statement for statement (the step's keys
+    of the block are prepared from the projection here; their RoPE rows are read here too,
+    which is after the wait and the same values)."""
+    d = tl.arange(0, D)
+    new_row = j - past
+    # Whether this key block holds any of the step's own keys.
+    has_new = base + blk * BLOCK + BLOCK > past
+    for b in range(blk, tl.minimum(blk + 1, n_blocks)):  # at most once
+        if FUSED_PREP:
+            k_new = tl.zeros([BLOCK, D], tl.bfloat16)
+            if has_new:
+                cos_k, sin_k = _rope_rows(cos_sin_ptr, positions_ptr, new_row, new, APPLY_ROPE)
+                k_new = _prep_rows(
+                    qkv_ptr,
+                    new_row * qkv_stride,
+                    tl.zeros([BLOCK], tl.int32) + k_col,
+                    new,
+                    cos_k,
+                    sin_k,
+                    1.0,
+                    prep_eps,
+                    BLOCK,
+                    APPLY_ROPE,
+                )
+        else:
+            k_new = tl.load(
+                qkv_ptr + new_row[:, None] * qkv_stride + k_col + d[None, :],
+                mask=new[:, None],
+                other=0.0,
+            )
+        v_new = tl.load(
+            qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :],
+            mask=new[:, None],
+            other=0.0,
+        )
+        k = tl.where(new[:, None], _to_cache_fp8(k_new, scale_bf16), k_old)
+        v = tl.where(new[:, None], _to_cache_fp8(v_new, scale_bf16), v_old)
+        s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * qk_scale
+        keep = (j[None, :] <= q_pos[:, None]) & (j[None, :] >= lo)
+        if WINDOW > 0:
+            keep = keep & (j[None, :] > q_pos[:, None] - WINDOW)
+        s = tl.where(keep, s, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.math.exp2(m_i - m_new)
+        p = tl.math.exp2(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16))
+        m_i = m_new
+    return m_i, l_i, acc
+
+
+@triton.jit
+def _store_partial(
+    part_o_ptr,
+    part_ml_ptr,
+    slot,
+    slots,
+    h,
+    r,
+    row_ok,
+    acc,
+    m_i,
+    l_i,
+    dequant,
+    HKV: tl.constexpr,
+    MG: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Store one partial at ``slot`` (nothing at or past ``slots``), as the split kernel does."""
+    d = tl.arange(0, D)
+    ok = row_ok & (slot < slots)
+    part = (slot * HKV + h) * MG + r
+    tl.store(part_o_ptr + part[:, None] * D + d[None, :], acc * dequant, mask=ok[:, None])
+    tl.store(part_ml_ptr + part * 2, m_i, mask=ok)
+    tl.store(part_ml_ptr + part * 2 + 1, l_i, mask=ok)
+
+
+@triton.jit
+def _swa_split_bpp_kernel(
+    qkv_ptr,
+    qkv_stride,
+    pool_ptr,
+    bt_ptr,
+    bt_stride_kv,
+    seq_len_ptr,
+    scale_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    prep_eps,
+    q_scale,
+    part_o_ptr,
+    part_ml_ptr,
+    sm_scale_log2,
+    num_splits,
+    M: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    D: tl.constexpr,
+    P: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+    R: tl.constexpr,
+    Q_FP8: tl.constexpr,
+    FUSED_PREP: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    BPP: tl.constexpr,
+    REQS: tl.constexpr = 1,
+    MERGE: tl.constexpr = False,
+):
+    """``_swa_split_kernel`` with ``BPP`` (2..4) consecutive key blocks per program.
+
+    Program ``(s, h, row group)`` owns blocks ``s * BPP .. s * BPP + BPP - 1``. Before the
+    wait it reads what the one-block programs of those blocks read there (their cached K/V,
+    the graph inputs) except the RoPE rows of the step's keys, which it reads with the
+    projection; after the wait it writes the step's K/V when it owns block 0 and prepares its
+    query rows once. Each block then runs that block's one-block statements from the initial
+    online-softmax state and stores its partial in slot ``block`` (``num_splits`` slots, the
+    combine unchanged), so every partial and every cache byte is the one-block kernel's.
+
+    ``MERGE`` (not used by the ops; the profile bench measures it) instead carries the
+    softmax state across the program's blocks and stores one partial per program in slot
+    ``s`` of ``ceil(num_splits / BPP)``: a different association of the same FP32 merge,
+    which does not reproduce the one-block bits.
+    """
+    G: tl.constexpr = HQ // HKV
+    PAGE: tl.constexpr = HKV * P * D
+    MG: tl.constexpr = M * G
+    pid = tl.program_id(0)
+    h = tl.program_id(1)
+    row_group = tl.program_id(2)
+    if MERGE:
+        slots = tl.cdiv(num_splits, BPP)
+    else:
+        slots = num_splits
+    if REQS > 1:
+        # As _swa_split_kernel: request ``req``'s rows, length, table row, positions, partials.
+        RG: tl.constexpr = (M * G + R - 1) // R
+        req = row_group // RG
+        row_group = row_group % RG
+        qkv_ptr += req * M * qkv_stride
+        bt_ptr += req * 2 * bt_stride_kv  # [requests, 2, pages], K then V rows
+        seq_len_ptr += req
+        if APPLY_ROPE:
+            positions_ptr += req * M
+        part_o_ptr += req * slots * HKV * MG * D
+        part_ml_ptr += req * slots * HKV * MG * 2
+    d = tl.arange(0, D)
+
+    q_stride = D
+    k_col = HQ * D + h * D
+    v_col = (HQ + HKV) * D + h * D
+    if FUSED_PREP:
+        if not QKV_PERMUTED:
+            q_stride = 2 * D
+            k_col = 2 * HQ * D + h * D
+            v_col = 2 * HQ * D + HKV * D + h * D
+
+    # ---- Before the wait: as _swa_split_kernel, for every block this program owns.
+    L = tl.load(seq_len_ptr)
+    past = L - M
+    if WINDOW > 0:
+        lo = tl.maximum(past - WINDOW + 1, 0)
+    else:
+        lo = 0
+    base = (lo // BLOCK) * BLOCK
+    n_blocks = tl.cdiv(L - base, BLOCK)
+    scale = tl.load(scale_ptr)
+    scale_bf16 = scale.to(tl.bfloat16)
+    dequant = 1.0 / scale
+
+    blk = pid * BPP
+    j0, new0, k_old0, v_old0 = _block_kv(
+        pool_ptr, bt_ptr, bt_stride_kv, h, base, blk, n_blocks, lo, past, L, D, P, PAGE, BLOCK
+    )
+    if BPP > 1:
+        j1, new1, k_old1, v_old1 = _block_kv(
+            pool_ptr, bt_ptr, bt_stride_kv, h, base, blk + 1, n_blocks, lo, past, L, D, P, PAGE,
+            BLOCK,
+        )  # fmt: skip
+    if BPP > 2:
+        j2, new2, k_old2, v_old2 = _block_kv(
+            pool_ptr, bt_ptr, bt_stride_kv, h, base, blk + 2, n_blocks, lo, past, L, D, P, PAGE,
+            BLOCK,
+        )  # fmt: skip
+    if BPP > 3:
+        j3, new3, k_old3, v_old3 = _block_kv(
+            pool_ptr, bt_ptr, bt_stride_kv, h, base, blk + 3, n_blocks, lo, past, L, D, P, PAGE,
+            BLOCK,
+        )  # fmt: skip
+
+    writer = (pid == 0) & (row_group == 0)
+    tok = tl.arange(0, 8)
+    tok_ok = tok < M
+    write_ok = tok_ok & writer
+    pos = past + tok
+    w_page_k = tl.load(bt_ptr + pos // P, mask=write_ok, other=0).to(tl.int64)
+    w_page_v = tl.load(bt_ptr + bt_stride_kv + pos // P, mask=write_ok, other=0).to(tl.int64)
+    slot = (h * P + pos % P) * D
+
+    r = row_group * R + tl.arange(0, R)  # row = token * G + query head within the KV group
+    t = r // G
+    row_ok = t < M
+    if FUSED_PREP:
+        cos_q, sin_q = _rope_rows(cos_sin_ptr, positions_ptr, t, row_ok, APPLY_ROPE)
+        cos_w, sin_w = _rope_rows(cos_sin_ptr, positions_ptr, tok, write_ok, APPLY_ROPE)
+
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    if writer:
+        # The step's K/V into the paged cache, as _swa_split_kernel's (0, h, 0) program.
+        if FUSED_PREP:
+            k_new = _prep_rows(
+                qkv_ptr,
+                tok * qkv_stride,
+                tl.zeros([8], tl.int32) + k_col,
+                tok_ok,
+                cos_w,
+                sin_w,
+                1.0,
+                prep_eps,
+                8,
+                APPLY_ROPE,
+            )
+        else:
+            k_new = tl.load(
+                qkv_ptr + tok[:, None] * qkv_stride + k_col + d[None, :],
+                mask=tok_ok[:, None],
+                other=0.0,
+            )
+        v_new = tl.load(
+            qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
+            mask=tok_ok[:, None],
+            other=0.0,
+        )
+        tl.store(
+            pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :],
+            _to_cache_fp8(k_new, scale_bf16),
+            mask=tok_ok[:, None],
+        )
+        tl.store(
+            pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :],
+            _to_cache_fp8(v_new, scale_bf16),
+            mask=tok_ok[:, None],
+        )
+
+    # The query rows, once for all the program's blocks.
+    q_head = h * G + r % G
+    if FUSED_PREP:
+        q = _prep_rows(
+            qkv_ptr,
+            t * qkv_stride,
+            q_head * q_stride,
+            row_ok,
+            cos_q,
+            sin_q,
+            q_scale,
+            prep_eps,
+            R,
+            APPLY_ROPE,
+        )
+        q = tl.where(row_ok[:, None], q, 0.0)
+    else:
+        q = tl.load(
+            qkv_ptr + t[:, None] * qkv_stride + q_head[:, None] * D + d[None, :],
+            mask=row_ok[:, None],
+            other=0.0,
+        )
+    qk_scale = sm_scale_log2 * dequant
+    if Q_FP8:
+        q = _to_cache_fp8(q, scale_bf16).to(tl.bfloat16)
+        qk_scale = qk_scale * dequant
+    q_pos = past + t
+
+    m_i = tl.full([R], -1.0e30, tl.float32)
+    l_i = tl.zeros([R], tl.float32)
+    acc = tl.zeros([R, D], tl.float32)
+    m_i, l_i, acc = _block_attend(
+        m_i, l_i, acc, q, qk_scale, q_pos, j0, new0, k_old0, v_old0, blk, n_blocks, base, lo,
+        past, qkv_ptr, qkv_stride, k_col, v_col, cos_sin_ptr, positions_ptr, prep_eps,
+        scale_bf16, D, WINDOW, BLOCK, FUSED_PREP, APPLY_ROPE,
+    )  # fmt: skip
+    if not MERGE:
+        _store_partial(part_o_ptr, part_ml_ptr, blk, slots, h, r, row_ok, acc, m_i, l_i,
+                       dequant, HKV, MG, D)  # fmt: skip
+    if BPP > 1:
+        if not MERGE:
+            m_i = tl.full([R], -1.0e30, tl.float32)
+            l_i = tl.zeros([R], tl.float32)
+            acc = tl.zeros([R, D], tl.float32)
+        m_i, l_i, acc = _block_attend(
+            m_i, l_i, acc, q, qk_scale, q_pos, j1, new1, k_old1, v_old1, blk + 1, n_blocks,
+            base, lo, past, qkv_ptr, qkv_stride, k_col, v_col, cos_sin_ptr, positions_ptr,
+            prep_eps, scale_bf16, D, WINDOW, BLOCK, FUSED_PREP, APPLY_ROPE,
+        )  # fmt: skip
+        if not MERGE:
+            _store_partial(part_o_ptr, part_ml_ptr, blk + 1, slots, h, r, row_ok, acc, m_i,
+                           l_i, dequant, HKV, MG, D)  # fmt: skip
+    if BPP > 2:
+        if not MERGE:
+            m_i = tl.full([R], -1.0e30, tl.float32)
+            l_i = tl.zeros([R], tl.float32)
+            acc = tl.zeros([R, D], tl.float32)
+        m_i, l_i, acc = _block_attend(
+            m_i, l_i, acc, q, qk_scale, q_pos, j2, new2, k_old2, v_old2, blk + 2, n_blocks,
+            base, lo, past, qkv_ptr, qkv_stride, k_col, v_col, cos_sin_ptr, positions_ptr,
+            prep_eps, scale_bf16, D, WINDOW, BLOCK, FUSED_PREP, APPLY_ROPE,
+        )  # fmt: skip
+        if not MERGE:
+            _store_partial(part_o_ptr, part_ml_ptr, blk + 2, slots, h, r, row_ok, acc, m_i,
+                           l_i, dequant, HKV, MG, D)  # fmt: skip
+    if BPP > 3:
+        if not MERGE:
+            m_i = tl.full([R], -1.0e30, tl.float32)
+            l_i = tl.zeros([R], tl.float32)
+            acc = tl.zeros([R, D], tl.float32)
+        m_i, l_i, acc = _block_attend(
+            m_i, l_i, acc, q, qk_scale, q_pos, j3, new3, k_old3, v_old3, blk + 3, n_blocks,
+            base, lo, past, qkv_ptr, qkv_stride, k_col, v_col, cos_sin_ptr, positions_ptr,
+            prep_eps, scale_bf16, D, WINDOW, BLOCK, FUSED_PREP, APPLY_ROPE,
+        )  # fmt: skip
+        if not MERGE:
+            _store_partial(part_o_ptr, part_ml_ptr, blk + 3, slots, h, r, row_ok, acc, m_i,
+                           l_i, dequant, HKV, MG, D)  # fmt: skip
+    if MERGE:
+        _store_partial(part_o_ptr, part_ml_ptr, pid, slots, h, r, row_ok, acc, m_i, l_i,
+                       dequant, HKV, MG, D)  # fmt: skip
+
+
+def launch_split_bpp(
+    qkv: torch.Tensor,
+    kv_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    table_stride_kv: int,
+    seq_lens: torch.Tensor,
+    kv_scale_orig_quant: torch.Tensor,
+    cos_sin: Optional[torch.Tensor],
+    positions: Optional[torch.Tensor],
+    prep_eps: float,
+    q_scale: float,
+    part_o: torch.Tensor,
+    part_ml: torch.Tensor,
+    num_splits: int,
+    *,
+    rows: int,
+    reqs: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    window: int,
+    q_fp8: bool,
+    fused_prep: bool,
+    qkv_permuted: bool,
+    enable_pdl: bool,
+    blocks_per_program: int,
+    merge: bool = False,
+    max_registers: Optional[int] = None,
+):
+    """Launch ``_swa_split_bpp_kernel`` of a ``reqs``-sequence step into ``part_o`` / ``part_ml``.
+
+    ``blocks_per_program`` 2..4 key blocks per program, ``ceil(num_splits /
+    blocks_per_program)`` programs per head and row group, with the arguments the ops pass
+    ``_swa_split_kernel`` (``blocks_per_program = 1`` is that kernel, which the ops launch
+    themselves). ``cos_sin`` / ``positions`` are ``None`` without RoPE. ``merge`` is for
+    measurements only (see the kernel); the ops never pass it. ``max_registers``: the compile's
+    register cap per thread (``maxnreg``; register allocation only, the same instructions'
+    results). Returns the compiled kernel.
+    """
+    rope = cos_sin is not None
+    row_groups = reqs * triton.cdiv(rows * Q_PER_KV, ROWS_PER_PROGRAM)
+    args = (
+        qkv,
+        qkv.stride(0),
+        kv_pool,
+        block_tables,
+        table_stride_kv,
+        seq_lens,
+        kv_scale_orig_quant,
+        cos_sin if rope else kv_scale_orig_quant,
+        positions if rope else seq_lens,
+        prep_eps,
+        q_scale,
+        part_o,
+        part_ml,
+        math.log2(math.e) / math.sqrt(HEAD_DIM),
+        num_splits,
+    )
+    meta = dict(
+        M=rows,
+        HQ=num_q_heads,
+        HKV=num_kv_heads,
+        D=HEAD_DIM,
+        P=kv_pool.shape[2],
+        WINDOW=window,
+        BLOCK=BLOCK_N,
+        R=ROWS_PER_PROGRAM,
+        Q_FP8=q_fp8,
+        FUSED_PREP=fused_prep,
+        QKV_PERMUTED=qkv_permuted,
+        APPLY_ROPE=rope,
+        LAUNCH_WITH_PDL=enable_pdl,
+    )
+    if reqs > 1:
+        meta["REQS"] = reqs
+    if max_registers is not None:
+        meta["maxnreg"] = max_registers
+    programs = triton.cdiv(num_splits, blocks_per_program)
+    return _swa_split_bpp_kernel[(programs, num_kv_heads, row_groups)](
+        *args,
+        **meta,
+        BPP=blocks_per_program,
+        MERGE=merge,
+        num_warps=NUM_WARPS,
+        num_stages=NUM_STAGES,
+        launch_pdl=enable_pdl,
+    )
+
+
+def check_blocks_per_program(
+    blocks_per_program: int, split_max_registers: Optional[int] = None
+) -> None:
+    """Raise ValueError unless ``blocks_per_program`` is 1..``MAX_BLOCKS_PER_PROGRAM`` and
+    ``split_max_registers`` is ``None`` or, with ``blocks_per_program`` > 1, a cap in
+    ``[MIN_SPLIT_REGISTERS, MAX_SPLIT_REGISTERS]`` (the one-block kernel has no cap)."""
+    if (
+        isinstance(blocks_per_program, bool)
+        or not isinstance(blocks_per_program, int)
+        or not 1 <= blocks_per_program <= MAX_BLOCKS_PER_PROGRAM
+    ):
+        raise ValueError(
+            f"swa_block takes 1..{MAX_BLOCKS_PER_PROGRAM} key blocks per split program, got "
+            f"{blocks_per_program!r}"
+        )
+    if split_max_registers is None:
+        return
+    if (
+        blocks_per_program == 1
+        or isinstance(split_max_registers, bool)
+        or not isinstance(split_max_registers, int)
+        or not MIN_SPLIT_REGISTERS <= split_max_registers <= MAX_SPLIT_REGISTERS
+    ):
+        raise ValueError(
+            f"swa_block's split register cap must be None or {MIN_SPLIT_REGISTERS}.."
+            f"{MAX_SPLIT_REGISTERS} with 2..{MAX_BLOCKS_PER_PROGRAM} key blocks per split "
+            f"program, got {split_max_registers!r} at {blocks_per_program!r}"
+        )
+
+
+@triton.jit
 def _norm_gate_sum_of_squares(x):
     """``sum(x * x)`` of one 64-wide head in the built-in norm-gate kernel's add order.
 
@@ -1623,6 +2172,11 @@ class SwaBlockAttention(OpWrapper):
     split kernel reads its graph inputs and the cached K/V before
     ``griddepcontrol.wait`` and the operand after it, then lets the combine
     launch; the combine waits and, with ``gate``, lets its dependent launch.
+
+    ``blocks_per_program`` (1..4): key blocks per split program (see the module
+    docstring); 1 is the one-block kernel, every value computes the same bits.
+    ``split_max_registers`` (``None`` or, with 2..4 blocks, a register cap per thread):
+    the split kernel's compile register cap, the same bits.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -1633,7 +2187,13 @@ class SwaBlockAttention(OpWrapper):
     griddepcontrol.wait; the layer's pool view; the FP8 KV scale. Call site:
     the target's sliding-window attention layers on decode steps of one
     sequence and at most 8 rows, under the swa_block fast path. Grids: split
-    (num_splits, G, M*8/32), combine (M*8, G).
+    (ceil(num_splits / blocks_per_program), G, M*8/32), combine (M*8, G).
+
+    blocks_per_program (1..4, default 1): key blocks per split program. 1 is
+    the one-block kernel; 2..4, uncapped and under split_max_registers =
+    SPLIT_REGISTER_CAP, are gated bit for bit against it (cache bytes,
+    output, gated output, 1..4 sequences, window and page boundaries, a late
+    PDL operand, CUDA-graph replays).
 
     Gated by its own tests, bit for bit against the chain it replaces
     (preattn_prep -> paged_decode_attention -> the built-in norm-gate kernel):
@@ -1674,7 +2234,10 @@ class SwaBlockAttention(OpWrapper):
         gate: Optional[torch.Tensor] = None,
         gate_eps: float = 0.0,
         enable_pdl: bool = False,
+        blocks_per_program: int = 1,
+        split_max_registers: Optional[int] = None,
     ) -> torch.Tensor:
+        check_blocks_per_program(blocks_per_program, split_max_registers)
         rows = qkv.shape[0]
         page = kv_pool.shape[2] if kv_pool.dim() == 4 else 0
         width = (2 if fused_prep else 1) * (num_q_heads + num_kv_heads) * HEAD_DIM
@@ -1787,39 +2350,51 @@ class SwaBlockAttention(OpWrapper):
         part_ml = torch.empty(
             (num_splits * num_kv_heads * group_rows, 2), dtype=torch.float32, device=qkv.device
         )
-        _swa_split_kernel[(num_splits, num_kv_heads, triton.cdiv(group_rows, ROWS_PER_PROGRAM))](
-            qkv,
-            qkv.stride(0),
-            kv_pool,
-            block_tables,
-            block_tables.stride(0),
-            seq_lens,
-            kv_scale_orig_quant,
-            cos_sin if rope else kv_scale_orig_quant,
-            positions if rope else seq_lens,
-            prep_eps,
-            q_scale,
-            part_o,
-            part_ml,
-            math.log2(math.e) / math.sqrt(HEAD_DIM),
-            num_splits,
-            M=rows,
-            HQ=num_q_heads,
-            HKV=num_kv_heads,
-            D=HEAD_DIM,
-            P=page,
-            WINDOW=window,
-            BLOCK=BLOCK_N,
-            R=ROWS_PER_PROGRAM,
-            Q_FP8=q_fp8,
-            FUSED_PREP=fused_prep,
-            QKV_PERMUTED=qkv_permuted,
-            APPLY_ROPE=rope,
-            LAUNCH_WITH_PDL=enable_pdl,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            launch_pdl=enable_pdl,
-        )
+        if blocks_per_program > 1:
+            launch_split_bpp(
+                qkv, kv_pool, block_tables, block_tables.stride(0), seq_lens, kv_scale_orig_quant,
+                cos_sin if rope else None, positions, prep_eps, q_scale, part_o, part_ml,
+                num_splits, rows=rows, reqs=1, num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads, window=window, q_fp8=q_fp8, fused_prep=fused_prep,
+                qkv_permuted=qkv_permuted, enable_pdl=enable_pdl,
+                blocks_per_program=blocks_per_program, max_registers=split_max_registers,
+            )  # fmt: skip
+        else:
+            _swa_split_kernel[
+                (num_splits, num_kv_heads, triton.cdiv(group_rows, ROWS_PER_PROGRAM))
+            ](
+                qkv,
+                qkv.stride(0),
+                kv_pool,
+                block_tables,
+                block_tables.stride(0),
+                seq_lens,
+                kv_scale_orig_quant,
+                cos_sin if rope else kv_scale_orig_quant,
+                positions if rope else seq_lens,
+                prep_eps,
+                q_scale,
+                part_o,
+                part_ml,
+                math.log2(math.e) / math.sqrt(HEAD_DIM),
+                num_splits,
+                M=rows,
+                HQ=num_q_heads,
+                HKV=num_kv_heads,
+                D=HEAD_DIM,
+                P=page,
+                WINDOW=window,
+                BLOCK=BLOCK_N,
+                R=ROWS_PER_PROGRAM,
+                Q_FP8=q_fp8,
+                FUSED_PREP=fused_prep,
+                QKV_PERMUTED=qkv_permuted,
+                APPLY_ROPE=rope,
+                LAUNCH_WITH_PDL=enable_pdl,
+                num_warps=NUM_WARPS,
+                num_stages=NUM_STAGES,
+                launch_pdl=enable_pdl,
+            )
         _swa_combine_kernel[(group_rows, num_kv_heads)](
             part_o,
             part_ml,
@@ -1863,13 +2438,15 @@ class SwaBlockAttention(OpWrapper):
         gate: Optional[torch.Tensor] = None,
         gate_eps: float = 0.0,
         enable_pdl: bool = False,
+        blocks_per_program: int = 1,
+        split_max_registers: Optional[int] = None,
     ) -> torch.Tensor:
         """The three references in sequence: ``preattn_prep``'s (with ``fused_prep``), then
         ``paged_decode_attention``'s (which writes the step's rows into ``kv_pool``), then the
         norm-gate in float64 between its BF16 rounding points (with ``gate``).
 
-        ``num_splits`` and ``enable_pdl`` change how the op is cut and launched, not what it
-        computes, and are ignored here.
+        ``num_splits``, ``enable_pdl``, ``blocks_per_program`` and ``split_max_registers`` change
+        how the op is cut and launched, not what it computes, and are ignored here.
         """
         if fused_prep:
             rope = cos_sin is not None
@@ -1926,6 +2503,8 @@ class SwaBlockAttention(OpWrapper):
         gate: Optional[torch.Tensor] = None,
         gate_eps: float = 0.0,
         enable_pdl: bool = False,
+        blocks_per_program: int = 1,
+        split_max_registers: Optional[int] = None,
     ) -> None:
         """What the kernels take and answer wrongly with no error: those of
         ``paged_decode_attention`` (a context shorter than the step, a block table too short, page
@@ -1975,7 +2554,8 @@ class SwaBlockMultiAttention(OpWrapper):
     on its sequence's rows, length, page ids, positions and partials (the kernels' ``REQS``
     axis; ``REQS = 1`` is the one-sequence build, unchanged).
 
-    Fusion boundary, PDL and pre-wait loads: as ``swa_block_attention``.
+    Fusion boundary, PDL and pre-wait loads: as ``swa_block_attention``; ``blocks_per_program``
+    and ``split_max_registers`` as there.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -1986,8 +2566,8 @@ class SwaBlockMultiAttention(OpWrapper):
     griddepcontrol.wait; the layer's pool view; the FP8 KV scale. Call site:
     the target's sliding-window attention layers on TP4 decode steps of 2..4
     sequences of equal row count (each request's spec-decoding verify), under
-    the wide_swa_block fast path. Grids: split (num_splits, G, B*ceil(M*8/32)),
-    combine (M*8, G, B).
+    the wide_swa_block fast path. Grids: split (ceil(num_splits /
+    blocks_per_program), G, B*ceil(M*8/32)), combine (M*8, G, B).
 
     Gated by its own tests, bit for bit against swa_block_attention of each
     sequence alone (cache bytes and output), eagerly and through CUDA-graph
@@ -2022,7 +2602,10 @@ class SwaBlockMultiAttention(OpWrapper):
         gate: Optional[torch.Tensor] = None,
         gate_eps: float = 0.0,
         enable_pdl: bool = False,
+        blocks_per_program: int = 1,
+        split_max_registers: Optional[int] = None,
     ) -> torch.Tensor:
+        check_blocks_per_program(blocks_per_program, split_max_registers)
         total = qkv.shape[0]
         reqs = seq_lens.numel()
         rows = total // reqs if reqs else 0
@@ -2304,42 +2887,52 @@ class SwaBlockMultiAttention(OpWrapper):
             dtype=torch.float32,
             device=qkv.device,
         )
-        _swa_split_kernel[
-            (num_splits, num_kv_heads, reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM))
-        ](
-            qkv,
-            qkv.stride(0),
-            kv_pool,
-            block_tables,
-            block_tables.stride(1),
-            seq_lens,
-            kv_scale_orig_quant,
-            cos_sin if rope else kv_scale_orig_quant,
-            positions if rope else seq_lens,
-            prep_eps,
-            q_scale,
-            part_o,
-            part_ml,
-            math.log2(math.e) / math.sqrt(HEAD_DIM),
-            num_splits,
-            M=rows,
-            HQ=num_q_heads,
-            HKV=num_kv_heads,
-            D=HEAD_DIM,
-            P=page,
-            WINDOW=window,
-            BLOCK=BLOCK_N,
-            R=ROWS_PER_PROGRAM,
-            Q_FP8=q_fp8,
-            FUSED_PREP=fused_prep,
-            QKV_PERMUTED=qkv_permuted,
-            APPLY_ROPE=rope,
-            LAUNCH_WITH_PDL=enable_pdl,
-            REQS=reqs,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            launch_pdl=enable_pdl,
-        )
+        if blocks_per_program > 1:
+            launch_split_bpp(
+                qkv, kv_pool, block_tables, block_tables.stride(1), seq_lens, kv_scale_orig_quant,
+                cos_sin if rope else None, positions, prep_eps, q_scale, part_o, part_ml,
+                num_splits, rows=rows, reqs=reqs, num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads, window=window, q_fp8=q_fp8, fused_prep=fused_prep,
+                qkv_permuted=qkv_permuted, enable_pdl=enable_pdl,
+                blocks_per_program=blocks_per_program, max_registers=split_max_registers,
+            )  # fmt: skip
+        else:
+            _swa_split_kernel[
+                (num_splits, num_kv_heads, reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM))
+            ](
+                qkv,
+                qkv.stride(0),
+                kv_pool,
+                block_tables,
+                block_tables.stride(1),
+                seq_lens,
+                kv_scale_orig_quant,
+                cos_sin if rope else kv_scale_orig_quant,
+                positions if rope else seq_lens,
+                prep_eps,
+                q_scale,
+                part_o,
+                part_ml,
+                math.log2(math.e) / math.sqrt(HEAD_DIM),
+                num_splits,
+                M=rows,
+                HQ=num_q_heads,
+                HKV=num_kv_heads,
+                D=HEAD_DIM,
+                P=page,
+                WINDOW=window,
+                BLOCK=BLOCK_N,
+                R=ROWS_PER_PROGRAM,
+                Q_FP8=q_fp8,
+                FUSED_PREP=fused_prep,
+                QKV_PERMUTED=qkv_permuted,
+                APPLY_ROPE=rope,
+                LAUNCH_WITH_PDL=enable_pdl,
+                REQS=reqs,
+                num_warps=NUM_WARPS,
+                num_stages=NUM_STAGES,
+                launch_pdl=enable_pdl,
+            )
         _swa_combine_kernel[(group_rows, num_kv_heads, reqs)](
             part_o,
             part_ml,
@@ -2384,6 +2977,8 @@ class SwaBlockMultiAttention(OpWrapper):
         gate: Optional[torch.Tensor] = None,
         gate_eps: float = 0.0,
         enable_pdl: bool = False,
+        blocks_per_program: int = 1,
+        split_max_registers: Optional[int] = None,
     ) -> torch.Tensor:
         """``swa_block_attention.reference`` of each sequence alone, rows concatenated."""
         reqs = seq_lens.numel()
@@ -2437,6 +3032,8 @@ class SwaBlockMultiAttention(OpWrapper):
         gate: Optional[torch.Tensor] = None,
         gate_eps: float = 0.0,
         enable_pdl: bool = False,
+        blocks_per_program: int = 1,
+        split_max_registers: Optional[int] = None,
     ) -> None:
         """``swa_block_attention.is_valid`` of each sequence, and no page written by two of them."""
         reqs = seq_lens.numel()

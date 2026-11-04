@@ -321,7 +321,9 @@ def weights_before_wait_rows(kernels: Sequence[str]) -> FrozenSet[int]:
     )
 
 
-def drop_converted_prefetches(model, plan, qkv: bool) -> Dict[str, Tuple[int, FrozenSet[int]]]:
+def drop_converted_prefetches(
+    model, plan, qkv: bool, wide_qkv: Optional[str] = None
+) -> Dict[str, Tuple[int, FrozenSet[int]]]:
     """Drop the ``dense_gemm_prefetch`` prefetch of the weights whose GEMM edge this fast path converts.
 
     ``qkv``: the unpooler's prefetch of the next layer's QKV weight, on every
@@ -330,13 +332,20 @@ def drop_converted_prefetches(model, plan, qkv: bool) -> Dict[str, Tuple[int, Fr
     (``weights_before_wait_rows``; the unpooler's and QKV's calls of
     one step have the same rows), and only when the plan launches with
     programmatic dependent launch: without it the consumer cannot start early,
-    and the prefetch is the only thing that streams its weight. Returns, per
-    site, how many layers dropped it and at which row counts, for the log line.
+    and the prefetch is the only thing that streams its weight. With
+    ``wide_qkv`` (``next_qkv_prefetch``'s wide setting, the one its ``install``
+    gets; None is its ``WIDE_OFF``) other than off it is also dropped at the
+    9..32 row counts of the plan's wide QKV table that ``next_qkv_prefetch.drop_rows``
+    names. Returns, per site, how many layers dropped it and at which row counts,
+    for the log line.
     """
+    from ..next_qkv_prefetch.prefetch import WIDE_OFF, drop_rows
+
     if plan is None or not plan.prefetch or not plan.enable_pdl:
         return {}
     none: FrozenSet[int] = frozenset()
-    rows = {"qkv": weights_before_wait_rows(plan.kernels["qkv"]) if qkv else none}
+    wide = drop_rows(plan, WIDE_OFF if wide_qkv is None else wide_qkv) if qkv else none
+    rows = {"qkv": weights_before_wait_rows(plan.kernels["qkv"]) | wide if qkv else none}
     dropped = {site: 0 for site in rows}
     layers = list(model.layers)
     for index, layer in enumerate(layers):
