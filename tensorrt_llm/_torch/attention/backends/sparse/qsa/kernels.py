@@ -190,7 +190,7 @@ def triton_qsa_decode_token_mapping(
 QSA_GENERATION_MAPPING_MAX_SEQS = 256
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_seqs", "num_rows"])
 def _qsa_generation_token_mapping_kernel(
     kv_lens,
     seq_lens,
@@ -276,8 +276,8 @@ def triton_qsa_generation_token_mapping(
     if num_rows == 0 or num_seqs == 0:
         return
 
-    # One specialization covers every batch and verify width, so no graph shape
-    # compiles a variant of its own.
+    # One specialization covers every batch and verify width (the kernel does not
+    # specialize on the request or row count), so no step compiles a variant of its own.
     block_rows = 32
     _qsa_generation_token_mapping_kernel[(triton.cdiv(num_rows, block_rows),)](
         kv_lens,

@@ -407,6 +407,37 @@ class TestMamba2Metadata:
         torch.testing.assert_close(triton_items, torch_items)
         torch.testing.assert_close(triton_n_writes, torch_n_writes)
 
+    def test_replay_work_items_triton_compiles_once(self):
+        """Every decode count and every decode-slice offset (the step's context requests come
+        first) reuses one compiled kernel: a mixed step that reached a new specialization would
+        compile it while serving."""
+        num_slots = 300
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        storage = torch.randperm(num_slots, device="cuda").to(torch.int32)
+        kernel = mamba2_metadata._prepare_gdn_replay_work_items_kernel
+        compiled = []
+        for num_contexts, num_decodes in ((0, 1), (0, 16), (1, 17), (2, 40), (3, 64), (5, 255)):
+            state_indices = storage[num_contexts : num_contexts + num_decodes]
+            items = torch.zeros(num_decodes, 4, dtype=torch.int32, device="cuda")
+            n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
+            _build_replay_work_items_triton(
+                state_indices,
+                prev_num_accepted_tokens,
+                cache_buf_idx,
+                items,
+                n_writes,
+                6,
+                MIN_REPLAY_HISTORY_SIZE,
+            )
+            expected_items, expected_n_writes = _torch_reference_work_items(
+                state_indices, prev_num_accepted_tokens, cache_buf_idx
+            )
+            torch.testing.assert_close(items, expected_items)
+            torch.testing.assert_close(n_writes, expected_n_writes)
+            compiled.append(len(kernel.device_caches[torch.cuda.current_device()][0]))
+        assert len(set(compiled)) == 1, compiled
+
     def test_prepare_replay_work_items_uses_the_selected_builder(self):
         """The entry point must feed the builder the decode slice, not the whole batch."""
         num_contexts, num_decodes = 3, 40

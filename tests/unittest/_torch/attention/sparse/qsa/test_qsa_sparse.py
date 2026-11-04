@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     QSA_GENERATION_MAPPING_MAX_SEQS,
     _expand_launch,
+    _qsa_generation_token_mapping_kernel,
     _qsa_index_scores_query_tile,
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
@@ -594,6 +595,38 @@ def test_qsa_generation_token_mapping_matches_general_mapping(
         torch.testing.assert_close(actual[:num_tokens], reference, rtol=0, atol=0)
         # Rows past the batch are left untouched.
         assert (actual[num_tokens:] == -7).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_generation_token_mapping_compiles_once() -> None:
+    """Every batch size and verify width reuses one compiled kernel."""
+    compiled = []
+    for num_seqs, width in ((1, 1), (1, 3), (16, 3), (17, 4), (64, 1), (256, 3)):
+        seq_lens = torch.full((num_seqs,), width, dtype=torch.int32, device="cuda")
+        kv_lens = seq_lens + 1029 + torch.arange(num_seqs, dtype=torch.int32, device="cuda")
+        num_tokens = num_seqs * width
+        outputs = (
+            torch.empty(num_tokens, dtype=torch.int32, device="cuda"),
+            torch.empty(num_tokens, dtype=torch.int64, device="cuda"),
+            torch.empty(num_tokens, dtype=torch.int32, device="cuda"),
+            torch.empty(num_tokens, dtype=torch.int32, device="cuda"),
+        )
+        triton_qsa_generation_token_mapping(
+            kv_lens=kv_lens,
+            seq_lens=seq_lens,
+            request_indices=outputs[0],
+            logical_positions=outputs[1],
+            sequence_lengths=outputs[2],
+            visible_blocks=outputs[3],
+            num_rows=num_tokens,
+            compress_ratio=4,
+        )
+        expected = _general_token_mapping(kv_lens, seq_lens, num_tokens, 4)
+        for actual, reference in zip(outputs, expected):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        cache = _qsa_generation_token_mapping_kernel.device_caches[torch.cuda.current_device()][0]
+        compiled.append(len(cache))
+    assert len(set(compiled)) == 1, compiled
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

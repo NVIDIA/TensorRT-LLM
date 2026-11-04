@@ -36,7 +36,11 @@ REPLAY_WORK_ITEM_WIDTH = 4
 _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
 
 
-@triton.jit
+# Neither the decode count nor the alignment of the decode slice (it starts
+# after the step's context requests) is specialized: a mixed step would
+# otherwise reach a new variant, and compile it, while serving.
+@triton.jit(do_not_specialize=["num_decodes"],
+            do_not_specialize_on_alignment=["state_indices"])
 def _prepare_gdn_replay_work_items_kernel(
     state_indices,
     prev_num_accepted_tokens,
@@ -83,8 +87,9 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
     Interchangeable with :func:`_build_replay_work_items_torch` for up to
     ``_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE`` decodes; the caller picks
     between them. Kept to one CTA because the write-first offsets come from an
-    in-block ``tl.cumsum``. The block always spans the largest batch, so a
-    single specialization serves every batch size.
+    in-block ``tl.cumsum``. The block always spans the largest batch and the
+    kernel specializes neither on the decode count nor on the alignment of
+    ``state_indices``, so one compiled kernel serves every batch and offset.
     """
     num_decodes = state_indices.shape[0]
     assert num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
