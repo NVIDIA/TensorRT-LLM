@@ -851,6 +851,7 @@ def _high_throughput_engine_kwargs(batch_size: int, draft_len: int) -> dict:
         enable_attention_dp=True,
         enable_lm_head_tp_in_adp=True,
         max_batch_size=batch_size,
+        max_seq_len=1048576,
         cuda_graph_config=CudaGraphConfig(
             batch_sizes=list(range(1, batch_size + 1)), enable_padding=True
         ),
@@ -860,7 +861,8 @@ def _high_throughput_engine_kwargs(batch_size: int, draft_len: int) -> dict:
             enable_block_reuse=False,
             enable_partial_reuse=False,
             free_gpu_memory_fraction=0.8,
-            max_tokens=batch_size * 16384,
+            # Keep the 1M indexer envelope after MTP's reserved tokens are subtracted.
+            max_tokens=1048576 + 64,
             host_cache_size=0,
         ),
         moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL", use_low_precision_moe_combine=True),
