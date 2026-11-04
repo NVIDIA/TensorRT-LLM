@@ -17,7 +17,7 @@
 import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -758,14 +758,18 @@ class MoESortTables:
 
     ``outputs`` are the six tensors ``torch.ops.trtllm.moe_sort`` returns, in
     its order, for the routed expert ids, the rank's expert range and
-    ``tile_size``. ``published``: instead, the routing kernel published the
-    routed ids token by token into the impl's ``published_routing_word`` and
-    the impl builds the tables itself (``outputs`` is empty).
+    ``tile_size``.
     """
 
     tile_size: int
     outputs: Tuple[torch.Tensor, ...]
-    published: bool = False
+
+
+@dataclass(frozen=True)
+class PublishedSortTables:
+    """In place of :class:`MoESortTables`: the routing kernel published the
+    routed ids token by token into the impl's ``published_routing_word``, and
+    the impl builds this rank's tables itself."""
 
 
 @dataclass(frozen=True)
@@ -778,7 +782,7 @@ class SortedRouting:
 
     token_selected_experts: torch.Tensor  # int32 [num_tokens, top_k]
     token_final_scales: torch.Tensor  # fp32 [num_tokens, top_k]
-    sort_tables: MoESortTables
+    sort_tables: Union[MoESortTables, PublishedSortTables]
 
 
 @dataclass(frozen=True)
@@ -818,7 +822,7 @@ class MoERunContext:
     replica_plan: Optional[MoEReplicaPlan] = None
     # produced by routing when the impl's ``try_route_with_sort`` routed this
     # forward: the ``moe_sort`` tables of ``token_selected_experts``.
-    sort_tables: Optional[MoESortTables] = None
+    sort_tables: Optional[Union[MoESortTables, PublishedSortTables]] = None
     # produced by a caller that finishes a one-shot MNNVL all-reduce of the
     # output: the impl also pushes its output rows into slot ``(token,
     # view.rank)`` of it (``MoEImplBase.output_push_max_tokens``).

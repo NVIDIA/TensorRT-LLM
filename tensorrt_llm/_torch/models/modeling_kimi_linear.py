@@ -157,7 +157,7 @@ from ..moe.fused_moe import (
     TRTLLMGenFusedMoE,
     create_moe,
 )
-from ..moe.fused_moe.impl_contract import MoESortTables, SortedRouting
+from ..moe.fused_moe.impl_contract import MoESortTables, PublishedSortTables, SortedRouting
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
@@ -2662,7 +2662,7 @@ class KimiK3MoERuntime(nn.Module):
             after_head,
         )
         if publish_word is not None:
-            tables = MoESortTables(kimi_k3_routing.TILE_SIZE, (), published=True)
+            tables = PublishedSortTables()
         else:
             tables = MoESortTables(kimi_k3_routing.TILE_SIZE, tuple(sort_outputs))
         routing = SortedRouting(ids, weights, tables)

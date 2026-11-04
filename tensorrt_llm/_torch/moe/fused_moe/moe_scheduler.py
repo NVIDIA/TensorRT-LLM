@@ -259,14 +259,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
 
         # ========== Step 3: Execute MoE computation ==========
-        if prerouted is not None and (num_chunks > 1 or moe.comm is not None or use_dp_padding):
-            raise ValueError("prerouted routing needs one chunk without communication or padding")
-        if sorted_routing is not None and (
+        caller_supplied = (prerouted, sorted_routing, output_push)
+        if any(arg is not None for arg in caller_supplied) and (
             num_chunks > 1 or moe.comm is not None or use_dp_padding
         ):
-            raise ValueError("sorted routing needs one chunk without communication or padding")
-        if output_push is not None and (num_chunks > 1 or moe.comm is not None or use_dp_padding):
-            raise ValueError("an output push needs one chunk without communication or padding")
+            raise ValueError(
+                "caller-supplied routing or an output push needs one chunk without "
+                "communication or padding"
+            )
         if num_chunks == 1:
             outputs = self._forward_single_chunk(
                 x,

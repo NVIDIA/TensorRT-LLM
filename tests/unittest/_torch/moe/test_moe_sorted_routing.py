@@ -412,10 +412,11 @@ def test_pushes_output_where_the_backend_pushes_and_no_comm(num_tokens, comm, ma
     assert ConfigurableMoE.pushes_output(moe, num_tokens) is expected
 
 
+@pytest.mark.parametrize("supplied", ["prerouted", "sorted_routing", "output_push"])
 @pytest.mark.parametrize("blocker", ["comm", "chunked"])
-def test_scheduler_rejects_output_push_it_cannot_honour(blocker):
-    """The scheduler raises instead of dropping an output push on a forward with more than one
-    chunk or a comm strategy."""
+def test_scheduler_rejects_caller_supplied_args_it_cannot_honour(blocker, supplied):
+    """The scheduler raises instead of dropping caller-supplied routing or an output push on a
+    forward with more than one chunk or a comm strategy."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
@@ -428,7 +429,7 @@ def test_scheduler_rejects_output_push_it_cannot_honour(blocker):
         determine_communication_method=lambda *_: None,
     )
     scheduler = ExternalCommMoEScheduler(moe)
-    with pytest.raises(ValueError, match="output push"):
+    with pytest.raises(ValueError, match="one chunk without communication"):
         scheduler.forward(
             torch.zeros(4, 8),
             torch.zeros(4, 16),
@@ -436,7 +437,7 @@ def test_scheduler_rejects_output_push_it_cannot_honour(blocker):
             output_dtype=torch.bfloat16,
             all_rank_num_tokens=[4],
             use_dp_padding=False,
-            output_push=object(),
+            **{supplied: object()},
         )
 
 

@@ -341,7 +341,7 @@ class MoEImplBase(
         ``run_moe`` may publish each routed token of a forward of ``num_tokens``
         tokens (its ids and weights stored, then a GPU-scope release add of 1),
         so that ``run_moe`` builds its tables from them while the routing grid
-        still runs (``MoESortTables.published``); or ``None``. Declining is the
+        still runs (``PublishedSortTables``); or ``None``. Declining is the
         default; overriding this is how a backend opts in.
         """
         return None

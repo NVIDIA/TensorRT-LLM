@@ -936,7 +936,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             if (kwargs.get("prerouted") is not None
                     or kwargs.get("sorted_routing") is not None):
                 raise NotImplementedError(
-                    "the `trtllm::moe_custom_op` graph path cannot carry prerouted routing"
+                    "the `trtllm::moe_custom_op` graph path cannot carry caller-supplied routing"
                 )
             if kwargs.get("output_push") is not None:
                 raise NotImplementedError(

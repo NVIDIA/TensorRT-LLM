@@ -71,6 +71,7 @@ from ..impl_contract import (
     MoERunContext,
     MoESortTables,
     MoEStaticCapability,
+    PublishedSortTables,
     require_comm_plan,
 )
 from ..impl_environment import MoEDep
@@ -437,7 +438,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         moe_output: torch.Tensor | None = None,
         enable_alltoall: bool = False,
         weight_view: NvFp4WeightView | None = None,
-        sort_tables: MoESortTables | None = None,
+        sort_tables: MoESortTables | PublishedSortTables | None = None,
         x_ready_event: torch.cuda.Event | None = None,
         output_push: LamportWorkspaceView | None = None,
     ) -> torch.Tensor:
@@ -470,11 +471,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             self._join_pending_x_ready()
             return moe_output
 
-        if (
-            sort_tables is not None
-            and sort_tables.published
-            and not (small_batch and self.tp_size > 1)
-        ):
+        published = isinstance(sort_tables, PublishedSortTables)
+        if published and not (small_batch and self.tp_size > 1):
             raise RuntimeError(
                 "published routing needs the token-indexed small-batch kernel (MoE-TP), not "
                 f"{num_tokens} tokens{' with all-to-all' if enable_alltoall else ''}"
@@ -549,12 +547,12 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         x_sf: torch.Tensor,
         moe_output: torch.Tensor,
         weight_view: NvFp4WeightView,
-        sort_tables: MoESortTables | None = None,
+        sort_tables: MoESortTables | PublishedSortTables | None = None,
         push: LamportWorkspaceView | None = None,
     ) -> torch.Tensor:
         """The small-batch kernel; it writes every element of ``moe_output`` (and pushes it into
         ``push``)."""
-        published = sort_tables is not None and sort_tables.published
+        published = isinstance(sort_tables, PublishedSortTables)
         if published:
             # the kernel builds the tables from the published top-k ids
             tile_idx_to_expert_idx = tile_idx_to_mn_limit = permuted_idx_to_expanded_idx = None
