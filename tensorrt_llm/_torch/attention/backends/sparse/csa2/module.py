@@ -1551,6 +1551,7 @@ class DeepseekV41Attention(nn.Module):
         if overlap:
             if self.aux_stream.device != hidden_states.device:
                 raise ValueError("CSA2 auxiliary stream must use the input CUDA device")
+            attn_metadata.resolve_swa_slots()
             self._prepare_start.record()
             if (
                 self.layer.mode == CSA2Mode.FULL

@@ -1056,6 +1056,33 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
         enabled[0] = True
     torch.cuda.synchronize()
 
+    # Advancing decode positions, overlapped first (no forward wrote their rows yet) with the
+    # descriptor stream held back, then serially: a cache write that read a step's SWA slots
+    # before their refresh would land on the previous step's row.
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
+
+    prepare_descriptors = CSA2Indexer.prepare_paged_descriptors
+
+    def delayed_descriptors(self, *args):
+        torch.cuda._sleep(1 << 26)
+        prepare_descriptors(self, *args)
+
+    monkeypatch.setattr(CSA2Indexer, "prepare_paged_descriptors", delayed_descriptors)
+    steps = [(cached, torch.randn_like(hidden)) for cached in (2, 3)]
+    outputs = {}
+    for overlap in (True, False):
+        enabled[0] = overlap
+        for cached, step_hidden in steps:
+            metadata.kv_cache_params = KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=[cached]
+            )
+            metadata.prepare()
+            metadata.reset_routing()
+            output = model(step_hidden, metadata.csa2_positions, metadata).clone()
+            outputs.setdefault(cached, []).append(output)
+    for cached, (parallel, serial) in outputs.items():
+        torch.testing.assert_close(parallel, serial, atol=0, rtol=0, msg=f"{cached} cached tokens")
+
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

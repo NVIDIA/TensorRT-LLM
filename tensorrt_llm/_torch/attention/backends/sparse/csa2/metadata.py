@@ -2838,6 +2838,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self._csa2_last_layer = layer.layer_idx
         self._ensure_swa_slots()
 
+    def resolve_swa_slots(self) -> None:
+        """Resolve this forward's SWA slots on the current stream, before a layer forks side
+        streams: the cache write reads them on this stream without joining those streams."""
+        self._ensure_swa_slots()
+
     def global_slot_tile(
         self,
         layer_idx: int,
