@@ -555,7 +555,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
 
         with (
             unittest.mock.patch.object(attn.qkv_proj, "forward", return_value=qkv),
-            unittest.mock.patch.object(attn, "preprocess_qkv", return_value=(q, k, v, None)),
+            unittest.mock.patch.object(attn, "preprocess_qkv", return_value=(q, k, v, None, None)),
             unittest.mock.patch.object(attn, "convert_qkv", return_value=(q, k, v)),
             unittest.mock.patch.object(
                 attn.attn, "forward", return_value=backend_output
