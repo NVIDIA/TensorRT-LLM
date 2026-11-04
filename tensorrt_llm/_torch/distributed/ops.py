@@ -398,6 +398,28 @@ def _mnnvl_workspace_all_succeeded(comm, local_success: bool) -> bool:
     return comm.allreduce(int(local_success)) == comm.Get_size()
 
 
+def create_mnnvl_multicast_buffer(mapping: Mapping,
+                                  size_bytes: int) -> Optional[McastGPUBuffer]:
+    """A zero-filled MNNVL multicast buffer of ``size_bytes`` over ``mapping``'s TP group.
+
+    It is set up on the communicator of the group's MNNVL all-reduce workspace; None when the
+    group runs no MNNVL all-reduce. Collective over the group, outside CUDA graph capture.
+    """
+    workspace = MNNVLAllReduce.allreduce_mnnvl_workspaces.get(mapping)
+    if workspace is None or workspace["comm"] is None:
+        return None
+    comm = workspace["comm"]
+    handle = _make_mnnvl_mcast_buffer(comm, size_bytes, mapping,
+                                      use_mnnvl_fabric_handle(mapping))
+    handle.get_uc_buffer(mapping.tp_rank, (size_bytes, ), torch.uint8,
+                         0).zero_()
+    torch.cuda.synchronize()
+    # Every rank's buffer is zeroed before any rank stores into it.
+    if not _mnnvl_workspace_all_succeeded(comm, True):
+        raise RuntimeError("MNNVL multicast buffer setup failed on a peer rank")
+    return handle
+
+
 def get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,

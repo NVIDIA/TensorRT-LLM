@@ -405,49 +405,39 @@ class _PairExchange:
         # The TP group whose MNNVL workspace the one-launch Markov chain
         # (VocabParallelHead.bind_markov_head) multicasts over.
         self.mapping = mapping
-        self._markov_v3 = None
+        # (entries, local address, multicast address, state, buffer handle) of
+        # that chain's key exchange (bind_markov_exchange).
+        self._markov_exchange = None
 
-    def multicast_supported(self) -> bool:
-        """Whether this TP group has an MNNVL all-reduce workspace to multicast over."""
+    def bind_markov_exchange(self, entries: int) -> bool:
+        """Allocate the CuTe DSL Markov chain's key exchange for ``entries``
+        (ranks x CTAs per rank): its rotating sets, zero-filled, on the TP
+        group's MNNVL multicast workspace, and this rank's int32 launch state.
+        Collective over the TP group, outside graph capture; False when the
+        group runs no MNNVL all-reduce."""
+        if self._markov_exchange is not None:
+            if self._markov_exchange[0] != entries:
+                raise ValueError("the Markov exchange is sized once per process")
+            return True
         if self.mapping is None or self.tp_size == 1:
             return False
-        from ..distributed.ops import MNNVLAllReduce
-
-        workspace = MNNVLAllReduce.allreduce_mnnvl_workspaces.get(self.mapping)
-        return workspace is not None and workspace.get("comm") is not None
-
-    def markov_v3_buffers(self, entries: int):
-        """``(local address, multicast address, state)`` of the CuTe DSL Markov
-        chain's key exchange for ``entries`` (ranks x CTAs per rank): its
-        rotating sets, zero-filled, and this rank's int32 launch state.
-        Allocated collectively on first use, outside graph capture."""
-        if self._markov_v3 is not None:
-            assert self._markov_v3[0] == entries, "the Markov exchange is sized once per process"
-            return self._markov_v3[1:4]
-        assert not torch.cuda.is_current_stream_capturing()
-        from ..distributed.ops import (
-            MNNVLAllReduce,
-            _make_mnnvl_mcast_buffer,
-            use_mnnvl_fabric_handle,
-        )
+        from ..distributed.ops import create_mnnvl_multicast_buffer
         from ..kernels.blackwell.dspark_markov_greedy import NUM_SETS, STATE_WORDS, set_bytes
 
         words = NUM_SETS * set_bytes(entries) // 4
-        state = torch.zeros((STATE_WORDS,), dtype=torch.int32, device="cuda")
-        comm = MNNVLAllReduce.allreduce_mnnvl_workspaces[self.mapping]["comm"]
-        handle = _make_mnnvl_mcast_buffer(
-            comm, words * 4, self.mapping, use_mnnvl_fabric_handle(self.mapping)
-        )
+        handle = create_mnnvl_multicast_buffer(self.mapping, words * 4)
+        if handle is None:
+            return False
         local = handle.get_uc_buffer(self.tp_rank, [words], torch.int32, 0)
         mcast = handle.get_mc_buffer([words], torch.int32, 0)
-        local.zero_()
-        torch.cuda.synchronize()
-        if hasattr(comm, "Barrier"):
-            comm.Barrier()
-        else:
-            torch.distributed.barrier(group=comm)
-        self._markov_v3 = (entries, local.data_ptr(), mcast.data_ptr(), state, handle)
-        return self._markov_v3[1:4]
+        state = torch.zeros((STATE_WORDS,), dtype=torch.int32, device="cuda")
+        self._markov_exchange = (entries, local.data_ptr(), mcast.data_ptr(), state, handle)
+        return True
+
+    def markov_exchange(self):
+        """``(local address, multicast address, state)`` of the key exchange
+        that :meth:`bind_markov_exchange` allocated."""
+        return self._markov_exchange[1:4]
 
     def layout(self, rows: int, n_cols: int, device: torch.device) -> _PairLayout:
         max_splits = triton.cdiv(n_cols, _LOCAL_BLOCK_V)
@@ -804,7 +794,7 @@ class VocabParallelHead:
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
         self._markov_one_launch = False
-        if not IS_CUTLASS_DSL_AVAILABLE or not self._exchange.multicast_supported():
+        if not IS_CUTLASS_DSL_AVAILABLE:
             return False
         rank_dim = markov_w1.shape[1]
         if (
@@ -828,9 +818,8 @@ class VocabParallelHead:
             and smem_bytes(rank_dim) <= props.shared_memory_per_block_optin
         ):
             return False
-        self._exchange.markov_v3_buffers(self._exchange.tp_size * ctas)
-        self._markov_one_launch = True
-        return True
+        self._markov_one_launch = self._exchange.bind_markov_exchange(self._exchange.tp_size * ctas)
+        return self._markov_one_launch
 
     def _markov_tokens_one_launch(
         self,
@@ -847,12 +836,11 @@ class VocabParallelHead:
         exchange; every CTA polls all keys of the step (``dspark_markov_greedy``).
         The bias is an MMA over the Markov rank.
         """
-        from ..kernels.blackwell.dspark_markov_greedy import ctas_for, run_dspark_markov_greedy
+        from ..kernels.blackwell.dspark_markov_greedy import run_dspark_markov_greedy
 
-        num_reqs, block_size, shard = local_block.shape
+        num_reqs, block_size, _ = local_block.shape
         tokens = torch.empty((num_reqs, block_size), dtype=torch.int32, device=local_block.device)
-        tp = self._exchange.tp_size
-        box_uc, box_mc, state = self._exchange.markov_v3_buffers(tp * ctas_for(shard))
+        box_uc, box_mc, state = self._exchange.markov_exchange()
         run_dspark_markov_greedy(
             local_block,
             first_prev_tokens,
@@ -860,7 +848,7 @@ class VocabParallelHead:
             self.markov_w2_shard(markov_w2),
             tokens,
             vocab=self.vocab_size,
-            tp=tp,
+            tp=self._exchange.tp_size,
             rank=self._exchange.tp_rank,
             state=state,
             box_uc=box_uc,
