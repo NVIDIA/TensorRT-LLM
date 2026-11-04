@@ -119,6 +119,8 @@ def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
     """
     # Partial test doubles of TorchLlmArgs may omit the field.
     config = getattr(llm_args, "autotuner_nvmmh_config", None)
+    if config is None and AutoTuner._instance is None:
+        return
     if config is not None:
         from ..custom_ops import cutedsl_matmul_heuristics
 
