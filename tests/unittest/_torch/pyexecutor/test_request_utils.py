@@ -1762,7 +1762,7 @@ class TestBroadcasterClock:
         assert b.rank0_aux == pytest.approx(0.17) and b.rank0_now == pytest.approx(1.0)
 
 
-@pytest.mark.parametrize("route", ["local", "pickle", "rpc", "ipc"])
+@pytest.mark.parametrize("route", ["local", "pickle", "cloudpickle", "ipc"])
 def test_typed_request_inputs_transport_and_child_policy(route: str) -> None:
     from tensorrt_llm.executor.ipc import IpcQueue
 
@@ -1791,8 +1791,7 @@ def test_typed_request_inputs_transport_and_child_policy(route: str) -> None:
     envelope.request.py_conversation_params = ConversationParams(conversation_id="stale")
     if route == "pickle":
         envelope = pickle.loads(pickle.dumps(envelope))
-    elif route == "rpc":
-        # Ray RPC uses cloudpickle for Python arguments.
+    elif route == "cloudpickle":
         import cloudpickle
 
         envelope = cloudpickle.loads(cloudpickle.dumps(envelope))
