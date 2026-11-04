@@ -247,6 +247,25 @@ class EntryTriggerGatedMLP(GatedMLP):
             return drafter_silu_and_mul(x, True)
         return super()._apply_activation(x, has_lora=has_lora)
 
+    def forward(
+        self,
+        x,
+        all_rank_num_tokens=None,
+        final_all_reduce_params=None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ):
+        # The silu fold (``kernels/dr3_folds``, ``drafter_folds``): gate_up's weight rows are
+        # interleaved and the 8-row activation runs in the gate_up GEMV's epilogue.
+        tactic = self.__dict__.get("_dr3_sf")
+        if tactic is None:
+            return super().forward(
+                x, all_rank_num_tokens, final_all_reduce_params, lora_params, **kwargs
+            )
+        from ..dr3_folds import folds as _dr3_folds
+
+        return _dr3_folds.folded_mlp(self, tactic, x, final_all_reduce_params, lora_params)
+
 
 def _mlp_reason(draft_model: nn.Module) -> Optional[str]:
     for index, layer in enumerate(draft_model.model.layers):

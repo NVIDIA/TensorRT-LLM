@@ -122,6 +122,7 @@ def _dflash_verify_fold_kernel(
     BUMP_KV_LENS: tl.constexpr,
     COPY_SEQ_LENS: tl.constexpr,
     SEQ_BLOCK: tl.constexpr,
+    PRE_WAIT: tl.constexpr = False,
 ):
     cols = tl.arange(0, BLOCK)
     qcols = tl.arange(0, QBLOCK)
@@ -129,61 +130,120 @@ def _dflash_verify_fold_kernel(
     in_row = cols < row_width
     in_block = qcols < block_size
     mask_id = tl.zeros([], dtype=tl.int64) + mask_token_id
-    # prepare_for_spec_dec's clone of _seq_lens_cuda: reads a graph input only.
-    if COPY_SEQ_LENS:
-        for start in range(0, seq_lens_numel, SEQ_BLOCK):
-            idx = start + tl.arange(0, SEQ_BLOCK)
-            keep = idx < seq_lens_numel
-            tl.store(seq_lens_copy_ptr + idx, tl.load(seq_lens_ptr + idx, mask=keep), mask=keep)
-    tl.store(offsets_ptr + cols, cols.to(tl.int64), mask=in_row)
-    counter = tl.zeros([], dtype=tl.int64)
-    if FORCE == 2:
-        # One bump per call, before any request reads it (as dflash_accept).
-        counter = tl.load(counter_ptr).to(tl.int64) + 1
-        tl.store(counter_ptr, counter)
-    for g in range(num_gens):
-        # --- acceptance: dflash_accept's statements for a generation row ---
-        tokens = tl.load(target_ptr + g * row_width + cols, mask=in_row, other=0)
-        tokens32 = tokens.to(tl.int32)
-        tl.store(accepted_ptr + g * row_width + cols, tokens32, mask=in_row)
+    if PRE_WAIT:
+        # The verify PDL of ``distributed_head_sampler`` (one request, launched with PDL): every
+        # load but the sampled tokens is issued before griddepcontrol.wait -- none of them is
+        # written by the sampler, and the sampler releases this kernel only after its own wait
+        # (``pre_wait`` in the op) -- and every store after it. The same statements on the same
+        # values as the loop below.
+        if COPY_SEQ_LENS:
+            seq_idx = tl.arange(0, SEQ_BLOCK)
+            seq_keep = seq_idx < seq_lens_numel
+            seq_vals = tl.load(seq_lens_ptr + seq_idx, mask=seq_keep)
+        counter_pre = tl.zeros([], dtype=tl.int64)
+        if FORCE == 2:
+            counter_pre = tl.load(counter_ptr).to(tl.int64) + 1
+            draw_pre = tl.load(pool_ptr + ((counter_pre * COUNTER_STRIDE) & POOL_MASK))
         if FORCE == 0:
-            drafts = tl.load(draft_ptr + g * draft_row_stride + cols, mask=cols < K, other=0)
-            mismatch = (cols < K) & (drafts.to(tl.int64) != tokens.to(tl.int64))
+            drafts_pre = tl.load(draft_ptr + cols, mask=cols < K, other=0)
+        slot_pre = tl.load(slots_ptr)
+        ctx_len_pre = tl.load(ctx_len_ptr + slot_pre).to(tl.int64)
+        if BUMP_KV_LENS:
+            kv_len_pre = tl.load(kv_lens_ptr)
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+        if COPY_SEQ_LENS:
+            tl.store(seq_lens_copy_ptr + seq_idx, seq_vals, mask=seq_keep)
+        tl.store(offsets_ptr + cols, cols.to(tl.int64), mask=in_row)
+        if FORCE == 2:
+            tl.store(counter_ptr, counter_pre)
+        tokens = tl.load(target_ptr + cols, mask=in_row, other=0)
+        tokens32 = tokens.to(tl.int32)
+        tl.store(accepted_ptr + cols, tokens32, mask=in_row)
+        if FORCE == 0:
+            mismatch = (cols < K) & (drafts_pre.to(tl.int64) != tokens.to(tl.int64))
             accepted = tl.min(tl.where(mismatch, cols, K), axis=0) + 1
         elif FORCE == 1:
             accepted = tl.zeros([], dtype=tl.int32) + base_total
         else:
-            index = (counter * COUNTER_STRIDE + g * SLOT_STRIDE) & POOL_MASK
-            draw = tl.load(pool_ptr + index)
-            accepted = tl.minimum(base_total + (draw < frac).to(tl.int32), max_total)
+            accepted = tl.minimum(base_total + (draw_pre < frac).to(tl.int32), max_total)
         accepted = accepted.to(tl.int32)
-        tl.store(num_accepted_ptr + g, accepted)
-        # --- the bookkeeping, each value written after the count it uses ---
-        tl.store(rewind_ptr + g, 1 - accepted)
+        tl.store(num_accepted_ptr, accepted)
+        tl.store(rewind_ptr, 1 - accepted)
         if BUMP_KV_LENS:
-            tl.store(kv_lens_ptr + g, tl.load(kv_lens_ptr + g) + 1)
-        tl.store(gen_rows_ptr + g, g.to(tl.int64))
+            tl.store(kv_lens_ptr, kv_len_pre + 1)
+        tl.store(gen_rows_ptr, tl.zeros([], dtype=tl.int64))
         bonus_index = tl.maximum(accepted - 1, 0)
         bonus = tl.sum(tl.where(in_row & (cols == bonus_index), tokens32, 0), axis=0).to(tl.int64)
-        tl.store(bonus_ptr + g, bonus)
+        tl.store(bonus_ptr, bonus)
         accepted64 = accepted.to(tl.int64)
-        tl.store(num_accepted_long_ptr + g, accepted64)
-        slot = tl.load(slots_ptr + g)
-        ctx_len = tl.load(ctx_len_ptr + slot).to(tl.int64)
-        ctx_now = tl.minimum(ctx_len + accepted64, max_ctx)
-        tl.store(
-            query_positions_ptr + g * block_size + qcols,
-            ctx_now + qcols.to(tl.int64),
-            mask=in_block,
-        )
-        tl.store(ctx_positions_ptr + g * row_width + cols, ctx_len + cols.to(tl.int64), mask=in_row)
-        tl.store(embed_ids_ptr + g, bonus)
-        tl.store(
-            noise_ids_ptr + g * block_size + qcols,
-            tl.where(qcols == 0, bonus, mask_id),
-            mask=in_block,
-        )
-    tl.store(embed_ids_ptr + num_gens, mask_id)
+        tl.store(num_accepted_long_ptr, accepted64)
+        ctx_now = tl.minimum(ctx_len_pre + accepted64, max_ctx)
+        tl.store(query_positions_ptr + qcols, ctx_now + qcols.to(tl.int64), mask=in_block)
+        tl.store(ctx_positions_ptr + cols, ctx_len_pre + cols.to(tl.int64), mask=in_row)
+        tl.store(embed_ids_ptr, bonus)
+        tl.store(noise_ids_ptr + qcols, tl.where(qcols == 0, bonus, mask_id), mask=in_block)
+        tl.store(embed_ids_ptr + 1, mask_id)
+    else:
+        # prepare_for_spec_dec's clone of _seq_lens_cuda: reads a graph input only.
+        if COPY_SEQ_LENS:
+            for start in range(0, seq_lens_numel, SEQ_BLOCK):
+                idx = start + tl.arange(0, SEQ_BLOCK)
+                keep = idx < seq_lens_numel
+                tl.store(seq_lens_copy_ptr + idx, tl.load(seq_lens_ptr + idx, mask=keep), mask=keep)
+        tl.store(offsets_ptr + cols, cols.to(tl.int64), mask=in_row)
+        counter = tl.zeros([], dtype=tl.int64)
+        if FORCE == 2:
+            # One bump per call, before any request reads it (as dflash_accept).
+            counter = tl.load(counter_ptr).to(tl.int64) + 1
+            tl.store(counter_ptr, counter)
+        for g in range(num_gens):
+            # --- acceptance: dflash_accept's statements for a generation row ---
+            tokens = tl.load(target_ptr + g * row_width + cols, mask=in_row, other=0)
+            tokens32 = tokens.to(tl.int32)
+            tl.store(accepted_ptr + g * row_width + cols, tokens32, mask=in_row)
+            if FORCE == 0:
+                drafts = tl.load(draft_ptr + g * draft_row_stride + cols, mask=cols < K, other=0)
+                mismatch = (cols < K) & (drafts.to(tl.int64) != tokens.to(tl.int64))
+                accepted = tl.min(tl.where(mismatch, cols, K), axis=0) + 1
+            elif FORCE == 1:
+                accepted = tl.zeros([], dtype=tl.int32) + base_total
+            else:
+                index = (counter * COUNTER_STRIDE + g * SLOT_STRIDE) & POOL_MASK
+                draw = tl.load(pool_ptr + index)
+                accepted = tl.minimum(base_total + (draw < frac).to(tl.int32), max_total)
+            accepted = accepted.to(tl.int32)
+            tl.store(num_accepted_ptr + g, accepted)
+            # --- the bookkeeping, each value written after the count it uses ---
+            tl.store(rewind_ptr + g, 1 - accepted)
+            if BUMP_KV_LENS:
+                tl.store(kv_lens_ptr + g, tl.load(kv_lens_ptr + g) + 1)
+            tl.store(gen_rows_ptr + g, g.to(tl.int64))
+            bonus_index = tl.maximum(accepted - 1, 0)
+            bonus = tl.sum(tl.where(in_row & (cols == bonus_index), tokens32, 0), axis=0).to(
+                tl.int64
+            )
+            tl.store(bonus_ptr + g, bonus)
+            accepted64 = accepted.to(tl.int64)
+            tl.store(num_accepted_long_ptr + g, accepted64)
+            slot = tl.load(slots_ptr + g)
+            ctx_len = tl.load(ctx_len_ptr + slot).to(tl.int64)
+            ctx_now = tl.minimum(ctx_len + accepted64, max_ctx)
+            tl.store(
+                query_positions_ptr + g * block_size + qcols,
+                ctx_now + qcols.to(tl.int64),
+                mask=in_block,
+            )
+            tl.store(
+                ctx_positions_ptr + g * row_width + cols, ctx_len + cols.to(tl.int64), mask=in_row
+            )
+            tl.store(embed_ids_ptr + g, bonus)
+            tl.store(
+                noise_ids_ptr + g * block_size + qcols,
+                tl.where(qcols == 0, bonus, mask_id),
+                mask=in_block,
+            )
+        tl.store(embed_ids_ptr + num_gens, mask_id)
 
 
 class DflashVerifyFold(OpWrapper):
@@ -205,7 +265,11 @@ class DflashVerifyFold(OpWrapper):
     the attention metadata's ``kv_lens_cuda`` (read-modify-write) and
     ``_seq_lens_cuda`` (read). One Triton program (grid 1, 1 warp), JIT-compiled
     per (K, block, force mode, buffer flags); loops over the requests
-    (``MAX_REQUESTS``). No programmatic-dependent-launch attributes.
+    (``MAX_REQUESTS``). No programmatic-dependent-launch attributes, except with
+    ``pre_wait`` (the verify PDL of ``distributed_head_sampler``, one request): launched
+    with PDL, every load but the sampled tokens' before ``griddepcontrol.wait``, every
+    store after it. The caller guarantees the predecessor (the sampler's draw)
+    releases it only after its own wait, so every value loaded before the wait is final.
 
     Call site: the DFlash worker's ``_sample_and_accept_draft_tokens_base``
     under the ``verify_fold`` fast path (``verify_fold/fold.py``), on generation-only uniform
@@ -240,6 +304,7 @@ class DflashVerifyFold(OpWrapper):
         mask_token_id: int,
         kv_lens: Optional[torch.Tensor],
         seq_lens: Optional[torch.Tensor],
+        pre_wait: bool = False,
     ) -> VerifyFold:
         num_gens, k = draft_tokens.shape
         device = target_tokens.device
@@ -260,6 +325,10 @@ class DflashVerifyFold(OpWrapper):
         )
         fractional = force_mode == FORCE_FRACTIONAL
         dummy = out.num_accepted
+        # pre_wait: one request, the copied _seq_lens_cuda within one block (else the plain launch).
+        pre_wait = (
+            pre_wait and num_gens == 1 and (seq_lens is None or seq_lens.numel() <= SEQ_BLOCK)
+        )
         _dflash_verify_fold_kernel[(1,)](
             target_tokens,
             draft_tokens,
@@ -300,6 +369,7 @@ class DflashVerifyFold(OpWrapper):
             BUMP_KV_LENS=kv_lens is not None,
             COPY_SEQ_LENS=seq_lens is not None,
             SEQ_BLOCK=SEQ_BLOCK,
+            **({"PRE_WAIT": True, "launch_pdl": True} if pre_wait else {}),
             num_warps=1,
         )
         return out
@@ -321,6 +391,7 @@ class DflashVerifyFold(OpWrapper):
         mask_token_id: int,
         kv_lens: Optional[torch.Tensor],
         seq_lens: Optional[torch.Tensor],
+        pre_wait: bool = False,
     ) -> VerifyFold:
         """The built-in chain, statement for statement, on a batch with no context rows.
 
@@ -390,6 +461,7 @@ class DflashVerifyFold(OpWrapper):
         mask_token_id: int,
         kv_lens: Optional[torch.Tensor],
         seq_lens: Optional[torch.Tensor],
+        pre_wait: bool = False,
     ) -> None:
         assert draft_tokens.dim() == 2 and draft_tokens.stride(-1) == 1, (
             "draft_tokens must be [gens, K] with unit column stride"

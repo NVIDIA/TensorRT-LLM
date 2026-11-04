@@ -70,12 +70,15 @@ within 10 % of it.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+
+from .dr3_qk_norm_rope import qk_fold_packed_q, qk_fold_rows
 
 #: The published DFlash 2 drafter at TP8: 64 query / 8 KV heads over eight
 #: ranks, head width 128, a 2048-token two-sided window (FlashAttention bounds
@@ -98,6 +101,20 @@ MAX_SPLITS = 128
 MAX_TILES = 16
 #: Most keys a block row's window may span (window_size[0] + M).
 MAX_WINDOW_SPAN = MAX_SPLITS * MAX_TILES * SPLIT_BLOCK_N
+
+
+@dataclass(frozen=True)
+class QkFold:
+    """The QK norm + RoPE the split kernel applies to raw ``q`` / ``k_new`` (``qk_fold``; NeoX, full rotary,
+    no YaRN): the norm weights ``[128]`` BF16, the token positions ``[B * M]`` int32 (row ``b * M + i``), eps,
+    the RoPE base and the attention factor, as ``drafter_attn_pdl`` passes them to its CUDA kernel."""
+
+    q_weight: torch.Tensor
+    k_weight: torch.Tensor
+    positions: torch.Tensor
+    eps: float
+    base: float
+    attention_factor: float = 1.0
 
 
 @triton.jit
@@ -157,6 +174,12 @@ def _window_attention_split_kernel(
     stride_ob,
     stride_om,
     stride_oh,
+    qn_q_w_ptr,
+    qn_k_w_ptr,
+    qn_pos_ptr,
+    qn_eps,
+    qn_base,
+    qn_af,
     M: tl.constexpr,
     M_P2: tl.constexpr,
     GROUP: tl.constexpr,
@@ -171,12 +194,14 @@ def _window_attention_split_kernel(
     DIRECT: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     PAGE: tl.constexpr,
+    PRE_WAIT: tl.constexpr = False,
+    QK_FOLD: tl.constexpr = False,
 ):
     split = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // HKV
     kvh = bh % HKV
-    if LAUNCH_WITH_PDL:
+    if LAUNCH_WITH_PDL and not PRE_WAIT:
         # Before any global read: q and the block's K/V are the previous
         # kernels' outputs. The merge kernel may launch now; it waits for this
         # whole grid (griddepcontrol.wait) before it reads a partial.
@@ -185,9 +210,15 @@ def _window_attention_split_kernel(
     seqlen = tl.load(seqlens_ptr + b)
     lo = tl.maximum(seqlen - M - WINDOW_LEFT, 0)
     start = lo + split * (TILES * BLOCK_N)
+    if PRE_WAIT:
+        # Issued beside the length's load rather than behind the exit test.
+        slot_pre = tl.load(batch_idx_ptr + b)
     if start >= seqlen:
         return
-    slot = tl.load(batch_idx_ptr + b).to(tl.int64)
+    if PRE_WAIT:
+        slot = slot_pre.to(tl.int64)
+    else:
+        slot = tl.load(batch_idx_ptr + b).to(tl.int64)
     dims = tl.arange(0, D)
     # A paged call's slot names the request's page-table row; its slot strides are 0.
     table = page_table_ptr + slot * stride_pt
@@ -195,6 +226,26 @@ def _window_attention_split_kernel(
     v_base = v_ptr + slot * stride_vs + kvh * stride_vh
     block_start = seqlen - M
     new_row0 = b.to(tl.int64) * M
+    if PRE_WAIT:
+        # split_pre_wait (with APPEND and PDL): the lengths, the slots and the
+        # context columns below the block are final once this grid is released
+        # (window_attention_launch), so the context part of the first key tile
+        # is loaded before the wait; q and the block's K/V only after it.
+        cols_pre = start + tl.arange(0, BLOCK_N)
+        arena_pre = (cols_pre < seqlen) & (cols_pre < block_start)
+        cols_pre64 = cols_pre.to(tl.int64)
+        k_pre = tl.load(
+            k_base + cols_pre64[:, None] * stride_kn + dims[None, :],
+            mask=arena_pre[:, None],
+            other=0.0,
+        )
+        v_pre = tl.load(
+            v_base + cols_pre64[:, None] * stride_vn + dims[None, :],
+            mask=arena_pre[:, None],
+            other=0.0,
+        )
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if APPEND:
         if split == 0:
             # The append: the block's K/V into the arena at [L - M, L). Nothing
@@ -205,10 +256,27 @@ def _window_attention_split_kernel(
             j_ok = j < M
             new_rows = new_row0 + j
             kv_rows = _context_rows(table, block_start + j, j_ok, page_rows, PAGE)
-            k_blk = tl.load(
-                k_new_ptr + new_rows[:, None] * stride_knt + kvh * stride_knh + dims[None, :],
-                mask=j_ok[:, None],
-            )
+            if QK_FOLD:
+                # The block's raw keys normalized and rotated here (``dr3_folds``' QK fold): the arena gets the bits
+                # the QK norm + RoPE kernel would have left in k_new.
+                k_blk = qk_fold_rows(
+                    k_new_ptr,
+                    new_rows * stride_knt + kvh * stride_knh,
+                    j_ok,
+                    qn_k_w_ptr,
+                    qn_pos_ptr,
+                    new_rows,
+                    qn_eps,
+                    qn_base,
+                    qn_af,
+                    M_P2,
+                    D,
+                )
+            else:
+                k_blk = tl.load(
+                    k_new_ptr + new_rows[:, None] * stride_knt + kvh * stride_knh + dims[None, :],
+                    mask=j_ok[:, None],
+                )
             v_blk = tl.load(
                 v_new_ptr + new_rows[:, None] * stride_vnt + kvh * stride_vnh + dims[None, :],
                 mask=j_ok[:, None],
@@ -228,15 +296,50 @@ def _window_attention_split_kernel(
     row_ok = rows < GROUP * M
     q_pos = block_start + i
     first_key = q_pos - WINDOW_LEFT
-    q = tl.load(
-        q_ptr
-        + b.to(tl.int64) * stride_qb
-        + i[:, None] * stride_qm
-        + (kvh * GROUP + g)[:, None] * stride_qh
-        + dims[None, :],
-        mask=row_ok[:, None],
-        other=0.0,
-    )
+    if QK_FOLD:
+        # ``dr3_folds``' QK fold: q holds the projection's raw query heads; each program normalizes and rotates its
+        # tile as the QK norm + RoPE kernel would (the same bits), the position of row (g, i) being that
+        # of token b * M + i.
+        q_off = b.to(tl.int64) * stride_qb + i * stride_qm + (kvh * GROUP + g) * stride_qh
+        if (M & (M - 1)) == 0 and ROWS % M == 0:
+            q = qk_fold_packed_q(
+                q_ptr,
+                q_off,
+                row_ok,
+                qn_q_w_ptr,
+                qn_pos_ptr,
+                new_row0,
+                qn_eps,
+                qn_base,
+                qn_af,
+                ROWS,
+                M,
+                D,
+            )
+        else:
+            q = qk_fold_rows(
+                q_ptr,
+                q_off,
+                row_ok,
+                qn_q_w_ptr,
+                qn_pos_ptr,
+                new_row0 + i,
+                qn_eps,
+                qn_base,
+                qn_af,
+                ROWS,
+                D,
+            )
+    else:
+        q = tl.load(
+            q_ptr
+            + b.to(tl.int64) * stride_qb
+            + i[:, None] * stride_qm
+            + (kvh * GROUP + g)[:, None] * stride_qh
+            + dims[None, :],
+            mask=row_ok[:, None],
+            other=0.0,
+        )
 
     m_i = tl.full([ROWS], float("-inf"), tl.float32)
     l_i = tl.zeros([ROWS], tl.float32)
@@ -251,25 +354,56 @@ def _window_attention_split_kernel(
             from_new = cols >= block_start
             in_arena = col_ok & (cols < block_start)
             new_rows = new_row0 + (cols - block_start)
-            k = tl.load(
-                k_base + kv_rows[:, None] * stride_kn + dims[None, :],
-                mask=in_arena[:, None],
-                other=0.0,
-            )
-            k = tl.where(
-                from_new[:, None],
-                tl.load(
-                    k_new_ptr + new_rows[:, None] * stride_knt + kvh * stride_knh + dims[None, :],
-                    mask=(col_ok & from_new)[:, None],
+            if PRE_WAIT and t == 0:
+                # Loaded before the wait over a dense arena (PRE_WAIT excludes PAGE), whose rows
+                # are the columns ``kv_rows`` names.
+                k = k_pre
+            else:
+                k = tl.load(
+                    k_base + kv_rows[:, None] * stride_kn + dims[None, :],
+                    mask=in_arena[:, None],
                     other=0.0,
-                ),
-                k,
-            )
-            v = tl.load(
-                v_base + kv_rows[:, None] * stride_vn + dims[None, :],
-                mask=in_arena[:, None],
-                other=0.0,
-            )
+                )
+            if QK_FOLD:
+                # Only the tile holding block columns normalizes keys (a scalar branch, so the
+                # other programs skip the arithmetic).
+                k_new_tile = tl.zeros([BLOCK_N, D], k.dtype)
+                if start + t * BLOCK_N + BLOCK_N > block_start:
+                    k_new_tile = qk_fold_rows(
+                        k_new_ptr,
+                        new_rows * stride_knt + kvh * stride_knh,
+                        col_ok & from_new,
+                        qn_k_w_ptr,
+                        qn_pos_ptr,
+                        new_rows,
+                        qn_eps,
+                        qn_base,
+                        qn_af,
+                        BLOCK_N,
+                        D,
+                    )
+                k = tl.where(from_new[:, None], k_new_tile, k)
+            else:
+                k = tl.where(
+                    from_new[:, None],
+                    tl.load(
+                        k_new_ptr
+                        + new_rows[:, None] * stride_knt
+                        + kvh * stride_knh
+                        + dims[None, :],
+                        mask=(col_ok & from_new)[:, None],
+                        other=0.0,
+                    ),
+                    k,
+                )
+            if PRE_WAIT and t == 0:
+                v = v_pre
+            else:
+                v = tl.load(
+                    v_base + kv_rows[:, None] * stride_vn + dims[None, :],
+                    mask=in_arena[:, None],
+                    other=0.0,
+                )
             v = tl.where(
                 from_new[:, None],
                 tl.load(
@@ -412,12 +546,17 @@ def window_attention_launch(
     merge_warps: int,
     merge_entry_trigger: bool = False,
     page_table: torch.Tensor | None = None,
+    split_pre_wait: bool = False,
+    qk_fold: "QkFold | None" = None,
 ) -> torch.Tensor:
     """Launch the split and merge kernels with an explicit split geometry.
 
     ``merge_entry_trigger`` (with ``enable_pdl``): the merge kernel releases its
     dependent before its own wait instead of at its exit (the PDL chain's ``pdl_merge``).
     ``page_table``: the caches are pools of pages (see the module docstring).
+    ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``, over a dense arena): see
+    ``DflashWindowAttention``.
+    ``qk_fold`` (with ``k_new``): see ``DflashWindowAttention``.
 
     Raises:
         ValueError: if the geometry cuts the window into more than ``MAX_SPLITS`` splits.
@@ -441,11 +580,24 @@ def window_attention_launch(
     if batch == 0:
         return out
     append = k_new is not None
+    if qk_fold is not None and (not append or d != 128 or q.dtype != torch.bfloat16):
+        raise ValueError("qk_fold takes BF16 128-wide heads with k_new / v_new")
     if not append:
         k_new = v_new = k_cache  # unused
     page_table, page, page_rows, stride_pt, stride_ks, stride_vs = _page_arguments(
         k_cache, v_cache, page_table, cache_batch_idx
     )
+    if qk_fold is None:
+        qn = (q, q, cache_seqlens, 0.0, 0.0, 0.0)  # unused
+    else:
+        qn = (
+            qk_fold.q_weight,
+            qk_fold.k_weight,
+            qk_fold.positions,
+            qk_fold.eps,
+            qk_fold.base,
+            qk_fold.attention_factor,
+        )
     direct = num_splits == 1
     if direct:
         o_part = lse_part = out  # unused
@@ -488,6 +640,7 @@ def window_attention_launch(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        *qn,
         M=m,
         M_P2=max(2, triton.next_power_of_2(m)),
         GROUP=group,
@@ -502,6 +655,8 @@ def window_attention_launch(
         DIRECT=direct,
         LAUNCH_WITH_PDL=enable_pdl,
         PAGE=page,
+        PRE_WAIT=enable_pdl and append and split_pre_wait and not page,
+        QK_FOLD=qk_fold is not None,
         num_warps=num_warps,
         launch_pdl=enable_pdl,
     )
@@ -569,7 +724,18 @@ class DflashWindowAttention(OpWrapper):
     * ``page_table`` ``[rows, max_pages]`` int32, unit last stride: the caches
       are pools ``[pages, page_size, Hkv, D]`` whose page stride is the same
       whole number of rows for both, and ``cache_batch_idx`` names table rows
-      (see the module docstring).
+      (see the module docstring);
+    * ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``, over a dense arena:
+      a paged call ignores it; ``drafter_folds``' attention PDL copy): the split
+      kernel loads the lengths, the slots and the context part (columns below
+      ``L - M``) of its first key tile before its ``griddepcontrol.wait``, and
+      ``q`` and the block's K/V after it. The caller guarantees those
+      tensors were final before the split's predecessor released it (its
+      predecessor triggers only after its own wait, in every CTA). The same values;
+    * ``qk_fold`` (a ``QkFold``, with ``k_new``; ``dr3_folds``' QK fold): ``q`` and ``k_new`` hold the
+      projection's raw query / key heads; each split program normalizes and rotates the rows it reads
+      (``dr3_qk_norm_rope``: the bits of ``drafter_attn_pdl``'s CUDA kernel) and the append stores the
+      rotated keys. The same output and arena as that kernel followed by this op.
 
     Returns ``[B, M, Hq, D]`` in ``q``'s dtype, contiguous.
 
@@ -601,6 +767,8 @@ class DflashWindowAttention(OpWrapper):
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
         page_table: torch.Tensor | None = None,
+        split_pre_wait: bool = False,
+        qk_fold: QkFold | None = None,
     ) -> None:
         reason = unsupported_reason(
             q,
@@ -630,6 +798,8 @@ class DflashWindowAttention(OpWrapper):
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
         page_table: torch.Tensor | None = None,
+        split_pre_wait: bool = False,
+        qk_fold: QkFold | None = None,
     ) -> torch.Tensor:
         m, num_q_heads = q.shape[1], q.shape[2]
         group = num_q_heads // k_cache.shape[2]
@@ -648,6 +818,8 @@ class DflashWindowAttention(OpWrapper):
             **config,
             merge_entry_trigger=merge_entry_trigger,
             page_table=page_table,
+            split_pre_wait=split_pre_wait,
+            qk_fold=qk_fold,
         )
 
     def reference(
@@ -663,13 +835,14 @@ class DflashWindowAttention(OpWrapper):
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
+        split_pre_wait: bool = False,
     ) -> torch.Tensor:
         """Dense masked softmax attention in fp32, one rounding at the end.
 
         The block's keys and values come from ``k_new`` / ``v_new`` when given;
-        the reference does not write the arena. ``enable_pdl`` and
-        ``merge_entry_trigger`` change how the op launches, not what it
-        computes; ignored.
+        the reference does not write the arena. ``enable_pdl``,
+        ``merge_entry_trigger`` and ``split_pre_wait`` change how the op
+        launches, not what it computes; ignored.
         """
         return attention_reference(
             q,
