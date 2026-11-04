@@ -42,6 +42,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._profiler import warn_unsupported_moe_routing
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention.attention import Attention
@@ -787,6 +788,8 @@ class Step3p7MoE(nn.Module):
         # Routed-expert LoRA must execute in the fused backend. Otherwise the
         # selected Python path owns expert execution and its dequantized weights.
         self._use_python_experts = self._use_python_clamp and not self._moe_lora_enabled
+        if self._use_python_experts:
+            warn_unsupported_moe_routing("Step3p7 Python clamp path")
 
         # An MTP layer nests its decoder block under ``mtp_block``.
         block = "mtp_block." if layer_idx >= int(text_config.num_hidden_layers) else ""

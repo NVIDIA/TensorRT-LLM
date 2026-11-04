@@ -35,6 +35,16 @@ if(${BUILD_PYT})
                              PRIVATE ${fmha_params_generated_include_dir})
 
   add_tllm_gtest(
+    profilerTest
+    OWNER
+    common
+    SOURCES
+    profilerTest.cpp
+    LINK_LIBRARIES
+    tllm::common_profiler
+    LABELS
+    "unit;common;host")
+  add_tllm_gtest(
     thUtilsTest
     SOURCES
     thUtilsTest.cpp

@@ -396,6 +396,8 @@ if(NOT WIN32)
 endif()
 
 if(BUILD_PYT)
+  # One shared selector and scope owner for core, Torch ops and bindings.
+  target_link_libraries(${SHARED_TARGET} PRIVATE tllm::common_profiler)
   add_subdirectory(thop)
   # modeling_v2 family libraries: torch-op libraries loaded on demand.
   add_subdirectory(modeling_v2)

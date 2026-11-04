@@ -74,6 +74,23 @@ target_link_libraries(tllm_common_environment PUBLIC tllm::common_cuda)
 set_target_properties(tllm_common_environment
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+if(BUILD_PYT)
+  add_library(tllm_common_profiler STATIC profiler.cpp)
+  add_library(tllm::common_profiler ALIAS tllm_common_profiler)
+  # CPU-side Torch libraries keep dynamic NVRTC out of the provider.
+  target_link_libraries(tllm_common_profiler PUBLIC tllm::common_headers
+                                                    torch_cpu c10)
+  target_compile_features(tllm_common_profiler PUBLIC cxx_std_20)
+  target_compile_definitions(
+    tllm_common_profiler
+    PUBLIC TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
+  set_target_properties(tllm_common_profiler
+                        PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(ENABLE_NCCL_PROFILING)
+    target_link_libraries(tllm_common_profiler PUBLIC CUDA::cudart)
+  endif()
+endif()
+
 add_library(
   common_src OBJECT
   cublasMMWrapper.cpp
