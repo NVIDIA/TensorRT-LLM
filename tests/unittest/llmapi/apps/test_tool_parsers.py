@@ -895,10 +895,12 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
 
-    def test_detect_and_parse_bare_json_list(self, sample_tools, parser):
-        """Bare JSON list of tool calls without wrapper is parsed."""
-        text = '[{"name":"get_weather","arguments":{"location":"Paris"}}]'
-
+    @pytest.mark.parametrize("text", [
+        '[{"name":"get_weather","arguments":{"location":"Paris"}}]',
+        '[0, {"name":"get_weather","arguments":{"location":"Paris"}}, null]',
+    ])
+    def test_detect_and_parse_bare_json_list(self, sample_tools, parser, text):
+        """Bare JSON lists retain valid calls and skip non-object entries."""
         result = parser.detect_and_parse(text, sample_tools)
 
         assert result.normal_text == ""
