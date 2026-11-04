@@ -27,7 +27,7 @@ class PythonRequestInputs:
     logits_post_processors: list[LogitsProcessor] | None = None
     multimodal_data: dict[str, Any] | None = None
     scheduling_params: SchedulingParams | None = None
-    num_logprobs: int = 0
+    num_logprobs: int | None = 0
     disaggregated_params: DisaggregatedParams | None = None
     lora_path: str | None = None
     lora_ckpt_source: str | None = None
