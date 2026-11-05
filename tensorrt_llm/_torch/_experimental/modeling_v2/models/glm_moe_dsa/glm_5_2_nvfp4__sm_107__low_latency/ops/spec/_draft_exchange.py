@@ -14,12 +14,15 @@ op and nothing else.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 
-from tensorrt_llm._torch.distributed.ops import _get_mnnvl_workspace_comm, _mnnvl_device_index
+from tensorrt_llm._torch.distributed.ops import (
+    _get_mnnvl_workspace_comm,
+    _mnnvl_device_index,
+    use_mnnvl_fabric_handle,
+)
 from tensorrt_llm._utils import torch_pybind11_abi
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.mapping import Mapping
@@ -144,9 +147,7 @@ class DraftExchangeWorkspace:
         Fabric handles across nodes or under ``TRTLLM_FORCE_MNNVL_AR``, NVLS handles within a node, as the MNNVL
         all-reduce workspace takes them.
         """
-        use_fabric_handle = (
-            os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-        )
+        use_fabric_handle = use_mnnvl_fabric_handle(mapping)
         return cls(
             buffer_size_bytes,
             mapping.tp_size,

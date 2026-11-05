@@ -52,7 +52,7 @@ from transformers import (
 from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import get_env_flag, prefer_pinned
+from ..._utils import prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -75,6 +75,7 @@ from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
+    _is_mm_disagg,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -90,7 +91,7 @@ from .modeling_utils import (
 
 logger = logging.getLogger(__name__)
 
-DISAGG = get_env_flag("TLLM_MULTIMODAL_DISAGGREGATED", False)
+DISAGG = _is_mm_disagg()
 
 
 def _has_meta_tensors(module: nn.Module) -> bool:

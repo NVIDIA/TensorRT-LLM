@@ -58,13 +58,13 @@ from ..moe.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
                              MoEWeightLoadingMode, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import _is_mm_disagg, fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, moe_experts_quant_config,
                              register_auto_model)
 
-DISAGG = get_env_flag('TLLM_MULTIMODAL_DISAGGREGATED', False)
+DISAGG = _is_mm_disagg()
 
 try:
     # Available in transformers<5

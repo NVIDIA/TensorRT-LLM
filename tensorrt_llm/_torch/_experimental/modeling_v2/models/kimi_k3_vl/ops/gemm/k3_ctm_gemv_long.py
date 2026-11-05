@@ -136,7 +136,7 @@ class K3CtmGemvLong(OpWrapper):
     runtime. Warm every key eagerly before graph capture or the first call
     raises RuntimeError. cutlass and cuda.bindings must be importable.
 
-    TRTLLM_ENABLE_PDL is read every call: unset or 1 enables PDL. Filling
+    TRTLLM_ENABLE_PDL is read every call: PDL is on unless it is 0. Filling
     the weight ring via TMA with L2 evict-first and prefetching remaining
     k-tiles precede griddepcontrol.wait. Weight must not be written by
     preceding in-flight work; x may be. trigger_early releases dependents

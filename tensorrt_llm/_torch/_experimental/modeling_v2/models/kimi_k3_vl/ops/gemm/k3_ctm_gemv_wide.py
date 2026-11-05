@@ -133,7 +133,7 @@ class K3CtmGemvWide(OpWrapper):
     eagerly before graph capture or the first call raises RuntimeError.
     cutlass and cuda.bindings must be importable.
 
-    TRTLLM_ENABLE_PDL is read every call: unset or 1 enables PDL. Weight
+    TRTLLM_ENABLE_PDL is read every call: PDL is on unless it is 0. Weight
     ring TMA loads with L2 evict-first and remaining k-tile prefetches precede
     griddepcontrol.wait, so weight must not be written by preceding
     in-flight work; x may be. Dependents are always released after initial

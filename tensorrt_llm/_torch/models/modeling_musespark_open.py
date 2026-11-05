@@ -36,7 +36,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.configs.musespark_open import SLIDING_ATTENTION, MuseSparkOpenConfig
-from tensorrt_llm._utils import get_env_flag, nvtx_range
+from tensorrt_llm._utils import nvtx_debug_enabled, nvtx_range
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, RotaryScalingType
 
 from ...models.modeling_utils import QuantConfig
@@ -74,7 +74,7 @@ _NVTX_OFF = contextlib.nullcontext()
 
 
 def nvtx_layer_ranges_enabled() -> bool:
-    return get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or get_env_flag("TLLM_NVTX_DEBUG", False)
+    return nvtx_debug_enabled()
 
 
 class LayerNvtx:

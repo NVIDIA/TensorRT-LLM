@@ -957,6 +957,12 @@ def nvtx_range(msg: str,
     return nvtx.annotate(msg, color=color, domain=domain, category=category)
 
 
+def nvtx_debug_enabled() -> bool:
+    """Whether the debug NVTX ranges are on (``TLLM_LLMAPI_ENABLE_NVTX`` or ``TLLM_NVTX_DEBUG``)."""
+    return get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or get_env_flag(
+        "TLLM_NVTX_DEBUG", False)
+
+
 def nvtx_range_debug(msg: str,
                      color: str = "grey",
                      domain: str = "TensorRT-LLM",
@@ -979,8 +985,7 @@ def nvtx_range_debug(msg: str,
                         that is both a context manager and an identity
                         decorator; it is safe for concurrent and nested use.
     """
-    if get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or \
-            get_env_flag("TLLM_NVTX_DEBUG", False):
+    if nvtx_debug_enabled():
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _NULL_RANGE
@@ -993,8 +998,7 @@ def nvtx_mark_debug(msg: str,
     """
     Creates an NVTX marker for debugging purposes.
     """
-    if get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or \
-            get_env_flag("TLLM_NVTX_DEBUG", False):
+    if nvtx_debug_enabled():
         nvtx_mark(msg, color=color, domain=domain, category=category)
 
 
@@ -1384,6 +1388,20 @@ def get_env_flag(name: str, default: Optional[bool] = None) -> Optional[bool]:
     raise ValueError(f"{name}={raw!r} is not one of "
                      f"{'/'.join(_ENV_FLAG_TRUE_VALUES)} or "
                      f"{'/'.join(_ENV_FLAG_FALSE_VALUES)}")
+
+
+def get_env_enable_pdl() -> bool:
+    """Whether ``TRTLLM_ENABLE_PDL`` leaves programmatic dependent launch on.
+
+    Parsed like the C++ ``getEnvEnablePDL()`` so Python and native kernels launch
+    with the same setting: on unless the variable is exactly ``0``. Callers check
+    the GPU architecture themselves.
+    """
+    enabled = os.environ.get("TRTLLM_ENABLE_PDL") != "0"
+    if enabled and not getattr(get_env_enable_pdl, "_printed", False):
+        logger.info("PDL enabled")
+        setattr(get_env_enable_pdl, "_printed", True)
+    return enabled
 
 
 @lru_cache(maxsize=None)

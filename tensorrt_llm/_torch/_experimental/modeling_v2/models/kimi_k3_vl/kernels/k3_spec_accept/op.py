@@ -35,6 +35,8 @@ from typing import Dict, List, Optional
 
 import torch
 
+from tensorrt_llm._utils import get_env_enable_pdl
+
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
 _scratch: Dict[tuple, tuple] = {}
@@ -86,6 +88,7 @@ def workspace(mapping, push_copies: int = 1) -> dict:
         _get_mnnvl_workspace_comm,
         _make_mnnvl_mcast_buffer,
         _mnnvl_workspace_all_succeeded,
+        use_mnnvl_fabric_handle,
     )
 
     kern = _kernel_module()
@@ -95,9 +98,7 @@ def workspace(mapping, push_copies: int = 1) -> dict:
             f"k3_spec_accept: {slots} exchange slots (an even count up to {kern.MAX_SLOTS})"
         )
     comm = _get_mnnvl_workspace_comm(mapping)
-    use_fabric_handle = (
-        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-    )
+    use_fabric_handle = use_mnnvl_fabric_handle(mapping)
     error: Optional[Exception] = None
     try:
         words = kern.BUFFERS * kern.BUF_WORDS
@@ -277,7 +278,7 @@ def k3_spec_accept(
     n_seq, max_blocks = block_off.shape[1], block_off.shape[3]
     scalars = (int(pool_idx) * n_seq * 2 * max_blocks, 2 * max_blocks, int(divisor), int(max_ctx), int(total),
                float(frac), int(mode), int(rank), int(shard_offset))  # fmt: skip
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    use_pdl = get_env_enable_pdl()
     consts = (grid, vocab, batch, drafts, block, hidden, max_blocks, int(slots), int(push_copies))
     key = consts + (use_pdl,)
     fn = _compiled.get(key)
