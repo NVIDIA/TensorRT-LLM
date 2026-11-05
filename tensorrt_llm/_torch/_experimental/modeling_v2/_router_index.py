@@ -215,6 +215,95 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
+#: The implementation id that honors any tactic: ``create_moe`` builds the experts and only that
+#: module runs them, so whatever a tactic resolves to is what runs.
+ANY_MOE_IMPL = "*"
+
+
+def _refuse_unhonored_moe_tactics(config: "ModelConfig", target: type, architecture: str) -> None:
+    """Raise ``NoTarget`` unless ``target`` honors each MoE tactic the config sets.
+
+    Routes read no tactic, so a target declares the implementation ids it honors:
+    ``moe_impls_honored`` for ``moe_config.tactic`` and ``draft_moe_impls_honored`` for
+    ``speculative_config.moe_tactic``; :data:`ANY_MOE_IMPL` honors any, undeclared honors none.
+    A target whose own kernels read the expert buffers lists only the id whose layout they
+    read. A tactic is honored when every implementation it can resolve to (narrowed to the
+    formats the target's experts run as on ``architecture``) is listed; otherwise the built-in
+    model runs it.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    moe_tactic = config.moe_tactic
+    if moe_tactic is not None:
+        _refuse_unhonored_moe_tactic(
+            "moe_config.tactic",
+            moe_tactic,
+            ModelConfig._declared_moe_quants(
+                config.quant_config, config.quant_config_dict, architecture=architecture
+            ),
+            target,
+            getattr(target, "moe_impls_honored", frozenset()),
+            "its experts",
+        )
+    draft_moe_tactic = getattr(getattr(config, "spec_config", None), "moe_tactic", None)
+    if draft_moe_tactic is not None:
+        _refuse_unhonored_moe_tactic(
+            "speculative_config.moe_tactic",
+            draft_moe_tactic,
+            None,
+            target,
+            getattr(target, "draft_moe_impls_honored", frozenset()),
+            "its draft's experts",
+        )
+
+
+def _refuse_unhonored_moe_tactic(
+    field: str,
+    tactic: str,
+    quants: set[str] | None,
+    target: type,
+    honored: frozenset[str],
+    experts: str,
+) -> None:
+    """Raise ``NoTarget`` unless every implementation ``tactic`` can resolve to is in ``honored``.
+
+    Args:
+        field: The option ``tactic`` was set by, as the refusal names it.
+        tactic: The MoE tactic.
+        quants: The experts' formats, spelled as MoE identities spell them; the tactic's
+            matches of these formats count, or all of them when none is. ``None`` counts all.
+        target: The target class, as the refusal names it.
+        honored: The implementation ids ``target`` honors for ``tactic``.
+        experts: The experts ``tactic`` selects, as the refusal names them.
+    """
+    if ANY_MOE_IMPL in honored:
+        return
+    if not honored:
+        raise NoTarget(
+            f"{field}={tactic!r} pins a MoE implementation, and {target.__name__} "
+            f"honors no MoE tactic for {experts}"
+        )
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import moe_impl_request
+
+    request = moe_impl_request(tactic=tactic)
+    impls = request.impls
+    if quants is not None:
+        impls = request.narrowed_to(quants).impls or impls
+    impl_ids = [
+        impl_cls.descriptor.impl_id
+        if getattr(impl_cls, "descriptor", None) is not None
+        else impl_cls.__name__
+        for impl_cls in impls
+    ]
+    if impl_ids and set(impl_ids) <= honored:
+        return
+    raise NoTarget(
+        f"{field}={tactic!r} pins a MoE implementation, and {target.__name__} runs "
+        f"{experts} only as {', '.join(sorted(honored))}; the tactic can resolve to "
+        f"{', '.join(impl_ids)}"
+    )
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
@@ -241,6 +330,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
         target = route(config, llm_args, _device_compute_capability())
+        if target is not None:
+            _refuse_unhonored_moe_tactics(config, target, arch)
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

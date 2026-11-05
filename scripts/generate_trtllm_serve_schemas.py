@@ -193,6 +193,33 @@ def _dwdp_launch_rules() -> list[dict]:
     ]
 
 
+def _any_case(token: str) -> str:
+    """A pattern matching ``token`` in any case; JSON Schema patterns take no flags."""
+    return "".join(f"[{char}{char.upper()}]" if char.isalpha() else char for char in token)
+
+
+def _moe_tactic_schema() -> dict:
+    """The MoE tactics the runtime accepts, as far as patterns can tell.
+
+    Every segment is ``*`` or a segment value in any case, around the
+    whitespace the runtime strips, and not every segment is ``*``. Which values
+    combine into an implementation id is left to the runtime.
+    """
+    from dataclasses import fields
+
+    from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MOE_IMPL_REGISTRY
+
+    values = "|".join(_any_case(token) for token in sorted(MOE_IMPL_REGISTRY.known_tokens()))
+    segment = rf"(\*|{values})"
+    more = len(fields(MoEImplId)) - 1
+    return {
+        "type": "string",
+        "pattern": rf"^\s*{segment}(\.{segment}){{0,{more}}}\s*$",
+        "not": {"pattern": rf"^\s*\*(\.\*){{0,{more}}}\s*$"},
+    }
+
+
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
@@ -286,6 +313,32 @@ def generate_serve_schema() -> dict:
         {"properties": {name: {"const": 0} for name in pair}},
         {"properties": {name: {"minimum": 1} for name in pair}, "required": list(pair)},
     ]
+    # Mirror the MoE tactic validators of MoeConfig and of every decoding
+    # config as far as a schema can, and that a tactic excludes any backend
+    # but AUTO (or unset, where that is allowed).
+    schema["$defs"]["MoeTactic"] = _moe_tactic_schema()
+
+    def mirror_moe_tactic_validators(
+        config_schema: dict, backend: str, tactic: str, admitted_backend: dict
+    ) -> None:
+        branches = config_schema["properties"][tactic]["anyOf"]
+        branches[:] = [
+            {"$ref": "#/$defs/MoeTactic"} if branch.get("type") == "string" else branch
+            for branch in branches
+        ]
+        config_schema["not"] = {
+            "required": [backend, tactic],
+            "properties": {backend: {"not": admitted_backend}, tactic: {"type": "string"}},
+        }
+
+    mirror_moe_tactic_validators(
+        schema["$defs"]["MoeConfig"], "backend", "tactic", {"const": "AUTO"}
+    )
+    for definition in schema["$defs"].values():
+        if "moe_tactic" in definition.get("properties", {}):
+            mirror_moe_tactic_validators(
+                definition, "moe_backend", "moe_tactic", {"enum": ["AUTO", None]}
+            )
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

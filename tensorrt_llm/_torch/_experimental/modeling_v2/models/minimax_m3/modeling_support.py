@@ -32,7 +32,8 @@ class ModelingSupport(Protocol):
     M3Eagle3Draft: Callable[..., nn.Module]
     M3Eagle3Worker: Callable[..., Any]
     ModelConfig: type[ModelConfig]
-    _get_requested_draft_moe_backend: Callable[..., Any]
+    _draft_loader_moe_kwargs: Callable[..., Any]
+    _draft_moe_selection: Callable[..., Any]
     _set_draft_kv_cache_quant_algo: Callable[..., None]
     should_use_separate_draft_kv_cache: Callable[..., bool]
 
@@ -263,7 +264,9 @@ def _build_speculation(state: ModelingSupport, /, shell: Any, model_config: Mode
         spec.speculative_model,
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=state._get_requested_draft_moe_backend(model_config, spec),
+        **state._draft_loader_moe_kwargs(
+            model_config, state._draft_moe_selection(model_config, spec)
+        ),
         mapping=model_config.mapping,
         spec_config=model_config.spec_config,
         max_num_tokens=model_config.max_num_tokens,

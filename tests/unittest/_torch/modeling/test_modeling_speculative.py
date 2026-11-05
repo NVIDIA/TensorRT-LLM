@@ -23,22 +23,26 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch import model_config as model_config_module
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import ModelConfig, MoESelection
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
     MTPForCausalLM,
     SpecDecOneEngineForCausalLM,
     _build_mtp_one_model_draft,
-    _copy_model_config_with_moe_backend,
+    _copy_model_config_with_moe_selection,
+    _draft_moe_selection,
+    _replacement_mtp_model_config,
     _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
 
 
 @pytest.mark.cpu_only
@@ -526,10 +530,13 @@ def _draft_backend_test_model_config(moe_backend: str = "CUTLASS") -> ModelConfi
     )
 
 
-def _external_spec_config(moe_backend: str | None) -> SimpleNamespace:
+def _external_spec_config(
+    moe_backend: str | None, moe_tactic: str | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         spec_dec_mode=SpeculativeDecodingMode.PARD,
         moe_backend=moe_backend,
+        moe_tactic=moe_tactic,
     )
 
 
@@ -540,6 +547,33 @@ def test_external_draft_moe_backend_none_inherits_target() -> None:
     kwargs = external_drafter_config_kwargs(model_config, _external_spec_config(None))
 
     assert kwargs["moe_backend"] == "CUTLASS"
+    assert kwargs["moe_tactic"] is None
+
+
+@pytest.mark.cpu_only
+def test_external_draft_of_a_pinned_target_resolves_auto() -> None:
+    """The target's tactic names the target's implementations, not the draft's."""
+    model_config = _draft_backend_test_model_config("CUTEDSL")
+    model_config.moe_tactic = "cutedsl.grouped_gemm.nvfp4"
+
+    kwargs = external_drafter_config_kwargs(model_config, _external_spec_config(None))
+
+    assert kwargs["moe_backend"] == "AUTO"
+    assert kwargs["moe_tactic"] is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_tactic", [None, "cutedsl.grouped_gemm.nvfp4"])
+def test_external_draft_moe_tactic_reaches_draft_loader(target_tactic: str | None) -> None:
+    model_config = _draft_backend_test_model_config("CUTEDSL")
+    model_config.moe_tactic = target_tactic
+
+    kwargs = external_drafter_config_kwargs(
+        model_config, _external_spec_config(None, moe_tactic="cutlass")
+    )
+
+    assert kwargs["moe_backend"] == "AUTO"
+    assert kwargs["moe_tactic"] == "cutlass"
 
 
 def test_external_draft_moe_backend_auto_reaches_draft_loader() -> None:
@@ -555,7 +589,9 @@ def test_loaded_draft_moe_backend_uses_isolated_model_config() -> None:
     """Resolving a loaded draft config does not modify another config."""
     target_config = _draft_backend_test_model_config("CUTLASS")
     with patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve_backend:
-        draft_config = _copy_model_config_with_moe_backend(target_config, "AUTO")
+        draft_config = _copy_model_config_with_moe_selection(
+            target_config, MoESelection(backend="AUTO")
+        )
 
     assert draft_config is not target_config
     assert draft_config.moe_backend == "TRTLLM"
@@ -563,6 +599,21 @@ def test_loaded_draft_moe_backend_uses_isolated_model_config() -> None:
     resolve_backend.assert_called_once_with(
         "AUTO", "DraftBackendTestForCausalLM", quant_config=target_config.quant_config
     )
+
+
+@pytest.mark.cpu_only
+def test_draft_moe_backend_drops_the_targets_pinned_tactic() -> None:
+    """A draft that names its own backend selects by it, not by the target's pin."""
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    target_config.moe_tactic = "grouped_gemm.nvfp4"
+    with patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM"):
+        draft_config = _copy_model_config_with_moe_selection(
+            target_config, MoESelection(backend="TRTLLM")
+        )
+
+    assert draft_config.moe_backend == "TRTLLM"
+    assert draft_config.moe_tactic is None
+    assert target_config.moe_tactic == "grouped_gemm.nvfp4"
 
 
 def test_internal_mtp_without_override_reuses_target_model_config() -> None:
@@ -741,13 +792,18 @@ def test_internal_mtp_auto_resolves_from_layer_quantization() -> None:
     assert target_config.moe_backend == "CUTEDSL"
 
 
-def test_internal_mtp_rejects_nemotron_backend_mismatch() -> None:
-    target_config = _draft_backend_test_model_config("CUTLASS")
+@pytest.mark.parametrize(
+    "target_backend,draft_backend", [("CUTLASS", "VANILLA"), ("VANILLA", "CUTLASS")]
+)
+def test_internal_mtp_rejects_nemotron_backend_mismatch(
+    target_backend: str, draft_backend: str
+) -> None:
+    target_config = _draft_backend_test_model_config(target_backend)
     target_config.pretrained_config.model_type = "nemotron_h"
-    target_config.spec_config = SimpleNamespace(moe_backend="VANILLA")
+    target_config.spec_config = SimpleNamespace(moe_backend=draft_backend)
     target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
 
-    with pytest.raises(ValueError, match="Nemotron-H embedded MTP layers"):
+    with pytest.raises(ValueError, match="must run VANILLA exactly when the target does"):
         _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)
 
 
@@ -816,3 +872,364 @@ def test_dflash_workspace_sizes_the_largest_folded_chunk(
     ]
     counter_calls = wrapper._dflash_trtllm_gen_ops.get_multi_ctas_kv_counter_size.call_args_list
     assert [call.args for call in counter_calls] == [(heads * chunk, 3, 148)]
+
+
+@pytest.mark.cpu_only
+def test_internal_nemotron_mtp_tactic_of_a_vanilla_target_is_rejected() -> None:
+    """No tactic names VANILLA, so a pinned draft would load the target's VANILLA layout wrongly."""
+    target_config = _draft_backend_test_model_config("VANILLA")
+    target_config.pretrained_config.model_type = "nemotron_h"
+    target_config.spec_config = SimpleNamespace(moe_backend=None, moe_tactic="cutlass")
+
+    with (
+        patch.object(ModelConfig, "pinned_moe_backend", return_value="CUTLASS"),
+        pytest.raises(ValueError, match="must run VANILLA exactly when the target does"),
+    ):
+        _build_mtp_draft_config(target_config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "target_backend,draft_backend", [("MARLIN", "CUTLASS"), ("CUTLASS", "TRTLLM")]
+)
+def test_internal_nemotron_mtp_may_select_another_non_vanilla_backend(
+    target_backend: str, draft_backend: str
+) -> None:
+    """The target's mapper lays out every backend but VANILLA alike."""
+    target_config = _draft_backend_test_model_config(target_backend)
+    target_config.pretrained_config.model_type = "nemotron_h"
+    target_config.spec_config = SimpleNamespace(moe_backend=draft_backend, moe_tactic=None)
+
+    with patch.object(ModelConfig, "resolve_moe_backend", return_value=draft_backend):
+        mtp_model_config = _build_mtp_draft_config(target_config)
+
+    assert mtp_model_config.moe_backend == draft_backend
+    assert target_config.moe_backend == target_backend
+
+
+@pytest.mark.cpu_only
+def test_internal_nemotron_mtp_tactic_may_name_another_family() -> None:
+    """A MARLIN-pinned NVFP4 target can pin CUTLASS for its unquantized MTP layers."""
+    target_config = _draft_backend_test_model_config("MARLIN")
+    target_config.pretrained_config.model_type = "nemotron_h"
+    target_config.moe_tactic = "marlin"
+    target_config.spec_config = SimpleNamespace(
+        moe_backend=None, moe_tactic="trtllm.cutlass.grouped_gemm.none"
+    )
+
+    with patch.object(ModelConfig, "pinned_moe_backend", return_value="CUTLASS"):
+        mtp_model_config = _build_mtp_draft_config(target_config)
+
+    assert mtp_model_config.moe_backend == "CUTLASS"
+    assert mtp_model_config.moe_tactic == "trtllm.cutlass.grouped_gemm.none"
+    assert target_config.moe_tactic == "marlin"
+
+
+def _build_mtp_draft_config(
+    target_config: ModelConfig, draft_config: ModelConfig | None = None
+) -> ModelConfig:
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+    with patch(
+        "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+        return_value=sentinel.draft_model,
+    ) as mtp_cls:
+        _build_mtp_one_model_draft(target_config, draft_config, sentinel.lm_head, target_model)
+    return mtp_cls.call_args.args[0]
+
+
+@pytest.mark.cpu_only
+def test_internal_mtp_of_a_pinned_target_resolves_auto_for_its_layers() -> None:
+    """An NVFP4 tactic must not reach the unquantized MTP layer of an NVFP4 checkpoint."""
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.moe_tactic = "cutedsl.grouped_gemm.nvfp4"
+    target_config.spec_config = SimpleNamespace(moe_backend=None, moe_tactic=None)
+    mtp_quant_config = QuantConfig()
+    target_config.quant_config_dict = {"model.layers.2.mlp.experts": mtp_quant_config}
+
+    with patch.object(ModelConfig, "resolve_moe_backend", return_value="CUTLASS") as resolve:
+        mtp_model_config = _build_mtp_draft_config(target_config)
+
+    assert mtp_model_config is not target_config
+    assert mtp_model_config.moe_backend == "CUTLASS"
+    assert mtp_model_config.moe_tactic is None
+    assert target_config.moe_tactic == "cutedsl.grouped_gemm.nvfp4"
+    resolve.assert_called_once_with(
+        "AUTO", "DraftBackendTestForCausalLM", quant_config=mtp_quant_config
+    )
+
+
+@pytest.mark.cpu_only
+def test_internal_mtp_moe_tactic_pins_its_layers() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend=None, moe_tactic="cutlass")
+    mtp_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    target_config.quant_config_dict = {"model.layers.2.mlp.experts": mtp_quant_config}
+
+    with patch.object(ModelConfig, "pinned_moe_backend", return_value="CUTLASS") as pinned:
+        mtp_model_config = _build_mtp_draft_config(target_config)
+
+    assert mtp_model_config.moe_backend == "CUTLASS"
+    assert mtp_model_config.moe_tactic == "cutlass"
+    assert target_config.moe_tactic is None
+    # The family is read from the MTP layer's format alone.
+    pinned.assert_called_once_with(
+        "cutlass", mtp_quant_config, None, architecture="DraftBackendTestForCausalLM"
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
+def test_embedded_nemotron_mtp_of_a_pinned_target_resolves_auto(model_type: str) -> None:
+    """AUTO is never VANILLA, so the target's mapper layout still fits the MTP experts."""
+    target_config = _draft_backend_test_model_config("MARLIN")
+    target_config.pretrained_config.model_type = model_type
+    target_config.moe_tactic = "marlin"
+    target_config.spec_config = SimpleNamespace(moe_backend=None, moe_tactic=None)
+    # The NVFP4 checkpoint leaves its MTP experts in BF16.
+    target_config.quant_config_dict = {"model.layers.2.mlp.experts": QuantConfig()}
+
+    mtp_model_config = _build_mtp_draft_config(target_config)
+
+    assert mtp_model_config.moe_backend == "CUTLASS"
+    assert mtp_model_config.moe_tactic is None
+    assert target_config.moe_backend == "MARLIN"
+    assert target_config.moe_tactic == "marlin"
+
+
+def _replacement_spec_config(moe_tactic: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(moe_backend=None, moe_tactic=moe_tactic, uses_replacement_heads=True)
+
+
+@pytest.mark.cpu_only
+def test_replacement_mtp_heads_of_a_pinned_target_resolve_auto() -> None:
+    """The heads load through their own mapper, so they select for their own weights."""
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    target_config.moe_tactic = "cutlass.grouped_gemm.nvfp4"
+    target_config.spec_config = _replacement_spec_config()
+    replacement_config = _draft_backend_test_model_config("CUTLASS")
+    replacement_config.moe_tactic = target_config.moe_tactic
+    head_experts = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    replacement_config.quant_config_dict = {"model.layers.2.mlp.experts": head_experts}
+
+    with patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve:
+        mtp_model_config = _build_mtp_draft_config(target_config, replacement_config)
+
+    assert mtp_model_config is not replacement_config
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert mtp_model_config.moe_tactic is None
+    assert replacement_config.moe_tactic == "cutlass.grouped_gemm.nvfp4"
+    resolve.assert_called_once_with(
+        "AUTO", "DraftBackendTestForCausalLM", quant_config=head_experts
+    )
+
+
+@pytest.mark.cpu_only
+def test_replacement_mtp_heads_honor_the_draft_tactic() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = _replacement_spec_config(moe_tactic="cutlass")
+    replacement_config = _draft_backend_test_model_config("CUTEDSL")
+    head_experts = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    replacement_config.quant_config_dict = {"model.layers.2.mlp.experts": head_experts}
+
+    with patch.object(ModelConfig, "pinned_moe_backend", return_value="CUTLASS") as pinned:
+        mtp_model_config = _build_mtp_draft_config(target_config, replacement_config)
+
+    assert mtp_model_config.moe_backend == "CUTLASS"
+    assert mtp_model_config.moe_tactic == "cutlass"
+    assert replacement_config.moe_backend == "CUTEDSL"
+    # The family is read from the replacement's own MTP experts.
+    pinned.assert_called_once_with(
+        "cutlass", head_experts, None, architecture="DraftBackendTestForCausalLM"
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "target_backend, target_tactic, spec_tactic, moe_kwargs",
+    [
+        pytest.param(
+            "CUTLASS", None, None, {"moe_backend": "CUTLASS", "moe_tactic": None}, id="inherit"
+        ),
+        # AUTO is hinted by architecture, as from_pretrained hints it.
+        pytest.param(
+            "MARLIN", "marlin", None, {"moe_backend": "CUTLASS", "moe_tactic": None}, id="auto"
+        ),
+        pytest.param(
+            "CUTLASS",
+            None,
+            "cutlass",
+            {"moe_backend": "CUTLASS", "moe_tactic": "cutlass"},
+            id="tactic",
+        ),
+    ],
+)
+def test_replacement_quantization_is_parsed_for_the_draft_selection(
+    tmp_path, target_backend, target_tactic, spec_tactic, moe_kwargs
+) -> None:
+    """Parsing picks some formats by the MoE request, which is the heads' own."""
+    (tmp_path / "hf_quant_config.json").write_text("{}")
+    target_config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=["NemotronHForCausalLM"], num_hidden_layers=2, num_nextn_predict_layers=1
+        ),
+        spec_config=SimpleNamespace(
+            speculative_model=tmp_path, moe_backend=None, moe_tactic=spec_tactic
+        ),
+        moe_backend=target_backend,
+    )
+    target_config.moe_tactic = target_tactic
+
+    with patch.object(
+        ModelConfig, "load_modelopt_quant_config", return_value=(QuantConfig(), None)
+    ) as load:
+        _replacement_mtp_model_config(target_config)
+
+    load.assert_called_once_with(
+        str(tmp_path / "hf_quant_config.json"),
+        str(tmp_path),
+        architecture="NemotronHForCausalLM",
+        **moe_kwargs,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "target_tactic, spec_backend, spec_tactic, load_balancer, expected",
+    [
+        pytest.param(None, None, None, None, None, id="inherit"),
+        pytest.param("cutlass", None, None, None, MoESelection(backend="AUTO"), id="pinned_target"),
+        pytest.param(
+            "mega_moe",
+            None,
+            None,
+            "per_layer_dynamic",
+            MoESelection(backend="MEGAMOE_CUTEDSL"),
+            id="pinned_target_per_layer_dynamic",
+        ),
+        pytest.param(
+            None,
+            "AUTO",
+            None,
+            "per_layer_dynamic",
+            MoESelection(backend="MEGAMOE_CUTEDSL"),
+            id="explicit_auto_per_layer_dynamic",
+        ),
+        pytest.param(
+            None,
+            "AUTO",
+            None,
+            "standard",
+            MoESelection(backend="AUTO"),
+            id="explicit_auto_standard",
+        ),
+        pytest.param(
+            None,
+            "TRTLLM",
+            None,
+            "per_layer_dynamic",
+            MoESelection(backend="TRTLLM"),
+            id="explicit_backend",
+        ),
+        pytest.param(
+            "cutlass",
+            None,
+            "deepgemm",
+            "per_layer_dynamic",
+            MoESelection(tactic="deepgemm"),
+            id="draft_tactic",
+        ),
+    ],
+)
+def test_draft_moe_selection_default_rule(
+    target_tactic, spec_backend, spec_tactic, load_balancer, expected
+) -> None:
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    target_config.moe_tactic = target_tactic
+    spec_config = SimpleNamespace(moe_backend=spec_backend, moe_tactic=spec_tactic)
+    load_balancer_config = {
+        None: None,
+        "standard": MoeLoadBalancerConfig(num_slots=8),
+        "per_layer_dynamic": MoePerLayerDynamicLoadBalancerConfig(num_slots=72),
+    }[load_balancer]
+
+    assert (
+        _draft_moe_selection(target_config, spec_config, load_balancer=load_balancer_config)
+        == expected
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "target_tactic, spec_backend",
+    [("trtllm.cutedsl.mega_moe.nvfp4", None), (None, "AUTO")],
+    ids=["pinned_target", "explicit_auto"],
+)
+def test_internal_mtp_auto_under_per_layer_dynamic_eplb_runs_megamoe_cutedsl(
+    target_tactic: str | None, spec_backend: str | None
+) -> None:
+    """The MTP layers register into the target's balancer, which only MegaMoE CuteDSL serves."""
+    target_config = _draft_backend_test_model_config("MEGAMOE_CUTEDSL")
+    target_config.moe_tactic = target_tactic
+    target_config.moe_load_balancer = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+    target_config.spec_config = SimpleNamespace(moe_backend=spec_backend, moe_tactic=None)
+
+    mtp_model_config = _build_mtp_draft_config(target_config)
+
+    assert mtp_model_config.moe_backend == "MEGAMOE_CUTEDSL"
+    assert mtp_model_config.moe_tactic is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "target_tactic, spec_tactic, stored_algo, run_algo, backend",
+    [
+        pytest.param(
+            None,
+            "trtllm.trtllm_gen.fused_moe.w4a16_mxfp4",
+            QuantAlgo.W4A8_MXFP4_MXFP8,
+            QuantAlgo.W4A16_MXFP4,
+            "TRTLLM",
+            id="draft_tactic",
+        ),
+        # The target's tactic picked its format; AUTO takes the SM's first choice.
+        pytest.param(
+            "trtllm_gen.w4a8_mxfp4_fp8",
+            None,
+            QuantAlgo.W4A8_MXFP4_FP8,
+            QuantAlgo.W4A8_MXFP4_MXFP8,
+            "CUTLASS",
+            id="pinned_target",
+        ),
+    ],
+)
+def test_internal_mtp_mxfp4_experts_run_as_the_draft_selection_picks(
+    monkeypatch, target_tactic, spec_tactic, stored_algo, run_algo, backend
+) -> None:
+    """MXFP4 storage does not fix the run format, which checkpoint parsing chose for the target."""
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    target_config = _draft_backend_test_model_config("TRTLLM")
+    target_config.pretrained_config.num_nextn_predict_layers = 1
+    target_config.moe_tactic = target_tactic
+    target_config.spec_config = SimpleNamespace(moe_backend=None, moe_tactic=spec_tactic)
+    # As DeepSeek-V4 parsing writes them: one entry shared by the target and MTP layers.
+    experts = QuantConfig(quant_algo=stored_algo, group_size=32)
+    # The target's layers read its quant modes first, which caches them.
+    assert experts.layer_quant_mode == QuantMode.from_quant_algo(stored_algo)
+    assert experts.quant_mode.objs == [QuantMode.from_quant_algo(stored_algo)]
+    target_quant_config_dict = {f"model.layers.{i}.mlp.experts": experts for i in range(3)}
+    target_config.quant_config_dict = dict(target_quant_config_dict)
+
+    mtp_model_config = _build_mtp_draft_config(target_config)
+
+    mtp_experts = mtp_model_config.quant_config_dict["model.layers.2.mlp.experts"]
+    assert mtp_experts.quant_algo == run_algo
+    assert mtp_experts.group_size == 32
+    assert mtp_experts.layer_quant_mode == QuantMode.from_quant_algo(run_algo)
+    assert mtp_experts.quant_mode.objs == [QuantMode.from_quant_algo(run_algo)]
+    assert experts.layer_quant_mode == QuantMode.from_quant_algo(stored_algo)
+    assert mtp_model_config.moe_backend == backend
+    assert mtp_model_config.moe_tactic == spec_tactic
+    assert mtp_model_config.quant_config_dict["model.layers.0.mlp.experts"] is experts
+    assert target_config.quant_config_dict == target_quant_config_dict
+    assert experts.quant_algo == stored_algo

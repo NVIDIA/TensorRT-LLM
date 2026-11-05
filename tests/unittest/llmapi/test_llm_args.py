@@ -70,6 +70,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           SpeculativeConfig, StrictBaseModel,
                                           TorchCompileConfig, TorchLlmArgs,
                                           UserProvidedDecodingConfig,
+                                          auto_moe_backend_for_load_balancer,
                                           update_llm_args_with_extra_dict,
                                           update_llm_args_with_extra_options)
 # fmt: on
@@ -298,6 +299,30 @@ class TestMoeConfigPerLayerDynamicEplb:
                            match=r"EPLB requires backend='MEGAMOE_CUTEDSL'"):
             MoeConfig(backend=backend, load_balancer=self._per_layer_dynamic())
 
+    @pytest.mark.parametrize(
+        "load_balancer, backend",
+        [
+            (None, "AUTO"),
+            ({
+                "num_slots": 72
+            }, "AUTO"),
+            ({
+                "mode": "per_layer_dynamic",
+                "num_slots": 72
+            }, "MEGAMOE_CUTEDSL"),
+        ],
+        ids=["none", "standard", "per_layer_dynamic"],
+    )
+    def test_auto_backend_follows_the_load_balancer(self,
+                                                    load_balancer: dict | None,
+                                                    backend: str) -> None:
+        """The rule drafts sharing the target's balancer resolve AUTO by."""
+        config = MoeConfig(load_balancer=load_balancer)
+
+        assert auto_moe_backend_for_load_balancer(
+            config.load_balancer) == backend
+        assert config.backend == backend
+
     @pytest.mark.parametrize("backend", [None, "AUTO", "MEGAMOE_CUTEDSL"])
     def test_resolves_auto_and_accepts_compatible_backend(
             self, backend: str | None) -> None:
@@ -507,6 +532,219 @@ class TestMoeConfigPerLayerDynamicEplb:
                 ValidationError,
                 match=r"Failed to load MoE load balancer config file:"):
             MoeConfig(load_balancer=str(config_path))
+
+
+@pytest.mark.cpu_only
+class TestDecodingBaseConfigMoeTactic:
+    """``speculative_config.moe_tactic`` is checked as ``moe_config.tactic`` is."""
+
+    def test_is_stored_stripped_and_in_lowercase(self) -> None:
+        config = MTPDecodingConfig(max_draft_len=1,
+                                   moe_tactic=" CUTLASS.Grouped_GEMM ")
+
+        assert config.moe_tactic == "cutlass.grouped_gemm"
+
+    @pytest.mark.parametrize(
+        "moe_tactic, message",
+        [("cutlass.", "malformed segment"), ("a.b.c.d.e", "5 segments")],
+        ids=["trailing_dot", "five_segments"],
+    )
+    def test_rejects_malformed_ids_at_construction(self, moe_tactic: str,
+                                                   message: str) -> None:
+        with pytest.raises(ValidationError,
+                           match=f"speculative_config.moe_tactic.*{message}"):
+            DecodingBaseConfig(moe_tactic=moe_tactic)
+
+    @pytest.mark.parametrize(
+        "moe_tactic, message",
+        [
+            ("cutlas", "unknown MoE impl token 'cutlas' in 'cutlas'. "
+             "Closest known values: ['cutlass'"),
+            ("*", "constrains no field"),
+            ("cutlass.mega_moe", "matches no registered implementation"),
+        ],
+        ids=["unknown_segment", "wildcards_only", "no_match"],
+    )
+    def test_rejects_ids_naming_no_implementation(self, moe_tactic: str,
+                                                  message: str) -> None:
+        with pytest.raises(
+                ValidationError,
+                match=f"speculative_config.moe_tactic.*{re.escape(message)}"):
+            DecodingBaseConfig(moe_tactic=moe_tactic)
+
+    @pytest.mark.parametrize("moe_backend", [None, "AUTO"])
+    def test_accepts_a_backend_that_names_no_implementation(
+            self, moe_backend: str | None) -> None:
+        config = DecodingBaseConfig(moe_backend=moe_backend,
+                                    moe_tactic="cutlass")
+
+        assert config.moe_tactic == "cutlass"
+
+    def test_rejects_a_concrete_backend_next_to_it(self) -> None:
+        with pytest.raises(ValidationError, match="both choose"):
+            DecodingBaseConfig(moe_backend="CUTLASS", moe_tactic="cutlass")
+
+    def test_yaml_round_trip(self) -> None:
+        restored = TypeAdapter(SpeculativeConfig).validate_python(
+            yaml.safe_load("""
+decoding_type: MTP
+max_draft_len: 1
+moe_tactic: cutlass.nvfp4
+"""))
+
+        assert isinstance(restored, MTPDecodingConfig)
+        assert restored.moe_tactic == "cutlass.nvfp4"
+        assert restored.model_dump()["moe_tactic"] == "cutlass.nvfp4"
+
+
+@pytest.mark.cpu_only
+class TestMoeConfigTactic:
+    """``MoeConfig.tactic`` is checked by MoE resolution's request parsing when built.
+
+    ``test_moe_impl.py`` covers what is checked only at resolution.
+    """
+
+    @pytest.mark.parametrize(
+        "tactic",
+        [
+            "trtllm.cutlass.grouped_gemm.nvfp4",
+            "trtllm.trtllm_gen",
+            "cutlass",
+            "grouped_gemm.nvfp4",
+            "*.cutlass.*.nvfp4",
+        ],
+        ids=["full", "truncated", "one_segment", "partial", "wildcards"],
+    )
+    def test_accepts_well_formed_ids(self, tactic: str) -> None:
+        assert MoeConfig(tactic=tactic).tactic == tactic
+
+    @pytest.mark.parametrize("tactic", ["CUTLASS", " Cutlass "])
+    def test_is_stored_stripped_and_in_lowercase(self, tactic: str) -> None:
+        assert MoeConfig(tactic=tactic).tactic == "cutlass"
+
+    @pytest.mark.parametrize(
+        "tactic, message",
+        [
+            ("", "malformed segment"),
+            ("cutlass.", "malformed segment"),
+            ("cutlass..nvfp4", "malformed segment"),
+            ("cut-lass", "malformed segment"),
+            ("cut lass", "malformed segment"),
+            ("_cutlass", "malformed segment"),
+            ("cut__lass", "malformed segment"),
+            ("cutlass\n.nvfp4", "malformed segment"),
+            ("a.b.c.d.e", "5 segments"),
+        ],
+        ids=[
+            "empty", "trailing_dot", "empty_segment", "hyphen", "space",
+            "leading_underscore", "double_underscore", "embedded_newline",
+            "five_segments"
+        ],
+    )
+    def test_rejects_malformed_ids_at_construction(self, tactic: str,
+                                                   message: str) -> None:
+        with pytest.raises(ValidationError, match=message):
+            MoeConfig(tactic=tactic)
+
+    @pytest.mark.parametrize(
+        "tactic, message",
+        [
+            ("cutlas", "unknown MoE impl token 'cutlas' in 'cutlas'. "
+             "Closest known values: ['cutlass'"),
+            ("Auto", "unknown MoE impl token 'auto'"),
+            ("nosuchprovider.nvfp4", "unknown MoE impl token 'nosuchprovider'"),
+            ("*", "constrains no field"),
+            ("*.*.*.*", "constrains no field"),
+            ("cutlass.mega_moe", "'*.cutlass.mega_moe.*' matches no registered "
+             "implementation"),
+            ("nvfp4.fp8", "sets field 'quant' twice"),
+        ],
+        ids=[
+            "typo", "auto", "unknown_provider", "wildcard", "wildcards",
+            "no_match", "field_twice"
+        ],
+    )
+    def test_rejects_ids_naming_no_implementation(self, tactic: str,
+                                                  message: str) -> None:
+        with pytest.raises(ValidationError,
+                           match=f"moe_config.tactic.*{re.escape(message)}"):
+            MoeConfig(tactic=tactic)
+
+    def test_rejects_a_concrete_backend_next_to_a_tactic(self) -> None:
+        with pytest.raises(ValidationError, match="both choose"):
+            MoeConfig(backend="CUTLASS", tactic="cutlass")
+
+    def test_accepts_an_explicit_auto_backend_next_to_a_tactic(self) -> None:
+        config = MoeConfig(backend="AUTO", tactic="cutlass")
+
+        assert config.backend == "AUTO"
+        assert config.tactic == "cutlass"
+
+    @pytest.mark.parametrize("tactic",
+                             ["trtllm.cutedsl.mega_moe.nvfp4", "mega_moe"])
+    def test_per_layer_dynamic_eplb_leaves_backend_to_the_tactic(
+            self, tactic: str) -> None:
+        """Resolution picks the match that consumes per-layer dynamic plans."""
+        config = MoeConfig(tactic=tactic,
+                           load_balancer={
+                               "mode": "per_layer_dynamic",
+                               "num_slots": 72
+                           })
+
+        assert config.backend == "AUTO"
+        assert config.tactic == tactic
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+
+    @pytest.mark.parametrize("tactic", ["cutlass", "deepgemm.mega_moe"])
+    def test_per_layer_dynamic_eplb_rejects_tactics_that_cannot_consume_it(
+            self, tactic: str) -> None:
+        with pytest.raises(ValidationError,
+                           match="per-layer dynamic EPLB requires a "
+                           "moe_config.tactic"):
+            MoeConfig(tactic=tactic,
+                      load_balancer={
+                          "mode": "per_layer_dynamic",
+                          "num_slots": 72
+                      })
+
+    def test_survives_a_rebuild_from_its_own_dump(self) -> None:
+        """A full dump marks ``backend`` as set; the rebuild must still pass."""
+        config = MoeConfig(tactic="Cutlass", max_num_tokens=64)
+
+        rebuilt = MoeConfig(**config.model_dump())
+
+        assert rebuilt == config
+        assert "backend" in rebuilt.model_fields_set
+
+    def test_reaches_the_model_config(self) -> None:
+        """The loader hands ``tactic`` to the checkpoint loader as ``moe_tactic``."""
+
+        class _StopAfterLoadConfig(Exception):
+            pass
+
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            moe_config=MoeConfig(tactic="Grouped_GEMM.NVFP4"))
+        checkpoint_loader = create_autospec(HfCheckpointLoader,
+                                            instance=True,
+                                            spec_set=True)
+        checkpoint_loader.load_config.side_effect = _StopAfterLoadConfig
+        loader = model_loader_mod.ModelLoader(
+            args,
+            args.parallel_config.to_mapping(),
+            spec_config=None,
+            sparse_attention_config=None,
+            max_num_tokens=args.max_num_tokens,
+            max_seq_len=args.max_seq_len,
+        )
+
+        with pytest.raises(_StopAfterLoadConfig):
+            loader._load_and_validate_config("/tmp/dummy_model",
+                                             checkpoint_loader)
+
+        kwargs = checkpoint_loader.load_config.call_args.kwargs
+        assert kwargs["moe_tactic"] == "grouped_gemm.nvfp4"
+        assert kwargs["moe_backend"] == "AUTO"
 
 
 @pytest.mark.cpu_only
@@ -1232,6 +1470,45 @@ class TestModelDefaults:
         # Check that the error message is helpful
         error_str = str(exc_info.value)
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
+
+    def test_user_tactic_supersedes_a_model_backend_default(self):
+        """A model's preferred backend yields to a pinned tactic, not the rest."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                moe_config=MoeConfig(tactic="Cutlass"))
+
+        applied = apply_model_defaults_to_llm_args(
+            llm_args,
+            {"moe_config": {
+                "backend": "MARLIN",
+                "max_num_tokens": 64
+            }})
+
+        assert llm_args.moe_config.tactic == "cutlass"
+        assert llm_args.moe_config.backend == "AUTO"
+        assert llm_args.moe_config.max_num_tokens == 64
+        assert applied == {"moe_config": {"max_num_tokens": 64}}
+
+    def test_model_backend_default_applies_without_a_tactic(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        applied = apply_model_defaults_to_llm_args(
+            llm_args, {"moe_config": {
+                "backend": "MARLIN"
+            }})
+
+        assert llm_args.moe_config.backend == "MARLIN"
+        assert applied == {"moe_config": {"backend": "MARLIN"}}
+
+    def test_tactic_survives_an_unrelated_defaults_rebuild(self):
+        """Applying any default rebuilds every nested config from a full dump."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                moe_config=MoeConfig(tactic="cutlass"))
+
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"enable_chunked_prefill": False})
+
+        assert llm_args.moe_config.tactic == "cutlass"
+        assert llm_args.moe_config.backend == "AUTO"
 
 
 @pytest.mark.cpu_only

@@ -42,9 +42,11 @@ only names the code that demonstrates them. Paths are relative to
 
 ## Backend Selection And Identity
 
-- `moe_resolution.py`: `resolve_moe_impl` builds `MoEProblem` and
-  `MoEDeployment`, walks `IMPL_PRIORITY` / `BACKEND_FAMILY` through
-  `_candidates_for`, and returns the report; `_UNRANKED` is the import-time
+- `moe_resolution.py`: `moe_impl_request` turns a backend literal (its
+  `BACKEND_FAMILY` entry, then the fallback) or a tactic (its registry
+  matches, no fallback) into a `MoEImplRequest` in `IMPL_PRIORITY` order;
+  `resolve_moe_impl` builds `MoEProblem` and `MoEDeployment`, asks each of the
+  request's candidates, and returns the report; `_UNRANKED` is the import-time
   table check; `_reject_unsupported_activation` reads each candidate's
   `activation_support`.
 - `impl_contract.py`: `MoEProblem` / `MoEDeployment` (everything a gate may
@@ -98,13 +100,14 @@ only names the code that demonstrates them. Paths are relative to
   - `cutedsl/`: laid out like the id `trtllm.cutedsl.<kernel>.<quant>`.
     `grouped_gemm/` holds `CuteDslFusedMoEBase` (construction, the
     layer-format check in `create_weights`, the locality-domain plan, the
-    weight lifecycle) and its NVFP4 and BF16 leaves; the `_init_format_state`
+    weight lifecycle) and its NVFP4, NVFP4_PLUS and BF16 leaves; the `_init_format_state`
     and `_locality_domain_scale_shard` hooks and the leaf-declared
     `_locality_domain_full_scale_params` carry what only one format needs.
     The other kernels share only the package-level modules with it.
 - Inheriting another implementation: `fused_moe_cute_dsl_b12x.py`
-  (`CuteDslB12xNvfp4FusedMoE`, `CuteDslB12xFusedMoEBase`); the guide's B12x
-  note says what that inheritance costs.
+  (`FlashinferCutedslNvfp4Impl`, which `CuteDslB12xNvfp4FusedMoE` aliases, over
+  the mixin `CuteDslB12xFusedMoEBase`); the guide's B12x note says what that
+  inheritance costs.
 - `mega_moe/`: `FUSED_COMM` implementations; read capability checks,
   validation, symmetric-memory allocation in `create_weights`,
   `quantize_input`, and `run_moe`.

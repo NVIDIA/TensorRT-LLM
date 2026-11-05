@@ -101,7 +101,7 @@ from ..attention.attention import Attention
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, MoESelection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -126,6 +126,7 @@ from .modeling_dflash import TRTLLM_GEN_LSE_LN2, DFlashForCausalLM, resolve_dspa
 from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
+    _draft_moe_selection,
     build_markov_head,
 )
 from .modeling_utils import (
@@ -1306,7 +1307,7 @@ class DSv4DSparkDraftModel(nn.Module):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         num_stages: Optional[int] = None,
         block_size: Optional[int] = None,
-        draft_moe_backend: Optional[str] = None,
+        draft_moe_selection: Optional[MoESelection] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -1368,7 +1369,7 @@ class DSv4DSparkDraftModel(nn.Module):
         #     MoE layers), so copy a main MoE layer's experts quant onto the
         #     draft layer keys.
         draft_model_config = self._derive_draft_model_config(
-            model_config, base, self.num_stages, draft_moe_backend=draft_moe_backend
+            model_config, base, self.num_stages, draft_moe_selection=draft_moe_selection
         )
         self.mtp_layers = nn.ModuleList(
             [
@@ -1477,7 +1478,11 @@ class DSv4DSparkDraftModel(nn.Module):
 
     @classmethod
     def _derive_draft_model_config(
-        cls, model_config, base: int, num_stages: int, draft_moe_backend: Optional[str] = None
+        cls,
+        model_config,
+        base: int,
+        num_stages: int,
+        draft_moe_selection: Optional[MoESelection] = None,
     ):
         """Return a draft-only ``model_config`` copy with draft-specific fixes.
 
@@ -1486,11 +1491,13 @@ class DSv4DSparkDraftModel(nn.Module):
         experts. A single shallow copy is made (and only when something needs to
         change) so the shared ``model_config`` and the target model are untouched.
 
-        The draft MoE backend inherits ``model_config.moe_backend`` unless
-        ``draft_moe_backend`` is set. AUTO is resolved after the draft-specific
-        quantization normalization below, so backend selection uses the draft
-        weights rather than the target's resolved backend. The draft ``mtp.*``
-        stages are full V4 blocks, so they share the target's MXFP4
+        The draft MoE layers inherit ``model_config``'s selection unless
+        ``draft_moe_selection`` is set, which replaces it, dropping any tactic
+        ``model_config.moe_tactic`` pins. ``draft_moe_selection`` is resolved after the
+        draft-specific quantization normalization below, against the draft stages'
+        entries only, so its backend follows the draft weights rather than the
+        target's. The draft
+        ``mtp.*`` stages are full V4 blocks, so they share the target's MXFP4
         ``n_routed_experts=384`` / ``n_group=8`` (= 48 experts/group) layout
         and therefore the same backend constraints: select a backend that
         supports it (CUTLASS today, DeepGEMM megaMoE once available). The
@@ -1502,35 +1509,46 @@ class DSv4DSparkDraftModel(nn.Module):
         new_qcd = cls._draft_quant_config_dict(model_config, base, num_stages)
         new_qc = cls._draft_normalized_quant_config(model_config)
         resolved_moe_backend = None
-        if draft_moe_backend is not None:
+        if draft_moe_selection is not None:
             draft_qcd = new_qcd if new_qcd is not None else model_config.quant_config_dict or {}
-            if any(
+            # A draft tactic that names no NVFP4_PLUS implementation is refused by resolution.
+            if draft_moe_selection.tactic is None and any(
                 getattr(draft_qcd.get(f"model.layers.{base + s}.mlp.experts"), "quant_algo", None)
                 == QuantAlgo.NVFP4_PLUS
                 for s in range(num_stages)
             ):
                 ModelConfig.require_nvfp4_plus_moe_backend(
-                    draft_moe_backend, "speculative_config.moe_backend"
+                    draft_moe_selection.backend, "speculative_config.moe_backend"
                 )
             architectures = getattr(model_config.pretrained_config, "architectures", None) or []
-            architecture = architectures[0] if architectures else ""
-            draft_quant_config = new_qc if new_qc is not None else model_config.quant_config
-            resolved_moe_backend = ModelConfig.resolve_moe_backend(
-                draft_moe_backend, architecture, quant_config=draft_quant_config
+            qcd = new_qcd if new_qcd is not None else model_config.quant_config_dict
+            # Only the draft stages' entries describe the draft's experts, so
+            # the target layers' formats must not widen a tactic's family.
+            stage_prefixes = tuple(f"model.layers.{base + s}." for s in range(num_stages))
+            stage_qcd = {
+                name: quant_config
+                for name, quant_config in (qcd or {}).items()
+                if name.startswith(stage_prefixes)
+            }
+            resolved_moe_backend = draft_moe_selection.resolve_backend(
+                architectures[0] if architectures else "",
+                new_qc if new_qc is not None else model_config.quant_config,
+                stage_qcd or None,
             )
-        if new_sa is None and new_qcd is None and new_qc is None and resolved_moe_backend is None:
-            return model_config
-        draft_cfg = copy.copy(model_config)
-        # ModelConfig is a frozen dataclass; bypass the guard for these fields.
-        if new_sa is not None:
-            object.__setattr__(draft_cfg, "sparse_attention_config", new_sa)
-        if new_qcd is not None:
-            object.__setattr__(draft_cfg, "quant_config_dict", new_qcd)
-        if new_qc is not None:
-            object.__setattr__(draft_cfg, "quant_config", new_qc)
+        changes = {
+            name: value
+            for name, value in (
+                ("sparse_attention_config", new_sa),
+                ("quant_config_dict", new_qcd),
+                ("quant_config", new_qc),
+            )
+            if value is not None
+        }
         if resolved_moe_backend is not None:
-            object.__setattr__(draft_cfg, "moe_backend", resolved_moe_backend)
-        return draft_cfg
+            changes.update(moe_backend=resolved_moe_backend, moe_tactic=draft_moe_selection.tactic)
+        if not changes:
+            return model_config
+        return model_config.copy_with(**changes)
 
     @staticmethod
     def _draft_normalized_quant_config(model_config):
@@ -2321,7 +2339,7 @@ class DSv4DSparkForCausalLM(nn.Module):
         aux_stream_dict=None,
         num_stages=None,
         block_size=None,
-        draft_moe_backend: Optional[str] = None,
+        draft_moe_selection: Optional[MoESelection] = None,
     ):
         super().__init__()
         self.dspark_model = self.draft_model_cls(
@@ -2329,7 +2347,7 @@ class DSv4DSparkForCausalLM(nn.Module):
             aux_stream_dict,
             num_stages=num_stages,
             block_size=block_size,
-            draft_moe_backend=draft_moe_backend,
+            draft_moe_selection=draft_moe_selection,
         )
         # Generic handles expected by the loader / weight mappers.
         self.model = self.dspark_model
@@ -4209,7 +4227,13 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             getattr(model, "aux_stream_dict", None),
             num_stages=num_stages,
             block_size=model_config.spec_config.block_size,
-            draft_moe_backend=getattr(model_config.spec_config, "moe_backend", None),
+            # Resolved again against the draft's normalized quantization. The
+            # embedded stages register into the target's load balancer.
+            draft_moe_selection=_draft_moe_selection(
+                model_config,
+                model_config.spec_config,
+                load_balancer=model_config.moe_load_balancer,
+            ),
         )
 
     # Dispatch on the attention shape, not on model_type: the block decode is

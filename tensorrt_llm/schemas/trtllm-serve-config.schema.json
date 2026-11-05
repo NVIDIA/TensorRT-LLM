@@ -149,6 +149,25 @@
     "AutoDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for auto speculative decoding.\n\nThis config will automatically select a good, draft-model free\nspeculation algorithm with some heuristic.\n\nAttributes that are inherited from the base class are ignored.",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -298,8 +317,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -746,6 +779,25 @@
     "DFlashDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for DFlash speculative decoding.\n\nDFlash is a target-dependent speculative decoding method that uses\nhidden states from specific target model layers as cross-attention\ncontext in the draft model to predict multiple draft tokens in parallel.\n\nKey features:\n- Target-dependent: uses hidden states from target model layers\n- Parallel prediction: all K draft tokens in one forward pass\n- Cross-attention: draft model attends to target hidden states\n\nReference: https://arxiv.org/pdf/2602.06036",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -932,8 +984,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "skip_ctx_buffer_budget_check": {
           "default": false,
@@ -1019,6 +1085,25 @@
     "DSparkDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. Confidence scheduling is\nopt-in; the default configuration retains native full-block verification.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -1288,8 +1373,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -1757,6 +1856,25 @@
     },
     "DraftTargetDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -1906,8 +2024,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -2202,6 +2334,25 @@
     },
     "Eagle3DecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -2404,8 +2555,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "sa_config": {
           "anyOf": [
@@ -2487,6 +2652,25 @@
     },
     "EagleDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -2689,8 +2873,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 3,
@@ -3813,6 +4011,25 @@
     },
     "MTPDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -4011,8 +4228,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "num_nextn_predict_layers": {
           "anyOf": [
@@ -4367,10 +4598,26 @@
     "MoeConfig": {
       "additionalProperties": false,
       "description": "Configuration for MoE.",
+      "not": {
+        "properties": {
+          "backend": {
+            "not": {
+              "const": "AUTO"
+            }
+          },
+          "tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "tactic"
+        ]
+      },
       "properties": {
         "backend": {
           "default": "AUTO",
-          "description": "MoE backend to use. AUTO selects default backend based on model. It currently doesn't always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.",
+          "description": "MoE backend to use. Choosing a backend other than AUTO is planned for deprecation; tactic is the recommended way to pin a MoE implementation. AUTO selects default backend based on model. It currently doesn't always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.",
           "enum": [
             "AUTO",
             "CUTLASS",
@@ -4428,6 +4675,20 @@
           "default": null,
           "description": "If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used.",
           "title": "Max Num Tokens"
+        },
+        "tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for the target model. The recommended interface for choosing it, replacing backend values other than AUTO. Takes an id 'provider.technique.kernel_name.quant' (e.g. 'trtllm.cutlass.grouped_gemm.nvfp4') or any dotted subset of its segments (e.g. 'cutlass', 'mega_moe'); case-insensitive. The highest-priority match for the checkpoint's expert format runs, with no fallback; the matches must belong to one backend family. Requires backend AUTO. Drafts and MTP layers are selected by speculative_config.moe_tactic. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree); a run logs the id of each MoE implementation it builds.",
+          "status": "prototype",
+          "title": "Tactic"
         },
         "use_low_precision_moe_combine": {
           "default": false,
@@ -4538,6 +4799,13 @@
       ],
       "title": "MoePerLayerDynamicLoadBalancerConfig",
       "type": "object"
+    },
+    "MoeTactic": {
+      "not": {
+        "pattern": "^\\s*\\*(\\.\\*){0,3}\\s*$"
+      },
+      "pattern": "^\\s*(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)(\\.(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)){0,3}\\s*$",
+      "type": "string"
     },
     "MooncakeStoreConfig": {
       "additionalProperties": false,
@@ -4835,6 +5103,25 @@
     "NGramDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for NGram drafter speculative decoding.",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -5009,8 +5296,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -5091,6 +5392,25 @@
     "PARDDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for PARD (Parallel Draft) speculative decoding.\n\nPARD is a target-independent speculative decoding method that uses\nmask tokens to predict multiple draft tokens in parallel within a\nsingle forward pass.\n\nKey features:\n- Target-independent: doesn't use target model hidden states\n- Parallel prediction: all K draft tokens in one forward pass\n- Shared mask token: uses the same mask_token_id across all positions\n\nReference: https://arxiv.org/pdf/2504.18583",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -5253,8 +5573,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "sa_config": {
           "anyOf": [
@@ -5799,6 +6133,25 @@
     "SADecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for standalone Suffix Automaton (SA) speculative decoding.\n\nUses a GPU-native suffix automaton for pattern matching. Drafting runs\ninside the target model forward; supports CUDA graph and overlap scheduler.\n\nTo combine SA with a neural drafter (Eagle3, MTP, PARD) instead of using\nit standalone, pass :class:`SAEnhancerConfig` via ``sa_config``.",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -5974,8 +6327,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -6052,6 +6419,25 @@
     },
     "SaveHiddenStatesDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -6224,8 +6610,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "output_directory": {
           "description": "Directory path where hidden states data files will be saved. The directory is created if it does not exist.",
@@ -6624,6 +7024,25 @@
     },
     "UserProvidedDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -6777,8 +7196,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Legacy interface: values other than AUTO are planned for deprecation, and moe_tactic is the recommended replacement. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it, replacing moe_backend values other than AUTO. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "resource_manager": {
           "type": "null"

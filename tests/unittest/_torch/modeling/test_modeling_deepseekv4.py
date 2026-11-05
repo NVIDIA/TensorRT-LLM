@@ -56,6 +56,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import moe_impl_request
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -822,7 +823,7 @@ def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeyp
     config = DeepseekV4Config(num_hidden_layers=2)
 
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        config, str(tmp_path), "TRTLLM", None
+        config, str(tmp_path), moe_impl_request("TRTLLM"), None
     )
 
     quant_config = layer_quant_config["model.layers.0.mlp.experts"]
@@ -856,7 +857,11 @@ def test_deepseek_v4_routed_moe_quant_config_covers_mtp_layers(tmp_path, monkeyp
         num_nextn_predict_layers = 3
 
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        DeepseekV4Config(num_hidden_layers=2), str(tmp_path), "TRTLLM", None, MTPConfig()
+        DeepseekV4Config(num_hidden_layers=2),
+        str(tmp_path),
+        moe_impl_request("TRTLLM"),
+        None,
+        MTPConfig(),
     )
 
     quant_algo = layer_quant_config["model.layers.0.mlp.experts"].quant_algo
@@ -1169,7 +1174,7 @@ def test_deepseek_v4_routed_moe_quant_config_ignores_fp8_header(tmp_path):
     existing = {"existing": object()}
 
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        DeepseekV4Config(), str(tmp_path), "TRTLLM", existing
+        DeepseekV4Config(), str(tmp_path), moe_impl_request("TRTLLM"), existing
     )
 
     assert layer_quant_config is existing

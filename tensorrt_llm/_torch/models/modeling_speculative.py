@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-import copy
 import inspect
 import os
 from dataclasses import replace
@@ -13,6 +12,8 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.llmapi.llm_args import (MoeLoadBalancerConfigType,
+                                          auto_moe_backend_for_load_balancer)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -22,7 +23,7 @@ from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
-from ..model_config import ModelConfig, TConfig
+from ..model_config import ModelConfig, MoESelection, TConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
@@ -80,14 +81,23 @@ def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
     from .checkpoints.auto_mapper import AutoCheckpointMapper
 
     checkpoint_dir = str(model_config.spec_config.speculative_model)
+    architecture = model_config.pretrained_config.architectures[0]
     quant_path = os.path.join(checkpoint_dir, "hf_quant_config.json")
     quant_config, layer_configs = QuantConfig(), None
     if os.path.isfile(quant_path):
+        # Parsed for the selection the heads' MTP layers make, with AUTO
+        # hinted by architecture as ModelConfig.from_pretrained hints it.
+        moe_kwargs = _draft_loader_moe_kwargs(
+            model_config,
+            _draft_moe_selection(model_config,
+                                 model_config.spec_config,
+                                 load_balancer=model_config.moe_load_balancer))
+        moe_kwargs["moe_backend"] = ModelConfig.resolve_moe_backend(
+            moe_kwargs["moe_backend"], architecture)
         quant_config, layer_configs = ModelConfig.load_modelopt_quant_config(
-            quant_path, checkpoint_dir, model_config.moe_backend)
+            quant_path, checkpoint_dir, architecture=architecture, **moe_kwargs)
 
-    mapper = AutoCheckpointMapper.get(
-        CheckpointFormat.HF, model_config.pretrained_config.architectures[0])
+    mapper = AutoCheckpointMapper.get(CheckpointFormat.HF, architecture)
     start_layer_idx = model_config.pretrained_config.num_hidden_layers
     if layer_configs is not None:
         normalized = {}
@@ -1530,37 +1540,129 @@ class MTPForCausalLM(nn.Module):
                                            self._quantization_named_modules())
 
 
-def _get_requested_draft_moe_backend(model_config: ModelConfig,
-                                     spec_config: object) -> str:
-    """Return the draft MoE backend request, preserving target inheritance."""
-    requested_backend = getattr(spec_config, "moe_backend", None)
-    return (model_config.moe_backend
-            if requested_backend is None else requested_backend)
+def _draft_moe_selection(
+    model_config: ModelConfig,
+    spec_config: object,
+    *,
+    load_balancer: Optional[MoeLoadBalancerConfigType] = None,
+) -> Optional[MoESelection]:
+    """The MoE selection a draft model or MTP layers make for themselves, or
+    None when they inherit the target's.
+
+    ``speculative_config.moe_tactic`` pins, else
+    ``speculative_config.moe_backend`` selects. With neither the draft
+    inherits the target's literal, unless ``moe_config.tactic`` pins the
+    target: that tactic names implementations of the target's experts, so the
+    draft resolves AUTO for its own weights. AUTO never resolves to VANILLA
+    and no tactic names it, so this default never changes the expert weight
+    layout of Nemotron-H embedded MTP, which goes through the target's
+    checkpoint weight mapper.
+
+    Args:
+        model_config: The target's config.
+        spec_config: The speculative config, read for ``moe_tactic`` and
+            ``moe_backend``.
+        load_balancer: The EPLB config the draft's MoE layers register into
+            when they share the target's balancer, else None. An AUTO
+            selection resolves under it as the target's does
+            (``auto_moe_backend_for_load_balancer``).
+    """
+    moe_tactic = getattr(spec_config, "moe_tactic", None)
+    if moe_tactic is not None:
+        return MoESelection(tactic=moe_tactic)
+    moe_backend = getattr(spec_config, "moe_backend", None)
+    if moe_backend is None:
+        if model_config.moe_tactic is None:
+            return None
+        # A tactic admits no other backend, so moe_config.backend is AUTO.
+        moe_backend = "AUTO"
+    if moe_backend == "AUTO":
+        moe_backend = auto_moe_backend_for_load_balancer(load_balancer)
+    return MoESelection(backend=moe_backend)
 
 
-def _copy_model_config_with_moe_backend(
-        model_config: ModelConfig,
-        requested_moe_backend: str,
-        quant_config: Optional[QuantConfig] = None) -> ModelConfig:
-    """Copy a ModelConfig and resolve its MoE backend against its own weights."""
+def _draft_loader_moe_kwargs(
+        model_config: ModelConfig, draft_moe_selection: Optional[MoESelection]
+) -> Dict[str, Optional[str]]:
+    """The MoE kwargs that load a separate draft checkpoint for ``draft_moe_selection``.
+
+    Inheriting the target's selection means its resolved literal: a separate
+    checkpoint never inherits a tactic, which names the target's
+    implementations, and then ``draft_moe_selection`` is not None.
+    """
+    selection = draft_moe_selection or MoESelection(
+        backend=model_config.moe_backend)
+    return selection.loader_kwargs()
+
+
+def _copy_model_config_with_moe_selection(
+    model_config: ModelConfig,
+    selection: MoESelection,
+    quant_config: Optional[QuantConfig] = None,
+    layer_quant_overrides: Optional[Dict[str, QuantConfig]] = None,
+) -> ModelConfig:
+    """Copy a ModelConfig and resolve ``selection`` against its own weights.
+
+    ``quant_config`` describes the copied layers when they are not quantized
+    as the checkpoint is globally. ``layer_quant_overrides`` replaces
+    ``quant_config_dict`` entries in a dict the copy owns, so the original's
+    is untouched. The copy drops any implementation the target pinned through
+    ``moe_config.tactic``.
+    """
     architectures = getattr(model_config.pretrained_config, "architectures",
                             None) or []
-    architecture = architectures[0] if architectures else ""
-    resolved_moe_backend = ModelConfig.resolve_moe_backend(
-        requested_moe_backend,
-        architecture,
-        quant_config=(model_config.quant_config
-                      if quant_config is None else quant_config))
-    draft_config = copy.copy(model_config)
-    # ModelConfig is frozen after loading. Temporarily thaw only the isolated
-    # draft copy so the target config remains unchanged.
-    was_frozen = draft_config._frozen
-    draft_config._frozen = False
-    try:
-        draft_config.moe_backend = resolved_moe_backend
-    finally:
-        draft_config._frozen = was_frozen
-    return draft_config
+    # An explicit quant_config describes the copied layers alone, so the
+    # checkpoint's other layer formats must not widen a tactic's family.
+    resolved_moe_backend = selection.resolve_backend(
+        architectures[0] if architectures else "",
+        model_config.quant_config if quant_config is None else quant_config,
+        model_config.quant_config_dict if quant_config is None else None)
+    changes = {
+        "moe_backend": resolved_moe_backend,
+        "moe_tactic": selection.tactic,
+    }
+    if layer_quant_overrides:
+        changes["quant_config_dict"] = {
+            **(model_config.quant_config_dict or {}),
+            **layer_quant_overrides
+        }
+    return model_config.copy_with(**changes)
+
+
+# The formats MXFP4 expert weights run as. The checkpoint stores MXFP4 alone;
+# the MoE selection picks the format (moe_resolution.mxfp4_quant_algo).
+_MXFP4_RUN_FORMATS = frozenset({
+    QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.W4A8_MXFP4_FP8,
+    QuantAlgo.W4A16_MXFP4,
+})
+
+
+def _mxfp4_run_quant_config(model_config: ModelConfig, selection: MoESelection,
+                            quant_config: QuantConfig) -> QuantConfig:
+    """``quant_config`` running in the MXFP4 format ``selection`` picks.
+
+    Checkpoint parsing writes the format the target's selection picks, so a
+    draft that selects for itself picks again. A format outside
+    ``_MXFP4_RUN_FORMATS`` is the checkpoint's and is returned as is.
+    """
+    if quant_config.quant_algo not in _MXFP4_RUN_FORMATS:
+        return quant_config
+    if selection.tactic is None:
+        # AUTO names its implementations only once resolved.
+        architectures = getattr(model_config.pretrained_config, "architectures",
+                                None) or []
+        selection = MoESelection(backend=selection.resolve_backend(
+            architectures[0] if architectures else "", quant_config))
+    quant_algo = ModelConfig.get_mxfp4_quant_algo(**selection.loader_kwargs())
+    if quant_algo is None or quant_algo == quant_config.quant_algo:
+        return quant_config
+    run_quant_config = quant_config.model_copy(
+        update={"quant_algo": quant_algo})
+    # model_copy keeps the cached quant modes derived from the stored format.
+    run_quant_config.__dict__.pop("quant_mode", None)
+    run_quant_config.__dict__.pop("layer_quant_mode", None)
+    return run_quant_config
 
 
 def _get_mtp_moe_quant_config(model_config: ModelConfig,
@@ -1586,6 +1688,47 @@ def _get_mtp_moe_quant_config(model_config: ModelConfig,
             if name.startswith(prefix) and ".experts" in name:
                 return quant_config
     return model_config.quant_config
+
+
+def _is_mtp_experts_entry(name: str, start_layer_idx: int) -> bool:
+    """Whether ``name`` is the ``model.layers.<i>.mlp.experts`` entry of an MTP
+    layer, numbered from ``start_layer_idx``."""
+    parts = name.split(".")
+    return (len(parts) == 5 and parts[0] == "model" and parts[1] == "layers"
+            and parts[2].isdigit() and int(parts[2]) >= start_layer_idx
+            and parts[3:] == ["mlp", "experts"])
+
+
+def _copy_mtp_model_config_with_moe_selection(
+        mtp_model_config: ModelConfig, selection: MoESelection,
+        start_layer_idx: int) -> ModelConfig:
+    """Copy the config of MTP layers numbered from ``start_layer_idx`` and
+    resolve ``selection`` against their routed experts' format.
+
+    MXFP4 experts run in the format ``selection`` picks
+    (``_mxfp4_run_quant_config``), which the copy's own ``quant_config_dict``
+    records for every MTP layer; any other format is the checkpoint's.
+    """
+    mtp_quant_config = _get_mtp_moe_quant_config(mtp_model_config,
+                                                 start_layer_idx)
+    layer_quant_overrides = None
+    # The MXFP4 run format is written per layer, so only a per-layer map can
+    # carry the one the draft's selection picks.
+    if mtp_model_config.quant_config_dict is not None:
+        run_quant_config = _mxfp4_run_quant_config(mtp_model_config, selection,
+                                                   mtp_quant_config)
+        if run_quant_config is not mtp_quant_config:
+            layer_quant_overrides = {
+                name: run_quant_config
+                for name in mtp_model_config.quant_config_dict
+                if _is_mtp_experts_entry(name, start_layer_idx)
+            }
+            mtp_quant_config = run_quant_config
+    return _copy_model_config_with_moe_selection(
+        mtp_model_config,
+        selection,
+        quant_config=mtp_quant_config,
+        layer_quant_overrides=layer_quant_overrides)
 
 
 def _enable_trtllm_moe_preload_for_draft(model: nn.Module,
@@ -1615,10 +1758,22 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     be keyed against a different namespace -- do not generalize this without
     designing a per-drafter EPLB config domain and layer identity first.
     """
+    # Only the embedded DSpark draft shares the target's EPLB namespace (its
+    # stages are target decoder blocks registered into the target's balancer).
+    # A standalone DSpark drafter is an independent checkpoint, so it falls
+    # under the "other external drafters" rule above.
+    shares_load_balancer = (spec_config.spec_dec_mode.is_dspark()
+                            and spec_config.draft_is_embedded_in_target)
+    load_balancer = (model_config.moe_load_balancer
+                     if shares_load_balancer else None)
     kwargs = dict(
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
+        **_draft_loader_moe_kwargs(
+            model_config,
+            _draft_moe_selection(model_config,
+                                 spec_config,
+                                 load_balancer=load_balancer)),
         # The drafter runs on every row; keep it TP where the TP group shares
         # requests (helix + attention DP at tp_size 1).
         mapping=model_config.mapping.mapping_for_full_rows(),
@@ -1631,13 +1786,8 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         # None sizes position tables from max_position_embeddings: 1M for K3.
         max_seq_len=model_config.max_seq_len,
     )
-    # Only the embedded DSpark draft shares the target's EPLB namespace (its
-    # stages are target decoder blocks registered into the target's balancer).
-    # A standalone DSpark drafter is an independent checkpoint, so it falls
-    # under the "other external drafters" rule above.
-    if (spec_config.spec_dec_mode.is_dspark()
-            and spec_config.draft_is_embedded_in_target):
-        kwargs["moe_load_balancer"] = model_config.moe_load_balancer
+    if shares_load_balancer:
+        kwargs["moe_load_balancer"] = load_balancer
     return kwargs
 
 
@@ -1663,23 +1813,26 @@ def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
 def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
     """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
     mtp_model_config = draft_config if draft_config is not None else model_config
-    requested_moe_backend = getattr(model_config.spec_config, "moe_backend",
-                                    None)
-    if requested_moe_backend is not None:
-        start_layer_idx = model_config.pretrained_config.num_hidden_layers
-        mtp_model_config = _copy_model_config_with_moe_backend(
-            mtp_model_config,
-            requested_moe_backend,
-            quant_config=_get_mtp_moe_quant_config(mtp_model_config,
-                                                   start_layer_idx))
-        model_type = model_config.pretrained_config.model_type
-        if (draft_config is None
-                and model_type in {"nemotron_h", "nemotron_h_puzzle"}
-                and mtp_model_config.moe_backend != model_config.moe_backend):
+    spec_config = model_config.spec_config
+    embedded_nemotron_h = (draft_config is None
+                           and model_config.pretrained_config.model_type
+                           in {"nemotron_h", "nemotron_h_puzzle"})
+    # The MTP layers register into the target's load balancer.
+    draft_moe_selection = _draft_moe_selection(
+        model_config, spec_config, load_balancer=model_config.moe_load_balancer)
+    if draft_moe_selection is not None:
+        mtp_model_config = _copy_mtp_model_config_with_moe_selection(
+            mtp_model_config, draft_moe_selection,
+            model_config.pretrained_config.num_hidden_layers)
+        if embedded_nemotron_h and ((mtp_model_config.moe_backend == "VANILLA")
+                                    != (model_config.moe_backend == "VANILLA")):
             raise ValueError(
-                "Nemotron-H embedded MTP layers cannot use a different MoE "
-                "backend from the target model because their checkpoint "
-                "weight mapper uses one shared backend-dependent layout.")
+                "Nemotron-H embedded MTP layers must run VANILLA exactly when "
+                "the target does, because the target's checkpoint weight "
+                "mapper lays out VANILLA expert weights differently from every "
+                "other backend. "
+                f"speculative_config selects {mtp_model_config.moe_backend} "
+                f"while the target runs {model_config.moe_backend}.")
         _enable_trtllm_moe_preload_for_draft(model,
                                              mtp_model_config.moe_backend)
     return MTPForCausalLM(mtp_model_config,
@@ -1814,9 +1967,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     model_config.mapping, model_config.max_num_tokens)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
-                requested_draft_moe_backend = _get_requested_draft_moe_backend(
-                    model_config, spec_config)
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
+                    # Of the Eagle3 drafts, only the Mistral one registers into
+                    # the target's load balancer.
+                    shares_load_balancer = (
+                        spec_config.eagle3_model_arch == "mistral_large3")
+                    draft_moe_selection = _draft_moe_selection(
+                        model_config,
+                        spec_config,
+                        load_balancer=(model_config.moe_load_balancer
+                                       if shares_load_balancer else None))
+                    draft_loader_moe_kwargs = _draft_loader_moe_kwargs(
+                        model_config, draft_moe_selection)
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                             MistralConfigLoader
@@ -1824,26 +1986,27 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             spec_config.speculative_model,
                             mapping=model_config.mapping.mapping_for_full_rows(
                             ),
-                            moe_backend=requested_draft_moe_backend,
+                            **draft_loader_moe_kwargs,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
-                        if getattr(spec_config, "moe_backend",
-                                   None) is not None:
+                        if draft_moe_selection is not None:
                             # Unlike ModelConfig.from_pretrained, the Mistral
                             # loader does not resolve AUTO after loading quant
-                            # metadata. Resolve it against the draft config now,
-                            # before constructing any draft modules.
-                            self.draft_config = _copy_model_config_with_moe_backend(
-                                self.draft_config, requested_draft_moe_backend)
+                            # metadata. Resolve the selection against the draft
+                            # config now, before constructing any draft modules;
+                            # a tactic resolves to the family the loader
+                            # already derived.
+                            self.draft_config = _copy_model_config_with_moe_selection(
+                                self.draft_config, draft_moe_selection)
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
-                            moe_backend=requested_draft_moe_backend,
+                            **draft_loader_moe_kwargs,
                             mapping=model_config.mapping.mapping_for_full_rows(
                             ),
                             spec_config=model_config.spec_config,
@@ -1862,7 +2025,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
-                        moe_backend=requested_draft_moe_backend,
+                        **_draft_loader_moe_kwargs(
+                            model_config,
+                            _draft_moe_selection(model_config, spec_config)),
                         mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
