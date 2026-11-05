@@ -339,7 +339,7 @@ Figure 10 compares these costs for 1024 input and output channels. The arithmeti
 
 ![Extra transformed-input and product workspace per output pixel](../media/tech_blog31/cost_workspace.svg)
 
-*Figure 10. Analytical costs per output pixel across all 1024 channels, with FP16 V and M. The axis labels $F(m\times m)$ denote $F(m\times m,3\times3)$ spatial convolutions. Transform counts use illustrative interpolation points. The lower panel measures extra high-bandwidth memory (HBM) capacity, not bytes transferred.*
+*Figure 10.* Analytical costs per output pixel across all 1024 channels, with FP16 V and M. The axis labels $F(m\times m)$ denote $F(m\times m,3\times3)$ spatial convolutions. Transform counts use illustrative interpolation points. The lower panel measures extra high-bandwidth memory (HBM) capacity, not bytes transferred.
 
 For equal channel counts $C$, direct spatial convolution takes $18C^2$ FLOPs per output pixel, counting a multiply-add as two. Winograd's GEMMs take $2C^2(m+2)^2/m^2$. At 1024 channels, this is 18.9 million FLOPs for direct convolution, 8.4 million for F2, and 4.7 million for F4.
 
