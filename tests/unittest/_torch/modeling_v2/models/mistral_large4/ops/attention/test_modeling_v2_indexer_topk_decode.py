@@ -615,11 +615,12 @@ def test_guard_refuses_top_k_past_the_launch_ceiling(width, k) -> None:
     seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
     indices = torch.full((1, k), UNWRITTEN, dtype=torch.int32, device="cuda")
     aux, _ = _scratch(spec, 1)
-    # Unguarded: the call returns quietly, the launch never ran, and its error
-    # surfaces at the next kernel launch, here a torch one of its own.
+    # Unguarded: the call returns quietly and the launch never ran. Torch's next
+    # launch does not report it either; the error stays in the CUDA runtime that
+    # libth_common links statically.
     _call(logits, seq_lens, indices, 1, k, *aux)
-    with pytest.raises(RuntimeError, match="invalid argument"):
-        torch.ones(1, device="cuda").add_(1)
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
     assert bool((indices == UNWRITTEN).all())
     # One past the ceiling is refused; the ceiling itself launches and answers.
     with pytest.raises(AssertionError, match="index_topk must be in"):
