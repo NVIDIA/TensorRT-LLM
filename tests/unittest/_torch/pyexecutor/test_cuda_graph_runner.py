@@ -661,7 +661,7 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
     runner = object.__new__(CUDAGraphRunner)
     runner.graph_metadata = {key: {"attn_metadata": metadata, "spec_metadata": None}}
     runner.shared_static_tensors = inputs
-    runner.config = SimpleNamespace(use_mrope=False)
+    runner.config = SimpleNamespace(use_mrope=False, stage_decode_inputs=False)
     runner._check_strict_buffer_stability = lambda meta: None
     runner._get_num_tokens_for_key = lambda key: 1
     runner._step_input_prologue_keys = {key: captured}
