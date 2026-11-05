@@ -2147,6 +2147,12 @@ class KVCacheManagerV2(BaseResourceManager):
         gen_preemption_headroom: int = 0,
         **kwargs,
     ) -> None:
+        """Initialize cache pools and per-request page-index buffers.
+
+        The configured max_seq_len bounds page-index capacity, including
+        generation headroom. Physical pool capacity may reduce the manager's
+        allocatable sequence length without reducing those buffers.
+        """
         self.mapping = mapping
         self.gen_preemption_headroom = gen_preemption_headroom
         self.dtype = dtype
