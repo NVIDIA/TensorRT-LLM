@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MTP draft loop's fused bookkeeping (`ops/spec/draft_loop.py`) against the engine's code.
+"""The MTP draft loop's fused bookkeeping (`spec_worker.py`) against the engine's code.
 
 Every fused op is compared, exactly, with the engine's own code on the same inputs:
 
@@ -25,11 +25,11 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the GLM-5.2 target imports sm_103 CuTe DSL kernels", allow_module_level=True)
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    spec_worker as op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.spec import (  # noqa: E402, E501
     draft_loop as K,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.spec import (  # noqa: E402, E501
-    draft_loop as op,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (  # noqa: E402
     DSAtrtllmAttentionMetadata,
@@ -410,13 +410,10 @@ def test_step_declines_and_stays_declined(monkeypatch) -> None:
 
 def test_worker_overrides_are_model_local() -> None:
     """The worker overrides methods of its own class only; the engine's are untouched."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E501
-        modeling as M,
-    )
     from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 
     for name in ("_forward_impl", "sample_and_accept_draft_tokens", "prepare_1st_drafter_inputs",
                  "_forward_linear_draft_loop", "_prepare_next_new_tokens"):  # fmt: skip
-        assert name in vars(M.Glm52MTPEagleWorker), name
-        assert vars(M.MTPEagleWorker).get(name) is None
-        assert getattr(M.MTPEagleWorker, name) is getattr(Eagle3OneModelWorker, name)
+        assert name in vars(op.Glm52MTPEagleWorker), name
+        assert vars(op.MTPEagleWorker).get(name) is None
+        assert getattr(op.MTPEagleWorker, name) is getattr(Eagle3OneModelWorker, name)
