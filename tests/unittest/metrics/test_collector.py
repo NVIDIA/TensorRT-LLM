@@ -292,7 +292,7 @@ class TestExistingRankAndTransferMetrics:
     def test_transfer_perf_metrics_count_once_across_candidates(self, collector):
         from types import SimpleNamespace
 
-        from tensorrt_llm.executor.result import RequestOutput
+        from tensorrt_llm.executor.result import GenerationResultBase
 
         result = SimpleNamespace(
             candidate_metrics=[],
@@ -317,7 +317,7 @@ class TestExistingRankAndTransferMetrics:
             RequestEventTiming.KV_CACHE_SIZE: 1024,
         }
         for sequence_index in [0, 1]:
-            RequestOutput._record_completion_stats(result, output, stats, sequence_index)
+            GenerationResultBase.record_stats(result, output, stats, sequence_index)
         for candidate in result.candidate_metrics:
             collector.log_request_metrics_dict(candidate)
         assert _get_counter_value(collector, "kv_cache_transfer_bytes") == 1024
