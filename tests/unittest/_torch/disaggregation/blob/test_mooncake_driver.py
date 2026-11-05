@@ -742,23 +742,23 @@ def test_get_answers_map_to_row_statuses(case: str) -> None:
 
 
 PUT_START_ANSWERS = {
-    # name: (the session start's answer, status, fault, the stat counting a skipped row)
-    "NO_AVAILABLE_HANDLE": (-200, "declined", None, "rows_declined_pool_full"),
+    # name: (the session start's answer, status, fault, the stat counting a skipped row, whether
+    #        the key is left open for close)
+    "NO_AVAILABLE_HANDLE": (-200, "declined", None, "rows_declined_pool_full", False),
     # This driver holds no session of the key: not a session of its own, but, say, a cachelib
     # master's object cap.
-    "INVALID_PARAMS": (-600, "fault", "put session start: INVALID_PARAMS(-600)", None),
-    "INVALID_REPLICA": (-702, "fault", "put session start: INVALID_REPLICA(-702)", None),
-    # The start may still reach the master, yet its key is not left open (MooncakeDriver
-    # docstring, step 3).
-    "RPC_FAIL": (-900, "fault", "put session start: RPC_FAIL(-900)", None),
-    "RPC_TIMEOUT": (-901, "fault", "put session start: RPC_TIMEOUT(-901)", None),
-    "unknown_code": (-9999, "fault", "put session start: code(-9999)", None),
+    "INVALID_PARAMS": (-600, "fault", "put session start: INVALID_PARAMS(-600)", None, False),
+    "INVALID_REPLICA": (-702, "fault", "put session start: INVALID_REPLICA(-702)", None, False),
+    # The start may still reach the master.
+    "RPC_FAIL": (-900, "fault", "put session start: RPC_FAIL(-900)", None, True),
+    "RPC_TIMEOUT": (-901, "fault", "put session start: RPC_TIMEOUT(-901)", None, True),
+    "unknown_code": (-9999, "fault", "put session start: code(-9999)", None, False),
 }
 
 
 @pytest.mark.parametrize("case", PUT_START_ANSWERS)
 def test_put_session_start_answers_map_to_row_statuses(case: str) -> None:
-    answer, status, fault, counted = PUT_START_ANSWERS[case]
+    answer, status, fault, counted, left_for_close = PUT_START_ANSWERS[case]
     bench = Bench()
     bench.fake.script(PUT_START, [answer])
     results, access_ended = bench.run("put", "A")
@@ -769,7 +769,7 @@ def test_put_session_start_answers_map_to_row_statuses(case: str) -> None:
     assert len(start.args) == 2 and start.kwargs == {}  # never a replicate config
     for method in (PUT_RANGES, PUT_END, PUT_REVOKE, "batch_is_exist"):
         assert bench.fake.calls_to(method) == []  # a session it did not start is not its own
-    assert bench.driver.stats()["put_keys_left_for_close"] == 0
+    assert bench.driver.stats()["put_keys_left_for_close"] == left_for_close
 
 
 PUT_WRITE_ANSWERS = {
@@ -876,6 +876,10 @@ SESSION_SCENARIOS = {
         "FRR",
         revoked="A",
         left_for_close="A",
+    ),
+    # The keys whose start may still reach the master are left open, not the one the SDK refused.
+    "start_rpc_failed_beside_a_start_the_sdk_refused": SessionScenario(
+        {PUT_START: [[-900, -600, -900]]}, "FFF", left_for_close="AC"
     ),
     # The SDK may have opened any of the sessions.
     "start_raises": SessionScenario(
@@ -1038,14 +1042,22 @@ def test_a_key_another_put_of_this_driver_holds_is_not_ready_without_asking_the_
     assert summary(results) == [("ready", None)]  # it exists already, committed
 
 
-@pytest.mark.parametrize("left", ["to_master", "for_close"])
-def test_a_key_left_open_is_never_put_again_and_ready_once_its_object_exists(left: str) -> None:
+LEFT_OPEN = {
+    # case: (the SDK call scripted in the first put, its answer, how that put leaves the key open)
+    "transfer_fail": (PUT_RANGES, -800, "to_master"),
+    # The retry ends the session, but the first end may still reach the master.
+    "end_timed_out": (PUT_END, -901, "for_close"),
+    # The start may still reach the master.
+    "start_timed_out": (PUT_START, -901, "for_close"),
+}
+
+
+@pytest.mark.parametrize("case", LEFT_OPEN)
+def test_a_key_left_open_is_never_put_again_and_ready_once_its_object_exists(case: str) -> None:
+    method, answer, left = LEFT_OPEN[case]
     bench = Bench()
     bench.fill_sources("put", "A")
-    if left == "to_master":
-        bench.fake.script(PUT_RANGES, [-800])
-    else:  # the retry ends the session, but the first end may still land
-        bench.fake.script(PUT_END, [-901])
+    bench.fake.script(method, [answer])
     bench.run("put", "A")
     assert bench.driver.stats()[f"put_keys_left_{left}"] == 1
     # The store dropped what the put left there: the master freed it, or evicted the object.
@@ -1059,6 +1071,30 @@ def test_a_key_left_open_is_never_put_again_and_ready_once_its_object_exists(lef
     assert summary(results) == [("ready", None)]  # whoever wrote it
     assert bench.keys_of(PUT_START) == [key("A")]  # no session of it was started again
     assert bench.keys_of("batch_is_exist") == [key("A")] * 2
+    assert bench.driver.stats()[f"put_keys_left_{left}"] == 1
+
+
+def test_a_key_left_open_faults_when_its_existence_check_fails() -> None:
+    bench = Bench()
+    bench.fill_sources("put", "A")
+    bench.fake.script(PUT_START, [-901])  # the start may still reach the master
+    bench.run("put", "A")
+    bench.fake.script("batch_is_exist", [-900])
+    results, _ = bench.run("put", "A")
+    assert summary(results) == [("fault", "existence check: RPC_FAIL(-900)")]
+    assert bench.keys_of(PUT_START) == [key("A")]
+
+
+def test_a_part_puts_its_fresh_keys_beside_a_key_left_open() -> None:
+    bench = Bench()
+    bench.fill_sources("put", "A", "B")
+    bench.fake.script(PUT_START, [-901])  # A's start may still reach the master
+    bench.run("put", "A")
+    results, access_ended = bench.run("put", "A", "B")
+    assert summary(results) == [("declined", None), ("ready", None)] and access_ended
+    assert bench.keys_of(PUT_START) == [key("A"), key("B")]  # the second put started B alone
+    assert bench.keys_of("batch_is_exist") == [key("A")]
+    assert bench.fake.pool.objects == {key("B"): b"B" * SLOT}
 
 
 def test_close_needs_a_drain_that_returned_true() -> None:

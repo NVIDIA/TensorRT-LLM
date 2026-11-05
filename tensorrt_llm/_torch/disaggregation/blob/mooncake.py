@@ -168,9 +168,9 @@ _SKIP_RESULTS = {
     "pool_full": _DECLINED,  # put start -200: no space for the object
 }
 
-# Session-end answers after which the end may still reach the master, so its key is left open
-# (class docstring, step 3), even when a retry ends the session.
-_END_OUTCOME_UNKNOWN = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT, _Code.METADATA_CALL_FAILED)
+# Session start and end answers after which the call may still reach the master, so its key is
+# left open (class docstring, step 3).
+_OUTCOME_UNKNOWN = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT, _Code.METADATA_CALL_FAILED)
 # Session-end answers retried once, as the master ends a session idempotently; an end call that
 # raised or miscounted is not retried.
 _END_RETRIED = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT)
@@ -300,26 +300,32 @@ class MooncakeDriver:
        it is never put again.
     2. Starts a session per reserved key, writes every started row in one scatter, ends the
        session of each row written whole (its object becomes readable) and revokes the rest.
-    3. Resolves each reserved key whose start the SDK refused, or whose session calls all had a
-       known outcome and left no session; every other key it leaves open for good. The master
-       matches an end or a revoke to an object by key and client alone, so one that may still
-       reach it would act on the next put of the key: a late end makes its object readable
-       before it is written, a late revoke frees its space mid-write. A start refused with
-       RPC_FAIL or RPC_TIMEOUT may have reached the master, or may still reach it: on a key with
-       no object it reserves one, so the key's next put is NOT_READY until
-       ``put_start_discard_timeout_sec``, and it replaces a put of the key unfinished past that
-       timeout with an unwritten object, which that put's end makes readable when the put is
-       this driver's. Leaving these keys open would instead bar every key whose start met a
-       master outage from ever being put again. A key is left open:
+    3. Resolves each reserved key whose session calls all had a known outcome and left no
+       session; every other key it leaves open for good. RPC_FAIL and RPC_TIMEOUT may answer a
+       call the client sent and stopped waiting on
+       (``mooncake-store/src/master_client.cpp:410-422``), so such a start, end or revoke may
+       still reach the master, where it would act on this driver's next put of the key. The
+       master matches an end or a revoke to an object by key and client, and lets a start
+       replace an object whose put started over ``put_start_discard_timeout_sec`` ago
+       (``master_service.cpp:4422-4453, 4516-4526, 4783-4793``). So a late start may replace the
+       next put's object with an unwritten one, which that put's end makes readable; a late end
+       makes the object readable before it is written; a late revoke frees its space mid-write.
+       Every key whose start fails during a master outage is thus barred from this driver's
+       puts for good and kept in memory until close, even one whose start was never sent
+       (``master_client.cpp:405-408``). A key is left open:
 
        - to the master, never revoked here, since the target may still write into the object: a
          scatter that raised or miscounted, a row answered TRANSFER_FAIL. The master frees them
          after ``put_start_release_timeout_sec``.
-       - for ``close`` to revoke, once no put runs: any other, such as a start that raised or
-         miscounted, an end whose outcome is unknown (``_END_OUTCOME_UNKNOWN``) even when a
-         retried end succeeded, a revoke that failed, or a put stopped by a raise. A put stopped
-         by a raise is unprovable, so no drain returns True and ``close`` never comes: the
-         master frees its sessions.
+       - for ``close`` to revoke, once no put runs: any other, such as a start or an end that
+         raised, miscounted, or answered RPC_FAIL or RPC_TIMEOUT (an end even when a retried end
+         succeeded), a revoke that failed, or a put stopped by a raise. After a start answered
+         RPC_FAIL or RPC_TIMEOUT the SDK holds no session, so the revoke never reaches the
+         master (``mooncake-store/src/real_client.cpp:5687-5690, 5971-5974``); an object a late
+         start reserved is freed by the master after ``put_start_release_timeout_sec``, or
+         replaced by another client's start after ``put_start_discard_timeout_sec``. A put
+         stopped by a raise is unprovable, so no drain returns True and ``close`` never comes:
+         the master frees its sessions.
 
     Args:
         store: An SDK store whose ``setup`` returned 0. The driver takes it over: ``close``
@@ -838,7 +844,7 @@ class MooncakeDriver:
                 if code == _Code.OK:
                     started.append(key)
                     continue
-                if code != _Code.METADATA_CALL_FAILED:  # the SDK answered and holds no session
+                if code not in _OUTCOME_UNKNOWN:  # refused: no session of the key, now or later
                     resolved.add(key)
                 if code == _Code.OBJECT_ALREADY_EXISTS:
                     existing.append(key)
@@ -906,8 +912,8 @@ class MooncakeDriver:
         self, keys: list[str], results: _PartResults, resolved: set[str]
     ) -> list[str]:
         """Ends the sessions of rows written whole. Returns the keys whose end was refused, to
-        revoke. A key whose first end answered ``_END_OUTCOME_UNKNOWN`` stays open, as that end may
-        still reach the master; its row is READY when the retry ended the session."""
+        revoke. A key whose first end answered one of ``_OUTCOME_UNKNOWN`` stays open, as that
+        end may still reach the master; its row is READY when the retry ended the session."""
         end = self._store.batch_put_session_end
         codes = self._metadata_call(end, keys)
         if not any(codes):  # every session ended (OK is 0)
@@ -923,7 +929,7 @@ class MooncakeDriver:
                 results.fault([key], f"put session end: {_describe(final[key])}")
             if first == _Code.OK:
                 resolved.add(key)
-            elif first not in _END_OUTCOME_UNKNOWN:
+            elif first not in _OUTCOME_UNKNOWN:
                 refused.append(key)
         return refused
 
