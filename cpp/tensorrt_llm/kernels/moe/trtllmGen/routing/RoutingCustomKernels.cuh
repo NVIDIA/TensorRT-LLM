@@ -1693,7 +1693,7 @@ void launchClusterKernelForPolicy(Data const& data, void* stream)
         });
     if (!dispatched)
     {
-        TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+        TLLM_CHECK_WITH_INFO(false, "No routing tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
     }
 }
 
@@ -1926,7 +1926,8 @@ void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32
                 });
             if (!dispatched)
             {
-                TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+                TLLM_CHECK_WITH_INFO(
+                    false, "No routing tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
             }
         });
 }

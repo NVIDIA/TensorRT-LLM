@@ -542,11 +542,11 @@ inline bool dispatchTierPairs(TierList<First, Rest...>*, Data const& data, Fn&& 
 // ┌──────────────────────────────────────────────────────────────────────────────┐
 // │  Policy (PreProc + PostProc)           Supported pairs                      │
 // ├──────────────────────────────────────────────────────────────────────────────┤
-// │  Softmax + None       (Default)        (128,8)                              │
+// │  Softmax + None       (Default)        (128,8) (256,8) (512,8) (2048,32)  │
 // │  None + Softmax       (Renormalize)    (128,4) (128,8) (160,8) (256,8)     │
 // │                                        (256,16) (512,8) (512,16)  │
 // │                                        (512,22) (576,8) (2048,32)          │
-// │  Sigmoid + SumNorm    (SigmoidRenorm)  (128,8)                              │
+// │  Sigmoid + SumNorm    (SigmoidRenorm)  (128,8) (256,8) (512,8) (2048,32)  │
 // │  SigmoidBias + ScaleS (DS nGroup≤1)    (128,8) (256,8) (384,8) (512,8)    │
 // │                                        (512,22)                            │
 // │  Softmax + SumNorm    (RenormNaive)    (128,4) (128,8) (256,8) (512,8)    │
@@ -566,11 +566,12 @@ struct PolicyTraits
         Tier<2048, 8>, Tier<2048, 32>>;
 };
 
-/// Softmax + None (Default): single config.
+/// Softmax + None (Default): tight tiers up to 512 experts / topK 8, plus a catch-all up to the
+/// kernel limits, so every expert count and topK the runner accepts has a tier.
 template <>
 struct PolicyTraits<SoftmaxPreprocess, NoOpPostprocess>
 {
-    using Pairs = TierList<Tier<128, 8>>;
+    using Pairs = TierList<Tier<128, 8>, Tier<256, 8>, Tier<512, 8>, Tier<2048, 32>>;
 };
 
 /// None + Softmax (Renormalize): many model configs.
@@ -593,11 +594,11 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess>
             >;
 };
 
-/// Sigmoid + SumNormalize (SigmoidRenorm): single config.
+/// Sigmoid + SumNormalize (SigmoidRenorm): same coverage as Default.
 template <>
 struct PolicyTraits<SigmoidPreprocess, SumNormalizePostprocess>
 {
-    using Pairs = TierList<Tier<128, 8>>;
+    using Pairs = TierList<Tier<128, 8>, Tier<256, 8>, Tier<512, 8>, Tier<2048, 32>>;
 };
 
 /// SigmoidBias + ScaledSumNormalize (DeepSeek nGroup≤1 / MiniMax2 / Kimi-K2 / Nemotron SuperV3).
@@ -718,7 +719,7 @@ struct DefaultRoutingLaunchConfig
             });                                                                                                        \
         if (!dispatched_)                                                                                              \
         {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
+            TLLM_CHECK_WITH_INFO(false, "No routing tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK); \
         }                                                                                                              \
     }(PolicyTraits<PreProc, PostProc>{})
 
@@ -749,7 +750,7 @@ struct DefaultRoutingLaunchConfig
             });                                                                                                        \
         if (!dispatched_)                                                                                              \
         {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
+            TLLM_CHECK_WITH_INFO(false, "No routing tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK); \
         }                                                                                                              \
     }(PolicyTraits<ExpertSelect, void>{})
 
