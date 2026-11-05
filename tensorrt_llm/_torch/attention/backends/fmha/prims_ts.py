@@ -156,6 +156,7 @@ class PrimsTSFmha(PhasedFmha):
     """Blackwell task-scheduled paged context and decode FMHA library."""
 
     supports_per_tensor_fp8 = True
+    supports_vc_attention = True
 
     SUPPORTED_SMS = frozenset({100, 103})
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
@@ -175,6 +176,7 @@ class PrimsTSFmha(PhasedFmha):
         self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
         # Cache-free context plans, keyed by (batch, seq_len, q/v/out dtype, mask).
         self._contiguous_context_wrappers: dict[tuple[Any, ...], "BatchPrefillTSWrapper"] = {}
+        # VC-Attention-QK16 K/V preparation with its token permutation, one per layer.
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
         self._mla_decode_wrappers: dict[int, "BatchMLADecodePagedTSWrapper"] = {}
         # Dense MLA's quantization scales are fixed for this layer/model. PrimTS
@@ -295,6 +297,8 @@ class PrimsTSFmha(PhasedFmha):
                 return False, "cache-free attention takes separate Q, K and V."
         elif k is not None or v is not None or (not attn.is_mla_enable and not fwd.is_fused_qkv):
             return False, "only fused QKV input is supported."
+        elif getattr(fwd, "vc_attention", False):
+            return False, "VC-Attention runs on cache-free context attention only."
         if meta.is_cross:
             return False, "cross attention is not supported."
         output = fwd.output
@@ -501,6 +505,13 @@ class PrimsTSFmha(PhasedFmha):
             )
         if fwd.v_fp8_per_tensor and not fwd.qk_fp8_per_tensor and q.dtype != torch.bfloat16:
             return False, f"the attention recipe keeps Q/K in BF16, got {q.dtype}."
+        if fwd.vc_attention:
+            if attn.num_heads != attn.num_kv_heads:
+                return False, "VC-Attention requires equal Q and K/V head counts."
+            if attn.head_dim != 128:
+                return False, "VC-Attention requires head dimension 128."
+            if mask_type != AttentionMaskType.padding:
+                return False, "VC-Attention requires a dense mask."
         output = fwd.output
         if output.dtype != q.dtype:
             return False, f"output dtype must match query dtype, got {output.dtype} and {q.dtype}."
@@ -859,12 +870,38 @@ class PrimsTSFmha(PhasedFmha):
                 q_dequant_scale.float() * k_dequant_scale.float() * (sm_scale * math.log2(math.e))
             ).reshape(1)
         output_scale = None
-        if forward_args.v_fp8_per_tensor:
+        vc_params = None
+        vc_repair_tiles = 0
+        vc_demean = True
+        if forward_args.vc_attention:
+            # The caller prepared the VC-Attention operands. They carry the V scale and
+            # tile means (and under QK8 the E4M3 Q/K with their block scales), so no
+            # per-tensor scale is folded here.
+            vc_operands = forward_args.vc_operands
+            if vc_operands is None:
+                raise RuntimeError("VC-Attention requires prepared operands in vc_operands.")
+            k_bshd, v_bshd, vc_params = vc_operands.k, vc_operands.v, vc_operands.params
+            vc_demean = vc_operands.demean
+            vc_repair_tiles = vc_operands.repair_tiles
+            if vc_operands.q is not None:
+                q_bshd = vc_operands.q
+        elif forward_args.v_fp8_per_tensor:
             v_bshd, v_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(v_bshd)
             output_scale = v_dequant_scale.float().reshape(1)
         out = output.view(batch_size, seq_len, num_heads, head_dim)
         mask_type = self._get_prims_mask_type(forward_args)
-        key = (batch_size, seq_len, q_bshd.dtype, v_bshd.dtype, out.dtype, mask_type)
+        # A VC plan is compiled per demean phase and repair tile count, so the
+        # operands of either V-Smooth phase meet a matching plan.
+        key = (
+            batch_size,
+            seq_len,
+            q_bshd.dtype,
+            v_bshd.dtype,
+            out.dtype,
+            mask_type,
+            vc_demean,
+            vc_repair_tiles,
+        )
         wrapper = self._contiguous_context_wrappers.get(key)
         if wrapper is None:
             if torch.cuda.is_current_stream_capturing():
@@ -872,9 +909,13 @@ class PrimsTSFmha(PhasedFmha):
             from tensorrt_llm._torch.attention.backends.prims_ts.context import (
                 BatchPrefillTSWrapper,
             )
+            from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import (
+                VCAttentionConfig,
+            )
 
             logger.info(
                 f"PrimTS cache-free context: q/k_dtype={q_bshd.dtype} v_dtype={v_bshd.dtype} "
+                f"vc_attention={forward_args.vc_attention} "
                 f"batch={batch_size} seq_len={seq_len} heads={num_heads}/{num_kv_heads} head_dim={head_dim}"
             )
             wrapper = BatchPrefillTSWrapper()
@@ -892,6 +933,9 @@ class PrimsTSFmha(PhasedFmha):
                 out_dtype=out.dtype,
                 mask_type=mask_type,
                 sm_scale=sm_scale,
+                vc_config=VCAttentionConfig(demean=vc_demean, repair_tiles=vc_repair_tiles)
+                if vc_params is not None
+                else None,
             )
             self._contiguous_context_wrappers[key] = wrapper
         wrapper.run(
@@ -901,6 +945,7 @@ class PrimsTSFmha(PhasedFmha):
             out=out,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            vc=vc_params,
             validate=False,
         )
 
