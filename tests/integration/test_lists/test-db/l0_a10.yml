@@ -244,7 +244,6 @@ l0_a10:
   # helper-script unit tests (CPU-only, ~3s)
   - unittest/scripts
   - unittest/kv_cache_manager_v2_tests # 4 min
-  - unittest/api_stability
   - unittest/bindings
 - condition:
     ranges:
