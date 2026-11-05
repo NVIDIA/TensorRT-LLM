@@ -170,6 +170,21 @@ inline __device__ void quantizeAndWriteMlaFp4Residual(PackedVec<T> const& values
     residualOut[1] = fp32_vec_to_e2m1(residualHigh);
 }
 
+template <typename T>
+inline __device__ uint2 convertMlaVecToE4m3(PackedVec<T> const& values, float scale)
+{
+    static_assert(sizeof(T) * 8 == sizeof(PackedVec<T>));
+    auto const* elements = reinterpret_cast<T const*>(&values);
+    uint2 packed;
+    auto* output = reinterpret_cast<__nv_fp8_e4m3*>(&packed);
+#pragma unroll
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        output[index] = __nv_fp8_e4m3(static_cast<float>(elements[index]) * scale);
+    }
+    return packed;
+}
+
 template <typename T, int32_t kMainVecsPerToken, int32_t kResidualVecsPerToken>
 inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& dataCache, KVBlockArray const& scaleCache,
     int32_t batchIdx, int32_t tokenIdx, int32_t inBlockIdx, uint32_t* dst, PackedVec<T>& values, float secondLevelScale)
@@ -178,6 +193,36 @@ inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& dataCache, KVB
     static_assert(kResidualVecsPerToken % 2 == 0);
     int32_t const dataBytesPerToken = dataCache.mBytesPerBlock / dataCache.mTokensPerBlock;
     int32_t const scaleBytesPerToken = scaleCache.mBytesPerBlock / scaleCache.mTokensPerBlock;
+
+    // Inline-scale record (FlashInfer PrimTS D576 "nvfp4.fp8rope"): E2M1 NoPE codes, the last
+    // kResidualVecsPerToken vectors (RoPE) as E4M3, then the NoPE block scales with block b at
+    // 8 * (b % 4) + b / 4. The scale pool is unused. Callers pass a unit second-level scale.
+    constexpr int32_t kNopeVecsPerToken = kMainVecsPerToken - kResidualVecsPerToken;
+    constexpr int32_t kRecordRopeOffset = kNopeVecsPerToken * static_cast<int32_t>(sizeof(uint32_t));
+    constexpr int32_t kRecordScaleOffset
+        = kRecordRopeOffset + kResidualVecsPerToken * static_cast<int32_t>(sizeof(uint2));
+    constexpr int32_t kRecordBytesPerToken = kRecordScaleOffset + kNopeVecsPerToken / 2;
+    if (dataBytesPerToken == kRecordBytesPerToken)
+    {
+        int32_t const tokenLocalIdx = inBlockIdx / kMainVecsPerToken;
+        int32_t const vecIdx = inBlockIdx % kMainVecsPerToken;
+        auto* record = reinterpret_cast<uint8_t*>(dst) + static_cast<int64_t>(tokenLocalIdx) * kRecordBytesPerToken;
+        if (vecIdx < kNopeVecsPerToken)
+        {
+            int32_t const scaleBlock = vecIdx / 2;
+            uint8_t* scaleOut
+                = (vecIdx & 1) == 0 ? record + kRecordScaleOffset + 8 * (scaleBlock % 4) + scaleBlock / 4 : nullptr;
+            reinterpret_cast<uint32_t*>(record)[vecIdx]
+                = cvt_warp_fp16_to_fp4<T, 16, false>(values, secondLevelScale, scaleOut);
+        }
+        else
+        {
+            reinterpret_cast<uint2*>(record + kRecordRopeOffset)[vecIdx - kNopeVecsPerToken]
+                = convertMlaVecToE4m3(values, secondLevelScale);
+        }
+        return;
+    }
+
     constexpr int32_t kResidualDataBytesPerToken
         = (kMainVecsPerToken + kResidualVecsPerToken) * static_cast<int32_t>(sizeof(uint32_t));
     constexpr int32_t kResidualScaleBytesPerToken = (kMainVecsPerToken + kResidualVecsPerToken) / 2;
