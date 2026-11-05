@@ -150,9 +150,7 @@ class ModelEngine:
             model_weights_restore_mode=model_weights_restore_mode,
         )
         if not (self.model.model_config.is_generation or self.llm_args.mm_encoder_only):
-            self.llm_args = resolve_scheduled_encoder_args(
-                self.llm_args, enable_attention_dp=self.mapping.enable_attention_dp
-            )
+            self.llm_args = resolve_scheduled_encoder_args(self.llm_args)
         self._init_from_model()
         self._size_cuda_graphs()
         self._compile_model(configured_encoder_max_num_tokens)

@@ -1178,14 +1178,8 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
         return outputs
 
 
-def resolve_scheduled_encoder_args(
-    llm_args: TorchLlmArgs, *, enable_attention_dp: bool
-) -> TorchLlmArgs:
+def resolve_scheduled_encoder_args(llm_args: TorchLlmArgs) -> TorchLlmArgs:
     """Reject or drop the settings a scheduled non-generation model cannot honor."""
-    if enable_attention_dp:
-        raise ValueError(
-            "Non-generation models do not support attention DP; set enable_attention_dp=False."
-        )
     graph_config = llm_args.cuda_graph_config
     if isinstance(graph_config, EncodeCudaGraphConfig) and graph_config.extra_model_inputs:
         raise ValueError(

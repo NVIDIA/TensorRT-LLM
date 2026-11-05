@@ -676,32 +676,21 @@ def test_encoder_graph_rejects_nested_outputs() -> None:
         runner._execute_prepared(prepared)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        ({}, "do not support attention DP"),
-        (
-            {
-                "cuda_graph_config": EncodeCudaGraphConfig(
-                    batch_sizes=[1],
-                    num_tokens=[8],
-                    seq_lens=[8],
-                    extra_model_inputs=[
-                        EncodeExtraInputSpec(
-                            name="token_type_ids", shape=("num_tokens",), dtype="int32"
-                        )
-                    ],
-                )
-            },
-            "can only be supplied through LLM.encode",
+def test_scheduled_encoder_args_reject_extra_model_inputs() -> None:
+    llm_args = TorchLlmArgs(
+        model="dummy",
+        cuda_graph_config=EncodeCudaGraphConfig(
+            batch_sizes=[1],
+            num_tokens=[8],
+            seq_lens=[8],
+            extra_model_inputs=[
+                EncodeExtraInputSpec(name="token_type_ids", shape=("num_tokens",), dtype="int32")
+            ],
         ),
-    ],
-)
-def test_scheduled_encoder_args_reject_unsupported_settings(overrides: dict, match: str) -> None:
-    llm_args = TorchLlmArgs(model="dummy", **overrides)
+    )
 
-    with pytest.raises(ValueError, match=match):
-        resolve_scheduled_encoder_args(llm_args, enable_attention_dp=not overrides)
+    with pytest.raises(ValueError, match="can only be supplied through LLM.encode"):
+        resolve_scheduled_encoder_args(llm_args)
 
 
 @pytest.mark.parametrize("backend", ["piecewise", "breakable"])
@@ -709,7 +698,7 @@ def test_scheduled_encoder_args_drop_prefill_cuda_graphs(backend: str) -> None:
     llm_args = TorchLlmArgs(model="dummy", prefill_cuda_graph_backend=backend)
 
     with patch.object(encoder_module.logger, "warning") as warning:
-        resolved = resolve_scheduled_encoder_args(llm_args, enable_attention_dp=False)
+        resolved = resolve_scheduled_encoder_args(llm_args)
 
     warning.assert_called_once()
     assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
@@ -723,7 +712,7 @@ def test_scheduled_encoder_args_keep_explicit_compile_config() -> None:
         model="dummy", prefill_cuda_graph_backend="piecewise", torch_compile_config=compile_config
     )
 
-    resolved = resolve_scheduled_encoder_args(llm_args, enable_attention_dp=False)
+    resolved = resolve_scheduled_encoder_args(llm_args)
 
     assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
     assert resolved.torch_compile_config == compile_config
@@ -732,4 +721,4 @@ def test_scheduled_encoder_args_keep_explicit_compile_config() -> None:
 def test_scheduled_encoder_args_keep_supported_settings() -> None:
     llm_args = TorchLlmArgs(model="dummy")
 
-    assert resolve_scheduled_encoder_args(llm_args, enable_attention_dp=False) is llm_args
+    assert resolve_scheduled_encoder_args(llm_args) is llm_args
