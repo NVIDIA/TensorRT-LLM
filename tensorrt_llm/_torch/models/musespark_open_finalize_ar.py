@@ -62,6 +62,7 @@ import zlib
 
 import numpy as np
 import torch
+from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm._ipc_utils import _ipc_mem_handle_from_bytes, _ipc_mem_handle_to_bytes
 from tensorrt_llm.logger import logger
@@ -608,10 +609,15 @@ class FinalizeIpcWorkspace:
 
         from tensorrt_llm._torch.distributed.communicator import Distributed
 
-        self._dist = Distributed.get(mapping)
-        self._agree("setup", *self._guarded(self._prepare, mapping))
-        self._allocate_ipc()
-        self._agree("initialization", *self._guarded(self._initialize))
+        # The model loader constructs models under `MetaInitMode`, which turns
+        # `torch.empty` into meta tensors; the torch.distributed backend stages
+        # its exchanges through such tensors. The workspace is device and IPC
+        # state, not parameters, so it is built with the active modes popped.
+        with _disable_current_modes():
+            self._dist = Distributed.get(mapping)
+            self._agree("setup", *self._guarded(self._prepare, mapping))
+            self._allocate_ipc()
+            self._agree("initialization", *self._guarded(self._initialize))
 
     # Construction stages. Each stage turns any local failure into a status
     # and agrees on it with the whole group, so that every rank either goes on

@@ -777,7 +777,10 @@ class MuseSparkOpenMoE(nn.Module):
             self._prepare_ready_event = torch.cuda.Event()
 
     def cache_derived_state(self) -> None:
-        """Cache the pre-expert norm's `1 + w`; the loader calls this after the weights land."""
+        """Cache the pre-expert norm's `1 + w` in the weight's dtype, as the fused kernel takes it.
+
+        The loader calls this after the weights land.
+        """
         weight = self.pre_expert_norm.weight
         if weight is None or weight.is_meta:
             return
@@ -816,10 +819,18 @@ class MuseSparkOpenMoE(nn.Module):
     def prepare_expert_input(self, pooled: torch.Tensor) -> torch.Tensor | Fp4QuantizedTensor:
         """The pre-expert norm, fused with the experts' NVFP4 input quantization where they take it.
 
-        The fused kernel quantizes the FP32 norm result without the reference's
-        intermediate BF16 round. It serves the native TRTLLM-Gen NVFP4 experts
-        with a single static input scale and no communication; everything else
-        takes the norm alone and leaves quantization to the experts.
+        The fused kernel serves the native TRTLLM-Gen NVFP4 experts with a
+        single static input scale and no communication; everything else takes
+        the norm alone and leaves quantization to the experts.
+
+        The two paths round differently. The kernel takes its gain in the
+        input's dtype, so `1 + w` is rounded to BF16, which moves a channel's
+        gain by up to 2^-8 (0.39%) for every token; the norm adds the 1 in
+        FP32. The kernel also rounds `x * (1 + w)` to BF16 and then applies the
+        inverse RMS in FP32, where the norm rounds its FP32 result to BF16.
+        Against the norm followed by the experts' quantization, about 1% of
+        the FP4 codes and up to 3% of the block scales differ, each by one
+        step, and the error against the exact norm is the same to within 0.1%.
         """
         experts = self.experts
         backend = getattr(experts, "backend", experts)

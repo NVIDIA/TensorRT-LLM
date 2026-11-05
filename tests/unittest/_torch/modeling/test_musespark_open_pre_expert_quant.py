@@ -121,6 +121,72 @@ def test_the_cached_gain_matches_the_one_computed_per_call():
         torch.testing.assert_close(cached.scaling_factor, uncached.scaling_factor, rtol=0, atol=0)
 
 
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _codes(packed: torch.Tensor) -> torch.Tensor:
+    """The E2M1 codes of packed NVFP4 values, two per byte, low nibble first."""
+    packed = packed.view(torch.uint8).to(torch.int64)
+    return torch.stack([packed & 0xF, packed >> 4], dim=-1).flatten(-2)
+
+
+def _dequantize(packed: torch.Tensor, scales: torch.Tensor, global_scale: float) -> torch.Tensor:
+    codes = _codes(packed)
+    magnitudes = torch.tensor(_E2M1, dtype=torch.float64, device=codes.device)[codes & 7]
+    values = torch.where(codes >= 8, -magnitudes, magnitudes)
+    blocks = scales.view(torch.float8_e4m3fn).to(torch.float64).repeat_interleave(16, dim=-1)
+    return values * blocks / global_scale
+
+
+@fused_available
+@pytest.mark.parametrize("gains", ["zero_centered", "small"])
+def test_the_fused_path_agrees_with_the_norm_then_the_experts_quantization(gains):
+    """Within one rounding step of `pre_expert_norm` followed by the experts' own quantization.
+
+    The two round differently (see `prepare_expert_input`), so a value near an
+    FP4 rounding boundary, or a block maximum near an E4M3 one, may land one
+    step away. `small` gains (|w| < 2^-8) lose most of `w` to the BF16 `1 + w`.
+    """
+    torch.manual_seed(845)
+    with torch.inference_mode():
+        module = _module("cuda")
+        weight = module.pre_expert_norm.weight
+        if gains == "zero_centered":
+            weight.normal_(0, 0.1)
+        else:
+            weight.uniform_(-0.99 * 2**-8, 0.99 * 2**-8)
+        x = torch.randn(256, 4096, device="cuda", dtype=torch.bfloat16)
+        eps = module.pre_expert_norm.variance_epsilon
+        rms = x.double().pow(2).mean(-1, keepdim=True).add(eps).sqrt()
+        exact = x.double() / rms * (1 + weight.double())
+        backend = module.experts.backend
+        # A calibrated input scale: the largest block maximum maps to the E4M3 maximum.
+        global_scale = 448.0 * 6.0 / exact.abs().max().item()
+        backend.fc31_input_scale.fill_(global_scale)
+        # What the experts' BF16 input branch reads: their packed width (no padding here).
+        backend.w3_w1_weight = torch.empty(0, 2048, dtype=torch.uint8, device="cuda")
+        backend.scaling_vector_size = 16
+
+        fused = module.prepare_expert_input(x)
+        assert isinstance(fused, Fp4QuantizedTensor)
+        packed, scales = TRTLLMGenNvfp4Base.quantize_input(backend, module.pre_expert_norm(x))
+
+        scale_steps = (
+            fused.scaling_factor.view(torch.uint8).int() - scales.view(torch.uint8).int()
+        ).abs()
+        assert scale_steps.max().item() <= 1
+        assert (scale_steps != 0).double().mean().item() <= 0.05
+        codes, reference_codes = _codes(fused.fp4_tensor), _codes(packed)
+        assert ((codes & 7) - (reference_codes & 7)).abs().max().item() <= 1
+        nonzero = ((codes & 7) != 0) & ((reference_codes & 7) != 0)
+        assert not (((codes ^ reference_codes) & 8) != 0)[nonzero].any(), "a sign flipped"
+        assert (codes != reference_codes).double().mean().item() <= 0.02
+
+        error = (_dequantize(fused.fp4_tensor, fused.scaling_factor, global_scale) - exact).norm()
+        reference_error = (_dequantize(packed, scales, global_scale) - exact).norm()
+        assert error.item() <= 1.01 * reference_error.item()
+
+
 @pytest.mark.parametrize("stage", ["post_load_weights", "cache_derived_state"])
 def test_the_gain_cache_follows_the_weight(stage):
     """Filled by either loader walk, skipped while meta, dropped by a dtype move."""

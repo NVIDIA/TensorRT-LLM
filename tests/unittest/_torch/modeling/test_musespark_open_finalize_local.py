@@ -3,9 +3,11 @@
 """Single-process contracts of the finalize+all-reduce module: imports, input checks, release order.
 
 These need no peers. Argument validation runs on a workspace whose launcher is
-replaced by a recorder, so a rejected call is proven to launch nothing. Release
-runs on a workspace holding fake buffers, with the TP group and the CUDA calls
-replaced by recorders, so the order of every step can be checked exactly.
+replaced by a recorder, so a rejected call is proven to launch nothing.
+Construction runs under `MetaInitMode` with a TP group that stages its
+exchanges as `TorchDist` does. Release runs on a workspace holding fake
+buffers, with the TP group and the CUDA calls replaced by recorders, so the
+order of every step can be checked exactly.
 """
 
 import subprocess
@@ -15,8 +17,11 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.models import musespark_open_finalize_ar
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.models.musespark_open_finalize_ar import FinalizeIpcWorkspace
+from tensorrt_llm.mapping import Mapping
 
 _BLOCKED_DSL = """
 import sys
@@ -161,6 +166,43 @@ def test_construction_stage_reports_any_exception_as_failure() -> None:
     status, detail = FinalizeIpcWorkspace._guarded(broken_stage, "injected")
     assert status == musespark_open_finalize_ar._FAILED
     assert detail.startswith("KeyError")
+
+
+class _StagingGroup:
+    """Four-rank TP group whose exchanges stage through `torch.empty`, as `TorchDist`'s do."""
+
+    def __init__(self):
+        self.staged_on = []
+
+    def tp_allgather_int64(self, values):
+        row = torch.empty(len(values), dtype=torch.int64)
+        row.copy_(torch.tensor(values, dtype=torch.int64))
+        self.staged_on.append(row.device.type)
+        return np.stack([row.numpy()] * 4)
+
+
+def test_construction_under_meta_init_exchanges_real_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model loader constructs models under `MetaInitMode`, which turns `torch.empty` into meta.
+
+    The setup stage fails on purpose, so construction ends at the first
+    agreement. It must end there with the agreed error, not with the mode's
+    `MetaInitException` from inside the exchange.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    group = _StagingGroup()
+    monkeypatch.setattr(communicator.Distributed, "get", staticmethod(lambda mapping: group))
+    monkeypatch.setattr(
+        FinalizeIpcWorkspace,
+        "_prepare",
+        lambda self, mapping: (musespark_open_finalize_ar._UNSUPPORTED, "injected"),
+    )
+    mapping = Mapping(world_size=4, rank=0, tp_size=4, gpus_per_node=4)
+    with MetaInitMode(), pytest.raises(ValueError, match="setup failed.*injected"):
+        FinalizeIpcWorkspace(mapping)
+    assert group.staged_on and set(group.staged_on) == {"cpu"}
 
 
 def test_closed_workspace_rejects_calls(recorded) -> None:
