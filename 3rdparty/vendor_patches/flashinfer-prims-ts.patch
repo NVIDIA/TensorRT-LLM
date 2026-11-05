@@ -1,5 +1,5 @@
 diff --git a/_compile_cache.py b/_compile_cache.py
-index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254006f8cb8 100644
+index b374a65..cdfa762 100644
 --- a/_compile_cache.py
 +++ b/_compile_cache.py
 @@ -1,3 +1,4 @@
@@ -194,7 +194,7 @@ index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254
          f"prims_ts_{family}",
          f"{kind}_sm{major}{minor}_{key}",
 diff --git a/block_sparse.py b/block_sparse.py
-index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe2532a1c7 100644
+index fa05561..38de492 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -256,19 +256,19 @@ index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index d3f104e4e34b1bcb7ada697f9e76f7013d6ca100..1ec1080b942f60fad22e3e4a1627cad9592697ad 100644
+index 898859e..564760b 100644
 --- a/context.py
 +++ b/context.py
-@@ -48,7 +48,7 @@ from ._hardware import get_max_active_clusters
- 
- import torch
+@@ -56,7 +56,7 @@ from .vc_attention import (
+     vc_scale_shapes,
+ )
  
 -from flashinfer.api_logging import flashinfer_experimental_api
 +from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
  
  if TYPE_CHECKING:
-@@ -493,7 +493,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -505,7 +505,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -278,7 +278,7 @@ index d3f104e4e34b1bcb7ada697f9e76f7013d6ca100..1ec1080b942f60fad22e3e4a1627cad9
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac722fed527 100644
+index 4fb096f..f918146 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -327,7 +327,7 @@ index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac7
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2fe30a922 100644
+index fbd1f12..2efae0a 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -335,7 +335,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -1199,8 +1200,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1310,8 +1311,6 @@ class GmemQKVResource(MemoryResource):
                  if cutlass.const_expr(self.cfg.has_uniform_varlen):
                      seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                  else:
@@ -344,7 +344,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
                      seqlen_k = _load_runtime_seq_len_kv(
                          self.seqlens_kv, self.max_seq_len_kv, batch_coord
                      )
-@@ -1223,8 +1222,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1334,8 +1333,6 @@ class GmemQKVResource(MemoryResource):
                      kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                      kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                  else:
@@ -353,7 +353,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
                      kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                          Int32(self.block_table_row_stride),
                          self.cfg,
-@@ -1300,13 +1297,9 @@ class GmemQKVResource(MemoryResource):
+@@ -1411,13 +1408,9 @@ class GmemQKVResource(MemoryResource):
              kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
              kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
          else:
@@ -367,7 +367,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
              kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                  Int32(self.block_table_row_stride),
                  self.cfg,
-@@ -1743,8 +1736,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
+@@ -1854,8 +1847,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
          kv_request_begin: Int32,
          kv_page_idx_ub: Int32,
      ) -> None:
@@ -376,7 +376,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
          cfg = self.cfg
          # Context's K/V tile index is kv_tile_start + loop_offset; for V the
          # producer runs one tile ahead in TAIL, so reuse the same expression
-@@ -1835,8 +1826,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
+@@ -1946,8 +1937,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
          tile_offset: cutlass.Constexpr[int] = 0,
      ) -> cutlass.Array:
          """Retain one tile's page IDs after its SMEM window is released."""
@@ -385,7 +385,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
          tile_idx = _resolve_kv_tile_idx_context(
              stage_info, kv_tile_start, tile_offset=tile_offset
          )
-@@ -5770,3 +5759,14 @@ class GmemOResource(MemoryResource):
+@@ -6541,3 +6530,14 @@ class GmemOResource(MemoryResource):
                  prims.cp_async_bulk_commit_group()
                  if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                      prims.cp_async_bulk_wait_group(0, read=True)
@@ -401,7 +401,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
 +    _resolve_kv_tile_idx_context,
 +)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
-index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a32c5289e 100644
+index b22f0f4..a4a8720 100644
 --- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 +++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 @@ -1,3 +1,4 @@
@@ -419,7 +419,7 @@ index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e231c98a52 100644
+index b62bd10..7a305b1 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -742,7 +742,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
  def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
      """Return workspace bytes using the same arguments as wrapper.plan().
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
-index e2bbef13c0f552030875e6b433e0fcdb20686cf6..17025dbc49ef997993009ddab7ff2250308f035c 100644
+index e2bbef1..17025db 100644
 --- a/q_token_kv_block_sparse_metadata.py
 +++ b/q_token_kv_block_sparse_metadata.py
 @@ -1,3 +1,4 @@
