@@ -177,7 +177,10 @@ class FakeEncoderExecutor:
     """Stands in for the encoder executor of an encode-only LLM."""
 
     def __init__(self) -> None:
-        self.model_engine = SimpleNamespace(batch_size=8, max_num_tokens=8192, max_seq_len=2048)
+        # The resolved limits the embedding server sizes its encode batcher from.
+        self.max_batch_size = 8
+        self.max_num_tokens = 8192
+        self.max_seq_len = 2048
 
     def shutdown(self) -> None:
         pass
