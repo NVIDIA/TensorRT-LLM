@@ -325,3 +325,14 @@ def test_the_capture_is_readable_by_its_owner_only(tmp_path):
             assert stat.S_IMODE(os.stat(out_dir / name).st_mode) == 0o600, (out_dir, name)
     assert stat.S_IMODE(os.stat(made).st_mode) == 0o700
     assert stat.S_IMODE(os.stat(out).st_mode) == 0o755  # an existing directory is left as it was
+
+
+def test_an_override_sets_only_fields_no_check_reads():
+    """A reply is judged against the body as recorded: --override takes sampling fields only."""
+    assert record_requests.parse_overrides(["temperature=0", "seed=7"]) == {"temperature": 0,
+                                                                            "seed": 7}  # fmt: skip
+    for item in ("stream=true", "tools=[]", "max_tokens=16", 'reasoning_effort="low"'):
+        with pytest.raises(ValueError, match="only sampling fields"):
+            record_requests.parse_overrides([item])
+    with pytest.raises(ValueError):
+        record_requests.parse_overrides(["temperature=zero"])

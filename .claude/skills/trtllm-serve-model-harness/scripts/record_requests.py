@@ -51,10 +51,12 @@ prove which build served (I-05, R-05).
 Operator probes (a self-test through the recorder, say) carry the header `x-mh-probe: 1`;
 they are recorded, and the validator leaves them out of the cell.
 
---override KEY=JSON (repeatable, forward mode) sets a top-level field of every JSON
+--override KEY=JSON (repeatable, forward mode) sets a top-level sampling field of every JSON
 object body before it is forwarded, e.g. ``--override temperature=0`` for greedy
 decoding in a protocol differential. The recorded body stays what the harness
-sent; the record names the overrides under ``forwarded_overrides``.
+sent; the record names the overrides under ``forwarded_overrides``. The checks read the
+recorded body, so only sampling fields, which no check reads, can be overridden
+(``OVERRIDABLE``): a reply is never judged against a field the server did not receive.
 
 Credentials: Authorization, Cookie and any header with key/token/secret in its
 name are recorded as "<redacted len=N>" and are NOT forwarded unless
@@ -299,6 +301,25 @@ def open_private(path):
     return os.fdopen(fd, "a")
 
 
+# Fields --override may set: sampling parameters. No check reads them, so the recorded body still
+# says what each reply is judged against (stream, tools, max_tokens, reasoning, ...).
+OVERRIDABLE = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty",
+               "frequency_penalty", "repetition_penalty")  # fmt: skip
+
+
+def parse_overrides(items):
+    """``KEY=JSON`` items as a dict; ValueError for a field not in OVERRIDABLE or bad JSON."""
+    overrides = {}
+    for item in items:
+        key, _, value = item.partition("=")
+        if key not in OVERRIDABLE:
+            allowed = ", ".join(OVERRIDABLE)
+            raise ValueError(f"--override {key}: only sampling fields can be overridden "
+                             f"({allowed}); the checks read the body as recorded")  # fmt: skip
+        overrides[key] = json.loads(value)
+    return overrides
+
+
 def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session=None, status=501,
               build_id=None):  # fmt: skip
     """The recorder as an aiohttp application (``main`` serves it).
@@ -353,10 +374,10 @@ def main():
         help="set a top-level body field before forwarding (recorded as forwarded_overrides)",
     )
     args = ap.parse_args()
-    overrides = {}
-    for item in args.override:
-        key, _, value = item.partition("=")
-        overrides[key] = json.loads(value)
+    try:
+        overrides = parse_overrides(args.override)
+    except ValueError as error:  # a JSONDecodeError too
+        ap.error(str(error))
     app = build_app(args.out_dir, args.forward, args.forward_auth, overrides, args.session,
                     args.status, args.build_id)  # fmt: skip
     # A client that leaves cancels its handler at once, so its record says when it left. Without
