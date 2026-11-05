@@ -286,7 +286,10 @@ def test_worker_marks_only_server_added_stop_rules(ignore_eos: bool) -> None:
     worker = SimpleNamespace(
         _lora_manager=None,
         max_seq_len=256,
-        engine=SimpleNamespace(enqueue_request=lambda value: submitted.append(value) or 42),
+        engine=SimpleNamespace(
+            is_generation_model=True,
+            enqueue_request=lambda value: submitted.append(value) or 42,
+        ),
     )
     assert BaseWorker._enqueue_request(worker, request) == 42
     assert submitted[0].py_num_generated_only_stop_words == (0 if ignore_eos else 1)
