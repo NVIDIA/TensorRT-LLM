@@ -937,6 +937,8 @@ def test_draft_forward_hides_mixed_precision_high_rows(backend):
     ]
     metadata = Mock(spec=cls)
     metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    metadata.draft_kv_cache_manager = None
+    metadata.mixed_precision_block_offsets_redirect = cls.mixed_precision_block_offsets_redirect
     metadata.draft_sliding_block_tables = None
     metadata.draft_mixed_precision_high_block_table = None
     metadata.draft_replay_swapped_attrs = {}
@@ -951,6 +953,37 @@ def test_draft_forward_hides_mixed_precision_high_rows(backend):
     metadata.restore_draft_swaps()
     assert metadata.mixed_precision_high_block_table is table
     assert cls.has_mixed_precision_high_rows.fget(metadata) is True
+
+
+@pytest.mark.cpu_only
+def test_dense_draft_forward_keeps_the_target_tables_for_an_appended_drafter():
+    """An appended drafter reads the redirected block offsets, so its rows must be copied back too."""
+    metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata.draft_replay_swapped_attrs = {}
+    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
+    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
+    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
+    metadata.sync_draft_mixed_precision_staging = lambda: None
+    metadata.mixed_precision_block_offsets_redirect = True
+    table, offsets = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
+    metadata.mixed_precision_high_block_table = table
+    metadata.mixed_precision_low_block_offsets = offsets
+    metadata.draft_mixed_precision_high_block_table = None
+    metadata.draft_mixed_precision_low_block_offsets = None
+
+    metadata.draft_kv_cache_manager = None
+    TrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
+    assert metadata.mixed_precision_high_block_table is table
+    assert metadata.mixed_precision_low_block_offsets is offsets
+    metadata.restore_draft_swaps()
+
+    # A separate draft manager without high layers runs its layers on a plain cache.
+    metadata.draft_kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    TrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
+    assert metadata.mixed_precision_high_block_table is None
+    assert metadata.mixed_precision_low_block_offsets is None
+    metadata.restore_draft_swaps()
+    assert metadata.mixed_precision_high_block_table is table
 
 
 @pytest.mark.cpu_only
