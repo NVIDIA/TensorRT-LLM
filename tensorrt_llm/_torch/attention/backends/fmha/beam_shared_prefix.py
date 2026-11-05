@@ -37,7 +37,7 @@ The current token's K/V is written into the beam's own block at
 interchangeable step by step.
 
 Scope: generation-only batches of a dense GQA/MHA model with an unquantized
-bf16/fp16 paged KV cache (manager V1), RoPE already applied by the module
+bf16/fp16 paged KV cache (KV cache manager V2), RoPE already applied by the module
 (``pos_embd_params`` not handed to the backend), no sliding window, sinks,
 custom masks, or speculative decoding. Mixed context+generation batches fall
 back to the regular library. The per-step planning (page table of the prompt,
@@ -123,6 +123,13 @@ def _get_float_workspace(device: torch.device) -> torch.Tensor:
     return workspace
 
 
+def _lib_enabled() -> bool:
+    """Whether ``TLLM_FMHA_LIBS`` enables this library."""
+    from .registry import get_enabled_fmha_lib_classes
+
+    return BeamSharedPrefixFmha in get_enabled_fmha_lib_classes()
+
+
 def _max_tail_from_env() -> int:
     value = os.environ.get(MAX_TAIL_ENV)
     if value is None or not value.strip():
@@ -138,8 +145,9 @@ class _PlanKey:
 
     __slots__ = ("num_heads", "num_kv_heads", "head_dim", "dtype", "sm_scale")
 
-    def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype,
-                 sm_scale: float):
+    def __init__(
+        self, num_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, sm_scale: float
+    ):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -214,9 +222,11 @@ class _BeamStepState:
 
     is_cuda_graph: bool
     pool_index: int
+    page_scale: int
+    """Page-index scale of the layers' pool (``get_layer_page_index_scale``)."""
     page_stride: int
-    """Divisor turning a K entry of ``kv_cache_block_offsets`` into a pool page
-    index: ``layers_in_pool * kv_factor`` for the standard pool layout."""
+    """Divisor turning a K entry of ``kv_cache_block_offsets`` (a base page index times the pool's
+    page-index scale) into a page of the layer's ``get_buffers`` view: ``kv_factor``."""
     max_tail: int
     num_pages: int
     """Pages in the primary pool; bounds every page index handed to a kernel."""
@@ -227,28 +237,32 @@ class _BeamStepState:
     step_counter: int = 0
 
 
-def _pool_layout(metadata: "TrtllmAttentionMetadata", local_layer_idx: int) -> tuple[int, int]:
-    """(pool index, page stride) of a layer's primary pool.
+def _pool_layout(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> tuple[int, int, int]:
+    """(pool index, page-index scale, page stride) of a layer's KV pool.
 
-    Mirrors the offset encoding of ``WindowBlockManager::setOffsets`` for the
-    standard (block-major) pool layout: the K entry of a block is
-    ``page * layers_in_pool * kv_factor``.
+    KV cache manager V2 keeps a base page index per block. The device block-offset table holds it
+    times the pool's page-index scale (K entry), and a page of the layer's ``get_buffers`` view is
+    that entry divided by ``kv_factor``.
     """
-    pool_mapping = metadata.host_kv_cache_pool_mapping
-    if pool_mapping is None or pool_mapping.ndim != 2 or pool_mapping.shape[1] < 2:
-        raise RuntimeError("KV-cache pool mapping must have shape [num_layers, >=2].")
-    pool_index = int(pool_mapping[local_layer_idx, 0])
-    layers_in_pool = int((pool_mapping[:, 0] == pool_index).sum())
-    kv_factor = int(metadata.kv_cache_manager.kv_factor)
-    return pool_index, layers_in_pool * kv_factor
+    manager = metadata.kv_cache_manager
+    pool_index = int(manager.layer_to_pool_mapping_dict[manager.layer_offsets[layer_idx]])
+    return pool_index, manager.get_layer_page_index_scale(layer_idx), int(manager.kv_factor)
 
 
 def _kv_manager_supported(kv_cache_manager) -> bool:
-    """Only the V1 paged manager exposes the per-layer pool view and the
-    host block-offset table this library reads."""
+    """Only KV cache manager V2 (its index mapper, per-layer page-index scale and pool view) with one
+    block-offset table per pool."""
     if kv_cache_manager is None:
         return False
-    for attr in ("get_buffers", "host_kv_cache_block_offsets", "kv_factor", "tokens_per_block"):
+    for attr in (
+        "get_buffers",
+        "get_batch_cache_indices",
+        "get_layer_page_index_scale",
+        "index_mapper",
+        "layer_to_pool_mapping_dict",
+        "kv_factor",
+        "tokens_per_block",
+    ):
         if not hasattr(kv_cache_manager, attr):
             return False
     if getattr(kv_cache_manager, "kv_factor", 0) != 2:
@@ -256,6 +270,10 @@ def _kv_manager_supported(kv_cache_manager) -> bool:
     # The layer-first pool layout (recurrent-state caches) encodes offsets
     # differently; those managers never run dense beam search anyway.
     if getattr(kv_cache_manager, "is_linear_attention", False):
+        return False
+    # Per-layer page tables (SWA scratch reuse, mixed page sizes or storage layouts in one lifecycle
+    # group) index kv_cache_block_offsets by local layer instead of by pool.
+    if getattr(kv_cache_manager, "_use_per_layer_page_tables", False):
         return False
     return True
 
@@ -284,24 +302,30 @@ def metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
 def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     """Per-step host planning, called from ``TrtllmAttentionMetadata.prepare``.
 
-    Builds the shared-prompt page table of every request from the host block
-    offsets the manager just filled, decides the tail length, and re-plans the
+    Builds the shared-prompt page table of every request from the KV cache
+    manager's block table, decides the tail length, and re-plans the
     FlashInfer wrappers the layers registered on earlier steps. Runs before any
     forward of the step, so under CUDA graphs it precedes capture and replay.
     """
-    if not metadata_eligible(metadata):
+    if not metadata_eligible(metadata) or not _lib_enabled():
         return
     state = metadata.fmha_plan_caches.get(LIB_NAME)
+    kv_cache_manager = metadata.kv_cache_manager
+    first_layer = min(kv_cache_manager.layer_offsets)
     if state is None:
-        # The layer-independent layout facts come from layer 0's pool; a
-        # layer of a different pool creates its own wrapper key below.
-        pool_index, page_stride = _pool_layout(metadata, 0)
-        kv_cache_manager = metadata.kv_cache_manager
-        first_layer = min(kv_cache_manager.layer_offsets)
+        # The layout facts come from the first layer's pool; every layer must
+        # share it (run_generation checks).
+        pool_index, page_scale, page_stride = _pool_layout(metadata, first_layer)
+        if page_scale % page_stride:
+            raise RuntimeError(
+                f"{LIB_NAME}: page-index scale {page_scale} is not a multiple of kv_factor "
+                f"{page_stride}; remove {LIB_NAME} from TLLM_FMHA_LIBS."
+            )
         pool = kv_cache_manager.get_buffers(first_layer, kv_layout="HND")
         state = _BeamStepState(
             is_cuda_graph=metadata.is_cuda_graph,
             pool_index=pool_index,
+            page_scale=page_scale,
             page_stride=page_stride,
             max_tail=_max_tail_from_env(),
             num_pages=int(pool.size(0)),
@@ -343,19 +367,24 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     request_prompt_lens = prompt_lens.view(num_requests, beam_width)[:, 0]
     ctx_blocks = (request_prompt_lens + tokens_per_block - 1) // tokens_per_block
     last_page_len = request_prompt_lens - (ctx_blocks - 1) * tokens_per_block
-    host_offsets = metadata.host_kv_cache_block_offsets
-    assert host_offsets is not None
-    offsets_k = host_offsets[state.pool_index, :, 0, :]
-    pages = []
-    for request_idx in range(num_requests):
-        row = num_ctx + request_idx * beam_width
-        n_blocks = int(ctx_blocks[request_idx])
-        pages.append(offsets_k[row, :n_blocks].to(torch.int64) // state.page_stride)
-    paged_kv_indices = (
-        torch.cat(pages).clamp(0, state.num_pages - 1).to(torch.int32)
-        if pages
-        else torch.zeros((0,), dtype=torch.int32)
+    # Beam 0's pages of the prompt, as pages of the layer's ``get_buffers`` view. Every beam of a
+    # request holds the same prompt tokens.
+    request_ids = metadata.request_ids
+    if request_ids is None or len(request_ids) < num_requests:
+        raise RuntimeError(f"{LIB_NAME}: the batch's request ids are required.")
+    pages = kv_cache_manager.get_batch_cache_indices(
+        list(request_ids[:num_requests]),
+        layer_idx=first_layer,
+        num_blocks_per_seq=ctx_blocks.tolist(),
     )
+    paged_kv_indices = torch.tensor(
+        [page for request_pages in pages for page in request_pages], dtype=torch.int64
+    )
+    if paged_kv_indices.numel() != int(ctx_blocks.sum()):
+        raise RuntimeError(
+            f"{LIB_NAME}: the KV cache holds fewer prompt blocks than the batch's prompt lengths."
+        )
+    paged_kv_indices = paged_kv_indices.clamp(0, state.num_pages - 1).to(torch.int32)
     paged_kv_indptr = torch.zeros((num_requests + 1,), dtype=torch.int32)
     paged_kv_indptr[1:] = torch.cumsum(ctx_blocks, dim=0).to(torch.int32)
     qo_indptr = (torch.arange(num_requests + 1, dtype=torch.int32) * beam_width).to(torch.int32)
@@ -458,8 +487,12 @@ def _step_indices(
     # Same clamp as the host plan: the prefix never extends past the current token.
     prompt_len = torch.minimum(prompt_len, current)
     prefix_empty = prompt_len < 1
-    write_page = (offsets_k[cache_rows, (current // tokens_per_block).clamp(max=max_blocks - 1)]
-                  .to(torch.int64) // state.page_stride).clamp(0, num_pages - 1)
+    write_page = (
+        offsets_k[cache_rows, (current // tokens_per_block).clamp(max=max_blocks - 1)].to(
+            torch.int64
+        )
+        // state.page_stride
+    ).clamp(0, num_pages - 1)
     write_slot = current % tokens_per_block
 
     tail_page = tail_slot = tail_valid = None
@@ -480,8 +513,9 @@ def _step_indices(
         src_beam = src_beam.to(torch.int64).clamp(0, beam_width - 1)
         src_rows = num_ctx + request_ids.view(-1, 1) * beam_width + src_beam
         blocks = (positions // tokens_per_block).clamp(max=max_blocks - 1)
-        tail_page = (offsets_k[src_rows, blocks].to(torch.int64)
-                     // state.page_stride).clamp(0, num_pages - 1)
+        tail_page = (offsets_k[src_rows, blocks].to(torch.int64) // state.page_stride).clamp(
+            0, num_pages - 1
+        )
         tail_slot = positions % tokens_per_block
 
     state.indices = _StepIndices(
@@ -547,10 +581,9 @@ def merge_prefix_and_tail(
     merged_max = torch.maximum(prefix_lse, tail_max)
     w_prefix = torch.exp2(prefix_lse - merged_max)
     w_tail = torch.exp2(tail_max - merged_max)
-    numerator = (
-        prefix_out.view(rows, num_kv_heads, group, head_dim).float() * w_prefix.unsqueeze(-1)
-        + tail_out * w_tail.unsqueeze(-1)
-    )
+    numerator = prefix_out.view(rows, num_kv_heads, group, head_dim).float() * w_prefix.unsqueeze(
+        -1
+    ) + tail_out * w_tail.unsqueeze(-1)
     denominator = (w_prefix + tail_sum * w_tail).unsqueeze(-1)
     return (numerator / denominator).view(rows, num_heads, head_dim)
 
@@ -563,14 +596,17 @@ class BeamSharedPrefixFmha(PhasedFmha):
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self._pool_views: Dict[int, torch.Tensor] = {}
-        # (pool index, page stride) of this layer; fixed for the manager lifetime.
-        self._layout: Optional[tuple[int, int]] = None
+        # (pool index, page-index scale, page stride) of this layer; fixed for the manager lifetime.
+        self._layout: Optional[tuple[int, int, int]] = None
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if not IS_FLASHINFER_AVAILABLE:
             return False
-        if getattr(attn, "is_mla_enable", False) or getattr(attn, "sparse_params", None) is not None:
+        if (
+            getattr(attn, "is_mla_enable", False)
+            or getattr(attn, "sparse_params", None) is not None
+        ):
             return False
         if getattr(attn, "predicted_tokens_per_seq", 1) != 1:
             return False
@@ -622,7 +658,11 @@ class BeamSharedPrefixFmha(PhasedFmha):
         if q.dtype not in (torch.bfloat16, torch.float16):
             return False
         window = forward_args.attention_window_size
-        if window is not None and metadata.max_seq_len is not None and window < metadata.max_seq_len:
+        if (
+            window is not None
+            and metadata.max_seq_len is not None
+            and window < metadata.max_seq_len
+        ):
             return False
         # One query token per beam row.
         if q.shape[0] - metadata.num_ctx_tokens != metadata.num_generations:
@@ -665,13 +705,12 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 f"{plan.num_requests} x {plan.beam_width} beams."
             )
         if self._layout is None:
-            self._layout = _pool_layout(metadata, attn.local_layer_idx)
-        pool_index, page_stride = self._layout
-        if pool_index != state.pool_index or page_stride != state.page_stride:
+            self._layout = _pool_layout(metadata, attn.layer_idx)
+        if self._layout != (state.pool_index, state.page_scale, state.page_stride):
             raise RuntimeError(
                 f"{type(self).__name__} supports a single KV pool layout per model; layer "
-                f"{attn.layer_idx} uses pool {pool_index} (stride {page_stride}) but the plan "
-                f"was built for pool {state.pool_index} (stride {state.page_stride})."
+                f"{attn.layer_idx} uses (pool, page-index scale, stride) {self._layout} but the "
+                f"plan was built for {(state.pool_index, state.page_scale, state.page_stride)}."
             )
 
         sm_scale = 1.0 / (math.sqrt(head_dim) * attn.q_scaling)
@@ -719,8 +758,16 @@ class BeamSharedPrefixFmha(PhasedFmha):
         if check:
             _sync_checkpoint(f"layer {attn.layer_idx}: FlashInfer prefix attention")
             _check_prefix_against_reference(
-                state, metadata, pool, q_contig, prefix_out, prefix_lse, indices,
-                num_kv_heads=num_kv_heads, sm_scale=sm_scale, layer_idx=attn.layer_idx,
+                state,
+                metadata,
+                pool,
+                q_contig,
+                prefix_out,
+                prefix_lse,
+                indices,
+                num_kv_heads=num_kv_heads,
+                sm_scale=sm_scale,
+                layer_idx=attn.layer_idx,
             )
 
         output = params.output
@@ -731,8 +778,16 @@ class BeamSharedPrefixFmha(PhasedFmha):
         # 3+4. Tail attention (past generated positions via indirection, plus
         # the current token) merged with the prefix state.
         merged = self._unfused_tail_and_merge(
-            pool, q, k, v, indices, plan, prefix_out, prefix_lse,
-            num_kv_heads=num_kv_heads, sm_scale=sm_scale,
+            pool,
+            q,
+            k,
+            v,
+            indices,
+            plan,
+            prefix_out,
+            prefix_lse,
+            num_kv_heads=num_kv_heads,
+            sm_scale=sm_scale,
         )
         if check:
             _sync_checkpoint(f"layer {attn.layer_idx}: tail + merge")
@@ -796,10 +851,11 @@ def _sync_checkpoint(what: str) -> None:
         raise RuntimeError(f"{LIB_NAME} check: CUDA error surfaced at [{what}]: {exc}") from exc
 
 
-def _check_plan(state: _BeamStepState, metadata: "TrtllmAttentionMetadata",
-                pool: torch.Tensor) -> None:
-    """Validate the host plan: page ids in range and equal to the manager's
-    block table for beam 0 of every request."""
+def _check_plan(
+    state: _BeamStepState, metadata: "TrtllmAttentionMetadata", pool: torch.Tensor
+) -> None:
+    """Validate the host plan: page ids in range and equal to beam 0's entries of the manager's
+    host block-offset table (base page indices by index-mapper slot)."""
     plan = state.plan
     assert plan is not None
     num_pages = pool.size(0)
@@ -809,32 +865,33 @@ def _check_plan(state: _BeamStepState, metadata: "TrtllmAttentionMetadata",
             f"{LIB_NAME} check: prefix page ids out of range [0, {num_pages}): "
             f"min {int(indices.min())} max {int(indices.max())} (page stride {state.page_stride})"
         )
+    manager = metadata.kv_cache_manager
+    host_offsets = getattr(manager, "host_kv_cache_block_offsets", None)
     request_ids = metadata.request_ids
-    if request_ids is None:
+    if host_offsets is None or request_ids is None:
         return
-    gen_request_ids = list(request_ids[metadata.num_contexts:])
+    gen_request_ids = list(request_ids[metadata.num_contexts :])
     if len(gen_request_ids) != plan.num_requests:
         raise RuntimeError(
             f"{LIB_NAME} check: {len(gen_request_ids)} generation request ids vs "
             f"{plan.num_requests} planned requests"
         )
-    try:
-        block_ids = metadata.kv_cache_manager.get_batch_cache_indices(gen_request_ids)
-    except Exception as exc:  # noqa: BLE001 - diagnostics only
-        logger.warning(f"{LIB_NAME} check: could not read the manager block table: {exc!r}")
-        return
     indptr = plan.paged_kv_indptr.tolist()
-    for request_idx, blocks in enumerate(block_ids):
-        planned = indices[indptr[request_idx]:indptr[request_idx + 1]].tolist()
-        expected = [int(b) for b in blocks[: len(planned)]]
+    for request_idx, request_id in enumerate(gen_request_ids):
+        planned = indices[indptr[request_idx] : indptr[request_idx + 1]].tolist()
+        row = manager.index_mapper.get_index(request_id) * int(manager.max_beam_width)
+        base = host_offsets[state.pool_index, row, 0, : len(planned)].to(torch.int64)
+        expected = (base * state.page_scale // state.page_stride).tolist()
         if planned != expected:
             raise RuntimeError(
                 f"{LIB_NAME} check: prefix page table of request {request_idx} differs from "
-                f"the KV manager's beam-0 block ids.\n planned : {planned[:12]}...\n"
+                f"beam 0 of the KV manager's host block table.\n planned : {planned[:12]}...\n"
                 f" manager: {expected[:12]}... (page stride {state.page_stride})"
             )
-    logger.info(f"{LIB_NAME} check: prefix page table matches the KV manager "
-                f"({plan.num_requests} requests, {int(indices.numel())} pages)")
+    logger.info(
+        f"{LIB_NAME} check: prefix page table matches the KV manager "
+        f"({plan.num_requests} requests, {int(indices.numel())} pages)"
+    )
 
 
 def _check_indices(indices: _StepIndices, pool: torch.Tensor, tokens_per_block: int) -> None:
@@ -879,14 +936,17 @@ def _check_prefix_against_reference(
     worst_out = 0.0
     worst_lse = 0.0
     for request_idx in range(plan.num_requests):
-        pages = pages_all[indptr[request_idx]:indptr[request_idx + 1]].to(pool.device)
+        pages = pages_all[indptr[request_idx] : indptr[request_idx + 1]].to(pool.device)
         n_pages = pages.numel()
         if n_pages == 0:
             continue
         prefix_len = (n_pages - 1) * tokens_per_block + int(last_page_len[request_idx])
         # [pages, 2, Hkv, tpb, D] -> [L, Hkv, D]
-        kv = pool[pages].permute(0, 3, 1, 2, 4).reshape(n_pages * tokens_per_block, 2,
-                                                       num_kv_heads, head_dim)[:prefix_len]
+        kv = (
+            pool[pages]
+            .permute(0, 3, 1, 2, 4)
+            .reshape(n_pages * tokens_per_block, 2, num_kv_heads, head_dim)[:prefix_len]
+        )
         k_ref = kv[:, 0].float()
         v_ref = kv[:, 1].float()
         row0 = request_idx * plan.beam_width
@@ -895,8 +955,7 @@ def _check_prefix_against_reference(
         scores = torch.einsum("rkgd,tkd->rkgt", q_req, k_ref) * sm_scale
         ref_out = torch.einsum("rkgt,tkd->rkgd", torch.softmax(scores, dim=-1), v_ref)
         ref_lse = torch.logsumexp(scores, dim=-1) * _LOG2E
-        got_out = prefix_out[row0:row1].float().view(plan.beam_width, num_kv_heads, group,
-                                                     head_dim)
+        got_out = prefix_out[row0:row1].float().view(plan.beam_width, num_kv_heads, group, head_dim)
         got_lse = prefix_lse[row0:row1].view(plan.beam_width, num_kv_heads, group)
         keep = ~indices.prefix_empty[row0:row1].view(-1, 1, 1)
         # The kernel writes bf16/fp16 output, so compare with a tolerance
@@ -912,9 +971,11 @@ def _check_prefix_against_reference(
             f"at layer {layer_idx}: max |out| diff / (1 + |ref|) {worst_out:.4f}, max |lse2| "
             f"diff {worst_lse:.4f} (backend {_backend_from_env()})"
         )
-    logger.info(f"{LIB_NAME} check: layer {layer_idx} prefix attention matches the dense "
-                f"reference (max relative |out| diff {worst_out:.2e}, "
-                f"max |lse2| diff {worst_lse:.2e})")
+    logger.info(
+        f"{LIB_NAME} check: layer {layer_idx} prefix attention matches the dense "
+        f"reference (max relative |out| diff {worst_out:.2e}, "
+        f"max |lse2| diff {worst_lse:.2e})"
+    )
 
 
 __all__ = [

@@ -135,16 +135,10 @@ def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
     return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
 
 
-def is_fmha_lib_enabled(name: str) -> bool:
-    """Whether ``TLLM_FMHA_LIBS`` (or the default set) enables ``name``."""
-    return name in _parse_fmha_libs_env()
-
-
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FmhaCls",
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
-    "is_fmha_lib_enabled",
 ]
