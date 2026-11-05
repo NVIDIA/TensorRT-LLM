@@ -25,7 +25,7 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     _FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP, IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
     BufferKind, FP8BlockScaleGemmRunner, MXFP8QuantizeRunner,
     fp8_block_scale_gemm_autotuned, fp8_block_scale_swiglu_prefers_bf16,
-    mxfp8_quantize_gemm_autotuned)
+    mxfp8_quantize_gemm_autotuned, small_m_applies_on_tuning_group)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -211,7 +211,7 @@ def _fp8_block_scale_small_m_tuned(input: torch.Tensor, weight: torch.Tensor,
     small-M kernel against the quantized GEMM, and afterwards wherever that race ran."""
     runner = FP8BlockScaleGemmRunner(torch.bfloat16)
     inputs = [input, weight, weight_scale, block_scale]
-    if not runner.small_m_applies(inputs):
+    if not small_m_applies_on_tuning_group(runner, inputs):
         return False
     tuner = AutoTuner.get()
     if tuner.is_tuning_mode:

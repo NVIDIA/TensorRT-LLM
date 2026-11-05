@@ -121,14 +121,31 @@ torch::Tensor alltoallvTokens(
 #if ENABLE_MULTI_DEVICE
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
+    TORCH_CHECK(input.dim() == 2, "alltoallv_tokens: input must be 2D [rows, row_size], got ", input.dim(), "D");
     auto const groupSize = static_cast<int>(groupRanks.size());
+    TORCH_CHECK(counts.size() == groupRanks.size(), "alltoallv_tokens: ", counts.size(), " counts for ", groupSize,
+        " group ranks");
+    TORCH_CHECK(rank >= 0 && rank < groupSize, "alltoallv_tokens: rank ", rank, " outside a group of ", groupSize);
+    // getComm numbers the group's ranks in increasing order: the index into groupRanks is the NCCL peer.
+    int64_t const sessionRank = COMM_SESSION.getRank();
+    TORCH_CHECK(static_cast<int64_t>(groupRanks[rank]) == sessionRank, "alltoallv_tokens: group rank ",
+        static_cast<int64_t>(groupRanks[rank]), " at index ", rank, " is not this process's rank ", sessionRank);
     std::set<int> group;
     int64_t localStart = 0;
+    int64_t totalRows = 0;
     for (int peer = 0; peer < groupSize; ++peer)
     {
-        group.insert(static_cast<int>(groupRanks[peer]));
-        localStart += peer < rank ? counts[peer] : 0;
+        int64_t const peerRank = groupRanks[peer];
+        int64_t const peerRows = counts[peer];
+        TORCH_CHECK(peer == 0 || peerRank > static_cast<int64_t>(groupRanks[peer - 1]),
+            "alltoallv_tokens: group ranks must be strictly increasing");
+        TORCH_CHECK(peerRows >= 0, "alltoallv_tokens: negative row count ", peerRows, " for peer ", peer);
+        group.insert(static_cast<int>(peerRank));
+        localStart += peer < rank ? peerRows : 0;
+        totalRows += peerRows;
     }
+    TORCH_CHECK(
+        totalRows == input.size(0), "alltoallv_tokens: counts sum to ", totalRows, " rows, input has ", input.size(0));
     c10::cuda::CUDAGuard deviceGuard(input.device());
     auto const localRows = counts[rank];
     auto output = torch::empty({groupSize, localRows, input.size(1)}, input.options());

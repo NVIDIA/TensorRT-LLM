@@ -460,7 +460,8 @@ class DisaggTransferCoordinator:
 
         ``defer`` says a forward step is in flight: asynchronous receives that
         wait for KV admission work queued behind it are then posted by
-        ``start_deferred_gen_receives``.
+        ``start_deferred_gen_receives``. Their resources are prepared before that
+        work finishes, so the executor does not defer with a KV connector.
         """
         if not admitted:
             return

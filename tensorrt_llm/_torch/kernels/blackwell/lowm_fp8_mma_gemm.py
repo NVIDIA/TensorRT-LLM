@@ -119,7 +119,7 @@ class LowMFp8MmaGemmKernel:
         ``ROPE_DIM`` columns of every ``a_rope_head_dim``-wide head of A back by their angle as A
         is loaded (interleaved inverse RoPE in FP32, rounded to BF16, as
         ``mla_rope_inplace(inverse=True)``). ``a_rms_norm``: RMS-normalize the rows of A over K
-        with the BF16 ``gamma`` [1, K] and ``a_rms_eps`` (not with groups or A RoPE). ``n_tiles``:
+        with the BF16 ``gamma`` [1, K] and ``a_rms_eps`` (not with groups or RoPE). ``n_tiles``:
         8-column tiles per CTA (N a multiple of ``8 * n_tiles``); fewer CTAs load A fewer times and
         fit a large N in one wave."""
         if k_extent % (CHUNK * k_warps):
@@ -159,8 +159,9 @@ class LowMFp8MmaGemmKernel:
             or (k_extent // k_warps) % a_rope_head_dim
         ):
             raise ValueError(f"unsupported A RoPE geometry: head {a_rope_head_dim}, K {k_extent}")
-        if a_rms_norm and (group_n or a_rope_head_dim):
-            raise ValueError("the A RMS norm needs ungrouped A without RoPE")
+        # The epilogue scales a column by its row's inverse RMS but not the RoPE partner it reads.
+        if a_rms_norm and (group_n or a_rope_head_dim or rope_head_dim):
+            raise ValueError("the A RMS norm needs ungrouped A and an output without RoPE")
         self.a_rms_norm = a_rms_norm
         self.a_rms_eps = a_rms_eps
 
@@ -270,17 +271,6 @@ class LowMFp8MmaGemmKernel:
                     # UE8M0 -> the bit pattern of 2^(s - 127).
                     s_bits[slot] = gS[b_row, k0 // GROUP].to(Int32) << 23
 
-        # A's inverse RoPE: positions of rows 16t + r and 16t + r + 8, final before this launch.
-        rope_pos = cute.make_rmem_tensor(
-            cute.make_layout((self.row_tiles, 2), stride=(2, 1)), Int32
-        )
-        if const_expr(self.a_rope_head_dim > 0):
-            rope_pos.fill(0)
-            for t in cutlass.range_constexpr(self.row_tiles):
-                for h in cutlass.range_constexpr(2):
-                    if 16 * t + r + 8 * h < self.num_rows:
-                        rope_pos[t, h] = gPos[16 * t + r + 8 * h]
-
         # The norm's gamma for this lane's K columns: 16 per chunk, as A.
         g_regs = cute.make_rmem_tensor(cute.make_layout((chunks, 16), stride=(16, 1)), BFloat16)
         if const_expr(self.a_rms_norm):
@@ -299,6 +289,17 @@ class LowMFp8MmaGemmKernel:
             # this grid's completion before reading the output.
             griddepcontrol_launch_dependents()
             griddepcontrol_wait()
+
+        # A's inverse RoPE: positions of rows 16t + r and 16t + r + 8.
+        rope_pos = cute.make_rmem_tensor(
+            cute.make_layout((self.row_tiles, 2), stride=(2, 1)), Int32
+        )
+        if const_expr(self.a_rope_head_dim > 0):
+            rope_pos.fill(0)
+            for t in cutlass.range_constexpr(self.row_tiles):
+                for h in cutlass.range_constexpr(2):
+                    if 16 * t + r + 8 * h < self.num_rows:
+                        rope_pos[t, h] = gPos[16 * t + r + 8 * h]
 
         gA_vec = cute.logical_divide(gA, (None, 8))
         acc = cute.make_rmem_tensor(

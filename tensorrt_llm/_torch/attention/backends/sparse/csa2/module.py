@@ -1681,7 +1681,10 @@ class DeepseekV41Attention(nn.Module):
                 latent_mxfp8=getattr(self, "_mxfp8_query_latent", False),
             )
         else:
-            fp8_query = self._fp8_query_request(hidden_states, positions, attn_metadata)
+            # The direct decode attends the BF16 Q and applies its RoPE itself.
+            fp8_query = (
+                None if direct else self._fp8_query_request(hidden_states, positions, attn_metadata)
+            )
             qr, q, swa = self._project_query_and_swa(
                 hidden_states,
                 decode_only=attn_metadata.num_ctx_tokens == 0,

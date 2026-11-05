@@ -2378,10 +2378,6 @@ class DeepseekV4MoE(nn.Module):
 class DeepseekV4DecoderLayer(DecoderLayer):
     # Subclass hook: the attention implementation this layer instantiates.
     attention_cls = DeepseekV4Attention
-    # Set per forward by a subclass whose next mHC boundary consumes the MoE output itself.
-    _moe_ar_skip = False
-    _moe_ar_trigger_at_end = True
-    _moe_unfinalized = False
 
     def _make_engram(self, layer_idx: int, engram_config, vocab_sizes_flat, stream) -> Engram:
         """Build this layer's Engram module.
@@ -2779,7 +2775,12 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         hidden_states_normalized: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         unrouted_rows: Optional[torch.Tensor] = None,
+        skip_allreduce: bool = False,
+        trigger_allreduce_at_end: bool = True,
+        unfinalized: bool = False,
     ) -> torch.Tensor:
+        """``skip_allreduce`` / ``unfinalized``: the next mHC boundary all-reduces the partial
+        output, or also combines the un-finalized expert rows, itself."""
         if hidden_states_normalized and self.fusion_config.PRE_MOE_FUSION:
             raise ValueError("Pre-normalized MoE input cannot use pre-MoE allreduce fusion")
         # A normalized input may also come quantized for the routed experts.
@@ -2794,14 +2795,13 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 hidden_states_fp4,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(
-                    # `_moe_ar_skip`: the consumer all-reduces the partial output itself.
                     enable_allreduce=not (
                         self.fusion_config.POST_MOE_FUSION
                         or self.mapping.tp_size == 1
-                        or self._moe_ar_skip
+                        or skip_allreduce
                     ),
                     # A consumer that prefetches before its PDL wait may launch early.
-                    trigger_completion_at_end=self._moe_ar_trigger_at_end,
+                    trigger_completion_at_end=trigger_allreduce_at_end,
                 ),
                 do_finalize=do_finalize,
                 input_ids=input_ids,
@@ -2837,8 +2837,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             )
         )
 
-        if self._moe_unfinalized:
-            # The consumer combines the un-finalized expert rows itself (and all-reduces them).
+        if unfinalized:
             do_finalize = False
         hidden_states = _run_MoE(
             hidden_states,

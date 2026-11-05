@@ -399,7 +399,7 @@ void initBindings(nb::module_& m)
                 TokenIdArray array;
                 if (nb::try_cast(input_tokens_handle, array, /*convert=*/false))
                 {
-                    tokens.reserve(tb::LlmRequest::promptTokensCapacity(array.shape(0), max_new_tokens));
+                    tokens.reserve(tb::LlmRequest::beamTokensCapacity(array.shape(0), max_new_tokens));
                     tokens.assign(array.data(), array.data() + array.shape(0));
                 }
                 else

@@ -34,15 +34,15 @@ namespace kernels::csa2SparseDecode
 //! sink in FP32. Invalid selections (-1, or rows outside the pool) are excluded; a row with no valid key yields zeros.
 //! The output is BF16 [numTokens, 64, 512], or its MXFP8 grouped O-A projection input (outFp8).
 //!
-//! Usage: makeSchedule() once per token count (it depends only on shapes and the SM count, so it is static under CUDA
-//! graph capture), a caller-owned workspace of getWorkspaceSize() bytes, then run() on a stream. The workspace needs no
-//! initialization.
+//! Usage: makeSchedule() once per token count and top-k widths (it depends only on them and the SM count, so it is
+//! static under CUDA graph capture), a caller-owned workspace of getWorkspaceSize() bytes, then run() on a stream. The
+//! workspace needs no initialization.
 //!
 //! Stream ordering: split tokens are tracked with per-device arrival counters (the module-scope device array
 //! csa2SplitArrivals), which are zero at module load and which every launch leaves at zero. Every run() on one device
 //! uses these counters, whatever its workspace, so all launches on a device must run in stream order (one stream, or
 //! streams ordered by events), exactly like launches that share a workspace. Two launches running concurrently on one
-//! device can make a combine kernel read partial results too early or wait forever.
+//! device can make a combine kernel read partial results too early, or trap after seconds of waiting.
 
 constexpr int kNumHeads = 64;
 constexpr int kHeadDim = 512;

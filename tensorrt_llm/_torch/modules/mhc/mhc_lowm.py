@@ -368,8 +368,9 @@ def mhc_allreduce_post_collapse_norm(
         allreduce.nranks,
         get_env_enable_pdl(),
         moe_key,
-        # A cluster of 4 CTAs per token for the smallest batches.
-        4 if m <= 12 else 1,
+        # A cluster of 4 CTAs per token for the smallest batches, when the token's warps
+        # (8 channels per thread) split evenly over them.
+        4 if m <= 12 and hidden % (4 * 32 * 8) == 0 else 1,
         mnnvl=allreduce.mnnvl,
         quant=quant,
     )

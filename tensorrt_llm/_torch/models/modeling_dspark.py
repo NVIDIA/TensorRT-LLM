@@ -818,12 +818,18 @@ def dspark_attention_forward_batched(
 _TP_ATTN_ROW_LIMIT = 64
 
 
-def _ue8m0_row_scales(scale: torch.Tensor, rows: int, block: int) -> torch.Tensor:
-    """Square ``block``x``block`` UE8M0 checkpoint scales as exact per-row 1x32 exponents."""
+def _ue8m0_row_scales(scale: torch.Tensor, rows: int, block: int) -> Optional[torch.Tensor]:
+    """Square ``block``x``block`` UE8M0 checkpoint scales as exact per-row 1x32 exponents, or None
+    when an FP32 scale is not a positive normal power of two."""
     if scale.dtype == torch.float8_e8m0fnu:
         exponents = scale.view(torch.uint8)
     else:
-        exponents = (torch.log2(scale.float()) + 127).round().to(torch.uint8)
+        bits = scale.float().view(torch.int32)
+        # A power of two keeps only the FP32 exponent field, which has the UE8M0 bias.
+        exponents = bits >> 23
+        if not bool(torch.all(((bits & 0x7FFFFF) == 0) & (exponents > 0) & (exponents < 255))):
+            return None
+        exponents = exponents.to(torch.uint8)
     return exponents.repeat_interleave(block, 0)[:rows].repeat_interleave(block // 32, 1)
 
 
@@ -2041,13 +2047,17 @@ class DSv4DSparkDraftModel(nn.Module):
         dev = self.mtp_layers[0].input_layernorm.weight.device
         self._cache_main_proj_shard(src, block, dev)
 
-        def native(key: str) -> tuple[torch.Tensor, torch.Tensor]:
+        def native(key: str) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             weight = src[f"{key}.weight"].to(dev)
             scale = _ue8m0_row_scales(src[f"{key}.scale"].to(dev), weight.shape[0], block)
             return weight, scale
 
         wkv = [native(f"mtp.{s}.attn.wkv") for s in range(len(self.mtp_layers))]
-        self._backfill_wkv_fp8 = (torch.cat([w for w, _ in wkv]), torch.cat([sc for _, sc in wkv]))
+        if all(sc is not None for _, sc in wkv):
+            self._backfill_wkv_fp8 = (
+                torch.cat([w for w, _ in wkv]),
+                torch.cat([sc for _, sc in wkv]),
+            )
         if self._main_proj_shard is not None and self.prep_fork_allreduce is None:
             # Collective over the TP group; every rank loads in step.
             self.prep_fork_allreduce = _private_allreduce(
@@ -2079,10 +2089,14 @@ class DSv4DSparkDraftModel(nn.Module):
         width = k // mapping.tp_size
         if weight.dtype != torch.float8_e4m3fn or k % (mapping.tp_size * block) or width % 64:
             return
+        # Every rank checks the whole scale, so all agree on the collective prep_fork_allreduce.
+        row_scales = _ue8m0_row_scales(scale.to(dev), n, block)
+        if row_scales is None:
+            return
         k0 = mapping.tp_rank * width
         self._main_proj_shard = (
             weight[:, k0 : k0 + width].to(dev).contiguous(),
-            _ue8m0_row_scales(scale[:, k0 // block : (k0 + width) // block].to(dev), n, block),
+            row_scales[:, k0 // 32 : (k0 + width) // 32].contiguous(),
             k0,
             width,
         )
@@ -3017,6 +3031,10 @@ class DSv4DSparkDraftModel(nn.Module):
         """
         if not self.uses_lagged_pre:
             return False
+        # The fused last boundary forms only the normalized hidden; gated and RNN Markov heads
+        # read the collapse.
+        if type(self.mtp_layers[-1].markov_head) not in (type(None), VanillaMarkov):
+            return False
         mapping = self.model_config.mapping
         if mapping.enable_attention_dp or mapping.tp_size < 2:
             return False
@@ -3094,14 +3112,19 @@ class DSv4DSparkDraftModel(nn.Module):
         also returns the per-position draft logits [*, block, vocab].
         ``deferred``: the last stage's un-reduced MoE output; its all-reduce, post-mapping,
         the collapse and the final norm then run as one boundary launch (only the normalized
-        hidden is formed, so the confidence head must be off).
+        hidden is formed, so neither the confidence head nor the Markov head may read the hidden).
         """
         last = self.mtp_layers[-1]
         if deferred is not None:
-            if pre_mix is None or deferred.allreduce is None or return_confidence:
+            if (
+                pre_mix is None
+                or deferred.allreduce is None
+                or return_confidence
+                or type(last.markov_head) not in (type(None), VanillaMarkov)
+            ):
                 raise ValueError(
-                    "A deferred DSpark head needs the pre-mix, a TP all-reduce "
-                    "and no confidence scoring"
+                    "A deferred DSpark head needs the pre-mix, a TP all-reduce, no confidence "
+                    "scoring and a Markov head that ignores the hidden"
                 )
             if deferred.coeff_event is not None:
                 torch.cuda.current_stream().wait_event(deferred.coeff_event)

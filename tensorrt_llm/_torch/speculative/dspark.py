@@ -58,6 +58,9 @@ if TYPE_CHECKING:
 # Verify rows per rank up to which a group shares the LM head; the replicated head wins above it.
 _GROUP_VERIFY_MAX_ROWS = 256
 
+# Widest draft the one-warp acceptance and next-token kernels serve: a lane per verified token.
+_ONE_WARP_MAX_DRAFT_LEN = 31
+
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
 _NEUTRAL_CONFIDENCE_LOGIT = NEUTRAL_CONFIDENCE_LOGIT
@@ -428,14 +431,14 @@ def _fused_accept_applies(
     worker: "DSv4DSparkWorker", attn_metadata, spec_metadata: "DSparkSpecMetadata", rows: int
 ) -> bool:
     """Whether ``worker`` accepts a generation-only batch of ``rows`` target rows in one fused
-    launch: a uniform verify window and strict acceptance (no rejection sampling, guided decoding
-    or occurrence penalties)."""
+    launch: a uniform verify window one warp covers and strict acceptance (no rejection sampling,
+    guided decoding or occurrence penalties)."""
     num_gens = attn_metadata.num_seqs
     K = spec_metadata.runtime_draft_len
     return not (
         attn_metadata.num_contexts != 0
         or num_gens == 0
-        or K <= 0
+        or not 0 < K <= _ONE_WARP_MAX_DRAFT_LEN
         or spec_metadata.is_ragged_verify
         or worker._can_use_rejection_sampling(spec_metadata)
         or getattr(spec_metadata, "enable_penalty", False)
@@ -1227,7 +1230,16 @@ class DSv4DSparkWorker(SpecWorkerBase):
         batch_size,
         num_accepted_tokens,
     ):
-        """The base class's result in one launch (``dspark_next_new_tokens``)."""
+        """The base class's result, in one launch (``dspark_next_new_tokens``) for drafts one warp
+        covers."""
+        if next_draft_tokens.shape[-1] > _ONE_WARP_MAX_DRAFT_LEN:
+            return super()._prepare_next_new_tokens(
+                accepted_tokens,
+                next_draft_tokens,
+                batch_indices_cuda,
+                batch_size,
+                num_accepted_tokens,
+            )
         from ..attention.kernels.blackwell.dspark.generation_prepare import dspark_next_new_tokens
 
         return dspark_next_new_tokens(

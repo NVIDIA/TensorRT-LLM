@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse MLA attention for 64 query heads on GB300 (sm_103: 512 TMEM columns), CuTe DSL.
+"""Sparse MLA attention for 64 query heads on sm_103 (its row maxima use ``tcgen05.ld.red``), CuTe DSL.
 
 One query token (64 heads) at a time per CTA; persistent CTAs walk tokens ``b, b + grid, ...``. A token's
 selected bank rows (``indices[t, :lengths[t]]``) are visited in tiles of 64 keys; every 512-byte E4M3 row is

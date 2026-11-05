@@ -947,11 +947,22 @@ def engram_packed_projection(
     """Project packed rows ``[num_sources, M, row_bytes]`` (``local_k`` E4M3 bytes, then
     ``local_k / 32`` UE8M0 codes, rows 16-byte aligned) with an MXFP8 weight (native swizzled
     scales) into the BF16 ``[M, N]`` ``out`` on the current stream."""
-    num_sources, m, _ = packed.shape
+    num_sources, m, row_bytes = packed.shape
     if packed.data_ptr() % 16 or packed.stride(1) % 16 or packed.stride(0) % 16:
         raise ValueError("Engram packed rows must be 16-byte aligned")
     n, k = weight.shape
-    local_k = k // num_sources
+    local_k = k // max(num_sources, 1)
+    # A source's 128-lane K tiles read their four UE8M0 codes (one per 32 lanes) as one word.
+    if (
+        num_sources < 1
+        or num_sources * local_k != k
+        or local_k % 128
+        or row_bytes < local_k + local_k // 32
+    ):
+        raise ValueError(
+            "Engram packed rows must split the projection's K into equal multiples of 128 lanes "
+            "per source, each followed by its UE8M0 codes per 32 lanes"
+        )
     if (
         out.shape != (m, n)
         or out.dtype != torch.bfloat16

@@ -99,16 +99,8 @@ class EngramLookupKernel:
         masked: bool,
         packed: bool,
     ):
-        if dim % self.vector_bytes != 0 or block_size % self.vector_bytes != 0:
-            raise ValueError(
-                f"Engram lookup needs dim ({dim}) and block size ({block_size}) "
-                f"divisible by {self.vector_bytes}"
-            )
+        check_lookup_geometry(dim, block_size)
         self.chunks = dim // self.vector_bytes
-        if self.num_threads % self.chunks != 0:
-            raise ValueError(
-                f"Engram lookup needs {self.num_threads} threads divisible by dim / 16 ({dim})"
-            )
         self.head_start = head_start
         self.local_heads = local_heads
         self.dim = dim
@@ -266,6 +258,22 @@ class EngramLookupKernel:
             output[token, values_width + (head * self.dim + column) // self.block_size] = (
                 cutlass.Uint8(code)
             )
+
+
+def check_lookup_geometry(dim: int, block_size: int) -> None:
+    """Raise ``ValueError`` unless the lookup can gather ``dim``-lane rows scaled per ``block_size``
+    lanes: whole 16-byte chunks, and a CTA's threads cover whole rows."""
+    vector_bytes = EngramLookupKernel.vector_bytes
+    if dim % vector_bytes != 0 or block_size % vector_bytes != 0:
+        raise ValueError(
+            f"Engram lookup needs dim ({dim}) and block size ({block_size}) "
+            f"divisible by {vector_bytes}"
+        )
+    if EngramLookupKernel.num_threads % (dim // vector_bytes) != 0:
+        raise ValueError(
+            f"Engram lookup needs {EngramLookupKernel.num_threads} threads divisible by "
+            f"dim / {vector_bytes} ({dim})"
+        )
 
 
 _OUTPUT_DTYPES = {

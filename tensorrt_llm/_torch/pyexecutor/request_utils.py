@@ -356,20 +356,38 @@ _OWNER_PROMPT_TAG = 21000
 _PROMPT_PLACEHOLDER = np.zeros(1, dtype=np.int32).tobytes()
 
 
+def _request_without_prompt(request: ExecutorRequest) -> ExecutorRequest:
+    """A copy of ``request`` whose prompt is a one-token placeholder (see _check_prompt_splice)."""
+    stripped = Request.__new__(Request)
+    stripped.__setstate__((_PROMPT_PLACEHOLDER, *request.request.__getstate__()[1:]))
+    return ExecutorRequest(stripped, request.inputs)
+
+
+def _check_prompt_splice() -> None:
+    """Raise unless the binding's pickled ``Request`` state leads with the prompt as int32 bytes."""
+    prompt = [1, 2, 3]
+    probe = ExecutorRequest.adapt(Request(input_token_ids=prompt, max_tokens=1))
+    state = probe.request.__getstate__()
+    if (
+        not isinstance(state, tuple)
+        or state[:1] != (np.asarray(prompt, dtype=np.int32).tobytes(),)
+        or _request_without_prompt(probe).num_input_tokens != 1
+    ):
+        raise RuntimeError(
+            "The pickled state of tensorrt_llm.bindings.executor.Request no longer leads with "
+            "the prompt as int32 bytes, which broadcasting requests without their prompts "
+            "(RequestBroadcaster prompts_to_owners) relies on."
+        )
+
+
 def _without_prompt(item):
     """A copy of a queued request whose prompt is a one-token placeholder."""
     if item.request is None:
         return item
-    num_input_tokens = item.request.num_input_tokens
-    state = item.request.request.__getstate__()
-    # The binding's pickled state leads with the prompt as int32 bytes.
-    assert len(state[0]) == 4 * num_input_tokens
-    request = Request.__new__(Request)
-    request.__setstate__((_PROMPT_PLACEHOLDER, *state[1:]))
     return dataclasses.replace(
         item,
-        request=ExecutorRequest(request, item.request.inputs),
-        num_input_tokens=num_input_tokens,
+        request=_request_without_prompt(item.request),
+        num_input_tokens=item.request.num_input_tokens,
     )
 
 
@@ -397,6 +415,9 @@ class RequestBroadcaster:
         self.rank0_now: Optional[float] = None
         self.aux: Optional[float] = None
         self.rank0_aux: Optional[float] = None
+        if prompts_to_owners:
+            # Every rank fails here at startup, rather than rank 0 alone mid-broadcast.
+            _check_prompt_splice()
         self.prompts_to_owners = prompts_to_owners
 
     def broadcast(

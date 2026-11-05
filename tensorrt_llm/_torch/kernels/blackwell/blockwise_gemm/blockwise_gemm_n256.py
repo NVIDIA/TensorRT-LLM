@@ -287,7 +287,7 @@ class Sm100BlockwiseGemmMxfp8N256Kernel(Sm100BlockwiseGemmKernel):
 
     A [M, K, L] and B [N, K, L] are K-major E4M3 with FP32 1x128 (A) and 128x128 (B) scales; C [M, N, L] is a
     row-major (N-contiguous) E4M3 view and ``out_sf`` the flat swizzled 128x4 UE8M0 scales of the (M, L * N) matrix.
-    Needs N % 256 == 0.
+    Needs a static N that is a multiple of 256.
     """
 
     def __init__(self):
@@ -473,6 +473,11 @@ class Sm100BlockwiseGemmMxfp8N256Kernel(Sm100BlockwiseGemmKernel):
             raise TypeError("Sm100BlockwiseGemmMxfp8N256Kernel needs a row-major (N-contiguous) C")
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
+        # The SFB copy is unpredicated, so every 256-column tile must lie inside N.
+        if cutlass.const_expr(not cute.is_static(b.shape[0]) or b.shape[0] % 256 != 0):
+            raise ValueError(
+                "Sm100BlockwiseGemmMxfp8N256Kernel needs a static N that is a multiple of 256"
+            )
 
         self._setup_attributes()
 

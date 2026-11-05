@@ -113,7 +113,8 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     ) -> MoEFusedRouteQuant | None:
         """Sqrt-softplus routing in one launch, with the runner's routing tables for small batches,
         for an input its producer already quantized to NVFP4 (e.g. the model's fused boundary)."""
-        if not self._fuses_route or x.is_sf_swizzled:
+        # A pre-quant scale (AWQ/ARC) must be applied before the producer's quantization.
+        if not self._fuses_route or x.is_sf_swizzled or self.fc31_act_scale is not None:
             return None
         rows = x.shape[0]
         local_experts = self._routing_table_experts(rows)

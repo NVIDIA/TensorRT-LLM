@@ -93,6 +93,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....autotuner import AutoTuner
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ....model_config import _DEEPSEEK_V4_ARCHITECTURES as _V4_ARCHITECTURES
+from ....model_config import _DEEPSEEK_V41_ARCHITECTURES as _V41_ARCHITECTURES
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from ..activation import (
@@ -141,7 +143,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-_DEEPSEEK_V4_ARCHITECTURES = ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+_DEEPSEEK_V4_ARCHITECTURES = _V4_ARCHITECTURES | _V41_ARCHITECTURES
 
 
 def _warn_shared_expert_fusion_ignored(reason: str) -> None:
@@ -308,7 +310,7 @@ def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
 
 
 def _slot_table(global_assignments: List[int]) -> torch.Tensor:
-    """The int32 expert -> slot table of a one-copy placement (slot -> expert list)."""
+    """The int32 expert -> slot table of a placement with one copy per expert (slot -> expert list)."""
     table = [0] * len(global_assignments)
     for slot, expert in enumerate(global_assignments):
         table[expert] = slot
@@ -1108,7 +1110,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Step 2-3: quant method registers all NVFP4 + MegaMoE-format params.
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
-        # A static one-copy placement is applied by the routing launch, which writes slots.
+        # A static placement (one copy per expert or a replicated cover) is applied by the routing
+        # launch, which writes slots.
         self._slot_of_expert = self._make_slot_table()
         if self._slot_of_expert is not None:
             with torch.inference_mode(False):
@@ -1351,8 +1354,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # The routing launch adds its picks to the warmup placement's counters.
     counts_routes = True
 
+    def _route_quant_fuses(self) -> bool:
+        # The fused launch quantizes x as is; a pre-quant scale (AWQ/ARC) must apply first.
+        return self._fuses_route_quant and getattr(self, "fc31_act_scale", None) is None
+
     def takes_router_logit_partials(self) -> bool:
-        return self._fuses_route_quant
+        return self._route_quant_fuses()
 
     def try_fused_route_quant(
         self,
@@ -1363,7 +1370,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Sqrt-softplus routing and NVFP4 input quantization in one launch, written straight into
         the launch bucket's kernel inputs once the scheduler has chosen the bucket; a static
         placement's slots go into the bucket and ``route_counters`` get the picks."""
-        if not self._fuses_route_quant:
+        if not self._route_quant_fuses():
             return None
         bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
         table = self._slot_of_expert
@@ -1454,23 +1461,24 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
             empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
             return empty_x, empty_sf
+        x_routed = x_bf16
         fc31_act_scale = getattr(self, "fc31_act_scale", None)
         if fc31_act_scale is not None:
             # Product stays bf16, which is what ``fp4_quantize`` below is given
             # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
             # admits bf16 activations only, so ``fc31_act_scale``, created at
             # ``module.dtype``, is bf16 as well.
-            x_bf16 = x_bf16 * fc31_act_scale
+            x_routed = x_bf16 * fc31_act_scale
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
         # default overload remains unchanged without a plan.
         if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
             # Positional: a keyword argument costs the op dispatch about a microsecond.
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize.sm_budget(
-                x_bf16, self.fc31_input_scale, 16, False, False, reserved_sms
+                x_routed, self.fc31_input_scale, 16, False, False, reserved_sms
             )
         else:
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
-                x_bf16,
+                x_routed,
                 self.fc31_input_scale,
                 16,  # scaling_vector_size == Nvfp4BlockSize
                 False,  # sf_use_ue8m0
@@ -1478,6 +1486,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         shared_target = self._shared_activation_target(x_bf16.shape[0])
         if shared_target is not None:
+            # The shared expert takes the unscaled input.
             mxfp8_quantize_megamoe(x_bf16, shared_target[1], shared_target[2])
             self._shared_quantized = (shared_target[0], x_bf16.shape[0])
         # ``fp4_quantize(is_sf_swizzled=False)`` returns LINEAR layout

@@ -16,6 +16,7 @@ import os
 import pickle
 import sys
 import traceback
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -1186,6 +1187,8 @@ def _mhc_moe_inputs(m: int, seed: int, rank: int, top_k: int = 6):
     return parts, res, post, comb, pre, weight
 
 
+# Pool workers run later tests: restore the environment.
+@patch.dict(os.environ)
 @torch.inference_mode()
 def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
     """Fused boundary vs the library all-reduce + boundary, eager and replayed, interleaved with
