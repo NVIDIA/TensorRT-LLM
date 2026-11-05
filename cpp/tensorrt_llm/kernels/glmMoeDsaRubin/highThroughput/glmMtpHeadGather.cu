@@ -102,6 +102,10 @@ __global__ void __launch_bounds__(kAllGatherBlockSize) oneshotAllGatherKernel(Al
 #endif
 
     LamportFlags<float4> flag(params.bufferFlags, 1);
+    // This workspace has one stage and uses all-ones words as its empty
+    // sentinel. Snapshot the dirty range before ctaArrive permits flag rotation.
+    uint4 const dirtyState = reinterpret_cast<uint4 const*>(params.bufferFlags)[0];
+    uint32_t const dirtyBytes = params.bufferFlags[4];
     auto* stageMcast = reinterpret_cast<float4*>(flag.getCurLamportBuf(params.bufferMcast, 0));
     auto const* stageLocal = reinterpret_cast<float4 const*>(flag.getCurLamportBuf(params.bufferLocal, 0));
 
@@ -131,13 +135,18 @@ __global__ void __launch_bounds__(kAllGatherBlockSize) oneshotAllGatherKernel(Al
 
     flag.ctaArrive();
     // Empty the buffer of the previous call; it is written again two calls later.
-    AllGatherPacket empty;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
+    if (dirtyState.w > 0)
     {
-        empty.words[i] = kAllGatherEmptyWord;
+        auto* dirty = reinterpret_cast<uint4*>(
+            static_cast<char*>(params.bufferLocal) + static_cast<size_t>(dirtyState.y) * dirtyState.z);
+        uint32_t const dirtyPackets = (dirtyBytes + sizeof(uint4) - 1) / sizeof(uint4);
+        uint4 const empty
+            = make_uint4(kAllGatherEmptyWord, kAllGatherEmptyWord, kAllGatherEmptyWord, kAllGatherEmptyWord);
+        for (uint32_t idx = static_cast<uint32_t>(tid); idx < dirtyPackets; idx += numThreads)
+        {
+            dirty[idx] = empty;
+        }
     }
-    flag.fillDirtyLamportBuf(params.bufferLocal, empty.packed);
 
     // Copy the gathered rows out of the local buffer as the packets of every rank land.
     for (int base = tid; base < gatherTotal; base += numThreads * kAllGatherPacketsInFlight)
