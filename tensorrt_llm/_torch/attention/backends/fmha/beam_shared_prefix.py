@@ -598,6 +598,8 @@ class BeamSharedPrefixFmha(PhasedFmha):
         self._pool_views: Dict[int, torch.Tensor] = {}
         # (pool index, page-index scale, page stride) of this layer; fixed for the manager lifetime.
         self._layout: Optional[tuple[int, int, int]] = None
+        # The KV cache manager the cached views and layout belong to.
+        self._pool_manager: Optional[object] = None
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -672,6 +674,15 @@ class BeamSharedPrefixFmha(PhasedFmha):
             return False
         return True
 
+    def _refresh_manager(self, metadata: "TrtllmAttentionMetadata") -> None:
+        """Drop the cached views and layout when the KV cache manager changes: the executor
+        replaces the manager after memory estimation, and the old one's pools are freed."""
+        manager = metadata.kv_cache_manager
+        if self._pool_manager is not manager:
+            self._pool_views.clear()
+            self._layout = None
+            self._pool_manager = manager
+
     def _pool_view(self, metadata: "TrtllmAttentionMetadata") -> torch.Tensor:
         layer_idx = self.attn.layer_idx
         pool = self._pool_views.get(layer_idx)
@@ -704,6 +715,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 f"{type(self).__name__}: {rows} generation rows do not match the planned "
                 f"{plan.num_requests} x {plan.beam_width} beams."
             )
+        self._refresh_manager(metadata)
         if self._layout is None:
             self._layout = _pool_layout(metadata, attn.layer_idx)
         if self._layout != (state.pool_index, state.page_scale, state.page_stride):
