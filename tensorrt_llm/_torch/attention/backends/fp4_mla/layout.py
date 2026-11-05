@@ -318,7 +318,7 @@ def _ensure_workspace_tensor(
     dtype: torch.dtype,
     device: torch.device,
     capacity_numel: int | None = None,
-    shared: bool = True,
+    shared: bool | None = None,
 ) -> torch.Tensor:
     # Grow-only scratch keyed by element count, handed out as a contiguous view
     # of the stored buffer. Callers that share one workspace across geometries
@@ -328,10 +328,15 @@ def _ensure_workspace_tensor(
     # dimension-wise instead returned a strided view the kernel host rejects
     # ("split-KV buffer must be contiguous ..."), which killed CUDA graph
     # capture of small MTP buckets.
-    # ``shared`` workspaces (the default) are views of the process-wide block
-    # described above, sized by ``capacity_numel`` on its first allocation;
-    # the per-state entry only caches the view of the latest request (the
-    # block itself is grow-only, see _workspace_capacity_numel).
+    # ``shared`` workspaces are views of the process-wide block described
+    # above, sized by ``capacity_numel`` on its first allocation; the
+    # per-state entry only caches the view of the latest request (the block
+    # itself is grow-only, see _workspace_capacity_numel). By default only a
+    # caller that passes ``capacity_numel`` shares: the pool never frees a
+    # reserved block, so an unbounded caller would leave one behind every time
+    # its request grows, while a per-state buffer is simply replaced.
+    if shared is None:
+        shared = capacity_numel is not None
     numel = 1
     for dim in shape:
         numel *= int(dim)
