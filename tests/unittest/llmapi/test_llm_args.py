@@ -2178,6 +2178,7 @@ class TestMultimodalConfig:
             multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
             trust_remote_code=True,
             enable_tokenization_cache=False,
+            prompt_token_cache_config=None,
         )
         llm._hf_model_dir = "unused"
         for method in ("_try_load_tokenizer", "_try_load_hf_model_config",
