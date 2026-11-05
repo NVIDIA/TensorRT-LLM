@@ -196,7 +196,7 @@ def test_a_count_tokens_corpus_cut_while_it_is_written_is_not_left(tmp_path):
 EVENT = b'event: response.created\ndata: {"type": "response.created"}\n\n'
 
 
-async def _replay(events, first_event_timeout, timeout, out_dir=None):
+async def _replay(events, first_event_timeout, timeout, out_dir=None, event=EVENT, build_id=None):
     """Replay one request against a stream that sends ``events`` events, then stays silent."""
     release = asyncio.Event()
 
@@ -204,7 +204,7 @@ async def _replay(events, first_event_timeout, timeout, out_dir=None):
         resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
         await resp.prepare(request)
         for _ in range(events):
-            await resp.write(EVENT)
+            await resp.write(event)
         if events > 1:
             await resp.write_eof()
             return resp
@@ -217,7 +217,7 @@ async def _replay(events, first_event_timeout, timeout, out_dir=None):
         args = types.SimpleNamespace(
             base_url=str(server.make_url("")), first_event_timeout=first_event_timeout,
             timeout=timeout, out_dir=out_dir, corpus=None, limit=0, header=None,
-            api_key_env=None, dry_run=False, concurrency=1)  # fmt: skip
+            api_key_env=None, dry_run=False, concurrency=1, build_id=build_id)  # fmt: skip
         entry = {"route": "/v1/responses", "body": {"stream": True}}
         try:
             if out_dir is None:
@@ -246,6 +246,23 @@ def test_a_replay_names_the_limit_that_cut_it(events, first_event_timeout, timeo
 
     assert response["status"] == status
     assert ("first_event_s" in response["timing"]) == (events > 0)
+
+
+def test_a_replay_finds_the_first_event_of_a_crlf_stream():
+    """An SSE stream framed with CRLF has its first event, as an LF one has."""
+    response = asyncio.run(_replay(2, 5.0, 5.0, event=EVENT.replace(b"\n", b"\r\n")))
+
+    assert response["status"] == "completed" and "first_event_s" in response["timing"]
+
+
+def test_a_replay_names_the_build_that_answered(tmp_path):
+    """With --build-id every record names the build, so the verdict can check it (I-05)."""
+    out_dir = tmp_path / "replay"
+    asyncio.run(_replay(2, 5.0, 5.0, out_dir=str(out_dir), build_id="1.3.0+abc"))
+
+    for name in ("requests-replay.jsonl", "responses-replay.jsonl"):
+        (record,) = [json.loads(line) for line in (out_dir / name).read_text().splitlines()]
+        assert record["build_id"] == "1.3.0+abc", name
 
 
 def test_the_replay_output_is_readable_by_its_owner_only(tmp_path):

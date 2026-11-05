@@ -81,16 +81,24 @@ findings at real token boundaries before filing them.
 ```bash
 python scripts/build_replay_corpus.py --workers 16 --out corpus.jsonl --manifest corpus.manifest.json \
     --per-thread 3 --max-records 2000 --model <served-model-name> --reasoning drop \
-    --max-output-tokens 4096 [--route /v1/responses] <request shards or hour dirs>
+    --max-output-tokens 4096 --route <harness route> <request shards or hour dirs>
 python scripts/replay_requests.py --base-url http://<host>:<port> --out-dir replay_out \
-    --concurrency 16 --first-event-timeout <first_event_s> corpus.jsonl
+    --concurrency 16 --first-event-timeout <first_event_s> --build-id "$BUILD_ID" corpus.jsonl
 python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model profiles/model/<m>.yaml \
-    --matrix <run>/matrix.yaml --population replay --out-dir replay_out/verdict replay_out
+    --matrix <run>/matrix.yaml --population replay --build-id "$BUILD_ID" \
+    --out-dir replay_out/verdict replay_out
 ```
 
-`<first_event_s>` is the harness profile's `timeouts.first_event_s` (Codex 120, pi 300, Claude
-Code 360): a replay that gives up sooner than the harness would records a timeout the harness
-never had.
+- `<harness route>` is the route the harness's requests used: `/v1/responses` (Codex),
+  `/v1/messages` (Claude Code) or `/v1/chat/completions`, or for pi the API it ran over. The
+  builder keeps only requests on that route, and its default is `/v1/responses`.
+- `<first_event_s>` is the harness profile's `timeouts.first_event_s` (Codex 120, pi 300, Claude
+  Code 360): a replay that gives up sooner than the harness would records a timeout the harness
+  never had.
+- `$BUILD_ID` is the identity of the build that serves the replay, read on the serving host as for
+  the recorder (`smoke.md` section 2: the `pip show tensorrt_llm` version with its commit). The
+  replay writes it into every record and the verdict checks them against it. Without it nothing
+  shows which build answered, so that inventory result does not count for the stage.
 
 ### Selection
 

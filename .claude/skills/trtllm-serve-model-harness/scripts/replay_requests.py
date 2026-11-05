@@ -36,10 +36,15 @@ Client behavior mirrors what agent harnesses do to a slow server:
 Status values: completed, client_first_event_timeout, client_timeout,
 connection_error, http_error (a non-2xx answer; its body is recorded).
 
+--build-id ID writes the served build's identity into every record, request and response, as
+record_requests.py does: pass the same value to the verdict, or it cannot prove which build
+answered the replay (I-05).
+
 The API key, when needed, is read from the environment variable named by
 --api-key-env and is never written to any output.
 
-usage: replay_requests.py --base-url URL --out-dir DIR [--concurrency N] corpus.jsonl
+usage: replay_requests.py --base-url URL --out-dir DIR [--concurrency N] [--build-id ID]
+                          corpus.jsonl
 """
 
 import argparse
@@ -136,7 +141,7 @@ async def replay_one(session, entry, args, headers):
                     chunks.append(chunk)
                     if first_event is None:
                         buffered += chunk
-                        if b"\n\n" in buffered:
+                        if b"\n\n" in buffered.replace(b"\r\n", b"\n"):  # LF or CRLF framing
                             first_event = time.monotonic() - start
                             timing["first_event_s"] = round(first_event, 4)
                 payload = b"".join(chunks).decode("utf-8", "replace")
@@ -165,6 +170,8 @@ async def replay_one(session, entry, args, headers):
         "timing": timing,
         "replay": {"corpus_id": entry.get("corpus_id")},
     }
+    if args.build_id:
+        request_line["build_id"] = response_line["build_id"] = args.build_id
     return request_line, response_line
 
 
@@ -236,6 +243,7 @@ def main():
     ap.add_argument("--header", action="append", help="extra 'Name: value' header (repeatable)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--build-id", help="the served build's identity, written into every record")
     ap.add_argument("corpus")
     asyncio.run(run(ap.parse_args()))
 
