@@ -109,6 +109,7 @@ class MetricsCollector:
             trtllm_avg_decoded_tokens_per_iter
             trtllm_spec_decode_num_draft_tokens_total
             trtllm_spec_decode_num_accepted_tokens_total
+            trtllm_spec_decode_num_drafts_total
             trtllm_spec_decode_acceptance_length
             trtllm_spec_decode_draft_overhead
             trtllm_prefill_batch_occupancy
@@ -475,11 +476,21 @@ class MetricsCollector:
             name=self.metric_prefix + "spec_decode_num_draft_tokens_total",
             documentation="Total number of draft tokens in speculative decoding",
             labelnames=self.labels.keys())
+        self.counter_spec_decode_num_draft_tokens.labels(**self.labels)
         self.counter_spec_decode_num_accepted_tokens = Counter(
             name=self.metric_prefix + "spec_decode_num_accepted_tokens_total",
             documentation=
             "Total number of accepted tokens in speculative decoding",
             labelnames=self.labels.keys())
+        self.counter_spec_decode_num_accepted_tokens.labels(**self.labels)
+        self.counter_spec_decode_num_drafts = Counter(
+            name=self.metric_prefix + "spec_decode_num_drafts_total",
+            documentation=(
+                "Total request verification rounds with draft tokens. "
+                "Use with spec_decode_num_accepted_tokens_total to compute "
+                "mean acceptance length: 1 + accepted / rounds."),
+            labelnames=self.labels.keys())
+        self.counter_spec_decode_num_drafts.labels(**self.labels)
         self.spec_decode_acceptance_length = Gauge(
             name=self.metric_prefix + "spec_decode_acceptance_length",
             documentation="Acceptance length in speculative decoding",
@@ -1031,6 +1042,10 @@ class MetricsCollector:
 
         # Speculative decoding stats are copied from rank 0 by ADP fanout.
         if spec_stats := iteration_stats.get("specDecodingStats"):
+            rounds = spec_stats.get("numRequestsWithDraftTokens", 0)
+            if rounds > 0:
+                self._log_counter(self.counter_spec_decode_num_drafts, {},
+                                  rounds)
             if "numDraftTokens" in spec_stats:
                 draft_tokens = spec_stats["numDraftTokens"]
                 if draft_tokens > 0:
