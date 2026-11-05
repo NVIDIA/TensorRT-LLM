@@ -64,10 +64,10 @@ def _bind_local(
         raise ValueError("participating layers do not share the same IPC workspace")
     # The public getter intentionally returns only the table. Read its ownership record once;
     # do not call it here, since a cache miss would allocate/open an IPC group collectively.
-    cache = getattr(distributed_ops._thread_local, f"allreduce_workspaces_{mapping.pp_rank}", {})
+    cache = distributed_ops._allreduce_workspaces
     entry = cache.get(mapping)
     if entry is None or len(entry) != 2 or entry[1] is not table:
-        raise ValueError("existing IPC ownership record is unavailable on this construction thread")
+        raise ValueError("existing IPC ownership record is unavailable")
     owners = tuple(entry[0])
     if len(owners) != 5 or not all(isinstance(x, IpcMemory) for x in owners[:3]):
         raise ValueError("unexpected IPC owner layout")
