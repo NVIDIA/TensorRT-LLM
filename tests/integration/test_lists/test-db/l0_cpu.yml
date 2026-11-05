@@ -44,6 +44,8 @@ l0_cpu:
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   - unittest/others/test_http_utils_fail_fast.py
+  # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
+  - unittest/others/test_perf_sanity_port_reservation.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
   # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a
