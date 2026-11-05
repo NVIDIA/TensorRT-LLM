@@ -162,9 +162,6 @@ def test_coordinator_unix_socket_is_in_new_owner_only_directory(monkeypatch, uma
     try:
         run.start()
         run.wait_for(lambda: run.fleet_urls and os.path.exists(run.fleet_urls[0][len("unix:") :]))
-    finally:
-        os.umask(old_umask)
-    try:
         url = run.fleet_urls[0]
         assert url.startswith("unix:")
         uds_path = url[len("unix:") :]
@@ -183,6 +180,7 @@ def test_coordinator_unix_socket_is_in_new_owner_only_directory(monkeypatch, uma
         assert b" 200 " in _http_get_unix(uds_path, "/version").split(b"\r\n", 1)[0]
         run.wait_for(lambda: _tcp_ready(run.coord_port))
     finally:
+        os.umask(old_umask)
         run.stop()
     assert not os.path.exists(uds_dir)
 
