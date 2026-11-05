@@ -4134,16 +4134,11 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _init_mixed_precision_high_layer_offsets(self) -> None:
-        """Record where each cold-page mixed-precision high layer sits in the slot of the page it copies.
-
-        The high layer shares its layer's pool with the same page scale, so a held token's high row is
-        its layer's row a fixed number of blocks further into the slot: the sparse backends redirect
-        selected rows with it and dense attention redirects block offsets by the per-pool difference.
-        """
+        """Record where each cold-page mixed-precision high layer sits in the slot of the page it
+        copies: the sparse backends redirect selected rows with it, dense attention block offsets."""
         # Local layer -> page offset of its mixed-precision high layer inside the shared slot.
         self.mixed_precision_high_layer_offsets: dict[int, int] = {}
-        # Pool -> block offset from a layer's block to its high layer's block; None where the pool's
-        # layers disagree, which only dense attention needs.
+        # Pool -> block distance from a layer's block to its high layer's block (None: not uniform).
         self.mixed_precision_high_block_deltas: dict[int, int | None] = {}
         if self.mixed_precision_low_dtype != self.mixed_precision_high_dtype:
             return

@@ -1156,11 +1156,13 @@ def test_cold_page_window_redirects_dense_block_offsets():
                 assert rows[offsets[kv][i] * block].data_ptr() == high_pool[high[i], kv].data_ptr()
         # Attention wrote this step's row (position 133: block 4, token 5) into the high layer;
         # the copy back fills that row of the layer's block and nothing else.
+        # Both views cover the shared pool, so only the layer's own pages take the sentinel.
+        for page in low:
+            low_pool[page].fill_(7)
         torch.manual_seed(0)
         written = torch.randn(2, 2, 64, device="cuda").to(torch.bfloat16)
         high_pool[high[4], :, 5].copy_(written)
         high_pool[high[4], :, 4].fill_(1.0)
-        low_pool.fill_(7)
         store_mixed_precision_low_rows(metadata, 0)
         torch.cuda.synchronize()
         assert torch.equal(low_pool[low[4], :, 5].view(torch.bfloat16), written)
