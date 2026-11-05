@@ -179,7 +179,8 @@ def _select_mla_generation_fmha(
         helix_position_offsets=torch.zeros(num_tokens, dtype=torch.int32) if helix else None,
         _helix_spec_tokens_valid=helix,
         kv_cache_manager=SimpleNamespace(
-            get_buffers=lambda layer_idx: torch.empty(0, dtype=torch.bfloat16)
+            get_buffers=lambda layer_idx: torch.empty(0, dtype=torch.bfloat16),
+            dtype=DataType.FP8 if fp8_kv else DataType.BF16,
         ),
         tokens_per_block=tokens_per_block,
     )

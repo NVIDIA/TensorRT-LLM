@@ -358,6 +358,7 @@ def test_paged_latent_prepare_reuses_the_compiled_kernel_across_batches():
     page_size, max_blocks, max_batch, width = 16, 4, 32, 4
     slot_of_row = torch.arange(max_batch, device="cuda")
     ctx_len = torch.zeros(max_batch + 1, dtype=torch.int64, device="cuda")
+    base_pages = torch.zeros(max_batch + 1, dtype=torch.int64, device="cuda")
     block_counts = torch.full((max_batch,), max_blocks, dtype=torch.int64, device="cuda")
     block_tables = torch.arange(max_batch * max_blocks, dtype=torch.int32, device="cuda")
     num_accepted = torch.ones(max_batch, dtype=torch.int32, device="cuda")
@@ -370,6 +371,7 @@ def test_paged_latent_prepare_reuses_the_compiled_kernel_across_batches():
             accepted,
             slot_of_row[first_row : first_row + num_gens],
             ctx_len,
+            base_pages,
             block_counts,
             block_tables.view(max_batch, max_blocks),
             seq_lens,
