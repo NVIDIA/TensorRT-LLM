@@ -440,3 +440,67 @@ def test_sparse_plan_accepts_host_lengths_and_device_offset(
     assert schedule.balanced_target_q_per_cta.call_args.kwargs["total_q"] == 48
     if target == "cpu":
         torch.testing.assert_close(plan["seqused_k"], kv_lengths, rtol=0, atol=0)
+
+
+@pytest.fixture
+def page_table_helpers() -> dict:
+    # Load the installed adapter's CPU-capable helpers without initializing CUDA.
+    source = Path(_fmha_sm100_dir()) / "sparse_fmha_adapter.py"
+    names = {"_build_page_table", "_version_token", "_page_table_for_plan"}
+    functions = [
+        node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert len(functions) == len(names)
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "inference_indices,inference_lengths",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_page_table_cache_tracks_input_mutations(
+    page_table_helpers: dict, inference_indices: bool, inference_lengths: bool
+) -> None:
+    with torch.inference_mode(inference_indices):
+        indices = torch.tensor([11, 12, 21, 22], dtype=torch.int32)
+    with torch.inference_mode(inference_lengths):
+        lengths = torch.tensor([256, 256], dtype=torch.int32)
+    table_for_plan = page_table_helpers["_page_table_for_plan"]
+    build_table = page_table_helpers["_build_page_table"]
+    plan = {}
+    first = table_for_plan(plan, indices, lengths, 128, 2)
+    second = table_for_plan(plan, indices, lengths, 128, 2)
+    if not inference_indices and not inference_lengths:
+        assert second is first
+    with torch.inference_mode():
+        indices.add_(10)
+    updated = table_for_plan(plan, indices, lengths, 128, 2)
+    assert torch.equal(updated, build_table(indices, lengths, 128, 2))
+    assert not torch.equal(updated, first)
+    with torch.inference_mode():
+        lengths.copy_(torch.tensor([128, 384], dtype=torch.int32))
+    resized = table_for_plan(plan, indices, lengths, 128, 2)
+    assert torch.equal(resized, build_table(indices, lengths, 128, 2))
+    assert resized.shape == (2, 3)
+
+
+@pytest.mark.cpu_only
+def test_page_table_cache_distinguishes_strided_views(page_table_helpers: dict) -> None:
+    storage = torch.arange(8, dtype=torch.int32)
+    lengths = torch.tensor([256, 256], dtype=torch.int32)
+    indices = storage[:4]
+    strided = storage[::2]
+    assert indices.data_ptr() == strided.data_ptr() and indices.numel() == strided.numel()
+    plan = {}
+    table_for_plan = page_table_helpers["_page_table_for_plan"]
+    first = table_for_plan(plan, indices, lengths, 128, 2)
+    # An equivalent tracked alias can reuse the table.
+    assert table_for_plan(plan, storage[:4], lengths, 128, 2) is first
+    updated = table_for_plan(plan, strided, lengths, 128, 2)
+    assert torch.equal(updated, page_table_helpers["_build_page_table"](strided, lengths, 128, 2))
+    assert not torch.equal(updated, first)

@@ -5392,7 +5392,8 @@ class TestAppendReserveShortestFirst:
         self, drafts: int, expected: int
     ) -> None:
         head = make_ctx_request(0, context_remaining_length=6144, num_draft_tokens=drafts)
-        next_request = make_ctx_request(1, context_remaining_length=2048)
+        follower_length = 2100 if drafts else 2048
+        next_request = make_ctx_request(1, context_remaining_length=follower_length)
         manager = make_kv_cache_manager(tokens_per_block=64)
         with patch.object(
             type(head),
@@ -5405,7 +5406,7 @@ class TestAppendReserveShortestFirst:
             assert head.is_last_context_chunk is (drafts == 0)
         assert ids(out.context_requests) == [0, 1]
         assert head.context_chunk_size == expected
-        assert next_request.context_chunk_size == 2048
+        assert next_request.context_chunk_size == follower_length
         assert manager.resize_context.call_args_list[0] == call(head, expected)
         head.discard_draft_tokens.assert_not_called()
 

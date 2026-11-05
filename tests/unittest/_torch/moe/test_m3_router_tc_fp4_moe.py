@@ -8,6 +8,8 @@ router_tc's payload must equal fp4_quantize(x, fc31_input_scale, 16, False, Fals
 payload as an unswizzled Fp4QuantizedTensor must equal the experts fed bf16 x bit for bit, so handing the payload over
 removes the experts' own quantize without changing the MoE output."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from _torch.moe.moe_test_utils import MoeBackendType
@@ -32,7 +34,7 @@ ACT = SwigluBiasActivation(gate_sigmoid_scale=1.702, linear_offset=1.0, clamp=7.
 pytestmark = pytest.mark.skipif(get_sm_version() != 107, reason="SM107 (Rubin) only")
 
 
-def _build(tokens):
+def _build(tokens: int) -> tuple[torch.nn.Module, MiniMaxM3Gate, torch.Tensor]:
     AutoTuner.get().setup_distributed_state(Mapping())
     g = torch.Generator(device="cuda").manual_seed(0)
     x = torch.randn((tokens, H), device="cuda", generator=g).to(torch.bfloat16)
@@ -62,7 +64,9 @@ def _build(tokens):
 
 
 @pytest.mark.parametrize("tokens", [9, 12, 16])
-def test_router_tc_payload_feeds_experts_bitwise(tokens, monkeypatch) -> None:
+def test_router_tc_payload_feeds_experts_bitwise(
+    tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if not torch.ops.trtllm.minimax_m3_router_tc_cluster16(H, full_fp32=True):
         pytest.skip("this device cannot co-schedule 16-CTA clusters (router_tc not used)")
     monkeypatch.setattr(
@@ -91,3 +95,56 @@ def test_router_tc_payload_feeds_experts_bitwise(tokens, monkeypatch) -> None:
             output_dtype=torch.bfloat16,
         )
         assert torch.equal(stock.view(torch.int16), handed.view(torch.int16)), "MoE output differs"
+
+        # Exercise the actual model branch with the same real gate and experts.
+        model_moe = mm.MiniMaxM3MoE.__new__(mm.MiniMaxM3MoE)
+        torch.nn.Module.__init__(model_moe)
+        model_moe.hidden_dim = H
+        model_moe.gate = gate
+        model_moe.experts = moe
+        model_moe.shared_experts = None
+        model_moe.allreduce = None
+        model_moe.routed_output_is_global = False
+        model_moe._prequantized_fp4 = None
+        metadata = Mock(spec_set=["all_rank_num_tokens", "num_contexts"])
+        metadata.all_rank_num_tokens = None
+        metadata.num_contexts = 0
+        assert model_moe.fp4_input_scale(tokens) is scale
+        expert_forward = Mock(wraps=moe.forward, spec=moe.forward)
+        payloads = []
+        native_payload = gate.router_tc_with_fp4
+
+        def record_payload(
+            hidden_states: torch.Tensor, input_scale: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            result = native_payload(hidden_states, input_scale)
+            payloads.append(result)
+            return result
+
+        payload_forward = Mock(side_effect=record_payload, spec=gate.router_tc_with_fp4)
+        monkeypatch.setattr(moe, "forward", expert_forward)
+        monkeypatch.setattr(gate, "router_tc_with_fp4", payload_forward)
+        monkeypatch.setattr(mm, "_ROUTER_TC_FP4_MOE", True)
+        model_result = model_moe(x, metadata)
+        expert_forward.assert_called_once()
+        payload_forward.assert_called_once()
+        carrier = expert_forward.call_args.args[0]
+        assert isinstance(carrier, Fp4QuantizedTensor)
+        assert carrier.fp4_tensor is payloads[0][1]
+        assert carrier.scaling_factor is payloads[0][2]
+        assert carrier.unquantized_hidden_states is x and not carrier.is_sf_swizzled
+        assert torch.equal(
+            carrier.fp4_tensor.view(torch.uint8).flatten(), ref_q.view(torch.uint8).flatten()
+        )
+        assert torch.equal(
+            carrier.scaling_factor.view(torch.uint8).flatten(), ref_sf.view(torch.uint8).flatten()
+        )
+        assert torch.equal(model_result.view(torch.int16), stock.view(torch.int16))
+        expert_forward.reset_mock()
+        payload_forward.reset_mock()
+        monkeypatch.setattr(mm, "_ROUTER_TC_FP4_MOE", False)
+        disabled_result = model_moe(x, metadata)
+        expert_forward.assert_called_once()
+        assert expert_forward.call_args.args[0] is x
+        payload_forward.assert_not_called()
+        assert torch.equal(disabled_result.view(torch.int16), stock.view(torch.int16))

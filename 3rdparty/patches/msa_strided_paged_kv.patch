@@ -6927,7 +6927,7 @@ diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse
          "seqused_k": seqused_k,
          "max_seqlen_q": max_seqlen_q,
          "max_seqlen_k": max_seqlen_k,
-@@ -228,23 +243,83 @@
+@@ -228,23 +243,77 @@
      page_size: int,
      batch: int,
  ) -> torch.Tensor:
@@ -6976,12 +6976,8 @@ diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse
 +    return page_table
 +
 +
-+def _version_token(tensor: torch.Tensor):
-+    """Version counter for `tensor`, or None if it does not track one.
-+
-+    Inference tensors have no version counter, so this is None on the serving
-+    path and the caller falls back to identity checks alone.
-+    """
++def _version_token(tensor: torch.Tensor) -> int | None:
++    """Return the mutation counter, or None when mutations cannot be tracked."""
 +    return None if torch.is_inference(tensor) else tensor._version
 +
 +
@@ -6992,42 +6988,40 @@ diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse
 +    page_size: int,
 +    batch: int,
 +) -> torch.Tensor:
-+    """Return this plan's page table, building it at most once per step.
-+
-+    Every sparse layer of a step runs the same plan over the same kv_indices
-+    buffer, so they all build a byte-identical table. Cache it on the plan and
-+    reuse it while the inputs look unchanged.
-+
-+    The cache holds a reference to kv_segment_lens so identity comparison is
-+    sound: a live object's id cannot be recycled. A caller that rebuilds its
-+    plan or restages these lengths therefore gets a fresh table. Version
-+    counters add a content check where tensors track one.
-+    """
++    """Reuse the table only while tracked inputs and their layouts are unchanged."""
++    versions = (_version_token(kv_indices), _version_token(kv_segment_lens))
++    if None in versions:
++        # Inference tensors can change in place without changing any metadata.
++        plan_info.pop("_page_table_cache", None)
++        return _build_page_table(kv_indices, kv_segment_lens, page_size, batch)
++    key = (
++        kv_indices.data_ptr(),
++        kv_indices.device,
++        kv_indices.dtype,
++        tuple(kv_indices.shape),
++        tuple(kv_indices.stride()),
++        tuple(kv_segment_lens.shape),
++        tuple(kv_segment_lens.stride()),
++        versions,
++        page_size,
++        batch,
++    )
 +    cached = plan_info.get("_page_table_cache")
 +    if cached is not None:
-+        lens, ptr, numel, versions, geometry, page_table = cached
++        indices, lens, cached_key, page_table = cached
 +        if (
 +            lens is kv_segment_lens
-+            and ptr == kv_indices.data_ptr()
-+            and numel == kv_indices.numel()
-+            and geometry == (page_size, batch)
-+            and versions
-+            == (_version_token(kv_indices), _version_token(kv_segment_lens))
++            and cached_key == key
++            and (_version_token(indices), _version_token(lens)) == versions
 +        ):
 +            return page_table
 +    page_table = _build_page_table(kv_indices, kv_segment_lens, page_size, batch)
-+    plan_info["_page_table_cache"] = (
-+        kv_segment_lens,
-+        kv_indices.data_ptr(),
-+        kv_indices.numel(),
-+        (_version_token(kv_indices), _version_token(kv_segment_lens)),
-+        (page_size, batch),
-+        page_table,
-+    )
++    # Retain both inputs so an allocator cannot recycle a cached storage pointer.
++    plan_info["_page_table_cache"] = (kv_indices, kv_segment_lens, key, page_table)
      return page_table
  
  
-@@ -351,8 +426,8 @@
+@@ -351,8 +420,8 @@
      if is_paged:
  
          if kv_indices is not None:
@@ -7038,7 +7032,7 @@ diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse
              )
  
      # build_k2q_csr(return_schedule=True) builds schedule using hardware SM count internally
-@@ -382,6 +457,17 @@
+@@ -382,6 +451,17 @@
  
      softmax_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
  
@@ -7056,7 +7050,7 @@ diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse
      # print(q.shape, k.shape)
      result = sparse_atten_func(
          q, k, v,
-@@ -398,9 +484,10 @@
+@@ -398,9 +478,10 @@
          seqused_k=seqused_k,
          schedule=schedule,
          usable_SM_count=usable_SM_count,

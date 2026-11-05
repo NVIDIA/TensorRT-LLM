@@ -149,7 +149,22 @@ def test_full_precision_router_retains_weight_residuals(m: int, strided: bool) -
     # A cancellation pair makes the discarded FP32 weight bits the entire signal.
     x = torch.ones_like(x)
     w = torch.zeros_like(w)
-    w[:, 0] = 1.0
-    w[:, 1] = -1.0 + 2.0**-23
+    w[:, 0] = 1.0 + 2.0**-11 + 2.0**-23
+    w[:, 1] = -(1.0 + 2.0**-11)
     result = torch.ops.trtllm.minimax_m3_router_tc(x, w, None, False, full_fp32=True)[0]
     torch.testing.assert_close(result, torch.full_like(result, 2.0**-23), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_full_precision_router_high_finite_weight(sign: int) -> None:
+    if not torch.ops.trtllm.minimax_m3_router_tc_cluster16(K):
+        pytest.skip("this device cannot co-schedule 16-CTA clusters")
+    assert torch.ops.trtllm.minimax_m3_router_tc_cluster16(K, full_fp32=True)
+    x = torch.zeros((16, K), device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros((E, K), device="cuda", dtype=torch.float32)
+    x[:, 0] = 2.0**-64
+    w[:, 0] = sign * torch.finfo(torch.float32).max
+    result = torch.ops.trtllm.minimax_m3_router_tc(x, w, None, False, full_fp32=True)[0]
+    reference = (x.double() @ w.double().t()).float()
+    assert torch.isfinite(reference).all()
+    torch.testing.assert_close(result, reference, rtol=0, atol=0)
