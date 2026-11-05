@@ -57,6 +57,7 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.run.execution import handoff as handoff_mod
+from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
@@ -1609,7 +1610,7 @@ def _regression_repo(root: Path) -> tuple[Path, Path, str]:
     return repo, workspace, base
 
 
-def _check(repo: Path, workspace: Path, head: str, root: Path):
+def _check(repo: Path, workspace: Path, head: str, root: Path, **options):
     ran = []
 
     @contextlib.contextmanager
@@ -1621,7 +1622,7 @@ def _check(repo: Path, workspace: Path, head: str, root: Path):
         finally:
             _git(repo, "worktree", "remove", "--force", str(tree))
 
-    def run_job(command, tree):
+    def run_job(command, tree, timeout_s=None):
         ran.append(command)
         return _run(command)
 
@@ -1634,6 +1635,7 @@ def _check(repo: Path, workspace: Path, head: str, root: Path):
         python=sys.executable,
         name="regression-2",
         paths=["tests"],
+        **options,
     )
     return result, ran
 
@@ -1657,7 +1659,7 @@ def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
         cache_dir=workspace / tc.CACHE_DIRNAME,
         out=tmp_path / "failed-probe",
         tree_at=lambda commit: contextlib.nullcontext(repo),
-        run_job=lambda command, tree: (1, "unavailable"),
+        run_job=lambda command, tree, timeout_s=None: (1, "unavailable"),
         python=sys.executable,
     )
     assert not results.env_digest and results.unrun(["tests/test_a.py"])
@@ -1703,6 +1705,270 @@ def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path)
         f"{tests}/test_modeling_v2_claims.py",
     ]
     assert why == "4 of 5 test files reach what changed"
+
+
+@_requires_git
+def test_a_target_init_reaches_its_importers_and_integration_changes_reach_none(tmp_path):
+    """A target's ``__init__.py`` reaches the tests importing its modules, not the package."""
+    repo = tmp_path / "repo"
+    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
+    dotted = models.replace("/", ".")
+    files = {
+        f"{models}/fam/__init__.py": "",
+        f"{models}/fam/tgt/__init__.py": '"""A target."""\n',
+        f"{models}/fam/tgt/modeling.py": "X = 1\n",
+        f"{models}/other/__init__.py": "",
+        f"{models}/other/tgt/__init__.py": "",
+        f"{models}/other/tgt/modeling.py": "Y = 1\n",
+        f"{tests}/models/fam/tgt/test_modeling.py": f"import {dotted}.fam.tgt.modeling\n",
+        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
+        f"{tests}/test_modeling_v2_claims.py": "",
+        "tests/integration/defs/test_fam.py": "Z = 1\n",
+    }
+    for path, content in files.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(content, encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
+    head = _commit(
+        repo,
+        base,
+        {
+            f"{models}/fam/tgt/__init__.py": '"""The target."""\n',
+            f"{tests}/models/fam/tgt/__init__.py": "",
+        },
+    )
+    picked, why = regression.affected_files(repo, base, head, listed)
+    assert picked == [
+        f"{tests}/models/fam/tgt/test_modeling.py",
+        f"{tests}/test_modeling_v2_claims.py",
+    ]
+    assert why == "2 of 3 test files reach what changed"
+    only_integration = _commit(repo, head, {"tests/integration/defs/test_fam.py": "Z = 2\n"})
+    picked, why = regression.affected_files(repo, head, only_integration, listed)
+    assert picked == [f"{tests}/test_modeling_v2_claims.py"]
+    assert "no unit test reaches what changed" in why
+    shared = _commit(repo, only_integration, {f"{models}/__init__.py": "W = 1\n"})
+    picked, why = regression.affected_files(repo, only_integration, shared, listed)
+    assert picked == listed and "is shared by the package" in why
+
+
+@_requires_git
+def test_a_target_imported_in_a_function_reaches_its_routing_tests_not_the_package(tmp_path):
+    """``models/__init__`` imports every routing; a routing imports its targets when called."""
+    repo = tmp_path / "repo"
+    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
+    dotted = models.replace("/", ".")
+    files = {
+        f"{models}/__init__.py": "from .fam import routing\nfrom .other import routing as o\n",
+        f"{models}/fam/__init__.py": "",
+        f"{models}/fam/routing.py": (
+            "import torch\n\n\ndef pick():\n    from .tgt.modeling import Model\n    return Model\n"
+        ),
+        f"{models}/fam/tgt/__init__.py": "",
+        f"{models}/fam/tgt/modeling.py": "class Model:\n    pass\n",
+        f"{models}/other/__init__.py": "",
+        f"{models}/other/routing.py": "X = 1\n",
+        f"{models}/other/tgt/__init__.py": "",
+        f"{models}/other/tgt/modeling.py": "Y = 1\n",
+        f"{tests}/models/fam/test_routing.py": f"from {dotted}.fam import routing\n",
+        f"{tests}/models/fam/tgt/test_modeling.py": f"from {dotted}.fam.tgt.modeling import Model\n",
+        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
+        f"{tests}/test_modeling_v2_claims.py": "",
+    }
+    for path, content in files.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(content, encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
+    head = _commit(repo, base, {f"{models}/fam/tgt/modeling.py": "class Model:\n    x = 1\n"})
+    picked, why = regression.affected_files(repo, base, head, listed)
+    assert picked == [
+        f"{tests}/models/fam/test_routing.py",
+        f"{tests}/models/fam/tgt/test_modeling.py",
+        f"{tests}/test_modeling_v2_claims.py",
+    ]
+    assert why == "3 of 4 test files reach what changed"
+
+
+def test_a_curated_selection_replaces_what_the_change_reaches(tmp_path, monkeypatch):
+    claims = "tests/test_modeling_v2_claims.py"
+    listed = ["tests/a/test_one.py", "tests/a/test_two.py", "tests/b/test_three.py", claims]
+    monkeypatch.delenv(regression.SELECTION_ENV, raising=False)
+    assert regression.curated_files(listed) is None
+    chosen = tmp_path / "curated.txt"
+    chosen.write_text(
+        "# the change's routing and layout\ntests/b/test_three.py\n"
+        "tests/a/test_one.py  # core\ntests/gone/test_old.py\n\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(regression.SELECTION_ENV, str(chosen))
+    picked, why = regression.curated_files(listed)
+    # The claims gates run with it; a listed path absent at the head is named.
+    assert picked == ["tests/a/test_one.py", "tests/b/test_three.py", claims]
+    assert why == (
+        f"2 curated test files ({chosen}) of 4, with the claims gates; not test files at the "
+        "head: tests/gone/test_old.py"
+    )
+    monkeypatch.setenv(regression.SELECTION_ENV, str(tmp_path / "missing.txt"))
+    with pytest.raises(ValueError, match="cannot be read"):
+        regression.curated_files(listed)
+
+
+@_requires_git
+def test_a_capped_check_defers_what_it_leaves_out_and_delivery_runs_it(tmp_path, monkeypatch):
+    """A curated list that names nothing runs nothing; one that leaves a test out defers it."""
+    from agent_flow.workflows.trtllm_modeling_v2.run.validation import completion
+
+    repo, workspace, base = _regression_repo(tmp_path)
+    # The head breaks test_a, which every file reaches (pkg/ is shared by the package).
+    head = _commit(repo, base, {"pkg/mod.py": "def f():\n    return 2\n"}, "break f")
+    chosen = tmp_path / "curated.txt"
+    chosen.write_text("tests/test_a_typo.py\n", encoding="utf-8")
+    monkeypatch.setenv(regression.SELECTION_ENV, str(chosen))
+    nothing, ran = _check(repo, workspace, head, tmp_path)
+    assert nothing.verdict == "INCOMPLETE" and not ran
+    assert nothing.failures == [
+        f"{regression.SELECTION_ENV} names none of the 3 test files at the head"
+    ]
+    # A list that leaves test_a out passes, but defers it and test_broken: it clears nothing.
+    chosen.write_text("tests/test_b.py\n", encoding="utf-8")
+    capped, _ = _check(repo, workspace, head, tmp_path)
+    assert capped.verdict == "CLEAN" and capped.deferred == 2
+    assert "2 reached test file(s) deferred" in capped.summary()
+    tasks = workspace / "tasks"
+    receipt = handoff_mod.build(
+        "regression-2", "check", result=handoff_mod.TaskResult("CHECKED"), deferred=head
+    )
+    handoff_mod.write(tasks, receipt)
+    assert receipt["deferred"] == head and "cleared" not in receipt
+    assert tc.default_base(workspace, repo, head) == base
+    assert regression.owed(workspace, repo, head) == [head]
+
+    # Delivery runs every reached file at HEAD, with no curated list: test_a's break is found.
+    jobs = []
+
+    @contextlib.contextmanager
+    def tree_at(commit):
+        tree = tmp_path / f"delivery-{commit[:8]}-{len(jobs)}"
+        _git(repo, "worktree", "add", "-q", "--detach", str(tree), commit)
+        try:
+            yield tree
+        finally:
+            _git(repo, "worktree", "remove", "--force", str(tree))
+
+    def run_job(command, tree, timeout_s=None):
+        jobs.append(command)
+        return _run(command)
+
+    monkeypatch.setattr(regression, "job_runner", lambda *_: (tree_at, run_job, sys.executable))
+    monkeypatch.setattr(regression, "PACKAGE_TESTS", ("tests",))
+    at = {"head": head}
+    events = []
+    wf = SimpleNamespace(
+        task_data={"trtllm_repo_path": str(repo)},
+        workspace=workspace,
+        _git=lambda _repo, *args: at["head"],
+        journal=SimpleNamespace(event=lambda kind, detail: events.append((kind, detail))),
+    )
+    assert completion.deferred_regression_check(wf) is None  # it runs at delivery only
+    found = completion.deferred_regression_check(wf, run=True)
+    assert found.name == completion.DEFERRED_REGRESSION and not found.passed
+    assert "tests/test_a.py::test_f" in found.detail and jobs
+    # Fixed, it holds and clears the head: nothing is owed any more.
+    fixed = _commit(repo, head, {"pkg/mod.py": "def f():\n    return 1\n"}, "fix f")
+    at["head"] = fixed
+    held = completion.deferred_regression_check(wf, run=True)
+    assert held.passed and f"owed by capped regression checks ({head[:10]})" in held.detail
+    assert tc.default_base(workspace, repo, fixed) == fixed
+    assert regression.owed(workspace, repo, fixed) == []
+    assert completion.deferred_regression_check(wf, run=True) is None
+    # A receipt that does not read may name a deferred head: it is owed, not ignored.
+    (tasks / "regression-3.receipt.yaml").write_text("task: [unclosed\n", encoding="utf-8")
+    assert regression.owed(workspace, repo, fixed) == ["unreadable regression-3.receipt.yaml"]
+    assert tc.default_base(workspace, repo, fixed) == fixed
+
+
+def test_an_agent_pick_runs_with_the_claims_gates_and_a_bad_one_runs_every_file(tmp_path):
+    claims = "tests/test_modeling_v2_claims.py"
+    reached = ["tests/a/test_one.py", "tests/a/test_two.py", "tests/b/test_three.py", claims]
+    path = tmp_path / "picked.txt"
+    asked = []
+
+    def capped(text, limit=2):
+        def pick(at, others, most):
+            asked.append((list(others), most))
+            if text is None:
+                raise RuntimeError("the turn timed out")
+            at.write_text(text, encoding="utf-8")
+
+        return regression.picked_files(reached, "4 of 9", limit=limit, pick=pick, path=path)
+
+    # Within the cap no agent is asked.
+    assert capped("", limit=3) == (reached, "4 of 9") and not asked
+    files, scope = capped(f"tests/b/test_three.py\n# its users\n{claims}\ntests/a/test_one.py\n")
+    assert asked == [(reached[:3], 2)]
+    assert files == sorted(["tests/a/test_one.py", "tests/b/test_three.py", claims])
+    assert scope == f"3 test files an agent picked ({path}), of 4 of 9"
+    for text, problem in (
+        ("tests/c/test_new.py\n", "names files the change does not reach: tests/c/test_new.py"),
+        ("".join(f"{f}\n" for f in reached[:3]), "names 3"),
+        ("# nothing to add\n", "names none"),
+        (None, "failed: RuntimeError: the turn timed out"),
+    ):
+        assert capped(text) == (
+            reached,
+            f"4 of 9; every one runs, as the pick of at most 2 {problem}",
+        )
+
+
+@_requires_git
+def test_past_max_files_the_planner_picks_what_a_regression_check_runs(tmp_path):
+    repo, workspace, base = _regression_repo(tmp_path)
+    cache = workspace / tc.CACHE_DIRNAME
+    _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_broken.py "
+         "-- -q -p no:cacheprovider")  # fmt: skip
+    head = _commit(repo, base, {"pkg/mod.py": "def f():\n    return 1  # reworded\n"})
+    turns = []
+
+    def run_turn(role, what, prompt, **kwargs):
+        turns.append((role, prompt, kwargs))
+        picked = re.search(r"Write the paths you pick to `([^`]+)`", prompt).group(1)
+        Path(picked).write_text("tests/test_a.py\n", encoding="utf-8")
+        return ""
+
+    stage = ExecutionStage(
+        SimpleNamespace(task_data={"trtllm_repo_path": str(repo)}, _run_turn=run_turn, _tls=None)
+    )
+    task = SimpleNamespace(id="regression-2")
+    result, _ = _check(
+        repo,
+        workspace,
+        head,
+        tmp_path,
+        max_files=1,
+        pick=lambda *asked: stage._pick_regression_files(task, *asked),
+    )
+    assert result.verdict == "CLEAN" and result.scope.startswith("1 test files an agent picked")
+    [(role, prompt, kwargs)] = turns
+    assert role == "planner" and kwargs["work"] == "regression-2"
+    assert "`regression.max_files` (1)" in prompt and f"git diff {base[:12]}" in prompt
+    # The pick hears which files cannot regress: every test of theirs failed at the base.
+    failing = prompt.split("## Test files whose every test failed at the base")[1]
+    assert "`tests/test_broken.py`" in failing.split("## The test files")[0]
+    assert tc.recorded(cache, head).unrun(["tests/test_a.py", "tests/test_b.py"]) == [
+        "tests/test_b.py"
+    ]
 
 
 @_requires_git

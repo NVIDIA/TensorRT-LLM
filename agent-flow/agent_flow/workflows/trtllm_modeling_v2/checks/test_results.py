@@ -258,6 +258,25 @@ def head_results(results: Results, files: Iterable[str]) -> HeadResults:
     return found
 
 
+def task_receipts(workspace: str | Path, unreadable: list[Path] | None = None) -> list[dict]:
+    """The task receipts in ``<workspace>/tasks/`` that read as mappings, by file name.
+
+    Those that do not are skipped, and added to ``unreadable`` when it is given: a reader that
+    must not miss one (``regression.owed``) treats it as unknown, not as absent.
+    """
+    receipts = []
+    for path in sorted((Path(workspace) / "tasks").glob("*.receipt.yaml")):
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            data = None
+        if isinstance(data, dict):
+            receipts.append(data)
+        elif unreadable is not None:
+            unreadable.append(path)
+    return receipts
+
+
 def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | None:
     """The commit a regression check last cleared, else the run's starting commit.
 
@@ -273,14 +292,7 @@ def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | No
     def ancestor(older: str, newer: str) -> bool:
         return git_output(repo, "merge-base", "--is-ancestor", older, newer) is not None
 
-    receipts = []
-    for path in sorted((Path(workspace) / "tasks").glob("*.receipt.yaml")):
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if isinstance(data, dict):
-            receipts.append(data)
+    receipts = task_receipts(workspace)
     cleared = []
     for receipt in receipts:
         commit = resolve(str(receipt["cleared"])) if receipt.get("cleared") else None
@@ -332,5 +344,6 @@ __all__ = [
     "list_test_files",
     "load_sessions",
     "recorded",
+    "task_receipts",
     "write_selection",
 ]

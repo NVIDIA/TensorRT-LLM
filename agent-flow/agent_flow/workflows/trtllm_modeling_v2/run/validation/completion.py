@@ -32,6 +32,7 @@ from ...spec.task_schema import (
     profile_of,
     resolve_per_unit,
 )
+from ..execution import handoff as handoff_mod
 from ..records.state import WorkflowState
 from . import contract as contract_mod
 from . import regression as regression_mod
@@ -198,10 +199,68 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
     if modules is not None:
         report = DeliveryReport(checks=(*report.checks, modules))
     tested = tests_check(workflow, report, run=run_tests)
+    owed = deferred_regression_check(workflow, run=run_tests)
     if run_tests:
         report = delivery_report(workflow)
-        report = DeliveryReport(checks=tuple(c for c in report.checks if c.name != "tests"))
-    return DeliveryReport(checks=(*report.checks, *((tested,) if tested else ())))
+        ran = {"tests", DEFERRED_REGRESSION}
+        report = DeliveryReport(checks=tuple(c for c in report.checks if c.name not in ran))
+    extra = tuple(c for c in (tested, owed) if c is not None)
+    return DeliveryReport(checks=(*report.checks, *extra))
+
+
+#: The delivery check that runs what capped regression checks deferred, and its receipt's task.
+DEFERRED_REGRESSION = "regression:deferred"
+DEFERRED_REGRESSION_TASK = "delivery-regression"
+
+
+def deferred_regression_check(workflow, *, run: bool = False) -> DeliveryCheck | None:
+    """The test files capped regression checks deferred (``regression.owed``), run at ``HEAD``.
+
+    ``None`` when none is owed, and without ``run``: they run at delivery, as a delivered test
+    with no result at ``HEAD`` does. With ``run``, one regression check at ``HEAD`` against the
+    last full check's head, with no cap and no curated selection; it holds only clean. A clean
+    one clears ``HEAD`` in its own receipt, so it runs once.
+    """
+    if not run:
+        return None
+    repo = Path(str(workflow.task_data["trtllm_repo_path"]))
+    head = (workflow._git(str(repo), "rev-parse", "HEAD") or "").strip()
+    deferred = regression_mod.owed(workflow.workspace, repo, head) if head else []
+    if not deferred:
+        return None
+    tree_at, run_job, python = regression_mod.job_runner(workflow, DEFERRED_REGRESSION_TASK)
+    result = regression_mod.run_regression_check(
+        workspace=workflow.workspace,
+        repo=repo,
+        head=head,
+        tree_at=tree_at,
+        run_job=run_job,
+        python=python,
+        name=DEFERRED_REGRESSION_TASK,
+        paths=regression_mod.PACKAGE_TESTS,
+        curate=False,
+    )
+    named = [c if c.startswith("unreadable ") else c[:10] for c in deferred]
+    what = f"owed by capped regression checks ({', '.join(named)}): {result.summary()}"
+    workflow.journal.event("regression", f"{DEFERRED_REGRESSION_TASK}: {result.summary()}")
+    if (workflow._git(str(repo), "rev-parse", "HEAD") or "").strip() != head:
+        return DeliveryCheck(DEFERRED_REGRESSION, False, "HEAD changed while deferred tests ran")
+    if not result.passed:
+        return DeliveryCheck(DEFERRED_REGRESSION, False, f"{what}: {'; '.join(result.failures)}")
+    note = "the deferred package tests passed at delivery"
+    try:
+        handoff_mod.write(
+            workflow.workspace / "tasks",
+            handoff_mod.build(
+                DEFERRED_REGRESSION_TASK,
+                "check",
+                result=handoff_mod.TaskResult("CHECKED", note),
+                cleared=head,
+            ),
+        )
+    except OSError as exc:
+        workflow.journal.event("receipt not kept", f"{DEFERRED_REGRESSION_TASK}: {exc}")
+    return DeliveryCheck(DEFERRED_REGRESSION, True, what)
 
 
 def target_test_modules_check(repo_root: str | Path, target_rel: str) -> DeliveryCheck | None:

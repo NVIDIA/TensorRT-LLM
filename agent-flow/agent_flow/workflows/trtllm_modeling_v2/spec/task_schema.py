@@ -183,7 +183,13 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     VARIANTS_FIELD,
     "coverage",
     "profile",
+    "regression",
 )
+#: ``regression.max_files``: the most test files a regression check runs besides the claims
+#: gates. When the changes reach more, an agent picks that many from them
+#: (``run/validation/regression.py``). Unset: every file they reach.
+REGRESSION_FIELD = "regression"
+REGRESSION_KEYS: tuple[str, ...] = ("max_files",)
 #: ``coverage.accept``: the requested feature@member cells the contract may leave uncovered.
 COVERAGE_FIELD = "coverage"
 COVERAGE_KEYS: tuple[str, ...] = ("accept",)
@@ -463,6 +469,19 @@ def _validate_coverage(block: Any, errors: list[str]) -> None:
         errors.append(
             f"'{COVERAGE_FIELD}.accept' must be a list of '<feature>@<member>' or '<feature>@*'"
         )
+
+
+def _validate_regression(block: Any, errors: list[str]) -> None:
+    """``regression``: a mapping whose ``max_files`` is a positive integer."""
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        errors.append(f"'{REGRESSION_FIELD}' must be a mapping, got {type(block).__name__}")
+        return
+    reject_unknown_keys(block, REGRESSION_KEYS, errors, where=REGRESSION_FIELD)
+    limit = block.get("max_files")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        errors.append(f"'{REGRESSION_FIELD}.max_files' must be a positive integer, got {limit!r}")
 
 
 def _validate_target(block: Any, errors: list[str]) -> None:
@@ -1675,6 +1694,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
 
     _validate_coverage(data.get(COVERAGE_FIELD), errors)
     _validate_profile(data, errors)
+    _validate_regression(data.get(REGRESSION_FIELD), errors)
 
     if ENVIRONMENT_FIELD not in data:
         errors.append(
@@ -1792,6 +1812,8 @@ __all__ = [
     "MTP_NAMESPACE_FEATURES",
     "PARALLEL_FIELD",
     "PARALLEL_UNIFIED",
+    "REGRESSION_FIELD",
+    "REGRESSION_KEYS",
     "REQUIRED_PATH_FIELDS",
     "RUNTIME_FIELD",
     "RUNTIME_SWITCHES",

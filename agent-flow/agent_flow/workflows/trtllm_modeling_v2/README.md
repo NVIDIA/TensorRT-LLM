@@ -114,7 +114,11 @@ must change before that.
    target. Commits are audited and integrated; shared-code changes require regression coverage.
    A regression check runs only when no contract check runs or waits, and only on the test files
    the change can reach (those it changed, those importing a module it changed, the claims
-   gates; every file when it touches code the whole package shares). A kernel task on a shared
+   gates; every file when it touches code the whole package shares), or, past
+   `regression.max_files`, the ones an agent picks from them. What such a cap (or a curated
+   `MV2FLOW_REGRESSION_SELECTION` list) leaves out is deferred, never dropped: the capped check
+   clears nothing, and delivery runs every file the change since the last full check reaches,
+   with no cap. A kernel task on a shared
    catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.

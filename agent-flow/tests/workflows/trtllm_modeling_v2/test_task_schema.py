@@ -55,6 +55,7 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
     # A disabled gate's fields are still validated.
     spec["accuracy"]["serve"] = {"enabled": False, "max_tokens": True, "prompt": " "}
     spec["accuracy"]["score_pattern"] = "accuracy: [0-9.]+"
+    spec["regression"] = {"max_files": 0}
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     message = str(excinfo.value)
@@ -65,6 +66,7 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
         "accuracy.serve.max_tokens",
         "accuracy.serve.prompt",
         "'accuracy.score_pattern' needs a group around the score",
+        "'regression.max_files' must be a positive integer",
     ):
         assert expected in message
 

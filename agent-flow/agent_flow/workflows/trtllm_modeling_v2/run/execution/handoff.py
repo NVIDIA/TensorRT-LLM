@@ -351,11 +351,14 @@ def build(
     attempt: int = 1,
     commits: Sequence[str] = (),
     cleared: str = "",
+    deferred: str = "",
 ) -> dict[str, Any]:
     """The receipt of task ``task_id``, from the dispatch that actually ran.
 
     ``cleared`` is the commit a regression check found clean, the next one's
-    base (``checks/test_results.default_base``).
+    base (``checks/test_results.default_base``); ``deferred`` the commit a
+    capped one passed at, leaving test files for a later full check or
+    delivery (``regression.owed``).
     """
     raw = result.data
     receipt: dict[str, Any] = {
@@ -380,6 +383,9 @@ def build(
     cleared = str(cleared or raw.get("cleared") or "").strip().lower()
     if _COMMIT.match(cleared):
         receipt["cleared"] = cleared
+    deferred = str(deferred or "").strip().lower()
+    if _COMMIT.match(deferred):
+        receipt["deferred"] = deferred
     if result.decision_file is not None:
         receipt["decision_file"] = str(result.decision_file)
     if result.result_file is not None:
