@@ -115,6 +115,9 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+# Longest a remote-metadata load waits for in-flight transfers without physical
+# ownership to leave _AgentOperationGate before it loads anyway.
+_METADATA_DRAIN_TIMEOUT_S = 10.0
 
 
 class _AgentOperationGate:
@@ -127,10 +130,16 @@ class _AgentOperationGate:
     thread of the process. Transfers enter as readers for the full
     submit + wait + release interval; a load enters as the single writer once
     no transfer is active, and waits here with the GIL released.
+
+    A transfer wait has no timeout, so the drain is bounded instead: after
+    ``drain_timeout_s`` the load enters with the remaining transfers still
+    inside. Those keep running and may overlap the load as they would without
+    the gate; transfers that arrive later still wait for the load to finish.
     """
 
-    def __init__(self):
+    def __init__(self, drain_timeout_s: float = _METADATA_DRAIN_TIMEOUT_S):
         self._condition = threading.Condition()
+        self._drain_timeout_s = drain_timeout_s
         self._active_transfers = 0
         self._metadata_active = False
         self._metadata_waiters = 0
@@ -152,17 +161,31 @@ class _AgentOperationGate:
                     self._condition.notify_all()
 
     @contextmanager
-    def metadata(self):
+    def metadata(self) -> Iterator[int]:
+        """Enter as the single writer.
+
+        Yields:
+            The number of transfers still inside the gate: 0 unless the drain
+            timed out.
+        """
         with self._condition:
             self._metadata_waiters += 1
             try:
+                deadline = time.monotonic() + self._drain_timeout_s
                 while self._metadata_active or self._active_transfers > 0:
-                    self._condition.wait()
+                    if self._metadata_active:
+                        self._condition.wait()
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(remaining)
                 self._metadata_active = True
+                undrained = self._active_transfers
             finally:
                 self._metadata_waiters -= 1
         try:
-            yield
+            yield undrained
         finally:
             with self._condition:
                 self._metadata_active = False
@@ -1886,7 +1909,13 @@ class Sender(SenderBase):
                 if self._enforce_physical_ownership
                 else self._agent_operation_gate.metadata()
             )
-            with metadata_gate:
+            with metadata_gate as undrained:
+                if undrained:
+                    logger.warning(
+                        f"Sender: loading remote agent '{agent_name}' while {undrained} NIXL "
+                        f"transfer(s) are still in flight after {_METADATA_DRAIN_TIMEOUT_S:.0f} s; "
+                        "a request released during the load can stall this process until it ends"
+                    )
                 self._agent.load_remote_agent(
                     agent_name,
                     ri.transfer_engine_info,

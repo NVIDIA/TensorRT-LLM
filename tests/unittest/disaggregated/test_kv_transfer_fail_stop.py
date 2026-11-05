@@ -455,6 +455,51 @@ def test_agent_gate_metadata_drains_transfers_and_goes_first() -> None:
     assert gate._active_transfers == 0 and not gate._metadata_active
 
 
+def test_agent_gate_metadata_loads_after_drain_timeout() -> None:
+    """A transfer that never leaves delays a metadata load only by the drain timeout."""
+    drain_timeout_s = 0.05
+    gate = transfer_mod._AgentOperationGate(drain_timeout_s=drain_timeout_s)
+    stuck_in, release_stuck = threading.Event(), threading.Event()
+    load_in, release_load = threading.Event(), threading.Event()
+    later_done = threading.Event()
+    undrained: list[int] = []
+
+    def stuck_transfer() -> None:
+        with gate.transfer():
+            stuck_in.set()
+            release_stuck.wait(5)
+
+    def load() -> None:
+        with gate.metadata() as count:
+            undrained.append(count)
+            load_in.set()
+            release_load.wait(5)
+
+    def later_transfer() -> None:
+        with gate.transfer():
+            later_done.set()
+
+    t_stuck = threading.Thread(target=stuck_transfer)
+    t_stuck.start()
+    assert stuck_in.wait(5)
+    started = time.monotonic()
+    t_load = threading.Thread(target=load)
+    t_load.start()
+    assert load_in.wait(5)
+    assert time.monotonic() - started >= drain_timeout_s
+    assert undrained == [1]  # the load entered with the stuck transfer still inside
+    t_later = threading.Thread(target=later_transfer)
+    t_later.start()
+    assert not later_done.wait(0.05)  # a new transfer still waits for the load
+    release_load.set()
+    assert later_done.wait(5)
+    release_stuck.set()
+    for t in (t_stuck, t_load, t_later):
+        t.join(5)
+        assert not t.is_alive()
+    assert gate._active_transfers == 0 and not gate._metadata_active
+
+
 def test_submit_transfer_releases_status_inside_agent_gate() -> None:
     """The status destructor (NIXL request release) runs before the transfer leaves the gate."""
     gate = transfer_mod._AgentOperationGate()
