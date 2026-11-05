@@ -187,7 +187,11 @@ def test_dense_prefill_fa4_short_tail_band_per_tp_geometry(
     rows = [(5, 900)]
     q, pool, metadata, flat = _case(912, rows, False)
     reference = _reference(q, pool, rows, flat)
+    real = msa_prefill._dense_fa4_forward()
+    spy = create_autospec(real, side_effect=real, spec_set=True)
+    monkeypatch.setattr(msa_prefill, "_dense_fa4_forward", lambda: spy)
     fa4 = _run(q, metadata, 0, 1)
+    assert spy.called, "FA4 did not serve the short-tail geometry"
     monkeypatch.setattr(msa_prefill, "dense_prefill_fa4_enabled", lambda *_: False)
     stock = _run(q, metadata, 0, 1)
     fa4_error, stock_error = _max_err(fa4, reference), _max_err(stock, reference)

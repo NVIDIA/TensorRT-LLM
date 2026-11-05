@@ -20,6 +20,7 @@ l0_gr100:
   - unittest/_torch/kernels/serial/test_m3_qkv_fusion.py
   - unittest/_torch/attention/fmha/test_msa_combine_mxfp8.py
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_dense_prefill_fa4.py
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_dense_prefill_fa4_patched.py
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_tile_select.py
   - unittest/_torch/attention/sparse/msa/test_msa_prefill_nvfp4_out_in_place.py
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_proxy_nofill.py
