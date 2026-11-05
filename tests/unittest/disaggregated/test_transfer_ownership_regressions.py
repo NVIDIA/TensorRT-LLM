@@ -20,7 +20,7 @@ import queue
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import DEFAULT, Mock
 
 import numpy as np
 import pytest
@@ -461,7 +461,9 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
 
 @pytest.mark.cpu_only
-def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
+def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rid = 94
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
@@ -489,7 +491,43 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
             dp_size=2,
         )
     )
-    receiver._request_sender_data = Mock()
+    publication_order: list[tuple[str, int]] = []
+    published_ranks: list[int] = []
+    captured_timestamps: list[tuple[int, int]] = []
+    publication_timestamps: dict[int, tuple[int, int]] = {}
+    fast_response_timestamps: dict[int, tuple[int, int]] = {}
+
+    def request_sender_data(endpoint: str, _payload: bytes) -> None:
+        rank = int(endpoint.rsplit("-", 1)[1])
+        assert publication_order[-1][0] == "capture"
+        publication_timestamps[rank] = captured_timestamps[-1]
+        published_ranks.append(rank)
+        publication_order.append(("send", rank))
+        # Model a listener response that races ahead of the deferred event
+        # emission after this send returns.
+        fast_response_timestamps[rank] = (
+            captured_timestamps[-1][0] + 50,
+            captured_timestamps[-1][1] + 50,
+        )
+        publication_order.append(("result", rank))
+
+    def capture_timestamp() -> tuple[int, int]:
+        index = len(captured_timestamps)
+        timestamp = (index + 100, index + 200)
+        captured_timestamps.append(timestamp)
+        publication_order.append(("capture", index))
+        return timestamp
+
+    def emit_event(event: str, **kwargs) -> None:
+        if event == "gen_request_data_sent":
+            rank = kwargs["peer_rank"]
+            assert kwargs["request_id"] == rid
+            assert kwargs["request_id_scope"] == "run"
+            assert kwargs["timestamp"] == publication_timestamps[rank]
+            assert kwargs["timestamp"][0] < fast_response_timestamps[rank][0]
+            publication_order.append(("emit", rank))
+
+    receiver._request_sender_data = request_sender_data
     session = RxSession(
         request_id=rid,
         params=DisaggregatedParams(
@@ -502,13 +540,32 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     task = session.prepare_receive(_sole_piece())
     assert task is not None
 
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "capture_timestamp",
+        capture_timestamp,
+    )
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
     session.dispatch_prepared_receive(task)
 
     assert task.expected_transfers == 2
-    assert {call.args[0] for call in receiver._request_sender_data.call_args_list} == {
+    assert {f"tcp://sender-{rank}" for rank in published_ranks} == {
         f"tcp://sender-{rank}" for rank in range(4)
     }
-    assert receiver._request_sender_data.call_count == 4
+    assert len(published_ranks) == 4
+    assert publication_order == [
+        *(
+            entry
+            for index, rank in enumerate(published_ranks)
+            for entry in (("capture", index), ("send", rank), ("result", rank))
+        ),
+        *(("emit", rank) for rank in published_ranks),
+    ]
     session.process_kv_agent_result(
         peer_rank=2,
         receiver_slice_id=0,
@@ -585,6 +642,13 @@ def test_partial_publication_waits_for_queued_writer_success(
             )
 
     receiver._request_sender_data = request_sender_data
+    emit_event = Mock()
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
     monkeypatch.setattr(
         transfer_mod.tensorrt_llm.bindings,
         "global_steady_clock_now",
@@ -604,6 +668,12 @@ def test_partial_publication_waits_for_queued_writer_success(
         session.receive(_sole_piece())
 
     assert queued_endpoints == ["tcp://sender-0"]
+    request_data_events = [
+        call for call in emit_event.call_args_list if call.args == ("gen_request_data_sent",)
+    ]
+    assert len(request_data_events) == 1
+    assert request_data_events[0].kwargs["request_id"] == rid
+    assert request_data_events[0].kwargs["peer_rank"] == 0
     if not writer_settles_before_failure:
         assert not session.resources_drained()
 
@@ -945,7 +1015,7 @@ def test_send_terminal_session_is_retained_when_close_refuses(
     session.close.return_value = True
     completed, failed = transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
 
-    assert failed == []
+    assert failed == ([rid] if status == SessionStatus.CANCELLED else [])
     assert completed == ([rid] if mark_complete else [])
     if mark_complete:
         assert request.state is not initial_state
@@ -1181,6 +1251,9 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender = object.__new__(transfer_mod.Sender)
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
     sender._pre_cancelled_rids = {}
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
@@ -1191,6 +1264,234 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._pending_session_quiescence = {}
     sender._send_task_queues = [queue.Queue()]
     return sender
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("diagnostics_enabled", [False, True])
+@pytest.mark.parametrize("perf_enabled", [False, True])
+def test_kv_payload_snapshot_is_shared_and_survives_same_peer_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostics_enabled: bool,
+    perf_enabled: bool,
+) -> None:
+    rid = 108
+    peer_rank = 2
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._device_id = 0
+    sender._agent = SimpleNamespace(
+        submit_transfer_requests=Mock(return_value=SimpleNamespace(wait=Mock(return_value=True)))
+    )
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._thread_local = threading.local()
+    peer_info = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=peer_rank,
+        self_endpoint="receiver",
+        cp_size=1,
+        dp_rank=0,
+        device_id=0,
+    )
+    extractor = Mock()
+    extractor.page_table = SimpleNamespace(
+        tokens_per_block=1, layer_groups=[SimpleNamespace(kind=CacheKind.PAGED)]
+    )
+    regions = SimpleNamespace(
+        src=SimpleNamespace(
+            memory=SimpleNamespace(ptrs=np.array([0x1000, 0x2000]), bytes_per_region=0x100)
+        ),
+        dst=SimpleNamespace(memory=SimpleNamespace(ptrs=np.array([0x3000, 0x4000]))),
+    )
+    sender._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="ctx", instance_rank=0, cp_size=1),
+        get_peer_rank_info=Mock(return_value=peer_info),
+        get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[peer_rank])),
+        self_extractor=extractor,
+        peer_extractor=Mock(return_value=extractor),
+        get_pool_mapping=Mock(return_value={(0, 0): (0, 0)}),
+        should_send_pool=Mock(return_value=True),
+        get_kv_map=Mock(return_value=SimpleNamespace(map=Mock(return_value=regions))),
+    )
+    sizes = Mock(size=2)
+    sizes.sum.return_value = 0x180
+    next_sizes = Mock(size=2)
+    next_sizes.sum.return_value = 0x300
+    monkeypatch.setattr(transfer_mod.np, "repeat", Mock(side_effect=[sizes, next_sizes]))
+    monkeypatch.setattr(transfer_mod.perf_log_manager, "_perf_enabled", perf_enabled)
+    perf_log = Mock()
+    monkeypatch.setattr(transfer_mod.perf_log_manager, "log_task_perf", perf_log)
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        diagnostics_enabled,
+    )
+    emit_event = Mock()
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    task = transfer_mod.KVSendTask(
+        _sole_piece([np.array([0, 1])], tokens=2),
+        DisaggregatedParams(disagg_request_id=rid),
+        slice_id=0,
+        prompt_len=2,
+    )
+    assert (task._perf_timer is not None) == perf_enabled
+    session = SimpleNamespace(
+        kv_tasks=[task],
+        lock=threading.Lock(),
+        status=SessionStatus.READY,
+        set_exception=Mock(),
+        transfer_end_time=None,
+    )
+    sender._sessions = {rid: session}
+    req_info = transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=peer_rank,
+        block_ids_per_layer_groups=[np.array([2, 3])],
+        unique_rid=rid,
+        slice_id=0,
+    )
+    write_meta = sender._build_kv_write_meta(task, req_info)
+    req_info.slice_id = 1
+    next_meta = sender._build_kv_write_meta(task, req_info)
+    measured = perf_enabled or diagnostics_enabled
+    assert write_meta.transfer_bytes == (0x180 if measured else None)
+    assert next_meta.transfer_bytes == (0x300 if measured else None)
+    if perf_enabled:
+        assert task._perf_timer.get_transfer_size(peer_rank) == 0x300
+        assert task._perf_timer.get_transfer_entry_count(peer_rank) == 2
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        transfer_mod.tensorrt_llm.bindings,
+        "global_steady_clock_now",
+        lambda: 0,
+    )
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock())
+    monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
+
+    sender._enqueue(write_meta)
+    sender._send_task_queues[0].put(None)
+    sender._process_task_queue(0)
+
+    result = transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])
+    # Successful wire reports attest the completed descriptor's bytes even
+    # when neither diagnostics nor performance logging is enabled.
+    assert result[5] == 0x180
+    assert sizes.sum.call_count == 1 + int(measured)
+    assert next_sizes.sum.call_count == int(measured)
+    assert task.status == transfer_mod.TaskStatus.TRANSFERRED
+    assert perf_log.call_count == int(perf_enabled)
+    if diagnostics_enabled:
+        assert [call.args[0] for call in emit_event.call_args_list] == [
+            "ctx_transfer_queued",
+            "ctx_worker_dequeued",
+            "ctx_backend_submit_start",
+            "ctx_backend_submitted",
+            "ctx_backend_complete",
+        ]
+        for call in emit_event.call_args_list:
+            assert call.kwargs["transfer_bytes"] == 0x180
+            assert call.kwargs["receiver_slice_id"] == 0
+        assert emit_event.call_args_list[2].kwargs["transfer_entries"] == 2
+    else:
+        emit_event.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_diagnostics_only_payload_size_failure_is_nonfatal() -> None:
+    sizes = Mock(size=2)
+    sizes.sum.side_effect = RuntimeError("diagnostic payload inspection failed")
+
+    assert transfer_mod._capture_transfer_bytes(sizes, None, 2) is None
+    sizes.sum.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_payload", [False, True])
+@pytest.mark.parametrize("canonical_request_id", [None, 109])
+def test_sender_event_helper_skips_empty_payload_and_isolates_sink_failures(
+    monkeypatch: pytest.MonkeyPatch, has_payload: bool, canonical_request_id: int | None
+) -> None:
+    sender = _make_owned_sender()
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._registrar = SimpleNamespace(self_rank_info=Mock())
+    emit_event = Mock(side_effect=RuntimeError("diagnostic sink failed"))
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True
+    )
+    write_meta = transfer_mod.WriteMeta(
+        task=SimpleNamespace(_params=DisaggregatedParams(disagg_request_id=canonical_request_id)),
+        expected_transfers=1,
+        peer_name="gen2",
+        peer_rank=2,
+        peer_endpoint="receiver",
+        unique_rid=109,
+        src_ptrs=np.array([0x1000] if has_payload else [], dtype=np.int64),
+        dst_ptrs=np.array([0x2000] if has_payload else [], dtype=np.int64),
+        sizes=np.array([0x100] if has_payload else [], dtype=np.int64),
+        transfer_bytes=0x100 if has_payload else 0,
+    )
+
+    sender._enqueue(write_meta)
+
+    assert sender._send_task_queues[0].get_nowait() is write_meta
+    assert emit_event.call_count == int(has_payload)
+    if has_payload:
+        assert emit_event.call_args.kwargs["request_id"] == 109
+        assert emit_event.call_args.kwargs["request_id_scope"] == (
+            "run" if canonical_request_id is not None else "process"
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("request_id_scope", ["run", "process", "unknown"])
+def test_writer_result_correlation_uses_session_provenance_not_wire_id(
+    monkeypatch: pytest.MonkeyPatch, request_id_scope: str
+) -> None:
+    rid = 109
+    session = (
+        None
+        if request_id_scope == "unknown"
+        else SimpleNamespace(
+            _base_args=SimpleNamespace(
+                params=DisaggregatedParams(
+                    disagg_request_id=rid if request_id_scope == "run" else None
+                )
+            ),
+            process_kv_agent_result=Mock(),
+        )
+    )
+    receiver = object.__new__(Receiver)
+    receiver._get_session = Mock(return_value=session)
+    receiver._registrar = SimpleNamespace(self_rank_info=Mock())
+    emit_event = Mock()
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True
+    )
+    message = transfer_mod._make_kv_result_msg(2, rid, 0, True, AgentResult.SUCCESS, 256)
+    wire_message = tuple(message)
+
+    receiver._process_kv_agent_result(b"sender", message)
+
+    receiver._get_session.assert_called_once_with(rid)
+    assert tuple(message) == wire_message
+    assert emit_event.call_args.args == ("gen_writer_result_received",)
+    assert emit_event.call_args.kwargs["request_id"] == rid
+    assert emit_event.call_args.kwargs["request_id_scope"] == request_id_scope
+    if session is not None:
+        session.process_kv_agent_result.assert_called_once_with(
+            2,
+            0,
+            True,
+            AgentResult.SUCCESS,
+            transfer_size=256,
+        )
 
 
 @pytest.mark.cpu_only
@@ -1219,6 +1520,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     session = SimpleNamespace(
         disagg_request_id=rid,
         _need_aux=True,
+        _enforce_physical_ownership=True,
         lock=threading.Lock(),
         has_failed=Mock(return_value=True),
         resources_drained=Mock(return_value=True),
@@ -1322,6 +1624,10 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
 
     session = transceiver._send_sessions[rid]
     assert session.status == SessionStatus.CANCELLED
+    outcome = session._logical_outcomes.terminal
+    assert outcome.status is SessionStatus.CANCELLED
+    assert outcome.by_peer is True
+    session.close = Mock(wraps=session.close, return_value=False)
     assert session.kv_tasks == []
     assert session.aux_task is None
     assert transceiver._send_reqs == {rid: request}
@@ -1341,15 +1647,31 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     # The reap's trailing rank-local error check is not under test here.
     executor.disagg._check_transfer_errors = Mock()
 
+    with pytest.raises(RuntimeError, match="session close refused"):
+        executor.disagg.reap_context_sends(0)
+
+    assert transfers == {rid: request}
+    end_transfer.assert_not_called()
+    assert transceiver._send_sessions == {rid: session}
+    assert transceiver._send_reqs == {rid: request}
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    assert not request.py_kv_send_session_retired
+    assert session._logical_outcomes.terminal is outcome
+
+    session.close.return_value = DEFAULT
+    executor.disagg.reap_context_sends(0)
     executor.disagg.reap_context_sends(0)
 
     assert transfers == {}
     end_transfer.assert_called_once_with(request)
+    assert session.close.call_count == 2
+    assert session._logical_outcomes.terminal is outcome
+    assert session.status is SessionStatus.CANCELLED
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert request.py_kv_send_session_retired
     assert transceiver._send_sessions == {}
     assert transceiver._send_reqs == {}
-    sweep_stale_req_infos.assert_called_once_with()
+    assert sweep_stale_req_infos.call_count == 2
 
 
 @pytest.mark.cpu_only
@@ -1614,7 +1936,7 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
     sender._agent.submit_transfer_requests.assert_not_called()
     assert task.resources_drained
     assert task.status == transfer_mod.TaskStatus.ERROR
-    sender._get_result_dealer.assert_called_once_with("receiver", legacy_shared=True)
+    sender._get_result_dealer.assert_called_once_with("receiver", legacy_shared=True, owned=True)
     dealer.send.assert_called_once()
     instance_rank, result_rid, result_slice, is_last, status_code, _ = (
         transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])
@@ -1721,6 +2043,12 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     peer_rank = 2
     sender = _make_owned_sender()
     sender._device_id = 0
+    sender._registrar = SimpleNamespace(self_rank_info=Mock())
+    emit_event = Mock()
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True
+    )
     wait = Mock(return_value=False)
     detail = "ERROR"
     if failure_mode == "wait_exception":
@@ -1738,6 +2066,7 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     sender._agent = SimpleNamespace(
         name="nixl",
         submit_transfer_requests=submit,
+        check_remote_descs=lambda _name, _descs: True,
     )
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
@@ -1781,12 +2110,17 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
         receiver_slice_id=0,
         is_last_slice=True,
         meta_type=meta_type,
+        transfer_bytes=0x100,
     )
 
     if meta_type == transfer_mod.WriteMetaType.KV:
         sender._deliver_kv_to_agent(write_meta)
         status_code = transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])[4]
         assert transfer_mod._AGENT_RESULT_BY_CODE[status_code] == AgentResult.IN_DOUBT
+        expected_events = ["ctx_backend_submit_start"]
+        if failure_mode != "submit_exception":
+            expected_events.append("ctx_backend_submitted")
+        assert [call.args[0] for call in emit_event.call_args_list] == expected_events
     else:
         sender._deliver_aux_to_agent(write_meta)
         assert dealer.send.call_args.args[0][-1] == AgentResult.IN_DOUBT.value.encode("ascii")
@@ -2083,6 +2417,59 @@ def test_sender_physical_operation_rejects_unproven_retirement(submitted: bool) 
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("lookup_raises", [False, True])
+def test_rejected_descriptor_does_not_poison_later_write(lookup_raises: bool) -> None:
+    rejected = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=12))
+    assert rejected.begin_physical_operation(7)
+    sender = _make_owned_sender()
+    sender._shutdown = True
+    status = Mock(wait=Mock(return_value=True))
+    sender._agent = Mock(submit_transfer_requests=Mock(return_value=status))
+    sender._agent.check_remote_descs.side_effect = [
+        RuntimeError("metadata lookup failed") if lookup_raises else False,
+        True,
+    ]
+    request = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+    with pytest.raises(transfer_mod._TransferNotSubmittedError):
+        sender._submit_transfer(rejected, 7, request)
+    sender._agent.check_remote_descs.assert_called_once_with("peer", request.dst_descs)
+    sender._agent.submit_transfer_requests.assert_not_called()
+    operation = rejected._physical_operations[7]
+    assert operation.state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+    assert operation.request is None
+    assert operation.status is None
+    assert rejected.resources_drained
+    assert sender._ownership_poisoned is None
+
+    later = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=13))
+    assert later.begin_physical_operation(8)
+    valid = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+    assert sender._submit_transfer(later, 8, valid) == (True, None)
+    sender._agent.submit_transfer_requests.assert_called_once_with(valid)
+    assert later._physical_operations[8].state is transfer_mod._PhysicalOperationState.BACKEND_DONE
+    assert later.resources_drained
+    assert sender._ownership_poisoned is None
+
+
+@pytest.mark.cpu_only
+def test_submission_exception_after_preflight_remains_in_doubt() -> None:
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=12))
+    assert task.begin_physical_operation(7)
+    sender = _make_owned_sender()
+    sender._shutdown = True
+    error = RuntimeError("submission outcome unknown")
+    sender._agent = Mock(
+        check_remote_descs=Mock(return_value=True),
+        submit_transfer_requests=Mock(side_effect=error),
+    )
+    request = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+    assert sender._submit_transfer(task, 7, request) == (False, str(error))
+    assert sender._ownership_poisoned is error
+    assert task._physical_operations[7].state is transfer_mod._PhysicalOperationState.IN_DOUBT
+    assert not task.resources_drained
+
+
+@pytest.mark.cpu_only
 def test_sender_retires_only_after_backend_done() -> None:
     sender = _make_owned_sender()
     done = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=92))
@@ -2303,6 +2690,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     send_session = SimpleNamespace(
         send=send_after_rooting,
         kv_tasks=send_tasks,
+        _enforce_physical_ownership=True,
         set_exception=Mock(),
         has_failed=Mock(return_value=False),
     )

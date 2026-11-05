@@ -467,3 +467,20 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
         second = llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
         assert len(first.outputs[0].token_ids) == output_length
         assert second.outputs[0].token_ids == first.outputs[0].token_ids
+
+
+class TestGLM53FlashNVFP4(LlmapiAccuracyTestHarness):
+    """GLM-5.3-Flash NVFP4 (FP8 KV cache) accuracy on Blackwell, including SM120."""
+
+    MODEL_NAME = "zai-org/GLM-5.3-Flash"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.3-Flash-NVFP4"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_tep(self, tp_size, ep_size):
+        with LLM(self.MODEL_PATH, **TestGLM53FlashFP8._llm_kwargs(tp_size, ep_size)) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
