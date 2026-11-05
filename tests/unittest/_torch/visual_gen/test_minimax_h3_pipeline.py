@@ -564,7 +564,7 @@ def test_modular_manifest_preserves_pipeline_metadata(tmp_path: Path) -> None:
     assert config.primary_pretrained_config.expand_timesteps is True
 
 
-@pytest.mark.parametrize("capability", [(8, 9), (9, 0), (10, 1), (12, 0)])
+@pytest.mark.parametrize("capability", [(8, 9), (10, 1), (12, 0)])
 def test_trtllm_attention_rejects_unvalidated_gpu(
     monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
 ) -> None:
@@ -576,11 +576,11 @@ def test_trtllm_attention_rejects_unvalidated_gpu(
         parallel=ParallelConfig(),
         attention=SimpleNamespace(backend="TRTLLM"),
     )
-    with pytest.raises(NotImplementedError, match="SM100"):
+    with pytest.raises(NotImplementedError, match="SM90, SM100 or SM103"):
         MiniMaxH3Pipeline(config)
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0), (10, 3)])
 def test_trtllm_attention_accepts_supported_gpu(
     monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
 ) -> None:
