@@ -345,3 +345,61 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
     torch.testing.assert_close(
         qkv[:, :q_size].float(), ref_qkv[:, :q_size].float(), rtol=2**-7, atol=1e-5
     )
+
+
+@pytest.mark.parametrize(
+    "per_layer_tables", [False, True], ids=["group_tables", "per_layer_tables"]
+)
+def test_per_layer_page_tables_are_declined(per_layer_tables):
+    """A KV manager with per-layer page tables (SWA scratch reuse) indexes ``kv_cache_block_offsets``
+    by local layer: layers 1 and 3 of one lifecycle group can map different pages. The library reads
+    the lifecycle group's table, so it declines such a manager; layer 3 then runs on the regular
+    kernel instead of reading layer 1's pages."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+        FlashAttn4GenerationFmha,
+    )
+    from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionInputType,
+        PredefinedAttentionMask,
+    )
+
+    manager = SimpleNamespace(
+        index_mapper=object(),
+        is_draft=False,
+        layer_offsets={1: 1, 3: 3},
+        layer_to_pool_mapping_dict={1: 1, 3: 1},  # one lifecycle group
+        _use_per_layer_page_tables=per_layer_tables,
+    )
+    metadata = SimpleNamespace(
+        num_generations=4,
+        num_contexts=0,
+        kv_cache_manager=manager,
+        kv_cache_block_offsets=torch.zeros(4, 4, 2, 8, dtype=torch.int32),
+        beam_width=1,
+        is_cross=False,
+        enable_helix=False,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
+        max_seq_len=None,
+    )
+    forward_args = SimpleNamespace(
+        attention_input_type=AttentionInputType.mixed,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_mask_data=None,
+        attention_sinks=None,
+        relative_attention_bias=None,
+        out_scale=None,
+        output_sf=None,
+        attention_window_size=None,
+    )
+    fmha = SimpleNamespace(attn=SimpleNamespace(layer_idx=3, position_embedding_type=0))
+    q = torch.empty(4, 8, dtype=torch.bfloat16)
+    supported = FlashAttn4GenerationFmha._is_supported(
+        fmha, q, None, None, metadata, forward_args, phase=FmhaPhase.GENERATION
+    )
+    assert supported is not per_layer_tables

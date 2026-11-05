@@ -738,6 +738,10 @@ class FlashAttn4GenerationFmha(PhasedFmha):
             or not hasattr(manager, "index_mapper")
             or (getattr(manager, "is_draft", False) and not _draft_enabled())
             or metadata.kv_cache_block_offsets is None
+            # Per-layer page tables are indexed by local layer, and two layers of one lifecycle
+            # group can map different pages; ``_page_table`` reads (and shares) the table of the
+            # lifecycle group.
+            or getattr(manager, "_use_per_layer_page_tables", False)
         ):
             return False
         if (
