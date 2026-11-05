@@ -20,6 +20,7 @@ import pickle
 import sys
 import traceback
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -59,6 +60,8 @@ def _fp8(gen, n, k):
     return (w / scale).to(torch.float8_e4m3fn), torch.exp2(exponent).to(torch.float8_e8m0fnu)
 
 
+# Pool workers run later tests: restore the environment.
+@patch.dict(os.environ)
 @torch.inference_mode()
 def _check(rank: int, tp_size: int, strategy: str) -> None:
     if strategy == "MNNVL":

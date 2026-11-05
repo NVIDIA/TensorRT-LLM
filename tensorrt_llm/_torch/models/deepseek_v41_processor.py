@@ -107,19 +107,20 @@ class _TurnPrefixTokenCache:
             digest.update(text[pos:end].encode("utf-8", "surrogatepass"))
             pos = end
             keys.append(digest.digest())
-        cut, head, hit = 0, [], None
+        cut, head, hit = 0, np.empty(0, dtype=np.int32), None
         for end, key in zip(reversed(ends), reversed(keys)):
             value = self._store.get(key)
             if value is not None:
-                cut, head, hit = end, np.frombuffer(value, dtype=np.int32).tolist(), key
+                cut, head, hit = end, np.frombuffer(value, dtype=np.int32), key
                 break
         if cut < ends[-1]:
-            head = head + self._encode(text[cut : ends[-1]])
-            self._store.put(keys[-1], np.asarray(head, dtype=np.int32).tobytes())
+            added = np.asarray(self._encode(text[cut : ends[-1]]), dtype=np.int32)
+            head = np.concatenate((head, added))
+            self._store.put(keys[-1], head.tobytes())
             if hit is not None:
                 # The longer entry serves the conversation's next turn.
                 self._store.demote(hit)
-        return head + self._encode(text[ends[-1] :])
+        return head.tolist() + self._encode(text[ends[-1] :])
 
     def _encode(self, text: str) -> list[int]:
         return self._tokenizer.encode(text, add_special_tokens=False)

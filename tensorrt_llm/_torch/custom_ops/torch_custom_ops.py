@@ -2619,12 +2619,25 @@ class RouterGemmRunner(TunableRunner):
 _ROUTER_GEMM_AUTOTUNED_OP = "trtllm::router_gemm_autotuned::gemm"
 
 
+def small_m_applies_on_tuning_group(
+        runner: TunableRunner, inputs: List[Optional[torch.Tensor]]) -> bool:
+    """``runner.small_m_applies(inputs)``; while tuning, on every rank of the tuning group, whose
+    ``choose_one`` all-gathers and so must run on all of them or none."""
+    applies = runner.small_m_applies(inputs)
+    tuner = AutoTuner.get()
+    if tuner.is_tuning_mode and tuner._needs_rank_agreement(
+            runner.tuning_config.distributed_tuning_strategy):
+        applies = all(tuner._dist.tp_cp_allgather(obj=bool(applies)))
+    return applies
+
+
 def router_gemm_autotuned(input: torch.Tensor,
                           weight: torch.Tensor) -> torch.Tensor:
     """FP32 ``input @ weight.T`` for an MoE router on this bucket's faster kernel."""
     runner = RouterGemmRunner()
     inputs = [input, weight]
-    if is_torch_compiling() or not runner.small_m_applies(inputs):
+    if is_torch_compiling() or not small_m_applies_on_tuning_group(
+            runner, inputs):
         return runner(inputs)
     _, tactic = AutoTuner.get().choose_one(_ROUTER_GEMM_AUTOTUNED_OP, [runner],
                                            runner.tuning_config, inputs)
@@ -2714,7 +2727,7 @@ def fp8_block_scale_swiglu_prefers_bf16(
     runner = FP8BlockScaleSwigluGemmRunner(
         swiglu_limit, use_cute_dsl_rubin=use_cute_dsl_rubin)
     inputs = [gate_up, weight, weight_scale, block_scale]
-    if not runner.small_m_applies(inputs):
+    if not small_m_applies_on_tuning_group(runner, inputs):
         return False
     tuner = AutoTuner.get()
     if tuner.is_tuning_mode:
@@ -2742,7 +2755,7 @@ def fp8_block_scale_gemm_autotuned(
     runner = FP8BlockScaleGemmRunner(torch.bfloat16,
                                      use_cute_dsl_rubin=use_cute_dsl_rubin)
     inputs = [input, weight, weight_scale, block_scale]
-    if not runner.small_m_applies(inputs):
+    if not small_m_applies_on_tuning_group(runner, inputs):
         return runner.run_quantized(input, weight, weight_scale)
     tuner = AutoTuner.get()
     if tuner.is_tuning_mode:

@@ -1220,6 +1220,7 @@ def _run_decoder_pass_graph() -> None:
     from test_modeling_deepseekv41 import _tiny_v41_model_config
 
     from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
+    from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
     from tensorrt_llm._torch.utils import (
         get_per_request_prefill_cuda_graph_flag,
         set_per_request_prefill_cuda_graph_flag,
@@ -1266,7 +1267,7 @@ def _run_decoder_pass_graph() -> None:
         config._frozen = True
         model = DeepseekV41ForCausalLM(config).cuda()
         _init_random_weights(model)
-        assert type(model.model.layers[5].mlp.experts.comm).__name__ == "NVLinkOneSided"
+        assert isinstance(model.model.layers[5].mlp.experts.comm, NVLinkOneSided)
         # Separated expert biases fix every routing choice, so that a rounding difference
         # cannot flip an expert; three experts on each EP rank keep the all-to-all busy.
         for layer in model.model.layers:

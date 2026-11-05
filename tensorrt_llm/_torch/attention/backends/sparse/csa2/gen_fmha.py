@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CSA2 generation attention on the GB300 sparse MLA CuTe DSL kernel (``kernels/blackwell/sparse_mla``).
+"""CSA2 generation attention on the sm_103 sparse MLA CuTe DSL kernel (``kernels/blackwell/sparse_mla``).
 
 Generation tiles of 64 query heads per rank (attention DP) with E4M3 staging on sm_103 that the backend
 routes here (``CSA2TrtllmAttention.gen_fmha_serves``) run this core instead of the fused decode or the native
@@ -20,17 +20,19 @@ HEADS = 64
 HEAD_DIM = 512
 # The core's per-token list buffer: 128 SWA rows + 512 selected rows.
 LIST_COLUMNS = 640
+# The core copies each list in whole tiles of this many keys.
+LIST_TILE = 64
 
 
 @functools.cache
 def gen_fmha_device_supported(device_index: int) -> bool:
-    """The core needs 512 TMEM columns and reads its row maxima with ``tcgen05.ld.red``: sm_103."""
+    """The core reads its row maxima with ``tcgen05.ld.red``, which needs sm_103."""
     return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
 def gen_fmha_fits(heads: int, width: int) -> bool:
     """Whether the core serves ``heads`` query heads over ``width``-column staging lists."""
-    return heads == HEADS and width <= LIST_COLUMNS
+    return heads == HEADS and width <= LIST_COLUMNS and width % LIST_TILE == 0
 
 
 def staging_bank(metadata) -> tuple[int, int] | None:

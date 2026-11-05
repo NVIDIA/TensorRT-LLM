@@ -3,8 +3,9 @@
 """Expert placement learned online from a server's own traffic: in warmup, or for the whole run.
 
 ``MoeLoadBalancerConfig.warmup_placement`` keeps the MoE layers static load-balancer layers with
-one slot per expert and lets a controller re-place their experts a bounded number of times at
-executor-step boundaries: per-layer expert counters run from ``start_step``, a round runs every
+one slot per expert, or a replicated cover of the experts, and lets a controller re-place their
+experts a bounded number of times at executor-step boundaries: per-layer expert counters run
+from ``start_step``, a round runs every
 ``interval_steps`` after it once ``min_rows`` new rows are counted, and the placement is frozen
 after ``max_migrations`` rounds. At ``deadline_step`` a last round runs on whatever was counted
 since the previous one, then the placement is frozen.
@@ -126,30 +127,6 @@ _SLOT_PARAM_NAMES = (
 )
 
 
-@dataclasses.dataclass(frozen=True)
-class WarmupPlacementSettings:
-    """Schedule and planner of the warmup placement (``MoeWarmupPlacementConfig``)."""
-
-    start_step: int
-    interval_steps: int
-    max_migrations: int
-    min_rows: int = 0
-    deadline_step: Optional[int] = None
-    planner: str = "lpt"
-    min_pos: int = 0
-    decay: float = 1.0
-    max_moved_fraction: float = 0.1
-    min_gain: float = 0.01
-    count_every_steps: int = 1
-    min_round_gain: float = 0.0
-
-    @classmethod
-    def from_config(
-        cls, config: Optional[MoeWarmupPlacementConfig]
-    ) -> Optional[WarmupPlacementSettings]:
-        return None if config is None else cls(**config.model_dump())
-
-
 class RouteCounters(NamedTuple):
     """One layer's counters for a routing kernel that adds its picks itself (see ``count_routing``)."""
 
@@ -166,7 +143,7 @@ NONE, CHECK, LAST = 0, 1, 2
 
 
 def schedule_action(
-    settings: WarmupPlacementSettings, step: int, migrations_done: int, next_check: int
+    settings: MoeWarmupPlacementConfig, step: int, next_check: int
 ) -> Tuple[int, int]:
     """(action, next_check) before the forward of ``step``: a pure function of its arguments, so
     every EP rank decides the same at the same step. Steps without a forward never reach the
@@ -593,7 +570,7 @@ class WarmupPlacementController:
 
     def __init__(
         self,
-        settings: WarmupPlacementSettings,
+        settings: MoeWarmupPlacementConfig,
         ep_rank: int,
         ep_size: int,
         num_target_layers: Optional[int] = None,
@@ -710,7 +687,7 @@ class WarmupPlacementController:
                 f"{self.ep_size}) for its slot exchange"
             )
         if not self.layers:
-            logger.warning(f"{_LOG} no static one-copy balancer layer registered; nothing to place")
+            logger.warning(f"{_LOG} no static balancer layer registered; nothing to place")
             self.frozen = True
             return
         self._comm = self._make_ep_comm()
@@ -880,9 +857,7 @@ class WarmupPlacementController:
             self._flag.fill_(1)
             self._counting_since = step
             logger.info(f"{_LOG} counters on at step {step}")
-        action, self._next_check = schedule_action(
-            self.settings, step, self.migrations_done, self._next_check
-        )
+        action, self._next_check = schedule_action(self.settings, step, self._next_check)
         if action != NONE:
             # Weights made in inference mode can only be updated in place inside it.
             with torch.inference_mode():

@@ -702,11 +702,14 @@ class PyExecutor:
                                            List[LlmRequest]]] = None
     # The longest a received request waits for its parse to overlap a GPU wait.
     INTAKE_WAIT_BOUND_S = 0.03  # 30 ms
-    # Response staging of enable_client_io_during_gpu_wait (executor thread only). Declared
-    # on the class: an instance built without __init__ publishes its responses directly.
+    # enable_client_io_during_gpu_wait state, written by the executor thread; the
+    # request-intake thread reads _fetch_may_block (wait_for_intake_window). Declared on
+    # the class: an instance built without __init__ publishes its responses directly.
     client_io_during_gpu_wait = False
     _stage_responses = False
-    _staged_responses: Sequence[Tuple[int, LlmResponse]] = ()
+    # (request id, response, result queue) entries.
+    _staged_responses: Sequence[Tuple[int, LlmResponse,
+                                      Optional["ActorHandle"]]] = ()
     _loop_iteration = 0
     _staged_at = 0
     _fetch_may_block = False
@@ -988,7 +991,8 @@ class PyExecutor:
         self.print_log = self.llm_args.print_iter_log
         self.client_io_during_gpu_wait = self.llm_args.enable_client_io_during_gpu_wait
         # Responses held for the next GPU wait.
-        self._staged_responses: List[Tuple[int, LlmResponse]] = []
+        self._staged_responses: List[Tuple[int, LlmResponse,
+                                           Optional["ActorHandle"]]] = []
         # Set while the overlap loop waits on the GPU, and for good at shutdown:
         # the request-intake thread parses then (wait_for_intake_window).
         self._intake_window = threading.Event()
@@ -7387,8 +7391,11 @@ class PyExecutor:
                     self._flush_pending_transfer_responses()
                 # A receive waits for its pages' admission work, which queues
                 # behind the step in flight; it is posted after _update_requests.
+                # Preparing a receive reports it to a KV connector, which must
+                # see it after that work, so a connector keeps the wait.
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch(
-                    defer_gen_receives=self.previous_batch is not None)
+                    defer_gen_receives=self.previous_batch is not None
+                    and self.kv_connector_manager is None)
 
                 if scheduled_batch is None:
                     self._flush_pending_transfer_responses()
@@ -11411,29 +11418,31 @@ class PyExecutor:
             )
 
         if self.dist.rank == 0 or self.gather_all_responses:
+            # Look up the result queues now: a staged response is published after
+            # its request may have terminated, which drops the request's queue.
+            routed = [(req_id, resp, self.result_wait_queues.get(req_id))
+                      for req_id, resp in responses]
             if self._stage_responses:
                 if not self._staged_responses:
                     self._staged_at = self._loop_iteration
-                self._staged_responses.extend(responses)
+                self._staged_responses.extend(routed)
                 self._maybe_record_hang_diagnostic_phase("responses_staged")
                 return
-            self._publish_responses(responses)
+            self._publish_responses(routed)
         self._maybe_record_hang_diagnostic_phase("responses_enqueued")
 
-    def _publish_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
+    def _publish_responses(self,
+                           responses: Iterable[Tuple[int, LlmResponse,
+                                                     Optional["ActorHandle"]]]):
         with self.response_cv:
-            for req_id, resp in responses:
+            for req_id, resp, result_wait_queue in responses:
                 if req_id in self.responses.keys():
                     self.responses[req_id].append(resp)
                 else:
                     self.responses.update({req_id: [resp]})
                 # (TODO: joyang) There are other types of responses, we need to sort out.
-                if type(
-                        resp
-                ) == LlmResponse and req_id in self.result_wait_queues and self.result_wait_queues[
-                        req_id] is not None:
-                    self.result_wait_queues[req_id].put_response.remote(
-                        resp.client_id, resp)
+                if type(resp) == LlmResponse and result_wait_queue is not None:
+                    result_wait_queue.put_response.remote(resp.client_id, resp)
             self.response_cv.notify_all()
 
     def _flush_staged_responses(self):

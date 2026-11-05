@@ -92,18 +92,53 @@ class PeerBuffers:
 
     @classmethod
     def _create_ipc(cls, mapping: Mapping, nbytes: int) -> Optional["PeerBuffers"]:
-        from tensorrt_llm._ipc_utils import IpcMemory
+        from tensorrt_llm._ipc_utils import (
+            IpcMemory,
+            _ipc_mem_handle_from_bytes,
+            _ipc_mem_handle_to_bytes,
+            _raise_if_error,
+            cudart,
+        )
 
         from .communicator import Distributed
 
+        if mapping.tp_size > mapping.gpus_per_node:
+            return None
         dist = Distributed.get(mapping)
-        ipc = None
+        # A holder only: when collected it frees peer_ptrs[tp_rank] and closes the other peer_ptrs.
+        ipc = IpcMemory(mapping, nbytes, False)
+        ipc.open_ipc = True
+        handle = None
         try:
-            ipc = IpcMemory(mapping, nbytes, True)  # cudaMalloc + memset 0 + handle all-gather
-            ok = ipc.open_ipc
+            # 2 MiB-aligned like IpcMemory: smaller allocations can share an IPC handle.
+            size = (nbytes + (1 << 21) - 1) // (1 << 21) * (1 << 21)
+            error, ptr = cudart.cudaMalloc(size)
+            _raise_if_error(error)
+            ipc.local_ptr = ipc.peer_ptrs[mapping.tp_rank] = ptr
+            _raise_if_error(cudart.cudaMemset(ptr, 0, size)[0])
+            error, local_handle = cudart.cudaIpcGetMemHandle(ptr)
+            _raise_if_error(error)
+            handle = _ipc_mem_handle_to_bytes(local_handle)
+        except RuntimeError as e:
+            logger.warning(f"IPC peer buffers failed: {e}")
+        # A rank whose allocation failed sends None in place of its handle: then no rank opens any.
+        handles = dist.tp_allgather(handle)
+        if None in handles:
+            return None
+        ok = True
+        try:
+            for r, peer_handle in enumerate(handles):
+                if r != mapping.tp_rank:
+                    error, ptr = cudart.cudaIpcOpenMemHandle(
+                        _ipc_mem_handle_from_bytes(peer_handle),
+                        cudart.cudaIpcMemLazyEnablePeerAccess,
+                    )
+                    _raise_if_error(error)
+                    ipc.peer_ptrs[r] = ptr
         except RuntimeError as e:
             logger.warning(f"IPC peer buffers failed: {e}")
             ok = False
+        # Opening a peer handle can fail on one rank only: every rank falls back together.
         if not all(dist.tp_allgather(ok)):
             return None
         # No rank writes before every rank's allocation is zeroed.
@@ -114,8 +149,8 @@ class PeerBuffers:
     @classmethod
     def _create_mnnvl(cls, mapping: Mapping, nbytes: int) -> Optional["PeerBuffers"]:
         from .mnnvl_memory import TpMnnvlMemory
-        from .ops import _mnnvl_workspace_all_succeeded
 
+        # An mpi4py communicator or, without MPI, a ProcessGroupComm: only the calls both have.
         comm = TpMnnvlMemory.get_comm(mapping)
         try:
             mem = TpMnnvlMemory(mapping, nbytes)
@@ -124,7 +159,7 @@ class PeerBuffers:
             logger.warning(f"MNNVL peer buffers failed: {e}")
             mem = None
         # Importing or mapping a peer handle can fail on one rank only: every rank falls back together.
-        if not _mnnvl_workspace_all_succeeded(comm, mem is not None):
+        if not all(comm.allgather(mem is not None)):
             return None
         torch.cuda.synchronize()
         # Every rank zeroed its buffer before any rank writes into it.

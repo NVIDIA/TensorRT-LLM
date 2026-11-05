@@ -43,6 +43,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm._torch.host_staging import copy_host_to_device
 from tensorrt_llm._torch.kernels.blackwell.engram.decode_hash import compile_engram_decode_hash
 from tensorrt_llm._torch.kernels.blackwell.engram.lookup import (
+    check_lookup_geometry,
     compile_engram_lookup,
     packed_row_bytes,
 )
@@ -1639,6 +1640,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
                 f"{block_size}; the checkpoint stores one exponent per block, so a "
                 "partial trailing block has no scale to dequantize it with."
             )
+        check_lookup_geometry(D, block_size)
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
         self.block_size = block_size
@@ -1992,6 +1994,10 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         ):
             raise ValueError(
                 "Engram packed rows must be a contiguous uint8 buffer from empty_packed"
+            )
+        if self.block_size != 32:
+            raise ValueError(
+                "Packed Engram rows feed the MXFP8 projection, which reads one scale per 32 lanes"
             )
         weight, scale = self.storage()
         num_ctas = max(1, _multi_processor_count(input_ids.device.index) // 2)

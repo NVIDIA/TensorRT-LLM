@@ -87,12 +87,13 @@ def _gather_kernel(
     ROWS_PAD: tl.constexpr,
     SAMPLED: tl.constexpr,
 ):
-    """Once every member finished sampling the previous call, copy this rank's rows (int32 words) and their
-    sampling parameters into every member's buffers; the last program counts the call and raises this rank's
-    arrival counter at every member. This rank's earlier calls are done (stream order), so program 0 first
-    releases them at every member."""
+    """Once every other member finished sampling the previous call, copy this rank's rows (int32 words) and
+    their sampling parameters into every member's buffers; the last program counts the call and raises this
+    rank's arrival counter at every member. This rank's earlier calls are done (stream order), so program 0
+    first releases them at every member, and no program waits for that release."""
     pid = tl.program_id(0)
     member = tl.arange(0, NRANKS)
+    others = member != rank
     done = tl.load(calls_ptr)
     bases = tl.load(peers_ptr + member).to(tl.uint64)
     if pid == 0:
@@ -101,12 +102,12 @@ def _gather_kernel(
     got = tl.atomic_add(
         consumed_ptr + member, tl.zeros([NRANKS], tl.int64), sem="acquire", scope="sys"
     )
-    pending = tl.sum((got < done).to(tl.int32))
+    pending = tl.sum(((got < done) & others).to(tl.int32))
     while pending > 0:
         got = tl.atomic_add(
             consumed_ptr + member, tl.zeros([NRANKS], tl.int64), sem="acquire", scope="sys"
         )
-        pending = tl.sum((got < done).to(tl.int32))
+        pending = tl.sum(((got < done) & others).to(tl.int32))
     words = pid * BLOCK + tl.arange(0, BLOCK)
     total = count * row_words
     live = words < total

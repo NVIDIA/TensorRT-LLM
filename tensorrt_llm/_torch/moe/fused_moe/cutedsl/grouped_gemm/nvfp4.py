@@ -174,7 +174,12 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     ) -> MoEFusedRouteQuant | None:
         """Sqrt-softplus routing in one CuTe DSL launch, bitwise ``routing_method.apply``, for an
         input its producer already quantized to NVFP4."""
-        if not getattr(self, "_fuses_route", False) or x.is_sf_swizzled:
+        # A pre-quant scale (AWQ/ARC) must be applied before the producer's quantization.
+        if (
+            not getattr(self, "_fuses_route", False)
+            or x.is_sf_swizzled
+            or getattr(self, "fc31_act_scale", None) is not None
+        ):
             return None
         ids, weights, _ = dsv4_route(
             router_logits.to(torch.float32).contiguous(),
