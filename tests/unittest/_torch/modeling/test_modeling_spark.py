@@ -950,6 +950,8 @@ class GoldenScenario:
     atol: float
     rtol: float
     max_failed_fraction: float
+    min_row_cosine: float
+    min_top1_agreement: float
 
     def __repr__(self) -> str:
         return f"backend:{self.backend.lower()}_dtype:{str(self.dtype).split('.')[-1]}"
@@ -964,7 +966,12 @@ class TestSparkGoldenParity(unittest.TestCase):
     out_proj), so loading them also validates SparkHfWeightMapper's renames and
     the q|k|v split order: a wrong split order cannot reproduce the reference
     logits. VANILLA runs fp32 against the fp32 golden with a tight tolerance;
-    TRTLLM runs bf16 (its fused RoPE path included) with a loose tolerance.
+    TRTLLM runs bf16 (its fused RoPE path included) with a tolerance derived
+    from bf16 precision (~0.4% relative per op over a 2-layer stack). Both
+    scenarios additionally assert scale-independent shape-of-distribution
+    checks (per-row cosine similarity and top-1 agreement) so a systematic
+    gate/RoPE/window error cannot hide inside the absolute tolerance band of
+    the small-magnitude golden logits.
     """
 
     @parameterized.expand(
@@ -976,14 +983,18 @@ class TestSparkGoldenParity(unittest.TestCase):
                 atol=1e-3,
                 rtol=1e-3,
                 max_failed_fraction=0.01,
+                min_row_cosine=0.999,
+                min_top1_agreement=1.0,
             ),
             GoldenScenario(
                 backend="TRTLLM",
                 dtype=torch.bfloat16,
                 kv_dtype=tensorrt_llm.bindings.DataType.BF16,
-                atol=0.2,
-                rtol=0.2,
-                max_failed_fraction=0.01,
+                atol=0.1,
+                rtol=0.1,
+                max_failed_fraction=0.02,
+                min_row_cosine=0.99,
+                min_top1_agreement=0.9,
             ),
         ],
         lambda func, num, param: f"{func.__name__}[{param.args[0]}]",
@@ -1053,15 +1064,26 @@ class TestSparkGoldenParity(unittest.TestCase):
             )
 
         ref_logits = golden["logits"]
-        matches = torch.isclose(
-            logits.float().cpu(),
-            ref_logits.float(),
-            atol=scenario.atol,
-            rtol=scenario.rtol,
-        )
+        got = logits.float().cpu()
+        ref = ref_logits.float()
+        matches = torch.isclose(got, ref, atol=scenario.atol, rtol=scenario.rtol)
         failed_fraction = (~matches).float().mean().item()
         assert failed_fraction <= scenario.max_failed_fraction, (
             f"Exceeded tolerance vs HF-reference golden: "
             f"{failed_fraction * 100:.2f}% of logits differ more than allowed "
             f"(max {scenario.max_failed_fraction * 100:.2f}%)"
+        )
+
+        # Scale-independent checks: a systematic gate/RoPE/window error shifts
+        # the logit distribution in ways the absolute band above could hide at
+        # this golden's small logit magnitude (std ~0.2).
+        row_cosine = torch.nn.functional.cosine_similarity(got, ref, dim=-1)
+        worst_row = int(row_cosine.argmin().item())
+        assert row_cosine.min().item() >= scenario.min_row_cosine, (
+            f"Row cosine similarity {row_cosine.min().item():.4f} at position {worst_row} "
+            f"below {scenario.min_row_cosine}"
+        )
+        top1 = (got.argmax(-1) == ref.argmax(-1)).float().mean().item()
+        assert top1 >= scenario.min_top1_agreement, (
+            f"Top-1 agreement {top1:.2%} below {scenario.min_top1_agreement:.2%}"
         )
