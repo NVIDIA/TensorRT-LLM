@@ -9,8 +9,10 @@ hash is byte-identical to hashing that reference output.
 
 import hashlib
 import struct
+from typing import Callable, Protocol
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 import torch
 from blake3 import blake3
@@ -28,23 +30,23 @@ from tensorrt_llm.inputs.multimodal_data import (
 pytestmark = pytest.mark.cpu_only
 
 
-def _u8(value):
+def _u8(value: int) -> bytes:
     return value.to_bytes(1, "big", signed=False)
 
 
-def _u32(value):
+def _u32(value: int) -> bytes:
     return value.to_bytes(4, "big", signed=False)
 
 
-def _u64(value):
+def _u64(value: int) -> bytes:
     return value.to_bytes(8, "big", signed=False)
 
 
-def _len_prefixed(payload):
+def _len_prefixed(payload: bytes) -> bytes:
     return _u64(len(payload)) + payload
 
 
-def _reference_serialize(obj):
+def _reference_serialize(obj: object) -> bytes:
     """Frozen copy of the previous `tobytes()`-based `serialize_item`."""
     if isinstance(obj, str):
         return _u8(0x01) + _len_prefixed(obj.encode("utf-8"))
@@ -94,7 +96,7 @@ def _reference_serialize(obj):
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
 
-def _reference_content(item):
+def _reference_content(item: object) -> bytes:
     """Bytes the previous `_update_hash` fed to the hasher for one item."""
     out = [_HASH_SCHEME_TAG]
     if isinstance(item, AudioData):
@@ -114,29 +116,43 @@ def _reference_content(item):
     return b"".join(out)
 
 
+class _Hasher(Protocol):
+    def update(self, data: bytes) -> None: ...
+
+    def hexdigest(self) -> str: ...
+
+
+_HashLib = Callable[[], _Hasher]
+
+
 class _BytesOnlySha256:
     """Custom hasher that only accepts `bytes`, as `ContentHasher` promises."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._hasher = hashlib.sha256()
 
-    def update(self, data):
+    def update(self, data: bytes) -> None:
         if type(data) is not bytes:
             raise TypeError(f"expected bytes, got {type(data).__name__}")
         self._hasher.update(data)
 
-    def hexdigest(self):
+    def hexdigest(self) -> str:
         return self._hasher.hexdigest()
 
 
 class _BytesSubclass(bytes):
-    def __bytes__(self):
+    def __bytes__(self) -> bytes:
         return b"overridden conversion"
 
 
-_HASH_LIBS = [blake3, hashlib.sha256, _BytesOnlySha256, hashlib.blake2b, hashlib.blake2s]
+_HASH_LIBS: list[_HashLib] = [
+    blake3,
+    hashlib.sha256,
+    _BytesOnlySha256,
+    hashlib.blake2b,
+    hashlib.blake2s,
+]
 _HASH_IDS = ["blake3", "sha256", "bytes-only", "blake2b", "blake2s"]
-_UUIDS = [None, "", "uid-한글-" + "a" * 80]
 
 _SCALAR_CASES = [
     pytest.param(item, id=f"scalar-{index}")
@@ -185,7 +201,7 @@ _DTYPES = [
 ]
 
 
-def _make_array(dtype, shape):
+def _make_array(dtype: npt.DTypeLike, shape: tuple[int, ...]) -> np.ndarray:
     size = int(np.prod(shape)) if shape else 1
     raw = np.arange(size) % 7
     dtype = np.dtype(dtype)
@@ -226,7 +242,7 @@ _TENSOR_CASES = [
 ]
 
 
-def _image(mode, size):
+def _image(mode: str, size: tuple[int, int]) -> Image.Image:
     image = Image.new("RGB", size)
     if size[0] and size[1]:
         pixels = np.arange(size[0] * size[1] * 3, dtype=np.uint8).reshape(size[1], size[0], 3)
@@ -262,11 +278,15 @@ _NESTED_CASES = [
 ]
 
 
-def _audio(samples):
+def _audio(samples: np.ndarray | torch.Tensor) -> AudioData:
     return AudioData(samples=samples, sample_rate=16000)
 
 
-def _video(frames, raw_bytes_hash=None, audio=None):
+def _video(
+    frames: list[Image.Image] | list[torch.Tensor] | np.ndarray,
+    raw_bytes_hash: str | None = None,
+    audio: AudioData | None = None,
+) -> VideoData:
     meta = {"frames_indices": [0, 1], "fps": 30.0, "duration": 1.0, "unused": "x"}
     return VideoData(frames=frames, metadata=meta, audio=audio, raw_bytes_hash=raw_bytes_hash)
 
@@ -314,11 +334,13 @@ _ALL_ITEM_CASES = (
 @pytest.mark.parametrize(
     "item", [*_SCALAR_CASES, *_ARRAY_CASES, *_TENSOR_CASES, *_IMAGE_CASES, *_NESTED_CASES]
 )
-def test_serialize_item_matches_reference(item):
+def test_serialize_item_matches_reference(item: object) -> None:
     assert serialize_item(item) == _reference_serialize(item)
 
 
-def _assert_streamed_hash_matches_reference(modality, item, hash_lib, uuid):
+def _assert_streamed_hash_matches_reference(
+    modality: str, item: object, hash_lib: _HashLib, uuid: str | None
+) -> None:
     reference = hash_lib()
     if uuid is not None:
         reference.update(b"<uuid>" + uuid.encode("utf-8") + b"</uuid><content>")
@@ -334,16 +356,34 @@ def _assert_streamed_hash_matches_reference(modality, item, hash_lib, uuid):
 
 
 @pytest.mark.parametrize("hash_lib", _HASH_LIBS, ids=_HASH_IDS)
-@pytest.mark.parametrize("uuid", _UUIDS, ids=["no-uuid", "empty-uuid", "unicode-long-uuid"])
 @pytest.mark.parametrize("modality,item", _ALL_ITEM_CASES)
-def test_streamed_hash_matches_reference(modality, item, hash_lib, uuid):
+def test_streamed_hash_matches_reference(modality: str, item: object, hash_lib: _HashLib) -> None:
+    _assert_streamed_hash_matches_reference(modality, item, hash_lib, None)
+
+
+# This PR does not change the UUID framing, so other UUIDs run on a few items only.
+_UUID_ITEM_CASES = [
+    pytest.param("image", np.arange(24, dtype=np.int16).reshape(4, 6)[:, ::2], id="strided-array"),
+    pytest.param("image", _image("RGB", (5, 3)), id="image"),
+    pytest.param("audio", _audio(np.linspace(-1, 1, 33, dtype=np.float32)), id="audio"),
+    pytest.param(
+        "video", _video([_image("RGB", (4, 3)), _image("RGB", (4, 3))]), id="video-pil-frames"
+    ),
+]
+
+
+@pytest.mark.parametrize("hash_lib", _HASH_LIBS, ids=_HASH_IDS)
+@pytest.mark.parametrize("uuid", ["", "uid-한글-" + "a" * 80], ids=["empty", "unicode-long"])
+@pytest.mark.parametrize("modality,item", _UUID_ITEM_CASES)
+def test_streamed_hash_with_uuid_matches_reference(
+    modality: str, item: object, hash_lib: _HashLib, uuid: str
+) -> None:
     _assert_streamed_hash_matches_reference(modality, item, hash_lib, uuid)
 
 
 @pytest.mark.parametrize("size", [(5, 3), (1, 1), (0, 0), (0, 4), (4, 0)])
 @pytest.mark.parametrize("hash_lib", _HASH_LIBS, ids=_HASH_IDS)
-@pytest.mark.parametrize("uuid", _UUIDS, ids=["no-uuid", "empty-uuid", "unicode-long-uuid"])
-def test_float_image_hash_matches_reference(size, hash_lib, uuid):
+def test_float_image_hash_matches_reference(size: tuple[int, int], hash_lib: _HashLib) -> None:
     item = _image("F", size)
     try:
         item.convert("RGBA")
@@ -356,16 +396,16 @@ def test_float_image_hash_matches_reference(size, hash_lib, uuid):
             apply_mm_hashes({"image": [item]}, hash_lib=hash_lib)
     else:
         assert serialize_item(item) == _reference_serialize(item)
-        _assert_streamed_hash_matches_reference("image", item, hash_lib, uuid)
+        _assert_streamed_hash_matches_reference("image", item, hash_lib, None)
 
 
 @pytest.mark.parametrize("hash_lib", _HASH_LIBS, ids=_HASH_IDS)
-def test_array_payload_buffer_contract(hash_lib, monkeypatch):
+def test_array_payload_buffer_contract(hash_lib: _HashLib, monkeypatch: pytest.MonkeyPatch) -> None:
     hasher = hash_lib()
     original_update = md._update_serialized_item
-    updates = []
+    updates: list[Callable[[md._Chunk], None]] = []
 
-    def record_update(update, item):
+    def record_update(update: Callable[[md._Chunk], None], item: object) -> None:
         updates.append(update)
         original_update(update, item)
 
@@ -404,7 +444,7 @@ def test_array_payload_buffer_contract(hash_lib, monkeypatch):
     ],
     ids=["tensor", "noncontiguous_array", "pil_image", "nested"],
 )
-def test_streamed_hash_pinned_digests(item, expected):
+def test_streamed_hash_pinned_digests(item: object, expected: str) -> None:
     reference = blake3()
     reference.update(_reference_content(item))
     assert reference.hexdigest() == expected
