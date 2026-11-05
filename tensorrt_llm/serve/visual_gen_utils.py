@@ -26,12 +26,6 @@ if TYPE_CHECKING:
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
-# Read once at import. The server imports this module at startup, so a typo
-# fails the launch: reading it quietly as "1" would break a working deployment,
-# and reading it quietly as "0" would leave one that believes it is locked down
-# open.
-_LOCAL_MEDIA_PATH_DISALLOWED = get_env_flag("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", False)
-
 IMAGE_EDIT_MAX_IMAGES = 16
 IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
 IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES = 256 * 1024 * 1024
@@ -124,12 +118,16 @@ def local_media_path_is_disallowed() -> bool:
     co-located client wants and what a remote one has no business doing, and
     the code cannot tell the two deployments apart, so both are allowed by
     default and turned off together with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``.
-    The local Python API is unaffected: this gate is the HTTP boundary's.
+    The local Python API is unaffected: this gate is the HTTP boundary's. The
+    server reads it once when it is constructed and passes it to
+    `parse_visual_gen_params`.
     """
-    return _LOCAL_MEDIA_PATH_DISALLOWED
+    return get_env_flag("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", False)
 
 
-def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
+def _reference_transport(
+    ref: Any, local_media_path_disallowed: bool
+) -> tuple[Any, str, Optional[str]]:
     """Extract ``(content, format, role)`` from one raw HTTP reference.
 
     ``ref`` is a multipart ``UploadFile`` (has ``.file``) or a
@@ -143,7 +141,7 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     content = getattr(ref, "content", None)
     if not isinstance(content, str):
         raise ValueError("reference item must carry a 'content' string.")
-    if ref.format == "path" and local_media_path_is_disallowed():
+    if ref.format == "path" and local_media_path_disallowed:
         raise ValueError(
             "reference format='path' is disallowed on this server "
             "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it reads server-side files "
@@ -177,7 +175,7 @@ def _validate_video_reference_counts(request: VideoGenerationRequest, generator:
                 raise ValueError(f"'{field}' accepts at most {limit} references, got {count}.")
 
 
-def _build_reference_list(value: Any) -> Optional[list]:
+def _build_reference_list(value: Any, local_media_path_disallowed: bool) -> Optional[list]:
     """Normalize one HTTP reference field into a list of ``MediaRef`` objects.
 
     ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
@@ -194,7 +192,7 @@ def _build_reference_list(value: Any) -> Optional[list]:
     raw_items = value if isinstance(value, list) else [value]
     refs = []
     for item in raw_items:
-        content, content_format, role = _reference_transport(item)
+        content, content_format, role = _reference_transport(item, local_media_path_disallowed)
         refs.append(MediaRef(content=content, format=content_format, role=role))
     return refs
 
@@ -426,6 +424,8 @@ def _apply_deprecated_input_reference(
 def parse_visual_gen_params(
     request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
     generator: VisualGen,
+    *,
+    local_media_path_disallowed: bool = False,
 ) -> VisualGenParams:
     """Translate an HTTP request into :class:`VisualGenParams`.
 
@@ -506,13 +506,13 @@ def parse_visual_gen_params(
         # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
         # transport content (``bytes`` for an upload, the string otherwise).
         # The engine resolves it to bytes; the boundary never touches disk.
-        image_refs = _build_reference_list(request.image_reference)
+        image_refs = _build_reference_list(request.image_reference, local_media_path_disallowed)
         if image_refs:
             params.image_reference = image_refs
-        video_refs = _build_reference_list(request.video_reference)
+        video_refs = _build_reference_list(request.video_reference, local_media_path_disallowed)
         if video_refs:
             params.video_reference = video_refs
-        audio_refs = _build_reference_list(request.audio_reference)
+        audio_refs = _build_reference_list(request.audio_reference, local_media_path_disallowed)
         if audio_refs:
             params.audio_reference = audio_refs
         _apply_deprecated_input_reference(request.input_reference, params)

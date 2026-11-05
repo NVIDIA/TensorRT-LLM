@@ -501,7 +501,8 @@ def extract_audio_from_video(
     if not _PYAV_ENABLED:
         raise RuntimeError(
             "PyAV is required for audio extraction from video. "
-            "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it."
+            "Set the environment variable TRTLLM_ENABLE_PYAV=1 before starting "
+            "the process to enable it."
         )
     try:
         import av
