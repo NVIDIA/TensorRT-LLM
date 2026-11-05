@@ -256,8 +256,8 @@ class QsaPagedSparseGqa(OpWrapper):
         ),
         Cell(
             why="tep4 kv_fp8 gated decode 32 x 1 row: 6 q / 1 kv head over an e4m3 pool, q and "
-            "the gate off the 17-head fused row, 32-way split-K + gated merge",
-            spec=_default(_spread(32, 1, 9215), _TP4_FP8, _SPLIT_K, splits=32, **_TP4_ROW),
+            "the gate off the 17-head fused row, 8-way split-K + gated merge",
+            spec=_default(_spread(32, 1, 9215), _TP4_FP8, _SPLIT_K, splits=8, **_TP4_ROW),
         ),
         Cell(
             why="tep4 kv_fp8 MTP3 gated verify 128 x 4 rows = 512: 6 q / 1 kv head over an e4m3 "

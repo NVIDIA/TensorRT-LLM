@@ -263,7 +263,12 @@ def _gdn_block(layer, x, si, int_idx, conv0, win0, p, captured, monkeypatch):
             ),
             int_conv={0: win0.clone()},
             replay=types.SimpleNamespace(
-                old={0: (history,) * 4}, cache_buf_idx=None, prev_num_accepted=None, history=16
+                old={0: (history,) * 4},
+                cache_buf_idx=None,
+                prev_num_accepted=None,
+                history=16,
+                ring=None,
+                cache_base=None,
             ),
         ),
     )
