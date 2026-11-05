@@ -131,6 +131,8 @@ from .runtime_hooks import ExecutorEvents, RuntimeHooks, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .sampler.sampler_common import SampleType
+from .sampler.sampler_features import (meet_max_token_stop_criteria_at,
+                                       stop_words_match)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -651,6 +653,33 @@ def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
     return connector is None or connector.capacity_only
 
 
+def _rebuild_disagg_imported_cache(resource_manager: ResourceManager,
+                                   requests: List[LlmRequest]) -> None:
+    """Rebuild the cache state derived from the KV the requests received.
+
+    Cache state that the generation worker derives from the imported KV
+    (e.g. FP4 MLA V scales and packed V) is not transferred. Rebuild it before
+    the first forward reads it or the blocks are committed for reuse. A request
+    terminated meanwhile (e.g. by a failed sampler setup) is no longer
+    transmission-complete, and its cache must not be touched.
+    """
+    kv_mgr = resource_manager.resource_managers.get(
+        ResourceManagerType.KV_CACHE_MANAGER)
+    rebuild = getattr(kv_mgr, "rebuild_disagg_imported_cache", None)
+    if rebuild is not None:
+        rebuild([
+            req for req in requests
+            if req.is_disagg_generation_transmission_complete
+        ])
+
+
+def _import_first_gen_tokens(req: LlmRequest, beam_width: int) -> None:
+    """Append the context server's first token of each beam to ``req``."""
+    first_gen_tokens = req.context_phase_params.first_gen_tokens
+    for beam in range(0, beam_width):
+        req.add_new_token(first_gen_tokens[beam], beam)
+
+
 @dataclasses.dataclass
 class PyExecutorResources:
     """Resources and capacities replaced between profiling and serving.
@@ -1005,6 +1034,12 @@ class PyExecutor:
         # drain into the next emitted record, so sums over records stay exact.
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
+        # Set while first-token close-outs, which run no batch, wait for a
+        # record; see _process_close_out_iter_stats.
+        self._close_outs_pending_iter_stats = False
+        # Close-outs waiting for their final requestStats entry (kept only
+        # with enable_iter_req_stats); their completions are already counted.
+        self._pending_close_out_requests: List[LlmRequest] = []
         self.stream_interval = self.llm_args.stream_interval
         # Streaming: also emit on decoding iterations 2..N when the model's
         # runtime hooks ask for it (RuntimeHooks.first_content_emit_iters; 1,
@@ -3787,6 +3822,7 @@ class PyExecutor:
                 batch_state.iter_stats.iter = batch_state.iter_id
         num_completed_requests = self._pending_num_completed_requests
         self._pending_num_completed_requests = 0
+        self._close_outs_pending_iter_stats = False
 
         # Snapshot per-loop profiler timings plus the batch-matched GPU
         # forward time. The FPM GPU value is read from CUDA events without
@@ -3802,11 +3838,14 @@ class PyExecutor:
                 batch_state.gpu_forward_start_event,
                 batch_state.gpu_forward_end_event)
 
+        # First-token close-outs finished outside any batch; they join the
+        # finished requests here for requestStats only.
         req_stats = self._populate_req_stats(
-            finished_requests, active_requests,
-            batch_state.scheduled_requests) if (
+            finished_requests + self._pending_close_out_requests,
+            active_requests, batch_state.scheduled_requests) if (
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
+        self._pending_close_out_requests = []
 
         stats = self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
                                         num_completed_requests,
@@ -3829,6 +3868,29 @@ class PyExecutor:
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
+
+    def _process_close_out_iter_stats(self,
+                                      iter_stats: Optional[IterationStats],
+                                      iter_start_time: float) -> None:
+        """Record first-token close-outs from an iteration that has no batch
+        record, under the usual sampling rules.
+
+        Otherwise their completions wait for the next batch, which may not
+        come once the executor is idle. Under attention DP only rank 0 records:
+        it owns the completion counts, and the other ranks get zero rows.
+        """
+        if not self._close_outs_pending_iter_stats:
+            return
+        if self.enable_attention_dp and self.dist.rank != 0:
+            return
+        self._process_iter_stats(
+            [], self.active_requests,
+            BatchState(
+                scheduled_requests=ScheduledRequests(),
+                sample_state=None,
+                iter_start_time=iter_start_time,
+                iter_stats=self._take_pending_new_active_requests(iter_stats),
+                iter_id=self.iter_counter))
 
     def _executor_loop_cleanup(self):
         # Wake any waiters in await_responses BEFORE potentially-blocking
@@ -4014,6 +4076,7 @@ class PyExecutor:
                 self.disagg.poll_gen_transfers()
                 self._activate_completed_remote_tails()
                 self._sweep_transfer_held_failures()
+                self._close_out_gen_receives_at_first_token()
 
                 iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -4329,8 +4392,7 @@ class PyExecutor:
 
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
-                self._progress_recompute_pause_termination_if_idle(
-                    executed_batch_num)
+                self._progress_idle_pp_iteration(executed_batch_num)
 
                 # Stage 3.4: Rebalance the KV pools once the drain started at
                 # the top of some earlier iteration has emptied the ring.
@@ -4338,6 +4400,11 @@ class PyExecutor:
                     self._maybe_finish_pp_rebalance()
 
                 if not can_queue and self._pp_ring_is_drained():
+                    # No batch in flight can carry pending close-outs into
+                    # its record.
+                    if self.enable_iter_perf_stats:
+                        self._process_close_out_iter_stats(
+                            iter_stats, iter_start_time)
                     self.disagg.pace_idle()
 
                 # Stage 4: March forward in microbatch slots
@@ -4705,6 +4772,25 @@ class PyExecutor:
                     dest=self.dist.next_pp_rank,
                     tag=tag,
                 )
+
+    def _progress_idle_pp_iteration(self, executed_batch_num: int) -> None:
+        """Advance what executed-batch handling drives, when no batch executed.
+
+        ``executed_batch_num`` is broadcast along the PP ring, so every rank
+        takes this path in the same iteration and the calls below stay
+        symmetric. Responses buffered outside a batch (first-token close-out,
+        transfer errors) are flushed instead of waiting for the next executed
+        batch, and deferred PP terminations progress so finished requests
+        release their blocks while nothing executes.
+        """
+        if executed_batch_num != 0:
+            return
+        self._flush_pending_transfer_responses()
+        if self._pending_recompute_pause_ids:
+            self._progress_recompute_pause_termination_if_idle(
+                executed_batch_num)
+        elif self._disagg_pp_termination_handler is not None:
+            self._disagg_pp_termination_handler.terminate_pending_requests()
 
     def _progress_recompute_pause_termination_if_idle(
             self, executed_batch_num: int) -> None:
@@ -5576,6 +5662,9 @@ class PyExecutor:
         # After the polls so a transfer that completed this iteration releases
         # its parked failure before scheduling can admit the request.
         self._sweep_transfer_held_failures()
+        # After the sweep, so a failed transfer is reported as a failure
+        # rather than closed out as a success.
+        self._close_out_gen_receives_at_first_token()
 
         iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -6902,6 +6991,9 @@ class PyExecutor:
                 elif gpu_forward_events_from_perf_pool:
                     self.perf_manager.release_forward_timing_events(
                         gpu_forward_start, gpu_forward_end)
+                if self.enable_iter_perf_stats and sample_state is None:
+                    self._process_close_out_iter_stats(iter_stats,
+                                                       iter_start_time)
                 # Same lockstep guarantee for iter-stats; no-op when
                 # TLLM_METRICS_ALL_RANKS=0.
                 self._flush_iter_stats_synced()
@@ -8026,6 +8118,9 @@ class PyExecutor:
                 # drained by the next loop-head exchange instead.
                 if not self._packed_sync_enabled:
                     self.disagg.handle_timeouts_synced()
+                if self.enable_iter_perf_stats and not can_queue:
+                    self._process_close_out_iter_stats(iter_stats,
+                                                       iter_start_time)
                 self._flush_iter_stats_synced()
 
                 # Drop any enable_packed_sync stash this pass left behind
@@ -10493,6 +10588,149 @@ class PyExecutor:
             req.py_kv_transfer_start_time = None
             req.py_kv_transfer_timed_out = False
 
+    def _first_gen_token_finish_reason(
+            self, req: LlmRequest) -> Optional[FinishReason]:
+        """The reason the context server's first token ends ``req``, if any.
+
+        Applies the checks of ``handle_stop_criteria`` in the same order to
+        the sequence the token produces, without appending it: END_ID, then
+        LENGTH (``max_new_tokens`` or ``max_seq_len``), then STOP_WORDS.
+
+        Every rank holding ``req`` must reach the same result. Under Helix
+        each CP rank holds only its slice of the prompt, so the sequence
+        length is taken from the full prompt and multi-token stop words,
+        which need the prompt's tail, are left to the decode steps.
+        """
+        first_gen_tokens = req.context_phase_params.first_gen_tokens
+        if not first_gen_tokens:
+            return None
+        token = first_gen_tokens[0]
+        if token == req.py_end_id:
+            return FinishReason.END_ID
+        helix_sliced = self.dist.cp_size > 1
+        num_tokens = req.get_num_tokens(0) + 1
+        seq_len = req.total_input_len_cp + 1 if helix_sliced else num_tokens
+        max_seq_len = getattr(self.sampler, "max_seq_len",
+                              None) or self.max_seq_len
+        if meet_max_token_stop_criteria_at(req,
+                                           num_tokens - req.py_orig_prompt_len,
+                                           seq_len, max_seq_len):
+            return FinishReason.LENGTH
+        stop_words = req.py_stop_words_list
+        if stop_words and helix_sliced:
+            stop_words = [word for word in stop_words if len(word) == 1]
+        if stop_words and stop_words_match(
+                stop_words, token, lambda: list(req.get_tokens(0)) + [token]):
+            return FinishReason.STOP_WORDS
+        return None
+
+    def _close_out_gen_receives_at_first_token(self) -> None:
+        """Finish received generation requests that their first token ends.
+
+        The context server samples the first token of a context-only request
+        with ``max_tokens`` set to 1, so its stop check reports LENGTH before
+        it can apply the client's limit or stop words, and this server imports
+        that token without a stop check. A request the token ends is finished
+        here with the reason aggregated serving gives, instead of being
+        scheduled for a decode step past its stop.
+
+        Runs after the transfer polls, timeouts and the parked-failure sweep,
+        so a failed transfer is still reported as a failure, and before
+        attention-DP padding and scheduling. Responses and terminations go
+        through ``_flush_pending_transfer_responses``, which every executor
+        loop enters at a rank-synchronized point. Every rank holding a request
+        must decide the same way, or one would schedule a request another
+        closed out.
+        """
+        if self._kv_connector_moves_kv:
+            # The connector is handed a finished request's blocks only on
+            # the batch path (_save_kv_to_connector_async).
+            return
+        candidates = [
+            req for req in self.active_requests
+            if req.is_disagg_generation_transmission_complete
+        ]
+        if not candidates:
+            return
+        held = self._held_transfer_failures()
+        closing = []
+        for req in candidates:
+            # A remote-tail destination samples its first token in a local
+            # context step, whose stop check the sampler runs; beam search
+            # needs the sampler's beam finalization. Parked failures and
+            # cancellations keep their own outcome.
+            cancel_id = (req.parent_request_id
+                         if req.is_child else req.py_request_id)
+            if (getattr(req, "py_csa2_remote_tail_mode", None) == "destination"
+                    or req.py_beam_width != 1 or id(req) in held
+                    or cancel_id in self.canceled_req_ids):
+                continue
+            reason = self._first_gen_token_finish_reason(req)
+            if reason is not None:
+                closing.append((req, reason))
+        if not closing:
+            return
+        _rebuild_disagg_imported_cache(self.resource_manager,
+                                       [req for req, _ in closing])
+        batch_token_time = self.perf_manager.get_timestamp()
+        finished = []
+        for req, reason in closing:
+            if not self.disagg.try_finish_gen_receive(req):
+                continue
+            req.decoding_iter = 1
+            req.py_decoding_iter = 1
+            req.py_draft_tokens = []
+            _import_first_gen_tokens(req, 1)
+            self._maybe_prepend_logprobs_and_logits(req, 1)
+            req.finish_by(reason, 0)
+            response = self._create_first_token_terminal_response(
+                req, batch_token_time)
+            if response is not None:
+                self._pending_transfer_responses.append(
+                    (req.py_request_id, response))
+            self._pending_response_terminations.append(req)
+            finished.append(req)
+        if not finished:
+            return
+        finished_ids = {id(req) for req in finished}
+        self.active_requests[:] = [
+            req for req in self.active_requests if id(req) not in finished_ids
+        ]
+        first_token_timer = getattr(self, "_first_token_timer", None)
+        if first_token_timer is not None:
+            first_token_timer.observe(finished, time.monotonic())
+        if self.enable_iter_perf_stats:
+            self._pending_num_completed_requests += len(finished)
+            self._close_outs_pending_iter_stats = True
+            # Under attention DP only rank 0's requestStats are exported.
+            if self.enable_iter_req_stats and not (self.enable_attention_dp
+                                                   and self.dist.rank != 0):
+                self._pending_close_out_requests.extend(finished)
+
+    def _create_first_token_terminal_response(self, req: LlmRequest,
+                                              batch_token_time):
+        """Terminal response of a request finished at its first token.
+
+        Does the per-request bookkeeping of ``_handle_responses``. The
+        response is also the first-token response, so first-token logits
+        prepended from the context server are snapshotted past
+        ``exclude_last_generation_logits``, as in
+        ``_handle_first_token_response``.
+        """
+        req.draft_tokens = []
+        req.decoding_iter = req.py_decoding_iter
+        self.perf_manager.append_step_metrics(req,
+                                              self.iter_counter,
+                                              batch_token_time=batch_token_time)
+        if req.return_perf_metrics:
+            req.update_perf_metrics(self.iter_counter)
+        logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
+                           if self._has_prepended_logits(req) else None)
+        response = self._create_request_response(req, {})
+        if logits_snapshot is not None and response is not None:
+            response.result.generation_logits = logits_snapshot
+        return response
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         cache_trans_complete_requests = [
@@ -10513,18 +10751,10 @@ class PyExecutor:
                 kv_mgr.on_state_transfer_complete([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
-        # Cache state that the generation worker derives from the imported KV
-        # (e.g. FP4 MLA V scales and packed V) is not transferred. Rebuild it
-        # before the first forward reads it. The sampler setup above may have
-        # terminated requests, whose caches must not be touched.
-        kv_mgr = self.resource_manager.resource_managers.get(
-            ResourceManagerType.KV_CACHE_MANAGER)
-        rebuild = getattr(kv_mgr, "rebuild_disagg_imported_cache", None)
-        if rebuild is not None:
-            rebuild([
-                req for req in cache_trans_complete_requests
-                if req.is_disagg_generation_transmission_complete
-            ])
+        # The sampler setup above may have terminated requests; the rebuild
+        # skips them.
+        _rebuild_disagg_imported_cache(self.resource_manager,
+                                       cache_trans_complete_requests)
 
         for req in scheduled_batch.generation_requests:
             if (getattr(req, "py_csa2_remote_tail_mode", None) == "destination"
@@ -10560,8 +10790,7 @@ class PyExecutor:
             if not self._update_sampler_state_for_disagg_gen_request(
                     req, beam_width, first_gen_tokens):
                 continue
-            for beam in range(0, beam_width):
-                req.add_new_token(first_gen_tokens[beam], beam)
+            _import_first_gen_tokens(req, beam_width)
 
             for engine in (self.model_engine, self.draft_model_engine):
                 prepare = getattr(getattr(engine, "model", None),
@@ -12076,6 +12305,33 @@ class PyExecutor:
             return True
         return first_gen_emit or decoding_iter % self.stream_interval == 0
 
+    def _create_request_response(self, request: LlmRequest,
+                                 gpu_times_cache: dict):
+        """Create ``request``'s response with the fields every emitted one carries."""
+        if request.return_perf_metrics:
+            # Response creation may finalize and copy scalar ctx GPU totals.
+            self.perf_manager.compute_batch_gpu_times(
+                [request], gpu_times_cache=gpu_times_cache)
+        response = request.create_response()
+        if response:
+            response.result.cached_tokens = request.cached_tokens
+            response.result.ctx_computed_tokens = getattr(
+                request, 'py_ctx_computed_tokens', 0)
+            response.result.ctx_first_begin = getattr(request,
+                                                      'py_ctx_first_begin', -1)
+            response.result.ctx_num_chunks = getattr(request,
+                                                     'py_ctx_num_chunks', 0)
+            self._maybe_attach_ctx_usage(request, response)
+            response.result.per_pos_drafted = request.py_per_pos_drafted
+            response.result.per_pos_accepted = request.py_per_pos_accepted
+            if request.py_total_draft_tokens > 0:
+                # Backfill RequestPerfMetrics.speculative_decoding on
+                # the client side from the Python-owned counters.
+                response.result.spec_dec_totals = (
+                    request.py_total_accepted_draft_tokens,
+                    request.py_total_draft_tokens)
+        return response
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -12199,31 +12455,12 @@ class PyExecutor:
                     and not request.return_perf_metrics):
                 should_emit = False
             if should_emit:
-                if request.return_perf_metrics:
-                    # Response creation may finalize and copy scalar ctx GPU totals.
-                    self.perf_manager.compute_batch_gpu_times(
-                        [request], gpu_times_cache=gpu_times_cache)
-                response = request.create_response()
+                response = self._create_request_response(
+                    request, gpu_times_cache)
                 if response:
                     if first_gen_emit:
                         request.py_gen_first_emitted = True
                     request_done = request.is_finished
-                    response.result.cached_tokens = request.cached_tokens
-                    response.result.ctx_computed_tokens = getattr(
-                        request, 'py_ctx_computed_tokens', 0)
-                    response.result.ctx_first_begin = getattr(
-                        request, 'py_ctx_first_begin', -1)
-                    response.result.ctx_num_chunks = getattr(
-                        request, 'py_ctx_num_chunks', 0)
-                    self._maybe_attach_ctx_usage(request, response)
-                    response.result.per_pos_drafted = request.py_per_pos_drafted
-                    response.result.per_pos_accepted = request.py_per_pos_accepted
-                    if request.py_total_draft_tokens > 0:
-                        # Backfill RequestPerfMetrics.speculative_decoding on
-                        # the client side from the Python-owned counters.
-                        response.result.spec_dec_totals = (
-                            request.py_total_accepted_draft_tokens,
-                            request.py_total_draft_tokens)
                     new_responses.append((req_id, response))
 
             if request_done:

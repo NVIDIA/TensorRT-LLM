@@ -7,16 +7,22 @@ admitted gen-init requests and starts their KV receive in the transfer mode
 the environment selects. Receive completion: the executor's
 ``_prepare_disagg_gen_transmission_complete`` prepares the batch, then asks the
 coordinator to finish each completed receive before initialising the request
-for generation.
+for generation; a received request that the context server's first token
+already ends (by the sampler's stop criteria) is closed out before scheduling
+by ``_close_out_gen_receives_at_first_token``.
 
 Single-rank cases run one ``CoordinatorHarness``; the multi-rank case runs one
 per rank over a ``FakeDistGroup``.
 """
 
+import copy
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
+from _torch.pyexecutor.llm_request_factory import make_llm_request
 from coordinator_harness import CoordinatorHarness, TransferRequest
 from fake_dist import FakeDistGroup
 
@@ -24,10 +30,14 @@ from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_utils import partition_context_for_helix
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings import executor as trtllm
+from tensorrt_llm.bindings.executor import FinishReason, IterationStats, RequestStage
 
 pytestmark = pytest.mark.cpu_only
 
@@ -771,3 +781,515 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
     assert h.transceiver.call_log == []
     assert [req.new_tokens for req in (first, second)] == [[], []]
     assert [req.decoding_iter for req in (first, second)] == [0, 0]
+
+
+# -- first-token close-out ----------------------------------------------------
+
+_PROMPT = [3, 5, 7, 9, 11, 13, 15, 17]  # prompt_len of _GenRequest
+
+
+class _ClosingRequest(_GenRequest):
+    """A received generation request with the fields the first-token close-out
+    reads; the first token of request ``rid`` is ``40 + rid``. ``prompt`` is
+    the part of the prompt this rank holds (a Helix CP rank holds a slice)."""
+
+    def __init__(self, rid: int, max_new_tokens: int = 1, prompt=_PROMPT, **overrides) -> None:
+        defaults = dict(
+            prompt_len=len(prompt),
+            total_input_len_cp=len(prompt),
+            py_max_new_tokens=max_new_tokens,
+            py_orig_prompt_len=len(prompt),
+            py_end_id=-1,
+            py_stop_words_list=None,
+            return_perf_metrics=False,
+            response=SimpleNamespace(result=SimpleNamespace()),
+            cached_tokens=5,
+            py_per_pos_drafted=None,
+            py_per_pos_accepted=None,
+            py_total_draft_tokens=0,
+            py_total_accepted_draft_tokens=0,
+        )
+        defaults.update(overrides)
+        super().__init__(rid, **defaults)
+        self.prompt = list(prompt)
+        self.finished_reason = None
+
+    def get_num_tokens(self, beam: int) -> int:
+        return len(self.get_tokens(beam))
+
+    def get_tokens(self, beam: int) -> list:
+        return self.prompt + [token for token, _ in self.new_tokens]
+
+    def finish_by(self, reason, beam: int) -> None:
+        self.state = LlmRequestState.GENERATION_COMPLETE
+        self.finished_reason = (reason, beam)
+
+
+def _closing_executor(
+    coordinator: DisaggTransferCoordinator, active, attention_dp=False, max_seq_len=64, cp_size=1
+) -> PyExecutor:
+    """Bare executor over ``coordinator`` whose response and termination sinks are mocks."""
+    executor = object.__new__(PyExecutor)
+    executor._disagg_coordinator = coordinator
+    executor.active_requests = list(active)
+    executor.enable_attention_dp = attention_dp
+    executor.dist = SimpleNamespace(rank=0, cp_size=cp_size)
+    executor.canceled_req_ids = []
+    executor.enable_iter_perf_stats = False
+    executor.iter_counter = 7
+    executor.perf_manager = Mock()
+    executor.sampler = SimpleNamespace(max_seq_len=max_seq_len)
+    executor.max_seq_len = max_seq_len
+    executor.should_exclude_last_generation_logits = False
+    executor.resource_manager = SimpleNamespace(resource_managers={})
+    executor._enqueue_responses = Mock()
+    executor._terminate_request = Mock()
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    return executor
+
+
+def test_close_out_ends_a_single_token_request_at_its_first_token() -> None:
+    """A received request with max_new_tokens 1 gets the context server's first
+    token and finishes by LENGTH before scheduling: its blocks are committed for
+    reuse, one terminal response carrying the context-side cached tokens is
+    buffered with its termination for the synchronized flush, and it leaves
+    active_requests, so no decode step appends a second token. A longer request,
+    one still receiving, a beam-search request and a remote-tail destination
+    keep the regular path untouched."""
+    h = CoordinatorHarness()
+    single = _ClosingRequest(1)
+    longer = _ClosingRequest(2, max_new_tokens=8)
+    receiving = _ClosingRequest(3, state=_RECEIVING)
+    beams = _ClosingRequest(4, py_beam_width=2)
+    remote_tail = _ClosingRequest(5, py_csa2_remote_tail_mode="destination")
+    untouched = (longer, receiving, beams, remote_tail)
+    executor = _closing_executor(h.coordinator, [single, *untouched])
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert single.new_tokens == [(41, 0)]
+    assert single.finished_reason == (FinishReason.LENGTH, 0)
+    assert single.state_at_response_creation == LlmRequestState.GENERATION_COMPLETE
+    assert (single.decoding_iter, single.py_decoding_iter) == (1, 1)
+    assert single.py_draft_tokens == []
+    assert single.response.result.cached_tokens == 5
+    assert executor._pending_transfer_responses == [(1, single.response)]
+    assert executor._pending_response_terminations == [single]
+    executor._enqueue_responses.assert_not_called()
+    executor._terminate_request.assert_not_called()
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+    assert executor.active_requests == list(untouched)
+    assert [req.state for req in untouched] == [_COMPLETE, _RECEIVING, _COMPLETE, _COMPLETE]
+    assert all(req.new_tokens == [] and req.finished_reason is None for req in untouched)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "max_seq_len", "reason"),
+    [
+        pytest.param({"max_new_tokens": 8}, 9, FinishReason.LENGTH, id="fills_max_seq_len"),
+        pytest.param(
+            {"max_new_tokens": 8, "py_stop_words_list": [[99], [41]]},
+            64,
+            FinishReason.STOP_WORDS,
+            id="single_token_stop_word",
+        ),
+        pytest.param(
+            {"max_new_tokens": 8, "py_stop_words_list": [[99], [17, 41]]},
+            64,
+            FinishReason.STOP_WORDS,
+            id="stop_word_ending_the_prompt",
+        ),
+        pytest.param({"max_new_tokens": 8, "py_end_id": 41}, 64, FinishReason.END_ID, id="end_id"),
+        pytest.param(
+            {"max_new_tokens": 1, "py_stop_words_list": [[41]]},
+            64,
+            FinishReason.LENGTH,
+            id="length_before_stop_words",
+        ),
+    ],
+)
+def test_close_out_applies_the_sampler_stop_criteria_in_order(
+    overrides, max_seq_len, reason
+) -> None:
+    """The first token ends the request under the checks and order of
+    handle_stop_criteria (END_ID, LENGTH including max_seq_len, STOP_WORDS,
+    with stop words matched across the prompt tail), so the result equals
+    aggregated serving's."""
+    h = CoordinatorHarness()
+    req = _ClosingRequest(1, **overrides)
+    executor = _closing_executor(h.coordinator, [req], max_seq_len=max_seq_len)
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert req.finished_reason == (reason, 0)
+    assert req.new_tokens == [(41, 0)]
+    assert executor.active_requests == []
+    assert executor._pending_response_terminations == [req]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"max_new_tokens": 2}, id="limit_not_reached"),
+        pytest.param(
+            {"max_new_tokens": 8, "py_stop_words_list": [[42], [15, 41]]},
+            id="no_stop_word_ends_at_the_token",
+        ),
+        pytest.param({"max_new_tokens": 8, "py_end_id": 2}, id="other_end_id"),
+    ],
+)
+def test_close_out_leaves_requests_the_first_token_does_not_end(overrides) -> None:
+    """Without a stop the request stays on the regular path: no reuse commit,
+    no first token, nothing buffered and no timestamp taken."""
+    h = CoordinatorHarness()
+    req = _ClosingRequest(1, **overrides)
+    executor = _closing_executor(h.coordinator, [req])
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert (req.state, req.new_tokens, req.finished_reason) == (_COMPLETE, [], None)
+    assert executor.active_requests == [req]
+    assert executor._pending_transfer_responses == []
+    assert h.transceiver.call_log == []
+    executor.perf_manager.get_timestamp.assert_not_called()
+
+
+def test_close_out_leaves_parked_failures_and_cancellations_to_their_paths() -> None:
+    """A request with a parked transfer failure is left for the parked-failure
+    sweep and a cancelled one for the cancellation path, so neither reaches the
+    client as a success."""
+    h = CoordinatorHarness()
+    parked = _ClosingRequest(1)
+    cancelled = _ClosingRequest(2)
+    executor = _closing_executor(h.coordinator, [parked, cancelled])
+    executor._transfer_held_failures = {id(parked): (parked, _GEN_ERROR_MSG)}
+    executor.canceled_req_ids = [2]
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert [req.new_tokens for req in (parked, cancelled)] == [[], []]
+    assert executor.active_requests == [parked, cancelled]
+    assert executor._pending_transfer_responses == []
+    assert h.transceiver.call_log == []
+
+
+def test_close_out_does_not_depend_on_the_rank_local_timeout_flag() -> None:
+    """Each rank checks the transfer deadline on its own clock, so a completed
+    receive can be flagged timed out on one rank only. Both ranks close it out
+    alike, as the regular receive path schedules it on both, and finishing the
+    receive clears the flag."""
+    requests = []
+    for timed_out in (True, False):
+        h = CoordinatorHarness()
+        req = _ClosingRequest(1, py_kv_transfer_timed_out=timed_out)
+        executor = _closing_executor(h.coordinator, [req])
+
+        executor._close_out_gen_receives_at_first_token()
+
+        assert executor.active_requests == []
+        requests.append(req)
+
+    assert [req.finished_reason for req in requests] == [(FinishReason.LENGTH, 0)] * 2
+    assert [req.py_kv_transfer_timed_out for req in requests] == [False, False]
+
+
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_close_out_leaves_requests_to_a_connector_that_moves_kv(capacity_only) -> None:
+    """A connector that moves KV is handed a finished request's blocks on the
+    batch path only, so its requests stay on that path; a capacity-only
+    connector moves nothing and does not stop the close-out."""
+    h = CoordinatorHarness()
+    req = _ClosingRequest(1)
+    executor = _closing_executor(h.coordinator, [req])
+    executor.kv_connector_manager = SimpleNamespace(capacity_only=capacity_only)
+
+    executor._close_out_gen_receives_at_first_token()
+
+    if capacity_only:
+        assert req.finished_reason == (FinishReason.LENGTH, 0)
+        assert executor.active_requests == []
+    else:
+        assert (req.state, req.new_tokens, req.finished_reason) == (_COMPLETE, [], None)
+        assert executor.active_requests == [req]
+        assert h.transceiver.call_log == []
+
+
+_HELIX_CP_SIZE = 2
+_HELIX_TOKENS_PER_BLOCK = 4
+
+
+@pytest.mark.parametrize(
+    "prompt_len",
+    [
+        # Blocks 0 and 2 (6 tokens, including the prompt's tail) on rank 0, block 1 on rank 1.
+        pytest.param(10, id="uneven_slices"),
+        # One block, all on rank 0; rank 1 holds no token.
+        pytest.param(3, id="empty_rank"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("max_new_tokens", "max_seq_len_margin", "stop_words", "reason"),
+    [
+        pytest.param(1, 8, None, FinishReason.LENGTH, id="max_new_tokens"),
+        pytest.param(8, 1, None, FinishReason.LENGTH, id="full_sequence_reaches_max_seq_len"),
+        pytest.param(8, 2, None, None, id="full_sequence_below_max_seq_len"),
+        pytest.param(8, 8, "multi_token", None, id="multi_token_stop_word"),
+        pytest.param(8, 8, "mixed", FinishReason.STOP_WORDS, id="single_token_word_in_mixed_list"),
+    ],
+)
+def test_close_out_decides_alike_on_every_helix_rank(
+    prompt_len, max_new_tokens, max_seq_len_margin, stop_words, reason
+) -> None:
+    """Under Helix each CP rank holds its own slice of the prompt, possibly an
+    empty one, and every rank must decide the same way or one would schedule
+    a request another closed out. The length limit is checked on the full
+    sequence; multi-token stop words, which need the prompt's tail, are left to
+    the decode steps, single-token ones are still checked, and the request's
+    stop words are not modified."""
+    prompt = list(range(100, 100 + prompt_len))
+    words = {
+        None: None,
+        "multi_token": [[prompt[-1], 41]],
+        "mixed": [[prompt[-1], 41], [41]],
+    }[stop_words]
+    slice_lens = []
+    outcomes = []
+    for cp_rank in range(_HELIX_CP_SIZE):
+        local_prompt, _, full_len, _ = partition_context_for_helix(
+            np.array(prompt), cp_rank, _HELIX_CP_SIZE, _HELIX_TOKENS_PER_BLOCK
+        )
+        slice_lens.append(len(local_prompt))
+        req = _ClosingRequest(
+            1,
+            max_new_tokens,
+            prompt=local_prompt,
+            total_input_len_cp=full_len,
+            py_stop_words_list=copy.deepcopy(words),
+        )
+        executor = _closing_executor(
+            CoordinatorHarness().coordinator,
+            [req],
+            max_seq_len=prompt_len + max_seq_len_margin,
+            cp_size=_HELIX_CP_SIZE,
+        )
+
+        executor._close_out_gen_receives_at_first_token()
+
+        outcomes.append((req.finished_reason, req.py_stop_words_list))
+
+    assert len(set(slice_lens)) == _HELIX_CP_SIZE, "slices must differ for this case"
+    expected_reason = None if reason is None else (reason, 0)
+    assert outcomes == [(expected_reason, words)] * _HELIX_CP_SIZE
+
+
+def _native_received_request(rid: int, **request_options) -> LlmRequest:
+    """C++-backed generation-only request whose KV receive has completed; the
+    context server's first token is 100."""
+    request = make_llm_request(
+        rid, trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY, **request_options
+    )
+    request.state = _COMPLETE
+    return request
+
+
+def _flushing_executor(coordinator: DisaggTransferCoordinator, active) -> PyExecutor:
+    """``_closing_executor`` whose synchronized flush enqueues responses and
+    terminates requests for real; only the sampler and resource release are mocks."""
+    executor = _closing_executor(coordinator, active)
+    del executor._enqueue_responses
+    del executor._terminate_request
+    executor.dist = SimpleNamespace(rank=0, cp_size=1, mapping=SimpleNamespace(tp_group=[0]))
+    executor.gather_all_responses = False
+    executor.response_cv = threading.Condition()
+    executor.responses = {}
+    executor.result_wait_queues = {}
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+    executor._disagg_pp_termination_handler = None
+    executor._prefetched_request_ids = set()
+    executor.sampler = SimpleNamespace(max_seq_len=64, release_request=Mock())
+    executor.resource_manager = SimpleNamespace(resource_managers={}, free_resources=Mock())
+    executor.model_engine = SimpleNamespace()
+    executor.draft_model_engine = None
+    return executor
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "stop_words", "reason"),
+    [
+        pytest.param(1, None, FinishReason.LENGTH, id="max_tokens_1"),
+        pytest.param(8, [[100]], FinishReason.STOP_WORDS, id="stop_word"),
+    ],
+)
+def test_close_out_of_a_native_request_responds_and_releases_once(
+    max_tokens, stop_words, reason
+) -> None:
+    """On the C++-backed request the client gets exactly one final response
+    whose only generated token is the context server's first token (100),
+    with the finish reason aggregated serving reports, and the request's
+    resources are released exactly once."""
+    request = _native_received_request(
+        1,
+        max_tokens=max_tokens,
+        stop_words=stop_words,
+        output_config=trtllm.OutputConfig(exclude_input_from_output=True),
+    )
+    h = CoordinatorHarness()
+    executor = _flushing_executor(h.coordinator, [request])
+
+    executor._close_out_gen_receives_at_first_token()
+    executor._flush_pending_transfer_responses()
+    executor._flush_pending_transfer_responses()
+
+    (response,) = executor.responses[1]
+    assert response.result.is_final
+    result = response.result.get_result()
+    assert result.output_token_ids == [[100]]
+    assert result.finish_reasons == [reason]
+    assert executor.active_requests == []
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+    executor.sampler.release_request.assert_called_once_with(request)
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+
+
+def _stats_executor(coordinator: DisaggTransferCoordinator, active) -> PyExecutor:
+    """``_closing_executor`` with iteration and request stats on, sampling every
+    iteration; each record reaches ``_append_iter_stats``, a mock."""
+    executor = _closing_executor(coordinator, active)
+    executor.enable_iter_perf_stats = True
+    executor.enable_iter_req_stats = True
+    executor.iter_perf_stats_interval = 1
+    executor._pending_num_new_active_requests = 0
+    executor._pending_num_completed_requests = 0
+    executor._close_outs_pending_iter_stats = False
+    executor._pending_close_out_requests = []
+    executor._latest_host_step_time_ms = None
+    executor._latest_prev_device_step_time_ms = None
+    executor.executor_request_queue = SimpleNamespace(
+        get_request_queue=lambda: SimpleNamespace(queue=[])
+    )
+
+    def update_iter_stats(stats, _iter_latency_ms, num_completed_requests, *_args):
+        stats.num_completed_requests = num_completed_requests
+        return stats
+
+    executor._update_iter_stats = update_iter_stats
+    executor._append_iter_stats = Mock()
+    return executor
+
+
+def _recorded(executor: PyExecutor) -> list:
+    """(completed count, final requestStats entries) of every record, the
+    entries as (request id, generated tokens)."""
+    return [
+        (
+            call.args[0].num_completed_requests,
+            sorted(
+                (stat.id, stat.num_generated_tokens)
+                for stat in call.args[1]
+                if stat.stage == RequestStage.GENERATION_COMPLETE
+            ),
+        )
+        for call in executor._append_iter_stats.call_args_list
+    ]
+
+
+def test_close_outs_are_reported_once_when_no_batch_follows() -> None:
+    """Requests closed out at their first token run no batch, so the iteration
+    that closed them out records them: the completed count and each request's
+    final requestStats entry, exactly once even with no further request."""
+    h = CoordinatorHarness()
+    requests = [_native_received_request(rid, max_tokens=1) for rid in (1, 2)]
+    executor = _stats_executor(h.coordinator, requests)
+
+    executor._close_out_gen_receives_at_first_token()
+    # The closing iteration, then an idle one.
+    for _ in range(2):
+        executor._process_close_out_iter_stats(IterationStats(), 0.0)
+
+    assert _recorded(executor) == [(2, [(1, 1), (2, 1)])]
+
+
+def test_close_outs_ride_on_a_batch_record_without_double_counting() -> None:
+    """A batch record of the same iteration carries the close-out next to the
+    batch's own finished request, each counted once and each with one final
+    requestStats entry; no separate record follows."""
+    h = CoordinatorHarness()
+    executor = _stats_executor(h.coordinator, [_native_received_request(1, max_tokens=1)])
+    batch_finished = make_llm_request(3, trtllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION)
+
+    executor._close_out_gen_receives_at_first_token()
+    executor._process_iter_stats(
+        [batch_finished],
+        executor.active_requests,
+        BatchState(
+            scheduled_requests=ScheduledRequests(),
+            sample_state=Mock(),
+            iter_start_time=0.0,
+            iter_stats=IterationStats(),
+            iter_id=7,
+        ),
+    )
+    executor._process_close_out_iter_stats(IterationStats(), 0.0)
+
+    assert _recorded(executor) == [(2, [(1, 1), (3, 0)])]
+
+
+def test_close_out_rebuilds_derived_cache_state_before_committing_blocks() -> None:
+    """As in the regular receive tail, the cache state the generation side
+    derives from the imported KV is rebuilt before the blocks enter the reuse
+    tree, where another request could read them."""
+    h = CoordinatorHarness()
+    events = []
+    commit = h.transceiver.commit_blocks_for_reuse
+
+    def commit_and_record(req):
+        events.append(("commit", req.py_request_id))
+        commit(req)
+
+    h.transceiver.commit_blocks_for_reuse = commit_and_record
+    req = _ClosingRequest(1)
+    executor = _closing_executor(h.coordinator, [req])
+    kv_cache_manager = SimpleNamespace(
+        rebuild_disagg_imported_cache=lambda requests: events.append(
+            ("rebuild", [request.py_request_id for request in requests])
+        )
+    )
+    executor.resource_manager = SimpleNamespace(
+        resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
+    )
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert events == [("rebuild", [1]), ("commit", 1)]
+
+
+def test_close_out_response_carries_the_prepended_first_token_logits() -> None:
+    """The terminal response is also the first-token response, so the logits
+    prepended from the context server are snapshotted past
+    exclude_last_generation_logits, as the first-token response path does."""
+    h = CoordinatorHarness()
+    logits = object()
+    req = _ClosingRequest(1, py_result=SimpleNamespace(get_latest_logits_unexcluded=lambda: logits))
+    executor = _closing_executor(h.coordinator, [req])
+    executor._has_prepended_logits = lambda _req: True
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert req.response.result.generation_logits is logits
+
+
+def test_close_out_under_attention_dp_waits_for_the_synchronized_flush() -> None:
+    """Under attention DP the response and the termination are buffered for
+    _flush_pending_transfer_responses instead of entering a rank-local gather."""
+    h = CoordinatorHarness()
+    req = _ClosingRequest(1)
+    executor = _closing_executor(h.coordinator, [req], attention_dp=True)
+
+    executor._close_out_gen_receives_at_first_token()
+
+    executor._enqueue_responses.assert_not_called()
+    executor._terminate_request.assert_not_called()
+    assert executor._pending_transfer_responses == [(1, req.response)]
+    assert executor._pending_response_terminations == [req]
+    assert executor.active_requests == []

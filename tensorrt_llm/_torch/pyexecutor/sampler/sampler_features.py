@@ -39,7 +39,7 @@ from concurrent import futures
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Any, Iterator, Optional, cast
+from typing import Any, Callable, Iterator, Optional, cast
 
 import torch
 
@@ -66,8 +66,10 @@ __all__ = [
     "fast_greedy_sample_kernel",
     "handle_stop_criteria",
     "meet_max_token_stop_criteria",
+    "meet_max_token_stop_criteria_at",
     "meet_stop_token_criteria",
     "scatter_new_tokens",
+    "stop_words_match",
 ]
 
 # --------------------------------------------------------------------------
@@ -330,40 +332,58 @@ class _UnpackedStepIndexer(_StridedStepIndexTranslator):
 # --------------------------------------------------------------------------
 
 
+def meet_max_token_stop_criteria_at(
+    request: LlmRequest, num_new_tokens: int, seq_len: int, max_seq_len: int
+) -> bool:
+    """Whether ``num_new_tokens`` generated tokens in a ``seq_len``-token
+    sequence reach the request's length limit."""
+    # Wrap in bool(): the operands come from C++ bindings (get_num_tokens,
+    # py_orig_prompt_len, py_max_new_tokens) and are Any-typed, so the
+    # comparison expression is inferred as Any rather than bool.
+    return bool((num_new_tokens >= request.py_max_new_tokens) or (seq_len >= max_seq_len))
+
+
 def meet_max_token_stop_criteria(
     request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX
 ) -> bool:
     num_tokens = request.get_num_tokens(beam_idx)
-    # Wrap in bool(): the operands come from C++ bindings (get_num_tokens,
-    # py_orig_prompt_len, py_max_new_tokens) and are Any-typed, so the
-    # comparison expression is inferred as Any rather than bool.
-    return bool(
-        (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens)
-        or (num_tokens >= max_seq_len)
+    return meet_max_token_stop_criteria_at(
+        request, num_tokens - request.py_orig_prompt_len, num_tokens, max_seq_len
     )
+
+
+def stop_words_match(
+    stop_words_list: list[list[int]], new_token: int, get_tokens: Callable[[], list[int]]
+) -> bool:
+    """Whether a stop word ends at ``new_token``.
+
+    ``get_tokens`` returns the token history ending with ``new_token``. It is
+    only called when a multi-token stop word needs it.
+    """
+    assert isinstance(stop_words_list, list), "stop_words_list should be a list"
+
+    # Fast path: all stop words are single tokens
+    if all(len(word) == 1 for word in stop_words_list):
+        return any(word[0] == new_token for word in stop_words_list)
+
+    # Slow path: at least one multi-token stop word exists
+    tokens = get_tokens()
+    for stop_word in stop_words_list:
+        if len(stop_word) > len(tokens):
+            continue
+        if tokens[-len(stop_word) :] == stop_word:
+            return True
+    return False
 
 
 def meet_stop_token_criteria(
     request: LlmRequest, new_token: int, beam_idx: int = DEFAULT_BEAM_IDX
 ) -> bool:
-    if request.py_stop_words_list:
-        assert isinstance(request.py_stop_words_list, list), (
-            "request.py_stop_words_list should be a list"
-        )
-        stop_words_list = request.py_stop_words_list
-
-        # Fast path: all stop words are single tokens
-        if all(len(word) == 1 for word in stop_words_list):
-            return any(word[0] == new_token for word in stop_words_list)
-
-        # Slow path: at least one multi-token stop word exists
-        tokens = request.get_tokens(beam_idx)
-        for stop_word in stop_words_list:
-            if len(stop_word) > len(tokens):
-                continue
-            if tokens[-len(stop_word) :] == stop_word:
-                return True
-    return False
+    if not request.py_stop_words_list:
+        return False
+    return stop_words_match(
+        request.py_stop_words_list, new_token, lambda: request.get_tokens(beam_idx)
+    )
 
 
 def handle_stop_criteria(

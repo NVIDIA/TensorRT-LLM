@@ -15,7 +15,10 @@ unbound against a minimal fake ``self`` and check that:
   executor is idle;
 * an interval of 1 still builds a record on every iteration;
 * KV-cache iteration deltas are keyed on the record's construction iteration,
-  so they still line up with sampled records under the overlap scheduler.
+  so they still line up with sampled records under the overlap scheduler;
+* completions of first-token close-outs, which run no batch, are recorded by
+  an iteration without a batch under the same rules, once, and under
+  attention DP through rank 0.
 """
 
 from __future__ import annotations
@@ -25,7 +28,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 
 pytestmark = pytest.mark.cpu_only
@@ -42,6 +47,7 @@ def _build_fake_self(interval: int, *, enabled: bool = True):
     fake.active_requests = []
     fake._pending_num_new_active_requests = 0
     fake._pending_num_completed_requests = 0
+    fake._close_outs_pending_iter_stats = False
     fake._latest_host_step_time_ms = None
     fake._latest_prev_device_step_time_ms = None
     # _get_init_iter_stats: no spec-decode resource manager / spec config.
@@ -214,6 +220,87 @@ def test_interval_one_never_flushes_unsampled_batch():
     _process(fake, None, iter_id=7, finished=[MagicMock()], active=[])
     fake._update_iter_stats.assert_not_called()
     fake._append_iter_stats.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _process_close_out_iter_stats
+# ---------------------------------------------------------------------------
+
+
+def _with_close_outs(fake, num_closed: int):
+    """``fake`` after first-token close-outs left ``num_closed`` completions pending."""
+    fake._process_iter_stats = types.MethodType(PyExecutor._process_iter_stats, fake)
+    fake._pending_num_completed_requests += num_closed
+    fake._close_outs_pending_iter_stats = True
+    return fake
+
+
+def _run_iteration_without_batch(fake, iter_counter: int) -> None:
+    fake.iter_counter = iter_counter
+    PyExecutor._process_close_out_iter_stats(fake, fake._init_iter_stats_if_sampled(0), 0.0)
+
+
+def _record_completed(stats, _iter_latency_ms, num_completed_requests, *_args):
+    stats.num_completed_requests = num_completed_requests
+    return stats
+
+
+def test_close_outs_are_recorded_once_by_an_iteration_without_a_batch():
+    fake = _with_close_outs(_build_fake_self(interval=1), num_closed=2)
+    _run_iteration_without_batch(fake, 5)
+    _run_iteration_without_batch(fake, 6)
+    assert [(stats.iter, completed) for stats, completed in _emitted(fake)] == [(5, 2)]
+
+
+def test_close_outs_in_an_unsampled_iteration_follow_the_interval_rules():
+    """Carried while requests remain active, then reported by the next sampled
+    iteration; with no active request left, a drain record reports them at once."""
+    fake = _with_close_outs(_build_fake_self(interval=4), num_closed=2)
+    fake.active_requests = [MagicMock()]
+    _run_iteration_without_batch(fake, 1)
+    assert _emitted(fake) == []
+    _run_iteration_without_batch(fake, 4)
+    assert [(stats.iter, completed) for stats, completed in _emitted(fake)] == [(4, 2)]
+
+    drained = _with_close_outs(_build_fake_self(interval=4), num_closed=3)
+    _run_iteration_without_batch(drained, 1)
+    _run_iteration_without_batch(drained, 2)
+    assert [(stats.iter, completed) for stats, completed in _emitted(drained)] == [(1, 3)]
+
+
+def test_close_outs_under_attention_dp_are_fanned_out_once_through_rank0():
+    """Only rank 0 records them, as it owns the completion counts. The record is
+    fanned out once the next exchange has collected the other rank's zero
+    payload, and never again."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    for rank, buffer in enumerate(buffers):
+        fake = _with_close_outs(_build_fake_self(interval=1), num_closed=2 + rank)
+        fake.enable_attention_dp = True
+        fake.dist.rank = rank
+        fake._adp_iter_stats = buffer
+        fake._update_iter_stats.side_effect = _record_completed
+        _run_iteration_without_batch(fake, 9)
+
+    def exchange():
+        states = []
+        for rank, buffer in enumerate(buffers):
+            payload = buffer.next_payload()
+            states.append(
+                RankState(rank=rank)
+                if payload is None
+                else RankState(rank=rank, iter_stats=payload)
+            )
+        return [buffer.finalize(states, is_rank0=rank == 0) for rank, buffer in enumerate(buffers)]
+
+    first, second, third = exchange(), exchange(), exchange()
+    assert first == [[], []]
+    rank0_records, rank1_records = second
+    assert rank1_records == []
+    assert [
+        (record.attention_dp_rank, record.stats.iter, record.stats.num_completed_requests)
+        for record in rank0_records
+    ] == [(0, 9, 2), (1, 9, 0)]
+    assert third == [[], []]
 
 
 # ---------------------------------------------------------------------------
