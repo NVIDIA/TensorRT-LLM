@@ -310,6 +310,24 @@ def _qa_entries(repo: Path) -> list[str]:
     ]
 
 
+# Unit tests that need hardware no CI stage provides, by test-db path, with what they
+# wait for. No test-db entry may run them.
+_NO_CI_STAGE = {
+    "unittest/_torch/modeling_v2/models/minimax_m3/ops/comm": (
+        "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/comm": (
+        "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/comm": (
+        "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/comm": (
+        "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+}
+
+
 def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     """Every modeling_v2 test is in a list some job runs.
 
@@ -318,15 +336,25 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     deployments, run from the QA lists. Paths are in test-db form: unit tests relative
     to ``tests/``, accuracy tests relative to ``tests/integration/defs/``. Only paths
     are compared: the ``-m cpu_only`` and ``-m "not cpu_only"`` split between stages is
-    not checked.
+    not checked. Unit tests under ``_NO_CI_STAGE`` are exempt until a stage can run them.
     """
     unit_root, accuracy_root = repo / "tests", repo / "tests/integration/defs"
     test_db = _test_db_entries(repo)
     any_list = test_db + _qa_entries(repo)
+    unit_tests = [str(p.relative_to(unit_root)) for p in sorted((repo / _UNIT).rglob("test_*.py"))]
+    # An exemption outlives its reason once its tests move, vanish, or a list starts running them.
+    stale = sorted(
+        where
+        for where in _NO_CI_STAGE
+        if not any(_at_or_under(t, where) for t in unit_tests)
+        or any(_runs(e, t) for e in test_db for t in unit_tests if _at_or_under(t, where))
+    )
+    assert not stale, f"_NO_CI_STAGE entries with no test or now listed: {stale}"
     # Test-db path -> the test files that stand for it, and the entries that may run them.
     tests = {
-        str(p.relative_to(unit_root)): ([str(p.relative_to(unit_root))], test_db)
-        for p in sorted((repo / _UNIT).rglob("test_*.py"))
+        t: ([t], test_db)
+        for t in unit_tests
+        if not any(_at_or_under(t, where) for where in _NO_CI_STAGE)
     }
     for family_dir in _families(repo):
         for d in _targets(family_dir):

@@ -18,14 +18,17 @@ Every test of these targets passes ``modeling_v2="require"`` to ``LLM``: under `
 a target's criteria would quietly fall back to the built-in implementation, pass, and report the built-in's numbers as
 the target's.
 
-The deployment is the one the targets route (``models/minimax_m3/routing.py``): the NVFP4 checkpoint on sm_103,
-tensor-parallel attention and experts on 4 or 8 ranks, the MiniMax-M3 MSA sparse attention with the fused five-way
-QKV/index projection, an FP8 indexer and an NVFP4 KV cache. ``_MiniMaxM3Target`` runs GSM8K without speculation and
-with one-model Eagle3, where a chat-GSM8K acceptance probe also guards the drafter (accuracy alone does not notice a
-corrupted draft KV). Each target subclass sets only its TP size.
+The deployment is the one the targets route (``models/minimax_m3/routing.py``): the NVFP4 checkpoint on sm_103
+(GB300, 4 or 8 ranks) or sm_107 (Rubin, 2, 4 or 8 ranks), tensor-parallel attention and experts, the MiniMax-M3 MSA
+sparse attention with the fused five-way QKV/index projection, an FP8 indexer and an NVFP4 KV cache.
+``_MiniMaxM3Target`` runs GSM8K without speculation and with one-model Eagle3, where a chat-GSM8K acceptance probe
+also guards the drafter (accuracy alone does not notice a corrupted draft KV). Each target subclass sets only its TP
+size.
 """
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -44,11 +47,16 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ....conftest import llm_models_root
 from ...accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from .._env import scoped_env_overrides
 
 # The targets assert their own SM at construction: certification is per GPU architecture.
 skip_not_sm103 = pytest.mark.skipif(
     get_sm_version() != 103,
-    reason="the MiniMax-M3 modeling_v2 targets are certified on sm_103 only",
+    reason="these MiniMax-M3 modeling_v2 targets are certified on sm_103 only",
+)
+skip_not_sm107 = pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="these MiniMax-M3 modeling_v2 targets are certified on sm_107 only",
 )
 
 # The chat-GSM8K acceptance floors of the in-tree test on an NVFP4 KV cache (test_llm_api_pytorch.TestMiniMaxM3).
@@ -73,33 +81,38 @@ class _MiniMaxM3Target(LlmapiAccuracyTestHarness):
     EAGLE_PATH = f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA"
     TP = 4
 
-    def _llm(self, eagle3: bool) -> LLM:
+    @contextmanager
+    def _llm(self, eagle3: bool) -> Iterator[LLM]:
         spec = (
             Eagle3DecodingConfig(max_draft_len=3, speculative_model=self.EAGLE_PATH)
             if eagle3
             else None
         )
-        return LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=self.TP,
-            moe_expert_parallel_size=1,
-            kv_cache_config=KvCacheConfig(
-                free_gpu_memory_fraction=0.6, enable_block_reuse=False, dtype="nvfp4"
-            ),
-            sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                implementation="msa", indexer_kv_dtype="fp8", fuse_qkv_index_projection=True
-            ),
-            moe_config=MoeConfig(backend="TRTLLM"),
-            max_seq_len=4096,
-            max_batch_size=64,
-            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=64),
-            speculative_config=spec,
-            enable_iter_perf_stats=eagle3,
-            max_stats_len=5000,
-            trust_remote_code=True,
-            modeling_v2="require",
-            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-        )
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=self.TP,
+                moe_expert_parallel_size=1,
+                kv_cache_config=KvCacheConfig(
+                    free_gpu_memory_fraction=0.6, enable_block_reuse=False, dtype="nvfp4"
+                ),
+                sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                    implementation="msa", indexer_kv_dtype="fp8", fuse_qkv_index_projection=True
+                ),
+                moe_config=MoeConfig(backend="TRTLLM"),
+                max_seq_len=4096,
+                max_batch_size=64,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=64),
+                speculative_config=spec,
+                enable_iter_perf_stats=eagle3,
+                max_stats_len=5000,
+                trust_remote_code=True,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            yield llm
 
     def _gsm8k(self, eagle3: bool) -> None:
         with self._llm(eagle3) as llm:

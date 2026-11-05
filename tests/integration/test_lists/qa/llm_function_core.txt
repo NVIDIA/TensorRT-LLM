@@ -362,6 +362,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph[dp8] TIMEOUT (120)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=MEGAMOE_DEEPGEMM]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_plus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=DEEPGEMM]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=TRTLLM]
@@ -469,6 +470,11 @@ accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtyp
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex-kv_dtype=fp8]
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex-kv_dtype=fp8]
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex-kv_dtype=fp8]
+# ModelingV2 MiniMax-M3: 2 or 4 Rubin GPUs (SM107).
+accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp2::test_gsm8k
+accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp2::test_eagle3_gsm8k_and_acceptance
+accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp4::test_gsm8k
+accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp4::test_eagle3_gsm8k_and_acceptance
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm]
@@ -608,7 +614,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_27B::test_dflash2[VANILLA]
-accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_tp8_mtp3_trtllm
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_bf16_tep4_cutlass
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_prefix_cache

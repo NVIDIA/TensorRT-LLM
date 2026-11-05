@@ -19,6 +19,7 @@ from ..models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             read_modelopt_quant_config,
+                                            reject_checkpoint_nvfp4_plus,
                                             warn_if_inline_diverges)
 # yapf: disable
 from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
@@ -74,6 +75,8 @@ class ModelLoader:
         hf_quant_algo = hf_quant_config.pop("quant_algo", None)
         if hf_quant_algo is None:
             raise ValueError("Pre-quantized checkpoint must have quant_algo.")
+        reject_checkpoint_nvfp4_plus(hf_quant_algo,
+                                     "The checkpoint quantization config")
         hf_quant_algo = QuantAlgo(hf_quant_algo)
         if quant_config.quant_algo is None:
             logger.info(
