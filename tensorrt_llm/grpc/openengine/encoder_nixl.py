@@ -21,7 +21,12 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 from .bindings import generation_pb2 as pb
 from .bindings import openengine_pb2_grpc
-from .encoder import _release, take_encoder_exports
+from .encoder import (
+    _capture_encoder_decode_state,
+    _encoder_input_params,
+    _release,
+    take_encoder_exports,
+)
 from .preparation import _config_digest, _input_digest
 
 BACKEND = "trtllm-nixl-encoder-v1"
@@ -300,14 +305,6 @@ class NixlEncoderCache:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         registration, _, descs = _descriptors(tensors, self.name)
-        destination = _encode(
-            {
-                "name": self.name,
-                "agent": base64.b64encode(self.agent.get_local_agent_desc()).decode(),
-                "memory_type": "VRAM" if self.device.type == "cuda" else "DRAM",
-                "descs": descs,
-            }
-        )
         attempted = False
         registered = False
         self._used += total
@@ -315,9 +312,14 @@ class NixlEncoderCache:
             self.agent.register_memory(registration)
             registered = True
             # Native agent metadata must include the just-registered buffers.
-            peer = _decode(destination)
-            peer["agent"] = base64.b64encode(self.agent.get_local_agent_desc()).decode()
-            destination = _encode(peer)
+            destination = _encode(
+                {
+                    "name": self.name,
+                    "agent": base64.b64encode(self.agent.get_local_agent_desc()).decode(),
+                    "memory_type": "VRAM" if self.device.type == "cuda" else "DRAM",
+                    "descs": descs,
+                }
+            )
             with grpc.insecure_channel(value["endpoint"]) as channel:
                 attempted = True
                 openengine_pb2_grpc.ControlStub(channel).TransferEncoderCache(
@@ -342,7 +344,15 @@ class NixlEncoderCache:
                     _QUARANTINED.append((self.agent, tensors, registration))
             raise
 
-    def prepare(self, reference, request, llm, sampling):
+    def prepare(
+        self,
+        reference,
+        request,
+        llm,
+        sampling,
+        disaggregated_params: DisaggregatedParams | None = None,
+    ):
+        params = _encoder_input_params(disaggregated_params)
         value = self._reference(reference)
         metadata = value.get("metadata", {})
         if metadata.get("input_digest") != _input_digest(request):
@@ -379,14 +389,23 @@ class NixlEncoderCache:
                     "mrope_position_ids_handle": exports[-2],
                     "mrope_position_deltas_handle": exports[-1],
                 }
-            params = DisaggregatedParams(
-                request_type="context_and_generation",
-                multimodal_embedding_handles=exports[:count],
-                multimodal_hashes=metadata["hashes"],
-                **positions,
-            )
+            params.multimodal_embedding_handles = exports[:count]
+            params.multimodal_hashes = metadata["hashes"]
+            params.mrope_position_ids_handle = positions.get("mrope_position_ids_handle")
+            params.mrope_position_deltas_handle = positions.get("mrope_position_deltas_handle")
             inputs = llm.preprocess({"prompt": prompt}, sampling, params)
             exports.clear()
+            if params.request_type == "context_only":
+                _capture_encoder_decode_state(
+                    llm,
+                    inputs,
+                    {
+                        "mrope_position_ids": tensors[-2],
+                        "mrope_position_deltas": tensors[-1],
+                    }
+                    if metadata.get("has_mrope")
+                    else {},
+                )
             return inputs, params
         finally:
             _release(exports)

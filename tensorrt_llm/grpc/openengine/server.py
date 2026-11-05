@@ -9,6 +9,7 @@ import ipaddress
 import os
 import signal
 import socket
+import sys
 import tempfile
 import threading
 import uuid
@@ -18,6 +19,7 @@ from typing import Any
 
 import click
 import grpc
+import torch
 import uvloop
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
@@ -39,6 +41,7 @@ from ._health import OpenEngineHealthServicer
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
+from .encoder_nixl import NixlEncoderCache
 from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .metrics import MetricsDirectory, OpenEngineMetrics
 from .servicer import OpenEngineInferenceServicer
@@ -266,6 +269,15 @@ class OpenEngineServer:
         self._engine_health_task = None
         return task.result()
 
+    def _needs_encoder_ipc_collection(self) -> bool:
+        cache = self._inference._encoder_cache
+        return (
+            self._inference.encoder_role == "consume"
+            and isinstance(cache, NixlEncoderCache)
+            and cache.device.type == "cuda"
+            and not cache.failed
+        )
+
     @staticmethod
     def _consume_engine_health_result(task: asyncio.Task[bool]) -> None:
         if not task.cancelled():
@@ -398,6 +410,7 @@ def launch_server(
         children = []
         failure = None
         serving = False
+        collect_encoder_ipc = False
         parent_pid = os.getppid()
 
         def fail(reason: str) -> None:
@@ -585,6 +598,7 @@ def launch_server(
                 await asyncio.gather(monitor, return_exceptions=True)
             try:
                 if server is not None:
+                    collect_encoder_ipc = server._needs_encoder_ipc_collection()
                     await server.stop()
             finally:
                 try:
@@ -598,6 +612,24 @@ def launch_server(
                     try:
                         if llm is not None:
                             await asyncio.to_thread(llm.shutdown)
+                            if (
+                                collect_encoder_ipc
+                                and server._needs_encoder_ipc_collection()
+                                and torch.cuda.is_initialized()
+                            ):
+                                preserve_failure = (
+                                    failure is not None or sys.exc_info()[0] is not None
+                                )
+                                try:
+                                    await asyncio.to_thread(torch.cuda.ipc_collect)
+                                except Exception as error:
+                                    if not preserve_failure:
+                                        raise
+                                    logger.error(f"Encoder CUDA IPC cleanup failed: {error}")
+                                else:
+                                    logger.info(
+                                        "Encoder CUDA IPC collection completed after LLM shutdown"
+                                    )
                     finally:
                         if metrics is not None:
                             await metrics.wait_for_collection()

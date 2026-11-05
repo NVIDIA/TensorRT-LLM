@@ -338,44 +338,67 @@ For disaggregated subagent context requests, configure `internal_request_auth_ke
 
 ## Image encoder handoff (experimental)
 
-Image E+PD uses the `EncoderOptions` / `EncoderReady` contract proposed in
+Image E+PD and E+P+D use the `EncoderOptions` / `EncoderReady` contract proposed in
 [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
 immutable source revision in the vendor lock. Both client and server need the
 matching bindings; this proposal is not in a published BSR release or runtime.
 TP/PP/CP must each be 1.
 
-For the optional shared-file backend, set `TRTLLM_OPENENGINE_ENCODER_CACHE_DIR`
-to the same private directory in both
-engine processes. Start the encoder with `mm_encoder_only: true` and the combined
-prefill/decode engine with `disable_mm_encoder: true`. The model processor must
-support native multimodal disaggregation. Use the same checkpoint path and
-processor configuration in both processes. Image E+PD has been manually validated with Qwen3-VL-2B across two GPU hosts.
-CUDA IPC shutdown cleanup remains under investigation.
+The model processor must support native multimodal disaggregation. Load the same
+immutable checkpoint revision and processor configuration on every engine.
+
+| Topology | Encoder | Language engines | Handoffs |
+| --- | --- | --- | --- |
+| E+PD | `mm_encoder_only: true` | One combined engine with `disable_mm_encoder: true` | Encoder cache to PD |
+| E+P+D | `mm_encoder_only: true` | Separate prefill and decode engines, both with `disable_mm_encoder: true` | Encoder cache to P; KV session and prepared decode metadata from P to D |
+
+For E+P+D, configure a compatible native `cache_transceiver_config` on both P and
+D, independently of the encoder transfer backend. The prefill request sets
+`extra.request_type = "context_only"` and consumes the encoder cache. The decode
+request carries the resulting `kv.session`, preserves the original prompt/media
+identity, and omits `encoder.cache`; an encoder reference must not be consumed
+twice. Decode reuses the expanded tokens and portable model state from prefill
+without fetching media or running the vision encoder.
+
+E+P+D requires the processor's decode-state capture and restore hooks. Missing
+capture hooks, missing state, or preparation metadata over the existing size bound cause
+the encoder-consuming prefill request to fail before language execution. These
+requirements do not change the ordinary PD preparation fallback or E+PD behavior.
+
+Image E+PD and E+P+D have been manually validated with Qwen3-VL-2B across GPU
+hosts using matching source overlays. Focused CPU checks cover the final rebased
+branch; GPU validation of that branch has not been repeated.
 
 `ModelInfo.encoder` advertises the schema version, encoder-only or cache-consumer
 role, and supported transfer backends. Encoder-only requests set
 `encoder.encode_only` and terminate with `EncoderReady`. The downstream request
-retains the original prompt and media identities and supplies `encoder.cache`;
-it does not fetch the image or run its own vision encoder. Text-only requests
-can go directly to the combined engine.
+retains the original prompt and media identities and supplies `encoder.cache`
+to PD or P; it does not fetch the image or run its own vision encoder. Text-only
+requests can bypass the encoder.
+
+For the optional shared-file backend, set `TRTLLM_OPENENGINE_ENCODER_CACHE_DIR`
+to the same private directory on the encoder and its consuming PD or P engine.
+They must run on the same host and use the same checkpoint path.
 
 The engine materializes native encoder exports into safetensors storage; tensor
 contents never pass through Dynamo. This baseline adds CPU copies and storage I/O.
 References are single-use and expire after five minutes; expired files are
 collected on the next cache operation. Published and claimed files are limited
 to 256 MiB, with at most one additional 64 MiB publication temporary under the
-cache lock. Tensor data is limited to 64 MiB per result. The shared-file backend rejects cross-host references. Both backends reject
-video/audio inputs and E+P+D handoffs.
+cache lock. Tensor data is limited to 64 MiB per result. The shared-file backend
+rejects cross-host encoder references. Both backends reject video/audio inputs.
 
 ### Networked encoder handoffs
 
-Set `TRTLLM_OPENENGINE_ENCODER_TRANSFER=nixl` on encoder and consumer engines.
-Both must load the same immutable checkpoint revision and set
+Set `TRTLLM_OPENENGINE_ENCODER_TRANSFER=nixl` on encoder and language engines.
+All must load the same immutable checkpoint revision and set
 `TRTLLM_OPENENGINE_ENCODER_MODEL_REVISION` to that revision. Load it with
 `--hf_revision`; this identity must not be a mutable branch name. On the encoder,
 set `TRTLLM_OPENENGINE_ENCODER_ENDPOINT` to its reachable OpenEngine `host:port`.
 The engines need compatible NIXL/UCX connectivity; no shared directory is used.
-The existing image-only E+PD and TP/PP/CP=1 restrictions still apply.
+The image-only and TP/PP/CP=1 restrictions still apply. In E+P+D, the encoder
+cache is transferred only to P; D receives the native KV handoff and does not
+request another encoder transfer.
 
 The encoder imports native exports locally and registers owned GPU tensors with
 TRT-LLM's NIXL agent. Its single-use reference includes layout, dtype, shape,
@@ -384,6 +407,13 @@ The consumer allocates/registers receive tensors and invokes
 `Control.TransferEncoderCache`; the producer writes to those buffers and returns
 only after native completion. Dynamo carries the opaque reference only. Metadata
 and mRoPE tensors are carried along with the image embeddings.
+
+Language engines release transport request references after native enqueue
+accepts ownership. Context-only KV transfers continue making progress while the
+engine is idle and retire request resources on completion. OpenEngine reclaims
+unused prefill exports once and drains cleanup before engine shutdown. Healthy
+CUDA NIXL consumers then reclaim zero-reference CUDA IPC allocations after
+successful native shutdown.
 
 Only trusted engine peers may call the transfer RPC or provide handoff metadata;
 this is not a public tensor-upload API. Deployment networking must make the

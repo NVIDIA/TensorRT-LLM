@@ -10,6 +10,7 @@ import pytest
 import torch
 from test_encoder import model, native_result, request
 
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.grpc.openengine import encoder_nixl as transport
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
 
@@ -101,6 +102,85 @@ def test_nixl_roundtrip_retains_tensors_metadata_and_mrope(pair):
     with pytest.raises(ValueError, match="already consumed"):
         consumer.prepare(ref, request(), llm, None)
     assert producer.agent.writes == 1
+
+
+def test_nixl_encoder_handoff_preserves_prefill_phase(pair):
+    producer, consumer = pair
+    llm, seen = model()
+    ref = producer.publish(native_result()[0], request(), llm)
+    phase = DisaggregatedParams(request_type="context_only")
+    _, params = consumer.prepare(ref, request(), llm, None, phase)
+    assert params is phase
+    assert params.request_type == "context_only"
+    assert seen["hashes"] == [[2147483647] * 8]
+    assert producer.agent.writes == 1
+    assert producer._used == consumer._used == 0
+
+
+def test_prefill_captures_mrope_when_native_embedding_path_bypasses_processor(pair):
+    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+
+    class Processor(SimpleNamespace):
+        _decode_state_capture = BaseMultimodalInputProcessor._decode_state_capture
+        capture_decode_state = BaseMultimodalInputProcessor.capture_decode_state
+        _capture_prepared_decode = BaseMultimodalInputProcessor._capture_prepared_decode
+        export_decode_state = Qwen2VLInputProcessorBase.export_decode_state
+
+    producer, consumer = pair
+    llm, _ = model()
+    llm.input_processor = Processor(**vars(llm.input_processor))
+    output, tensors = native_result()
+    ref = producer.publish(output, request(), llm)
+    preprocess = llm.preprocess
+
+    def prepare(*args):
+        inputs = preprocess(*args)
+        inputs.prompt_token_ids = [11, 12]
+        return inputs
+
+    llm.preprocess = prepare
+    phase = DisaggregatedParams(request_type="context_only")
+    with llm.input_processor.capture_decode_state() as captured:
+        consumer.prepare(ref, request(), llm, None, phase)
+    assert captured == {
+        "prompt_token_ids": [11, 12],
+        "state": llm.input_processor.export_decode_state(
+            {
+                "mrope_config": {
+                    "mrope_position_ids": tensors[1],
+                    "mrope_position_deltas": tensors[2],
+                }
+            }
+        ),
+    }
+
+
+def test_failed_native_decode_capture_reclaims_prepared_inputs(pair):
+    producer, consumer = pair
+    llm, _ = model()
+    ref = producer.publish(native_result()[0], request(), llm)
+    preprocess = llm.preprocess
+    released = []
+
+    def prepare(*args):
+        inputs = preprocess(*args)
+        inputs.prompt_token_ids = [11, 12]
+        inputs.multimodal_params = SimpleNamespace(release_handles=lambda: released.append(True))
+        return inputs
+
+    def broken_capture(_):
+        raise ValueError("invalid decode state")
+
+    llm.preprocess = prepare
+    llm.input_processor._capture_prepared_decode = broken_capture
+    with pytest.raises(ValueError, match="invalid decode state"):
+        consumer.prepare(
+            ref, request(), llm, None, DisaggregatedParams(request_type="context_only")
+        )
+    assert released == [True]
+    assert producer._used == consumer._used == 0
+    assert not producer._exports
 
 
 def _consume_worker_exports(pipe):

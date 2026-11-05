@@ -71,6 +71,47 @@ def native_result():
     return SimpleNamespace(disaggregated_params=params), tensors
 
 
+def test_prefill_result_reclaims_new_exports_once_and_leaves_consumed_inputs(monkeypatch):
+    incoming, _ = native_result()
+    params = incoming.disaggregated_params
+    inputs = [params.mrope_position_ids_handle, params.mrope_position_deltas_handle]
+    for handle in [*params.multimodal_embedding_handles, *inputs]:
+        SharedTensorContainer.from_dict(handle).get_local_view()
+    owner = oe.PrefillResultExports(params)
+    released = []
+    release = SharedTensorContainer.release_dict
+
+    def record(handle):
+        released.append(handle)
+        release(handle)
+
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", record)
+    owner.release(incoming)
+    assert [params.mrope_position_ids_handle, params.mrope_position_deltas_handle] == inputs
+    assert not released
+    for _ in range(2):
+        fresh, _ = native_result()
+        SharedTensorContainer.release_dict(
+            fresh.disaggregated_params.multimodal_embedding_handles[0]
+        )
+        released.clear()
+        handles = [
+            fresh.disaggregated_params.mrope_position_ids_handle,
+            fresh.disaggregated_params.mrope_position_deltas_handle,
+        ]
+        owner.release(fresh)
+        # Native result snapshots can repeat the same handles in new dictionaries.
+        owner.release(
+            SimpleNamespace(
+                disaggregated_params=DisaggregatedParams(
+                    mrope_position_ids_handle=dict(handles[0]),
+                    mrope_position_deltas_handle=dict(handles[1]),
+                )
+            )
+        )
+        assert released == handles
+
+
 def test_native_exports_roundtrip_once_with_metadata_and_mrope(tmp_path):
     cache = oe.EncoderCache(str(tmp_path))
     llm, seen = model()
@@ -87,6 +128,18 @@ def test_native_exports_roundtrip_once_with_metadata_and_mrope(tmp_path):
         cache.prepare(ref, request(), llm, None)
     assert not list(tmp_path.glob("*.safetensors"))
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_shared_encoder_handoff_preserves_prefill_phase(tmp_path):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, seen = model()
+    ref = cache.publish(native_result()[0], request(), llm)
+    phase = DisaggregatedParams(request_type="context_only")
+    _, params = cache.prepare(ref, request(), llm, None, phase)
+    assert params is phase
+    assert params.request_type == "context_only"
+    assert seen["hashes"] == [[2147483647] * 8]
+    assert not list(tmp_path.glob("*.safetensors"))
 
 
 def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
@@ -171,4 +224,9 @@ def test_encoder_role_validation_fails_closed():
         oe.validate_encoder(req, "encode")
     req.ClearField("encoder")
     with pytest.raises(UnsupportedFeatureError, match="cache reference"):
+        oe.validate_encoder(req, "consume")
+    req.kv.session.session_id = "123"
+    assert oe.validate_encoder(req, "consume") == ""
+    req.encoder.cache.transfer_backend = oe.BACKEND
+    with pytest.raises(UnsupportedFeatureError, match="must not consume an encoder cache"):
         oe.validate_encoder(req, "consume")
