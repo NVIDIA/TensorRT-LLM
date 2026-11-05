@@ -63,12 +63,8 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.encoder import EncoderRunner, resolve_scheduled_encoder_args
-from .engine.runners.encoder_decoder import (
-    EncoderDecoderRunner,
-    EncoderDecoderRunnerConfig,
-    EncoderStageConfig,
-)
+from .engine.runners.encoder import EncoderConfig, EncoderRunner, resolve_scheduled_encoder_args
+from .engine.runners.encoder_decoder import EncoderDecoderRunner, EncoderDecoderRunnerConfig
 from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
 from .engine.runners.mm_encoder import MultimodalEncoderRunner
 from .guided_decoder import CapturableGuidedDecoder
@@ -518,7 +514,7 @@ class ModelEngine:
     def _initialize_encoder_decoder_runner(
         self, runner_cls: type[EncoderDecoderRunner]
     ) -> EncoderDecoderRunner:
-        encoder_config = EncoderStageConfig.create(
+        encoder_config = EncoderConfig.create(
             model=self.model,
             mapping=self.mapping,
             graph_config=self.llm_args.encoder_cuda_graph_config,

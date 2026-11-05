@@ -25,10 +25,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderRunner,
     resolve_scheduled_encoder_args,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
-    EncoderStage,
-    EncoderStageConfig,
-)
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderStage
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs, ScheduledInputs
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
@@ -66,7 +63,6 @@ def _encoder_config(
             def encoder_graph_spec(self) -> tuple[tuple[int, ...], torch.dtype, int]:
                 return feature_spec
 
-    config_type = EncoderStageConfig if encoder_decoder else EncoderConfig
     kwargs = dict(
         model=_Model(),
         mapping=SimpleNamespace(tp_size=tp_size),
@@ -80,7 +76,7 @@ def _encoder_config(
         enable_autotuner=False,
         is_encoder_decoder=encoder_decoder,
     )
-    return config_type.create(**kwargs), feature_spec
+    return EncoderConfig.create(**kwargs), feature_spec
 
 
 @pytest.mark.parametrize(
