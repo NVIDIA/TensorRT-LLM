@@ -92,7 +92,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  
  class _VariantWrapper:
      """Wraps a TVM-FFI function to look like a module with .run()."""
-@@ -312,7 +387,7 @@
+@@ -312,12 +387,12 @@
                      pass
  
              # Try per-variant .so
@@ -101,16 +101,31 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
              so_path = cache_dir / f"{variant_name}.so"
              lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
              try:
-@@ -329,7 +404,7 @@
+                 if not so_path.exists():
+-                    self._compile_only(variant_name, params)
++                    self._compile_only(variant_name, params, cache_dir)
  
-     def _compile_only(self, variant_name, params):
-         """Compile a variant without loading. Safe to call from subprocesses."""
+                 import tvm_ffi
+                 module = tvm_ffi.load_module(str(so_path))
+@@ -327,9 +402,14 @@
+             self._loaded[variant_name] = _VariantWrapper(fn)
+             return self._loaded[variant_name]
+ 
+-    def _compile_only(self, variant_name, params):
+-        """Compile a variant without loading. Safe to call from subprocesses."""
 -        cache_dir = CACHE_BASE / variant_name
-+        cache_dir = _built_dir(variant_name, f"{variant_name}.so")
++    def _compile_only(self, variant_name, params, cache_dir=None):
++        """Compile a variant without loading. Safe to call from subprocesses.
++
++        ``cache_dir`` is where to build, so a caller that already chose the
++        directory it will load from builds into that one; by default
++        _built_dir() chooses."""
++        if cache_dir is None:
++            cache_dir = _built_dir(variant_name, f"{variant_name}.so")
          so_path = cache_dir / f"{variant_name}.so"
  
          if so_path.exists():
-@@ -386,7 +461,7 @@
+@@ -386,7 +466,7 @@
  
      def _run_ninja(self, cache_dir):
          result = subprocess.run(
@@ -119,7 +134,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
              cwd=str(cache_dir),
              capture_output=True,
              text=True,
-@@ -420,7 +495,7 @@
+@@ -420,7 +500,7 @@
  
  def _do_compile_plan():
      """Generate and compile plan kernel. No TVM loading."""
@@ -128,7 +143,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      so_path = cache_dir / "fmha_sm100_plan.so"
  
      if so_path.exists():
-@@ -478,11 +553,11 @@
+@@ -478,11 +558,11 @@
  
  def _compile_plan_module():
      """Compile and load plan kernel."""
@@ -142,7 +157,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
          return tvm_ffi.load_module(str(so_path))
      finally:
          _release_file_lock(lock_fd)
-@@ -510,7 +585,7 @@
+@@ -510,7 +590,7 @@
  
  
  def _do_compile_sparse_topk():
@@ -151,7 +166,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      so_path = cache_dir / "sparse_topk_select.so"
  
      if so_path.exists():
-@@ -576,11 +651,11 @@
+@@ -576,11 +656,11 @@
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
              return _sparse_topk_module
@@ -165,7 +180,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
              _sparse_topk_module = tvm_ffi.load_module(str(so_path))
          finally:
              _release_file_lock(lock_fd)
-@@ -596,7 +671,7 @@
+@@ -596,7 +676,7 @@
  
  
  def _do_compile_reduction():
@@ -174,7 +189,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      so_path = cache_dir / "fmha_sm100_reduction.so"
  
      if so_path.exists():
-@@ -661,11 +736,11 @@
+@@ -661,11 +741,11 @@
      with _reduction_lock:
          if _reduction_module is not None:
              return _reduction_module
