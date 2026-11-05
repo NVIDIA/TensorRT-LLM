@@ -178,6 +178,11 @@ def _kv_manager_supported(kv_cache_manager) -> bool:
     # differently; those managers never run dense attention anyway.
     if getattr(kv_cache_manager, "is_linear_attention", False):
         return False
+    # With per-layer page tables (SWA scratch reuse, mixed page sizes or storage layouts in one
+    # lifecycle group) the block-offset table is indexed by local layer, not by the lifecycle
+    # group this library reads, and the layers of a group do not share one table.
+    if getattr(kv_cache_manager, "_use_per_layer_page_tables", False):
+        return False
     return True
 
 
