@@ -18,7 +18,7 @@ See "CuteDSL leaves" in MOE_DEVELOPER_GUIDE.md for the layout.
 """
 
 from .dense_gemm import TrtllmCutedslDenseGemmNvfp4Impl
-from .fused_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
+from .fused_fc12 import TrtllmCutedslFusedFc12Mxfp8Impl, TrtllmCutedslFusedFc12Nvfp4Impl
 from .grouped_gemm import (
     CuteDslFusedMoEBase,
     TrtllmCutedslGroupedGemmBf16Impl,
@@ -31,6 +31,7 @@ from .grouped_gemm import (
 __all__ = [
     "CuteDslFusedMoEBase",
     "TrtllmCutedslDenseGemmNvfp4Impl",
+    "TrtllmCutedslFusedFc12Mxfp8Impl",
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "TrtllmCutedslGroupedGemmBf16Impl",
     "TrtllmCutedslGroupedGemmNvfp4Impl",
