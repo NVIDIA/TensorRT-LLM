@@ -405,9 +405,12 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     With `has_initial_state` (`hi_p` / `hi_all`): a fresh sequence's slot is never
     read, and the scatter writes every named slot, so the fresh slots of the
     recurrent pool need no zeroing before this call (the conv pass reads no carry
-    for such a sequence and its publish writes the whole conv window). Bitwise
-    zeroing the fresh slots followed by the plain call; the gather moves only the
-    carried sequences' rows.
+    for such a sequence and its publish writes the whole conv window). Above
+    `INPLACE_MAX_TOKENS` context tokens (the packed path) it is bitwise zeroing the
+    fresh slots followed by the plain call, which the test holds; the gather moves
+    only the carried sequences' rows. A call of at most `INPLACE_MAX_TOKENS` runs in
+    place (below), within the same band of the fp64 reference but not bitwise to the
+    plain call, which may take the context-parallel pipeline instead.
 
     Certified at the 461-slot fp32 pool: three ragged context rows and one
     8192-token row, each into an `output=` buffer, and an 8-token context

@@ -340,8 +340,9 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
 
     Windows: a window's weight stacks are its own experts only (the op compares the scales'
     expert dimension with `local_num_experts`; the whole stack beside a window's scales would be
-    read as its first experts, refused by `is_valid`). Not certified: windows of the padded
-    I 256 stack (tp4 does not split experts); window rows past 8192 (the caller chunks).
+    read as its first experts, refused by `is_valid`; the windows test holds this refusal).
+    Not certified: windows of the padded I 256 stack (tp4 does not split experts); window rows
+    past 8192 (the caller chunks).
 
     Hard limits
       window       the whole 512 at I 640 (tp1), 128 of 512 at I 640 (every offset), 256 of

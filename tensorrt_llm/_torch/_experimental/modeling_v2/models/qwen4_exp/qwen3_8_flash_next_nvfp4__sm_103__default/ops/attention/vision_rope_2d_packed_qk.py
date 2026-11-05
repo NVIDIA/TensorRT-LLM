@@ -71,7 +71,8 @@ _BLOCK_H = 4
 _BLOCK_M = 8
 
 
-@triton.jit
+# The token counts vary per image: not specialized, so one compile serves every grid.
+@triton.jit(do_not_specialize=["seqlen", "seqlen_ro"])
 def _rotary_neox_inplace_kernel(
     X,
     COS,
@@ -175,11 +176,13 @@ class VisionRope2dPackedQk(OpWrapper):
     (tp4, tep4, dep4) runs the tower at these shapes.
 
     Source: Triton, JIT-compiled at first call for the running device; the cells ran that
-    path on sm_103 (GB300). Launch: `(cdiv(heads, 4), cdiv(T, 8))` programs, one per 4
-    heads x 8 tokens, each loading its 8 tokens' cos / sin once and both half-heads of
-    its 4 heads with 64-lane masked loads (36 live). Token offsets are int64, so no
-    address product overflows (the origin's int32 product would pass 2^31 at 621379 rows
-    of the 3456-wide qkv row); the cos / sin index is `t * half`.
+    path on sm_103 (GB300). The token counts are not specialized, so one compile serves
+    every grid (the tower's `warm_up` makes it at load; the test holds one variant).
+    Launch: `(cdiv(heads, 4), cdiv(T, 8))` programs, one per 4 heads x 8 tokens, each
+    loading its 8 tokens' cos / sin once and both half-heads of its 4 heads with 64-lane
+    masked loads (36 live). Token offsets are int64, so no address product overflows (the
+    origin's int32 product would pass 2^31 at 621379 rows of the 3456-wide qkv row); the
+    cos / sin index is `t * half`.
 
     Preconditions: `qk` 3-D, any strides (the kernel reads all three); `cos` and `sin`
     fp32, contiguous, both `[T, head_dim // 2]`. In place: the return value is `qk`

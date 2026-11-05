@@ -22,6 +22,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention.vision_rope_2d_packed_qk import (  # noqa: E501
     HEAD_DIM,
     NUM_HEADS,
+    _rotary_neox_inplace_kernel,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention.vision_rope_2d_packed_qk import (  # noqa: E501
     vision_rope_2d_packed_qk as op,
@@ -195,3 +196,21 @@ def test_is_valid_refuses_each_silent_table_fault(fault):
     assert not torch.equal(got, want), f"{fault}: the kernel got it right after all"
     with validating(op), pytest.raises(AssertionError):
         op(_qk(qkv.clone()), bad_cos, bad_sin)
+
+
+def test_one_compile_serves_every_grid():
+    """The token counts are not specialized: grids whose counts are and are not multiples of
+    16 run the one compiled kernel, bitwise the reference."""
+    variants = []
+    for grid in ([(1, 2, 2)], [(1, 4, 4)], [(1, 6, 10)], [(2, 8, 12)], [(1, 62, 90)]):
+        grid_thw = torch.tensor(grid, dtype=torch.int64)
+        qkv = _packed_qkv(_num_tokens(grid), torch.bfloat16, seed=23)
+        cos, sin = _angle_table(grid_thw, MERGE, THETA, HEAD_DIM)
+        want = op.reference(_qk(qkv), cos, sin)
+        got = op(_qk(qkv), cos, sin)
+        torch.cuda.synchronize()
+        assert _mismatch(got, want)[0] == 0, grid
+        variants.append(
+            len(_rotary_neox_inplace_kernel.device_caches[torch.cuda.current_device()][0])
+        )
+    assert variants == [variants[0]] * len(variants), variants

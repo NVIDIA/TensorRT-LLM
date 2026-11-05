@@ -34,7 +34,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attentio
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
-from .qsa_rowtile_attention_cute import BLOCK_M, BLOCK_N
+from .qsa_rowtile_attention_cute import BLOCK_M, BLOCK_N, ROW_ATOM
 from .qsa_rowtile_attention_cute import eligible as _cute_eligible
 from .qsa_rowtile_attention_cute import num_ctas as _rowtile_ctas
 from .qsa_rowtile_attention_cute import rowtile_attention_cute as _rowtile_attention_cute
@@ -613,6 +613,12 @@ def _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_ind
         raise ValueError("QSA row-tile sparse GQA needs every tensor on one CUDA device")
     if num_q_heads // num_kv_heads > BLOCK_M:
         raise ValueError("a row's query heads per KV head must fit the 128-row tile")
+    group_size = num_q_heads // num_kv_heads
+    if BLOCK_M // group_size * group_size % ROW_ATOM:
+        raise ValueError(
+            f"a row tile of {BLOCK_M // group_size} rows x {group_size} query heads per KV head "
+            f"must fill whole {ROW_ATOM}-row swizzle atoms of the output staging"
+        )
     if not _cute_eligible(q, k_cache, v_cache):
         raise ValueError(
             "the row-tile pass needs SM103, head_dim 256, unit-stride heads (q's heads packed) "

@@ -18,6 +18,9 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.vision.triton_pos_embed_interpolate import (  # noqa: E501
+    _bilinear_pos_embed_kernel,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.vision.triton_pos_embed_interpolate import (  # noqa: E501
     triton_pos_embed_interpolate as op,
 )
 
@@ -114,3 +117,17 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     for wrong in (dict(align=False), dict(raster=True), dict(swap=True)):
         with pytest.raises(AssertionError):
             _compare(out, _resize64(table, t, h, w, m_size, **wrong).float())
+
+
+def test_one_compile_serves_every_grid():
+    """The grid sides are not specialized: sides that are and are not multiples of 16 run
+    the one compiled kernel, each within the band."""
+    table = _table(41)
+    variants = []
+    for t, h, w in ((1, 2, 2), (1, 16, 16), (1, 4, 34), (2, 62, 90), (1, 32, 6)):
+        args = (table, t, h, w, NUM_GRID, MERGE, torch.bfloat16)
+        _compare(op(*args), op.reference(*args))
+        variants.append(
+            len(_bilinear_pos_embed_kernel.device_caches[torch.cuda.current_device()][0])
+        )
+    assert variants == [variants[0]] * len(variants), variants

@@ -38,6 +38,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attentio
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rowtile_attention_cute import (  # noqa: E501
     BLOCK_M,
     BLOCK_N,
+    ROW_ATOM,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rowtile_attention_cute import (  # noqa: E501
     eligible as _cute_eligible,
@@ -64,8 +65,6 @@ _PLAN_WORDS = {16: 64, 32: 16}  # capacity: fixed: a loop step; the plan loops o
 # this many quarters of a per-row tile (1.5x), cost no more than its rows' own columns.
 _SHARED_TILE_COST = 6
 _PLAN_WARPS = 4
-#: The O staging's swizzle atom in MMA rows: a group's rows x heads come in whole atoms.
-_ROW_ATOM = 8
 _LONE_WARPS = 2
 _LONE_STAGES = 2
 
@@ -548,7 +547,7 @@ def rows_per_group(group_size: int) -> int:
     """Rows of one request a row-tile item serves: the most whose `rows x group_size` MMA
     rows fill whole 8-row swizzle atoms of the 128-row tile (10 at 12 heads, 20 at 6)."""
     rows = BLOCK_M // group_size
-    while rows > 1 and rows * group_size % _ROW_ATOM:
+    while rows > 1 and rows * group_size % ROW_ATOM:
         rows -= 1
     return rows
 

@@ -317,3 +317,47 @@ def test_commit_graph_replay_rereads_its_inputs() -> None:
 
 
 _GUARD_SPEC = dict(n=8, p=4, planes=12)
+
+#: Argument positions in `_Step.call_args()`.
+_STREAM, _PAGES, _PTRS, _STRIDES, _INDEX_OLD = 3, 9, 11, 12, 13
+
+
+def _strided_index_old(step: _Step, args: list) -> None:
+    wide = torch.zeros(step.count, step.n * step.p, 2 * ROW, dtype=torch.bfloat16, device=DEV)
+    args[_INDEX_OLD] = wide[..., :ROW]
+
+
+def _narrow_stream(step: _Step, args: list) -> None:
+    args[_STREAM] = args[_STREAM][:, :-1].contiguous()
+
+
+def _int32_pages(step: _Step, args: list) -> None:
+    args[_PAGES] = args[_PAGES].to(torch.int32)
+
+
+def _short_plane_table(step: _Step, args: list) -> None:
+    args[_PTRS], args[_STRIDES] = args[_PTRS][:-1], args[_STRIDES][:-1]
+
+
+@pytest.mark.parametrize(
+    "perturb, message",
+    [
+        (_strided_index_old, "index_old must be the contiguous"),
+        (_narrow_stream, "stream must be the contiguous"),
+        (_int32_pages, "pages and within must be int64"),
+        (_short_plane_table, "the plane table holds 11 planes and index_old 12"),
+    ],
+    ids=["strided_index_old", "narrow_stream", "int32_pages", "short_plane_table"],
+)
+def test_guard_refuses_a_misshapen_staged_input(perturb, message) -> None:
+    """Each staged tensor the kernel reads by raw offset, one wrong at a time: `is_valid`
+    refuses it before the launch, so no pool is written."""
+    step = _Step(_GUARD_SPEC, 31)
+    before = step.snapshot()
+    args = list(step.call_args())
+    perturb(step, args)
+    with validating(spec_rollback_commit), pytest.raises(AssertionError, match=message):
+        spec_rollback_commit(*args)
+    torch.cuda.synchronize()
+    for got, want, what in zip(step.snapshot(), before, ("n-gram", "conv", "position")):
+        _equal(got, want, f"{what} pool after a refused call")

@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.ssm.gdn_cached_replay_cute__verify as cr  # noqa: E501
+from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
 _MV2_TESTS = Path(__file__).resolve().parents[4]
 if str(_MV2_TESTS) not in sys.path:
@@ -275,3 +276,27 @@ def test_launch_mappings_agree(n, t, pdl) -> None:
     for cfg, got in zip(_MAPPINGS[1:], results[1:]):
         for name, x, y in zip(("out", "state", "u", "k", "G"), got, results[0]):
             assert torch.equal(x, y), f"{name}: {cfg} vs {_MAPPINGS[0]}"
+
+
+@pytest.mark.parametrize("heads", cr.GEOMETRIES, ids=[f"{h}x{hv}" for h, hv in cr.GEOMETRIES])
+def test_precompile_covers_every_step(heads) -> None:
+    """After `precompile`, as the target runs it at bind, a verify step of any request count
+    compiles nothing: steps at each launch mapping's edges, 9 to 15 requests (an eager mixed
+    step's, which no padded decode graph captures) among them, the partitioned ones with work
+    items and the all-layer commit as the target hands them over."""
+    t, partition_from = 4, CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    kernels = cr.precompile(t, *heads, 40, pdl=True, partition_from=partition_from)
+    assert kernels > 0, kernels
+    compiled = len(cr._COMPILED)
+    for n in (1, 2, 3, 8, 9, 12, 15, 16, 17, 40):
+        path = "all_layer" if n >= partition_from else "small"
+        spec = _rank_spec(heads, path=path, n=n, t=t, steps=1, layers=1, slots=64)
+        bench = trep._Bench(spec, 5150 + n, exact=False)
+        bench.prepare()
+        act = bench.inputs()
+        kw = bench.kwargs(0, act)
+        kw["g"], kw["beta"] = _gates(bench, act, True)
+        kw["launch_with_pdl"] = True
+        op(**kw)
+        torch.cuda.synchronize()
+        assert len(cr._COMPILED) == compiled, f"a step of {n} requests compiled a kernel"

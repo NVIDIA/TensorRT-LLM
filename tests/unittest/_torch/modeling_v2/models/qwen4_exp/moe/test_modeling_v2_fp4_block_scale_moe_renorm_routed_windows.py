@@ -205,3 +205,26 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     H._compare(y, exp.to(torch.bfloat16))
     elt, rms = H._dev(y, exp.to(torch.bfloat16))
     print(f"  cell {cell.why[:64]!r}: {elt:.2f} elt / {rms:.2f} rms ulp")
+
+
+def test_guard_refuses_the_whole_stack_beside_a_window(many_expert_layer):  # noqa: F811
+    """The whole 512-expert weight stack passed beside a window's scales: the kernel sizes the
+    window from the scales and would read the stack's first experts as the window's;
+    `is_valid` refuses it."""
+    cell = next(
+        c
+        for c in _WINDOWS
+        if c.spec["intermediate"] == 640 and c.spec["local_num_experts"] < c.spec["num_experts"]
+    )
+    spec = cell.spec
+    win_args, _, data, sf, _, logits, _, _, _, scalars = _operands(spec, 7, many_expert_layer)
+    whole, _ = _stack(spec, many_expert_layer)
+    weights = dict(
+        win_args, gemm1_weights=whole["gemm1_weights"], gemm2_weights=whole["gemm2_weights"]
+    )
+    message = (
+        f"gemm1_weights holds {spec['num_experts']} experts but the window has "
+        f"{spec['local_num_experts']}"
+    )
+    with validating(op), pytest.raises(AssertionError, match=message):
+        _routed(win_args, data, sf, logits, scalars, spec, weights=weights)

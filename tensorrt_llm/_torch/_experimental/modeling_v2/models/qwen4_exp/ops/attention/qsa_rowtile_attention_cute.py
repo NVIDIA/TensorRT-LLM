@@ -66,6 +66,8 @@ HEAD_DIM = 256
 #: MMA rows per CTA and tokens per tile (one 64-bit bitmap word).
 BLOCK_M = 128
 BLOCK_N = 64
+#: The O staging's swizzle atom in MMA rows: a tile's rows x heads come in whole atoms.
+ROW_ATOM = 8
 #: K/V ring slots (32 KB each); with the 60 KB Q buffer, about 220 KB of shared memory.
 KV_SLOTS = 5
 #: Work items in flight in the shared-memory schedule ring.
@@ -103,7 +105,7 @@ class _RowtileAttentionKernel:
         assert group_size * rows_per_tile <= 128
         # The O staging's four SW128 boxes sit `64 G R` elements apart: each must start on
         # a 1024-byte swizzle atom, so the live MMA rows come in whole 8-row atoms.
-        assert group_size * rows_per_tile % 8 == 0, (group_size, rows_per_tile)
+        assert group_size * rows_per_tile % ROW_ATOM == 0, (group_size, rows_per_tile)
         self.group_size = group_size
         self.rows_per_tile = rows_per_tile
         self.d = head_dim

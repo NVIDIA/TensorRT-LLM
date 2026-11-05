@@ -355,9 +355,11 @@ _CARRIED = next(c for c in op.CELLS if "initial" in c.spec)
 
 
 def test_has_initial_state_is_the_reset_then_the_plain_call() -> None:
-    """The flags are zeroing the fresh slots before the call: zeroing them and running the
-    plain in-place call gives the same output and pool, bitwise; a linear gate that is
-    `torch.exp` of the plain call's log gate changes nothing."""
+    """On the packed path (above `INPLACE_MAX_TOKENS`), the flags are zeroing the fresh slots
+    before the call: zeroing them and running the plain in-place call gives the same output
+    and pool, bitwise; a linear gate that is `torch.exp` of the plain call's log gate changes
+    nothing."""
+    assert sum(_CARRIED.spec["seqlens"]) > INPLACE_MAX_TOKENS, "the cell must take the packed path"
     args, _ = _build(_CARRIED.spec, seed=5)
     flags = args.pop("has_initial_state")
     linear_gate = args.pop("linear_gate", False)

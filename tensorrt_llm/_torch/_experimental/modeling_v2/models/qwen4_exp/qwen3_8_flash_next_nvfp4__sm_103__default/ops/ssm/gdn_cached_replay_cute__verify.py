@@ -1687,6 +1687,75 @@ def default_config(n: int, t: int, commit: bool = False) -> dict:
     return dict(tpc=8, warps=4, pf=1, minb=5)
 
 
+def _kernel_kw(
+    n: int,
+    t: int,
+    h: int,
+    hv: int,
+    *,
+    commit: bool,
+    pdl: bool,
+    l2norm: bool,
+    gating: bool,
+    g_f32: bool,
+    b_f32: bool,
+    work_items: bool,
+    config: Optional[dict] = None,
+) -> dict:
+    """The kernel's compile-time parameters for a call of `n` requests: its key in `_COMPILED`."""
+    cfg = dict(default_config(n, t, commit))
+    if config:
+        cfg.update(config)
+    # with PDL, issue the state / history (not written by the previous kernel) before the wait;
+    # without it, the step's own small inputs first
+    cfg.setdefault("qk_first", not pdl)
+    cfg["use_wi"] = bool(cfg.pop("use_wi", True)) and work_items
+    return dict(
+        T=t,
+        h=h,
+        hv=hv,
+        commit=commit,
+        pdl=pdl,
+        l2norm=l2norm,
+        gating=gating,
+        g_f32=g_f32,
+        b_f32=b_f32,
+        **cfg,
+    )
+
+
+def precompile(
+    t: int, h: int, hv: int, max_requests: int, *, pdl: bool, partition_from: int
+) -> int:
+    """Compile every kernel a verify step of 1..`max_requests` requests launches, the way a
+    target calls this entry: work items, and with them no in-kernel commit, from
+    `partition_from` requests on; the q/k L2 norm and the gating in-kernel; bf16 `a` / `b`.
+    A compile costs 5-10 s, so a target runs this at bind, before any step: the captured
+    decode graphs do not reach every mapping (padded graphs skip 9 to 15 requests, which an
+    eager mixed step carries). Returns the number of distinct kernels."""
+    keys = set()
+    for n in range(1, max_requests + 1):
+        partitioned = n >= partition_from
+        kw = _kernel_kw(
+            n,
+            t,
+            h,
+            hv,
+            commit=not partitioned,
+            pdl=pdl,
+            l2norm=True,
+            gating=True,
+            g_f32=False,
+            b_f32=False,
+            work_items=partitioned,
+        )
+        key = tuple(sorted(kw.items()))
+        if key not in keys:
+            keys.add(key)
+            _compile(key, _Replay(**kw))
+    return len(keys)
+
+
 def _compile(key, kern):
     fn = _COMPILED.get(key)
     if fn is None:
@@ -1800,27 +1869,21 @@ def cached_replay_update(
         ap, dp = A_log.data_ptr(), dt_bias.data_ptr()
     else:
         ap = dp = 0
-    cfg = dict(default_config(N, T, commit))
-    if config:
-        cfg.update(config)
-    # with PDL, issue the state / history (not written by the previous kernel) before the wait;
-    # without it, the step's own small inputs first
-    cfg.setdefault("qk_first", not bool(launch_with_pdl))
-    use_wi = bool(cfg.pop("use_wi", True)) and replay_work_items is not None
-    cfg["use_wi"] = use_wi
-    pdl = bool(launch_with_pdl)
-    kw = dict(
-        T=T,
-        h=H,
-        hv=HV,
+    kw = _kernel_kw(
+        N,
+        T,
+        H,
+        HV,
         commit=commit,
-        pdl=pdl,
+        pdl=bool(launch_with_pdl),
         l2norm=bool(use_qk_l2norm_in_kernel),
         gating=gating,
         g_f32=g.dtype == torch.float32,
         b_f32=beta.dtype == torch.float32,
-        **cfg,
+        work_items=replay_work_items is not None,
+        config=config,
     )
+    use_wi = kw["use_wi"]
     key = tuple(sorted(kw.items()))
     fn = _COMPILED.get(key)
     if fn is None:
@@ -2020,8 +2083,9 @@ class GdnCachedReplayCute(OpWrapper):
     dependents at its start (`launch_dependent_kernels`), so the kernel streams the checkpoint
     and the history -- which nothing in the step writes ahead of it -- while the conv runs, and
     reads q/k/v, a and b only after `griddepcontrol.wait`. Compiles one kernel per (geometry,
-    T, launch mapping, commit, PDL, ...) on first use (5-10 s): the warm-up before CUDA-graph
-    capture covers it.
+    T, launch mapping, commit, PDL, ...) on first use (5-10 s); `precompile` builds every one a
+    target's verify steps reach, and the target runs it at bind (the captured decode graphs
+    alone skip 9 to 15 requests, which an eager mixed step carries).
 
     Certified at the whole layer's 16 / 48 heads (tp1, dep4) over a bf16 state: the in-kernel
     commit at N = 1 and T = 3, 4, the all-layer commit at N = 32 and 256 (T = 4). Certified at

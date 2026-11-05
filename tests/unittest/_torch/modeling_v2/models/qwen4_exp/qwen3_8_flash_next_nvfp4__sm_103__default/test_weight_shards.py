@@ -554,10 +554,10 @@ def _block(start: int, width: int) -> list[int]:
 
 
 @pytest.mark.parametrize("rank", RANKS)
-@pytest.mark.parametrize("member", ["tep4", "dep4"])
+@pytest.mark.parametrize("member", ["tp4", "tep4", "dep4"])
 def test_cuts_select_the_rank_heads(stored, configs, member, rank):
-    """tp4 cuts attention and Gated-DeltaNet exactly as tep4 does: the members differ only
-    in the routed experts."""
+    """Each rank's attention and Gated-DeltaNet rows: tp4 and tep4 cut them alike (the
+    members differ only in the routed experts), dep4 holds every head."""
     d = _dims(configs, member, rank)
     fake = _fake_checkpoint(stored)
     manifest = WT.MODEL_WEIGHTS.manifest(d)

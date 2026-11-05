@@ -529,11 +529,12 @@ class CausalConv1dUpdate(OpWrapper):
             _decode_conv(x, conv_state, weight, conv_state_indices, pad_slot_id)
             return x
         if conv_state.shape[0] * conv_state.stride(0) >= TRTLLM_SLOT_OFFSET_LIMIT:
+            last = (TRTLLM_SLOT_OFFSET_LIMIT - 1) // conv_state.stride(0)
             raise ValueError(
                 f"a conv-state pool of {conv_state.shape[0]} slots at stride "
-                f"{conv_state.stride(0)}: TRT-LLM's causal_conv1d_update forms a slot's offset "
-                f"in 32 bits and would wrap past slot {(TRTLLM_SLOT_OFFSET_LIMIT - 1) // conv_state.stride(0)}; "
-                "lower free_gpu_memory_fraction or the recurrent-state share of the KV cache"
+                f"{conv_state.stride(0)}: TRT-LLM's C++ conv kernel addresses a slot in 32 bits "
+                f"and would wrap past slot {last}; lower free_gpu_memory_fraction or the "
+                "recurrent-state share of the KV cache"
             )
         torch.ops.trtllm.causal_conv1d_update(
             x.unsqueeze(-1) if x.dim() == 2 else x,

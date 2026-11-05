@@ -448,6 +448,7 @@ from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import precompile as hc_tc_fir
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
+from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_precompile
 
 # The GPU architecture this target is certified for; a direct instantiation could
 # bypass routing.
@@ -1608,6 +1609,18 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"a {state_dtype} recurrent-state cache; this layout serves "
             f"{' or '.join(str(d) for d in served)} (kv_cache_config.mamba_ssm_cache_dtype)"
         )
+        if self.mtp_enabled and state_dtype == torch.bfloat16:
+            # Every CuTe replay kernel a verify step of up to `max_num_requests` requests
+            # launches (`_gdn_verify`), compiled now: the captured decode graphs do not reach
+            # every launch mapping, and a compile in a serving step stalls it 5-10 s.
+            gdn_replay_precompile(
+                self.max_verify_rows,
+                self.num_k_heads,
+                self.num_v_heads,
+                md.max_num_requests,
+                pdl=_GDN_REPLAY_PDL,
+                partition_from=CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+            )
         # No sliding window: the targets pass `max_seq_len` as the window.
         windows = cm.max_attention_window_vec
         attn_windows = {windows[off] for off in rank_pools.pool_idx.values()}
@@ -6771,6 +6784,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
         super().post_load_weights()
         self.model.post_load_weights()
         self.vision_tower = _vision.VisionTower(self.model.w, self.model.vision_config)
+        self.vision_tower.warm_up()
         if self.one_rank:
             self._build_heads(self.lm_head.weight.data)
 

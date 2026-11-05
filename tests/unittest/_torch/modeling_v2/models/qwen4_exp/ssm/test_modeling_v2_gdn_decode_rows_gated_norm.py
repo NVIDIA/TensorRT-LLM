@@ -226,8 +226,10 @@ def _build(spec, seed):
         # and slot 100 sits ~2.8G elements past the base (past int32).
         layers, num = PAGE_LAYERS, 102
         page = torch.empty(num * layers * v_heads * V * K, device=DEV, dtype=state)
-        page[: v_heads * V * K * 4].normal_(0.0, 0.05, generator=g)
         pool = page.as_strided((num, v_heads, V, K), (layers * v_heads * V * K, V * K, K, 1))
+        # The pool is compared whole: no slot of the view is left uninitialized.
+        pool.zero_()
+        page[: v_heads * V * K * 4].normal_(0.0, 0.05, generator=g)
         for s in (100, 101):
             pool[s].copy_(torch.randn(v_heads, V, K, generator=g, device=DEV) * 0.05)
         slots = torch.tensor([100, 101][:rows], dtype=torch.int32, device=DEV)

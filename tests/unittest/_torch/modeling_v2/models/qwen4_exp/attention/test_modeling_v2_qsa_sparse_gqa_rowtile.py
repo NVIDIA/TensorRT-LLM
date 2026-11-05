@@ -252,3 +252,11 @@ def test_rejects_a_call_without_the_prefill_pair() -> None:
     args.update(query_positions=None, compress_ratio=None)
     with pytest.raises(ValueError, match=re.escape("the row-tile kernel needs the prefill pair")):
         op(**args)
+
+
+def test_rejects_a_group_size_whose_tile_breaks_the_row_atoms() -> None:
+    """6 query heads per KV head would take 21 rows (126 MMA rows), not whole 8-row swizzle
+    atoms: the op refuses it before the kernel is built."""
+    args = _build(_with([(600, 4)], slots=8, q_heads=12), seed=9200)
+    with pytest.raises(ValueError, match="must fill whole 8-row swizzle atoms"):
+        op(**args)

@@ -163,6 +163,11 @@ DEVICE_PATHS = (
 _POSITION_AXES = 3
 
 
+#: The grids `VisionTower.warm_up` runs: one call whose patch count is a multiple of 16 (4x4)
+#: and one whose count is not (2x2), the two variants Triton compiles a row count into.
+WARM_UP_GRIDS = (((1, 4, 4),), ((1, 2, 2),))
+
+
 # --------------------------------------------------------------- weight views ---
 
 
@@ -332,6 +337,16 @@ class VisionTower:
         # Persistent scratch: `thop_attention` grows `workspace` in place; never the
         # engine's own workspace.
         self._ws: torch.Tensor | None = None
+
+    def warm_up(self) -> None:
+        """Run the tower once per `WARM_UP_GRIDS` grid on zero pixels, so every JIT kernel it
+        launches is compiled at load rather than on the first media request. The rope and
+        position-embedding kernels take the grid as unspecialized ints; the layer norm's row
+        count is specialized only on divisibility by 16, and the two grids cover both."""
+        device = self._w.pos.device
+        for grid in WARM_UP_GRIDS:
+            rows = sum(t * h * w for t, h, w in grid)
+            self._run(torch.zeros(rows, self.pixel_width, dtype=self.dtype, device=device), grid)
 
     def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """`pixel_values` is `[sum(t*h*w), in_channels*kt*kh*kw]`, one flat patch per row,

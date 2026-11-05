@@ -99,6 +99,7 @@ from torch import nn
 
 from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
 from tensorrt_llm._utils import CUASSERT
+from tensorrt_llm.llmapi.utils import get_numa_aware_cpu_affinity
 
 from .pool import attention_tp_size
 
@@ -193,23 +194,16 @@ _CUDA_HOST_REGISTER_MAPPED = 0x02
 
 
 def _local_cpus(device) -> set | None:
-    """The CPUs sysfs lists as local to `device`'s PCI function and this process may run on,
-    or None when that is unknown."""
+    """The CPUs of `device`'s NUMA affinity, as NVML reports it (`get_numa_aware_cpu_affinity`),
+    that this process may run on, or None when NVML cannot tell."""
+    import pynvml
+
+    index = torch.device(device).index
     try:
-        props = torch.cuda.get_device_properties(device)
-        path = (
-            f"/sys/bus/pci/devices/{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
-            f"{props.pci_device_id:02x}.0/local_cpulist"
-        )
-        with open(path) as fh:
-            text = fh.read().strip()
-    except (OSError, AttributeError, RuntimeError):
+        local = get_numa_aware_cpu_affinity(torch.cuda.current_device() if index is None else index)
+    except pynvml.NVMLError:
         return None
-    cpus = set()
-    for part in filter(None, text.split(",")):
-        lo, _, hi = part.partition("-")
-        cpus.update(range(int(lo), int(hi or lo) + 1))
-    return (cpus & os.sched_getaffinity(0)) or None
+    return (set(local) & os.sched_getaffinity(0)) or None
 
 
 class _RegisteredHostBuffer:
@@ -218,16 +212,16 @@ class _RegisteredHostBuffer:
     allocation with `mmap` and returns it with `munmap`, so freeing registered pages
     would leave the driver mapping memory the OS may hand out again.
 
-    Not torch's pinned allocator: it rounds the 47.7 GiB table up to 64 GiB, and the
-    device's random row gathers from its pages are slower than from registered pageable
-    memory."""
+    Not torch's pinned allocator: it rounds the 47.7 GiB table up to 64 GiB, and on
+    GB300 the device's random row gathers from its pages run an order of magnitude
+    slower than from registered pageable memory."""
 
     def __init__(self, nbytes: int, device=None) -> None:
         # The registration faults the pages in on this thread, so under the default local
         # allocation policy they land on the NUMA node of the CPU it runs on. Pinned to the
         # CPUs local to `device` meanwhile, the table sits next to the GPU that gathers from
-        # it: with a process per GPU, half the ranks would otherwise gather from the other
-        # socket's memory.
+        # it: on GB300, random row gathers from the other socket's memory run ~1.7x slower,
+        # and with a process per GPU half of them would otherwise land there.
         local = _local_cpus(device) if device is not None else None
         previous = os.sched_getaffinity(0) if local else None
         if local:
