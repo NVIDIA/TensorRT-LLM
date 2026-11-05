@@ -261,6 +261,12 @@ error does not count again. Other terminal transfer failures count as `error`.
 User cancellation alone is excluded. CTX send and GEN receive workers each
 report their own side; summing both counts both endpoints.
 
+Expired asynchronous GEN receives are cancelled from the transfer poll even
+when no model batch can run. A refused cancellation retains the request and KV
+pages and is retried; request failure follows only after safe retirement. CTX
+resources are reclaimed after the final transceiver or connector owner releases
+them, including requests already removed from the active list.
+
 Counts accumulate on the executor CPU and ride the existing sampled iteration
 records and attention-DP exchange as three integers, without extra collectives,
 CUDA synchronization, or request iteration stats. Skipped iterations do not lose
