@@ -1991,26 +1991,25 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         )
 
     def load_weights(self, weights: dict) -> None:
-        """Load weights with key remapping from Cosmos3-Nano / Diffusers checkpoints.
+        """Load a Cosmos3 diffusion-transformer checkpoint, including Edge-FP8.
 
         Expects tensor names as in ``diffusion_pytorch_model.safetensors.index.json``
-        (e.g. ``layers.{i}.self_attn.to_q.weight``, ``proj_in.weight``).
-        Maps UND vs GEN blocks into this module's layout (causal self-attn vs cross-attn + MLPs).
+        (e.g. ``layers.{i}.self_attn.to_q.weight``, ``proj_in.weight``). A missing
+        required weight raises ``ValueError``. An unrecognized key is logged and
+        left unloaded.
         """
         remapped = {}
         skipped_keys = []
 
         for key, value in weights.items():
             action, mapped = remap_cosmos3_checkpoint_key(key)
+            if action == "quantizer":
+                continue
             if action == "skip":
-                normalized = key[len("model.") :] if key.startswith("model.") else key
-                # Quantizer buffers are numerous and intentionally unused. Keep
-                # them out of the skip summary, which names whole components.
-                if "quantizer" not in normalized:
-                    skipped_keys.append(normalized)
+                skipped_keys.append(mapped)
                 continue
             if action == "unmatched":
-                if mapped is not None and mapped.startswith("layers."):
+                if mapped.startswith("layers."):
                     logger.warning(f"Unmatched layer key: {key}")
                 else:
                     logger.warning(f"Skipping unknown checkpoint key: {key}")

@@ -7,24 +7,65 @@ Kept free of torch imports so the Edge-FP8 tensor manifest can be checked
 without constructing the model or a GPU.
 """
 
-from typing import Optional, Tuple
+from typing import Literal, Tuple
+
+CheckpointKeyStatus = Literal["quantizer", "skip", "remap", "unmatched"]
+
+# Source prefix and destination template. ``{layer_idx}`` comes from the key.
+_LAYER_KEY_TEMPLATES: Tuple[Tuple[str, str], ...] = (
+    ("self_attn.add_q_proj.", "gen_layers.{layer_idx}.cross_attention.to_q."),
+    ("self_attn.add_k_proj.", "gen_layers.{layer_idx}.cross_attention.to_k."),
+    ("self_attn.add_v_proj.", "gen_layers.{layer_idx}.cross_attention.to_v."),
+    ("self_attn.to_add_out.", "gen_layers.{layer_idx}.cross_attention.to_out.0."),
+    ("self_attn.norm_added_q.", "gen_layers.{layer_idx}.cross_attention.norm_q."),
+    ("self_attn.norm_added_k.", "gen_layers.{layer_idx}.cross_attention.norm_k."),
+    ("self_attn.to_q.", "language_model.layers.{layer_idx}.self_attn.to_q."),
+    ("self_attn.to_k.", "language_model.layers.{layer_idx}.self_attn.to_k."),
+    ("self_attn.to_v.", "language_model.layers.{layer_idx}.self_attn.to_v."),
+    ("self_attn.to_out.", "language_model.layers.{layer_idx}.self_attn.to_out.0."),
+    ("self_attn.norm_q.", "language_model.layers.{layer_idx}.self_attn.norm_q."),
+    ("self_attn.norm_k.", "language_model.layers.{layer_idx}.self_attn.norm_k."),
+    (
+        "self_attn.k_norm_und_for_gen.",
+        "language_model.layers.{layer_idx}.self_attn.k_norm_und_for_gen.",
+    ),
+    ("input_layernorm.", "language_model.layers.{layer_idx}.input_layernorm."),
+    (
+        "post_attention_layernorm.",
+        "language_model.layers.{layer_idx}.post_attention_layernorm.",
+    ),
+    ("input_layernorm_moe_gen.", "gen_layers.{layer_idx}.input_layernorm."),
+    (
+        "post_attention_layernorm_moe_gen.",
+        "gen_layers.{layer_idx}.post_attention_layernorm.",
+    ),
+    ("mlp.gate_proj.", "language_model.layers.{layer_idx}.mlp.gate_proj."),
+    ("mlp.up_proj.", "language_model.layers.{layer_idx}.mlp.up_proj."),
+    ("mlp.down_proj.", "language_model.layers.{layer_idx}.mlp.down_proj."),
+    ("mlp_moe_gen.gate_proj.", "gen_layers.{layer_idx}.mlp.gate_proj."),
+    ("mlp_moe_gen.up_proj.", "gen_layers.{layer_idx}.mlp.up_proj."),
+    ("mlp_moe_gen.down_proj.", "gen_layers.{layer_idx}.mlp.down_proj."),
+)
 
 
-def remap_cosmos3_checkpoint_key(key: str) -> Tuple[str, Optional[str]]:
+def remap_cosmos3_checkpoint_key(key: str) -> Tuple[CheckpointKeyStatus, str]:
     """Classify one diffusion-transformer checkpoint tensor.
 
-    Returns ``("skip", None)`` for tensors the runtime does not load,
-    ``("remap", runtime_name)`` for tensors that land on a constructed
-    parameter, or ``("unmatched", normalized_key)`` when the name is not part
-    of this topology. ModelOpt fake-quant buffers (``*_quantizer._amax`` /
-    ``._scale``) are skipped: the loader consumes ``weight``, ``weight_scale``
-    and ``input_scale`` only.
+    The second value is the normalized checkpoint key, except for ``"remap"``,
+    where it is the translated name. ``"remap"`` means the name matches a
+    known pattern. This helper does not check that the translated name is a
+    parameter of the constructed module; the loader does.
+
+    ``"quantizer"`` is a ModelOpt fake-quant buffer (``*_quantizer._amax`` /
+    ``._scale``). The loader consumes ``weight``, ``weight_scale``, and
+    ``input_scale`` only. ``"skip"`` is an intentionally unused model tensor.
+    ``"unmatched"`` is a name outside this topology.
     """
     normalized = key[len("model.") :] if key.startswith("model.") else key
     if "quantizer" in normalized:
-        return "skip", None
+        return "quantizer", normalized
     if normalized.startswith(("lm_head.", "action_pos_embed.", "norm.")):
-        return "skip", None
+        return "skip", normalized
 
     for source, destination in (
         ("proj_in.", "vae2llm."),
@@ -61,45 +102,7 @@ def remap_cosmos3_checkpoint_key(key: str) -> Tuple[str, Optional[str]]:
     if len(parts) < 3:
         return "unmatched", normalized
     layer_idx, rest = parts[1], parts[2]
-    understanding = f"language_model.layers.{layer_idx}"
-    generation = f"gen_layers.{layer_idx}"
-    # Generation patterns are matched first. ``add_*`` names share the
-    # ``self_attn.`` prefix with the understanding projections but not their stems.
-    mappings = (
-        {
-            "self_attn.add_q_proj.": f"{generation}.cross_attention.to_q.",
-            "self_attn.add_k_proj.": f"{generation}.cross_attention.to_k.",
-            "self_attn.add_v_proj.": f"{generation}.cross_attention.to_v.",
-            "self_attn.to_add_out.": f"{generation}.cross_attention.to_out.0.",
-            "self_attn.norm_added_q.": f"{generation}.cross_attention.norm_q.",
-            "self_attn.norm_added_k.": f"{generation}.cross_attention.norm_k.",
-        },
-        {
-            "self_attn.to_q.": f"{understanding}.self_attn.to_q.",
-            "self_attn.to_k.": f"{understanding}.self_attn.to_k.",
-            "self_attn.to_v.": f"{understanding}.self_attn.to_v.",
-            "self_attn.to_out.": f"{understanding}.self_attn.to_out.0.",
-            "self_attn.norm_q.": f"{understanding}.self_attn.norm_q.",
-            "self_attn.norm_k.": f"{understanding}.self_attn.norm_k.",
-            "self_attn.k_norm_und_for_gen.": f"{understanding}.self_attn.k_norm_und_for_gen.",
-        },
-        {
-            "input_layernorm.": f"{understanding}.input_layernorm.",
-            "post_attention_layernorm.": f"{understanding}.post_attention_layernorm.",
-            "input_layernorm_moe_gen.": f"{generation}.input_layernorm.",
-            "post_attention_layernorm_moe_gen.": f"{generation}.post_attention_layernorm.",
-        },
-        {
-            "mlp.gate_proj.": f"{understanding}.mlp.gate_proj.",
-            "mlp.up_proj.": f"{understanding}.mlp.up_proj.",
-            "mlp.down_proj.": f"{understanding}.mlp.down_proj.",
-            "mlp_moe_gen.gate_proj.": f"{generation}.mlp.gate_proj.",
-            "mlp_moe_gen.up_proj.": f"{generation}.mlp.up_proj.",
-            "mlp_moe_gen.down_proj.": f"{generation}.mlp.down_proj.",
-        },
-    )
-    for mapping in mappings:
-        for pattern, replacement in mapping.items():
-            if rest.startswith(pattern):
-                return "remap", replacement + rest[len(pattern) :]
+    for source, destination in _LAYER_KEY_TEMPLATES:
+        if rest.startswith(source):
+            return "remap", destination.format(layer_idx=layer_idx) + rest[len(source) :]
     return "unmatched", normalized

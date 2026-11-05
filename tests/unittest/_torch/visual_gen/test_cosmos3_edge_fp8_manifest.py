@@ -32,7 +32,7 @@ def _load_remap():
         )
 
         return remap_cosmos3_checkpoint_key
-    except (ImportError, ModuleNotFoundError):
+    except ImportError:
         path = (
             Path(__file__).resolve().parents[4]
             / "tensorrt_llm/_torch/visual_gen/models/cosmos3/checkpoint_keys.py"
@@ -146,25 +146,25 @@ def test_edge_fp8_manifest_covers_the_runtime_modules():
         if action == "remap":
             remapped.add(mapped)
         elif action == "skip":
-            skipped.append(key)
+            skipped.append(mapped)
+        elif action == "quantizer":
+            skipped.append(mapped)
         else:
             unmatched.append(key)
 
     assert unmatched == []
     assert remapped == _expected_edge_runtime_keys()
     assert {key for key in skipped if "quantizer" not in key} == {"lm_head.weight", "norm.weight"}
-    assert all(
-        "quantizer" in key for key in skipped if key not in {"lm_head.weight", "norm.weight"}
-    )
     scale_keys = [key for key in keys if key.endswith("weight_scale")]
     assert len(scale_keys) == _NUM_LAYERS * 6 * 2
 
 
 def test_quantizer_buffers_do_not_shadow_real_weights():
     action, mapped = remap_cosmos3_checkpoint_key("layers.0.self_attn.to_q.input_quantizer._amax")
-    assert action == "skip"
-    assert mapped is None
+    assert action == "quantizer"
+    assert mapped == "layers.0.self_attn.to_q.input_quantizer._amax"
     action, mapped = remap_cosmos3_checkpoint_key("layers.0.self_attn.to_q.weight_scale")
+    assert action == "remap"
     assert mapped == "language_model.layers.0.self_attn.to_q.weight_scale"
 
 
