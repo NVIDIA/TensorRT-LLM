@@ -91,9 +91,10 @@ def _pre_shutdown(proxy):
 @pytest.mark.parametrize("batching", [False, True])
 def test_batching_is_opt_in(monkeypatch, batching):
     monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", "1" if batching else "0")
-    q = _RecordingQueue(block_first_put=True)
+    q = _RecordingQueue(block_first_put=batching)
     sender = _create_request_sender(q, queue.Queue())
     sender.send(pickle.dumps("a"))
+    delivered_on_return = bool(q.messages)
     assert q.first_put_started.wait(10)
     sender.send(pickle.dumps("b"))
     sender.send(pickle.dumps("c"))
@@ -105,6 +106,8 @@ def test_batching_is_opt_in(monkeypatch, batching):
         else [_payloads("a"), _payloads("b"), _payloads("c")]
     )
     assert q.messages == expected
+    if not batching:
+        assert delivered_on_return, "unbatched submission returned before its command was sent"
 
 
 def test_lone_request_is_sent_as_one_payload_list():
@@ -394,7 +397,8 @@ def test_connection_recovery_requires_worker_receipt(tmp_path, push, acknowledge
 @pytest.mark.timeout(12, method="thread")
 def test_control_capacity_is_reserved_when_admission_is_full():
     q = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(q, queue.Queue(), batching=False)
+    sender = _RequestSender(q, queue.Queue())
+    sender.MAX_BATCH_SIZE = 1
     sender.MAX_PENDING_REQUESTS = 1
     sender.MAX_PENDING_CONTROLS = 1
     try:
@@ -415,7 +419,7 @@ def test_control_capacity_is_reserved_when_admission_is_full():
 @pytest.mark.timeout(12, method="thread")
 def test_shutdown_cancels_survive_full_control_queue():
     q = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(q, queue.Queue(), batching=False)
+    sender = _RequestSender(q, queue.Queue())
     sender.MAX_PENDING_CONTROLS = 1
     sender.MAX_BATCH_SIZE = 1
     sender.send(pickle.dumps("in-flight"))
@@ -459,14 +463,23 @@ def test_connected_worker_backpressure_pauses_admission():
 
 
 @pytest.mark.timeout(12, method="thread")
-def test_recovery_acknowledgements_survive_reconnecting_worker():
+@pytest.mark.parametrize("drop_first_ack", [False, True])
+def test_recovery_acknowledgements_survive_reconnecting_worker(drop_first_ack):
+    delivered = []
+
     class Commands(_RecordingQueue):
         retry = False
         acknowledged = 0
+        dropped_ack = False
 
         def put(self, message, **kwargs):
             request = pickle.loads(message[0])
             if isinstance(request, _CommandBarrier):
+                if drop_first_ack and not self.dropped_ack:
+                    # The worker can time out opening its ACK connection while
+                    # the frontend is paused, then continue processing commands.
+                    self.dropped_ack = True
+                    return
                 # Each barrier gets a fresh worker-side connection, as in
                 # worker_main. The receiver persists across recoveries.
                 ack = IpcQueue(request.ack_addr, is_server=False, socket_type=zmq.PUSH)
@@ -482,9 +495,10 @@ def test_recovery_acknowledgements_survive_reconnecting_worker():
                 raise zmq.Again()
             else:
                 self.retry = False
+                delivered.append(request)
 
     commands = Commands()
-    sender = _RequestSender(commands, queue.Queue(), batching=False, recovery_timeout=0.5)
+    sender = _RequestSender(commands, queue.Queue(), batching=False, recovery_timeout=1)
     try:
         for cycle in range(3):
             sender.send(pickle.dumps(cycle))
@@ -495,5 +509,6 @@ def test_recovery_acknowledgements_survive_reconnecting_worker():
                     timeout=2,
                 )
             assert sender.available
+        assert delivered == [0, 1, 2]
     finally:
         sender.close(timeout=3)
