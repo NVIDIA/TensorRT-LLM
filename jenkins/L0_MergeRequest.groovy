@@ -890,7 +890,7 @@ def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
 def preparation(pipeline, testFilter, globalVars)
 {
     image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
-    setupPipelineSpec = createKubernetesPodConfig(image, "package")
+    setupPipelineSpec = createKubernetesPodConfig(image, "package", "amd64", "Setup Environment")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         def targetBranchInfo = [:]
         stage("Setup Environment") {
