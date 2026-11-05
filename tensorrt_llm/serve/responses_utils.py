@@ -56,7 +56,6 @@ from transformers.utils.chat_template_utils import render_jinja_template
 
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
-from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
@@ -3486,40 +3485,6 @@ async def keep_responses_stream_alive(
     finally:
         # Stops the task reading ``frames`` when this stream ends early.
         await items.aclose()
-
-
-class ServerArrivalTimeMiddleware:
-    """
-    Custom ASGI middleware to track server arrival time.
-
-    We implement this as a pure ASGI middleware instead of using FastAPI's
-    @app.middleware("http") decorator because the decorator internally uses
-    BaseHTTPMiddleware, which wraps the ASGI `receive` callable. This wrapping
-    breaks Request.is_disconnected() functionality - the wrapped receive doesn't
-    properly forward http.disconnect events while the middleware is waiting in
-    call_next(), preventing detection of client disconnections during long-running
-    non-streaming requests.
-
-    By implementing pure ASGI middleware, we pass through the original receive/send
-    callables unchanged, preserving the ability to detect client disconnections.
-
-    See: https://github.com/encode/starlette/discussions/2094
-    """
-
-    def __init__(self,
-                 app,
-                 adjusted_clock: Optional[AdjustedSteadyClock] = None):
-        self.app = app
-        self._adjusted_clock = adjusted_clock or AdjustedSteadyClock()
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            # Add arrival time to scope
-            scope["state"] = {}
-            scope["state"]["server_arrival_time"] = self._adjusted_clock.now()
-
-        # Pass through the original receive/send - no wrapping!
-        await self.app(scope, receive, send)
 
 
 class PeriodicLatencyLogger:
