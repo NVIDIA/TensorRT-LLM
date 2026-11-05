@@ -205,6 +205,7 @@ l0_cpu:
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_capacity_only.py::test_index_mapper_reservation_tracks_confidence_scheduling
+  - unittest/_torch/pyexecutor/kv_cache/test_kvcm2_integration.py::test_page_index_capacity_covers_configured_sequence_length
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/speculative/test_device_window_sampling_layout.py
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
