@@ -20,7 +20,11 @@ from ..model_config import ModelConfig
 from .deepseek_v41_processor import IMAGE_PLACEHOLDER, DeepseekV41InputProcessor
 from .deepseek_v41_vision import DeepseekV41Aligner, DeepseekV41VisionModel
 from .modeling_deepseekv41 import DeepseekV41ForCausalLM
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalModelMixin,
+    encode_multimodal_by_groups,
+)
 from .modeling_utils import register_auto_model
 
 
@@ -186,39 +190,61 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
         # Preserve lazy checkpoint metadata and consumable-weight ownership.
         self.llm.load_weights(weights)
 
+    @property
+    def mm_encoder_groups(self) -> tuple[EncoderGroup, ...]:
+        return (
+            EncoderGroup(
+                modalities=("image",),
+                encoder_fn=self._encode_images,
+                input_fields={
+                    "pixel_values": {"image": "pixel_values"},
+                    "image_grid_hw": {"image": "image_grid_hw"},
+                    "llm_grid_hw": {"image": "llm_grid_hw"},
+                    "num_tokens": {"image": "num_tokens"},
+                },
+            ),
+        )
+
     def encode_multimodal_inputs(
         self, multimodal_params: Sequence[MultimodalParams]
     ) -> torch.Tensor:
+        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
+
+    def _encode_images(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_hw: torch.Tensor,
+        llm_grid_hw: torch.Tensor,
+        num_tokens: torch.Tensor,
+    ) -> torch.Tensor:
         if self.vision is None or self.aligner is None:
             raise ValueError("Raw images require a local DeepSeek-V4.1 vision encoder")
+        grids = image_grid_hw.tolist()
+        llm_grids = llm_grid_hw.tolist()
+        lengths = num_tokens.tolist()
+        if not (len(grids) == len(llm_grids) == len(lengths)):
+            raise ValueError("DeepSeek-V4.1 image metadata lengths disagree")
+        patches = pixel_values.split([height * width for height, width in grids])
         embeddings = []
         device = self.text_embedding_layer.weight.device
-        for param in multimodal_params:
-            images = param.multimodal_data["image"]
-            patches = images["pixel_values"]
-            grids = images["image_grid_hw"]
-            llm_grids = images["llm_grid_hw"]
-            lengths = images["num_tokens"]
-            if not (len(patches) == len(grids) == len(llm_grids) == len(lengths)):
-                raise ValueError("DeepSeek-V4.1 image metadata lengths disagree")
-            for pixels, (height, width), (rows, columns), length in zip(
-                patches, grids, llm_grids, lengths
-            ):
-                pixels = pixels.to(device=device, dtype=self.embedding_dtype)
-                features = self.aligner(self.vision(pixels, height, width), height, width)
-                if features.shape[0] != rows * columns or length != rows * (columns + 1) + 2:
-                    raise ValueError("DeepSeek-V4.1 image grid does not match its placeholder span")
-                features = features.reshape(rows, columns, self.embedding_dim)
-                newline = self.image_newline.to(features.dtype).expand(rows, 1, -1)
-                embeddings.append(
-                    torch.cat(
-                        (
-                            self.image_start.to(features.dtype).unsqueeze(0),
-                            torch.cat((features, newline), dim=1).flatten(0, 1),
-                            self.image_end.to(features.dtype).unsqueeze(0),
-                        )
+        for pixels, (height, width), (rows, columns), length in zip(
+            patches, grids, llm_grids, lengths
+        ):
+            pixels = pixels.to(device=device, dtype=self.embedding_dtype)
+            features = self.aligner(self.vision(pixels, height, width), height, width)
+            if features.shape[0] != rows * columns or length != rows * (columns + 1) + 2:
+                raise ValueError("DeepSeek-V4.1 image grid does not match its placeholder span")
+            features = features.reshape(rows, columns, self.embedding_dim)
+            newline = self.image_newline.to(features.dtype).expand(rows, 1, -1)
+            embeddings.append(
+                torch.cat(
+                    (
+                        self.image_start.to(features.dtype).unsqueeze(0),
+                        torch.cat((features, newline), dim=1).flatten(0, 1),
+                        self.image_end.to(features.dtype).unsqueeze(0),
                     )
                 )
+            )
         if not embeddings:
             raise ValueError("No images supplied to DeepSeek-V4.1 encoder")
         return torch.cat(embeddings)

@@ -3,6 +3,7 @@
 
 import math
 from types import SimpleNamespace
+from typing import Sequence
 from unittest.mock import Mock
 
 import numpy as np
@@ -25,6 +26,11 @@ from tensorrt_llm._torch.models.modeling_deepseekv41_multimodal import (
 )
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import PreparedLlmInputs
 from tensorrt_llm.inputs import create_input_processor_with_hash
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 
 pytestmark = pytest.mark.cpu_only
 _IMAGE_ID = 129264
@@ -165,15 +171,15 @@ def test_processor_preserves_interleaved_text_and_image_payload() -> None:
     data = extra["multimodal_data"]
     image = data["image"]
     assert image["positions"] == [1, 6]
-    assert image["num_tokens"] == [4, 10]
+    assert image["num_tokens"].tolist() == [4, 10]
     assert data["multimodal_encoder_item_metadata"].output_embedding_lengths == (4, 10)
-    assert image["image_grid_hw"] == [(3, 3), (4, 7)]
-    assert image["llm_grid_hw"] == [(1, 1), (2, 3)]
+    assert image["image_grid_hw"].tolist() == [[3, 3], [4, 7]]
+    assert image["llm_grid_hw"].tolist() == [[1, 1], [2, 3]]
     assert image["token_types"][1].tolist() == [0, 1, 1, 1, 2, 1, 1, 1, 2, 3]
     expected = torch.from_numpy(pixels).permute(2, 0, 1).float() / 255
     expected = ((expected - 0.5) / 0.5).to(torch.bfloat16)
     expected = expected.reshape(3, 3, 2, 3, 2).permute(1, 3, 0, 2, 4).reshape(9, 3, 2, 2)
-    torch.testing.assert_close(image["pixel_values"][0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(image["pixel_values"][:9], expected, rtol=0, atol=0)
     assert extra["multimodal_input"] is not None
     tokenizer.encode.assert_not_called()
     tokenizer.decode.assert_not_called()
@@ -215,14 +221,17 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
     wrapper.image_newline = nn.Parameter(torch.tensor([-5.0, -6.0]))
     pixels = torch.randn(20, 3, 2, 2)
     params = [
-        SimpleNamespace(
+        MultimodalParams(
             multimodal_data={
                 "image": {
-                    "pixel_values": [pixels],
-                    "image_grid_hw": [(4, 5)],
-                    "llm_grid_hw": [(2, 2)],
-                    "num_tokens": [8],
-                }
+                    "pixel_values": pixels,
+                    "image_grid_hw": torch.tensor([[4, 5]]),
+                    "llm_grid_hw": torch.tensor([[2, 2]]),
+                    "num_tokens": torch.tensor([8]),
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[8]
+                ),
             }
         )
     ]
@@ -301,3 +310,159 @@ def test_wrapper_request_lifecycle_preserves_image_history() -> None:
     )
     wrapper.release_request_state(41)
     provider.release_request_state.assert_called_once_with(41)
+
+
+def _main_encode_multimodal_inputs(
+    self, multimodal_params: Sequence[MultimodalParams]
+) -> torch.Tensor:
+    if self.vision is None or self.aligner is None:
+        raise ValueError("Raw images require a local DeepSeek-V4.1 vision encoder")
+    embeddings = []
+    device = self.text_embedding_layer.weight.device
+    for param in multimodal_params:
+        images = param.multimodal_data["image"]
+        patches = images["pixel_values"]
+        grids = images["image_grid_hw"]
+        llm_grids = images["llm_grid_hw"]
+        lengths = images["num_tokens"]
+        if not (len(patches) == len(grids) == len(llm_grids) == len(lengths)):
+            raise ValueError("DeepSeek-V4.1 image metadata lengths disagree")
+        for pixels, (height, width), (rows, columns), length in zip(
+            patches, grids, llm_grids, lengths
+        ):
+            pixels = pixels.to(device=device, dtype=self.embedding_dtype)
+            features = self.aligner(self.vision(pixels, height, width), height, width)
+            if features.shape[0] != rows * columns or length != rows * (columns + 1) + 2:
+                raise ValueError("DeepSeek-V4.1 image grid does not match its placeholder span")
+            features = features.reshape(rows, columns, self.embedding_dim)
+            newline = self.image_newline.to(features.dtype).expand(rows, 1, -1)
+            embeddings.append(
+                torch.cat(
+                    (
+                        self.image_start.to(features.dtype).unsqueeze(0),
+                        torch.cat((features, newline), dim=1).flatten(0, 1),
+                        self.image_end.to(features.dtype).unsqueeze(0),
+                    )
+                )
+            )
+    if not embeddings:
+        raise ValueError("No images supplied to DeepSeek-V4.1 encoder")
+    return torch.cat(embeddings)
+
+
+@pytest.mark.parametrize("grids_by_request", [[[(3, 3)]], [[(4, 5)], [(3, 3), (2, 7)]]])
+@pytest.mark.parametrize("mixed_dtype", [False, True])
+def test_encoder_group_matches_main_per_image_calls(
+    vision_config: DeepseekV41VisionConfig,
+    grids_by_request: list[list[tuple[int, int]]],
+    mixed_dtype: bool,
+) -> None:
+    torch.manual_seed(67)
+    wrapper = _wrapper()
+    wrapper.vision = DeepseekV41VisionModel(vision_config).eval()
+    wrapper.aligner = DeepseekV41Aligner(vision_config, 2).eval()
+    for name in ("image_start", "image_end", "image_newline"):
+        setattr(wrapper, name, nn.Parameter(torch.randn(2)))
+    main_params, params = [], []
+    for request_index, grids in enumerate(grids_by_request):
+        dtype = torch.bfloat16 if mixed_dtype and request_index % 2 else torch.float32
+        patches = [torch.randn(height * width, 3, 2, 2).to(dtype) for height, width in grids]
+        llm_grids = [(math.ceil(height / 3), math.ceil(width / 3)) for height, width in grids]
+        lengths = [rows * (columns + 1) + 2 for rows, columns in llm_grids]
+        main_params.append(
+            MultimodalParams(
+                multimodal_data={
+                    "image": {
+                        "pixel_values": patches,
+                        "image_grid_hw": grids,
+                        "llm_grid_hw": llm_grids,
+                        "num_tokens": lengths,
+                    }
+                }
+            )
+        )
+        params.append(
+            MultimodalParams(
+                multimodal_data={
+                    "image": {
+                        "pixel_values": torch.cat(patches),
+                        "image_grid_hw": torch.tensor(grids),
+                        "llm_grid_hw": torch.tensor(llm_grids),
+                        "num_tokens": torch.tensor(lengths),
+                    },
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", index) for index in range(len(grids))],
+                        output_embedding_lengths=lengths,
+                    ),
+                }
+            )
+        )
+    wrapper._encode_images = Mock(wraps=wrapper._encode_images)
+    with torch.inference_mode():
+        expected = torch.cat(
+            [_main_encode_multimodal_inputs(wrapper, [param]) for param in main_params]
+        )
+        wrapper.vision.forward = Mock(wraps=wrapper.vision.forward)
+        actual = wrapper.encode_multimodal_inputs(params)
+    assert torch.equal(actual, expected)
+    signatures = list(
+        dict.fromkeys(param.multimodal_data["image"]["pixel_values"].dtype for param in params)
+    )
+    assert wrapper._encode_images.call_count == len(signatures)
+    assert wrapper.vision.forward.call_count == sum(map(len, grids_by_request))
+    for signature, call in zip(signatures, wrapper._encode_images.call_args_list):
+        main_images = [
+            param.multimodal_data["image"]
+            for param in main_params
+            if param.multimodal_data["image"]["pixel_values"][0].dtype == signature
+        ]
+        packed = call.kwargs
+        for field in ("pixel_values", "image_grid_hw", "llm_grid_hw", "num_tokens"):
+            values = [value for images in main_images for value in images[field]]
+            expected_input = torch.cat(values) if field == "pixel_values" else torch.tensor(values)
+            assert torch.equal(packed[field], expected_input)
+            assert packed[field].dtype == expected_input.dtype
+            assert packed[field].device == expected_input.device
+
+
+def test_processor_metadata_without_hashing_and_dummy(
+    vision_config: DeepseekV41VisionConfig,
+) -> None:
+    config = PretrainedConfig(
+        text_config={"vocab_size": 129280},
+        vision_config=vision_config.to_dict(),
+        image_token_id=_IMAGE_ID,
+    )
+    tokenizer = Mock(unk_token_id=None)
+    tokenizer.convert_tokens_to_ids.return_value = _IMAGE_ID
+    processor = DeepseekV41InputProcessor("unused", config, tokenizer)
+    processor._min_pixels = 0
+    processor._multimodal_hashing_supported = False
+    wrapped = create_input_processor_with_hash(processor)
+    _, extra = wrapped(
+        {
+            "prompt_token_ids": [_IMAGE_ID],
+            "multi_modal_data": {"image": Image.new("RGB", (6, 6))},
+        },
+        None,
+    )
+    data = extra["multimodal_data"]
+    metadata = data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.item_refs == (("image", 0),)
+    assert metadata.output_embedding_lengths == (4,)
+    assert "multimodal_input" not in extra
+    for field in ("image_grid_hw", "llm_grid_hw", "num_tokens"):
+        assert data["image"][field].dtype == torch.int64
+        assert data["image"][field].device.type == "cpu"
+    dummy = processor.get_dummy_mm_data(max_num_encoder_tokens=20, mm_counts={"image": 1})
+    dummy_metadata = dummy[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert dummy_metadata.item_refs == (("image", 0),)
+    assert dummy_metadata.output_embedding_lengths == tuple(dummy["image"]["num_tokens"].tolist())
+    wrapper = _wrapper()
+    wrapper.vision = DeepseekV41VisionModel(vision_config).eval()
+    wrapper.aligner = DeepseekV41Aligner(vision_config, 2).eval()
+    for name in ("image_start", "image_end", "image_newline"):
+        setattr(wrapper, name, nn.Parameter(torch.randn(2)))
+    with torch.inference_mode():
+        output = wrapper.encode_multimodal_inputs([MultimodalParams(multimodal_data=dummy)])
+    assert output.shape == (sum(dummy_metadata.output_embedding_lengths), 2)

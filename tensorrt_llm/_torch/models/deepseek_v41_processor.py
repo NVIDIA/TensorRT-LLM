@@ -29,6 +29,10 @@ from tensorrt_llm.inputs import (
     ExtraProcessedInputs,
     TextPrompt,
 )
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.tokenizer import TransformersTokenizer
 
@@ -182,6 +186,25 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         """All image positions, including learned delimiters, receive embeddings."""
         return torch.tensor([self._image_token_id], dtype=torch.int32)
 
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: list[int],
+        multimodal_data: dict[str, Any],
+        mm_item_order: list[dict] | None = None,
+    ) -> MultimodalItemMetadata | None:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        if metadata is None and multimodal_data.get("image") is not None:
+            lengths = multimodal_data["image"]["num_tokens"].tolist()
+            item_refs = (
+                [(entry["modality"], entry["index"]) for entry in mm_item_order]
+                if mm_item_order
+                else [("image", index) for index in range(len(lengths))]
+            )
+            metadata = MultimodalItemMetadata(
+                item_refs, output_embedding_lengths=[lengths[index] for _, index in item_refs]
+            )
+        return metadata
+
     def _dummy_grid(self, budget: int | None) -> tuple[int, int]:
         """Maximize encoder patches within the patch budget and LLM span limit."""
         ratio = self._downsample_ratio
@@ -229,23 +252,28 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         )
         length = _num_image_tokens(rows, columns)
         return {
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", index) for index in range(count)],
+                output_embedding_lengths=[length] * count,
+            ),
             "image": {
-                "pixel_values": [
-                    torch.zeros(
-                        height * width,
-                        3,
-                        self._patch_size,
-                        self._patch_size,
-                        dtype=dtype or self.dtype,
-                    )
-                    for _ in range(count)
-                ],
-                "image_grid_hw": [(height, width)] * count,
-                "llm_grid_hw": [(rows, columns)] * count,
-                "num_tokens": [length] * count,
+                "pixel_values": torch.zeros(
+                    count * height * width,
+                    3,
+                    self._patch_size,
+                    self._patch_size,
+                    dtype=dtype or self.dtype,
+                ),
+                "image_grid_hw": torch.tensor(
+                    [(height, width)] * count, dtype=torch.int64, device="cpu"
+                ),
+                "llm_grid_hw": torch.tensor(
+                    [(rows, columns)] * count, dtype=torch.int64, device="cpu"
+                ),
+                "num_tokens": torch.full((count,), length, dtype=torch.int64, device="cpu"),
                 "token_types": [_image_token_types(rows, columns) for _ in range(count)],
                 "positions": [index * length for index in range(count)],
-            }
+            },
         }
 
     def _plan_grid(self, width: int, height: int) -> tuple[int, int, int, int]:
@@ -376,11 +404,11 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         return expanded_ids, {
             "multimodal_data": {
                 "image": {
-                    "pixel_values": pixels,
-                    "image_grid_hw": image_grids,
-                    "llm_grid_hw": llm_grids,
+                    "pixel_values": torch.cat(pixels),
+                    "image_grid_hw": torch.tensor(image_grids, dtype=torch.int64, device="cpu"),
+                    "llm_grid_hw": torch.tensor(llm_grids, dtype=torch.int64, device="cpu"),
                     "token_types": token_types,
-                    "num_tokens": num_tokens,
+                    "num_tokens": torch.tensor(num_tokens, dtype=torch.int64, device="cpu"),
                     "positions": updates["image"]["positions"],
                 }
             }
