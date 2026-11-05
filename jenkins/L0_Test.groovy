@@ -2792,21 +2792,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
                             rm -f "\$tmp_path"
 
-                            # enroot import unpacks the image layers under ENROOT_TEMP_PATH.
-                            # On some MARS Slurm clusters (for example cs-oci-ord), the prolog
-                            # of every new job wrongly chowns the directories in the default
-                            # ENROOT_TEMP_PATH to another user, and an import running at that
-                            # time produces a broken .sqsh. See TRTLLMINF-548.
-                            # As a workaround, point ENROOT_TEMP_PATH to a job-private directory
-                            # under this user's enroot data directory, or under /tmp when
-                            # enroot cannot report that directory.
+                            # enroot import unpacks the image layers under ENROOT_TEMP_PATH. On some MARS Slurm clusters (for example cs-oci-ord),
+                            # the prolog of a new job can wrongly chown the directories in the default ENROOT_TEMP_PATH to another user, and an
+                            # import running at that time then produces a broken .sqsh. See TRTLLMINF-548.
+                            # As a workaround, point ENROOT_TEMP_PATH to a job-private directory under this user's enroot data directory, or under
+                            # /tmp when enroot cannot report that directory.
                             import_base=\$(enroot info 2>/dev/null | sed -n 's/^[[:space:]]*ENROOT_DATA_PATH=//p' || true)
                             if [ -z "\$import_base" ] || [ ! -O "\$import_base" ] || [ ! -w "\$import_base" ]
                             then
                                 echo "WARNING: no writable per-user ENROOT_DATA_PATH from 'enroot info' ('\$import_base'); importing in /tmp"
                                 import_base=/tmp
                             fi
-                            # Remove directories left behind by imports that were killed.
+                            # Remove directories left behind by killed imports: ours, last changed more than one day ago (an import takes far less).
                             find "\$import_base" -mindepth 1 -maxdepth 1 -type d -name '.enroot-import.*' -user "\$(id -u)" -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
                             import_tmp_dir=\$(mktemp -d "\$import_base/.enroot-import.XXXXXX")
                             echo "Enroot import temp dir: \$import_tmp_dir"
