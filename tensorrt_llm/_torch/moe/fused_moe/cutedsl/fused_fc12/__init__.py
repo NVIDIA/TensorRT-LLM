@@ -14,11 +14,13 @@
 # limitations under the License.
 """CuteDSL fused FC12: FC1 and FC2 in one persistent kernel, one leaf per quant.
 
-Importing this package registers its leaves.
+Importing this package registers both leaves.
 """
 
+from .mxfp8 import TrtllmCutedslFusedFc12Mxfp8Impl
 from .nvfp4 import TrtllmCutedslFusedFc12Nvfp4Impl
 
 __all__ = [
+    "TrtllmCutedslFusedFc12Mxfp8Impl",
     "TrtllmCutedslFusedFc12Nvfp4Impl",
 ]
