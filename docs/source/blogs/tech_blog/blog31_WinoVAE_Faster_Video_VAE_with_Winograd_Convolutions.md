@@ -46,9 +46,21 @@ WinoVAE retains the trained weights and preserves these convolutions in exact ar
 
 ![Decoder graph showing the mid block, four up blocks, channel counts, and frame dimensions](../media/tech_blog31/decoder_graph.svg)
 
-*Figure 2. Decoder structure for a steady-state chunk containing one latent frame at 720p. Dimensions at the right are the outputs of each stage. The first chunk has separate causal-start behavior. The green stages have larger spatial maps and fewer channels. Unpatchify rearranges 12 feature channels into RGB pixels at twice the height and width.*
+*Figure 2. Decoder structure for a steady-state chunk containing one latent frame at 720p. Operations within each box run from top to bottom. Dimensions at the right are the outputs of each stage. The first chunk has separate causal-start behavior. The green stages have larger spatial maps and fewer channels. Unpatchify rearranges 12 feature channels into RGB pixels at twice the height and width.*
 
-The mid block operates at the smallest spatial resolution and includes attention over the frame. Three upsampling stages then increase the spatial resolution, and two also increase the frame count. The final rearrangement produces RGB video. Within a residual block, the shortcut bypasses two sequences of normalization, activation, and convolution. A projection matches channel counts when necessary. Root-mean-square normalization (RMSNorm) normalizes each pixel over its channels, and SiLU applies $x\,\mathrm{sigmoid}(x)$ elementwise.
+The mid block operates at the smallest spatial resolution and includes attention over the frame. Three upsampling stages then increase the spatial resolution, and two also increase the frame count. The final rearrangement produces RGB video.
+
+At inference, each residual block computes
+
+$$
+\begin{aligned}
+h_1 &= C_1\bigl(\operatorname{SiLU}(N_1(x))\bigr),\\
+h_2 &= C_2\bigl(\operatorname{SiLU}(N_2(h_1))\bigr),\\
+y &= S(x)+h_2.
+\end{aligned}
+$$
+
+Here, $N_1$ and $N_2$ are root-mean-square normalization (RMSNorm) over each pixel's channels. The activation is $\operatorname{SiLU}(x)=x\,\mathrm{sigmoid}(x)$. Each $C_j$ is a learned causal 3 × 3 × 3 convolution, including its bias. The shortcut $S(x)$ is $x$ when channel counts match, or a learned 1 × 1 × 1 projection otherwise. It bypasses both normalization, activation, and convolution sequences.
 
 Early convolutions have many channels and small spatial maps. Later convolutions have fewer channels and many more pixels. One kernel decomposition need not be best at every stage.
 

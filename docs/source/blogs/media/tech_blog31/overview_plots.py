@@ -71,45 +71,42 @@ def arrow(ax: plt.Axes, start: tuple, end: tuple) -> None:
 
 
 def decoder_graph() -> None:
-    fig, ax = plt.subplots(figsize=(6.4, 8.0))
-    ax.set(xlim=(0, 6.4), ylim=(0, 8.0))
+    fig, ax = plt.subplots(figsize=(6.4, 8.8))
+    ax.set(xlim=(0, 6.4), ylim=(0, 8.8))
     ax.axis("off")
     rows = [
         ("Input", "Latents", "48 ch · 1 frame\n45 × 80", 0.45),
-        ("Mid", "conv_in → ResBlock\n→ attention → ResBlock", "1024 ch · 1 frame\n45 × 80", 0.65),
-        ("up0", "3 ResBlocks\nUpsample time and space", "1024 ch · 2 frames\n90 × 160", 0.65),
-        ("up1", "3 ResBlocks\nUpsample time and space", "1024 ch · 4 frames\n180 × 320", 0.65),
-        ("up2", "3 ResBlocks\nSpatial upsample", "512 ch · 4 frames\n360 × 640", 0.65),
+        (
+            "conv_in\n+ mid",
+            "conv_in\nResBlock\nAttention\nResBlock",
+            "1024 ch · 1 frame\n45 × 80",
+            1.12,
+        ),
+        (
+            "up0",
+            "3 ResBlocks\nTime conv 3×1×1\nUpsample 2×\nSpatial conv 3×3",
+            "1024 ch · 2 frames\n90 × 160",
+            1.12,
+        ),
+        (
+            "up1",
+            "3 ResBlocks\nTime conv 3×1×1\nUpsample 2×\nSpatial conv 3×3",
+            "1024 ch · 4 frames\n180 × 320",
+            1.12,
+        ),
+        ("up2", "3 ResBlocks\nUpsample 2×\nSpatial conv 3×3", "512 ch · 4 frames\n360 × 640", 0.86),
         ("up3", "3 ResBlocks", "256 ch · 4 frames\n360 × 640", 0.45),
-        ("Output", "Norm → conv_out\n→ unpatchify", "3 ch · 4 frames\n720 × 1280", 0.65),
+        ("Output", "RMSNorm\nSiLU\nconv_out\nUnpatchify", "3 ch · 4 frames\n720 × 1280", 1.12),
     ]
-    y = 7.7
+    y = 8.45
     for i, (name, label, dims, height) in enumerate(rows):
         y -= height
-        ax.text(0.65, y + height / 2, name, ha="center", va="center", fontsize=13, weight="bold")
-        node(ax, 1.3, y, 3.0, height, label, "#E3EFD3" if name in ("up2", "up3") else "#EAF0F6", 12)
+        ax.text(0.58, y + height / 2, name, ha="center", va="center", fontsize=12, weight="bold")
+        node(ax, 1.3, y, 3.0, height, label, "#E3EFD3" if name in ("up2", "up3") else "#EAF0F6", 13)
         ax.text(4.55, y + height / 2, dims, va="center", fontsize=12, color=INK)
         if i != len(rows) - 1:
             arrow(ax, (2.8, y - 0.04), (2.8, y - 0.26))
         y -= 0.30
-    ax.text(0.1, 1.28, "Inside each ResBlock", fontsize=14, weight="bold", color=INK)
-    node(
-        ax,
-        0.15,
-        0.47,
-        6.0,
-        0.59,
-        "RMSNorm → SiLU → causal 3×3×3 convolution\nRMSNorm → SiLU → causal 3×3×3 convolution",
-        size=12,
-    )
-    ax.text(
-        3.15,
-        0.12,
-        "Add the shortcut; project it if channel counts change.",
-        ha="center",
-        fontsize=12,
-        color=GREY,
-    )
     save(fig, "decoder_graph")
 
 
