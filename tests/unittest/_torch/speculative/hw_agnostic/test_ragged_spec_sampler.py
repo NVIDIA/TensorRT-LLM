@@ -59,6 +59,7 @@ def _penalty_mapping_meta(
         verify_lens=None,
         qo_indptr=None,
         total_verify_tokens=None,
+        watermark_ready=False,
     )
     if verify_lens is not None:
         lens = torch.tensor(verify_lens, dtype=torch.int32)
@@ -187,8 +188,9 @@ def test_uniform_verify_window_keeps_runtime_draft_length(cpu_sampler):
 @pytest.mark.parametrize("force_accept", [0.0, 1.0, 3.0])
 def test_ragged_strict_acceptance_stops_at_each_request_window(force_accept):
     worker = _make_worker(force_accept)
-    worker._sample_tokens_for_batch = lambda *args: torch.tensor(
-        [1, 100, 2, 8, 4, 101], dtype=torch.int64
+    worker._sample_tokens_and_watermark_plans = lambda *args: (
+        torch.tensor([1, 100, 2, 8, 4, 101], dtype=torch.int64),
+        None,
     )
     metadata = _penalty_mapping_meta([0, 1], [2, 4])
     metadata.is_cuda_graph = False
@@ -395,7 +397,7 @@ def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ra
         calls.update(kwargs)
         return torch.zeros(2, 4, dtype=torch.int32), torch.tensor([4, 4])
 
-    worker._sample_tokens_for_batch = lambda *args: torch.tensor([7])
+    worker._sample_tokens_and_watermark_plans = lambda *args: (torch.tensor([7]), None)
     worker._compute_probs_from_logits = compute_probs
     worker._rng_state_per_request = lambda *args, slot: (None, None)
     monkeypatch.setattr(interface_ops, "rejection_sampling_one_model", rejection)
@@ -493,7 +495,7 @@ def test_rejection_retains_request_local_bonus_distribution(
     if vocab_mode == "d2t":
         # Neither draft-vocabulary ID maps to target token 0.
         worker._d2t = torch.tensor([1, 2])
-    worker._sample_tokens_for_batch = lambda *args: torch.tensor([3])
+    worker._sample_tokens_and_watermark_plans = lambda *args: (torch.tensor([3]), None)
     worker._compute_probs_from_logits = lambda mode, scores, *params: scores.softmax(-1)
     worker._rng_state_per_request = lambda *args, slot: (None, None)
     calls = {}

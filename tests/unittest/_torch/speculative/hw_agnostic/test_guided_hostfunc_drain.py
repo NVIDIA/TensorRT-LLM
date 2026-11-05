@@ -180,8 +180,8 @@ def test_skip_drafting_routes_through_the_guided_helper():
         patch.object(_Worker, "_execute_guided_decoder_if_present") as helper,
         patch.object(
             _Worker,
-            "_sample_tokens_for_batch",
-            return_value=torch.arange(batch_size, dtype=torch.int),
+            "_sample_tokens_and_watermark_plans",
+            return_value=(torch.arange(batch_size, dtype=torch.int), None),
         ),
     ):
         out = worker.skip_drafting(
