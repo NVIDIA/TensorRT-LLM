@@ -61,6 +61,8 @@ def _request(request_id: int, *, dummy: bool = False) -> MagicMock:
     req.context_current_position = 0
     req.context_remaining_length = 8
     req.context_chunk_size = 8
+    req.py_orig_prompt_len = 8
+    req.total_input_len_cp = 8
     req.get_tokens.return_value = list(range(8))
     req.py_draft_tokens = []
     req.kv_cache_retention_config = None
@@ -107,6 +109,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor._packed_sync_enabled = False
     executor._stage_timing = False
     executor.kv_cache_transceiver = None
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.dwdp_manager = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)

@@ -68,6 +68,44 @@ _FUSED_VERIFY_MAX_TOKENS = 8
 _FUSED_VERIFY_HISTORY = 16
 
 
+class GdnIterationContext(NamedTuple):
+    """Metadata-derived arguments of forward_extend / forward_decode, shared by every GDN layer of one iteration.
+
+    Built by the first GDN layer of the iteration (Qwen3NextGatedDeltaNet._iteration_context, which needs the
+    speculative metadata that Mamba2Metadata.prepare does not see), stored on ``Mamba2Metadata.gdn_iteration_context``
+    and cleared by every Mamba2Metadata.prepare / prepare_steady_gen_step. Layers only read it; per-layer state and
+    scratch are passed separately.
+    """
+
+    has_initial_states: Optional[torch.Tensor]
+    has_initial_states_bs: Optional[torch.Tensor]
+    has_initial_states_p: Optional[torch.Tensor]
+    cache_indices: torch.Tensor
+    query_start_loc: Optional[torch.Tensor]
+    query_start_loc_p: Optional[torch.Tensor]
+    query_start_loc_long: Optional[torch.Tensor]
+    batch_size: int
+    num_prefill_tokens: int
+    num_decode_tokens: int
+    state_indices_p: torch.Tensor
+    state_indices_d: torch.Tensor
+    num_prefill: int
+    num_decodes: int
+    is_target_verify: bool
+    intermediate_state_indices: Optional[torch.Tensor]
+    use_replay: bool
+    replay_metadata: object
+    replay_work_items: Optional[torch.Tensor]
+    replay_n_writes: Optional[torch.Tensor]
+    use_cached_replay_all_layer_commit: bool
+    scan_state_indices: Optional[torch.Tensor]
+    scan_cu_seqlens: Optional[torch.Tensor]
+    scan_prefill_layout: object
+    decode_cu_seqlens_long: torch.Tensor
+    decode_state_indices: Optional[torch.Tensor]
+    g_linear: bool
+
+
 class FusedVerifyPlan(NamedTuple):
     """Per-call state of a fused target-verify step (Qwen3NextGatedDeltaNet._fused_verify_plan).
 
@@ -2330,13 +2368,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             key += (split.k, split.num_tail_tokens, split.cu.data_ptr())
         return key
 
-    def _iteration_kwargs(
+    def _iteration_context(
         self,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
         spec_metadata: Optional[SpecMetadata],
         has_layer_cache: bool,
-    ) -> dict:
+    ) -> GdnIterationContext:
         """The metadata-derived arguments of forward_extend / forward_decode for
         one iteration: batch split, request-slot and initial-state views, scan
         layout, replay bookkeeping. Built once per iteration by the first GDN
@@ -2396,43 +2434,43 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if has_initial_states is not None:
             has_initial_states_bs = has_initial_states[:batch_size]
             has_initial_states_p = has_initial_states[:num_prefills]
-        return {
-            "has_initial_states": has_initial_states,
-            "has_initial_states_bs": has_initial_states_bs,
-            "has_initial_states_p": has_initial_states_p,
-            "cache_indices": state_indices,
-            "query_start_loc": query_start_loc,
-            "query_start_loc_p": query_start_loc_p,
-            "query_start_loc_long": query_start_loc_long,
-            "batch_size": batch_size,
-            "num_prefill_tokens": num_prefill_tokens,
-            "num_decode_tokens": num_decode_tokens,
-            "state_indices_p": state_indices_p,
-            "state_indices_d": state_indices_d,
-            "num_prefill": num_prefills,
-            "num_decodes": num_decodes,
-            "is_target_verify": is_target_verify,
-            "intermediate_state_indices": intermediate_state_indices,
-            "use_replay": use_replay,
-            "replay_metadata": replay_metadata,
-            "replay_work_items": mamba_metadata.replay_work_items[:num_decodes]
+        return GdnIterationContext(
+            has_initial_states=has_initial_states,
+            has_initial_states_bs=has_initial_states_bs,
+            has_initial_states_p=has_initial_states_p,
+            cache_indices=state_indices,
+            query_start_loc=query_start_loc,
+            query_start_loc_p=query_start_loc_p,
+            query_start_loc_long=query_start_loc_long,
+            batch_size=batch_size,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decode_tokens=num_decode_tokens,
+            state_indices_p=state_indices_p,
+            state_indices_d=state_indices_d,
+            num_prefill=num_prefills,
+            num_decodes=num_decodes,
+            is_target_verify=is_target_verify,
+            intermediate_state_indices=intermediate_state_indices,
+            use_replay=use_replay,
+            replay_metadata=replay_metadata,
+            replay_work_items=mamba_metadata.replay_work_items[:num_decodes]
             if pass_replay_work_items
             else None,
-            "replay_n_writes": mamba_metadata.replay_n_writes if pass_replay_work_items else None,
-            "use_cached_replay_all_layer_commit": use_cached_replay_all_layer_commit,
+            replay_n_writes=mamba_metadata.replay_n_writes if pass_replay_work_items else None,
+            use_cached_replay_all_layer_commit=use_cached_replay_all_layer_commit,
             # The main scan's layout: the context segments first, then the decode
             # requests as one-token sequences; its prefill-only prefix serves the
             # mixed-iteration scan.
-            "scan_state_indices": scan_state_indices,
-            "scan_cu_seqlens": scan_cu_seqlens,
-            "scan_prefill_layout": scan_prefill_layout,
+            scan_state_indices=scan_state_indices,
+            scan_cu_seqlens=scan_cu_seqlens,
+            scan_prefill_layout=scan_prefill_layout,
             # cu_seqlens of the decode requests as one-token sequences and their
             # slots in an aligned buffer (mixed iterations, see _mixed_decode_recurrent).
-            "decode_cu_seqlens_long": mamba_metadata.arange_long(num_decodes),
-            "decode_state_indices": decode_state_indices,
+            decode_cu_seqlens_long=mamba_metadata.arange_long(num_decodes),
+            decode_state_indices=decode_state_indices,
             # Gate convention of the resolved prefill scan (see _gdn_prefill_uses_flashinfer).
-            "g_linear": _gdn_prefill_uses_flashinfer(),
-        }
+            g_linear=_gdn_prefill_uses_flashinfer(),
+        )
 
     def forward_core(
         self,
@@ -2457,14 +2495,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # Everything below that derives from the metadata alone is the same for
         # every GDN layer of the iteration: the first layer builds it, the
         # others reuse it (Mamba2Metadata.prepare clears the slot).
-        common = getattr(mamba_metadata, "gdn_iteration_kwargs", None)
+        common = getattr(mamba_metadata, "gdn_iteration_context", None)
         if common is None:
-            common = self._iteration_kwargs(
+            common = self._iteration_context(
                 attn_metadata, mamba_metadata, spec_metadata, layer_cache is not None
             )
-            if hasattr(mamba_metadata, "gdn_iteration_kwargs"):
-                mamba_metadata.gdn_iteration_kwargs = common
-        num_prefills = common["num_prefill"]
+            if hasattr(mamba_metadata, "gdn_iteration_context"):
+                mamba_metadata.gdn_iteration_context = common
+        num_prefills = common.num_prefill
         if num_prefills > 0:
             # PyExecutor guarantees prefill requests are placed before decode requests
             self._reset_prefill_states(
@@ -2472,10 +2510,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 mamba_metadata,
                 ssm_states,
                 conv_states,
-                common["state_indices_p"],
-                common["has_initial_states_p"],
+                common.state_indices_p,
+                common.has_initial_states_p,
             )
-        kwargs = dict(common)
+        kwargs = common._asdict()
         # forward_extend / forward_decode take is_target_verify as a named argument.
         is_target_verify = kwargs.pop("is_target_verify")
         intermediate_conv_states = (

@@ -824,9 +824,10 @@ class TestHttpErrorBodyPreservation:
         assert exc_info.value.status == status
         assert exc_info.value.message == f"{http_response.reason}: {body}"
         assert exc_info.value.headers == http_response.headers
-        # Streaming rejections never replay. Non-streaming CTX retains its retry
-        # budget, but an accepted GEN leg cannot acquire a new pairing identity.
-        retried = not stream and role == ServerRole.CONTEXT
+        # Streaming rejections and deterministic 4xx rejections never replay.
+        # Non-streaming CTX retains its retry budget for server errors, but an
+        # accepted GEN leg cannot acquire a new pairing identity.
+        retried = not stream and role == ServerRole.CONTEXT and status >= 500
         assert session.post.call_count == (2 if retried else 1)
         assert next_id.await_count == int(retried)
         assert req.disaggregated_params.disagg_request_id == (2 if retried else 1)
@@ -1845,7 +1846,10 @@ class TestCtxFrontendAffinity:
         url = mock_session.post.call_args[0][0]
         assert url.startswith(f"http://localhost:{8000 + 10 * (frontend + 1)}/")
         # Router bookkeeping keeps the routed server's shared address.
-        hooks.on_ctx_resp.assert_called_once_with("localhost:8000", response_body)
+        hooks.on_ctx_resp.assert_called_once()
+        server, relayed = hooks.on_ctx_resp.call_args.args
+        assert server == "localhost:8000"
+        assert relayed.model_dump() == response_body.model_dump()
 
     @pytest.mark.asyncio
     async def test_refused_frontend_port_falls_back_to_shared_port(self, mock_router, mock_session):

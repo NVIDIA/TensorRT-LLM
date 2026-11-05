@@ -16,7 +16,7 @@
 import contextlib
 import itertools
 import math
-from typing import NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -29,6 +29,9 @@ from tensorrt_llm._torch.modules.fla.flashinfer_chunk import \
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
+
+if TYPE_CHECKING:
+    from .gdn_mixer import GdnIterationContext
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
 REPLAY_WORK_CACHE_SLOT = 1
@@ -447,11 +450,10 @@ class Mamba2Metadata:
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
-        # Per-iteration GDN call context (Qwen3NextGatedDeltaNet.forward_core):
-        # the first GDN layer of an iteration builds the metadata-derived
-        # kwargs (batch split, slot / initial-state views, scan layout) once and
-        # the other layers reuse them. Cleared by prepare().
-        self.gdn_iteration_kwargs = None
+        # Per-iteration GdnIterationContext (Qwen3NextGatedDeltaNet.forward_core):
+        # the first GDN layer of an iteration builds it once and the other
+        # layers reuse it. Cleared by prepare() and prepare_steady_gen_step().
+        self.gdn_iteration_context: Optional["GdnIterationContext"] = None
 
         self.replay_work_items = torch.zeros(max_batch_size,
                                              REPLAY_WORK_ITEM_WIDTH,
@@ -489,7 +491,7 @@ class Mamba2Metadata:
         per-step bookkeeping is refreshed."""
         self.prefill_needs_state_reset = False
         self.state_reset_done = False
-        self.gdn_iteration_kwargs = None
+        self.gdn_iteration_context = None
         batch_size = attn_metadata.seq_lens.shape[0]
         kv_cache_manager = attn_metadata.kv_cache_manager
 
@@ -663,7 +665,7 @@ class Mamba2Metadata:
         # decides whether any request needs it at all.
         self.prefill_needs_state_reset = False
         self.state_reset_done = False
-        self.gdn_iteration_kwargs = None
+        self.gdn_iteration_context = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
