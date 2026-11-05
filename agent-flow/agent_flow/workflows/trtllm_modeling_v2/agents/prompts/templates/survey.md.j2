@@ -1,0 +1,47 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+{{ heading }}
+
+Planning preview of the shared public LLM configuration (`checks/check_config.py`, `launch_captures`). Request checks and trtllm-eval receive the same options. The engine can filter batches by launch limits; these previews are not actual capture evidence. Worker observations remain necessary.
+
+{% if error is not none -%}
+- the units' lists cannot be resolved ({{ error }}); preflight names the cause
+{% endif -%}
+{% for capture in captures -%}
+- {% if capture.name != capture.unit -%}
+variant `{{ capture.name }}` (unit `{{ capture.unit }}`):
+{%- else -%}
+`{{ capture.name }}`:
+{%- endif %} {% if capture.description is none -%}
+no CUDA graphs at any gate
+{% else -%}
+{{ capture.description }}, at boot, acceptance and accuracy, from {{ capture.source }}
+{% endif -%}
+{% endfor -%}
+{% if inherited -%}
+- variants {{ inherited | join(', ') }}: their unit's list
+{% endif -%}
+- LLM API default, `CudaGraphConfig()`, what a user who sets no `cuda_graph_config` runs: {{ default_capture }}
+{% if not perf_enabled -%}
+- tune: `perf` is off, so no serving config is measured
+{% else -%}
+{% for entry in tune -%}
+- tune `{{ entry.name }}`: {% if entry.error -%}
+cannot be resolved ({{ entry.error }}); repair this configuration before measuring
+{% elif not entry.readable -%}
+{{ entry.path }} (not readable here)
+{% else -%}
+{% if entry.description is none -%}
+no CUDA graphs
+{%- else -%}
+{{ entry.description }}
+{%- endif %}, from {% if entry.path -%}
+{{ entry.path }}
+{% elif entry.overlay -%}
+its `llm_api_options`
+{% else -%}
+`capture_batch_sizes` up to concurrency {{ entry.max_concurrency }}
+{% endif -%}
+{% endif -%}
+{% endfor -%}
+{% endif -%}

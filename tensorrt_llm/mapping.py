@@ -661,6 +661,9 @@ class Mapping(MappingBase):
     # DeviceMesh specific methods
     @property
     def tp_group_pg(self) -> ProcessGroup:
+        tp_group_pg = getattr(self, "_tp_group_pg", None)
+        if tp_group_pg is not None:
+            return tp_group_pg
         raise NotImplementedError("tp_group_pg is not implemented.")
 
     @property

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Real NCCL coverage of H3 Ulysses padding and distributed spatial VAE tiles."""
+"""Real NCCL coverage of H3 TP, Ulysses padding and distributed spatial VAE tiles."""
 
 from types import SimpleNamespace
 
@@ -98,11 +98,18 @@ def _make_vae() -> TiledAutoencoderKLMiniMaxH3:
 
 
 def _logic_h3_ulysses_and_parallel_vae(
-    rank: int, world_size: int, backend: str, async_ulysses: bool = False
+    rank: int,
+    world_size: int,
+    backend: str,
+    async_ulysses: bool = False,
+    tp_size: int = 1,
+    ulysses_size: int = 2,
 ) -> None:
+    assert world_size == tp_size * ulysses_size
     device = torch.device("cuda", rank)
     torch.manual_seed(42)
     config = _make_model_config(backend)
+    config.pretrained_config.num_attention_heads = 4
     reference = MiniMaxH3Transformer3DModel(config).to(device).eval()
     with torch.no_grad():
         for name, parameter in reference.named_parameters():
@@ -111,11 +118,41 @@ def _logic_h3_ulysses_and_parallel_vae(
             else:
                 parameter.normal_(0, 0.02)
     config = _make_model_config(backend, async_ulysses)
-    vgm = VisualGenMapping(world_size=2, rank=rank, ulysses_size=2, parallel_vae_size=2)
+    config.pretrained_config.num_attention_heads = 4
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=tp_size,
+        ulysses_size=ulysses_size,
+        parallel_vae_size=2,
+    )
     config.visual_gen_mapping = vgm
     config.mapping = vgm.to_llm_mapping()
     candidate = MiniMaxH3Transformer3DModel(config).to(device).eval()
-    candidate.load_state_dict(_split_fused_qkv(reference.state_dict(), candidate.state_dict()))
+    if async_ulysses:
+        candidate.load_state_dict(_split_fused_qkv(reference.state_dict(), candidate.state_dict()))
+    else:
+        checkpoint = {}
+        for name, parameter in reference.state_dict().items():
+            if ".qkv_proj." in name:
+                prefix, suffix = name.split("qkv_proj.", maxsplit=1)
+                for projection, value in zip(("to_q", "to_k", "to_v"), parameter.chunk(3, dim=0)):
+                    checkpoint[f"{prefix}{projection}.{suffix}"] = value
+            elif ".gate_up_proj." in name:
+                prefix, suffix = name.split("gate_up_proj.", maxsplit=1)
+                gate, up = parameter.chunk(2, dim=0)
+                checkpoint[f"{prefix}net.0.proj.{suffix}"] = torch.cat((up, gate), dim=0)
+            else:
+                checkpoint[name.replace(".ff.down_proj.", ".ff.net.2.")] = parameter
+        candidate.load_weights(checkpoint)
+    assert candidate.transformer_blocks[0].attn.local_num_attention_heads == 4 // tp_size
+    assert candidate.transformer_blocks[0].adaln_proj.linear.weight.shape == (
+        reference.transformer_blocks[0].adaln_proj.linear.weight.shape
+    )
+    if tp_size > 1:
+        assert sum(p.numel() for p in candidate.parameters()) < sum(
+            p.numel() for p in reference.parameters()
+        )
     # Five packed rows and one text row both require padding for two ranks.
     inputs = {
         "hidden_states": torch.randn(1, 3, 2, device=device),
@@ -221,3 +258,21 @@ def test_h3_partial_vae_groups() -> None:
     if torch.cuda.device_count() < 4:
         pytest.skip(f"Test requires 4 GPUs, only {torch.cuda.device_count()} available")
     run_distributed(4, _logic_h3_partial_vae_groups, preload=("tensorrt_llm",))
+
+
+@pytest.mark.parametrize("tp_size,ulysses_size", [(2, 1), (4, 1), (2, 2)])
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
+def test_h3_tensor_parallel(tp_size: int, ulysses_size: int, backend: str) -> None:
+    world_size = tp_size * ulysses_size
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"Requires {world_size} CUDA GPUs")
+    if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FA4 requires SM100 or newer")
+    run_distributed(
+        world_size,
+        _logic_h3_ulysses_and_parallel_vae,
+        backend,
+        tp_size=tp_size,
+        ulysses_size=ulysses_size,
+        preload=("tensorrt_llm",),
+    )

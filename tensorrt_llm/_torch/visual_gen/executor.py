@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import os
@@ -17,9 +20,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
 
+from tensorrt_llm._torch.distributed.initialization import init_torch_distributed
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
@@ -800,6 +805,7 @@ def run_diffusion_worker(
         device_id = _local_rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
+            check_cuda_architecture_supported(device_id)
             try:
                 configure_cpu_affinity(device_id)
             except Exception as e:
@@ -809,7 +815,7 @@ def run_diffusion_worker(
                     f"performance."
                 )
 
-        dist.init_process_group(
+        init_torch_distributed(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             init_method="env://",
             world_size=world_size,

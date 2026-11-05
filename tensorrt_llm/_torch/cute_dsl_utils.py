@@ -14,10 +14,10 @@
 # limitations under the License.
 
 import math
-import os
 import platform
 import sys
 import types
+from typing import Optional
 
 from ..logger import logger
 
@@ -63,6 +63,45 @@ if platform.system() != "Windows":
         pass
 
 
+class _GraphSafeDlpack:
+    """DLPack export without a stream synchronization (safe under CUDA-graph capture)."""
+
+    def __init__(self, tensor):
+        self._tensor = tensor.detach()
+
+    def __dlpack__(self, stream=None):
+        return self._tensor.__dlpack__(stream=-1)
+
+    def __dlpack_device__(self):
+        return self._tensor.__dlpack_device__()
+
+
+def graph_safe_cute_tensor(tensor,
+                           assumed_align: int = 16,
+                           dynamic_leading_dim: Optional[int] = None):
+    """CuTe DSL view of a torch tensor whose export does not synchronize streams.
+
+    ``dynamic_leading_dim``: the shape and the strides other than that (unit-stride) dimension's are runtime
+    values, so one compiled kernel serves every size.
+    """
+    from cutlass.cute.runtime import from_dlpack
+
+    view = from_dlpack(_GraphSafeDlpack(tensor), assumed_align=assumed_align)
+    if dynamic_leading_dim is not None:
+        view = view.mark_layout_dynamic(leading_dim=dynamic_leading_dim)
+    return view
+
+
+def gmem_ptr(tensor, dtype, assumed_align: int):
+    """CuTe global-memory pointer of ``dtype`` to ``tensor``'s data (keeps no reference to the tensor)."""
+    import cutlass.cute as cute
+
+    return cute.runtime.make_ptr(dtype,
+                                 tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=assumed_align)
+
+
 def install_cutlass_dsl_compatibility() -> None:
     """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
     if not IS_CUTLASS_DSL_AVAILABLE:
@@ -77,24 +116,48 @@ def install_cutlass_dsl_compatibility() -> None:
         cute.make_fragment = cute.make_rmem_tensor
 
 
-# ``TRTLLM_CUTEDSL_SM_RESERVE=<n>`` (default 0) keeps ``n`` SMs out of every
-# CuTeDSL persistent grid, so CTAs that would land on SMs another kernel holds
-# resident do not run their static tile share as a second wave. The hook wraps
-# ``HardwareInfo.get_max_active_clusters`` on the class, is installed when this
-# module is imported (before any kernel queries occupancy), and reads the
-# variable at each grid sizing; callers that memoize the occupancy must key on
-# ``sm_reserve()`` (the dense GEMM custom op does) or a reserve set after their
-# first query is lost.
-_SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
-_sm_reserve_announced = set()
+# SMs that a kernel resident for the whole step holds (the DWDP fabric gather;
+# ``DwdpManager`` sets it once, before the model is built). Persistent grids
+# leave them out, so CTAs that would land on those SMs do not run their static
+# tile share as a second wave. The hook below wraps
+# ``HardwareInfo.get_max_active_clusters`` on the class (installed when this
+# module is imported, before any kernel queries occupancy) so every CuTeDSL
+# persistent grid honors the reserve. Kernels that size their own persistent
+# grids take the reserve as an argument from their module, which reads
+# ``sm_reserve()`` (the KDA mixer reads it at construction). Callers that
+# memoize the occupancy key it on ``sm_reserve()`` (the dense GEMM custom op
+# does).
+_sm_reserve = 0
+
+
+def set_sm_reserve(reserve: int) -> None:
+    """Keep ``reserve`` SMs out of persistent grids from now on (0 = none).
+
+    A nonzero ``reserve`` must leave at least one SM of the current device.
+    """
+    global _sm_reserve
+    if reserve < 0:
+        raise ValueError(f"SM reserve must be non-negative, got {reserve}")
+    if reserve:
+        import torch
+
+        if torch.cuda.is_available():
+            sm_count = torch.cuda.get_device_properties(
+                torch.cuda.current_device()).multi_processor_count
+            if reserve >= sm_count:
+                raise ValueError(
+                    f"SM reserve {reserve} must leave at least one of "
+                    f"{sm_count} SMs")
+    if reserve and reserve != _sm_reserve:
+        logger.info(
+            f"[cute_dsl_utils] persistent grids launch with {reserve} SMs reserved"
+        )
+    _sm_reserve = reserve
 
 
 def sm_reserve() -> int:
-    """SMs to keep out of persistent grids, from ``TRTLLM_CUTEDSL_SM_RESERVE`` (0 = none)."""
-    try:
-        return max(0, int(os.environ.get(_SM_RESERVE_ENV, "0")))
-    except ValueError:
-        return 0
+    """SMs kept out of persistent grids (see :func:`set_sm_reserve`)."""
+    return _sm_reserve
 
 
 def reserved_max_active_clusters(full: int, cluster_size: int,
@@ -125,15 +188,7 @@ def _install_sm_reserve() -> None:
     def get_max_active_clusters(self, cluster_size: int, *args,
                                 **kwargs) -> int:
         full = original(self, cluster_size, *args, **kwargs)
-        reserve = sm_reserve()
-        if reserve <= 0:
-            return full
-        if reserve not in _sm_reserve_announced:
-            _sm_reserve_announced.add(reserve)
-            logger.info(
-                f"[cute_dsl_utils] {_SM_RESERVE_ENV}={reserve}: persistent grids "
-                f"launch with {reserve} SMs reserved")
-        return reserved_max_active_clusters(full, cluster_size, reserve)
+        return reserved_max_active_clusters(full, cluster_size, sm_reserve())
 
     get_max_active_clusters._trtllm_sm_reserve_hook = True
     HardwareInfo.get_max_active_clusters = get_max_active_clusters
