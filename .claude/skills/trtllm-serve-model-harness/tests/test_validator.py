@@ -583,6 +583,36 @@ def test_verdict_names_the_matrix_bytes_it_read(tmp_path):
     assert v["thresholds_from"] == f"{matrix}@{digest}"
 
 
+@pytest.mark.parametrize("own, billed", [
+    ({}, 50),
+    ({"chat_template": "{{ messages }}"}, 53),
+    ({"prompt_token_ids": [1, 2, 3]}, 53),
+    ({"add_generation_prompt": False}, 53),
+], ids=["opener_rendered", "own_template", "prompt_token_ids", "no_generation_prompt"])  # fmt: skip
+def test_the_prompt_offset_applies_only_where_the_server_renders_the_opener(tmp_path, own, billed):
+    """K3 bills its 3-token opener out of a Chat prompt it renders, not out of one it was given."""
+    chat = controls.write_profile(str(tmp_path / "h.yaml"), controls.CONTROL_PROFILES["chat"])
+    usage = {"prompt_tokens": billed, "completion_tokens": 1, "total_tokens": billed + 1}
+    chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}}]},
+              {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+              {"choices": [], "usage": usage}]  # fmt: skip
+    reply = "".join("data: " + json.dumps(dict(c, id="chatcmpl-x", object="chat.completion.chunk",
+                                               model="m", created=1)) + "\n\n"
+                    for c in chunks) + "data: [DONE]\n\n"  # fmt: skip
+    request = controls._chat_request(
+        "c1", [{"role": "user", "content": "go"}], "2026-01-01T00:00:01Z"
+    )
+    request["body"].update(own, stream_options={"include_usage": True})
+    record = dict(
+        controls._sse_response("c1", reply), prompt_tokens={"count": 53, "source": "test"}
+    )
+    controls._write_trace(str(tmp_path / "t"), [(request, record)])
+    _, v = controls.run_verdict(str(tmp_path / "v"), [str(tmp_path / "t")], chat, "window",
+                                "conformance", model=controls.K3_PROFILE)  # fmt: skip
+    c14 = next(r for r in v["checks"] if r["id"] == "C-14")
+    assert c14["usage_vs_trace_prompt"] == 1 and "USG-07" not in v["tripped"]
+
+
 def test_verdict_that_cannot_be_written_is_no_verdict(tmp_path, capsys):
     """An output directory that cannot be made gives exit 3 (no verdict), never 1 (a FAIL)."""
     harness = controls.write_profile(

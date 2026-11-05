@@ -583,6 +583,8 @@ class Pipeline:
             "counted": usage_mod.counted_digest(body)
             if adapter.PROTOCOL == "anthropic-messages"
             else None,
+            # A prompt the request ends itself carries no model prompt offset (USG-07).
+            "own_prompt": usage_mod.renders_own_prompt(adapter.PROTOCOL, body),
             # Server-side clearing the client asked for: the rendered prompt may shrink (USG-08).
             "context_management": context_management_clears(body.get("context_management")),
             "reasoning": dict(view.reasoning or {}),
@@ -1019,7 +1021,8 @@ class Pipeline:
         billed = usage_mod.input_tokens(protocol, reply.usage)
         if isinstance(prompt.get("count"), int) and billed is not None:
             self.counts["den:usage_vs_trace_prompt"] += 1
-            if billed != prompt["count"] - self.prompt_offsets.get(protocol, 0):
+            offset = 0 if summary.get("own_prompt") else self.prompt_offsets.get(protocol, 0)
+            if billed != prompt["count"] - offset:
                 found.append(Violation("USG-07", {"why": "input_vs_server_prompt_count"}))
         self._usage_found(found, loc, session)
 

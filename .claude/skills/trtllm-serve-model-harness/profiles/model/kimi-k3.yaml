@@ -58,8 +58,9 @@ usage:
   # it), and /v1/messages runs through openai_chat. The Responses route bills the whole prompt
   # (responses_utils does not call the extension; measured on K3 x Codex: every reply billed its
   # re-rendered prompt). A build whose Responses route subtracts it too bills 3 less there, and a
-  # cell on such a build needs responses: 3. No offset either way when the server runs with
-  # --chat_template, or for a request with its own template or prompt token ids.
+  # cell on such a build needs responses: 3. No offset either way for a Chat request with its own
+  # template or prompt token ids, or with add_generation_prompt: false (the validator applies none
+  # to those), or when the server runs with --chat_template (declare 0 for such a cell).
   # count_tokens on main does not subtract it.
   prompt_offset: {chat-completions: 3, anthropic-messages: 3, responses: 0}
 

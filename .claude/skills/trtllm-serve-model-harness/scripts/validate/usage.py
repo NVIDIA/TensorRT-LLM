@@ -49,6 +49,25 @@ def counted_digest(body: dict) -> str:
     )
 
 
+# Chat Completions request fields that bring the prompt's end with them: a request-level template,
+# or a prompt sent already tokenized. trtllm-serve renders no generation opener of its own for
+# them (tensorrt_llm/serve/extensions/kimi_k3.py, prompt_tokens_excluded_from_usage).
+OWN_PROMPT_FIELDS = ("chat_template", "prompt_token_ids", "prompt_token_ids_b64")
+
+
+def renders_own_prompt(protocol: str, body: dict) -> bool:
+    """Whether a request ends its prompt itself, so no model prompt offset applies (USG-07).
+
+    Only a Chat Completions request can: the Messages adapter builds its chat request from its
+    own fields. ``add_generation_prompt: false`` asks for no generation opener either.
+    """
+    if protocol != "chat-completions" or not isinstance(body, dict):
+        return False
+    if body.get("add_generation_prompt") is False:
+        return True
+    return any(body.get(field) is not None for field in OWN_PROMPT_FIELDS)
+
+
 def _int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
