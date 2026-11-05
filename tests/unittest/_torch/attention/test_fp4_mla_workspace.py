@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Host-side tests of the shared FP4 MLA decode scratch (CPU tensors, fake buffer pool)."""
 
 from types import SimpleNamespace
