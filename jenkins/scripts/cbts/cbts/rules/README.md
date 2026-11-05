@@ -175,7 +175,8 @@ parametrization:
   `accuracy/test_*.py::TestLlama3_1_8BInstruct` rather than the whole
   `accuracy/` subtree.
 - `TestC::test_m` id (`acceptance_length.yaml` only) → that method in
-  every module defining `TestC`.
+  every module defining it on `TestC`. An unverified suffix keeps the
+  class, covering inherited tests, and includes namespace consumers.
 - Other acceptance keys, such as `ModelingV2Target::mtp3`, select every
   test class containing a reference literal with the same namespace
   (`ModelingV2Target::`). This also covers variants constructed with string

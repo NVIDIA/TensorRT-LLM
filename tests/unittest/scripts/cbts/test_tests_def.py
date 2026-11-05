@@ -442,6 +442,7 @@ def test_deleted_accuracy_key_requires_absence_from_test_sources(
     expected: list[str],
     test_path: str,
 ) -> None:
+    """Deleted reference sections remain relevant while a nested test still reads them."""
     git_path = f"{ACCURACY_REFS_PREFIX}gsm8k.yaml"
     yaml_path = "accuracy/references/gsm8k.yaml"
     reference = tmp_path / git_path
@@ -467,6 +468,17 @@ def test_deleted_accuracy_key_requires_absence_from_test_sources(
             "class TestTarget:\n    def test_accuracy(self):\n        pass\n",
             "TestTarget::test_accuracy",
             ["accuracy/modeling_v2/test_target.py::TestTarget::test_accuracy"],
+        ),
+        (
+            'class TestTarget:\n    KEY = "TestTarget::mtp3"\n'
+            "    def test_accuracy(self):\n        pass\n",
+            "TestTarget::mtp3",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
+        ),
+        (
+            "class TestTarget(BaseTest):\n    pass\n",
+            "TestTarget::test_inherited",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
         ),
         (
             'class TestTarget:\n    KEY = ("ModelingV2Target::" "mtp3")\n',
@@ -503,6 +515,7 @@ def test_deleted_accuracy_key_requires_absence_from_test_sources(
 def test_nested_accuracy_reference_anchors(
     tmp_path: Path, source: str, key: str, expected: list[str]
 ) -> None:
+    """Resolve nested model, method and variant keys without inventing method anchors."""
     _write_defs_file(tmp_path, "accuracy/modeling_v2/test_target.py", source)
     _write_defs_file(tmp_path, "accuracy/test_other.py", "class TestOther:\n    pass\n")
     yaml_path = "accuracy/references/acceptance_length.yaml"
@@ -515,8 +528,12 @@ def test_nested_accuracy_reference_anchors(
     )
 
 
-def test_acceptance_reference_only_selects_consuming_classes(tmp_path: Path) -> None:
-    key = "ModelingV2Target::mtp3"
+@pytest.mark.parametrize("namespace", ("ModelingV2Target", "TestTarget"))
+def test_acceptance_reference_only_selects_consuming_classes(
+    tmp_path: Path, namespace: str
+) -> None:
+    """A variant reference keeps listed test methods through their consuming class."""
+    key = f"{namespace}::mtp3"
     yaml_path = "accuracy/references/acceptance_length.yaml"
     _write_defs_file(tmp_path, yaml_path, f"{key}:\n  min_al: 2.5\n")
     for module in ("modeling_v2", "other"):
@@ -553,6 +570,7 @@ def test_acceptance_reference_only_selects_consuming_classes(tmp_path: Path) -> 
 
 
 def test_mixed_known_and_unknown_reference_keys_keep_fallback(tmp_path: Path) -> None:
+    """One unresolved namespace prevents narrowing a mixed reference change."""
     _write_defs_file(
         tmp_path,
         "accuracy/modeling_v2/test_target.py",
