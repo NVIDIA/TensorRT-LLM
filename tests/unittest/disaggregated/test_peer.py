@@ -711,6 +711,7 @@ def test_receiver_rejects_view_mismatch_before_registration(
         for rid in (1, 2):
             params = SimpleNamespace(ctx_info_endpoint=bad_endpoint, ctx_dp_rank=0)
             task = KVRecvTask(rid, chunk, slice_id=0, params=params, aux_slot=None)
+            task._enforce_physical_ownership = enforce_physical_ownership
             if enforce_physical_ownership:
                 task.begin_publication()
 
