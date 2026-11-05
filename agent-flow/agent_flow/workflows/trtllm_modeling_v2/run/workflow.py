@@ -107,6 +107,31 @@ SKILL_DIRS: tuple[str, ...] = (".claude/skills", ".agents/skills")
 #: by suffix. The files a gate does read under them are kept (`gate_inputs`).
 UNGATED_PREFIXES: tuple[str, ...] = ("tests/", "docs/", ".github/", "examples/")
 UNGATED_SUFFIXES: tuple[str, ...] = (".md",)
+#: What a gate that runs one of the tree's tests (``contract.TREE_TEST_GATES``)
+#: runs of it beyond what the marker counts: the tests, from whose pytest root it
+#: runs, which puts the others on its import path, and the examples they run;
+#: but for the unit tests and the CI test lists (:data:`UNRUN_TESTS`), which no
+#: gate runs.
+TEST_TREES: tuple[str, ...] = ("tests/", "examples/")
+UNRUN_TESTS: tuple[str, ...] = ("tests/unittest/", "tests/integration/test_lists/")
+#: The flow's own source. No check runs it: a gate runs the controller's
+#: installed copy, never the tree's. The marker counts it, as the markers
+#: verdicts were recorded under do; :func:`unrun` carries a verdict past it.
+FLOW_SOURCE = "agent-flow/"
+#: What a path no check runs is, by the first of these prefixes it starts with,
+#: as a verdict carried past a change to it says (:func:`unrun`).
+UNRUN_KINDS: tuple[tuple[str, str], ...] = (
+    ("tests/unittest/", "unit tests"),
+    ("tests/integration/test_lists/", "CI test lists"),
+    ("tests/", "tests"),
+    ("docs/", "documentation"),
+    (".github/", "CI configuration"),
+    ("examples/", "examples"),
+    (FLOW_SOURCE, "the flow's own source"),
+)
+#: How many commits' trees the marker keeps listed at once: a verdict's commit
+#: and the head it is asked about, for each of a few verdicts in turn.
+LISTED_TREES = 8
 #: Where the native libraries an engine loads are built: inside the checkout,
 #: and ignored by git.
 NATIVE_LIBRARY_DIRS: tuple[str, ...] = ("tensorrt_llm", "tensorrt_llm/libs")
@@ -235,6 +260,8 @@ class TrtllmModelingV2Workflow:
         self.journal = Journal(path=self.journal_path)
         #: One milestone recorded at a time.
         self._milestone_lock = threading.Lock()
+        #: Guards what the target's identity keeps between calls: listed trees, what was journaled.
+        self._identity_lock = threading.Lock()
         self.gate_log = check_result.GateLog()
         #: Compiled at preflight; see `contract.py`.
         self._contract: contract_mod.Contract | None = None
@@ -641,10 +668,39 @@ class TrtllmModelingV2Workflow:
         snapshot, so they leave the marker as it is.
 
         ``""`` means **not established**, and every caller reads it as
-        "assume changed".
+        "assume changed". The checkout moving to a commit with the same marker
+        is journaled once, with what the change touched.
         """
         head = self._head()
-        return self._commit_marker(head) if head else ""
+        marker = self._commit_marker(head) if head else ""
+        if marker:
+            self._note_unmoved(head, marker)
+        return marker
+
+    def _note_unmoved(self, head: str, marker: str) -> None:
+        """Journal it when the checkout reached ``head`` from another commit with ``marker`` too.
+
+        Every verdict there holds on it, but a gate's that runs the tree's tests where
+        the change touches them (:meth:`_verdict_holds`).
+        """
+        with self._identity_lock:
+            last = self.__dict__.get("_last_target")
+            self.__dict__["_last_target"] = (head, marker)
+        if last is None or last[0] == head or last[1] != marker:
+            return
+        kinds = self._unrun_change(last[0], head)
+        if kinds is None:
+            return
+        contract = self._contract
+        gates = {c.gate for c in contract.checks} if contract is not None else set()
+        gates &= contract_mod.TREE_TEST_GATES
+        but = ""
+        if gates and self._unrun_change(last[0], head, runs_tests=True) is None:
+            but = f" but a {' or '.join(sorted(gates))} check's"
+        what = f"which changes only {touched(kinds)}" if kinds else "the same tree"
+        self.journal.event(
+            "carried", f"every verdict on {last[0][:10]}{but} holds on {head[:10]}, {what}"
+        )
 
     def _head(self) -> str:
         """The commit the checkout is at; ``""`` when git cannot say.
@@ -713,41 +769,154 @@ class TrtllmModelingV2Workflow:
         return (ident, marker) if marker else ("", "")
 
     def _verdict_holds(self, verdict: contract_mod.Verdict) -> bool:
-        """Whether ``verdict`` holds on the target as it is.
+        """Whether ``verdict`` holds on the target as it is, where its marker alone cannot say.
 
-        What it read of the tree is unchanged: its narrowed marker (:meth:`_commit_marker`
-        with ``reads``) on the checkout's ``HEAD`` is the one it recorded. Asked once per head
-        and list.
+        That is a verdict recorded on another state of the target, and one of a gate that
+        runs the tree's tests (``contract.TREE_TEST_GATES``), which the marker does not count.
+        It holds where its check runs the same of the tree on the checkout's ``HEAD`` as on
+        the commit it measured (:meth:`_measured_commit`): that commit's marker is still the
+        one the verdict recorded (the same tree, its native libraries not rebuilt since), and
+        every path the two commits differ in is one the check does not run (:func:`unrun`):
+        what no gate runs (the tree's tests and examples where its gate runs none of them),
+        the flow's own source, the Python files its processes did not import
+        (:attr:`~.contract.Verdict.reads`). A verdict naming no commit holds on its own
+        marker alone, and a void one nowhere else. A verdict carried to a head is journaled
+        once, with what the change touched. Asked once per head, commit and check.
         """
         head = self._head()
-        if not head or not verdict.reads or not verdict.reads_marker:
+        repo = str(self.task_data.get("trtllm_repo_path") or "")
+        if not head or not repo or verdict.void or not verdict.marker:
             return False
-        key = (head, verdict.reads)
-        cache = self.__dict__.setdefault("_narrowed_now", {})
-        if key not in cache:
-            try:
-                reads = json.loads(
-                    (self.workspace / READS_DIRNAME / f"{verdict.reads}.json").read_text(
-                        encoding="utf-8"
-                    )
+        commit = self._measured_commit(verdict)
+        if not commit:
+            # Without the commit it measured, nothing says whether the tree's tests changed
+            # since: a gate that runs them holds nowhere it was not measured.
+            if verdict.gate in contract_mod.TREE_TEST_GATES:
+                return False
+            return verdict.marker == self._commit_marker(head)
+        libraries = tuple(native_libraries(Path(repo)))
+        key = (head, commit, verdict.marker, verdict.gate, verdict.reads, libraries)
+        cache = self.__dict__.setdefault("_carried", {})
+        unasked = object()
+        kinds = cache.get(key, unasked)
+        if kinds is unasked:
+            kinds = None
+            if self._commit_marker(commit) == verdict.marker:
+                kinds = self._unrun_change(
+                    commit,
+                    head,
+                    runs_tests=verdict.gate in contract_mod.TREE_TEST_GATES,
+                    reads=self._read_list(verdict.reads),
                 )
-            except (OSError, ValueError):
-                reads = None
             if len(cache) > 256:
                 cache.clear()
-            cache[key] = self._commit_marker(head, reads) if reads else ""
-        return bool(cache[key]) and cache[key] == verdict.reads_marker
+            cache[key] = kinds
+        if kinds is None:
+            return False
+        if commit != head:
+            self._journal_carried(verdict, commit, head, kinds)
+        return True
+
+    def _measured_commit(self, verdict: contract_mod.Verdict) -> str:
+        """The commit ``verdict`` measured, in full; ``""`` when it names none git knows.
+
+        The one commit its commands imported (:attr:`~.contract.Verdict.imported`),
+        else the one its ``tree_state`` names (``git describe``: a tag,
+        ``<tag>-<n>-g<commit>``, or a commit). :meth:`_verdict_holds` takes it only
+        while its marker is still the verdict's.
+        """
+        repo = str(self.task_data.get("trtllm_repo_path") or "")
+        imported = set(verdict.imported)
+        names = [imported.pop()] if len(imported) == 1 else []
+        state = verdict.tree_state
+        if state and state != check_result.UNKNOWN_TREE_STATE:
+            names += [state.rpartition("-g")[2], state]
+        resolved = self.__dict__.setdefault("_named_commits", {})
+        for name in dict.fromkeys(n for n in names if n and not n.startswith("-")):
+            if name not in resolved:
+                answer = self._git(repo, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}")
+                resolved[name] = (answer or "").strip()
+            if resolved[name]:
+                return resolved[name]
+        return ""
+
+    def _unrun_change(
+        self,
+        commit: str,
+        head: str,
+        *,
+        runs_tests: bool = False,
+        reads: Collection[str] | None = None,
+    ) -> dict[str, int] | None:
+        """How many paths of each kind (:func:`unrun`) ``commit`` and ``head`` differ in.
+
+        ``None`` when a check that runs as ``runs_tests`` and ``reads`` say runs one of
+        them, or git cannot list either commit.
+        """
+        repo = str(self.task_data.get("trtllm_repo_path") or "")
+        try:
+            before = self._committed_blobs(repo, commit)
+            after = self._committed_blobs(repo, head)
+            keep = gate_inputs(self.task_data, repo)
+        except (OSError, ValueError):
+            return None
+        if before is None or after is None:
+            return None
+        denied = CommitPolicy.from_task(self.task_data, workspace=self.workspace).denied_paths
+        kinds: dict[str, int] = {}
+        for path in before.keys() | after.keys():
+            if before.get(path) == after.get(path):
+                continue
+            kind = unrun(path, keep=keep, denied=denied, runs_tests=runs_tests, reads=reads)
+            if not kind:
+                return None
+            kinds[kind] = kinds.get(kind, 0) + 1
+        return kinds
+
+    def _read_list(self, ident: str) -> frozenset[str] | None:
+        """The Python files of the tree a verdict's processes imported; ``None`` when not known."""
+        if not ident:
+            return None
+        try:
+            listed = json.loads(
+                (self.workspace / READS_DIRNAME / f"{ident}.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+        return frozenset(str(p) for p in listed) if isinstance(listed, list) else None
+
+    def _journal_carried(
+        self, verdict: contract_mod.Verdict, commit: str, head: str, kinds: Mapping[str, int]
+    ) -> None:
+        """Journal, once, that ``verdict`` measured on ``commit`` holds on ``head``, and why."""
+        name = f"{verdict.unit}:{verdict.gate}@{verdict.member}"
+        with self._identity_lock:
+            said = self.__dict__.setdefault("_carried_said", set())
+            if (name, commit, head) in said:
+                return
+            said.add((name, commit, head))
+        what = f"the diff touches only {touched(kinds)}" if kinds else "the two trees are the same"
+        self.journal.event(
+            "carried",
+            f"{name} {'pass' if verdict.passed else 'failure'} carried from {commit[:10]} to "
+            f"{head[:10]}: {what}",
+        )
 
     def _committed_blobs(self, repo: str, head: str) -> dict[str, str] | None:
-        """Every path in ``head``'s tree and its object id; the last head asked is kept."""
-        cached = self.__dict__.get("_head_blobs")
-        if cached is not None and cached[0] == (repo, head):
-            return cached[1]
+        """Every path in ``head``'s tree and its object id; the :data:`LISTED_TREES` last asked are kept."""
+        with self._identity_lock:
+            cache = self.__dict__.setdefault("_head_blobs", {})
+            if (repo, head) in cache:
+                cache[(repo, head)] = cache.pop((repo, head))
+                return cache[(repo, head)]
         listing = self._git(repo, "ls-tree", "-r", "-z", "--full-tree", head)
         if listing is None:
             return None
         blobs = tree_blobs(listing)
-        self.__dict__["_head_blobs"] = ((repo, head), blobs)
+        with self._identity_lock:
+            while len(cache) >= LISTED_TREES:
+                cache.pop(next(iter(cache)))
+            cache[(repo, head)] = blobs
         return blobs
 
     # ------------------------------------------------------------------ helpers
@@ -1214,6 +1383,51 @@ def gate_inputs(task_data: Mapping[str, Any], repo: str | Path) -> frozenset[str
     return frozenset(keep)
 
 
+def unrun(
+    path: str,
+    *,
+    keep: Collection[str] = (),
+    denied: Sequence[str] = (),
+    runs_tests: bool = False,
+    reads: Collection[str] | None = None,
+) -> str:
+    """Why a check does not run ``path`` of the tree, as the kind of file it is; ``""`` when it may.
+
+    No check runs the run's own paths (``denied``), what no gate runs or reads
+    (:func:`gate_relevant`), or the flow's own source (:data:`FLOW_SOURCE`),
+    but for the tree's tests and examples where its gate runs them
+    (``runs_tests``: :data:`TEST_TREES`). Of the rest, a Python file is run
+    when the check's processes imported it (``reads``; ``None`` when they did
+    not say, and then every one is), and a file of any other kind may be read
+    by code no import names, so each is.
+    """
+    if path.startswith(tuple(denied)):
+        return "the run's workspace"
+    if path in keep:
+        return ""
+    lowered = path.lower()
+    tests = (
+        runs_tests
+        and path.startswith(TEST_TREES)
+        and not path.startswith(UNRUN_TESTS)
+        and not lowered.endswith(UNGATED_SUFFIXES)
+    )
+    if not tests and (path.startswith(FLOW_SOURCE) or not gate_relevant(path, denied=denied)):
+        for prefix, kind in UNRUN_KINDS:
+            if path.startswith(prefix):
+                return kind
+        return "documentation" if lowered.endswith(UNGATED_SUFFIXES) else "files no gate runs"
+    if reads is not None and path.endswith(".py") and path not in reads:
+        return "Python files it did not import"
+    return ""
+
+
+def touched(kinds: Mapping[str, int]) -> str:
+    """``unit tests (2 files) and documentation (1 file)``: what a change touched, by kind."""
+    parts = [f"{kind} ({n} file{'' if n == 1 else 's'})" for kind, n in sorted(kinds.items())]
+    return " and ".join(parts) if len(parts) < 3 else f"{', '.join(parts[:-1])} and {parts[-1]}"
+
+
 def _in_checkout(name: str, root: Path) -> str | None:
     """``name``, a path absolute or relative to ``root``, as a file in the checkout; else ``None``."""
     candidate = Path(name) if os.path.isabs(name) else root / name
@@ -1297,18 +1511,25 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_MAX_PARALLEL_TASKS",
     "DEFAULT_REVISION_CAP",
+    "FLOW_SOURCE",
     "GATE_INPUT_BLOCKS",
     "HOST_FACTS_FILENAME",
+    "LISTED_TREES",
     "NATIVE_LIBRARY_DIRS",
     "SKILL_DIRS",
+    "TEST_TREES",
     "TROUBLESHOOTING_HINT",
     "UNGATED_PREFIXES",
     "UNGATED_SUFFIXES",
+    "UNRUN_KINDS",
+    "UNRUN_TESTS",
     "TrtllmModelingV2Workflow",
     "fingerprint",
     "gate_inputs",
     "gate_relevant",
     "native_libraries",
     "porcelain_paths",
+    "touched",
     "tree_blobs",
+    "unrun",
 ]
