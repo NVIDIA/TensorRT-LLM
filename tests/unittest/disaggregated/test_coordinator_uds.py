@@ -21,6 +21,7 @@ the fleet processes are stand-ins.
 """
 
 import os
+import shutil
 import socket
 import stat
 import tempfile
@@ -154,8 +155,23 @@ def _tcp_ready(port: int) -> bool:
         return False
 
 
+@pytest.fixture
+def short_temp_root(monkeypatch):
+    """A new directory in /tmp that ``tempfile`` uses as its default directory.
+
+    Its path is short enough for the coordinator socket made under it to fit in
+    a Unix socket address.
+    """
+    root = tempfile.mkdtemp(prefix="coord_uds_", dir="/tmp")
+    monkeypatch.setattr(tempfile, "tempdir", root)
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
+
+
 @pytest.mark.parametrize("umask", [0o000, 0o022, 0o077])
-def test_coordinator_unix_socket_is_in_new_owner_only_directory(monkeypatch, umask):
+def test_coordinator_unix_socket_is_in_new_owner_only_directory(
+    monkeypatch, short_temp_root, umask
+):
     monkeypatch.delenv(serve.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, raising=False)
     run = _CoordinatorRun(monkeypatch)
     old_umask = os.umask(umask)
@@ -171,10 +187,7 @@ def test_coordinator_unix_socket_is_in_new_owner_only_directory(monkeypatch, uma
         assert oct(stat.S_IMODE(dir_stat.st_mode)) == oct(0o700)
         assert dir_stat.st_uid == os.getuid()
         assert os.path.basename(uds_dir).startswith(f"trtllm_disagg_coord_{run.public_port}_")
-        assert os.path.realpath(uds_dir) not in {
-            os.path.realpath(tempfile.gettempdir()),
-            os.path.realpath("/tmp"),
-        }
+        assert os.path.dirname(uds_dir) == short_temp_root
 
         # The fleet's route to the coordinator still answers, as does TCP.
         assert b" 200 " in _http_get_unix(uds_path, "/version").split(b"\r\n", 1)[0]
