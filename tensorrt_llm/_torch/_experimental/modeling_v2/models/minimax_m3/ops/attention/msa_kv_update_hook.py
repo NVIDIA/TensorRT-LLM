@@ -11,8 +11,9 @@ int32 results in one launch:
     out_loc[t]  = table[r, min(max(pos, 0) // page, ncols - 1)] * page + max(pos, 0) % page
     n_valid[t]  = (max(pos + 1, 0) + page - 1) // page
 
-``msa_kv_update`` is the target's ``MsaKvUpdate`` (``tensorrt_llm._torch.pyexecutor.runtime_hooks``): the MSA
-metadata calls it with its own buffers and falls back to the torch formulation when it returns False. The kernel is
+``msa_kv_update`` has the signature of the MSA metadata's own one-launch update
+(``sparse/minimax_m3/kernels/msa_kv_update.py``): it returns False, having written nothing, when it cannot take the
+step, and the caller then runs the torch formulation. The kernel is
 ``torch.ops.trtllm.minimax_m3_msa_kv_update``, called through this target's ``msa_kv_update`` entry.
 """
 

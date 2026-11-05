@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -249,7 +249,8 @@ def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
 
         def __init__(self) -> None:
             self._state_indices_buffer = DeviceCopyBuffer(
-                torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda")
+                torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda"),
+                site=CopySite.MAMBA_STATE_INDICES,
             )
 
         def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:

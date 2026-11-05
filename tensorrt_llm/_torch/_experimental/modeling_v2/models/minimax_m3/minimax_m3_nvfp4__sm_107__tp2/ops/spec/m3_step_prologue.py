@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode graph's step-input prologue in one launch (this target's ``RuntimeHooks.pack_prologue_op``)."""
+"""The decode graph's step-input prologue in one launch (this target's ``device_copy.InGraph.prologue_op``)."""
 
 from __future__ import annotations
 
@@ -13,14 +13,14 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 
 class M3StepPrologue(OpWrapper):
-    """``StepInputPack``'s early-copy prologue as one single-CTA C++ launch
+    """The copy plan's in-graph early-copy prologue as one single-CTA C++ launch
     (trtllm::minimax_m3_sm107_tp2_step_prologue, minimaxM3Sm107/stepPrologue.cu).
 
     ``window`` is the pack's device window (``gdev``): an int64 header ``[host copies, device copies]``, then one
     ``(dst, src, bytes)`` descriptor per copy, host copies first (a host copy's ``src`` is a byte offset into the
     window, a device copy's a device address). The launch writes up to ``max_desc`` copies of each kind, every host
     copy before any device copy, then zeroes the header; with ``epoch`` it increments ``epoch[0]`` once. The default
-    prologue does the same with two parallel-scatter launches (``step_inputs._graph_scatter_kernel``) and a header
+    prologue does the same with two parallel-scatter launches (``device_copy._graph_scatter_kernel``) and a header
     fill."""
 
     ARCHS = frozenset({Arch.SM_107})
@@ -50,7 +50,7 @@ class M3StepPrologue(OpWrapper):
 
     def reference(self, window: torch.Tensor, epoch: Optional[torch.Tensor], max_desc: int) -> None:
         """The default prologue on the same arguments: it writes the same destinations."""
-        from tensorrt_llm._torch.pyexecutor.step_inputs import _graph_scatter_kernel
+        from tensorrt_llm._torch.pyexecutor.device_copy import _graph_scatter_kernel
 
         stage_i64 = window.view(torch.int64)
         for device_src in (False, True):

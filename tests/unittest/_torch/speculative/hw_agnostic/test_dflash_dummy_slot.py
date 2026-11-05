@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 
 pytestmark = pytest.mark.skipif(
@@ -50,7 +50,9 @@ def _worker(lengths):
         _ctx_len_host=list(lengths),
         _ctx_base_pages=torch.zeros(len(lengths), dtype=torch.long, device="cuda"),
         _ctx_base_host=[0] * len(lengths),
-        _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long, device="cuda")),
+        _batch_to_slot_buffer=DeviceCopyBuffer(
+            torch.zeros(8, dtype=torch.long, device="cuda"), site=CopySite.DFLASH_BATCH_TO_SLOT
+        ),
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)
     w._advance_ctx_len = partial(DFlashWorker._advance_ctx_len, w)
@@ -65,7 +67,9 @@ def _prepare(worker, request_ids, num_generations):
         batch_indices_cuda=torch.zeros(8, dtype=torch.int, device="cuda"),
         _dflash_worker=worker,
     )
-    meta._batch_indices_buffer = DeviceCopyBuffer(meta.batch_indices_cuda)
+    meta._batch_indices_buffer = DeviceCopyBuffer(
+        meta.batch_indices_cuda, site=CopySite.DFLASH_BATCH_INDICES
+    )
     DFlashSpecMetadata.prepare(meta)
     torch.cuda.synchronize()
 

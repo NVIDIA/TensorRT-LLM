@@ -377,6 +377,26 @@ workspace, page-table KV metadata, and prefill/decode wrapper state.
 sparse-specific runtime state (indexer buffers, routing state, side-cache
 state).
 
+Two class-level `TrtllmAttentionMetadata` hooks let a metadata family decide
+engine behaviour that depends on what its own `prepare()` does, instead of a
+model arming it from outside (MiniMax-M3's MSA metadata sets both):
+
+- `skips_unchanged_uploads`: its per-step uploads (`_upload_metadata`) skip
+  values their destination already holds. This is sound only while nothing
+  else writes those buffers, so the decoder runner then gives the CUDA-graph
+  metadata private buffers. Each skippable destination keeps its record in a
+  `device_copy.DeviceCopyBuffer` with the upload's site; the CUDA-graph
+  metadata copies share one set of them. Every graph key's metadata still
+  takes its buffers from one pool, and a captured forward's device writes
+  into a block rerun at each replay, so only a destination its upload alone
+  writes (MSA's block table) goes through `_upload_metadata`; the others use
+  the never-skipping `device_copy.copy` / `device_copy.fill_tail`.
+- `short_long_seq_len_threshold(sparse_config, tokens_per_gen_step)`: a
+  sequence length at which `prepare()` stages different work, so the runner
+  keys decode CUDA graphs by short and long contexts. The runner passes one
+  generation step's tokens as headroom: the graph key's host length estimate
+  misses up to the in-flight step's accepted tokens.
+
 `SparseRuntimeParams` is the backend-to-`AttentionOp` carrier only on the
 `TrtllmAttention` path. Its fields are algorithm-specific, not a generic
 sparse-attention ABI; `VanillaAttention` uses its own per-request contract.

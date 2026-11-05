@@ -10,19 +10,19 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
-from tensorrt_llm._torch.pyexecutor import step_inputs
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     get_mrope_dummy_seq_slot,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -376,7 +376,9 @@ class DecoderInputPreparer:
         self.cuda_graph_runner: CUDAGraphRunner | None = None
         self._prepare_inputs_event: torch.cuda.Event | None = None
         self._gather_ids_buffer = (
-            DeviceCopyBuffer(buffers.gather_ids_cuda, pin_memory=prefer_pinned())
+            DeviceCopyBuffer(
+                buffers.gather_ids_cuda, site=CopySite.INPUT_GATHER_IDS, pin_memory=prefer_pinned()
+            )
             if config is not None and config.is_spec_decode
             else None
         )
@@ -2424,7 +2426,11 @@ class DecoderInputPreparer:
                     generation_positions.view(1, 1, -1).expand(3, 1, -1),
                 )
         else:
-            step_inputs.copy_(self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids)
+            device_copy.copy(
+                CopySite.INPUT_POSITION_IDS,
+                self._buffers.position_ids_cuda[:total_num_tokens],
+                host_position_ids,
+            )
 
         host.host_position_ids = host_position_ids
 

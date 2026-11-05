@@ -1,26 +1,51 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the msa_kv_update entry (the one-launch MSA KV-length correction)."""
+"""MSA's one-launch KV-length correction (kernels.msa_kv_update) against its torch formulation."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.msa_kv_update import (  # noqa: E501
-    TOKENS_PER_BLOCK,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.msa_kv_update import (  # noqa: E501
-    msa_kv_update as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.msa_kv_update import (  # noqa: E501
-    msa_kv_update as hook,
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_kv_update as kv
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or not kv.kernel_available(),
+    reason="needs CUDA and the trtllm::minimax_m3_msa_kv_update kernel",
 )
 
-__extra_import_path__ = ["../../../.."]
-from _validating import certifying, validating  # noqa: E402, F401 — needs the path declared above
+#: The MSA pool's page: one sparse block is one 128-token KV page.
+TOKENS_PER_BLOCK = 128
 
-assert torch.cuda.is_available(), "msa_kv_update requires a CUDA device"
+#: The steps the metadata hands the kernel: (why, spec).
+_CASES = (
+    (
+        "decode without speculation at one request",
+        dict(batch=1, query_len=1, accept="full", cu_kv=True, n_valid=True),
+    ),
+    (
+        "decode without speculation at batch 8",
+        dict(batch=8, query_len=1, accept="full", cu_kv=True, n_valid=True),
+    ),
+    (
+        "Eagle3 verify (draft 3) with partial acceptance",
+        dict(batch=8, query_len=4, accept="partial", cu_kv=True, n_valid=True),
+    ),
+    ("without cu_kv_lens", dict(batch=4, query_len=4, accept="partial", cu_kv=False, n_valid=True)),
+    (
+        "CUDA-graph padding rows and no n_valid_blocks",
+        dict(batch=8, query_len=4, accept="padded", cu_kv=True, n_valid=False),
+    ),
+    (
+        "positions crossing a page boundary",
+        dict(batch=3, query_len=4, accept="page_edge", cu_kv=True, n_valid=True),
+    ),
+    (
+        "a batch past one thread block's 256 lanes",
+        dict(batch=300, query_len=2, accept="partial", cu_kv=True, n_valid=True),
+    ),
+)
+
 
 #: Spare capacity past the live rows, as the metadata's buffers have: the op must leave it alone.
 _SPARE = 3
@@ -85,44 +110,28 @@ def _check(args, ref):
         assert bool((n_valid[total_q:] == -12345).all())
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
-    args = _case(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    certifying(op)
-    op(*args)
-    _check(args, op.reference(*args))
+def _reference(args):
+    return kv.reference(*args[:9], cu_kv=args[10] is not None, n_valid=args[12] is not None)
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_the_hook_takes_every_cell(cell) -> None:
-    """The target's hook (what the metadata calls) takes each certified step and writes what the op does."""
-    args = _case(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31 + 1)
-    assert hook(*args) is True
-    _check(args, op.reference(*args))
+@pytest.mark.parametrize("why, spec", _CASES, ids=[c[0] for c in _CASES])
+def test_the_kernel_matches_the_torch_formulation(why, spec) -> None:
+    args = _case(spec, seed=zlib.crc32(why.encode()) % 2**31)
+    assert kv.msa_kv_update(*args) is True
+    _check(args, _reference(args))
 
 
-def test_the_hook_declines_what_the_op_would_misread() -> None:
-    """A strided operand is read wrongly by the op, so the hook declines it (the metadata then runs its own
-    torch update) and writes nothing."""
-    args = list(_case(op.CELLS[2].spec, seed=5))
+def test_a_strided_operand_is_declined_and_nothing_is_written() -> None:
+    """The kernel reads operands densely, so a strided one is declined (the metadata then runs its own torch
+    update) with nothing written."""
+    args = list(_case(_CASES[2][1], seed=5))
     args[0] = torch.stack([args[0], args[0]], dim=1)[:, 0]
     before = args[11].clone()
-    assert hook(*args) is False
+    assert kv.msa_kv_update(*args) is False
     assert torch.equal(args[11], before)
 
 
-def test_guard_refuses_a_strided_operand() -> None:
-    args = list(_case(op.CELLS[2].spec, seed=6))
-    args[0] = torch.stack([args[0], args[0]], dim=1)[:, 0]
-    with pytest.raises(AssertionError, match="contiguous"):
-        with validating(op):
-            op(*args)
-
-
-def test_guard_refuses_a_request_index_past_the_batch() -> None:
-    args = list(_case(op.CELLS[2].spec, seed=7))
-    args[3] = args[3].clone()
-    args[3][-1] = args[7]
-    with pytest.raises(AssertionError, match="q_batch_row"):
-        with validating(op):
-            op(*args)
+def test_a_non_int32_operand_is_declined() -> None:
+    args = list(_case(_CASES[0][1], seed=6))
+    args[2] = args[2].to(torch.int64)
+    assert kv.msa_kv_update(*args) is False
