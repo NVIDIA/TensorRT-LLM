@@ -37,7 +37,10 @@ from .....cute_dsl_utils import (
     mxfp8_fused_fc12_tuner_key_suffix,
 )
 from .....locality_domain.policy import PartitionPlan
-from .....locality_domain_utils import _copy_to_new_cuda_allocation
+from .....locality_domain_utils import (
+    _copy_to_new_cuda_allocation,
+    get_locality_domain_compute_sm_counts,
+)
 from .....model_config import ModelConfig
 from .....utils import ActivationType, AuxStreamType, EventType, swizzle_sf, unswizzle_sf
 from ...activation import (
@@ -265,16 +268,38 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         super().create_weights()
 
     def _adjust_locality_domain_plan(self, plan: PartitionPlan) -> PartitionPlan:
-        if plan.enabled and self.intermediate_size_per_partition % (128 * plan.num_partitions) != 0:
+        """Veto a split the shard kernels cannot run.
+
+        Each shard takes whole 128-channel groups, and the fused kernel needs
+        every persistent 2-CTA cluster of its grid resident at once (FC2 waits
+        on FC1 readiness), so each partition must hold a whole number of
+        clusters.
+        """
+        if not plan.enabled:
+            return plan
+        reason = None
+        granule = self._INTERMEDIATE_ALIGNMENT * plan.num_partitions
+        if self.intermediate_size_per_partition % granule != 0:
             reason = (
                 "MXFP8 locality domain MoE needs intermediate_size_per_partition "
                 f"({self.intermediate_size_per_partition}) to split into "
-                f"{plan.num_partitions} multiples of 128 channels; running the "
-                "full-GPU fused FC12 kernel"
+                f"{plan.num_partitions} multiples of {self._INTERMEDIATE_ALIGNMENT} "
+                "channels"
             )
-            logger.warning(f"{type(self).__name__}: {reason}")
-            return PartitionPlan(enabled=False, reason_if_disabled=reason)
-        return plan
+        else:
+            for pid in range(plan.num_partitions):
+                sm_counts = get_locality_domain_compute_sm_counts(pid)
+                if sm_counts is None or sm_counts[0] % 2 != 0:
+                    reason = (
+                        f"MXFP8 locality domain MoE needs partition {pid} to hold whole "
+                        f"2-CTA clusters, got SM counts {sm_counts}"
+                    )
+                    break
+        if reason is None:
+            return plan
+        reason += "; running the full-GPU fused FC12 kernel"
+        logger.warning_once(f"{type(self).__name__}: {reason}", key=reason)
+        return PartitionPlan(enabled=False, reason_if_disabled=reason)
 
     def _get_quant_method(self) -> object:
         # Cutlass MXFP8 storage/swizzle + the gate/up interleave the fused FC12
@@ -677,6 +702,54 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # ------------------------------------------------------------------
     # Locality domain
     # ------------------------------------------------------------------
+    def pre_reload_weights(self) -> None:
+        """Recreate the full weights from the shards before a reload.
+
+        The split released the full weights, and the base reload re-creates
+        them uninitialized. A refit may rewrite only part of the layer (one
+        projection, some experts, or nothing), so copy the shards back into
+        them first: the untouched parts then keep their current values. The
+        shard tensors are kept, and the next split refreshes them in place,
+        so captured CUDA graphs keep reading valid addresses.
+        """
+        shards = self._locality_domain_weight_shards
+        super().pre_reload_weights()
+        if shards is not None:
+            self._restore_full_weights_from_shards(shards)
+            self._locality_domain_shard_buffers = shards
+
+    @torch.no_grad()
+    def _restore_full_weights_from_shards(self, shards: list[dict[str, torch.Tensor]]) -> None:
+        """Write the kernel-layout full weights and block scales back from the shards."""
+        sf_vec = self.quant_method.BLOCK_SIZE
+        num_experts, hidden, inner = self.w2_weight.shape
+        half_inner = inner // len(shards)
+        self.w3_w1_weight.data.copy_(torch.cat([s["w3_w1_weight"] for s in shards], dim=1))
+        self.w2_weight.data.copy_(torch.cat([s["w2_weight"] for s in shards], dim=2))
+        # The FC1 shards cut whole 128-row swizzle atoms, so their scales are
+        # row slices of the swizzled tensor.
+        fc1_scale = torch.cat([s["fc31_weight_block_scale"] for s in shards], dim=1)
+        self.w3_w1_weight_scale.data.copy_(fc1_scale.view(self.w3_w1_weight_scale.shape))
+        # The FC2 shards cut the K/32 columns, which the swizzle interleaves:
+        # rebuild the linear matrix and swizzle it again.
+        fc2_scale_linear = torch.cat(
+            [
+                unswizzle_sf(
+                    s["fc2_weight_block_scale"].view(torch.uint8), hidden, half_inner, sf_vec
+                ).view(num_experts, hidden, half_inner // sf_vec)
+                for s in shards
+            ],
+            dim=2,
+        )
+        fc2_scale = swizzle_sf(fc2_scale_linear.contiguous(), hidden, inner, sf_vec)
+        self.w2_weight_scale.data.copy_(
+            fc2_scale.view(torch.uint8)
+            .view(self.w2_weight_scale.dtype)
+            .view(self.w2_weight_scale.shape)
+        )
+        self.quant_method.mark_all_slots_in_kernel_layout(self)
+        self.quant_method.setup_quant_scales(self)
+
     def _split_weights_for_locality_domain(self) -> list[dict[str, torch.Tensor]]:
         """Split every expert's inner channels for the fused FC12 kernel.
 
@@ -686,7 +759,8 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         stored in the 128x4 swizzled layout (int32-packed), whose memory order
         is not the logical ``[N, K/32]`` matrix, so they are unswizzled, sliced
         like their weights and swizzled again per shard. The two shards
-        together hold one copy of the weights.
+        together hold one copy of the weights. After a reload, the previous
+        shard tensors are refreshed in place (see :meth:`pre_reload_weights`).
         """
         num_p = self._locality_domain_plan.num_partitions
         if num_p != 2:
@@ -711,6 +785,8 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         fc2_scale_linear = unswizzle_sf(fc2_scale.view(torch.uint8), hidden, inner, sf_vec).view(
             num_experts, hidden, inner // sf_vec
         )
+        previous = getattr(self, "_locality_domain_shard_buffers", None)
+        self._locality_domain_shard_buffers = None
         shards = []
         for pid in range(num_p):
             n_slice = slice(pid * 2 * half_inner, (pid + 1) * 2 * half_inner)
@@ -730,13 +806,23 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
                 .view(num_experts, hidden, half_inner // sf_vec)
                 .view(fc2_scale.dtype)
             )
+            sources = {
+                "w3_w1_weight": self.w3_w1_weight[:, n_slice],
+                "w2_weight": self.w2_weight[:, :, k_slice],
+                "fc31_weight_block_scale": fc1_shard_scale,
+                "fc2_weight_block_scale": fc2_shard_scale,
+            }
             with self._locality_domain_runtime.partition_weight_context(pid):
-                shards.append(
-                    {
-                        "w3_w1_weight": _copy_to_new_cuda_allocation(self.w3_w1_weight[:, n_slice]),
-                        "w2_weight": _copy_to_new_cuda_allocation(self.w2_weight[:, :, k_slice]),
-                        "fc31_weight_block_scale": _copy_to_new_cuda_allocation(fc1_shard_scale),
-                        "fc2_weight_block_scale": _copy_to_new_cuda_allocation(fc2_shard_scale),
-                    }
-                )
+                old = previous[pid] if previous is not None else None
+                if old is not None and all(
+                    old[name].shape == src.shape and old[name].dtype == src.dtype
+                    for name, src in sources.items()
+                ):
+                    for name, src in sources.items():
+                        old[name].copy_(src)
+                    shards.append(old)
+                else:
+                    shards.append(
+                        {name: _copy_to_new_cuda_allocation(src) for name, src in sources.items()}
+                    )
         return shards

@@ -586,7 +586,8 @@ finalize (scatter-add) into one persistent kernel, driven through
   warmup still profiles the larger buckets, up to that cap), and the comb
   checker pins the inner `mma_tiler_m` to it.
 - **Locality domains** (`enable_locality_domains`, `plan_moe` op
-  `mxfp8_moe`): `trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin`
+  `mxfp8_moe`, opt-in with `TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE=1`):
+  `trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin`
   runs the fused kernel on two compute partitions, each holding half of every
   expert's inner channels (FC1 weights/scales sliced along N as whole gate/up
   pairs and 128-row scale atoms, FC2 weights/scales along K; together one copy
@@ -595,19 +596,23 @@ finalize (scatter-add) into one persistent kernel, driven through
   dense case) and quantizes raw BF16/FP16 input once before the fork, so the
   split pays the same single reset as the full-GPU op and the shards launch
   GEMM-only. Both shards scatter-add into the shared output, so the split is
-  not bitwise equal to the full-GPU kernel. As for the NVFP4 and BF16 paths
-  the split is a static planner decision: with `enable_locality_domains`
-  every shape of the layer runs the split (its tile / weight-streaming
-  tactics are autotuned like the full-GPU op's), and `transform_weights`
+  not bitwise equal to the full-GPU kernel. Unlike the NVFP4 and BF16 paths,
+  `mxfp8_moe` is not in the default `allowed_ops`: with the opt-in set the
+  split is a static planner decision and every shape of the layer runs it.
+  The planner declines it under the balanced split
+  (`TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD=balanced`), and the leaf vetoes
+  it when a partition cannot hold whole 2-CTA clusters, because the fused
+  kernel needs its whole persistent grid resident. `transform_weights`
   shards the weights and releases the full parameters and block scales
   (`_locality_domain_full_scale_params`), so the shards are the only copy. A
-  refit after that (RLHF) re-creates the full parameters through
-  `pre_reload_weights`, and the next `transform_weights` re-shards and
-  releases them again. Measured on Rubin at the peak HBM clock, module-level
-  per MoE call, worst rank, cold weights: the split saves 7-19% from 4-8
-  tokens/rank up on TEP8, DEP4 and DEP16 decode shapes and is neutral at 1-2
-  tokens; on prefill-sized rows (16K rows/rank) it measured about 20% slower
-  than the full-GPU op, so enable it on decode (generation) engines.
+  refit (RLHF) re-creates the full parameters from the shards in
+  `pre_reload_weights`, so a partial refit keeps the untouched experts and
+  projections, and the next `transform_weights` refreshes the shard tensors
+  in place, so captured CUDA graphs stay valid. The split helps decode and
+  hurts prefill: TEP8 gains from 16-32 tokens and DEP from 2-4 tokens/rank,
+  it is 7-15% slower at TEP8 4-8 tokens and 10% slower at DEP4 1 token/rank,
+  and about 20% slower at prefill-sized rows (16K rows/rank). Enable it on
+  decode (generation) engines.
 - **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
   than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
   `IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE` (true when `cutlass.memory` and
