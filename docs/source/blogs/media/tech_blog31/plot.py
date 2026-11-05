@@ -281,7 +281,7 @@ def halo() -> None:
 def costs(data: dict) -> None:
     rows = data["spatial_cost_model"]["rows"]
     xs = np.arange(len(rows))
-    labels = ["Direct", "F2", "F3", "F4", "F5", "F6", "F7", "F8"]
+    labels = ["Direct"] + [f"F({m}×{m})" for m in range(2, 9)]
     for name, key, title, unit in [
         ("cost_flops", "gemm_flops_per_output_pixel", "Arithmetic per output pixel", "FLOPs"),
         (
@@ -317,7 +317,8 @@ def costs(data: dict) -> None:
                     ha="center",
                     fontsize=16,
                 )
-        ax.set_xticks(xs, labels)
+        ax.set_xticks(xs, labels, rotation=40, ha="right", fontsize=13)
+        ax.set_xlabel("Spatial output tile (3 × 3 filter)", fontsize=14)
         ax.set_ylabel(unit)
         clean(ax, "y")
         save(fig, name)
