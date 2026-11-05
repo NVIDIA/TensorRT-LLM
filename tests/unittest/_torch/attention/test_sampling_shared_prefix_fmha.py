@@ -269,6 +269,26 @@ def test_beam_search_batches_and_a_v1_manager_are_declined():
     assert beam.fmha_plan_caches == {} and not lib.has_active_plan(beam)
 
 
+def test_per_layer_page_tables_are_declined():
+    """With per-layer page tables (SWA scratch reuse) the block-offset table is indexed by local
+    layer, and two layers of one lifecycle group can map different pages; the library reads the
+    group's table for every layer, so it declines such a manager."""
+    manager = SimpleNamespace(
+        get_buffers=lambda layer, kv_layout: None,
+        host_kv_cache_block_offsets=None,
+        kv_factor=2,
+        tokens_per_block=32,
+        index_mapper=object(),
+        _use_per_layer_page_tables=False,
+    )
+    assert lib.sampling_metadata_eligible(_eligible_meta(manager))
+    manager._use_per_layer_page_tables = True
+    meta = _eligible_meta(manager)
+    assert not lib.sampling_metadata_eligible(meta)
+    lib.plan_step(meta)
+    assert meta.fmha_plan_caches == {} and not lib.has_active_plan(meta)
+
+
 # --------------------------------------------------------------------------- #
 # Planner (SM90)
 # --------------------------------------------------------------------------- #
