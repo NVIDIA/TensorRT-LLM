@@ -378,12 +378,8 @@ def test_mixed_processor_matches_separate_inputs(tensor_images):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("num_images", [1, 2])
 def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
-    from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
-        Glm5NextInputProcessor,
-        _glm5_next_build_batched_input,
-    )
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextInputProcessor
     from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-        EncoderGroup,
         MultimodalModelMixin,
         encode_multimodal_by_groups,
     )
@@ -417,7 +413,8 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
         return pixel_values.new_zeros((pixel_values.shape[0] // 4, 2))
 
     output = encode_multimodal_by_groups(
-        (EncoderGroup(("image", "video"), encode, _glm5_next_build_batched_input),), params
+        Glm5NextVisionModelBase.mm_encoder_groups.fget(SimpleNamespace(encode_batched=encode)),
+        params,
     )
     assert output.shape == (num_images * 4, 2)
     assert output.dtype == torch.float16
@@ -1481,3 +1478,163 @@ def test_indexer_topk_without_cute_dsl(monkeypatch: pytest.MonkeyPatch) -> None:
         expected = torch.arange(max(0, count - indexer.select_k), count, dtype=torch.int32)
         assert torch.equal(valid, expected)
         assert int((selected[row] == -1).sum()) == indexer.select_k - min(count, indexer.select_k)
+
+
+def _main_flatten_video_grid_thw(video_grid_thw: torch.Tensor) -> torch.Tensor:
+    """Source ``Glm5NextModel.get_video_features``: every temporal frame pair of
+    a video is encoded as its own ``(1, h, w)`` item, so ``(t, h, w)`` becomes
+    ``t`` rows of ``(1, h, w)``."""
+    t = video_grid_thw[:, 0]
+    hw = torch.repeat_interleave(video_grid_thw[:, 1:], t, dim=0)
+    return torch.cat([hw.new_ones(hw.shape[0], 1), hw], dim=1)
+
+
+def _main_glm5_next_build_batched_input(multimodal_params: list) -> dict:
+    pixels: list[torch.Tensor] = []
+    grids: list[torch.Tensor] = []
+    for param in multimodal_params:
+        bucket = param.multimodal_data.get("image")
+        if bucket is not None:
+            pixels.append(bucket["pixel_values"])
+            grids.append(bucket["image_grid_thw"])
+    for param in multimodal_params:
+        bucket = param.multimodal_data.get("video")
+        if bucket is not None:
+            pixels.append(bucket["pixel_values_videos"])
+            grids.append(_main_flatten_video_grid_thw(bucket["video_grid_thw"]))
+    device = pixels[0].device
+    return {
+        "pixel_values": torch.cat(pixels, dim=0),
+        "grid_thw": torch.cat([g.to(device) for g in grids], dim=0),
+    }
+
+
+class _Glm5CpuVisionTower:
+    device = torch.device("cpu")
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, pixel_values, *, grid_thw):
+        self.calls.append((pixel_values, grid_thw))
+        return pixel_values.reshape(-1, 4, pixel_values.shape[-1]).sum(dim=1)
+
+
+class _Glm5CpuEncoder:
+    mm_encoder_groups = Glm5NextVisionModelBase.mm_encoder_groups
+    encode_batched = Glm5NextVisionModelBase.encode_batched
+    forward = Glm5NextVisionModelBase.forward
+    model_dtype = torch.float32
+
+    def __init__(self):
+        self.visual = _Glm5CpuVisionTower()
+
+
+def _glm5_cpu_param(image_grids=(), video_grids=(), video_first=False):
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
+        Glm5NextInputProcessor,
+        _flatten_video_grid_thw,
+    )
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalParams,
+    )
+
+    data = {}
+    for modality, grids, pixel_key, grid_key in (
+        ("image", image_grids, "pixel_values", "image_grid_thw"),
+        ("video", video_grids, "pixel_values_videos", "video_grid_thw"),
+    ):
+        if grids:
+            grid = torch.tensor(grids, dtype=torch.int64)
+            rows = int(grid.prod(dim=-1).sum())
+            data[modality] = {
+                pixel_key: torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3),
+                grid_key: grid,
+            }
+            if modality == "video":
+                data[modality]["video_frame_grid_thw"] = _flatten_video_grid_thw(grid)
+    config = _config()
+    config.image_token_id, config.video_token_id = 11, 12
+    processor = Glm5NextInputProcessor("unused", config, tokenizer=Mock())
+    modalities = ("video", "image") if video_first else ("image", "video")
+    order = [
+        {"modality": modality, "index": index}
+        for modality in modalities
+        if modality in data
+        for index in range(len(data[modality][f"{modality}_grid_thw"]))
+    ]
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata([], data, order)
+    return MultimodalParams(multimodal_data=data)
+
+
+def _main_glm5_request_output(param):
+    packed = _main_glm5_next_build_batched_input([param])
+    rows = _Glm5CpuVisionTower()(**packed)
+    by_item = {}
+    offset = 0
+    metadata = param.item_metadata
+    lengths = dict(zip(metadata.item_refs, metadata.output_embedding_lengths))
+    for modality in ("image", "video"):
+        for ref in sorted(ref for ref in metadata.item_refs if ref[0] == modality):
+            length = lengths[ref]
+            by_item[ref] = rows[offset : offset + length]
+            offset += length
+    return torch.cat([by_item[ref] for ref in metadata.item_refs])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("case", ["single", "images", "videos", "mixed"])
+def test_glm5_declared_inputs_match_main(case):
+    if case == "single":
+        params = [_glm5_cpu_param(image_grids=[(1, 4, 4)])]
+    elif case == "images":
+        params = [
+            _glm5_cpu_param(image_grids=[(1, 4, 4), (1, 4, 6)]),
+            _glm5_cpu_param(image_grids=[(1, 6, 4)]),
+        ]
+    elif case == "videos":
+        params = [
+            _glm5_cpu_param(video_grids=[(3, 4, 4)]),
+            _glm5_cpu_param(video_grids=[(2, 6, 4)]),
+        ]
+    else:
+        params = [
+            _glm5_cpu_param(video_grids=[(2, 4, 4)]),
+            _glm5_cpu_param(image_grids=[(1, 4, 6)], video_grids=[(3, 4, 4)], video_first=True),
+            _glm5_cpu_param(image_grids=[(1, 6, 4)]),
+        ]
+    encoder = _Glm5CpuEncoder()
+    actual = encoder.forward(params)
+    assert len(actual) == 1
+    assert len(encoder.visual.calls) == 1
+    oracle = _main_glm5_next_build_batched_input(params)
+    for captured, name in zip(encoder.visual.calls[0], ("pixel_values", "grid_thw")):
+        assert torch.equal(captured, oracle[name])
+        assert captured.dtype == oracle[name].dtype
+        assert captured.device == oracle[name].device
+    expected = torch.cat([_main_glm5_request_output(param) for param in params])
+    assert torch.equal(actual[0], expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("video_first", [False, True])
+def test_glm5_metadata_without_hashing_preserves_prompt_order(video_first):
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextInputProcessor
+    from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+
+    param = _glm5_cpu_param(image_grids=[(1, 4, 4)], video_grids=[(2, 4, 4)])
+    data = {key: value for key, value in param.multimodal_data.items() if key in ("image", "video")}
+    config = _config()
+    config.image_token_id, config.video_token_id = 11, 12
+    processor = Glm5NextInputProcessor("unused", config, tokenizer=Mock())
+    image = [processor.config.image_token_id] * 4
+    video = [processor.config.video_token_id] * 8
+    prompt = video + image if video_first else image + video
+    metadata = processor.get_mm_item_metadata(prompt, data)
+    expected = (("video", 0), ("image", 0)) if video_first else (("image", 0), ("video", 0))
+    assert metadata.item_refs == expected
+    assert metadata.output_embedding_lengths == ((8, 4) if video_first else (4, 8))
+    # A record from hashing is returned unchanged.
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    assert processor.get_mm_item_metadata(prompt, data) is metadata
