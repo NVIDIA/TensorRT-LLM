@@ -96,17 +96,25 @@ def _receiver(num_chunks: int, rounds: int, to_sender, from_sender, results):
     _transfer_env()
     from cuda.bindings import runtime as cudart
 
-    from tensorrt_llm._torch.disaggregation.native.bounce.buffer import Buffer
+    from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
     from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
+    from tensorrt_llm.runtime.kv_cache_manager_v2._introspection import (
+        PooledPhysMemAllocator,
+        VirtMem,
+    )
 
     torch.cuda.set_device(1)
     torch.zeros(1, device="cuda")
-    # A fabric VMM region backed by one physical allocation per chunk, like a KV cache pool.
-    buf = Buffer(num_chunks * _CHUNK_BYTES, _CHUNK_BYTES, name=_DST_AGENT)
+    # A VMM region backed by one physical allocation per chunk, like a KV cache pool.
+    allocator = PooledPhysMemAllocator(_CHUNK_BYTES)
+    vm = VirtMem(num_chunks * _CHUNK_BYTES, allocator, init_num_phys_mem=num_chunks)
+    base_ptr = int(vm.address)
     agent = BindingsNixlTransferAgent(_DST_AGENT, True, num_threads=1)
-    reg = buf.reg_descs()
+    reg = RegMemoryDescs(
+        "VRAM", [(base_ptr, num_chunks * _CHUNK_BYTES, allocator.device_id, _DST_AGENT)]
+    )
     agent.register_memory(reg)
-    to_sender.put((bytes(agent.get_local_agent_desc()), buf.base_ptr, buf.device_id))
+    to_sender.put((bytes(agent.get_local_agent_desc()), base_ptr, allocator.device_id))
     host = np.empty(num_chunks * _CHUNK_BYTES, dtype=np.uint8)
     matches = []
     for round_idx in range(rounds):
@@ -114,7 +122,7 @@ def _receiver(num_chunks: int, rounds: int, to_sender, from_sender, results):
             raise RuntimeError("receiver: rounds out of order")
         (err,) = cudart.cudaMemcpy(
             host.ctypes.data,
-            buf.base_ptr,
+            base_ptr,
             host.nbytes,
             cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
         )
@@ -127,7 +135,7 @@ def _receiver(num_chunks: int, rounds: int, to_sender, from_sender, results):
     from_sender.get(timeout=240)  # sender is done with the region
     agent.deregister_memory(reg)
     agent.shutdown()
-    buf.close()
+    vm.destroy()
     results.put(("receiver", matches))
 
 
