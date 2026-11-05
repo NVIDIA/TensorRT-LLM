@@ -84,6 +84,31 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
         (
             generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": True}},
+            True,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": False}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": "invalid"}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": 1}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": None}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
             {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
             True,
         ),
@@ -171,6 +196,58 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "native",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "morton",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "hilbert",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "peano",
+                    }
+                }
+            },
+            False,
+        ),
     ],
 )
 def test_config_validation(
@@ -756,12 +833,12 @@ def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> 
         str(schema_dir),
     ]
     before_sync = {path.name: path.read_bytes() for path in schema_dir.iterdir()}
-    result = subprocess.run(command + ["--check"], capture_output=True, text=True)
+    result = subprocess.run(command + ["--check"], capture_output=True, text=True, timeout=60)
     assert result.returncode != 0
     assert "Missing or stale configuration schemas" in result.stderr
     assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_sync
 
-    subprocess.run(command, check=True, capture_output=True, text=True)
+    subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
     version = generator._source_version()
     before_check = {}
     for filename, expected_command in generator._SCHEMA_COMMANDS.items():
@@ -773,7 +850,7 @@ def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> 
         assert schema["sentinel"] == {"preserved": True}
         before_check[filename] = path.read_bytes()
 
-    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True)
+    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True, timeout=60)
     assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_check
 
 

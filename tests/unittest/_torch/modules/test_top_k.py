@@ -288,14 +288,22 @@ def test_gvr_uses_caller_prepared_row_order(monkeypatch) -> None:
 
 
 def _install_fake_selfsampling_runner(monkeypatch) -> Mock:
-    """Replace the lazily imported self-sampling varlen entry with a Mock."""
+    """Replace the lazily imported self-sampling varlen entries with Mocks (every launcher
+    compiled); return the runner Mock."""
     runner = Mock()
     monkeypatch.setitem(
         sys.modules,
         "tensorrt_llm._torch.kernels.blackwell.top_k",
-        SimpleNamespace(selfsampling_topk_run_varlen=runner),
+        SimpleNamespace(
+            selfsampling_topk_run_varlen=runner,
+            selfsampling_topk_varlen_ready=Mock(return_value=True),
+        ),
     )
     return runner
+
+
+def _sm100_or_sm103() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
 def _run_gvr_v2_decode(top_k: TopK, out_width: int = 2) -> None:
@@ -330,6 +338,48 @@ def test_gvr_v2_decode_is_hint_free(monkeypatch) -> None:
     assert not top_k.needs_gvr_prior
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("padded_rows", [False, True])
+def test_gvr_v2_decode_preserves_native_input(monkeypatch, dtype, padded_rows) -> None:
+    """Aligned FP32, BF16 and FP16 decode scores reach the self-sampling runner as the caller's
+    tensor, without a copy or a cast."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    # Multirow views use the aligned arena stride, even for an odd logical
+    # width. A single row must have an aligned logical width as well.
+    width = 12 if dtype == torch.float32 else 16
+    scores = (
+        torch.randn(2, 16, dtype=dtype)[:, :13]
+        if padded_rows
+        else torch.randn(1, width, dtype=dtype)
+    )
+    lengths = torch.full((scores.shape[0],), scores.shape[1], dtype=torch.int32)
+    output = torch.empty(scores.shape[0], 2, dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=scores.shape[1],
+    )
+
+    assert result is output
+    runner.assert_called_once()
+    assert runner.call_args.args[0] is scores
+    assert runner.call_args.args[1] is lengths
+    assert runner.call_args.args[2] is output
+    assert runner.call_args.kwargs == {
+        "next_n": 1,
+        "compress_ratio": 1,
+        "max_seq_len": scores.shape[1],
+    }
+    decode.assert_not_called()
+
+
 def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     top_k = TopK(
@@ -352,6 +402,262 @@ def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
     }
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gvr_v2_decode_deterministic_16bit_widens_to_fp32(monkeypatch, dtype) -> None:
+    """Deterministic decode widens 16-bit scores to an aligned FP32 copy for the FP32-only
+    deterministic engine and forwards the deterministic options."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_deterministic=True,
+        gvr_sorting="ascending",
+    )
+    # an aligned 16-bit arena view with an odd logical width (multirow stride 24, wider than the
+    # float4-rounded width)
+    scores = torch.randn(2, 24, dtype=dtype)[:, :13]
+    lengths = torch.full((2,), 13, dtype=torch.int32)
+    output = torch.empty(2, 2, dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=13,
+    )
+
+    assert result is output
+    decode.assert_not_called()
+    args, kwargs = runner.call_args
+    widened = args[0]
+    # the deterministic engine is fp32-only: an exact fp32 view with the source row stride,
+    # which the launcher key includes
+    assert widened.dtype == torch.float32
+    assert widened.shape == scores.shape
+    assert widened.stride(1) == 1 and widened.stride(0) == scores.stride(0)
+    assert widened.data_ptr() % 16 == 0
+    assert torch.equal(widened, scores.float())
+    assert args[1] is lengths and args[2] is output
+    assert kwargs == {
+        "next_n": 1,
+        "compress_ratio": 1,
+        "max_seq_len": 13,
+        "deterministic": True,
+        "sorting": "ascending",
+    }
+
+
+def test_gvr_v2_decode_deterministic_16bit_capture_checks_fp32_engine(monkeypatch) -> None:
+    """Under capture, the readiness check of a deterministic 16-bit decode looks up the FP32
+    launcher that runs the widened scores, at the source row stride (the one warmup compiles)."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
+    monkeypatch.setattr(TopK, "_decode_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        compress_ratio=4,
+        gvr_deterministic=True,
+    )
+    scores = torch.randn(2, 264, dtype=torch.bfloat16)[:, :250]
+    lengths = torch.full((2,), 1000, dtype=torch.int32)
+    output = torch.empty(2, 2, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=250,
+    )
+
+    (ready_scores, ready_output), ready_kwargs = fake.selfsampling_topk_varlen_ready.call_args
+    assert ready_scores.dtype == torch.float32 and ready_scores.stride(0) == 264
+    assert ready_output is output
+    assert ready_kwargs == {
+        "next_n": 1,
+        "compress_ratio": 4,
+        "max_seq_len": 1000,
+        "deterministic": True,
+    }
+    assert runner.call_args.args[0] is ready_scores
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_gvr_v2_decode_capture_uncompiled_uses_radix(monkeypatch, dtype) -> None:
+    """Under CUDA graph capture a decode launcher missed by warmup must not JIT; the exact
+    radix decode is captured instead, 16-bit scores on its native 16-bit entry."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
+    fake.selfsampling_topk_varlen_ready = Mock(return_value=False)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    monkeypatch.setattr(TopK, "_decode_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    scores = torch.randn(2, 16, dtype=dtype)
+    lengths = torch.full((2,), 16, dtype=torch.int32)
+    output = torch.empty(2, 2, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=16,
+        radix_aux_indices=torch.empty(2, 10, 2, dtype=torch.int32),
+        radix_aux_logits=torch.empty(2, 10, 2),
+    )
+
+    runner.assert_not_called()
+    fake.selfsampling_topk_varlen_ready.assert_called_once_with(
+        scores, output, next_n=1, compress_ratio=1, max_seq_len=16
+    )
+    args, kwargs = decode.call_args
+    assert args[0] is scores and args[1] is lengths and args[2] is output
+    assert args[3:] == (1, 2)
+    # the split-work scratch serves the FP32 entry only
+    assert (kwargs["radix_aux_indices"] is not None) == (dtype == torch.float32)
+
+
+def test_gvr_v2_decode_capture_compiled_uses_engine(monkeypatch) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    monkeypatch.setattr(TopK, "_decode_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR, compress_ratio=4)
+
+    _run_gvr_v2_decode(top_k)
+
+    runner.assert_called_once()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("reason", ["capture_uncompiled", "base"])
+def test_gvr_v2_decode_wide_16bit_radix_fallback_widens_to_fp32(monkeypatch, reason, dtype) -> None:
+    """The 16-bit CUDA radix decode entry has no split-work tier, so 16-bit rows of 200,000 or
+    more columns that take the radix fallback arrive as an exact FP32 copy with the caller's
+    split-work scratch."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    if reason == "capture_uncompiled":
+        fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
+        fake.selfsampling_topk_varlen_ready = Mock(return_value=False)
+        monkeypatch.setattr(TopK, "_decode_capturing", staticmethod(lambda scores: True))
+        scores = torch.randn(1, 200_000, dtype=dtype)
+    else:
+        scores = torch.randn(1, 200_008, dtype=dtype)[:, 1:]  # unaligned base
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    lengths = torch.full((1,), scores.shape[1], dtype=torch.int32)
+    output = torch.empty(1, 2, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=scores.shape[1],
+        radix_aux_indices=torch.empty(1, 10, 2, dtype=torch.int32),
+        radix_aux_logits=torch.empty(1, 10, 2),
+    )
+
+    runner.assert_not_called()
+    args, kwargs = decode.call_args
+    assert args[0].dtype == torch.float32 and torch.equal(args[0], scores.float())
+    assert args[1] is lengths and args[2] is output
+    assert kwargs["radix_aux_indices"] is not None and kwargs["radix_aux_logits"] is not None
+
+
+@pytest.mark.skipif(not _sm100_or_sm103(), reason="requires SM100 or SM103")
+def test_gvr_v2_decode_deterministic_16bit_capture_replays_fp32_warmup() -> None:
+    """A deterministic BF16 decode captured on a padded arena view runs the FP32 launcher that
+    warmup compiled at the arena row stride, with the eager engine's indices and order."""
+    from tensorrt_llm._torch.kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling_host as host,
+    )
+
+    rows, width, stride, k, cr = 4, 2000, 2048, 512, 4
+    host.warmup_varlen(
+        k,
+        width * cr,
+        compress_ratio=cr,
+        num_rows_list=(rows,),
+        row_stride=stride,
+        deterministic=True,
+    )
+    arena = torch.randn(rows, stride, device="cuda").round().to(torch.bfloat16)
+    scores = arena[:, :width]
+    lengths = torch.full((rows,), width * cr, dtype=torch.int32, device="cuda")
+    output = torch.full((rows, k), -7, dtype=torch.int32, device="cuda")
+    top_k = TopK(
+        k,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        compress_ratio=cr,
+        gvr_deterministic=True,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        top_k(
+            scores,
+            output,
+            is_prefill=False,
+            sequence_lengths=lengths,
+            scan_lengths=lengths,
+            max_seq_len=width,
+        )
+    graph.replay()
+    expected = torch.full_like(output, -7)
+    host.run_varlen(
+        arena.float()[:, :width],
+        lengths,
+        expected,
+        compress_ratio=cr,
+        max_seq_len=width * cr,
+        deterministic=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.skipif(not _sm100_or_sm103(), reason="requires SM100 or SM103")
+def test_gvr_v2_decode_16bit_capture_without_warmup_uses_radix(monkeypatch) -> None:
+    """A BF16 decode captured without a 16-bit warmup runs the CUDA radix decode in the graph
+    instead of raising, and replays exact."""
+    from tensorrt_llm._torch.kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling_host as host,
+    )
+
+    monkeypatch.setattr(host, "_VARLEN_CACHE_BF16", {})
+    rows, width, stride, k = 3, 3000, 3008, 512
+    scores = torch.randn(rows, stride, device="cuda").to(torch.bfloat16)[:, :width]
+    lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    output = torch.full((rows, k), -7, dtype=torch.int32, device="cuda")
+    top_k = TopK(k, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        top_k(
+            scores,
+            output,
+            is_prefill=False,
+            sequence_lengths=lengths,
+            scan_lengths=lengths,
+            max_seq_len=width,
+        )
+    assert host._VARLEN_CACHE_BF16 == {}
+    graph.replay()
+    torch.cuda.synchronize()
+    # range check before the gather: a bad index must fail here, not as a device-side assert
+    assert int(output.min()) >= 0 and int(output.max()) < width
+    expected = torch.topk(scores.float(), k, dim=1).values.sort(dim=1).values
+    actual = scores.float().gather(1, output.long()).sort(dim=1).values
+    assert torch.equal(actual, expected)
+
+
 def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
@@ -361,7 +667,7 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
         decode_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
-    scores = torch.randn(1, 8, dtype=torch.bfloat16)
+    scores = torch.randn(1, 8, dtype=torch.float64)  # dtype gate miss
     lengths = torch.tensor([32], dtype=torch.int32)
     output = torch.empty(1, 2, dtype=torch.int32)
 
@@ -382,6 +688,48 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
         1,
         2,
         compress_ratio=4,
+        radix_aux_indices=None,
+        radix_aux_logits=None,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["row_stride", "inner_stride", "base", "single_row_width"])
+def test_gvr_v2_16bit_unaligned_layout_falls_back(monkeypatch, layout, dtype) -> None:
+    """16-bit scores that break the 16-byte load layout (row stride or single-row width not a
+    multiple of 8, strided columns, unaligned base) fall back to indexer_topk_decode."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    if layout == "row_stride":
+        scores = torch.randn(2, 12, dtype=dtype)
+    elif layout == "inner_stride":
+        scores = torch.randn(2, 16, dtype=dtype)[:, ::2]
+    elif layout == "base":
+        scores = torch.randn(2, 16, dtype=dtype)[:, 1:9]
+    else:
+        scores = torch.randn(1, 16, dtype=dtype)[:, :12]
+    lengths = torch.full((scores.shape[0],), scores.shape[1], dtype=torch.int32)
+    output = torch.empty(scores.shape[0], 2, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=scores.shape[1],
+    )
+
+    runner.assert_not_called()
+    decode.assert_called_once_with(
+        scores,
+        lengths,
+        output,
+        1,
+        2,
+        compress_ratio=1,
         radix_aux_indices=None,
         radix_aux_logits=None,
     )
@@ -612,6 +960,7 @@ def _install_fake_prefill_runner(monkeypatch) -> Mock:
         "tensorrt_llm._torch.kernels.blackwell.top_k",
         SimpleNamespace(
             selfsampling_topk_run_varlen=Mock(),
+            selfsampling_topk_varlen_ready=Mock(return_value=True),
             selfsampling_topk_run_prefill=prefill,
             selfsampling_topk_prefill_ready=Mock(return_value=True),
         ),
@@ -651,6 +1000,150 @@ def test_gvr_v2_prefill_routes_to_selfsampling_runner(monkeypatch) -> None:
     assert kwargs == {}
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("padded_rows", [False, True])
+def test_gvr_v2_prefill_preserves_native_input(monkeypatch, dtype, padded_rows) -> None:
+    """Aligned FP32, BF16 and FP16 prefill scores reach the self-sampling runner as the caller's
+    tensor, without a copy or a cast."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(8, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    # the row stride must be a multiple of 16 bytes; the logical width may be odd
+    scores = (
+        torch.randn(3, 16, dtype=dtype)[:, :13] if padded_rows else torch.randn(3, 16, dtype=dtype)
+    )
+
+    row_starts, row_ends, output = _prefill_call(top_k, scores, out_width=8)
+
+    runner.assert_called_once()
+    args, kwargs = runner.call_args
+    assert args[0] is scores and args[1] is row_starts and args[2] is row_ends
+    assert args[3] is output
+    assert kwargs == {}
+    radix.assert_not_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["aligned", "row_stride", "inner_stride", "base"])
+def test_gvr_v2_prefill_deterministic_16bit_widens_to_fp32(monkeypatch, layout, dtype) -> None:
+    """Deterministic prefill widens 16-bit scores, aligned or not, to an aligned FP32 copy for
+    the FP32-only deterministic engine and forwards the deterministic options."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(
+        2,
+        prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_deterministic=True,
+        gvr_sorting="ascending",
+    )
+    if layout == "aligned":
+        scores = torch.randn(3, 16, dtype=dtype)[:, :13]
+    elif layout == "row_stride":
+        scores = torch.randn(3, 12, dtype=dtype)
+    elif layout == "inner_stride":
+        scores = torch.randn(3, 32, dtype=dtype)[:, ::2]
+    else:
+        scores = torch.randn(3, 16, dtype=dtype)[:, 1:13]
+
+    row_starts, row_ends, output = _prefill_call(top_k, scores)
+
+    radix.assert_not_called()
+    args, kwargs = runner.call_args
+    widened = args[0]
+    assert widened.dtype == torch.float32
+    assert widened.shape == scores.shape
+    assert widened.stride(1) == 1 and widened.stride(0) % 4 == 0
+    assert widened.data_ptr() % 16 == 0
+    assert torch.equal(widened, scores.float())
+    assert args[1] is row_starts and args[2] is row_ends and args[3] is output
+    assert kwargs == {"deterministic": True, "sorting": "ascending"}
+
+
+def test_gvr_v2_prefill_deterministic_16bit_capture_checks_fp32_engine(monkeypatch) -> None:
+    """Under capture, the readiness check of a deterministic 16-bit prefill looks up the FP32
+    engine that runs the widened scores (the one warmup compiles)."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
+    monkeypatch.setattr(TopK, "_prefill_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(2, prefill_implementation=TopKImplementation.CUTE_DSL_GVR, gvr_deterministic=True)
+
+    _, _, output = _prefill_call(top_k, torch.randn(3, 8, dtype=torch.bfloat16))
+
+    (ready_scores, ready_output), ready_kwargs = fake.selfsampling_topk_prefill_ready.call_args
+    assert ready_scores.dtype == torch.float32 and ready_output is output
+    assert ready_kwargs == {"deterministic": True}
+    assert runner.call_args.args[0] is ready_scores
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "row_stride",
+        "inner_stride",
+        "base",
+        "short_rows",
+        "small_k",
+        "temporal",
+        "capture_uncompiled",
+    ],
+)
+def test_gvr_v2_prefill_16bit_radix_fallbacks_widen_to_fp32(monkeypatch, reason, dtype) -> None:
+    """16-bit prefill scores that do not run the engine (a layout that breaks the 16-byte loads,
+    rows no wider than K, K < 8, temporal GVR, an engine not compiled under capture) take the
+    CUDA radix prefill, which reads an exact FP32 copy."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    if reason == "capture_uncompiled":
+        fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
+        fake.selfsampling_topk_prefill_ready = Mock(return_value=False)
+        monkeypatch.setattr(TopK, "_prefill_capturing", staticmethod(lambda scores: True))
+    k = 4 if reason == "small_k" else 8
+    top_k = TopK(
+        k,
+        prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=reason != "temporal",
+    )
+    if reason == "row_stride":
+        scores = torch.randn(2, 12, dtype=dtype)
+    elif reason == "inner_stride":
+        scores = torch.randn(2, 32, dtype=dtype)[:, ::2]
+    elif reason == "base":
+        scores = torch.randn(2, 32, dtype=dtype)[:, 1:17]
+    elif reason == "short_rows":
+        scores = torch.randn(2, 8, dtype=dtype)
+    else:
+        scores = torch.randn(2, 16, dtype=dtype)
+
+    row_starts, row_ends, output = _prefill_call(top_k, scores, out_width=k)
+
+    runner.assert_not_called()
+    radix.assert_called_once()
+    widened, *rest = radix.call_args.args
+    assert widened.dtype == torch.float32 and torch.equal(widened, scores.float())
+    assert rest[0] is row_starts and rest[1] is row_ends and rest[2] is output and rest[3] == k
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_cuda_radix_prefill_reads_fp32_scores(monkeypatch, dtype) -> None:
+    """The CUDA radix prefill kernel reads FP32 only: FP32 scores pass through, 16-bit scores
+    arrive as an exact FP32 copy."""
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    scores = torch.randn(3, 8, dtype=dtype)
+
+    _prefill_call(TopK(2), scores)
+
+    passed = radix.call_args.args[0]
+    if dtype == torch.float32:
+        assert passed is scores
+    else:
+        assert passed.dtype == torch.float32 and torch.equal(passed, scores.float())
+
+
 def test_gvr_v2_prefill_format_gate_falls_back_to_radix(monkeypatch) -> None:
     runner = _install_fake_prefill_runner(monkeypatch)
     radix = Mock()
@@ -660,7 +1153,7 @@ def test_gvr_v2_prefill_format_gate_falls_back_to_radix(monkeypatch) -> None:
         prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
-    scores = torch.randn(3, 8, dtype=torch.bfloat16)  # dtype gate miss
+    scores = torch.randn(3, 8, dtype=torch.float64)  # dtype gate miss
     row_starts, row_ends, output = _prefill_call(top_k, scores)
 
     runner.assert_not_called()

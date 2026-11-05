@@ -2039,6 +2039,7 @@ class TestMultimodalEncoderCudaGraphConfig:
 class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().vision_gpu_normalize is False
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
@@ -2048,11 +2049,58 @@ class TestMultimodalConfig:
     def test_torch_llm_args_default_multimodal_config(self):
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.vision_gpu_normalize is False
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_vision_gpu_normalize_yaml(self, enabled: bool):
+        config = yaml.safe_load(
+            f"multimodal_config:\n  vision_gpu_normalize: {str(enabled).lower()}\n"
+        )
+        args = TorchLlmArgs(model=llama_model_path, **config)
+        assert args.multimodal_config.vision_gpu_normalize is enabled
+        dumped = args.multimodal_config.model_dump()
+        assert dumped["vision_gpu_normalize"] is enabled
+
+    @pytest.mark.parametrize("value", [None, "invalid", 2, [], {}])
+    def test_vision_gpu_normalize_rejects_invalid_values(self, value):
+        with pytest.raises(ValidationError):
+            MultimodalConfig(vision_gpu_normalize=value)
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("encoder_only", [False, True])
+    def test_vision_gpu_normalize_reaches_input_processor(
+            self, enabled: bool, encoder_only: bool):
+        from tensorrt_llm.llmapi.llm import BaseLLM
+
+        cls = public_llmapi.MultimodalEncoder if encoder_only else TorchLLM
+        llm = cls.__new__(cls)
+        llm.shutdown = lambda: None
+        llm.args = SimpleNamespace(
+            multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
+            trust_remote_code=True,
+            enable_tokenization_cache=False,
+        )
+        llm._hf_model_dir = "unused"
+        for method in ("_try_load_tokenizer", "_try_load_hf_model_config",
+                       "_capture_usage_startup",
+                       "_reject_token_encoder_config_without_buckets",
+                       "_try_load_generation_config",
+                       "_try_load_generation_config_explicit_values"):
+            setattr(llm, method, lambda *args, **kwargs: None)
+        module = "mm_encoder" if encoder_only else "llm"
+        with patch.object(BaseLLM, "_build_model"), patch(
+                f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                side_effect=ValueError("input processor boundary")) as factory:
+            with pytest.raises(ValueError, match="input processor boundary"):
+                llm._build_model()
+        kwargs = factory.call_args.kwargs
+        assert kwargs.get("vision_gpu_normalize", False) is enabled
+        assert ("vision_gpu_normalize" in kwargs) is enabled
 
     def test_disable_mm_encoder_disables_encoder_cache(self):
         multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
@@ -3609,7 +3657,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
-        # The shared bounce capacity defaults to off (0), accepts a positive size, and rejects
+        # kv_cache_bounce_size_mb defaults to off (0), accepts a positive size, and rejects
         # negatives at the Pydantic boundary (ge=0).
         assert config.kv_cache_bounce_size_mb == 0
         assert CacheTransceiverConfig(
@@ -3617,24 +3665,18 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
-        # agent_bounce_buffer_enable defaults to the Python implementation (False); enabling the
-        # C++ transfer-agent implementation with a zero capacity is a contradiction.
+        # The deprecated agent_bounce_buffer_enable defaults to False and is
+        # ignored: True with a zero capacity validates.
         assert config.agent_bounce_buffer_enable is False
         assert config.agent_bounce_params is None
         assert CacheTransceiverConfig(
-            kv_cache_bounce_size_mb=512,
-            agent_bounce_buffer_enable=True).agent_bounce_buffer_enable is True
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="kv_cache_bounce_size_mb is 0"):
-            CacheTransceiverConfig(agent_bounce_buffer_enable=True)
+            agent_bounce_buffer_enable=True).kv_cache_bounce_size_mb == 0
 
         # Bounce is Python-transceiver-only: the pybind (C++ transceiver) config
         # carries no bounce fields at all. backend must be set: from_string(None)
         # is a pre-existing _to_pybind limit.
         pybind_config = CacheTransceiverConfig(
-            backend="NIXL",
-            kv_cache_bounce_size_mb=384,
-            agent_bounce_buffer_enable=True)._to_pybind()
+            backend="NIXL", kv_cache_bounce_size_mb=384)._to_pybind()
         assert not any("bounce" in attr for attr in dir(pybind_config))
 
         # Arbitrary arguments should be rejected
@@ -3647,7 +3689,6 @@ class TestStrictBaseModelArbitraryArgs:
         """agent_bounce_params coercion, key/consistency validation, pybind passthrough."""
         # Values are coerced to strings (YAML often yields ints/bools).
         config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
-                                        agent_bounce_buffer_enable=True,
                                         agent_bounce_params={
                                             "max_chunk_size": 4096,
                                             "enable_eager_gather": False
@@ -3657,12 +3698,17 @@ class TestStrictBaseModelArbitraryArgs:
             "enable_eager_gather": "False"
         }
 
-        # Params without the C++ agent implementation are a contradiction: they
-        # would be silently ignored, so validation rejects them outright.
+        # Params with bounce disabled (capacity 0) are a contradiction: they
+        # would be silently ignored, so validation rejects them outright. The
+        # deprecated flag does not change that.
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="agent_bounce_buffer_enable"):
+                           match="kv_cache_bounce_size_mb is 0"):
             CacheTransceiverConfig(
-                kv_cache_bounce_size_mb=512,
+                agent_bounce_params={"copy_stream_count": "2"})
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="kv_cache_bounce_size_mb is 0"):
+            CacheTransceiverConfig(
+                agent_bounce_buffer_enable=True,
                 agent_bounce_params={"copy_stream_count": "2"})
 
         # Unknown keys (here the env-var-style typo WITH the trailing _bytes) are
@@ -3671,7 +3717,6 @@ class TestStrictBaseModelArbitraryArgs:
                            match="max_chunk_size_bytes.*min_descriptor_count"):
             CacheTransceiverConfig(
                 kv_cache_bounce_size_mb=512,
-                agent_bounce_buffer_enable=True,
                 agent_bounce_params={"max_chunk_size_bytes": "4096"})
 
         # Non-dict input fails cleanly in the coercion validator, not with a bare
@@ -3679,8 +3724,39 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
                            match="must be a dict"):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
-                                   agent_bounce_buffer_enable=True,
                                    agent_bounce_params="max_chunk_size=4096")
+
+    def test_cache_transceiver_config_agent_bounce_buffer_enable_is_deprecated_noop(
+            self, monkeypatch):
+        """agent_bounce_buffer_enable is a deprecated no-op that warns only when True."""
+        warnings_seen = []
+        monkeypatch.setattr(
+            llm_args_mod.logger, "warning_once",
+            lambda message, key: warnings_seen.append((message, key)))
+
+        field = CacheTransceiverConfig.model_fields[
+            "agent_bounce_buffer_enable"]
+        assert field.json_schema_extra["status"] == "deprecated"
+
+        # True only warns: the config is otherwise identical to the flag-less one.
+        config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                                        agent_bounce_buffer_enable=True)
+        assert len(warnings_seen) == 1
+        message, key = warnings_seen[0]
+        assert "deprecated" in message
+        assert key == "cache_transceiver_config.agent_bounce_buffer_enable"
+        assert config.model_dump(
+            exclude={"agent_bounce_buffer_enable"}) == CacheTransceiverConfig(
+                kv_cache_bounce_size_mb=512).model_dump(
+                    exclude={"agent_bounce_buffer_enable"})
+        # Re-validating a full dump (as apply_model_defaults_to_llm_args does)
+        # and an explicit False stay silent.
+        warnings_seen.clear()
+        CacheTransceiverConfig(**CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=512).model_dump())
+        CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                               agent_bounce_buffer_enable=False)
+        assert warnings_seen == []
 
     def test_agent_bounce_param_keys_match_cpp_env_knobs(self):
         """AGENT_BOUNCE_PARAM_KEYS must mirror kEnvKnobs in BounceConfig.h (parsed here)."""
@@ -5677,3 +5753,173 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+class TestDSparkConfidenceScheduling:
+    """Config surface for DSpark confidence-scheduled verification."""
+
+    def _cfg(self, **kw):
+        from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+        kw.setdefault("max_draft_len", 5)
+        return DSparkDecodingConfig(**kw)
+
+    def _scheduled(self, **kw):
+        """Scheduling on with the required cost table."""
+        kw["enable_confidence_scheduling"] = True
+        kw.setdefault("confidence_cost_table_path", "/tmp/costs.json")
+        return self._cfg(**kw)
+
+    def test_defaults_are_off(self):
+        c = self._cfg()
+        assert c.enable_confidence_scheduling is False
+        assert c.confidence_min_predicted_gain == pytest.approx(0.04)
+
+    def test_confidence_paths_are_ignored_when_scheduling_is_off(self):
+        # A static config copied from a dynamic one keeps working.
+        c = self._cfg(confidence_cost_table_path="/tmp/costs.json",
+                      confidence_calibration_path="/tmp/calibration.json")
+        assert c.enable_confidence_scheduling is False
+
+    def test_scheduling_requires_a_cost_table(self):
+        with pytest.raises(ValueError, match="confidence_cost_table_path"):
+            self._cfg(enable_confidence_scheduling=True)
+
+    def test_min_predicted_gain_must_be_non_negative(self):
+        with pytest.raises(ValidationError,
+                           match="confidence_min_predicted_gain"):
+            self._scheduled(confidence_min_predicted_gain=-0.01)
+
+    @pytest.mark.parametrize("field", [
+        "validate_confidence_artifact_freshness",
+        "confidence_sps_live_fingerprint_path",
+        "confidence_admission_receipt_path",
+        "confidence_admission_receipt_sha256",
+        "confidence_verify_len_tiers",
+    ])
+    def test_removed_fields_are_rejected(self, field):
+        with pytest.raises(ValidationError, match=field):
+            self._scheduled(**{field: None})
+
+    def test_physical_k1_resolves_confidence_scheduling_to_static(self):
+        c = self._scheduled(
+            max_draft_len=1,
+            confidence_calibration_path="/tmp/calibration.json",
+        )
+
+        assert c.enable_confidence_scheduling is False
+
+    def test_physical_k1_needs_no_confidence_artifacts(self):
+        c = self._cfg(max_draft_len=1, enable_confidence_scheduling=True)
+
+        assert c.enable_confidence_scheduling is False
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
+
+    def test_physical_k1_remains_valid_when_scheduling_is_off(self):
+        c = self._cfg(max_draft_len=1)
+        assert c.enable_confidence_scheduling is False
+        assert c.max_draft_len == 1
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
+
+    @staticmethod
+    def _environment(**overrides):
+        values = dict(
+            cuda_graph_config=SimpleNamespace(enable_padding=True),
+            moe_config=SimpleNamespace(load_balancer=None),
+            speculative_config=SimpleNamespace(
+                draft_is_embedded_in_target=True),
+            guided_decoding_backend=None,
+            enable_lora=False,
+            lora_config=None,
+            sparse_attention_config=None,
+            pipeline_parallel_size=1,
+            context_parallel_size=1,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_confidence_environment_rejects_standalone_dspark(self):
+        environment = self._environment(speculative_config=SimpleNamespace(
+            draft_is_embedded_in_target=False))
+        with pytest.raises(ValueError,
+                           match="only the embedded DeepSeek-V4 draft"):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({
+                "cuda_graph_config": None
+            }, "requires cuda_graph_config"),
+            (
+                {
+                    "cuda_graph_config": SimpleNamespace(enable_padding=False)
+                },
+                "enable_padding=True",
+            ),
+            ({
+                "guided_decoding_backend": "xgrammar"
+            }, "guided decoding"),
+            ({
+                "enable_lora": True
+            }, "does not yet support LoRA"),
+            ({
+                "pipeline_parallel_size": 2
+            }, "does not yet support pipeline parallelism"),
+            ({
+                "context_parallel_size": 2
+            }, "context_parallel_size=1"),
+            (
+                {
+                    "moe_config":
+                    SimpleNamespace(load_balancer=SimpleNamespace(
+                        mode="per_layer_dynamic"))
+                },
+                "per-layer dynamic EPLB",
+            ),
+            (
+                {
+                    "sparse_attention_config":
+                    SimpleNamespace(
+                        enable_heuristic_topk=True,
+                        use_cute_dsl_topk=False,
+                        use_cute_dsl_paged_mqa_logits=False,
+                    )
+                },
+                "enable_heuristic_topk",
+            ),
+            (
+                {
+                    "sparse_attention_config":
+                    SimpleNamespace(
+                        enable_heuristic_topk=False,
+                        use_cute_dsl_topk=True,
+                        use_cute_dsl_paged_mqa_logits=False,
+                    )
+                },
+                "use_cute_dsl_topk",
+            ),
+            (
+                {
+                    "speculative_config":
+                    SimpleNamespace(draft_is_embedded_in_target=True,
+                                    acceptance_rate_window_size=16,
+                                    acceptance_rate_threshold=0.3)
+                },
+                "acceptance-rate gate",
+            ),
+        ],
+    )
+    def test_confidence_environment_rejects_unsupported_runtime_combinations(
+            self, overrides, message):
+        environment = self._environment(**overrides)
+        with pytest.raises(ValueError, match=message):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    @pytest.mark.parametrize("mode", [None, "standard"])
+    def test_confidence_environment_accepts_padded_cuda_graphs(self, mode):
+        load_balancer = None if mode is None else SimpleNamespace(mode=mode)
+        TorchLlmArgs._validate_dspark_confidence_environment(
+            self._environment(moe_config=SimpleNamespace(
+                load_balancer=load_balancer)))

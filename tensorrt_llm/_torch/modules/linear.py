@@ -50,7 +50,8 @@ from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
-from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
+from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
+                         low_m_gemm_dispatcher)
 
 
 class WeightMode(str, enum.Enum):
@@ -512,6 +513,14 @@ class LinearMethodBase(ABC):
                                tp_group: List[int], *args, **kwargs):
         raise NotImplementedError
 
+    def apply_linear_allreduce_norm(
+        self, module: Linear, input: torch.Tensor,
+        all_reduce_params: AllReduceParams
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """The row-parallel projection, its all-reduce and the residual RMSNorm fusion of
+        ``all_reduce_params`` as one kernel (outputs of ``AllReduce``), or None."""
+        return None
+
     def load_weights(self,
                      module: Linear,
                      weights: List[Dict],
@@ -695,7 +704,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # Skip when use_custom_cublas_mm is set: that path may allocate output
         # in an NCCL symmetric-memory window for TP all-reduce fusion, which
         # the low-M dispatcher does not support.
-        if _should_apply_low_m_gemm(input) and not getattr(
+        if _should_apply_low_m_gemm(input, module) and not getattr(
                 module, "use_custom_cublas_mm", False):
             output = apply_low_m_gemm(module, input, weight, bias)
             if output is not None:
@@ -857,13 +866,23 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        static_input_scale = self.get_static_input_scale(module)
+        # The opt-in low-M dispatcher races cuBLAS against the low-M FP8 GEMM
+        # for static-scale projections; None falls through to the stock path.
+        if (static_input_scale is not None and bias is None
+                and _should_apply_low_m_gemm(input, module)):
+            dispatcher = low_m_gemm_dispatcher(module)
+            output = dispatcher.apply_fp8(
+                input, module.weight, module.weight_scale, static_input_scale,
+                module.dtype or torch.bfloat16) if dispatcher else None
+            if output is not None:
+                return output
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
-        static_input_scale = self.get_static_input_scale(module)
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
             if static_input_scale is not None:
@@ -929,6 +948,32 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_linear_allreduce_norm(
+        self, module: Linear, input: torch.Tensor,
+        all_reduce_params: AllReduceParams
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """The MNNVL GEMM + all-reduce + residual RMSNorm kernel, where the low-M race picked the warp-MMA
+        GEMM for this projection (same summation order as the plain projection)."""
+        static_input_scale = self.get_static_input_scale(module)
+        dispatcher = low_m_gemm_dispatcher(module)
+        if (static_input_scale is None or module.bias is not None
+                or dispatcher is None or input.dim() != 2
+                or not _should_apply_low_m_gemm(input, module)):
+            return None
+        tactic = dispatcher.warp_mma_tactic(input.shape[0],
+                                            module.weight,
+                                            module.weight_scale,
+                                            static_input_scale,
+                                            quantize=input.dtype
+                                            != torch.float8_e4m3fn)
+        if tactic is None:
+            return None
+        return module.all_reduce.gemm_allreduce_norm(input, module.weight,
+                                                     module.weight_scale,
+                                                     static_input_scale,
+                                                     all_reduce_params,
+                                                     tactic[:3])
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -3137,23 +3182,27 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         elm_packing = 2 if module.tp_mode == TensorParallelMode.COLUMN else 1
         load_weights_vanilla_helper(module, weights, elm_packing=elm_packing)
 
-        # Use the same device as the weight tensor
-        # as we register pre_quant_scale after sharded model weights are moved to respective gpus
-        device = module.weight.device
-        pre_quant_scale = module.load_shard(
-            weights[0]["pre_quant_scale"],
-            # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
-            flip_tp=True,
-            device=device,
-        )
+        pre_quant_scale = weights[0].get("pre_quant_scale")
+        if pre_quant_scale is not None:
+            # Use the device of the loaded weight for the activation scale.
+            device = module.weight.device
+            pre_quant_scale = module.load_shard(
+                pre_quant_scale,
+                # Activation scales shard along the input dimension.
+                flip_tp=True,
+                device=device,
+            )
 
-        module.pre_quant_scale = Parameter(
-            torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
-            requires_grad=False).to(device=device)
+            module.pre_quant_scale = Parameter(
+                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
+                requires_grad=False).to(device=device)
+
+            copy_weight(module.pre_quant_scale, pre_quant_scale)
+        else:
+            module.pre_quant_scale = None
 
         weight_scale = self.load_weight_scales(module, weights)[0]
 
-        copy_weight(module.pre_quant_scale, pre_quant_scale)
         copy_weight(module.weight_scale, weight_scale.T.contiguous())
 
     def load_weights_fused_qkv_linear(self, module: Linear,
@@ -3516,6 +3565,16 @@ _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+
+
+def flashinfer_mxfp8_autotune_active() -> bool:
+    """Whether the current forward runs inside ``flashinfer_mxfp8_autotune``."""
+    return _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+
+
+def flashinfer_mxfp8_decode_graph_capture_active() -> bool:
+    """Whether the current forward is a decode CUDA-graph warmup or capture."""
+    return _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
 
 
 @contextmanager
@@ -4685,7 +4744,16 @@ class Linear(nn.Module):
                 use_fused_gemm_allreduce = all_reduce_params.enable_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
 
             bias = None if (self.tp_rank > 0) else self.bias
-            if self.reduce_output:
+            fused_norm = None
+            if (self.reduce_output and all_reduce_params is not None
+                    and all_reduce_params.enable_allreduce
+                    and all_reduce_params.fusion_op != AllReduceFusionOp.NONE
+                    and not use_locality_domain and lora_params is None):
+                fused_norm = self.quant_method.apply_linear_allreduce_norm(
+                    self, input, all_reduce_params)
+            if fused_norm is not None:
+                output = fused_norm
+            elif self.reduce_output:
                 if use_fused_gemm_allreduce:
                     output = self.apply_linear_allreduce(
                         input, self.bias, layer_idx)

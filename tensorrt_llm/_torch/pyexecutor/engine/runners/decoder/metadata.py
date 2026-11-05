@@ -18,7 +18,14 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    MsaRuntimePolicy,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
+from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sampling
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -34,6 +41,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .inputs import DecoderInputBuffers
 
@@ -45,6 +53,9 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
 
 class DecoderMetadata:
     """Attention and speculative metadata reused across decoder iterations."""
+
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
 
     def __init__(
         self,
@@ -58,6 +69,7 @@ class DecoderMetadata:
         self._config = config
         self.mapping = mapping
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(model)
         self._buffers = buffers
         self._attention_runtime_features = attention_runtime_features
         # This field is initialized lazily on the first forward pass.
@@ -104,8 +116,36 @@ class DecoderMetadata:
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
         self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        self._arm_msa_policy(kv_cache_manager)
 
         return self.attn_metadata
+
+    def _arm_msa_policy(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None) -> None:
+        """Hand the model's MiniMax-M3 MSA preparation choices to the metadata and the KV cache."""
+        msa = self.runtime_hooks.msa
+        if msa == MsaRuntimePolicy():
+            return
+        # Imported here: only a model that armed an MSA policy needs the sparse backend.
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+            MiniMaxM3KVCacheManagerV2,
+        )
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+            MiniMaxM3MsaSparseAttentionMetadata,
+        )
+
+        if not isinstance(
+            self.attn_metadata, MiniMaxM3MsaSparseAttentionMetadata
+        ) or not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+            raise ValueError(
+                "RuntimeHooks.msa requires the MiniMax-M3 MSA sparse attention backend and KV cache, "
+                f"got {type(self.attn_metadata).__name__} and {type(kv_cache_manager).__name__}"
+            )
+        self.attn_metadata.msa_policy = msa
+        kv_cache_manager.configure_decode_shortcuts(
+            skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
+            reuse_pool_views=msa.reuse_pool_views,
+            block_ids_from_views=msa.block_ids_from_views,
+        )
 
     def setup_speculative(
         self, spec_resource_manager: BaseResourceManager | None
@@ -113,8 +153,16 @@ class DecoderMetadata:
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = create_spec_metadata(
-            self._config, self.model.config, spec_resource_manager
+            self._config, self.model.config, spec_resource_manager, self.mapping
         )
+        self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
+        self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        if self.runtime_hooks.pack_spec_rng_uploads:
+            logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
+        if self.runtime_hooks.spec_small_h2d:
+            logger.info(
+                "[M3 host] spec step small uploads off the boundary (accepted counts packed, static slot ids)"
+            )
         return self.spec_metadata
 
     @property
@@ -268,6 +316,7 @@ def create_spec_metadata(
     config: DecoderRunnerConfig,
     pretrained_config: object,
     spec_resource_manager: BaseResourceManager | None,
+    mapping: Mapping | None = None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
     return get_spec_metadata(
@@ -278,6 +327,10 @@ def create_spec_metadata(
         spec_resource_manager=spec_resource_manager,
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
+        # The decode CUDA graphs then capture the temperature-only variant.
+        temperature_only_graphs=config.cuda_graph_config is not None
+        and config.spec_decode_fast_paths
+        and supports_sharded_target_sampling(config.spec_config, mapping),
     )
 
 
@@ -328,7 +381,11 @@ def update_spec_metadata(
 
 
 def sync_group_all_greedy_sample(
-    spec_metadata: SpecMetadata, mapping: Mapping, dist: Distributed | None
+    spec_metadata: SpecMetadata,
+    mapping: Mapping,
+    dist: Distributed | None,
+    *,
+    confidence_enabled: bool = False,
 ) -> None:
     """All-gather the per-rank greedy flags and store the group AND.
 
@@ -343,18 +400,45 @@ def sync_group_all_greedy_sample(
     ``all_rank_num_tokens`` exchange, which runs in ``prepare_inputs`` --
     after the graph key, too late for the key to see the synced value.
     """
-    # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
-    # Mapping.__init__), so ADP needs no separate check here.
-    if not (mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
+    # Confidence needs the same group-uniform rejection decision even without
+    # LM-head TP. Feature-off execution retains the existing gate.
+    if not (
+        spec_metadata.use_rejection_sampling
+        and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+    ):
         return
     local_flag = bool(spec_metadata.is_all_greedy_sample)
-    all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
-    spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    if mapping.tp_size > 1:
+        all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
+        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    else:
+        spec_metadata.group_all_greedy_sample = local_flag
     # Also overwrite the live flag directly: this iteration's scan already
     # ran (update_is_all_greedy_sample just returned) and the CUDA graph
     # key reads the flag next -- the stored override only takes effect on
     # the NEXT rescan (populate), which is after key selection.
     spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
+
+def supports_advanced_draft_sampling(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether the engine may capture an advanced draft-sampling variant."""
+    return not (
+        getattr(spec_config, "enable_confidence_scheduling", False)
+        and spec_config.use_rejection_sampling
+    )
+
+
+def validate_dspark_draft_sampling(
+    spec_metadata: SpecMetadata,
+    *,
+    confidence_enabled: bool,
+) -> None:
+    """Reject unsupported group-uniform sampling before graph lookup."""
+    if confidence_enabled and spec_metadata.wants_advanced_draft_sampling:
+        raise ValueError(
+            "DSpark confidence scheduling does not support advanced rejection "
+            "draft sampling: confidence is conditioned on the greedy proposal prefix"
+        )
 
 
 def set_spec_metadata_all_rank_num_tokens(

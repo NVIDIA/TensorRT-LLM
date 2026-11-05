@@ -611,6 +611,8 @@ def test_overlap_offsets_follow_the_packed_prefix(
     decoder._dspark_device_windows = False
     decoder._prepare_inputs_fast_path = lambda *_args, **_kwargs: None
     decoder._can_use_steady_gen_fast_prepare = lambda *_args: False
+    decoder._steady_mtp = None
+    decoder.breakable_cuda_graph_runner = None
     decoder._new_extra_inputs = lambda: SimpleNamespace(
         add_generation_request=lambda _request: None, build=lambda *_args: {}
     )
@@ -730,7 +732,7 @@ def test_overlap_offsets_follow_the_packed_prefix(
 def test_graph_overlap_offset_zeroing_preserves_ragged_bucket_padding(trims: bool) -> None:
     decoder = object.__new__(DecoderInputPreparer)
     decoder._config = SimpleNamespace(
-        max_num_tokens=16, max_beam_width=1, disable_overlap_scheduler=False
+        max_num_tokens=16, max_beam_width=1, disable_overlap_scheduler=False, is_spec_decode=True
     )
     decoder._dspark_trims_submitted_tokens = trims
     decoder._staged_previous_batch_indices = None

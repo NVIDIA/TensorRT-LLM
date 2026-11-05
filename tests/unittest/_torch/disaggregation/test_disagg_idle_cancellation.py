@@ -19,7 +19,6 @@ import pytest
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheTransceiver
-from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
@@ -611,7 +610,6 @@ def _published_receive(
     aux.alloc_slot.return_value = SimpleNamespace(id=0)
     receiver = SimpleNamespace(
         _enforce_physical_ownership=True,
-        _bounce=NoBounceTransport(),
         _registrar=SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
         ),

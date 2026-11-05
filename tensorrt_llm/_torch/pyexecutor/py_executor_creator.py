@@ -389,6 +389,26 @@ def _branch_snapshot_ctx_chunk_config(
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
+def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
+                           is_generation: bool) -> None:
+    """Reject the settings a non-generation model cannot run with; warn on those it ignores."""
+    if is_generation:
+        return
+    if mapping.has_pp():
+        raise ValueError(
+            "Pipeline parallelism is not supported for non-generation models "
+            "(pooling and mm_encoder_only); set pipeline_parallel_size=1.")
+    if mapping.enable_attention_dp:
+        raise ValueError(
+            "Non-generation models do not support attention DP; set "
+            "enable_attention_dp=False.")
+    if llm_args.enable_chunked_prefill:
+        logger.warning(
+            "enable_chunked_prefill is ignored for non-generation models: each "
+            "request runs whole in one forward, and requests longer than "
+            "max_num_tokens are rejected.")
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -467,9 +487,10 @@ def create_encoder_executor(
 ):
     """Create an EncoderExecutor for models using the encode-only path.
 
-    Handles model loading and model_engine creation, then wraps in a
-    lightweight EncoderExecutor. Skips all decoder infrastructure
-    (KV cache, scheduler, sampler, drafter, speculative decoding).
+    Resolves the config, checkpoint loader and mapping, then lets
+    EncoderExecutor load the model and build its runner without ModelEngine.
+    Skips all decoder infrastructure (KV cache, scheduler, sampler, drafter,
+    speculative decoding).
 
     Args:
         llm_args: Configuration arguments.
@@ -486,17 +507,11 @@ def create_encoder_executor(
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     dist = Distributed.get(mapping)
 
-    model_engine = ModelEngine(
+    return EncoderExecutor.create(
+        llm_args,
         model_path=checkpoint_dir,
-        llm_args=llm_args,
-        mapping=mapping,
-        dist=dist,
-        spec_config=None,
         checkpoint_loader=checkpoint_loader,
-    )
-
-    return EncoderExecutor(
-        model_engine=model_engine,
+        mapping=mapping,
         dist=dist,
     )
 
@@ -866,6 +881,12 @@ def _create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    is_generation = model_engine.model.model_config.is_generation
+    _check_no_kv_execution(llm_args, mapping, is_generation)
+    if not is_generation:
+        enable_chunked_context = False
+        model_engine.attn_runtime_features.chunked_prefill = False
+
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
         kv_cache_config.enable_block_reuse)
@@ -984,6 +1005,12 @@ def _create_py_executor(
         kv_cache_config.enable_block_reuse = False
         model_engine.attn_runtime_features.cache_reuse = False
 
+    # A user-set budget also bounds the transfers where PyExecutor would
+    # bypass the transfer window.
+    transfer_budget_is_explicit = (
+        cache_transceiver_config is not None
+        and cache_transceiver_config.max_tokens_in_buffer is not None)
+
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
     # tokens_per_block multiple: CacheTransBufferManager requires
@@ -1040,6 +1067,7 @@ def _create_py_executor(
                 ):
                     # GuidedDecoder is applicable to non-speculative decoding and drafter-based speculative decoding.
                     guided_decoder = GuidedDecoder(**kwargs)
+                    model_engine.drop_greedy_only_outputs()
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
                     # CapturableGuidedDecoder is applicable to one-model speculative decoding.
@@ -1295,6 +1323,7 @@ def _create_py_executor(
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
+            transfer_budget_is_explicit=transfer_budget_is_explicit,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
             max_num_sequences=max_num_seq_slots,
