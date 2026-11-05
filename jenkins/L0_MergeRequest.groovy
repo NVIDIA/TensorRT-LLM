@@ -1955,6 +1955,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/api/anthropic/serving.py",
         // /health is the disaggregated readiness probe.
         "tensorrt_llm/serve/api/ops/",
+        "tensorrt_llm/serve/chat_tokenization.py",
         "tensorrt_llm/serve/cluster_storage.py",
         "tensorrt_llm/serve/disagg_auto_scaling.py",
         // The error renderers both apps install; the disaggregated frontend runs them.
