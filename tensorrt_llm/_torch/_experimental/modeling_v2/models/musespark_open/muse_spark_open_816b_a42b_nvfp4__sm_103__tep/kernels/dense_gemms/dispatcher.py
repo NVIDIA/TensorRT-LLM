@@ -146,8 +146,10 @@ TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
 #: o_proj's dispatcher joins it before the built-in GEMM it keeps. The attention output projection
 #: is not named: its 8-row cell is cuBLAS, which no split-K cell reproduces bit for bit. Nor are the
 #: pooler and unpooler: above 8 rows the built-in tep8 model multiplies their whole replicated
-#: weights, a shape these sites do not take. Chosen from the shapes, not from a per-call sweep;
-#: ``install``'s split-K check refuses a cell that would change the bits.
+#: weights, a shape these sites do not take; ``wide_projection_gathers`` names their slices in its
+#: own TP8 table, armed per decode forward (``set_wide_kernels``), and leaves QKV to this one.
+#: Chosen from the shapes, not from a per-call sweep; ``install``'s split-K check refuses a cell
+#: that would change the bits.
 SM103_TP8_WIDE_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "qkv": ((16, "splitk:64,16,4,10"), (WIDE_MAX_ROWS, "splitk:64,32,4,8")),
 }

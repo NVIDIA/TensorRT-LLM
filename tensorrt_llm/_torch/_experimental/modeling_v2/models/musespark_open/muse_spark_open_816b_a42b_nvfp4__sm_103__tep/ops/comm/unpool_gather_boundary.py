@@ -259,7 +259,8 @@ if _AVAILABLE:
             # Thread (rank, tid) covers columns [offset, offset + 8): words
             # [word, word + 4) of peer ``peer``'s slice. It also sends the same
             # four words of this rank's slice to that peer, which covers every
-            # (peer, word) pair once.
+            # (peer, word) pair once. At TP8 and 9..32 rows a CTA's two halves
+            # have two peers.
             flat = rank * self.threads + tid
             peer = flat // self.per_peer
             word = (flat % self.per_peer) * 4
@@ -550,7 +551,7 @@ class UnpoolGatherBoundary(OpWrapper):
     A collective over the TP group (TP4 or TP8, ``inbox.world``): every rank
     calls it with the same row count, in the same order relative to its other
     calls on ``inbox``. Launched with programmatic dependent launch. Rows 1..8 on
-    any inbox; rows 9..32 at TP4 on a wide inbox (``inbox.max_rows`` 32).
+    any inbox; rows 9..32 on a wide inbox (``inbox.max_rows`` 32), at TP4 or TP8.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -559,8 +560,10 @@ class UnpoolGatherBoundary(OpWrapper):
     Certified against the built-in gather + cluster boundary bit for bit (the
     test compares raw bits through CUDA-graph replays with changing inputs,
     shape changes, tag wrap and a delayed rank), and against `reference` within
-    a band. Rows 1..8; and 9..32 at TP4 only, on a wide inbox: at TP8 the
-    boundary's 4-CTA clusters of those rows would straddle two peers' slices.
+    a band. Rows 1..8; and 9..32 on a wide inbox at TP4 and at TP8, where each
+    CTA of the boundary's 4-CTA clusters covers two peers' slices and waits on
+    both (the TP8 rows over eight ranks on two trays, CUDA-graph capture
+    included).
     """
 
     def __call__(
@@ -678,7 +681,7 @@ class UnpoolGatherBoundary(OpWrapper):
 
         A strided, misaligned or mistyped tensor is read as if it were packed,
         with no error; a row count above the inbox's ``max_rows`` addresses outside
-        it, and one of 9..32 at TP8 has CTAs that straddle two peers' slices.
+        it.
         ``capture`` is written the same way: 16-byte stores at its row stride, so
         it must be BF16 ``[M, 8192]`` with unit column stride, a row stride that
         keeps every row 16-byte aligned, and a 16-byte aligned start.
