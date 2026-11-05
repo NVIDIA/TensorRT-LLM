@@ -1378,7 +1378,7 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     try {
         echo "[SLURM-FINALIZER] ${entry.id}: reconciling orphaned SLURM resources off-pod " +
              "(job=${entry.slurmJobId ?: entry.jobUID}, node=${entry.nodeName ?: 'n/a'})."
-        def stageName = entry.id.toString().replaceFirst(/\/slurm$/, "")
+        def stageName = entry.id.toString().replaceFirst(/\/slurm\/[^\/]+$/, "")
         launchKubernetesStagePod(pipeline, podSpec, containerName, stageName, [reportFailure: false], {
             if (entry.usedSbatch) {
                 cleanUpSlurmResources(pipeline, cluster, entry.clusterName, entry.jobUID)
