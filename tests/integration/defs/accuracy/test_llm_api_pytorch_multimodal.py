@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 from typing import ClassVar
 
+import numpy as np
 import pytest
+from PIL import Image
+from transformers import AutoProcessor
 
 from tensorrt_llm import LLM
 from tensorrt_llm.evaluate.post_processing import (
@@ -196,6 +200,62 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestGemma4_31B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-31B-it"
+
+    def test_multi_image_encoder_budget(self, tmp_path):
+        """A request spanning several encoder steps completes, and the executor keeps serving."""
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
+        # Raise every image to 1120 soft tokens (10,080 encoder patches) so 8 images need several
+        # encoder steps.
+        for name in os.listdir(self.MODEL_PATH):
+            if name != "processor_config.json":
+                os.symlink(os.path.join(self.MODEL_PATH, name), tmp_path / name)
+        with open(os.path.join(self.MODEL_PATH, "processor_config.json")) as f:
+            processor_config = json.load(f)
+        processor_config["image_processor"]["max_soft_tokens"] = 1120
+        with open(tmp_path / "processor_config.json", "w") as f:
+            json.dump(processor_config, f)
+        processor = AutoProcessor.from_pretrained(tmp_path)
+        assert processor.image_processor.max_soft_tokens == 1120
+
+        num_images = 8
+        prompt = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image"}] * num_images
+                    + [{"type": "text", "text": "Describe these images."}],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+        images = [
+            Image.fromarray(np.random.randint(0, 255, (2000, 2000, 3), dtype=np.uint8))
+            for _ in range(num_images)
+        ]
+        sampling_params = SamplingParams(max_tokens=8)
+        with LLM(
+            str(tmp_path),
+            max_seq_len=65536,
+            max_batch_size=32,
+            max_num_tokens=2048,
+            enable_chunked_prefill=True,
+            attn_backend="FLASHINFER",
+            cuda_graph_config=None,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
+        ) as llm:
+            output = llm.generate(
+                {"prompt": prompt, "multi_modal_data": {"image": images}}, sampling_params
+            )
+            assert output.outputs[0].token_ids
+            output = llm.generate("Hello", sampling_params)
+            assert output.outputs[0].token_ids
 
 
 @skip_pre_hopper
