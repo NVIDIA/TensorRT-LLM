@@ -295,6 +295,7 @@ def _dspark_exact_secondary_padding_ready(
         int(payload[1]) != 0 or bool(int(payload[secondary_ready_index]))
         for payload in payloads)
 
+
 # How long a drain=True control request waits on KV transfers that have left the
 # scheduler queues but are not yet pulled by the generation engine (see
 # _handle_control_request). Generous relative to a transfer, which is one RDMA of
@@ -7011,12 +7012,12 @@ class PyExecutor:
         connector's pending loads and transfers are waited for without a bound.
         """
         # Generation-side receives that are still retiring count as active work.
-        queues_busy = bool(self.active_requests or self.waiting_queue
-                           or self.disagg.has_retiring_gen_receives)
+        queues_busy = (len(self.active_requests) > 0
+                       or len(self.waiting_queue) > 0
+                       or self.disagg.has_retiring_gen_receives)
         if not (queues_busy or connector_pending or transfers_in_flight > 0):
             return True
-        if (transfers_in_flight > 0 and not connector_pending
-                and not queues_busy):
+        if transfers_in_flight > 0 and not connector_pending and not queues_busy:
             deadline = getattr(self, "_control_drain_transfer_deadline", None)
             if deadline is None:
                 deadline = time.monotonic() + _CONTROL_DRAIN_TRANSFER_TIMEOUT_S
