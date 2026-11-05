@@ -394,6 +394,15 @@ def test_planner_follows_new_pages_in_recycled_slots(new_request_ids):
     lib._plan_sampling_step(meta(request_ids, slot_of, caches))
     assert state.grouping.version == version
 
+    # New requests in the same slots, with every block-table entry and length unchanged: the
+    # grouping is rebuilt from their tables, while the same requests keep it.
+    lib._plan_sampling_step(meta(request_ids, slot_of, caches))
+    assert state.grouping.version == version
+    newer_ids = [301, 302]
+    lib._plan_sampling_step(meta(newer_ids, dict(zip(newer_ids, (0, 1))), caches))
+    assert state.grouping.version != version
+    assert state.plan.grouping.prefix_indices.tolist() == fresh.prefix_indices.tolist()
+
 
 @needs_fa4
 def test_planner_declines_short_drafts_and_eager_batches_without_sharing(monkeypatch):
