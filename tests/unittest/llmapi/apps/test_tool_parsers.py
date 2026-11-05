@@ -4949,7 +4949,8 @@ class TestMiniMaxM3StreamingBlockBoundaries:
         parser = MiniMaxM3ToolParser()
         results = [parser.parse_streaming_increment(c, tools) for c in chunks]
         text = "".join(r.normal_text for r in results)
-        calls = [(c.name, c.parameters) for r in results for c in r.calls]
+        calls = [(c.tool_index, c.name, c.parameters) for r in results
+                 for c in r.calls]
         return text, calls
 
     def test_second_block_split_across_chunks_is_not_leaked_as_text(
@@ -4962,7 +4963,9 @@ class TestMiniMaxM3StreamingBlockBoundaries:
         text, calls = self._stream(chunks, sample_tools)
 
         assert M3_NS not in text
-        assert [name for name, _ in calls] == ["get_weather", "search_web"]
+        assert [(index, name) for index, name, _ in calls] == [
+            (0, "get_weather"), (1, "search_web")
+        ]
 
     def test_every_split_matches_one_shot_parse(self, sample_tools):
         whole = ("Checking. " + _m3_call("get_weather", "Paris") + "\n" +
@@ -4973,8 +4976,9 @@ class TestMiniMaxM3StreamingBlockBoundaries:
         for cut in range(1, len(whole)):
             text, calls = self._stream([whole[:cut], whole[cut:]],
                                        sample_tools)
-            assert calls == [(c.name, c.parameters) for c in expected.calls], (
-                f"calls differ when split at {cut}")
+            assert calls == [(c.tool_index, c.name, c.parameters)
+                             for c in expected.calls], (
+                                 f"calls differ when split at {cut}")
             # Only the spacing around the prose may differ between a
             # one-shot and a streamed parse.
             assert "".join(text.split()) == "".join(

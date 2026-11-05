@@ -225,7 +225,10 @@ class MiniMaxM3ToolParser(BaseToolParser):
             if result.normal_text:
                 texts.append(result.normal_text)
             for call in result.calls:
-                call.tool_index = len(calls)
+                # Clients use the index to tell calls apart across increments, so
+                # it counts calls over the whole stream, not within one increment.
+                self.current_tool_id += 1
+                call.tool_index = self.current_tool_id
                 calls.append(call)
 
         rest = self._buffer
