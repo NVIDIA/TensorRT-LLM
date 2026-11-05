@@ -68,7 +68,7 @@ def test_resolve_runner_dispatches_startup_families(
 @pytest.mark.parametrize(
     ("runner_type", "initializer_name"),
     [
-        (EncoderRunner, "_initialize_encoder_runner"),
+        (EncoderRunner, None),
         (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
         (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
         (DecoderRunner, "_initialize_decoder_runner"),
