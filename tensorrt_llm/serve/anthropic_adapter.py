@@ -636,6 +636,11 @@ def anthropic_message_id(chat_id: Optional[str], request_id: Optional[int] = Non
     ``chatcmpl-<engine request id>`` chat id, which is how a streamed chat
     completion is named; a non-streamed one has a random id, so its caller must
     pass ``request_id``. With neither, the message id has no request id in it.
+
+    A disaggregated server passes its disaggregated request id as ``request_id``:
+    each worker numbers its own engine requests, so a worker's id can name
+    different requests on different workers, while the disaggregated request id
+    is unique across the deployment and is the one its perf metrics record.
     """
     prefix = "chatcmpl-"
     if request_id is None and chat_id and chat_id.startswith(prefix):
@@ -667,8 +672,8 @@ def convert_chat_response(
 ) -> AnthropicMessagesResponse:
     """Translate a non-streaming chat completion into an Anthropic message.
 
-    ``request_id`` is the engine's id for the generation, when the caller has it;
-    the message id carries it (see ``anthropic_message_id``).
+    ``request_id`` is the id of the generation, when the caller has it; the
+    message id carries it (see ``anthropic_message_id``).
     """
     content: List[Any] = []
     stop_reason: AnthropicStopReason = "end_turn"
@@ -776,9 +781,12 @@ class AnthropicStreamReframer:
     ``partial_json`` is exactly what upstream sent for it.
     """
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, request_id: Optional[int] = None):
         self.model = model
-        self.message_id = f"msg_{uuid.uuid4().hex}"
+        # The id of the generation, when the caller has it; without it the
+        # message is named after the upstream chunks (see adopt_id).
+        self.request_id = request_id
+        self.message_id = anthropic_message_id(None, request_id)
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
@@ -982,9 +990,10 @@ class AnthropicStreamReframer:
     def adopt_id(self, chat_id: Optional[str]) -> None:
         """Name the message after the upstream generation (see ``anthropic_message_id``).
 
-        The constructor's id stays for a stream that fails before its first chunk.
+        The constructor's id stays for a stream that fails before its first chunk,
+        and for a caller that gave the request id.
         """
-        if chat_id and not self.message_started:
+        if chat_id and self.request_id is None and not self.message_started:
             self.message_id = anthropic_message_id(chat_id)
 
     def _start_message(self, usage: Optional[AnthropicUsage]) -> List[str]:
@@ -1239,9 +1248,11 @@ async def _with_ticks(
 
 
 async def reframe_openai_stream(
-    openai_sse: AsyncIterator[Union[str, bytes]], model: str
+    openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: Optional[int] = None
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames.
+
+    ``request_id`` names the message as in ``convert_chat_response``.
 
     Until [DONE], a ping goes out whenever no other event has for
     ``STREAM_PING_INTERVAL_S`` seconds, before ``message_start`` too: the message
@@ -1249,7 +1260,7 @@ async def reframe_openai_stream(
     slow first token would otherwise leave the stream silent. Clients skip
     pings wherever they appear.
     """
-    reframer = AnthropicStreamReframer(model=model)
+    reframer = AnthropicStreamReframer(model=model, request_id=request_id)
     done = False
     # The frames that close the message, held from [DONE] until the upstream
     # has been read to its end.

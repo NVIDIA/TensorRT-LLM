@@ -42,6 +42,7 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.render import chat as render_chat_module
+from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
@@ -90,17 +91,20 @@ def _json_chat_response(*, tool_arguments=None, status_code=200):
     )
 
 
-def _streaming_chat_response():
+def _streaming_chat_response(chat_id="chatcmpl-route-test"):
     chunks = [
         ChatCompletionStreamResponse(
+            id=chat_id,
             model=MODEL,
             choices=[{"index": 0, "delta": {"role": "assistant"}}],
         ),
         ChatCompletionStreamResponse(
+            id=chat_id,
             model=MODEL,
             choices=[{"index": 0, "delta": {"content": "hello"}}],
         ),
         ChatCompletionStreamResponse(
+            id=chat_id,
             model=MODEL,
             choices=[
                 {
@@ -364,6 +368,56 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert '"text":"hello"' in response.text
     assert response.text.rstrip().endswith('event: message_stop\ndata: {"type":"message_stop"}')
     assert backend.await_args.args[0].stream
+
+
+def _disagg_route_client(answer):
+    """A disaggregated server whose real request wrapper and hooks call ``answer``."""
+    server = object.__new__(OpenAIDisaggServer)
+    server._service = SimpleNamespace(openai_chat_completion=answer)
+    server._perf_metrics_collector = SimpleNamespace(
+        total_requests=Mock(),
+        stream_requests=Mock(),
+        nonstream_requests=Mock(),
+        total_responses=Mock(),
+        queue_latency_seconds=Mock(),
+    )
+    server._allow_request_chat_template = False
+    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
+    server._collect_perf_metrics = False
+    app = FastAPI()
+    app.add_middleware(ServerArrivalTimeMiddleware)
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+    return TestClient(app)
+
+
+@pytest.mark.parametrize("disagg_request_ids", [[17], [16, 17]], ids=["once", "ctx_retried"])
+@pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
+def test_disagg_message_is_named_after_the_disagg_request(stream, disagg_request_ids):
+    """Not after the generation worker's engine request: each worker numbers its own.
+
+    The worker names its chat stream ``chatcmpl-<its engine request id>``, and a
+    non-streamed chat completion has a random id. A retried context request gets
+    a new disaggregated request id; the reply takes the one the perf metrics record.
+    """
+
+    async def answer(chat_request, hooks):
+        hooks.on_req_begin(chat_request)
+        for disagg_request_id in disagg_request_ids:
+            hooks.on_disagg_request_id(disagg_request_id)
+        if stream:
+            return _streaming_chat_response(chat_id="chatcmpl-5").body_iterator
+        return _chat_response()
+
+    response = _disagg_route_client(answer).post("/v1/messages", json=_request(stream=stream))
+
+    assert response.status_code == 200, response.text
+    if stream:
+        start = response.text.split("\n\n")[0]
+        assert start.startswith("event: message_start\n")
+        message_id = json.loads(start.split("data: ", 1)[1])["message"]["id"]
+    else:
+        message_id = response.json()["id"]
+    assert re.fullmatch(r"msg_17_[0-9a-f]{16}", message_id)
 
 
 class _StreamedGeneration:
