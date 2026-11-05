@@ -31,7 +31,8 @@ Probe on both sides of each such size, up to the served max_seq_len.
   model that always thinks, ask for its lowest effort and raise ``--max-tokens``.
 - One line per probe; the model's answer is never printed, only its length.
 - Exit 0 when every probe recalled its passphrase, 1 otherwise. A refused request (e.g. a size
-  past ``max_seq_len``) is a probe that did not recall.
+  past ``max_seq_len``) is a probe that did not recall. Exit 2 when ``--sizes`` names no positive
+  size: a probe that sent nothing recalled nothing.
 """
 
 import argparse
@@ -116,7 +117,12 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=900.0, help="seconds per request")
     ap.add_argument("--seed", type=int, default=11)
     args = ap.parse_args(argv)
-    sizes = [int(s) for s in args.sizes.split(",") if s.strip()]
+    try:
+        sizes = [int(s) for s in args.sizes.split(",") if s.strip()]
+    except ValueError:
+        sizes = []
+    if not sizes or min(sizes) <= 0:
+        ap.error(f"--sizes {args.sizes!r}: give one or more positive token counts, e.g. 1500,3000")
     rng = random.Random(args.seed)
     failed = 0
     for size in sizes:

@@ -700,3 +700,11 @@ def test_a_recall_probe_reports_each_probe_and_never_the_answer(capsys):
               for path, version, body in _Model.seen]  # fmt: skip
     assert routes == [("/v1/chat/completions", None, {"enable_thinking": False}, 0)] * 6 + [
         ("/v1/messages", "2023-06-01", None, 0)] * 2  # fmt: skip
+
+
+@pytest.mark.parametrize("sizes", ["", ",", " , ", "0", "-5,100", "abc"])
+def test_a_recall_probe_without_a_size_is_refused(sizes):
+    """A probe that would send nothing, or a size of no tokens, is a usage error and not a pass."""
+    with pytest.raises(SystemExit) as stop:
+        probe_recall.main(["--base-url", "http://127.0.0.1:9", "--model", "m", "--sizes", sizes])
+    assert stop.value.code == 2
