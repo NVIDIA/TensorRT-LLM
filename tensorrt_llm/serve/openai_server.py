@@ -96,6 +96,7 @@ from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
+                                               LAUNCHER_RECOVERY_HEADER,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
                                                MultiFrontendServing,
@@ -1738,6 +1739,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # ensures we only send SIGINT once — repeated health probes
             # won't stack signals during an in-progress teardown.
             executor = getattr(self.generator, '_executor', None)
+            headers = {}
             if executor is not None and getattr(executor, '_fatal_error',
                                                 None) is not None:
                 if not getattr(executor, 'doing_shutdown', True):
@@ -1746,8 +1748,19 @@ class OpenAIServer(_VideoRoutesMixin):
                         f"server shutdown: {executor._fatal_error}")
                     _record_generator_termination(self.generator)
                     signal.raise_signal(signal.SIGINT)
+            elif (executor is not None
+                  and not getattr(executor, '_engine_dead', False)
+                  and not getattr(executor, 'doing_shutdown', True)):
+                sender = getattr(executor, '_request_sender', None)
+                batcher = self.embedding_batcher
+                if (sender is not None and sender.recovering
+                        and (batcher is None or batcher.is_alive())):
+                    # Readiness stays unavailable, but attached frontends must
+                    # survive until the sender's recovery deadline expires.
+                    headers[LAUNCHER_RECOVERY_HEADER] = "1"
             return Response(
                 status_code=503,
+                headers=headers,
                 content=
                 "LLM is unavailable. Please check the server logs for more details."
             )
