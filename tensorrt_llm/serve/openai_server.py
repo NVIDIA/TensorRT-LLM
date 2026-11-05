@@ -75,7 +75,7 @@ from tensorrt_llm.serve.perf_metrics import PerfMetricsJsonlWriter
 from tensorrt_llm.serve.postprocess_handlers import (
     PostprocStrategy, ResponsesAPIPostprocArgs, responses_api_post_processor,
     responses_api_streaming_post_processor, select_postproc_strategy)
-from tensorrt_llm.serve.render import RenderResources, mount_render_endpoints
+from tensorrt_llm.serve.render import RenderResources, render_endpoints_enabled
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
                                                 ResponsesStreamingProcessor)
@@ -245,19 +245,6 @@ class OpenAIServer:
         )
         BaseMediaIO.set_executor(self._media_load_executor)
         log_allowed_local_media_path()
-        # /metrics reads iteration stats with a blocking call that waits up to
-        # 2 s. A dedicated thread keeps those waits off the default executor,
-        # which request handling also uses; get_iteration_stats runs at most
-        # one read on it at a time.
-        self._metrics_stats_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="trtllm_metrics_stats",
-        )
-        self._metrics_stats_read: Optional[asyncio.Future] = None
-        # Whether a scrape is awaiting the last read, and whether a scrape has
-        # returned its stats.
-        self._metrics_stats_read_waiting = False
-        self._metrics_stats_read_consumed = True
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -307,13 +294,6 @@ class OpenAIServer:
             and multi_frontend_serving.is_launcher else None)
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
-        # Bounded snapshot of iteration stats for the GET /metrics handler.
-        # When the background Prometheus collector loop is active, it is the
-        # sole consumer of the engine's stats queue and appends each drained
-        # stat here; /metrics then serves from this buffer instead of racing
-        # the loop for the queue. Created lazily when the loop starts.
-        # See nvbug 6102381.
-        self._iteration_stats_buffer: Optional[deque] = None
         # Rank-adjusted clock mapped to the disaggregated server's clock domain.
         self._adjusted_steady_clock = AdjustedSteadyClock()
 
@@ -351,6 +331,8 @@ class OpenAIServer:
                         logger.warning(
                             f"Failed to initialize GPU energy monitoring: {e}")
                         self.energy_monitor = None
+                if self._worker_serving is not None:
+                    self._worker_serving.energy_monitor = self.energy_monitor
 
                 # Start background iteration stats collector if metrics are enabled
                 # The PyTorch backend args include `enable_iter_perf_stats`.
@@ -378,12 +360,13 @@ class OpenAIServer:
                     # Other consumers can read it through get_iteration_stats(),
                     # which clears the buffer. Adding another queue consumer
                     # requires revisiting the buffering and clearing ownership.
-                    max_buf = self._iteration_stats_buffer_maxlen(
+                    max_buf = self._metrics_serving._iteration_stats_buffer_maxlen(
                         getattr(self.generator.args,
                                 "iter_stats_max_iterations", 1000))
-                    self._iteration_stats_buffer = deque(maxlen=max_buf)
+                    self._metrics_serving._iteration_stats_buffer = deque(
+                        maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
-                        self._iteration_stats_collector_loop())
+                        self._metrics_serving._iteration_stats_collector_loop())
                     # Wake up the collector immediately so it processes the
                     # initial stats emitted by the executor at startup (e.g.
                     # cache_config_info).
@@ -428,8 +411,8 @@ class OpenAIServer:
             self.generator.shutdown()
             # A stats read still in flight fails fast now that the executor is
             # down; the /metrics handler already treats that as no stats.
-            self._metrics_stats_executor.shutdown(wait=False,
-                                                  cancel_futures=True)
+            self._metrics_serving._metrics_stats_executor.shutdown(
+                wait=False, cancel_futures=True)
 
         async def validation_exception_handler(request, exc):
             if request.url.path.startswith("/v1/messages"):
@@ -480,6 +463,23 @@ class OpenAIServer:
         # health API exists.
         app.state.ops_serving_system = SystemServing(
             model=self.model, health_probe=self._health_probe)
+        # /metrics and the iteration-stats collector for every role. The
+        # EMBEDDING role gets no /metrics route, but its collector still runs,
+        # so the lifespan finds the machinery on every server.
+        from tensorrt_llm.serve.api.ops.metrics import \
+            api_router as metrics_router
+        from tensorrt_llm.serve.api.ops.metrics.serving import MetricsServing
+        self._metrics_serving = MetricsServing(
+            model=self.model,
+            generator=self.generator,
+            is_visual_gen=self._is_visual_gen,
+            metrics_collector=self.metrics_collector,
+            iteration_stats_wakeup_event=self._iteration_stats_wakeup_event,
+            iteration_stats_poll_interval=self._iteration_stats_poll_interval)
+        setattr(app.state, metrics_router.APP_STATE_KEY, self._metrics_serving)
+        # Built in the LLM branch below; the lifespan hands it the energy
+        # monitor.
+        self._worker_serving = None
         if role_group_of(self.server_role) is RoleGroup.LLM:
             # An attached frontend of a multi-frontend server forwards the
             # launcher-owned routes, the Message Batches routes among them.
@@ -528,7 +528,6 @@ class OpenAIServer:
                     allow_request_chat_template=self.
                     allow_request_chat_template,
                     **self._generate_serving_kwargs()))
-            self.register_mm_encoder_routes()
         elif self.server_role is ServerRole.EMBEDDING:
             assert getattr(self.generator.args, "encode_only", False), (
                 "generator must be an encode_only=True LLM for the embedding "
@@ -560,15 +559,103 @@ class OpenAIServer:
                 CompletionServing
             setattr(app.state, completions_router.APP_STATE_KEY,
                     CompletionServing(**self._generate_serving_kwargs()))
+            from tensorrt_llm.serve.api.ops.worker import \
+                api_router as worker_router
+            from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
+            self._worker_serving = WorkerServing(
+                model=self.model,
+                generator=self.generator,
+                adjusted_steady_clock=self._adjusted_steady_clock,
+                shared_clock_offset=self._shared_clock_offset,
+                chat_serving=self._chat_serving,
+                render_resources=self._render_resources)
+            setattr(app.state, worker_router.APP_STATE_KEY,
+                    self._worker_serving)
+            from tensorrt_llm.serve.api.ops.profile import \
+                api_router as profile_router
+            from tensorrt_llm.serve.api.ops.profile.serving import \
+                ProfileServing
+            setattr(app.state, profile_router.APP_STATE_KEY,
+                    ProfileServing(model=self.model, generator=self.generator))
+            resource_governor_queue = self.generator.resource_governor_queue
+            if resource_governor_queue is not None:
+                from .resource_governor import ResourceGovernor
+                self.resource_governor = ResourceGovernor(
+                    resource_governor_queue=resource_governor_queue,
+                    tokenizer=self.tokenizer,
+                    model_config=self.model_config,
+                    processor=self.processor,
+                    allow_request_chat_template=self.
+                    allow_request_chat_template,
+                    harmony_adapter_factory=get_harmony_adapter
+                    if self.use_harmony else None,
+                    chat_template=self.chat_template,
+                )
+                # The governor registers its own routes when its router attaches.
+                from tensorrt_llm.serve.api.ops.control import \
+                    api_router as control_router
+                setattr(app.state, control_router.APP_STATE_KEY,
+                        self.resource_governor)
+            else:
+                # Resource governor is unavailable because the executor does not
+                # expose a resource_governor_queue. This is expected in RPC
+                # orchestrator mode (GenerationExecutorRpcProxy), non-PyExecutor
+                # backends, or when enable_resource_governor is false. The
+                # /_resource_governor/* endpoints will not be registered; clients
+                # that attempt to call them will receive 404.
+                logger.warning(
+                    "Resource governor is disabled: the executor backend does "
+                    "not provide a resource_governor_queue (e.g. RPC "
+                    "orchestrator mode or explicit opt-out). Endpoints under "
+                    "/_resource_governor/ will not be available.")
+                self.resource_governor = None
+            if self._enable_runtime_control_endpoints:
+                from tensorrt_llm.serve.api.ops.runtime_control import \
+                    api_router as runtime_control_router
+                from tensorrt_llm.serve.api.ops.runtime_control.serving import \
+                    RuntimeControlServing
+                setattr(
+                    app.state, runtime_control_router.APP_STATE_KEY,
+                    RuntimeControlServing(
+                        model=self.model,
+                        generator=self.generator,
+                        runtime_control_api_key=self._runtime_control_api_key,
+                        runtime_control_replay_cache=self.
+                        _runtime_control_replay_cache))
+            if self._enable_rl_control_endpoints:
+                from tensorrt_llm.serve.api.ops.rl import \
+                    api_router as rl_router
+                from tensorrt_llm.serve.api.ops.rl.serving import RLServing
+                setattr(
+                    app.state, rl_router.APP_STATE_KEY,
+                    RLServing(model=self.model,
+                              generator=self.generator,
+                              rl_control_api_key=self._rl_control_api_key))
+            # The render routes read the resources the composition root built
+            # once.
+            app.state.render_resources = self._render_resources
             self.register_routes()
 
         # Attach routers after the role switch: every attach_router checks
         # that its serving objects are on app.state.
-        attach_routers(
-            app,
-            dataclasses.replace(ServerCapabilities.for_role(self.server_role),
-                                harmony_model=(not self._is_visual_gen)
-                                and self.use_harmony))
+        attach_routers(app, self._server_capabilities())
+
+    def _server_capabilities(self) -> ServerCapabilities:
+        """Which routers attach: computed once, after the serving objects exist."""
+        # harmony_model: the Anthropic routes stay off for harmony models.
+        caps = dataclasses.replace(
+            ServerCapabilities.for_role(self.server_role),
+            harmony_model=(not self._is_visual_gen) and self.use_harmony)
+        if caps.role_group is not RoleGroup.LLM:
+            return caps
+        return dataclasses.replace(
+            caps,
+            governor_queue=self.resource_governor is not None,
+            rl_control=self._enable_rl_control_endpoints,
+            runtime_control=self._enable_runtime_control_endpoints,
+            perf_metrics=bool(self.generator.args.return_perf_metrics),
+            render_endpoints=render_endpoints_enabled(),
+        )
 
     def _init_visual_gen(self):
         self.processor = None
@@ -741,58 +828,6 @@ class OpenAIServer:
         return self.generator.check_health()
 
     def register_routes(self):
-        self.app.add_api_route("/health_generate",
-                               self.health_generate,
-                               methods=["GET"])
-        self.app.add_api_route("/v1/data_transceiver_state",
-                               self.data_transceiver_state,
-                               methods=["GET"])
-        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
-        self.app.add_api_route("/metrics",
-                               self.get_iteration_stats,
-                               methods=["GET"])
-        self.app.add_api_route("/energy_metrics",
-                               self.get_energy_metrics,
-                               methods=["GET"])
-        self.app.add_api_route("/steady_clock_offset",
-                               self.get_steady_clock_offset,
-                               methods=["GET"])
-        # Called by the disagg server to update the worker reference clock.
-        self.app.add_api_route("/steady_clock_offset",
-                               self.set_steady_clock_offset,
-                               methods=["POST"])
-        # TODO: workaround before ETCD support
-        self.app.add_api_route("/kv_cache_events",
-                               self.get_kv_cache_events,
-                               methods=["POST"])
-        resource_governor_queue = self.generator.resource_governor_queue
-        if resource_governor_queue is not None:
-            from .resource_governor import ResourceGovernor
-            self.resource_governor = ResourceGovernor(
-                resource_governor_queue=resource_governor_queue,
-                tokenizer=self.tokenizer,
-                model_config=self.model_config,
-                processor=self.processor,
-                allow_request_chat_template=self.allow_request_chat_template,
-                harmony_adapter_factory=get_harmony_adapter
-                if self.use_harmony else None,
-                chat_template=self.chat_template,
-            )
-            self.resource_governor.register_routes(self.app)
-        else:
-            # Resource governor is unavailable because the executor does not
-            # expose a resource_governor_queue. This is expected in RPC
-            # orchestrator mode (GenerationExecutorRpcProxy), non-PyExecutor
-            # backends, or when enable_resource_governor is false. The
-            # /_resource_governor/* endpoints will not be registered; clients
-            # that attempt to call them will receive 404.
-            logger.warning(
-                "Resource governor is disabled: the executor backend does "
-                "not provide a resource_governor_queue (e.g. RPC "
-                "orchestrator mode or explicit opt-out). Endpoints under "
-                "/_resource_governor/ will not be available.")
-            self.resource_governor = None
-
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
@@ -803,31 +838,10 @@ class OpenAIServer:
                                self.openai_responses_delete_response,
                                methods=["DELETE"])
 
-        # Profiling endpoints (PyTorch backend only)
-        self.app.add_api_route("/start_profile",
-                               self.start_profile,
-                               methods=["POST"])
-        self.app.add_api_route("/stop_profile",
-                               self.stop_profile,
-                               methods=["POST"])
-
-        self._register_runtime_control_routes()
-        self._register_rl_control_routes()
-        self.app.add_api_route("/server_info",
-                               self.get_server_info,
-                               methods=["GET"])
-        # The render and generate routes are a separate exposed surface: off
-        # unless TRTLLM_ENABLE_RENDER_ENDPOINTS=1.
-        mount_render_endpoints(self.app, self)
-        if self.generator.args.return_perf_metrics:
-            # register /prometheus/metrics
-            self.mount_metrics()
-
     def register_visual_gen_routes(self):
         """Wire VisualGen serving for the VISUAL_GEN role.
 
-        The VisualGen routes come from their RouterSpec; /metrics is
-        registered here, not by a router.
+        The VisualGen routes come from their RouterSpec.
         """
         # The only place outside serve/api/visual_gen/ that loads it, besides
         # attach_routers through the VisualGen RouterSpec.
@@ -839,9 +853,6 @@ class OpenAIServer:
             model=self.model,
             adjusted_clock=self._adjusted_steady_clock)
         logger.info(f"VisualGen media storage path: {self.media_storage_path}")
-        self.app.add_api_route("/metrics",
-                               self.get_iteration_stats,
-                               methods=["GET"])
 
     def _register_launcher_forwarding_routes(self) -> None:
         """Attached frontends: forward launcher-owned routes (before register_routes())."""

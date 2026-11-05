@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -93,7 +93,9 @@ def attach_render_routes(app: FastAPI, serving: ServingRender) -> None:
     )
 
 
-def mount_render_endpoints(app: FastAPI, server: Any, *, enabled: Optional[bool] = None) -> bool:
+def mount_render_endpoints(
+    app: FastAPI, resources: RenderResources, *, enabled: Optional[bool] = None
+) -> bool:
     """Mount the render routes on a serving worker's app.
 
     They are a separate exposed surface, so a worker mounts them only when
@@ -104,5 +106,20 @@ def mount_render_endpoints(app: FastAPI, server: Any, *, enabled: Optional[bool]
     """
     if not (render_endpoints_enabled() if enabled is None else enabled):
         return False
-    attach_render_routes(app, ServingRender(lambda: RenderResources.from_server(server)))
+    attach_render_routes(app, ServingRender(lambda: resources))
     return True
+
+
+def attach_router(app: FastAPI) -> None:
+    """Mount the render routes from the router table, with the resources the root built once.
+
+    The router table already checked ``TRTLLM_ENABLE_RENDER_ENDPOINTS``, so the
+    decision is forced here. The routes are registered on the app (not through
+    an included router), so the app's own route class applies to them.
+    """
+    if not hasattr(app.state, "render_resources"):
+        raise RuntimeError(
+            "app.state.render_resources (the RenderResources) must be set before attaching "
+            "tensorrt_llm.serve.render.api_router; the composition root sets it in the LLM branch."
+        )
+    mount_render_endpoints(app, app.state.render_resources, enabled=True)

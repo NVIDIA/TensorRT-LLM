@@ -57,6 +57,19 @@ class ServerCapabilities:
     # A harmony (gpt-oss) model serves chat through the harmony path, which
     # the Anthropic Messages routes do not support; LLM role only.
     harmony_model: bool = False
+    # The LLM role group only; the composition root computes each one where
+    # the server decided the same registration before the routers existed.
+    # The executor exposes a resource-governor queue, so the governor exists.
+    governor_queue: bool = False
+    # enable_rl_control_endpoints (deprecated; exclusive with runtime_control).
+    rl_control: bool = False
+    # enable_runtime_control_endpoints.
+    runtime_control: bool = False
+    # return_perf_metrics, after the normalization for perf_metrics_output_dir:
+    # the Prometheus mount.
+    perf_metrics: bool = False
+    # TRTLLM_ENABLE_RENDER_ENDPOINTS=1, read once at startup.
+    render_endpoints: bool = False
 
     @classmethod
     def for_role(cls, role: Optional[ServerRole]) -> ServerCapabilities:
@@ -71,6 +84,26 @@ def _anthropic_routes_enabled(caps: ServerCapabilities) -> bool:
     return not caps.harmony_model
 
 
+def _when_governor_queue(caps: ServerCapabilities) -> bool:
+    return caps.governor_queue
+
+
+def _when_rl_control(caps: ServerCapabilities) -> bool:
+    return caps.rl_control
+
+
+def _when_runtime_control(caps: ServerCapabilities) -> bool:
+    return caps.runtime_control
+
+
+def _when_render_endpoints(caps: ServerCapabilities) -> bool:
+    return caps.render_endpoints
+
+
+def _when_perf_metrics(caps: ServerCapabilities) -> bool:
+    return caps.perf_metrics
+
+
 @dataclass(frozen=True)
 class RouterSpec:
     """One router module and the roles and capabilities that mount it."""
@@ -81,9 +114,20 @@ class RouterSpec:
 
 
 # Attach order is registration order. Keep the route snapshot's conflict-relevant
-# order: a router that registers GET /metrics must come before the Prometheus mount.
+# order: the metrics router (the JSON GET /metrics) must come before the Prometheus
+# mount, which stays last.
 ROUTERS: tuple[RouterSpec, ...] = (
     RouterSpec("tensorrt_llm.serve.api.ops.system.api_router", roles=ALL_ROLE_GROUPS),
+    RouterSpec("tensorrt_llm.serve.api.ops.worker.api_router", roles=frozenset({RoleGroup.LLM})),
+    RouterSpec(
+        "tensorrt_llm.serve.api.ops.metrics.api_router",
+        roles=ALL_ROLE_GROUPS - {RoleGroup.EMBEDDING},
+    ),
+    RouterSpec(
+        "tensorrt_llm.serve.api.ops.control.api_router",
+        roles=frozenset({RoleGroup.LLM}),
+        when=_when_governor_queue,
+    ),
     RouterSpec(
         "tensorrt_llm.serve.api.openai.embeddings.api_router",
         roles=frozenset({RoleGroup.EMBEDDING}),
@@ -104,8 +148,31 @@ ROUTERS: tuple[RouterSpec, ...] = (
         roles=frozenset({RoleGroup.LLM}),
         when=_anthropic_routes_enabled,
     ),
+    RouterSpec("tensorrt_llm.serve.api.ops.profile.api_router", roles=frozenset({RoleGroup.LLM})),
+    RouterSpec(
+        "tensorrt_llm.serve.api.ops.runtime_control.api_router",
+        roles=frozenset({RoleGroup.LLM}),
+        when=_when_runtime_control,
+    ),
+    RouterSpec(
+        "tensorrt_llm.serve.api.ops.rl.api_router",
+        roles=frozenset({RoleGroup.LLM}),
+        when=_when_rl_control,
+    ),
     RouterSpec(
         "tensorrt_llm.serve.api.visual_gen.api_router", roles=frozenset({RoleGroup.VISUAL_GEN})
+    ),
+    RouterSpec(
+        "tensorrt_llm.serve.render.api_router",
+        roles=frozenset({RoleGroup.LLM}),
+        when=_when_render_endpoints,
+    ),
+    # Last: the Prometheus GET /metrics must register after the JSON one, and the
+    # instrumentator's middleware must be added before the composition root's.
+    RouterSpec(
+        "tensorrt_llm.serve.api.ops.metrics.prometheus",
+        roles=frozenset({RoleGroup.LLM}),
+        when=_when_perf_metrics,
     ),
 )
 
