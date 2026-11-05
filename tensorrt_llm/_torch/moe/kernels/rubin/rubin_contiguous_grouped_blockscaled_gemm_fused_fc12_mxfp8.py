@@ -3117,6 +3117,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     while ready != fc1_ready_expected:
                         nanosleep(cutlass.Int32(32))
                         ready = ld_acquire_gpu(fc1_ready, fc2_m_tile)
+                    # The acquire is a generic-proxy load, while the FC2 A/SFA
+                    # loads below are TMA (async proxy) reads of fc1_c and of
+                    # fc1_sfc, which the epilogue writes with generic stores.
+                    # Order the acquire before those async-proxy reads.
+                    cute.arch.fence_proxy("async.global")
 
                     fc2_a_gmem = tFC2AgA[(None, fc2_m_tile, None, 0)]
                     fc2_sfa_gmem = tFC2AgSFA[(None, fc2_m_tile, None, 0)]
