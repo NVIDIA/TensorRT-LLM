@@ -270,10 +270,12 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
     assert request.py_result._context_logits._storage is None
 
 
+@pytest.mark.parametrize("promoted_final_context", [False, True])
 @pytest.mark.parametrize("eligible", [False, True])
 def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
-    monkeypatch, eligible: bool
+    monkeypatch, eligible: bool, promoted_final_context: bool
 ) -> None:
+    """Bounded projection runs eagerly, except for promoted one-row final contexts."""
     from contextlib import nullcontext
     from unittest.mock import Mock
 
@@ -317,8 +319,11 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
     batch = SimpleNamespace(
         context_requests=[request], num_context_requests=1, all_requests=lambda: [request]
     )
-    promoted = SimpleNamespace(context_requests=[], generation_requests=[request])
-    promoted_ids = frozenset({17})
+    if promoted_final_context:
+        graph_batch = SimpleNamespace(context_requests=[], generation_requests=[request])
+        promoted_ids = frozenset({17})
+    else:
+        graph_batch, promoted_ids = batch, frozenset()
     key = object()
     metadata = SimpleNamespace()
     outputs = {"logits": object()}
@@ -330,8 +335,8 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
 
     graphs = SimpleNamespace(
         attention_dp_execution_batch=lambda value: value,
-        promote_final_contexts=lambda *args, **kwargs: (promoted, promoted_ids),
-        pad_batch=lambda *args: nullcontext(promoted),
+        promote_final_contexts=lambda *args, **kwargs: (graph_batch, promoted_ids),
+        pad_batch=lambda *args: nullcontext(graph_batch),
         select=Mock(
             return_value=SimpleNamespace(
                 key=key, use_lora_graph=False, attn_metadata=metadata, spec_metadata=None
@@ -379,20 +384,24 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
     )
     manager = SimpleNamespace(get_resource_manager=lambda kind: object())
     result = DecoderRunner._forward_decoder(runner, forward_inputs, manager, is_dummy=False)
-    bounded = eligible
+    # A promoted final context yields one decode-sized row per request, so the
+    # graph replays even when the head could project context logits eagerly.
+    bounded = eligible and not promoted_final_context
     assert graphs.run.call_args.args[0] is (None if bounded else key)
-    assert inputs.prepare_inputs.call_args.args[0] is (batch if bounded else promoted)
+    assert inputs.prepare_inputs.call_args.args[0] is (batch if bounded else graph_batch)
     assert inputs.prepare_inputs.call_args.args[7] is not bounded
     assert result["logits"] is outputs["logits"]
     bypass.assert_called_once_with(bypass=bounded)
     if bounded:
         forward.assert_called_once()
         replay.assert_not_called()
-        inputs.record_promoted_iter_states.assert_not_called()
     else:
         replay.assert_called_once()
         forward.assert_not_called()
+    if promoted_final_context and not bounded:
         inputs.record_promoted_iter_states.assert_called_once_with(batch)
+    else:
+        inputs.record_promoted_iter_states.assert_not_called()
 
 
 @pytest.mark.cpu_only

@@ -713,6 +713,10 @@ class DecoderRunner(ScheduledModelRunner):
             key = selection.key
             use_lora_graph = selection.use_lora_graph
 
+            if context_plan is not None and key is not None and promoted_context_request_ids:
+                # Every context is a promoted one-row final chunk, so its logits
+                # are decode-sized and need no bounded projection; replay the graph.
+                context_plan = None
             can_run_graph = (
                 key is not None
                 and context_plan is None
