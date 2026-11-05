@@ -569,8 +569,7 @@ def _store_mixed_precision_low_rows_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """Per (request, BLOCK_T new tokens, K or V): copy a held block's rows from the high layer's
-    block (`src`, the redirected block offsets) to the layer's own block (`dst`)."""
+    """Per (request, BLOCK_T new tokens, K or V): copy a held block's rows from `src` to `dst`."""
     request = tl.program_id(0).to(tl.int64)
     kv = tl.program_id(2)
     j = tl.program_id(1) * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -598,15 +597,8 @@ def _store_mixed_precision_low_rows_kernel(
 
 
 def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> None:
-    """Copy this step's rows of the held blocks from the mixed-precision high layer to the layer.
-
-    Dense attention wrote them into the high layer's blocks, where the redirected block offsets
-    point; the layer's own blocks keep the history complete for the blocks the window releases.
-
-    Args:
-        metadata: Attention metadata of the batch, after the attention op of ``layer_idx``.
-        layer_idx: Model layer whose rows the attention op wrote.
-    """
+    """Copy this step's rows of the held blocks from the mixed-precision high layer's blocks, where
+    dense attention wrote them through the redirected block offsets, to the layer's own blocks."""
     manager = metadata.kv_cache_manager
     local = manager.layer_offsets[layer_idx]
     num_seqs = metadata.num_seqs
