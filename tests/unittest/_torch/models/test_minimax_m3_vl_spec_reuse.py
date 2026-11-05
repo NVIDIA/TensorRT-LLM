@@ -45,7 +45,12 @@ from torch import nn
 
 from tensorrt_llm._torch.models import modeling_speculative
 from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -102,7 +107,13 @@ def _params(
     pv = torch.cat([_pixel_values(tags) for tags in image_tags], dim=0)
     grid = torch.cat([_grid(len(tags)) for tags in image_tags], dim=0)
     return MultimodalParams(
-        multimodal_data={"image": {"pixel_values": pv, "image_grid_thw": grid}},
+        multimodal_data={
+            "image": {"pixel_values": pv, "image_grid_thw": grid},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", index) for index in range(len(image_tags))],
+                output_embedding_lengths=[len(tags) for tags in image_tags],
+            ),
+        },
         multimodal_runtime=runtime,
     )
 

@@ -23,6 +23,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, get_multimodal_item_metadata
+
 # ---------------------------------------------------------------------------
 # MiniMax-M3 VL special tokens.
 #
@@ -809,112 +811,6 @@ def prepare_multimodal_inputs_embeds(
     _splice(image_feats, image_runs)
     _splice(video_feats, video_runs)
     return out
-
-
-def extract_multimodal_data_from_params(
-    multimodal_params: Sequence[Any],
-) -> Dict[str, Optional[torch.Tensor]]:
-    """Flatten ``MultimodalParams`` list to a single batched dict for forward.
-
-    Accepts the ``multimodal_params`` list TensorRT-LLM passes to the
-    model forward as ``kwargs["multimodal_params"]`` (each element has a
-    ``multimodal_data`` dict with ``image`` / ``video`` entries). Returns
-    a dict with keys ``image_pixel_values``, ``image_grid_thws``,
-    ``video_pixel_values``, ``video_grid_thws`` suitable to pass into
-    :func:`prepare_multimodal_inputs_embeds`. Per-request batches are
-    concatenated; ``None`` is returned for missing modalities.
-
-    Note: this function buckets all images first then all videos, which
-    only matches left-to-right ``mm_token_indices`` for single-modality
-    requests. For mixed image+video ordering across requests within a
-    batch, use :func:`extract_multimodal_items_in_request_order` to
-    preserve per-request, per-modality order.
-    """
-    image_pixel_list: List[torch.Tensor] = []
-    image_grid_list: List[torch.Tensor] = []
-    video_pixel_list: List[torch.Tensor] = []
-    video_grid_list: List[torch.Tensor] = []
-    for params in multimodal_params:
-        if params is None:
-            continue
-        data = getattr(params, "multimodal_data", None)
-        if not data:
-            continue
-        img = data.get("image") if isinstance(data, Mapping) else None
-        if isinstance(img, Mapping):
-            pv = img.get("pixel_values")
-            gthw = img.get("image_grid_thw")
-            if pv is not None and gthw is not None:
-                image_pixel_list.append(pv)
-                image_grid_list.append(gthw)
-        vid = data.get("video") if isinstance(data, Mapping) else None
-        if isinstance(vid, Mapping):
-            pv = vid.get("pixel_values_videos")
-            if pv is None:
-                pv = vid.get("pixel_values")
-            gthw = vid.get("video_grid_thw")
-            if pv is not None and gthw is not None:
-                video_pixel_list.append(pv)
-                video_grid_list.append(gthw)
-
-    def _cat(items: List[torch.Tensor]) -> Optional[torch.Tensor]:
-        if not items:
-            return None
-        if len(items) == 1:
-            return items[0]
-        return torch.cat(items, dim=0)
-
-    return {
-        "image_pixel_values": _cat(image_pixel_list),
-        "image_grid_thws": _cat(image_grid_list),
-        "video_pixel_values": _cat(video_pixel_list),
-        "video_grid_thws": _cat(video_grid_list),
-    }
-
-
-def extract_multimodal_items_in_request_order(
-    multimodal_params: Sequence[Any],
-) -> List[Dict[str, Any]]:
-    """Walk ``multimodal_params`` and return per-item entries in request order.
-
-    Where :func:`extract_multimodal_data_from_params` concatenates all
-    image rows together and all video rows together (image-first
-    bucketing), this helper keeps the natural left-to-right request
-    order. Each MultimodalParams contributes at most one image item and
-    at most one video item — within a single request the M3 processor
-    expands all image placeholders first, then all video placeholders,
-    so a request that carries both modalities still emits image then
-    video in left-to-right order.
-
-    Returned list element schema:
-        {
-            "modality":     "image" | "video",
-            "pixel_values": Tensor [N_rows, C*T*P*P],
-            "grid_thw":     Tensor [n_grids, 3],
-        }
-    """
-    items: List[Dict[str, Any]] = []
-    for params in multimodal_params:
-        if params is None:
-            continue
-        data = getattr(params, "multimodal_data", None)
-        if not data:
-            continue
-        img = data.get("image") if isinstance(data, Mapping) else None
-        if isinstance(img, Mapping):
-            pv = img.get("pixel_values")
-            gthw = img.get("image_grid_thw")
-            if pv is not None and gthw is not None:
-                items.append({"modality": "image", "pixel_values": pv, "grid_thw": gthw})
-        vid = data.get("video") if isinstance(data, Mapping) else None
-        if isinstance(vid, Mapping):
-            pv = vid.get("pixel_values_videos")
-            if pv is None:
-                pv = vid.get("pixel_values")
-            gthw = vid.get("video_grid_thw")
-            if pv is not None and gthw is not None:
-                items.append({"modality": "video", "pixel_values": pv, "grid_thw": gthw})
-    return items
 
 
 @dataclass
@@ -2035,6 +1931,63 @@ class MiniMaxM3VLInputProcessor:
         merge = int(self.processor.video_processor.merge_size)
         per_patch = (grid[:, 1] * grid[:, 2]) // (merge * merge) + 2
         return int((grid[:, 0] * per_patch).sum().item())
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        video = multimodal_data.get("video")
+        if isinstance(video, dict) and "pixel_values_videos" not in video:
+            video["pixel_values_videos"] = video.get("pixel_values")
+        metadata = get_multimodal_item_metadata(multimodal_data)
+        if metadata is not None and metadata.output_embedding_lengths is not None:
+            return metadata
+        vision_config = CLIPVisionConfig.from_dict_or_obj(
+            getattr(self.config, "vision_config", None)
+        )
+        merge = vision_config.img_token_compression_config.get("spatial_merge_size", 2)
+        rows = {
+            modality: compute_visual_token_counts(data[grid_key].tolist(), merge)
+            for modality, grid_key in (("image", "image_grid_thw"), ("video", "video_grid_thw"))
+            if isinstance((data := multimodal_data.get(modality)), dict)
+        }
+        if not rows:
+            return metadata
+        if metadata is not None:
+            item_refs = metadata.item_refs
+        elif mm_item_order:
+            item_refs = [(item["modality"], item["index"]) for item in mm_item_order]
+        elif len(rows) == 1:
+            item_refs = [
+                (modality, index)
+                for modality, lengths in rows.items()
+                for index in range(len(lengths))
+            ]
+        else:
+            item_refs = []
+            indices = {modality: 0 for modality in rows}
+            remaining = dict.fromkeys(rows, 0)
+            token_modalities = {self._image_token_id: "image", self._video_token_id: "video"}
+            for token_id in prompt_token_ids:
+                modality = token_modalities.get(token_id)
+                if modality not in rows:
+                    continue
+                if remaining[modality] == 0:
+                    index = indices[modality]
+                    if index >= len(rows[modality]):
+                        raise ValueError("MiniMax-M3 prompt has more visual items than its grids")
+                    item_refs.append((modality, index))
+                    remaining[modality] = rows[modality][index]
+                    indices[modality] += 1
+                remaining[modality] -= 1
+            if any(indices[m] != len(rows[m]) or remaining[m] for m in rows):
+                raise ValueError("MiniMax-M3 prompt visual tokens do not match its grids")
+        return MultimodalItemMetadata(
+            item_refs,
+            output_embedding_lengths=[rows[modality][index] for modality, index in item_refs],
+        )
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         # uint8 HWC arrays for both modalities: the form the checkpoint's
