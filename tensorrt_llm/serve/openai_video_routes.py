@@ -30,7 +30,11 @@ from pydantic import ValidationError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
-from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
+from tensorrt_llm.serve.api.visual_gen.protocol import (
+    VideoGenerationRequest,
+    VideoJob,
+    VideoJobList,
+)
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings,
     build_visual_gen_timing_headers,

@@ -27,9 +27,11 @@ Name files and symbols here, never line numbers.
 - Model-specific behavior: a hook on `ServingExtension` (`serve/serving_extensions.py`,
   `serve/extensions/`). Do not branch on a model name in a handler.
 - Prompt rendering: `serve/render/` only. Handlers do not call `apply_chat_template`.
-- Request and response models: a new field needs a row in
+- Request and response models: `serve/openai_protocol/<api>.py`. Import the submodule, not the
+  package; the package's name table is frozen. A new field needs a row in
   `tests/unittest/api_stability/references/trtllm_serve_api.yaml`.
-  Check: `tests/unittest/api_stability/test_serve_api.py`.
+  Check: `tests/unittest/api_stability/test_serve_api.py` and
+  `tests/unittest/serve/openai_protocol/test_openai_protocol_facade.py`.
 - Routes: every server configuration's routes (path, method, route class, and the order of
   routes that can match the same request) are pinned in
   `tests/unittest/api_stability/references/trtllm_serve_routes.yaml`. A route change

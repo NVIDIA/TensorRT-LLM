@@ -205,6 +205,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_wan_timestep_routing.py
   - unittest/_torch/weight_sharing
   - unittest/api_stability
+  - unittest/api_stability/visual_gen/test_visual_gen_serve_api.py
   - unittest/bindings
   - unittest/disaggregated
   - unittest/docs/test_llmapi_reference_docs.py
