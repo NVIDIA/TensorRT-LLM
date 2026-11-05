@@ -1126,7 +1126,7 @@ def test_cold_page_window_redirects_dense_block_offsets():
             request_ids=[0],
             prompt_lens=[cached],
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
-            kv_layout="NHD",
+            kv_layout="HND",
             mapping=mapping,
             runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
         )
@@ -1147,26 +1147,29 @@ def test_cold_page_window_redirects_dense_block_offsets():
                 (high[i] * 2 + delta if i in held else low[i] * 2) + kv * kv_offset
                 for i in range(blocks)
             ]
-        # The redirected offsets address the high layer's rows of those pages.
-        low_pool = manager.get_buffers(0, "NHD", mixed_precision_pool="low")
-        high_pool = manager.get_buffers(0, "NHD", mixed_precision_pool="high")
-        rows = low_pool.view(-1, low_pool.shape[3] * low_pool.shape[4])
+        # The redirected offsets address the high layer's blocks of those pages (HND: a block is
+        # heads x tokens rows of one head's bytes).
+        low_pool = manager.get_buffers(0, "HND", mixed_precision_pool="low")
+        high_pool = manager.get_buffers(0, "HND", mixed_precision_pool="high")
+        rows = low_pool.view(-1, low_pool.shape[4])
         for i in held:
             for kv in range(2):
-                assert rows[offsets[kv][i] * block].data_ptr() == high_pool[high[i], kv].data_ptr()
-        # Attention wrote this step's row (position 133: block 4, token 5) into the high layer;
-        # the copy back fills that row of the layer's block and nothing else.
+                assert (
+                    rows[offsets[kv][i] * 2 * block].data_ptr() == high_pool[high[i], kv].data_ptr()
+                )
+        # Attention wrote this step's token (position 133: block 4, token 5) into the high layer;
+        # the copy back fills that token of every head in the layer's block and nothing else.
         # Both views cover the shared pool, so only the layer's own pages take the sentinel.
         for page in low:
             low_pool[page].fill_(7)
         torch.manual_seed(0)
         written = torch.randn(2, 2, 64, device="cuda").to(torch.bfloat16)
-        high_pool[high[4], :, 5].copy_(written)
-        high_pool[high[4], :, 4].fill_(1.0)
+        high_pool[high[4], :, :, 5].copy_(written)
+        high_pool[high[4], :, :, 4].fill_(1.0)
         store_mixed_precision_low_rows(metadata, 0)
         torch.cuda.synchronize()
-        assert torch.equal(low_pool[low[4], :, 5].view(torch.bfloat16), written)
-        assert (low_pool[low[4], :, 4] == 7).all() and (low_pool[low[3]] == 7).all()
+        assert torch.equal(low_pool[low[4], :, :, 5].view(torch.bfloat16), written)
+        assert (low_pool[low[4], :, :, 4] == 7).all() and (low_pool[low[3]] == 7).all()
         assert (low_pool[low[0]] == 7).all()
     finally:
         manager.shutdown()

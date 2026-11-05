@@ -550,11 +550,15 @@ def _store_mixed_precision_low_rows_kernel(
     new_lens_ptr,
     tokens_per_block,
     max_blocks,
+    num_heads,
+    head_stride,
+    token_stride,
     ROW_WIDTH: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """Per (request, BLOCK_T new tokens, K or V): copy a held block's rows from `src` to `dst`."""
+    """Per (request, BLOCK_T new tokens, K or V): copy a held block's (head, token) rows from `src`
+    to `dst`; the strides are the pool layout's row strides inside a block."""
     request = tl.program_id(0).to(tl.int64)
     kv = tl.program_id(2)
     j = tl.program_id(1) * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -565,20 +569,23 @@ def _store_mixed_precision_low_rows_kernel(
     page = tl.load(high_table_ptr + request * high_table_stride + block, mask=valid, other=-1)
     valid = valid & (page >= 0)
     entry = request * offsets_request_stride + kv * offsets_kv_stride + block
-    src_block = tl.load(src_ptr + entry, mask=valid, other=0).to(tl.int64)
-    dst_block = tl.load(dst_ptr + entry, mask=valid, other=0).to(tl.int64)
-    token = position % tokens_per_block
-    _copy_rows(
-        rows_ptr,
-        src_block * tokens_per_block + token,
-        rows_ptr,
-        dst_block * tokens_per_block + token,
-        valid,
-        rows_ptr,
-        False,
-        ROW_WIDTH,
-        BLOCK_W,
-    )
+    rows_per_block = num_heads * tokens_per_block
+    src_row = tl.load(src_ptr + entry, mask=valid, other=0).to(tl.int64) * rows_per_block
+    dst_row = tl.load(dst_ptr + entry, mask=valid, other=0).to(tl.int64) * rows_per_block
+    token = (position % tokens_per_block) * token_stride
+    for head in range(num_heads):
+        offset = head * head_stride + token
+        _copy_rows(
+            rows_ptr,
+            src_row + offset,
+            rows_ptr,
+            dst_row + offset,
+            valid,
+            rows_ptr,
+            False,
+            ROW_WIDTH,
+            BLOCK_W,
+        )
 
 
 def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> None:
@@ -592,9 +599,14 @@ def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_id
     src = metadata.kv_cache_block_offsets[pool_id]
     dst = metadata.mixed_precision_low_block_offsets[pool_id]
     high_table = metadata.mixed_precision_high_block_table
-    # [pages, kv_factor, tokens, heads, bytes]: block offsets count K/V blocks from this base.
-    pool = manager._get_mixed_precision_buffers(local, "NHD", "low")
-    rows = pool.view(-1, pool.shape[3] * pool.shape[4])
+    # The pool in its own layout as rows of one head's bytes; block offsets count K/V blocks.
+    layout = metadata.kv_layout
+    pool = manager._get_mixed_precision_buffers(local, layout, "low")
+    heads, tokens = (
+        (pool.shape[2], pool.shape[3]) if layout == "HND" else (pool.shape[3], pool.shape[2])
+    )
+    head_stride, token_stride = (tokens, 1) if layout == "HND" else (1, heads)
+    rows = pool.view(-1, pool.shape[4])
     max_new = int(metadata.seq_lens_kv[:num_seqs].max())
     block_t = 16
     _store_mixed_precision_low_rows_kernel[
@@ -609,8 +621,11 @@ def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_id
         src.stride(1),
         metadata.kv_lens_cuda_runtime,
         metadata.seq_lens_kv_cuda[:num_seqs],
-        pool.shape[2],
+        tokens,
         high_table.shape[1],
+        heads,
+        head_stride,
+        token_stride,
         ROW_WIDTH=rows.shape[1],
         BLOCK_T=block_t,
         BLOCK_W=128,
