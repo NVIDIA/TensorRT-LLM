@@ -919,19 +919,31 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
     assert stage._dspark_context_wkv_slice is None
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "tp_size,enable_attention_dp,use_bf16",
+    "sm,tp_size,enable_attention_dp,use_bf16",
     [
-        (1, False, False),
-        (2, True, False),
-        (2, False, True),
+        (90, 1, False, True),
+        (90, 2, True, True),
+        (90, 2, False, True),
+        (100, 1, False, True),
+        (100, 2, True, True),
+        (100, 2, False, True),
+        (107, 1, False, False),
+        (107, 2, True, False),
+        (107, 2, False, True),
     ],
 )
 def test_post_load_weights_selects_dspark_linear_backend(
-    monkeypatch, tp_size, enable_attention_dp, use_bf16
-):
+    monkeypatch: pytest.MonkeyPatch,
+    sm: int,
+    tp_size: int,
+    enable_attention_dp: bool,
+    use_bf16: bool,
+) -> None:
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     torch.nn.Module.__init__(model)
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: sm)
     monkeypatch.delenv("TRTLLM_DSPARK_LINEAR_BACKEND", raising=False)
     mapping = types.SimpleNamespace(
         tp_size=tp_size,
@@ -957,28 +969,41 @@ def test_post_load_weights_selects_dspark_linear_backend(
         bf16_bind.assert_not_called()
 
 
-def test_post_load_weights_selects_rubin_cute_backend_before_transform(monkeypatch):
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_cute_backend", [False, True])
+def test_post_load_weights_preserves_linear_backend_before_transform(
+    monkeypatch: pytest.MonkeyPatch, use_cute_backend: bool
+) -> None:
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     torch.nn.Module.__init__(model)
     model._use_bf16_linear = False
 
     projection = Linear.__new__(Linear)
     torch.nn.Module.__init__(projection)
-    projection.use_cute_dsl_blockscaling_mm = False
-    projection.transform_weights = Mock()
+    projection.use_cute_dsl_blockscaling_mm = use_cute_backend
+    events = []
+
+    def transform() -> None:
+        assert projection.use_cute_dsl_blockscaling_mm is use_cute_backend
+        events.append("transform")
+
+    projection.transform_weights = Mock(side_effect=transform)
     stage = types.SimpleNamespace(self_attn=types.SimpleNamespace(modules=lambda: [projection]))
     model.mtp_layers = [stage]
     model.modules = lambda: [projection]
 
-    bind = Mock()
+    bind = Mock(side_effect=lambda: events.append("bind"))
     monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
     monkeypatch.setattr(DSv4DSparkDraftModel, "_bind_attn_projections", bind)
 
+    model.post_load_weights()
     model.post_load_weights({})
+    model.post_load_weights()
 
-    assert projection.use_cute_dsl_blockscaling_mm is True
+    assert projection.use_cute_dsl_blockscaling_mm is use_cute_backend
     projection.transform_weights.assert_called_once_with()
     bind.assert_called_once_with()
+    assert events == ["transform", "bind"]
 
 
 def test_bind_bf16_attn_projections_disables_every_fp8_projection():
