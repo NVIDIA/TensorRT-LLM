@@ -43,7 +43,8 @@ non-zero BF16). The first read that finds no sentinel word returns the final val
 Polling is stale-only: after one read of every awaited slot only the slots still
 holding a sentinel word are read again, all in flight together. A reader writes the
 sentinel back into each slot it consumed. A call takes one of two transports, chosen by
-its row count (``TWO_SHOT_ROWS``):
+its row count against the workspace's cut (served: ``TWO_SHOT_ROWS_BY_RANKS``, 32 rows at
+four ranks and 16 at eight):
 
 * One-shot. A rank publishes its sanitized partial into slab ``rank`` of the current
   buffer on every peer (one store to the multicast address, or one unicast store per
@@ -89,11 +90,12 @@ the lowest-indexed unfinished cluster is resident on every rank once every lower
 finished, publishes, and finishes; so every cluster finishes even when the grid
 (``4 * rows`` CTAs) exceeds what is resident at once.
 
-Workspace per rank: the one-shot area ``2 * ranks * (TWO_SHOT_ROWS - 1) * 16 KiB`` plus
-the two-shot area ``2 * 2 * max_rows * 16 KiB`` (scatter and gather), its own fabric
-allocation and counter, never shared with the 8-row hop, the built-in MNNVL all-reduce
-or the expert finalize. Calls on one workspace must be issued in the same order on every
-rank and serialized on one stream (graph replay included).
+Workspace per rank: the one-shot area ``2 * ranks * (two_shot_rows - 1) * 16 KiB``
+(``two_shot_rows`` the workspace's cut: 3.875 MiB on the served four-rank workspace, 3.75
+MiB on the eight-rank one) plus the two-shot area ``2 * 2 * max_rows * 16 KiB`` (scatter
+and gather), its own fabric allocation and counter, never shared with the 8-row hop, the
+built-in MNNVL all-reduce or the expert finalize. Calls on one workspace must be issued in
+the same order on every rank and serialized on one stream (graph replay included).
 
 Capacities. The served workspace holds calls of up to ``MAX_ROWS`` rows (64 requests). A
 decode step of ``MAX_ROWS + 1..WIDE_MAX_ROWS`` rows (65..128 requests: a generation worker
@@ -137,9 +139,16 @@ MAX_ROWS = 512
 WIDE_MAX_ROWS = 1024
 #: The transport capacities, ascending: a call runs on the smallest that holds its rows.
 CAPACITIES = (MAX_ROWS, WIDE_MAX_ROWS)
-#: Fewest rows a call takes the two-shot transport for (one-shot below): on GB300 at four
-#: ranks the one-shot is the faster transport up to 24 rows, the two-shot from 32.
-TWO_SHOT_ROWS = 32
+#: Fewest rows a call takes the two-shot transport for (one-shot below), by the group's rank
+#: count, on GB300. At four ranks the one-shot is the faster transport up to 24 rows, the
+#: two-shot from 32. At eight ranks over two trays' fabric, where a one-shot call moves
+#: seven peers' rows instead of three, the two-shot is the faster from 16 rows. The served
+#: workspace takes its group's entry (``two_shot_rows_for``); both transports give the same
+#: bits, so the cut moves time only.
+TWO_SHOT_ROWS_BY_RANKS = {4: 32, 8: 16}
+#: The four-rank cut: ``log_once_enabled``'s default, and what callers that predate the
+#: per-rank table read.
+TWO_SHOT_ROWS = TWO_SHOT_ROWS_BY_RANKS[4]
 #: The served workspace's publication: unicast stores to each peer (the two-shot gather
 #: then skips the owner's own copy). ``multicast=True`` publishes with one multimem
 #: store per published vector instead (the one-shot slab, the two-shot gather): the same values
@@ -197,6 +206,21 @@ assert grid_shift(MAX_ROWS) == GRID_SHIFT
 
 
 assert (1 << grid_shift(WIDE_MAX_ROWS)) >= CLUSTER * WIDE_MAX_ROWS
+
+
+def two_shot_rows_for(ranks: int) -> int:
+    """The served cut of a group of ``ranks`` ranks (``TWO_SHOT_ROWS_BY_RANKS``).
+
+    Raises:
+        ValueError: for a rank count the wide hop does not serve (4 or 8), with the
+            workspace's own message.
+    """
+    cut = TWO_SHOT_ROWS_BY_RANKS.get(int(ranks))
+    if cut is None:
+        raise ValueError(f"the wide hop serves 4 or 8 ranks, got {ranks}")
+    return cut
+
+
 CONTROL_WORDS = 4
 
 HAS_CUTE_DSL = _hop.HAS_CUTE_DSL
@@ -1687,7 +1711,8 @@ class WideHopWorkspace:
     two-shot transport, fewer the one-shot; the receive memory holds the areas of the
     transports that range uses. ``early_launch`` is the kernel's launch mode
     (``_WideHopKernel``). The defaults are the served configuration (``SERVED_MULTICAST``,
-    ``TWO_SHOT_ROWS``, ``SERVED_EARLY_LAUNCH``) on the served capacity ``MAX_ROWS``;
+    the group's ``two_shot_rows_for`` cut, ``SERVED_EARLY_LAUNCH``) on the served
+    capacity ``MAX_ROWS``;
     ``max_rows=WIDE_MAX_ROWS`` builds the larger transport. A setting left None (the
     publication, the launch mode, the two-row grid and the SMEM pad) takes the module's
     ``SERVED_*`` setting at construction. ``cluster`` is the row split of the
@@ -1701,7 +1726,7 @@ class WideHopWorkspace:
         *,
         multicast: Optional[bool] = None,
         variants: Sequence[Tuple[float, float, bool]] = (),
-        two_shot_rows: int = TWO_SHOT_ROWS,
+        two_shot_rows: Optional[int] = None,
         early_launch: Optional[bool] = None,
         max_rows: int = MAX_ROWS,
         r2: Optional[bool] = None,
@@ -1741,7 +1766,9 @@ class WideHopWorkspace:
         self.pad_rows = (int(pad_rows[0]), int(pad_rows[1]))
         if self.ranks not in (4, _hop.MAX_RANKS):
             raise ValueError(f"the wide hop serves 4 or 8 ranks, got {self.ranks}")
-        self.two_shot_rows = int(two_shot_rows)
+        self.two_shot_rows = int(
+            two_shot_rows_for(self.ranks) if two_shot_rows is None else two_shot_rows
+        )
         self.max_rows = int(max_rows)
         if int(cluster) not in CLUSTERS:
             raise ValueError(f"cluster must be one of {CLUSTERS}, got {cluster}")
@@ -1968,15 +1995,17 @@ def shared_wide_workspace(
     cluster_rows: Optional[FrozenSet[int]] = None,
 ) -> WideHopWorkspace:
     """The one wide-hop workspace of this group, publication, launch mode, capacity and row
-    split, built on first use. The larger capacity (``WIDE_MAX_ROWS``) takes only calls of
-    more than ``MAX_ROWS`` rows, so it is two-shot only. ``multicast`` and ``early_launch``
+    split, built on first use. The served capacity (``MAX_ROWS``) splits its calls at the
+    group's cut (``two_shot_rows_for(mapping.tp_size)``: 32 rows at four ranks, 16 at eight).
+    The larger capacity (``WIDE_MAX_ROWS``) takes only calls of more than ``MAX_ROWS`` rows,
+    so it is two-shot only. ``multicast`` and ``early_launch``
     left None take the module's settings (``SERVED_MULTICAST``, ``SERVED_EARLY_LAUNCH``).
 
     Collective on first use.
     """
     multicast = SERVED_MULTICAST if multicast is None else multicast
     early_launch = SERVED_EARLY_LAUNCH if early_launch is None else early_launch
-    two_shot_rows = TWO_SHOT_ROWS if max_rows == MAX_ROWS else MIN_ROWS
+    two_shot_rows = two_shot_rows_for(mapping.tp_size) if max_rows == MAX_ROWS else MIN_ROWS
     key = (mapping, bool(multicast), _LAUNCH_PDL, two_shot_rows, bool(early_launch), max_rows)
     if int(cluster) != CLUSTER:
         key += (int(cluster), None if cluster_rows is None else frozenset(cluster_rows))
@@ -2155,7 +2184,10 @@ def log_once_enabled(
     smem_pad: Optional[int] = None,
     cluster: int = CLUSTER,
     cluster_rows: Optional[FrozenSet[int]] = None,
+    ranks: Optional[int] = None,
 ) -> None:
+    """The install line. It names the workspace's cut as ``two_shot_rows=<cut>`` (and the
+    group as ``ranks=<ranks>`` when given), whatever row range the transports cover."""
     # A setting left None reads the module's ``SERVED_*`` setting.
     early_launch = SERVED_EARLY_LAUNCH if early_launch is None else early_launch
     r2 = SERVED_R2 if r2 is None else r2
@@ -2180,10 +2212,11 @@ def log_once_enabled(
     launch = (
         "launched as a programmatic dependent" if early_launch else "launched after its producer"
     )
+    cut = f"two_shot_rows={two_shot_rows}" + (f" ranks={ranks}" if ranks is not None else "")
     logger.info(
         "[musespark_open] multi_request_post_attention_hop: fused post-attention hop (AR + residual "
         f"join + pre-FFN norm) on the decode path of all {layers} layers: {transports} "
-        f"({'multicast' if multicast else 'unicast'} publication, {launch}, early "
+        f"({cut}; {'multicast' if multicast else 'unicast'} publication, {launch}, early "
         "dependent-launch trigger, stale-only polling)"
         + (
             "; two rows per CTA "

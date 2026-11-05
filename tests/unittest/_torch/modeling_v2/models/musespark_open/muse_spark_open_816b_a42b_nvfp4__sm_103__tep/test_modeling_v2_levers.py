@@ -217,7 +217,7 @@ def test_the_compositions_and_the_fast_paths():
     assert sorted(TARGET_PATHS) == [(103, 4), (103, 8)]
     served = TARGET_PATHS[(103, 4)].served | TARGET_PATHS[(103, 8)].served
     assert DISPATCH.FAST_PATH_NAMES == served
-    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (51, 55)
+    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (53, 55)
     with pytest.raises(KeyError):
         table((107, 4), 4, "agg", "windowed")
 
@@ -446,9 +446,9 @@ C55_SERVED = {
 }
 
 
-#: The paths sm103 TEP8 serves beyond ``C55_SERVED``: the multi-request decode paths of
-#: ``modeling._SM103_TEP8_MULTI_REQUEST_PATHS``. They are fast paths, not rule levers, so
-#: the baseline serves them like the rest of the composition.
+#: The paths TEP8 serves beyond ``C55_SERVED``: the multi-request decode paths of
+#: ``modeling._SM103_TEP8_MULTI_REQUEST_PATHS`` and ``wide_dense_gemms``, TEP8's alone. The
+#: baseline serves them like the rest of the composition.
 SM103_TEP8_ADDED = frozenset(
     {
         "drafter_window_compact",
@@ -457,6 +457,8 @@ SM103_TEP8_ADDED = frozenset(
         "multi_request_split_kv",
         "router_gemm",
         "vocab_parallel_head",
+        "wide_dense_gemms",
+        "wide_moe_allreduce",
         "wide_split_sampler",
     }
 )

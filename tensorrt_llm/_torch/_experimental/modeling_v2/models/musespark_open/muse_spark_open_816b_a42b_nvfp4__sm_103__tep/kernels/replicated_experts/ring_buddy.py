@@ -15,7 +15,8 @@ the built-in loader finished, so the copy is bitwise the owner's -- stacked as
 parameters are re-bound as views of the stack's first half, so the own block
 is stored once.
 
-Each decode step (``M <= 16`` rows), the routing method's call additionally
+Each decode step of at most ``max_rows`` rows (``MAX_ROWS``, 16; 32 on sm103 at
+tep8, ``MAX_ROWS_BY_SM_TP``), the routing method's call additionally
 runs ``ops/moe/ring_buddy_assign`` on the main stream. In the built-in MoE
 input schedule it overlaps the pool/quantize work of the preparation stream;
 where the main stream is the longer branch instead (the router after the pool
@@ -104,14 +105,33 @@ from ...ops.moe.ring_buddy_assign import (
     BLOCK,
     EXPERTS,
     HALF_SPAN,
+    MAX_SLOTS,
     RANKS,
     TOP_K,
     block_of,
     ring_buddy_assign,
 )
 
-#: Decode rows the stacked path serves; larger calls keep the built-in path.
+#: Decode rows the stacked path serves (``install``'s ``max_rows`` default); larger
+#: calls keep the built-in path.
 MAX_ROWS = 16
+
+#: The stacked path's row cap per ``(SM, tensor-parallel size)`` where it is not
+#: ``MAX_ROWS`` (``max_rows_for``). sm103 tep8 also balances the decode steps of three
+#: and four requests (17..32 rows at K = 7): 32 rows of ``TOP_K`` slots are the 256 slots
+#: of one ``ring_buddy_assign`` program (``MAX_SLOTS``); measured at 6.4 / 8.3 us per layer
+#: net faster than the built-in path at 24 / 32 rows.
+MAX_ROWS_BY_SM_TP = {(103, 8): 32}
+
+
+def max_rows_for(compute_capability, tp_size) -> int:
+    """The stacked path's row cap on a device of ``compute_capability`` at ``tp_size``.
+
+    ``MAX_ROWS_BY_SM_TP``'s entry, else ``MAX_ROWS`` (also without a capability).
+    """
+    sm = _tp_agreement.sm_of(compute_capability)
+    return MAX_ROWS_BY_SM_TP.get((sm, tp_size), MAX_ROWS)
+
 
 #: Decode rows the stacked path serves on a half-window layer (``half_window_experts``):
 #: up to four requests' verify steps, the slots of one ``ring_buddy_assign`` program.
@@ -256,6 +276,7 @@ class _State:
         windows: int = 2,
         ranks: int = RANKS,
         half: bool = False,
+        max_rows: int = MAX_ROWS,
     ):
         self.kind = kind
         self.stacks = stacks
@@ -278,8 +299,9 @@ class _State:
         self.by_window[windows * self.block] = stacks
         # The half window (``half_window_experts``): the owner-only placement over the
         # stack's own block, and the prologue's half-window placement over all of it.
+        # Every other layer serves calls of up to ``max_rows`` rows (``install``'s).
         self.half = half
-        self.max_rows = HALF_MAX_ROWS if half else MAX_ROWS
+        self.max_rows = HALF_MAX_ROWS if half else max_rows
         if half:
             self.default_window = self.block
             self.by_window = {
@@ -769,6 +791,7 @@ def install(
     persistent_rows: int = 8,
     windows: int = 2,
     half: bool = False,
+    max_rows: int = MAX_ROWS,
 ) -> List[int]:
     """Replicate and patch every eligible MoE layer of ``text_model``; returns their indices.
 
@@ -801,6 +824,10 @@ def install(
     owner-only placement, tep4 only) stacks the predecessor's upper half on every NVFP4
     layer the persistent kernel serves (see the module docstring); the other layers
     keep the owner-only window.
+    ``max_rows`` (``MAX_ROWS``; ``max_rows_for`` of the device and the TP size) is the
+    largest decode call the stacked path takes on every layer but a half-window one
+    (``HALF_MAX_ROWS``); larger calls keep the built-in path. At most
+    ``MAX_SLOTS // TOP_K`` (32), the rows of one ``ring_buddy_assign`` program.
 
     A layer installed by an earlier call is refreshed in place (``_refresh``):
     its stacks follow the newly loaded parameters, its hooks are not wrapped
@@ -821,7 +848,7 @@ def install(
     """
     ranks = ring_size(mapping)
     refusal = _install_refusal(
-        text_model, windows, persistent, balance, bf16_unpacked, ranks, static_from, half
+        text_model, windows, persistent, balance, bf16_unpacked, ranks, static_from, half, max_rows
     )
     refusal = _tp_agreement.agreed_refusal(mapping, refusal)
     if refusal is not None:
@@ -850,6 +877,7 @@ def install(
             _refresh(moe, state, mapping)
             state.balance = balance
             state.static_from = static_from
+            state.max_rows = HALF_MAX_ROWS if state.half else max_rows
             refreshed.append(index)
             continue
         reason = eligible(moe, mapping)
@@ -867,7 +895,15 @@ def install(
         stacks = _replicate(moe, kind, mapping, layer_windows, layer_half)
         added += sum(t[block:].numel() * t.element_size() for t in stacks.values())
         state = _State(
-            kind, stacks, mapping.tp_rank, balance, static_from, layer_windows, ranks, layer_half
+            kind,
+            stacks,
+            mapping.tp_rank,
+            balance,
+            static_from,
+            layer_windows,
+            ranks,
+            layer_half,
+            max_rows=max_rows,
         )
         moe._replicated_experts = state
         if failed is None:
@@ -913,7 +949,8 @@ def install(
         f"{'(persistent NVFP4 expert kernel) ' if persistent else ''}"
         f"{'(unpacked BF16 routing) ' if bf16_unpacked else ''}"
         f"{f'(three ring windows on {len(widened)} layers) ' if windows == 3 else ''}"
-        f"({placement} placement, "
+        f"({placement} placement, ring-buddy max_rows={max_rows}"
+        f"{f' ({HALF_MAX_ROWS} on the half-window layers)' if halved else ''}, "
         f"{dict(sorted(kinds.items()))}), refreshed in place on {len(refreshed)}; "
         f"per rank: replicated experts +{added / 2**30:.2f} GiB, torch allocated "
         f"+{allocated_added / 2**30:.2f} GiB, device +{device_added / 2**30:.2f} GiB, of "
@@ -933,8 +970,14 @@ def _install_refusal(
     ranks: Optional[int] = RANKS,
     static_from: Optional[int] = None,
     half: bool = False,
+    max_rows: int = MAX_ROWS,
 ) -> Optional[str]:
     """``install``'s refusals known before its first all-gather, or None."""
+    if not 0 < max_rows <= MAX_SLOTS // TOP_K:
+        return (
+            f"the stacked path's calls are placed by one ring_buddy_assign program of at most "
+            f"{MAX_SLOTS} slots, {MAX_SLOTS // TOP_K} rows of {TOP_K}; got max_rows={max_rows}"
+        )
     if windows not in (1, 2, 3):
         return (
             "the ring-buddy stacks hold the owner-only window, two ring windows, or three with "

@@ -16,7 +16,9 @@ yields a ``DenseGemmDispatcher`` and keeps whatever the engine assigns to it as
 that dispatcher's fallback. A call that fits -- BF16, no bias, at most 8 rows,
 the site's shape -- runs ``dense_gemm`` with the kernel this fast path names for
 the site and row count, the same on every rank; any other call goes to the built-in dispatcher
-unchanged. A fast path may also give the plan a table for 9..32 rows
+unchanged. ``wide_dense_gemms`` gives the sites its table names (``WIDE_KERNELS_BY_SM_TP``:
+QKV at tep8) a kernel for the 9..32-row calls as well, on every call of those rows. A
+fast path may also give the plan a table for 9..32 rows
 (``DenseGemmPlan.set_wide_kernels``, ``wide_projection_gathers``): while it arms
 the plan (``wide_armed``, one decode forward), a call of those rows at a site the
 table names runs that table's kernel. Nothing else in the layer changes, so the other fast paths
@@ -128,6 +130,97 @@ TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "pool": ((2, "direct:256,2"), (MAX_ROWS, "splitk:64,8,2,10")),
     "unpool": ((2, "direct:128,2"), (MAX_ROWS, CUBLAS)),
 }
+
+#: ``wide_dense_gemms`` on sm103 at tep8 (two trays): the QKV projection ``[2304, 8192]`` of the
+#: 9..32-row calls of a decode step of 2..4 requests, as ``(last row count, kernel)`` steps from 9
+#: rows. flashinfer's split-K with the ``split_k`` 4 of QKV's 8-row cell in ``DEFAULT_KERNELS`` --
+#: required, not preferred: ``install``'s split-K check refuses any other, and with it every row of a
+#: wide call gets the bits it gets in a one-request step. ``mma_m`` 64 gives 36 column tiles, 144
+#: CTAs in clusters of 4 (one wave, the grid of the cuBLAS split-K these calls ran); ``mma_n`` 16 /
+#: 32 holds the rows of two / three or four requests in one tile, at the deepest pipeline the shared
+#: memory takes at ``split_k`` 4 (10 / 8 stages; the owner CTA also holds its three peers' partials,
+#: which is why the tep4 sweeps' deepest split-K-4 pick is 10 at ``mma_n`` 16 where split-K 2 reaches
+#: 11). It replaces the built-in low-M dispatch's cache-miss pick, cuBLAS's split-K 4 plus its
+#: reduce kernel. Served here, QKV also forks the
+#: attention output projection's L2 prefetch (``dense_gemm_prefetch``) at these rows, as at 1..8;
+#: o_proj's dispatcher joins it before the built-in GEMM it keeps. The attention output projection
+#: is not named: its 8-row cell is cuBLAS, which no split-K cell reproduces bit for bit. Nor are the
+#: pooler and unpooler: above 8 rows the built-in tep8 model multiplies their whole replicated
+#: weights, a shape these sites do not take. Chosen from the shapes, not from a per-call sweep;
+#: ``install``'s split-K check refuses a cell that would change the bits.
+SM103_TP8_WIDE_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((16, "splitk:64,16,4,10"), (WIDE_MAX_ROWS, "splitk:64,32,4,8")),
+}
+
+#: The ``wide_dense_gemms`` table of each ``(compute capability, TP size)`` it is measured for.
+WIDE_KERNELS_BY_SM_TP: Mapping[
+    Tuple[Tuple[int, int], int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {
+    ((10, 3), 8): SM103_TP8_WIDE_KERNELS,
+}
+
+#: The sites whose wide cells are measured on the rank's slices (``sharded_projections``).
+_SLICE_SITES = frozenset({"pool", "unpool"})
+
+
+def wide_kernels(table: Mapping[str, Tuple[Tuple[int, str], ...]]) -> Dict[str, Tuple[str, ...]]:
+    """The kernel of each site of a ``wide_dense_gemms`` table (``WIDE_KERNELS_BY_SM_TP``) for rows
+    9..32 (index ``rows - 9``)."""
+    out = {}
+    for site, steps in table.items():
+        kernels, first = [], MAX_ROWS + 1
+        for last, kernel in steps:
+            kernels += [kernel] * (last - first + 1)
+            first = last + 1
+        assert len(kernels) == WIDE_MAX_ROWS - MAX_ROWS, steps
+        out[site] = tuple(kernels)
+    return out
+
+
+def wide_kernel_table(
+    capability: Tuple[int, int],
+    tp_size: int,
+    sharded: bool,
+    kernels: Mapping[str, Tuple[str, ...]],
+) -> Dict[str, Tuple[str, ...]]:
+    """``wide_dense_gemms``' kernel per row count 9..32 of each site its table names on
+    ``capability`` at ``tp_size`` (``WIDE_KERNELS_BY_SM_TP``), checked against ``kernels``, the
+    plan's 1..8-row table.
+
+    Every wide cell must be flashinfer's split-K with the ``split_k`` of its site's 8-row cell:
+    split-K tactics of one ``split_k`` sum the same K slices in the same order, so every row of a
+    wide call gets the bits that row gets in a one-request step. Reads only the tables.
+
+    Raises:
+        ValueError: if ``WIDE_KERNELS_BY_SM_TP`` has no table for ``(capability, tp_size)``; if the
+            table names the pooler or unpooler (cells measured on the rank's slices) and the
+            projections are not ``sharded``; or if a wide cell does not sum the K slices of its
+            site's 8-row cell.
+    """
+    key = (tuple(capability), int(tp_size))
+    steps = WIDE_KERNELS_BY_SM_TP.get(key)
+    if steps is None or (not sharded and _SLICE_SITES & set(steps)):
+        measured = ", ".join(
+            f"SM {sm} at TP{tp}"
+            + (" with the sharded pooler and unpooler" if _SLICE_SITES & set(cells) else "")
+            for (sm, tp), cells in sorted(WIDE_KERNELS_BY_SM_TP.items())
+        )
+        raise ValueError(
+            f"[musespark_open] wide_dense_gemms is measured for {measured}; got SM {key[0]} at "
+            f"TP{key[1]}, {'sharded' if sharded else 'replicated'} projections"
+        )
+    table = wide_kernels(steps)
+    for role, wide_cells in table.items():
+        family, fields = parse_kernel(kernels[role][MAX_ROWS - 1])
+        for kernel in wide_cells:
+            wide_family, wide_fields = parse_kernel(kernel)
+            if family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]:
+                raise ValueError(
+                    f"[musespark_open] wide_dense_gemms: {role} kernel {kernel} does not sum "
+                    f"the K slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"
+                )
+    return table
+
 
 #: The measured table of each ``(compute capability, TP size)``, with the pooler and
 #: unpooler on the rank's slices (``kernel_steps`` swaps in the replicated tep4 cells).
@@ -365,8 +458,12 @@ class DenseGemmPlan:
         prefetch: bool,
         enable_pdl: bool,
         capability: Optional[Tuple[int, int]] = None,
+        wide: Optional[Mapping[str, Tuple[str, ...]]] = None,
     ) -> None:
         self.kernels = dict(kernels)
+        #: ``wide_dense_gemms``: the kernel of a site's 9..32-row calls (``wide[site][rows - 9]``);
+        #: a site it does not name keeps the built-in dispatch at those rows.
+        self.wide = dict(wide or {})
         #: The 9..32-row table (``set_wide_kernels``) and whether the current forward arms it.
         self.wide_kernels: Dict[str, Tuple[str, ...]] = {}
         self.wide_armed = False
@@ -395,12 +492,16 @@ class DenseGemmPlan:
 
     def kernel_for(self, role: str, rows: int) -> Optional[str]:
         """The kernel of a ``rows``-row call at site ``role``, or None where the plan has none
-        (the built-in dispatch): ``kernels`` at 1..8 rows; at 9..32 rows ``wide_kernels``
-        while ``wide_armed`` (``wide_projection_gathers``)."""
+        (the built-in dispatch): ``kernels`` at 1..8 rows; at 9..32 rows the ``wide`` table
+        (``wide_dense_gemms``) for the sites it names, else ``wide_kernels`` while ``wide_armed``
+        (``wide_projection_gathers``)."""
         if 1 <= rows <= MAX_ROWS:
             return self.kernels[role][rows - 1]
         if not WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
             return None
+        wide = self.wide.get(role)
+        if wide is not None:
+            return wide[rows - WIDE_MIN_ROWS]
         if self.wide_armed:
             wide = self.wide_kernels.get(role)
             return None if wide is None else wide[rows - WIDE_MIN_ROWS]
@@ -835,17 +936,20 @@ def install(
 
     ``kernels`` is the kernel of each site per row count; when None, the table of the
     device's compute capability (``device_capability``, read once here), the model's TP
-    size and its projection layout (``default_kernels``); ``wide`` is ignored. Every module is checked
-    before any is re-classed, so a refusal
-    leaves the model as it was. Only the weights' shapes are read, so this runs
-    on a model whose weights are still on the meta device.
+    size and its projection layout (``default_kernels``). ``wide`` (``wide_dense_gemms``, tep8's
+    QKV) adds the TP size's 9..32-row table (``wide_kernel_table``) for the sites it names.
+    Every module is checked before any is re-classed, so a refusal leaves the model as it was.
+    Only the weights' shapes are read, so this runs on a model whose weights are still on the
+    meta device.
 
     Raises:
         ValueError: if the low-M dispatch is off (``TRTLLM_LOW_M_GEMM_BACKEND``), so
             the built-in ``Linear`` never asks a dispatcher; if no ``kernels`` are given
             and the device and TP size have no table (``kernel_steps``); if ``prefetch`` is asked
             without the sharded projections (``sharded_projections``), whose
-            pooler GEMM would read the whole replicated weight; if a
+            pooler GEMM would read the whole replicated weight; if ``wide`` is asked where
+            ``wide_kernel_table`` refuses (no table for the device and TP size, slices
+            without the sharded projections, a cell off its 8-row ``split_k``); if a
             projection cannot be re-classed (see
             ``MuseSparkOpenTepDenseLinear.check``); or if a named kernel cannot
             serve its site's shape.
@@ -865,7 +969,10 @@ def install(
             "(MUSESPARK_OPEN_SHARDED_PROJECTIONS=1); without them the pooler GEMM reads the "
             "whole replicated weight"
         )
-    plan = DenseGemmPlan(kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability)
+    wide_table = wide_kernel_table(capability, tp_size, sharded, kernels) if wide else {}
+    plan = DenseGemmPlan(
+        kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability, wide=wide_table
+    )
     plan.tp_size = tp_size
 
     layers = list(model.layers)
@@ -899,6 +1006,12 @@ def install(
                     raise ValueError(
                         f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
                     )
+            for rows, kernel in enumerate(wide_table.get(role, ()), start=MAX_ROWS + 1):
+                error = kernel_error(kernel, rows, *shape)
+                if error is not None:
+                    raise ValueError(
+                        f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
+                    )
             planned.append((index, role, modules[role], shape, weights))
 
     next_of = {"qkv": "o_proj", "o_proj": "pool"}
@@ -920,4 +1033,15 @@ def install(
         f"{MAX_ROWS} rows by {describe(kernels)}; "
         f"L2 prefetch of the next weight {'on' if prefetch else 'off'}"
     )
+    if wide_table:
+        table = WIDE_KERNELS_BY_SM_TP[(tuple(capability), tp_size)]
+        steps = "; ".join(
+            f"{site}=" + ", ".join(f"{k}@..{last}" for last, k in table[site]) for site in table
+        )
+        builtin = ", ".join(site for site in SITES if site not in table)
+        logger.info(
+            f"[musespark_open] wide_dense_gemms: calls of {MAX_ROWS + 1}..{WIDE_MAX_ROWS} rows by "
+            f"{steps}; each row gets the bits of its {MAX_ROWS}-row kernel"
+            + (f"; {builtin} keep the built-in dispatch at these rows" if builtin else "")
+        )
     return plan

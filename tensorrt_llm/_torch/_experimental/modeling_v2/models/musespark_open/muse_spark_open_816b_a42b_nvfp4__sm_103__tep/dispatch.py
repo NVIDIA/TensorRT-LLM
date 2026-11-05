@@ -130,6 +130,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     # Dense projections and prefetch.
     FastPath("dense_gemms", "dense projections on one named kernel per shape", "construct"),
     FastPath(
+        "wide_dense_gemms",
+        "QKV projections of 9..32-row decode steps on flashinfer's split-K at tep8",
+        "construct",
+        ("dense_gemms",),
+    ),
+    FastPath(
         "dense_gemm_prefetch",
         "L2 prefetch of the next dense projection's weight",
         "construct",

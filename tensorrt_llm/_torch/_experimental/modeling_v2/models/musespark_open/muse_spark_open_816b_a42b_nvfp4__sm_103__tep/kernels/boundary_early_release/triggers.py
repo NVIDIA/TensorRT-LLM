@@ -297,9 +297,17 @@ def drop_converted_prefetches(model, plan, qkv: bool) -> Dict[str, Tuple[int, Fr
     (``weights_before_wait_rows``; the unpooler's and QKV's calls of
     one step have the same rows), and only when the plan launches with
     programmatic dependent launch: without it the consumer cannot start early,
-    and the prefetch is the only thing that streams its weight.
-    Returns, per site, how many layers dropped it and at which row counts,
-    for the log line.
+    and the prefetch is the only thing that streams its weight. Returns, per
+    site, how many layers dropped it and at which row counts, for the log line.
+
+    The rows come from the plan's 1..8-row table only, at this call and nowhere
+    else: ``weights_before_wait_rows`` also gives ``next_qkv_prefetch`` its fork rows.
+    ``wide_dense_gemms``' 9..32-row QKV cells are not added. At tep8 (QKV only)
+    the 9..32-row boundary is the built-in one, released at exit, and the unpooler
+    multiplies the whole replicated weight there, which its dispatcher declines, so
+    it forks no prefetch to drop; the QKV dispatcher's own prefetch of the attention
+    output weight is not this edge's and stays. A fast path that fuses the 9..32-row
+    boundary at tep8 has to add those rows here, for tep8 only.
     """
     if plan is None or not plan.prefetch or not plan.enable_pdl:
         return {}

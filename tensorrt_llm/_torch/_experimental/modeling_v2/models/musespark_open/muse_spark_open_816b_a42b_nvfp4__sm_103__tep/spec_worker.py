@@ -68,7 +68,9 @@ kernel), the fused context K/V projection (``F.linear``), and the TP-sharded
 ``qkv_proj`` / ``o_proj`` / ``gate_up_proj`` / ``down_proj`` (whose per-rank
 autotuner choices differ between ranks). Same tactic on every rank; drafter
 numerics only. The install reports every candidate call site it left
-built-in, and why.
+built-in, and why. On sm103 TP8 it first checks every row of the table with
+flashinfer's own validation and refuses the fast path if one fails
+(``fixed_low_m_gemm.INSTALL_CHECKED``).
 """
 
 from __future__ import annotations
@@ -88,7 +90,13 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
 from .dispatch import LAUNCH_PDL
-from .ops.gemm.fixed_low_m_gemm import fixed_low_m_gemm, splitk_tactics, tactic_for, takes
+from .ops.gemm.fixed_low_m_gemm import (
+    fixed_low_m_gemm,
+    refused_rows,
+    splitk_tactics,
+    tactic_for,
+    takes,
+)
 from .ops.spec.dflash_accept import (
     COUNTER_STRIDE,
     FORCE_FIXED,
@@ -677,9 +685,10 @@ def install(
         ValueError: if ``fc_shard`` or ``fused_accept`` is asked for and cannot be installed
             (no drafter / worker, or the reason its install declined), or
             ``fixed_gemms`` is asked for on a TP size without a tactic table
-            (``splitk_tactics``: 4 and 8) or some drafter GEMM call site takes no fixed
-            tactic -- running the built-in path under the fast path's name would
-            misreport what runs.
+            (``splitk_tactics``: 4 and 8), on a table with a row the split-K kernel refuses
+            (``refused_rows``; the tables of ``INSTALL_CHECKED``: sm103 TP8), or some drafter
+            GEMM call site takes no fixed tactic -- running the built-in path under the fast
+            path's name would misreport what runs.
     """
     enable_pdl = LAUNCH_PDL
     if fc_shard:
@@ -716,10 +725,18 @@ def install(
         tp_size = getattr(mapping, "tp_size", None)
         try:
             tactics = splitk_tactics(tp_size)
+            refused = refused_rows(tp_size)
         except ValueError as error:
             raise ValueError(
                 f"[musespark_open] drafter_fixed_gemms cannot run here: {error}"
             ) from error
+        if refused:
+            # Before any module changes, as dense_gemms.install refuses a cell it cannot serve:
+            # otherwise the first call at that row count raises inside the engine's warmup.
+            raise ValueError(
+                "[musespark_open] drafter_fixed_gemms cannot run here: the split-K kernel refuses "
+                f"{len(refused)} row(s) of the TP{tp_size} tactic table ({'; '.join(refused)})"
+            )
         sites = install_fixed_tactic_gemms(draft_model, enable_pdl, tactics)
         total = sites.installed + len(sites.declined)
         if not sites.installed or sites.declined:
