@@ -216,7 +216,8 @@ def _run_beam_search(model_path, prompts, beam_width, max_tokens, env):
                 max_tokens=max_tokens,
                 ignore_eos=True,
                 end_id=-1,
-                logprobs=1,
+                # Beam search returns only the sampled token's logprob.
+                logprobs=0,
             )
             outputs = llm.generate(prompts, sampling_params=sampling)
         return [
