@@ -67,7 +67,7 @@ class AttnResRmsnormFwd(OpWrapper):
 
     No metadata, workspace or caller-visible state. Device architecture checks
     and dynamic-shared-memory limits are cached. TRTLLM_ENABLE_PDL is read once
-    per process; unset or 1 enables PDL. N<=4 uses one 256-thread CTA per token;
+    per process; PDL is on unless it is 0. N<=4 uses one 256-thread CTA per token;
     N>=5 uses one eight-CTA split-K cluster per token. The former retains bf16
     candidates in registers; the latter keeps fp32 candidates in shared memory
     and reduces through distributed shared memory, using 3652*N bytes per CTA.

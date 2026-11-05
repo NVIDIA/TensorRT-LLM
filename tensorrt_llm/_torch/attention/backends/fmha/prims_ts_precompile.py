@@ -51,6 +51,7 @@ import tempfile
 import time
 from typing import Any, Sequence
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 _WORKER_BOOTSTRAP = """
@@ -126,7 +127,7 @@ def worker_count(num_payloads: int, *, local_ranks: int = 1) -> int:
 
 
 def strict() -> bool:
-    return os.environ.get("TLLM_PRIMTS_WARM_STRICT", "0") == "1"
+    return get_env_flag("TLLM_PRIMTS_WARM_STRICT", False)
 
 
 def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) -> dict[str, Any]:

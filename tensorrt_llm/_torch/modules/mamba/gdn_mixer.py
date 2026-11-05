@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from tensorrt_llm._torch.modules.fla.utils import tensor_cache
-from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
+from tensorrt_llm._utils import get_env_flag, is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -85,7 +85,7 @@ class FusedVerifyPlan(NamedTuple):
 def _use_flashinfer_gdn_prefill() -> bool:
     """Check the prefill backend setting and supported GPU architecture."""
     return (
-        os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
+        get_env_flag("TLLM_USE_FLASHINFER_GDN_PREFILL", True)
         and is_flashinfer_gdn_prefill_supported_arch()
     )
 

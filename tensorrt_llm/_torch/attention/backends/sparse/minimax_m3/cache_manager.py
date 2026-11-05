@@ -28,7 +28,6 @@ Provides:
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -44,6 +43,7 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
     convert_to_torch_tensor,
+    get_env_flag,
     get_sm_version,
     prefer_pinned,
 )
@@ -278,7 +278,7 @@ def extend_attention_op_pools_for_shared_draft_layers(
 
 # Zero every KV pool view (NVFP4 + FP8 K/V, NVFP4 block scales, paged index keys) once at allocation, so no reader
 # ever sees uninitialized bytes. Kill switch (diagnostics only): TRTLLM_M3_KV_POOL_ZERO_INIT=0.
-_KV_POOL_ZERO_INIT = os.environ.get("TRTLLM_M3_KV_POOL_ZERO_INIT", "1") == "1"
+_KV_POOL_ZERO_INIT = get_env_flag("TRTLLM_M3_KV_POOL_ZERO_INIT", True)
 
 
 def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:

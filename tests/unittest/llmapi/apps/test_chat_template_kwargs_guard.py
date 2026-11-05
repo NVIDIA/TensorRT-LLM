@@ -15,7 +15,6 @@ import pytest
 
 from tensorrt_llm.inputs import chat_template_guard
 from tensorrt_llm.inputs.chat_template_guard import (
-    ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR,
     ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS,
     UnusedChatTemplateKwargsError,
     validate_chat_template_kwargs,
@@ -152,13 +151,13 @@ class TestValidateChatTemplateKwargs:
         validate_chat_template_kwargs(TEMPLATE_UNPARSEABLE, kwargs)
 
     def test_unparseable_template_respects_escape_hatch(self, monkeypatch):
-        monkeypatch.setenv(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, "1")
+        monkeypatch.setattr(chat_template_guard, "_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", True)
         with patch.object(chat_template_guard, "logger") as mock_logger:
             validate_chat_template_kwargs(TEMPLATE_UNPARSEABLE, {"disable_reasoning": True})
             mock_logger.warning.assert_not_called()
 
     def test_escape_hatch_downgrades_to_warning(self, monkeypatch):
-        monkeypatch.setenv(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, "1")
+        monkeypatch.setattr(chat_template_guard, "_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", True)
         with patch.object(chat_template_guard, "logger") as mock_logger:
             validate_chat_template_kwargs(TEMPLATE_WITH_TOGGLE, {"disable_reasoning": True})
             assert mock_logger.warning.call_count == 1
@@ -168,7 +167,7 @@ class TestValidateChatTemplateKwargs:
             assert mock_logger.warning.call_count == 1
 
     def test_strict_argument_overrides_env(self, monkeypatch):
-        monkeypatch.setenv(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, "1")
+        monkeypatch.setattr(chat_template_guard, "_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", True)
         with pytest.raises(ValueError, match="disable_reasoning"):
             validate_chat_template_kwargs(
                 TEMPLATE_WITH_TOGGLE, {"disable_reasoning": True}, strict=True

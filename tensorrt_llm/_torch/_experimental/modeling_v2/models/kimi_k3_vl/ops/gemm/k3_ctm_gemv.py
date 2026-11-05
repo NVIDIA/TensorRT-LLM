@@ -61,7 +61,7 @@ class K3CtmGemv(OpWrapper):
     A new key requires an eager CuTe DSL compile before graph capture, or
     raises RuntimeError. cutlass and cuda.bindings must be importable.
 
-    TRTLLM_ENABLE_PDL is read every call: unset or 1 enables PDL. Weight TMA
+    TRTLLM_ENABLE_PDL is read every call: PDL is on unless it is 0. Weight TMA
     loads use L2 evict-first and precede griddepcontrol.wait; weight must not
     be written by preceding in-flight work. The x read waits. With
     trigger_early=True, dependents are released after weight loads are issued

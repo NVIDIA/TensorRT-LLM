@@ -123,7 +123,10 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     GQADSparkForCausalLM,
     draft_is_embedded_in_target,
 )
-from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+from tensorrt_llm._torch.models.modeling_kimi_linear import (
+    KimiLinearForCausalLM,
+    k3_router_gemm_bf16,
+)
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
@@ -145,6 +148,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
 from tensorrt_llm._torch.utils import AuxStreamType
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -279,9 +283,7 @@ _LANG_PREFIX = "language_model."
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
-_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
-    os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
-)
+_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = get_env_flag("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", False)
 
 
 # Identity-RoPE table positions for the MLA backends. K3 is NoPE (the table
@@ -438,13 +440,13 @@ def _is_mla_layer(cfg, layer_idx: int) -> bool:
 KIMI_K3_AUX_ATTN_RES_STREAM_ENV = "KIMI_K3_AUX_ATTN_RES_STREAM"
 
 
-_AUX_ATTN_RES_STREAM_ENABLED = os.environ.get(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, "1") == "1"
+_AUX_ATTN_RES_STREAM_ENABLED = get_env_flag(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, True)
 
 
 KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
 
 
-_FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
+_FUSED_ATTN_RES_ENABLED = get_env_flag(KIMI_K3_FUSED_ATTN_RES_ENV, True)
 
 
 KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
@@ -918,9 +920,9 @@ class KimiK3MoERuntime(nn.Module):
         # Routing scores stay fp32; the gate GEMM runs bf16xbf16 with fp32
         # accumulate/output (checkpoint stores the gate weight in bf16; saves a
         # per-layer input cast + fp32 splitK pair on the bs1 decode path).
-        # KIMI_K3_ROUTER_BF16=0 forces the upcast-to-fp32 GEMM.
-        _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
-        _router_bf16 = _router_bf16_env == "1" if _router_bf16_env is not None else True
+        # KIMI_K3_ROUTER_BF16=0 forces the upcast-to-fp32 GEMM;
+        # k3_router_gemm_bf16 lists the other values.
+        _router_bf16 = k3_router_gemm_bf16(model_config.mapping.tp_group_shares_requests)
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)

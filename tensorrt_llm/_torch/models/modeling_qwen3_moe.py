@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Dict, List, Optional
 
 import torch
@@ -21,6 +20,7 @@ from torch import nn
 from transformers import Qwen3MoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm._utils import get_env_flag
 
 from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
@@ -229,8 +229,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(model_config.mapping)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not get_env_flag(
+            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", False)
         self.enable_fusion &= not self.enable_attention_dp
 
         has_tp = self.mapping.has_tp()

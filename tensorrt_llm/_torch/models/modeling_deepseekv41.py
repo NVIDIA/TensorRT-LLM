@@ -23,6 +23,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -2353,7 +2354,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         # entry (mHC.fused_hc_lagged): one fewer kernel per layer at decode. Not across an
         # engram entry, the CED boundary (both need a materialized residual), or the final layer;
         # TRTLLM_V41_MHC_DEFER=0 turns it off for A/B.
-        defer_ok = os.environ.get("TRTLLM_V41_MHC_DEFER", "1").lower() not in ("0", "false")
+        defer_ok = get_env_flag("TRTLLM_V41_MHC_DEFER", True)
         defer_ok = defer_ok and not self.model_config.mapping.has_pp()
         layers = self._post_load_decoder_layers()
         for idx, layer in enumerate(layers):

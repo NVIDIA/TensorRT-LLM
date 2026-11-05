@@ -33,7 +33,6 @@ Shapes and coordinates use this notation throughout:
 """
 
 import math
-import os
 from dataclasses import replace
 from typing import Optional
 
@@ -53,7 +52,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, _fp8_block_scales_uses_cute_dsl_sm107
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_env_flag, get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -309,7 +308,7 @@ class DSAVanillaIndexer(nn.Module):
         self.mtp_index_share = sparse_params.mtp_index_share
         # As in the production indexer, TRTLLM_DSA_INDEXER_BF16=1 runs the
         # fused wk/weights_proj projection in the model dtype instead of FP32.
-        self._indexer_bf16 = os.environ.get("TRTLLM_DSA_INDEXER_BF16", "0") == "1"
+        self._indexer_bf16 = get_env_flag("TRTLLM_DSA_INDEXER_BF16", False)
         wk_wp_dtype = dtype if self._indexer_bf16 else torch.float32
 
         self.wq_b = Linear(

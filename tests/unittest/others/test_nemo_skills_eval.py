@@ -33,6 +33,7 @@ from tensorrt_llm.evaluate.nemo_skills_eval import (
     IFBench,
     NemoSkillsEvaluator,
     SciCode,
+    _ensure_sandbox_server,
 )
 
 
@@ -206,3 +207,49 @@ def test_scicode_grader_shim_leading_newline():
     finally:
         sc.eval_prefix = original
         sc._trtllm_simps_shim = original_shim
+
+
+# --- The sandbox runs model-generated code: remote hosts need an opt-in -----
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("allow_remote, starts", [(None, False), ("false", False), ("true", True)])
+def test_sandbox_auto_start_on_remote_host_needs_opt_in(monkeypatch, allow_remote, starts):
+    import socket
+    import subprocess
+
+    monkeypatch.setenv("NEMO_SKILLS_SANDBOX_HOST", "10.0.0.1")
+    if allow_remote is None:
+        monkeypatch.delenv("NEMO_SKILLS_SANDBOX_ALLOW_REMOTE", raising=False)
+    else:
+        monkeypatch.setenv("NEMO_SKILLS_SANDBOX_ALLOW_REMOTE", allow_remote)
+    started = []
+
+    # Fake the socket and the process start: the sandbox port answers only after
+    # fake_popen has run.
+    class FakeSocket:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect_ex(self, address):
+            return 0 if started else 1
+
+    def fake_popen(*args, **kwargs):
+        started.append(args)
+        return "sandbox-process"
+
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    if starts:
+        assert _ensure_sandbox_server() == "sandbox-process"
+    else:
+        with pytest.raises(RuntimeError, match="Refusing to auto-start"):
+            _ensure_sandbox_server()
+        assert not started

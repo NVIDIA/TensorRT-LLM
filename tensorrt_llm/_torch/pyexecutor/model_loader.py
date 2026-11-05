@@ -30,7 +30,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
     WeightManifestWriteResult, check_weight_sharing_compatibility,
     maybe_write_weight_manifest)
-from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm._utils import get_env_flag, get_sm_version, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
@@ -656,8 +656,7 @@ def _inspect_shadow_weight_load_plan(
         checkpoint_loader: Any, checkpoint_dir: str, weight_mapper: Any,
         **kwargs: Any) -> tuple[CheckpointCatalog, WeightLoadPlan] | None:
     """Build and validate advisory checkpoint metadata without changing loading."""
-    enabled = os.environ.get(_SHADOW_WEIGHT_LOAD_PLAN_ENV,
-                             "0").lower() in ("1", "true", "yes", "on")
+    enabled = get_env_flag(_SHADOW_WEIGHT_LOAD_PLAN_ENV, False)
     if not enabled:
         return None
 
@@ -717,6 +716,10 @@ def _load_weights_strips_compile_wrapper(model: torch.nn.Module) -> bool:
                    None) is DecoderModelForCausalLM.load_weights
 
 
+# Read once at import, so a bad value fails the launch instead of a refit.
+_REFIT_SKIP_WRAPPER_CHECK = get_env_flag("TLLM_REFIT_SKIP_WRAPPER_CHECK", False)
+
+
 def _assert_no_compile_wrapper_in_paths(model: torch.nn.Module) -> None:
     """Fail loudly if a torch.compile wrapper would make this reload a no-op.
 
@@ -731,7 +734,7 @@ def _assert_no_compile_wrapper_in_paths(model: torch.nn.Module) -> None:
     ``model_engine.unwrap_compiled_model_for_refit()``.
     """
     # Escape hatch, for reproducing the pre-guard behaviour on purpose.
-    if os.environ.get("TLLM_REFIT_SKIP_WRAPPER_CHECK") == "1":
+    if _REFIT_SKIP_WRAPPER_CHECK:
         return
     for name, _ in model.named_parameters():
         if "._orig_mod." in name or name.startswith("_orig_mod."):

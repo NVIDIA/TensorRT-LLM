@@ -29,7 +29,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
+from tensorrt_llm._utils import (get_env_flag, get_sm_version, is_sm_100f,
+                                 is_sm_120f)
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
@@ -2174,8 +2175,7 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-_USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
-                                           "1") == "1"
+_USE_FUSED_FP8_QUANT_PACK = get_env_flag("TRTLLM_FUSED_FP8_QUANT_PACK", True)
 
 
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
@@ -2710,8 +2710,7 @@ def _(
 # wins (agg TP2: only NCCL / ONESHOT are picked; ~1.24 GiB per rank of KV, GEMM-AR 803388).
 # TRTLLM_AR_TUNE_NCCL_SYMMETRIC=0 leaves it out of the candidates (no windows) and makes plain NCCL the cache-miss
 # fallback; the default keeps stock behavior.
-_AR_TUNE_NCCL_SYMMETRIC = os.environ.get("TRTLLM_AR_TUNE_NCCL_SYMMETRIC",
-                                         "1") == "1"
+_AR_TUNE_NCCL_SYMMETRIC = get_env_flag("TRTLLM_AR_TUNE_NCCL_SYMMETRIC", True)
 _AR_TUNE_NCCL_SYMMETRIC_LOGGED = False
 
 

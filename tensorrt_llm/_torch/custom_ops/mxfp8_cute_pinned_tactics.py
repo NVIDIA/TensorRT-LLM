@@ -12,15 +12,14 @@ FlashInfer runner (decode-graph capture, autotune); eager prefill takes other GE
 calls arm() for a model whose RuntimeHooks set mxfp8_pinned_tactics. Kill: TRTLLM_MXFP8_CUTE_PIN=0.
 """
 
-import os
 from typing import Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.logger import logger
 
-ENABLED = os.environ.get("TRTLLM_MXFP8_CUTE_PIN", "1") == "1"
+ENABLED = get_env_flag("TRTLLM_MXFP8_CUTE_PIN", True)
 MIN_ROWS = 33  # 1..32 rows keep FlashInfer's split-K low-M path (its tuned tactics there are split-K: not bitwise)
 MAX_BUCKET = 16384
 

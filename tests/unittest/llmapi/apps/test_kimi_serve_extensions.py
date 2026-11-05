@@ -26,6 +26,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm.serve.extensions import kimi_k3
 from tensorrt_llm.serve.extensions.kimi_k3 import (
     dynamic_tool_dicts,
     enforce_kimi_param_policy,
@@ -38,6 +39,7 @@ from tensorrt_llm.serve.openai_protocol import (
     _response_format_to_guided_decoding_params,
 )
 from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
+from tensorrt_llm.serve.tool_parser import kimi_k3_tool_parser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import (
     KimiK3ToolParser,
     _escape_attr,
@@ -541,18 +543,18 @@ class TestKimiParamPolicy:
     def _enable_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The policy is opt-in (off by default); these tests exercise its
         # enabled semantics as a KVV certification run would.
-        monkeypatch.setenv("TRTLLM_KIMI_PARAM_POLICY", "1")
+        monkeypatch.setattr(kimi_k3, "_KIMI_PARAM_POLICY_ENABLED", True)
 
     def enforce(self, **kwargs) -> ChatCompletionRequest:
         req = make_request(**kwargs)
         enforce_kimi_param_policy(req)
         return req
 
-    def test_policy_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("TRTLLM_KIMI_PARAM_POLICY", raising=False)
+    def test_policy_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(kimi_k3, "_KIMI_PARAM_POLICY_ENABLED", False)
         req = self.enforce(top_p=0.8, temperature=2.0, n=2)
-        # Existing deployments keep today's behavior: no rejection, no
-        # coercion, unless a certification run opts in with =1.
+        # With the policy off (the default), requests pass unchanged: no
+        # rejection and no coercion. A certification run turns the policy on.
         assert req.top_p == 0.8
         assert req.temperature == 2.0
         assert req.n == 2
@@ -589,14 +591,6 @@ class TestKimiParamPolicy:
         with pytest.raises(ValueError, match="n is fixed"):
             self.enforce(n=2)
 
-    def test_policy_env_off_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("TRTLLM_KIMI_PARAM_POLICY", "0")
-        req = self.enforce(top_p=0.8, temperature=2.0, n=2)
-        # Fully unconstrained: no rejection and no coercion.
-        assert req.top_p == 0.8
-        assert req.temperature == 2.0
-        assert req.n == 2
-
 
 class TestKimiResponseFormatGuidedDecoding:
     def test_thinking_mode_builds_triggered_tags_on_response_channel(self) -> None:
@@ -628,8 +622,8 @@ class TestKimiResponseFormatGuidedDecoding:
 
 
 class TestKimiK3StrictGrammar:
-    def build(self, monkeypatch: pytest.MonkeyPatch, tools: list, gate: str = "1") -> dict | None:
-        monkeypatch.setenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", gate)
+    def build(self, monkeypatch: pytest.MonkeyPatch, tools: list, gate: bool = True) -> dict | None:
+        monkeypatch.setattr(kimi_k3_tool_parser, "_STRICT_TOOL_GRAMMAR_ENABLED", gate)
         parser = KimiK3ToolParser()
         return parser.build_strict_structural_tag_format(
             [ChatCompletionToolsParam.model_validate(t) for t in tools]
@@ -638,7 +632,7 @@ class TestKimiK3StrictGrammar:
     def test_env_gate_off_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         strict = json.loads(json.dumps(WEATHER_TOOL))
         strict["function"]["strict"] = True
-        assert self.build(monkeypatch, [strict], gate="0") is None
+        assert self.build(monkeypatch, [strict], gate=False) is None
 
     def test_empty_tools_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         assert self.build(monkeypatch, []) is None

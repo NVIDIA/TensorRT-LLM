@@ -27,7 +27,7 @@ from typing import Any, Callable, List, NamedTuple, Optional
 
 from strenum import StrEnum
 
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import get_env_flag, mpi_rank
 from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
@@ -100,7 +100,7 @@ def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
 
 def get_spawn_proxy_process_env() -> bool:
     ''' Get the environment variable for the spawn proxy process dynamically. '''
-    return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS) == "1"
+    return get_env_flag(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS, False)
 
 
 def create_mpi_comm_session(

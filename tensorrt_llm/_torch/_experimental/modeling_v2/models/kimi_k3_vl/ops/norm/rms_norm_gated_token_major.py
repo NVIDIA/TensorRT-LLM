@@ -107,7 +107,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     (possibly copied), and the row-level multi-row or generic kernel is used.
     weight is made contiguous. Shape, gate-name and last-stride failures are
     rejected by the op.
-    The multi-row kernel uses PDL when TRTLLM_ENABLE_PDL is unset or 1, SM>=9.0,
+    The multi-row kernel uses PDL when TRTLLM_ENABLE_PDL is not 0, SM>=9.0,
     and the grid has fewer CTAs than SMs: wait before the first load, release
     dependents after the final store. The module-level RMSNorm instead takes
     z already row-aligned with x.

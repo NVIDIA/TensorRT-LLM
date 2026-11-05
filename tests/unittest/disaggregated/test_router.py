@@ -2586,10 +2586,11 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input(
     router_tokenizer.apply_chat_template.assert_not_called()
 
 
+@pytest.mark.parametrize("disable_value", ["1", "true"])
 def test_gpt_oss_router_respects_disable_harmony_adapter(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, disable_value: str) -> None:
     """Router follows the same DISABLE_HARMONY_ADAPTER gate as the server."""
-    monkeypatch.setenv("DISABLE_HARMONY_ADAPTER", "1")
+    monkeypatch.setenv("DISABLE_HARMONY_ADAPTER", disable_value)
     router = KvCacheAwareRouter(server_role=None,
                                 servers=["server1"],
                                 use_tokens=False,

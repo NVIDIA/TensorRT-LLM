@@ -56,10 +56,11 @@ Programmatic dependent launch (memory order and progress):
   progress does not depend on co-residency with the shared expert's kernels.
 """
 
-import os
 from typing import Dict, Optional, Tuple
 
 import torch
+
+from tensorrt_llm._utils import get_env_enable_pdl
 
 from ... import native_ops
 
@@ -136,7 +137,7 @@ DEFAULT_FLAGS = (
 
 
 def _pdl_enabled() -> bool:
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
+    return get_env_enable_pdl()
 
 
 def launch_config(rows: int = 1) -> Tuple[Tuple[int, int], Tuple[int, int], int]:

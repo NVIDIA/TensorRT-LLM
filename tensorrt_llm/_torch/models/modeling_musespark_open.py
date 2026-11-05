@@ -30,14 +30,13 @@ output rejoins through a norm-preserving gated residual add.
 
 import contextlib
 import copy
-import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.configs.musespark_open import SLIDING_ATTENTION, MuseSparkOpenConfig
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_debug_enabled, nvtx_range
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, RotaryScalingType
 
 from ...models.modeling_utils import QuantConfig
@@ -75,9 +74,7 @@ _NVTX_OFF = contextlib.nullcontext()
 
 
 def nvtx_layer_ranges_enabled() -> bool:
-    return (
-        os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or os.getenv("TLLM_NVTX_DEBUG", "0") == "1"
-    )
+    return nvtx_debug_enabled()
 
 
 class LayerNvtx:

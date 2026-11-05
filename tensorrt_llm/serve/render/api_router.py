@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from tensorrt_llm._utils import get_env_flag
 
 from .prompt_types import RenderedRequest
 from .resources import RenderResources
@@ -36,7 +37,7 @@ ENABLE_ENV = "TRTLLM_ENABLE_RENDER_ENDPOINTS"
 
 def render_endpoints_enabled() -> bool:
     """Whether a serving worker mounts the render routes."""
-    return os.getenv(ENABLE_ENV, "0") == "1"
+    return get_env_flag(ENABLE_ENV, False)
 
 
 def error_response(error: RenderRequestError) -> JSONResponse:

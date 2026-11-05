@@ -17,11 +17,12 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferId, LayerGroupId
@@ -80,7 +81,7 @@ class SparseOffloadState:
     compress_read_table: torch.Tensor
     read_table_valid: torch.Tensor
     debug_assert: bool = field(
-        default_factory=lambda: os.environ.get("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", "0") == "1"
+        default_factory=lambda: get_env_flag("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", False)
     )
     history_upload_done: torch.cuda.Event = field(default_factory=torch.cuda.Event)
     history_upload_pending: bool = False

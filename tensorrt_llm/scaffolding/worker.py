@@ -28,6 +28,7 @@ import openai
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.executor import GenerationExecutor, GenerationResult
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
 from tensorrt_llm.sampling_params import SamplingParams
@@ -223,8 +224,8 @@ class OpenaiWorker(Worker):
             "extra_body": copy.deepcopy(self.extra_body),
         }
 
-        if hasattr(task, "sub_request_markers") and os.environ.get(
-                'DEBUG_AGENT_HIERARCHY') == '1':
+        if hasattr(task, "sub_request_markers") and get_env_flag(
+                'DEBUG_AGENT_HIERARCHY', False):
             print(f"task.sub_request_markers is {task.sub_request_markers}")
 
         if not isinstance(task, ChatTask):

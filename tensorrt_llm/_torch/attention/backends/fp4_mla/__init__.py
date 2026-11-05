@@ -59,7 +59,6 @@ from .config import (
 )
 from .config import _ceil_div as _ceil_div
 from .config import _cutedsl_backend_available as _cutedsl_backend_available
-from .config import _env_enabled_default as _env_enabled_default
 from .config import _env_int as _env_int
 from .config import _fp4_mla_attention_backend as _fp4_mla_attention_backend
 from .config import (

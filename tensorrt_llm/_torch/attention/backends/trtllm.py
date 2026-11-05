@@ -35,8 +35,8 @@ if TYPE_CHECKING:
     from .fmha.interface import Fmha
     from .sparse.dsa.metadata import TokenMajorGenView
 
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
-                                 maybe_pin_memory, prefer_pinned)
+from tensorrt_llm._utils import (get_env_flag, get_sm_version, is_sm_100f,
+                                 is_sm_120f, maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
                                      RotaryScalingType)
@@ -2278,8 +2278,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return False
 
         # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
-        if not os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT",
-                              "1") == "1":
+        if not get_env_flag("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT", True):
             return False
 
         use_paged_context_fmha = (

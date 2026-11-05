@@ -22,8 +22,8 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
+from tensorrt_llm._utils import (confidential_compute_enabled, get_env_flag,
+                                 get_sm_version, is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -2295,8 +2295,8 @@ class KvCacheCreator:
                 "windows; keeping a separate draft KV cache.",
                 key="dflash_mixed_draft_windows_fallback")
             return False
-        if self._is_disagg and os.environ.get(
-                "TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1":
+        if self._is_disagg and not get_env_flag("TRTLLM_DISAGG_SHARED_DRAFT_KV",
+                                                False):
             return False
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
                 target_layout, draft_layout):
