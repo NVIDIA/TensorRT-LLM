@@ -164,7 +164,10 @@ async def _wait_for(predicate, timeout: float = 10.0) -> None:
         await asyncio.sleep(0.01)
 
 
-def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_path) -> None:
+@pytest.mark.parametrize("initial_status", [200, 503])
+def test_watchdog_counts_health_failures_only_after_the_launcher_answered(
+    tmp_path, initial_status
+) -> None:
     path = str(tmp_path / "launcher.sock")
     deaths = []
 
@@ -184,12 +187,11 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_pa
             # The launcher starts listening after its attached frontends: ~25
             # failed probes against a socket nobody serves yet are not fatal.
             await asyncio.sleep(0.5)
-            launcher = await asyncio.to_thread(_FakeLauncher, path, 503)
-            await _wait_for(lambda: launcher.health_hits >= 3)
             assert not deaths and not task.done()
-            launcher.health_status = 200
-            await _wait_for(lambda: launcher.health_hits >= 4)
-            launcher.health_status = 503
+            launcher = await asyncio.to_thread(_FakeLauncher, path, initial_status)
+            if initial_status == 200:
+                await _wait_for(lambda: launcher.health_hits >= 3)
+                launcher.health_status = 503
             await asyncio.wait_for(task, timeout=10)
         finally:
             task.cancel()
