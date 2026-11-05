@@ -324,7 +324,7 @@ def sass_function_sizes(lib: library.Library) -> Dict[str, int]:
     """SASS instructions per device function of the library (``cuobjdump -sass``), or an empty dict."""
     import os
     import re
-    import subprocess
+    import subprocess  # nosec B404 - runs cuobjdump with a fixed argv, no shell
 
     from torch.utils import cpp_extension
 

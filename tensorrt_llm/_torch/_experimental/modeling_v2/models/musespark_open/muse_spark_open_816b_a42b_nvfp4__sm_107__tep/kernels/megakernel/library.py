@@ -24,7 +24,7 @@ import hashlib
 import json
 import os
 import re
-import subprocess
+import subprocess  # nosec B404 - runs cuobjdump with a fixed argv, no shell
 import threading
 from dataclasses import dataclass
 from pathlib import Path
