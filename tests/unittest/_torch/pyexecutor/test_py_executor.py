@@ -65,6 +65,7 @@ from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -3179,6 +3180,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         enable_attention_dp=False,
         adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
         max_num_active_requests=max_num_active_requests,
+        canceled_req_ids=[],
         enable_iter_perf_stats=False,
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
@@ -3188,6 +3190,9 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         _kv_cache_capacity={},
     )
     seen = {}
+    stub._cancel_queued_context_requests = types.MethodType(
+        PyExecutor._cancel_queued_context_requests, stub
+    )
     stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
 
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
@@ -3265,6 +3270,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
         max_num_active_requests=4,
         is_benchmark_disagg=False,
+        canceled_req_ids=[],
         enable_iter_perf_stats=False,
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
@@ -3273,7 +3279,11 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
     )
-    for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
+    for name in (
+        "_get_request_admission_capacity",
+        "_pop_from_waiting_queue",
+        "_cancel_queued_context_requests",
+    ):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
     live = []
     stub._fetch_and_enqueue_requests = lambda queue, num_live: live.append(num_live)
@@ -3614,6 +3624,25 @@ def test_update_request_states_uses_common_dummy_cleanup():
     PyExecutor._update_request_states_tp(stub, scheduled_requests)
 
     stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
+
+
+@pytest.mark.parametrize("cp_type", [CpType.ULYSSES, CpType.RING, CpType.HELIX])
+def test_update_request_states_single_cp_rank_takes_tp_path(cp_type):
+    stub = Mock(dist=Mock(cp_config={"cp_type": cp_type}, cp_size=1))
+    scheduled_requests = Mock(context_requests=[])
+
+    PyExecutor._update_request_states(stub, scheduled_requests)
+
+    stub._update_request_states_tp.assert_called_once_with(scheduled_requests)
+
+
+def test_update_request_states_rejects_unsupported_cp_type_with_context_parallelism():
+    stub = Mock(dist=Mock(cp_config={"cp_type": CpType.ULYSSES}, cp_size=2))
+
+    with pytest.raises(NotImplementedError, match="Unsupported cp type ULYSSES"):
+        PyExecutor._update_request_states(stub, Mock(context_requests=[]))
+
+    stub._update_request_states_tp.assert_not_called()
 
 
 def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():

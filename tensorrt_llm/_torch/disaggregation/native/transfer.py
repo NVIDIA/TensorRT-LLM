@@ -38,6 +38,7 @@ except ImportError:
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -212,6 +213,21 @@ class WriteMeta:
     receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
+    transfer_bytes: Optional[int] = None
+
+
+def _capture_transfer_bytes(
+    sizes: np.ndarray, timer: Optional[PerfTimer], peer_rank: int
+) -> Optional[int]:
+    """Share one payload-size measurement without enabling performance logging."""
+    if timer is not None:
+        transfer_bytes = int(sizes.sum())
+        timer.record_transfer_sizes(peer_rank, transfer_bytes, int(sizes.size))
+        return transfer_bytes
+    with disagg_diagnostics.suppress_diagnostic_errors():
+        return int(sizes.sum())
+    return None
 
 
 class MessageType:
@@ -823,11 +839,50 @@ class Sender(SenderBase):
                 task.status = TaskStatus.TRANSFERRING
             return True
 
+    def _emit_kv_transfer_event(
+        self,
+        event: str,
+        write_meta: WriteMeta,
+        *,
+        worker_queue_index: Optional[int] = None,
+        include_transfer_entries: bool = False,
+        outcome: Optional[str] = None,
+    ) -> None:
+        """Emit descriptor-local evidence without affecting transfer execution."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            if write_meta.meta_type != WriteMetaType.KV or write_meta.src_ptrs.size == 0:
+                return
+            fields: dict[str, disagg_diagnostics.DiagnosticValue] = {}
+            if worker_queue_index is not None:
+                fields.update(
+                    is_last_slice=write_meta.is_last_slice, worker_queue_index=worker_queue_index
+                )
+            if include_transfer_entries:
+                fields["transfer_entries"] = int(write_meta.sizes.size)
+            if outcome is not None:
+                fields["outcome"] = outcome
+            disagg_diagnostics.emit_event(
+                event,
+                side="ctx",
+                request_id=write_meta.unique_rid,
+                request_id_scope=disagg_diagnostics.get_request_id_scope(write_meta.task._params),
+                rank_info=self._registrar.self_rank_info,
+                slice_id=write_meta.slice_id,
+                peer_rank=write_meta.peer_rank,
+                receiver_slice_id=write_meta.receiver_slice_id,
+                transfer_bytes=write_meta.transfer_bytes,
+                **fields,
+            )
+
     def _enqueue(self, write_meta: WriteMeta):
+        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            self._emit_kv_transfer_event(
+                "ctx_transfer_queued", write_meta, worker_queue_index=thread_idx
+            )
         # Route by (unique_rid, peer_rank) so that:
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
@@ -857,9 +912,26 @@ class Sender(SenderBase):
         task: SendTaskBase,
         peer_rank: int,
         request: TransferRequest,
+        on_submitted: Optional[Callable[[], None]] = None,
     ) -> tuple[bool, Optional[str]]:
-        if not self._owns_task(task):
+        owned = self._owns_task(task)
+        try:
+            # This query cannot submit a transfer. Reject before acquiring backend ownership.
+            if request.op == TransferOp.WRITE and not self._agent.check_remote_descs(
+                request.remote_name, request.dst_descs
+            ):
+                raise RuntimeError("NIXL WRITE remote descriptors unavailable")
+        except Exception as error:
+            if owned:
+                task.retire_unsubmitted_physical_operation(peer_rank)
+            raise _TransferNotSubmittedError(
+                "NIXL sender rejected transfer before backend submission"
+            ) from error
+        if not owned:
             status = self._agent.submit_transfer_requests(request)
+            if on_submitted is not None:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    on_submitted()
             completed = status.wait()
             detail = None if completed else getattr(status, "last_status_str", lambda: None)()
             return completed, detail
@@ -881,6 +953,9 @@ class Sender(SenderBase):
                 self._ownership_poisoned = error
                 task.mark_physical_operation_in_doubt(peer_rank)
             return False, str(error)
+        if on_submitted is not None:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                on_submitted()
         try:
             if not status.wait():
                 # A non-success query is a logical transfer failure, but the
@@ -940,6 +1015,10 @@ class Sender(SenderBase):
                     except Exception as e:
                         logger.warning(f"failed to send transfer rejection: {e}")
                     continue
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_kv_transfer_event(
+                        "ctx_worker_dequeued", write_meta, worker_queue_index=thread_idx
+                    )
                 try:
                     if write_meta.meta_type == WriteMetaType.AUX:
                         logger.debug(
@@ -1126,6 +1205,16 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         submitted_and_completed = False
+        backend_submitted = False
+        submission_callback: Optional[Callable[[], None]] = None
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+
+            def emit_submitted() -> None:
+                nonlocal backend_submitted
+                backend_submitted = True
+                self._emit_kv_transfer_event("ctx_backend_submitted", write_meta)
+
+            submission_callback = emit_submitted
         if write_meta.src_ptrs.size > 0:
             try:
                 request = Sender._make_agent_request(write_meta, device_id=self._device_id)
@@ -1154,8 +1243,16 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_kv_transfer_event(
+                        "ctx_backend_submit_start", write_meta, include_transfer_entries=True
+                    )
+
                 transfer_finished, last_status = self._submit_transfer(
-                    task, write_meta.peer_rank, request
+                    task,
+                    write_meta.peer_rank,
+                    request,
+                    on_submitted=submission_callback,
                 )
                 if transfer_finished:
                     submitted_and_completed = True
@@ -1186,6 +1283,13 @@ class Sender(SenderBase):
             task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            if backend_submitted and agent_result != AgentResult.IN_DOUBT:
+                self._emit_kv_transfer_event(
+                    "ctx_backend_complete",
+                    write_meta,
+                    outcome=("completed" if agent_result == AgentResult.SUCCESS else "failed"),
+                )
 
         # Attested written bytes: only what was actually submitted to the
         # agent AND completed. The receiver checks the per-slice sum against
@@ -1543,7 +1647,9 @@ class Sender(SenderBase):
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, int(kv_sizes.sum()), dst_frags.size)
+        transfer_bytes = None
+        if timer is not None or disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            transfer_bytes = _capture_transfer_bytes(kv_sizes, timer, peer_ri.instance_rank)
 
         return WriteMeta(
             task=task,
@@ -1559,6 +1665,7 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
+            transfer_bytes=transfer_bytes,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1814,6 +1921,10 @@ class Sender(SenderBase):
             return
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
+        received_timestamp = None
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                received_timestamp = disagg_diagnostics.capture_timestamp()
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             fenced = (
@@ -1822,11 +1933,28 @@ class Sender(SenderBase):
             )
             if session is None and not fenced:
                 self._save_peer_req_info(info)
-                return
+        if received_timestamp is not None:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.emit_event(
+                    "ctx_request_data_received",
+                    side="ctx",
+                    request_id=info.unique_rid,
+                    request_id_scope=(
+                        disagg_diagnostics.get_request_id_scope(session._base_args.params)
+                        if session is not None
+                        else "unknown"
+                    ),
+                    rank_info=self._registrar.self_rank_info,
+                    slice_id=info.slice_id,
+                    peer_rank=info.instance_rank,
+                    peer_instance=info.instance_name,
+                    timestamp=received_timestamp,
+                )
         if fenced:
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
-        assert session is not None
+        if session is None:
+            return
         with session.lock:
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
@@ -2236,6 +2364,35 @@ class TxSession(TxSessionBase):
         )
         return f"{prefix} operation_phases=[{phases}] unavailable_tasks={busy_tasks}"
 
+    def _emit_deadline_event(self, event: str, timer_start_s: float | None = None) -> None:
+        """Observe the native wait deadline without changing its policy.
+
+        Args:
+            event: Deadline-creation or expiry-observation event name.
+            timer_start_s: Existing monotonic clock reading that anchored the deadline.
+        """
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            deadline = self._deadline_monotonic_s
+            if deadline is None:
+                return
+            timeout_s = self._overall_timeout_s
+            if timeout_s is None or timeout_s <= 0:
+                timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+            disagg_diagnostics.emit_event(
+                event,
+                side="ctx",
+                request_id=self.disagg_request_id,
+                request_id_scope=disagg_diagnostics.get_request_id_scope(self._base_args.params),
+                local_request_id=self.request_id,
+                rank_info=self._sender._registrar.self_rank_info,
+                timeout_owner="native_tx_session",
+                timer_start_monotonic_ns=(
+                    int(timer_start_s * 1_000_000_000) if timer_start_s is not None else None
+                ),
+                deadline_monotonic_ns=int(deadline * 1_000_000_000),
+                timeout_ms=timeout_s * 1000,
+            )
+
     def send(self, chunk: Chunk) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
@@ -2246,7 +2403,10 @@ class TxSession(TxSessionBase):
                 overall_timeout_s = self._overall_timeout_s
                 if overall_timeout_s is None or overall_timeout_s <= 0:
                     overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
-                self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+                timeout_start = time.monotonic()
+                self._deadline_monotonic_s = timeout_start + overall_timeout_s
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_deadline_event("ctx_native_deadline_started", timeout_start)
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
@@ -2478,7 +2638,10 @@ class TxSession(TxSessionBase):
                 overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
             with self.lock:
                 if self._deadline_monotonic_s is None:
-                    self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+                    timeout_start = time.monotonic()
+                    self._deadline_monotonic_s = timeout_start + overall_timeout_s
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        self._emit_deadline_event("ctx_native_deadline_started", timeout_start)
 
         # ``_timeout_s`` bounds one scheduler wait slice. The separate absolute
         # deadline is shared by every KV task and aux; it is never reset by a
@@ -2511,6 +2674,8 @@ class TxSession(TxSessionBase):
                                 if self.has_failed()
                                 else WaitResult.COMPLETED
                             )
+                        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                            self._emit_deadline_event("ctx_native_deadline_observed")
                         return WaitResult.TIMEOUT
                 timeout_s = wait_slice_s if remaining_s is None else min(wait_slice_s, remaining_s)
                 task.wait(timeout=timeout_s)
@@ -3044,22 +3209,47 @@ class Receiver(ReceiverBase):
             for rank in peer_overlap.ranks:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
+                send_timestamp = None
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        send_timestamp = disagg_diagnostics.capture_timestamp()
                 self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+                if send_timestamp is not None:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "gen_request_data_sent",
+                            side="gen",
+                            request_id=receiver_req.unique_rid,
+                            request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
+                            rank_info=self._registrar.self_rank_info,
+                            slice_id=receiver_req.slice_id,
+                            peer_rank=rank,
+                            timestamp=send_timestamp,
+                        )
             return
 
         peer_ranks = list(peer_overlap.ranks)
         published_writers: set[int] = set()
+        published_writer_timestamps: Optional[
+            list[tuple[int, disagg_diagnostics.DiagnosticTimestamp]]
+        ] = [] if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED else None
 
         def publish_requests() -> None:
             for rank in peer_ranks:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
+                send_timestamp = None
+                if published_writer_timestamps is not None:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        send_timestamp = disagg_diagnostics.capture_timestamp()
                 published_writers.add(rank)
                 try:
                     self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
                 except Exception:
                     published_writers.discard(rank)
                     raise
+                if published_writer_timestamps is not None and send_timestamp is not None:
+                    published_writer_timestamps.append((rank, send_timestamp))
 
         # Gen-first ADP publishes the destination to every eligible DP group,
         # but the qualified immutable-request, no-retry/no-reroute profile
@@ -3068,15 +3258,30 @@ class Receiver(ReceiverBase):
         writer_cohort = (
             set(peer_ranks) if sender_dp_rank is not None or peer_infos.dp_size == 1 else None
         )
-        if not session.try_begin_transfer(
-            task.slice_id,
-            sender_endpoints,
-            writer_cohort,
-            writer_candidates=set(peer_ranks),
-            publish=publish_requests,
-            published_writers=published_writers,
-        ):
-            task.cancel_unpublished()
+        try:
+            if not session.try_begin_transfer(
+                task.slice_id,
+                sender_endpoints,
+                writer_cohort,
+                writer_candidates=set(peer_ranks),
+                publish=publish_requests,
+                published_writers=published_writers,
+            ):
+                task.cancel_unpublished()
+        finally:
+            if published_writer_timestamps:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    for rank, send_timestamp in published_writer_timestamps:
+                        disagg_diagnostics.emit_event(
+                            "gen_request_data_sent",
+                            side="gen",
+                            request_id=receiver_req.unique_rid,
+                            request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
+                            rank_info=self._registrar.self_rank_info,
+                            slice_id=receiver_req.slice_id,
+                            peer_rank=rank,
+                            timestamp=send_timestamp,
+                        )
 
     @staticmethod
     def _extract_info_endpoint(params: DisaggregatedParams) -> str:
@@ -3241,16 +3446,41 @@ class Receiver(ReceiverBase):
             _KV_RESULT_FRAME.unpack(message[1])
         )
         session = self._get_session(unique_rid)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                diagnostic_result = _AGENT_RESULT_BY_CODE.get(status_code)
+                disagg_diagnostics.emit_event(
+                    "gen_writer_result_received",
+                    side="gen",
+                    request_id=unique_rid,
+                    request_id_scope=(
+                        disagg_diagnostics.get_request_id_scope(session._base_args.params)
+                        if session is not None
+                        else "unknown"
+                    ),
+                    rank_info=self._registrar.self_rank_info,
+                    slice_id=receiver_slice_id,
+                    peer_rank=peer_rank,
+                    outcome=(
+                        diagnostic_result.value.lower()
+                        if diagnostic_result is not None
+                        else f"unknown:{status_code}"
+                    ),
+                    is_last_slice=is_last_slice,
+                    transfer_bytes=transfer_size,
+                    session_found=session is not None,
+                )
         if session is None:
             logger.warning(
                 f"_process_kv_agent_result: session {unique_rid} not found (already closed?), dropping status"
             )
             return
+        agent_result = _AGENT_RESULT_BY_CODE[status_code]
         session.process_kv_agent_result(
             peer_rank,
             receiver_slice_id,
             is_last_slice,
-            _AGENT_RESULT_BY_CODE[status_code],
+            agent_result,
             transfer_size=transfer_size,
         )
 
@@ -3746,6 +3976,10 @@ class RxSession(RxSessionBase):
                 # Once every expected writer has reported success for the last slice, complete the
                 # task and log perf, unless the task has already failed.
                 if is_last_slice and all_succeeded and task.status != TaskStatus.ERROR:
+                    destination_timestamp = None
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            destination_timestamp = disagg_diagnostics.capture_timestamp()
                     task.complete()
                     # Record completion before best-effort diagnostics.
                     if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
@@ -3760,6 +3994,22 @@ class RxSession(RxSessionBase):
                             f"KV transfer perf logging failed for request {self.request_id} "
                             f"slice={receiver_slice_id}: {e}"
                         )
+                    if destination_timestamp is not None:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_event(
+                                "gen_destination_complete",
+                                side="gen",
+                                request_id=self.disagg_request_id,
+                                request_id_scope=disagg_diagnostics.get_request_id_scope(
+                                    task._params
+                                ),
+                                local_request_id=self.request_id,
+                                rank_info=ri,
+                                slice_id=receiver_slice_id,
+                                peer_rank=peer_rank,
+                                outcome="completed",
+                                timestamp=destination_timestamp,
+                            )
                     logger.debug(
                         f"KV transfer complete for request {self.request_id} "
                         f"slice={receiver_slice_id}"
@@ -4243,6 +4493,15 @@ class TransferWorker:
         self._setup_transfer_engine()
         if self._retirement_watchdog is not None:
             self._retirement_watchdog.start()
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.emit_event(
+                    "diagnostic_profile",
+                    side="runtime",
+                    request_id=None,
+                    rank_info=self._rank_info,
+                    profile="native_v1",
+                )
 
     def _on_quiescence_fatal(self, event: QuiescenceFatalEvent) -> None:
         """Forward fatal evidence while rooting all worker-owned resources.

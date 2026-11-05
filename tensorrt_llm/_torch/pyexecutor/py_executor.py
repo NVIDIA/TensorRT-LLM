@@ -59,6 +59,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
+from ..disaggregation import diagnostics as disagg_diagnostics
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
 from ..disaggregation.orchestration.admission import \
@@ -8206,6 +8207,7 @@ class PyExecutor:
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
+        self._cancel_queued_context_requests(waiting_queue)
 
         # 3. Pop requests from waiting queue
         new_requests, placement = self._pop_from_waiting_queue(
@@ -8251,6 +8253,77 @@ class PyExecutor:
                               exclude_last_generation_logits=self.
                               _should_exclude_last_generation_logits(),
                               is_disagg=self.kv_cache_transceiver is not None)
+
+    def _cancel_queued_context_requests(self,
+                                        waiting_queue: WaitingQueue) -> None:
+        """Finish cancelled CTX work before admission or rank placement.
+
+        The executor loop serializes removal with activation. Entries already
+        activated remain on the existing active-request cancellation path.
+        No model, KV, or transfer resources have been acquired for these raw
+        entries, so only a terminal response is emitted, not resource teardown.
+
+        Args:
+            waiting_queue: Replicated queue of accepted, unactivated requests.
+        """
+        if not self.canceled_req_ids or self.kv_connector_manager is not None:
+            return
+        cancelled_ids = set(self.canceled_req_ids)
+        cancelled_items = [
+            item for item in waiting_queue
+            if item.id in cancelled_ids and item.request is not None and
+            item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY
+        ]
+        if not cancelled_items:
+            return
+        handled_ids = {item.id for item in cancelled_items}
+        waiting_queue.remove_by_ids(handled_ids)
+        self.canceled_req_ids[:] = [
+            req_id for req_id in self.canceled_req_ids
+            if req_id not in handled_ids
+        ]
+        if self.dist.rank == 0:
+            # Discard parent/child timing records without counting admission.
+            self.executor_request_queue.calculate_queue_latency(
+                cancelled_items, time.time())
+
+        # Before ADP placement every rank owns the same raw queue. Contribute
+        # one copy to the existing response gather, including empty peer lists.
+        emit_response = self.dist.rank == 0 or (self.gather_all_responses and
+                                                not self.enable_attention_dp)
+        responses = []
+        for item in cancelled_items if emit_response else ():
+            raw = item.request
+            # Reuse native beam/sequence completion and result serialization,
+            # without activation or copying multimodal/LoRA execution inputs.
+            request = LlmRequest(
+                request_id=item.id,
+                max_new_tokens=raw.max_tokens,
+                input_tokens=raw.get_input_token_ids_array(),
+                sampling_config=raw.sampling_config,
+                is_streaming=raw.streaming,
+                draft_tokens=None,
+                exclude_input_from_output=raw.output_config.
+                exclude_input_from_output,
+                client_id=raw.client_id
+                if raw.client_id is not None else item.id,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+                return_perf_metrics=raw.output_config.return_perf_metrics,
+            )
+            for child_id in item.child_req_ids or ():
+                request.create_child_request(child_id)
+            for sequence in (request, *request.child_requests):
+                sequence.finish_by_reason(FinishReason.CANCELLED)
+                response = sequence.create_response()
+                if response is not None:
+                    responses.append((item.id, response))
+        # This replicated pre-admission boundary also runs on idle PP passes;
+        # do not wait for a model batch or flush unrelated resource teardown.
+        self._enqueue_responses(responses)
+        if self.dist.rank == 0 or self.gather_all_responses:
+            with self.response_cv:
+                for req_id in handled_ids:
+                    self.result_wait_queues.pop(req_id, None)
 
     def _handle_special_queue_items(
             self,
@@ -8339,6 +8412,23 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for request in validated_requests:
+                    if not request.is_disagg_generation_init_state:
+                        continue
+                    prompt_tokens = getattr(request, "total_input_len_cp", None)
+                    if prompt_tokens is None:
+                        prompt_tokens = request.prompt_len
+                    disagg_diagnostics.emit_request_event(
+                        "gen_ingress",
+                        request,
+                        side="gen",
+                        rank=self.global_rank,
+                        dist=self.dist,
+                        prompt_tokens=prompt_tokens,
+                        state=request.state.name,
+                    )
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -9595,6 +9685,19 @@ class PyExecutor:
                     prepare(req)
 
             self._maybe_prepend_logprobs_and_logits(req, beam_width)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    prompt_tokens = getattr(req, "total_input_len_cp", None)
+                    if prompt_tokens is None:
+                        prompt_tokens = req.prompt_len
+                    disagg_diagnostics.emit_request_event(
+                        "gen_decode_ready",
+                        req,
+                        side="gen",
+                        rank=self.global_rank,
+                        dist=self.dist,
+                        prompt_tokens=prompt_tokens,
+                    )
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
@@ -10074,7 +10177,8 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
+        # A cp_type takes effect only with context parallelism on.
+        if 'cp_type' in cp_config and self.dist.cp_size > 1:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.HELIX:
                 # Take the usual route with _update_request_states_tp().
@@ -10522,6 +10626,19 @@ class PyExecutor:
             )
         self.sampler.release_request(request)
         self.resource_manager.free_resources(request)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if request.is_context_only_request:
+                    disagg_diagnostics.emit_request_event(
+                        "ctx_source_kv_released",
+                        request,
+                        side="ctx",
+                        rank=self.global_rank,
+                        dist=self.dist,
+                        prompt_tokens=request.prompt_len,
+                        state=request.state.name,
+                        source_kv_request_owned=False,
+                    )
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
         for engine in (self.model_engine, self.draft_model_engine):
