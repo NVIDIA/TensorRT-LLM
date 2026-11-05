@@ -43,6 +43,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantMode
 
 
@@ -1214,6 +1215,30 @@ def test_sequence_lengths_are_live_source_view() -> None:
     torch.testing.assert_close(actual, torch.tensor([33, 65], dtype=torch.int32))
 
 
+@pytest.mark.parametrize("enabled_libs", ["prims_ts", "trtllm-gen"])
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_mla_non_fp8_has_no_token_scaled_workspace_reservation(
+    monkeypatch: pytest.MonkeyPatch, enabled_libs: str, attention_dp: bool
+) -> None:
+    monkeypatch.setenv("TLLM_FMHA_LIBS", enabled_libs)
+    monkeypatch.setattr("tensorrt_llm._torch.attention.backends.trtllm.get_sm_version", lambda: 100)
+    config = SimpleNamespace(
+        model_type="deepseek_v3",
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
+        num_attention_heads=16,
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        quant_config=SimpleNamespace(quant_mode=QuantMode(0)),
+        sparse_attention_config=None,
+    )
+    mapping = Mapping(world_size=2, tp_size=2, enable_attention_dp=attention_dp)
+    assert TrtllmAttention.runtime_workspace_bytes_per_token(model_config, mapping) == 0
+
+
 @pytest.mark.parametrize("num_heads", [6, 96])
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("mask", [PredefinedAttentionMask.CAUSAL, PredefinedAttentionMask.FULL])
@@ -1296,6 +1321,18 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.run.call_args.kwargs["out"] is output
     assert wrapper.run.call_args.args[1].shape == (9, num_heads, head_dim)
     assert wrapper.run.call_args.args[2].shape == (9, num_heads, v_head_dim)
+    layout, workspace_bytes = fmha._mla_context_workspace_layout(q, k, 2)
+    assert ("v" in layout) is fp8
+    processed_v = wrapper.run.call_args.args[2]
+    if fp8:
+        assert processed_v.is_contiguous()
+        assert processed_v.data_ptr() != v.data_ptr()
+    else:
+        assert processed_v.data_ptr() == v.data_ptr()
+        assert processed_v.stride() == (v.stride(0), v_head_dim, 1)
+        assert native_preprocess.call_args.args[-3] is v
+        longer_k = torch.empty(17, num_heads * head_dim, dtype=q.dtype)
+        assert fmha._mla_context_workspace_layout(q, longer_k, 2)[1] == workspace_bytes
     assert wrapper.plan.call_args.kwargs["head_dim"] == head_dim
     assert wrapper.plan.call_args.kwargs["head_dim_vo"] == v_head_dim
     assert wrapper.plan.call_args.kwargs["store_softmax_stats"] is store_softmax_stats

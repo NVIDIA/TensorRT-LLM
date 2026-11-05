@@ -123,6 +123,20 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
         )
         for history, tensor in ((True, k), (True, v), (False, k), (False, v))
     )
+
+    def strided_value(value: torch.Tensor) -> torch.Tensor:
+        padding = case.num_heads * case.qk_nope_head_dim
+        storage = torch.full(
+            (value.shape[0], padding + value.shape[1]),
+            32.0,
+            dtype=value.dtype,
+            device=value.device,
+        )
+        view = storage[:, padding:]
+        view.copy_(value)
+        return view
+
+    v, historical_v, fresh_v = map(strided_value, (v, historical_v, fresh_v))
     reference = _ragged_causal_reference(q, k, v, case)
     atol, rtol = _tolerances(case, kv_dtype)
     attn = create_attention(

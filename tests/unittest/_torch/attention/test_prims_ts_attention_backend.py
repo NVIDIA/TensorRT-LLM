@@ -577,10 +577,11 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("strided_v", [False, True])
 @pytest.mark.parametrize("kv_length", [0, 5])
-def test_prims_ts_mla_context_quantize_layout(
-    head_dim: int, v_head_dim: int, dtype: torch.dtype, strided_v: bool, kv_length: int
+@pytest.mark.parametrize("fp8", [False, True])
+def test_prims_ts_mla_context_preprocess_layout(
+    head_dim: int, v_head_dim: int, dtype: torch.dtype, strided_v: bool, kv_length: int, fp8: bool
 ) -> None:
-    """Cached-partition preprocessing preserves Q/K and packs the actual V row stride."""
+    """Preserve non-FP8 views; quantize FP8 from the actual V row stride."""
     from tensorrt_llm.quantization.mode import QuantMode
 
     torch.manual_seed(1729)
@@ -594,12 +595,19 @@ def test_prims_ts_mla_context_quantize_layout(
     v = v_storage[:, padding:]
     v.copy_(torch.randn_like(v))
     originals = tuple(tensor.clone() for tensor in (q, k, v))
-    processed = tuple(
-        torch.empty(tensor.shape, dtype=torch.float8_e4m3fn, device="cuda") for tensor in (q, k, v)
+    processed = (
+        tuple(
+            torch.empty(tensor.shape, dtype=torch.float8_e4m3fn, device="cuda")
+            for tensor in (q, k, v)
+        )
+        if fp8
+        else (q, k, v)
     )
     # No RoPE/cache append is performed for an already-prepared cached partition.
     # Supply a real pool so the native page-table carrier is valid nonetheless.
-    pool = torch.zeros(1, page_size, 576, device="cuda", dtype=torch.float8_e4m3fn)
+    pool = torch.zeros(
+        1, page_size, 576, device="cuda", dtype=torch.float8_e4m3fn if fp8 else dtype
+    )
     block_offsets = torch.zeros(1, 1, 2, 1, device="cuda", dtype=torch.int32)
     pool_pointers = torch.tensor([[pool.data_ptr(), 0]], dtype=torch.int64)
     pool_mapping = torch.zeros(1, 2, dtype=torch.int32)
@@ -628,7 +636,7 @@ def test_prims_ts_mla_context_quantize_layout(
         0,
         page_size,
         page_size,
-        int(QuantMode.FP8_KV_CACHE),
+        int(QuantMode.from_description(use_fp8_kv_cache=fp8)),
         0.125,
         *processed,
         bmm1_scale,
@@ -636,12 +644,18 @@ def test_prims_ts_mla_context_quantize_layout(
     )
     for original, actual, result in zip(originals, (q, k, v), processed, strict=True):
         torch.testing.assert_close(actual, original, atol=0, rtol=0)
-        expected = (original.float() * 2.0).to(torch.float8_e4m3fn).float()
+        expected = (
+            (original.float() * 2.0).to(torch.float8_e4m3fn).float() if fp8 else original.float()
+        )
         torch.testing.assert_close(result.float(), expected, atol=0, rtol=0)
-    torch.testing.assert_close(
-        bmm1_scale, torch.tensor([0.03125, 0.03125 * math.log2(math.e)], device="cuda")
-    )
-    torch.testing.assert_close(bmm2_scale, dequant_scale)
+        if not fp8:
+            assert result.data_ptr() == actual.data_ptr()
+            assert result.stride() == actual.stride()
+    if fp8:
+        torch.testing.assert_close(
+            bmm1_scale, torch.tensor([0.03125, 0.03125 * math.log2(math.e)], device="cuda")
+        )
+        torch.testing.assert_close(bmm2_scale, dequant_scale)
 
 
 @pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
