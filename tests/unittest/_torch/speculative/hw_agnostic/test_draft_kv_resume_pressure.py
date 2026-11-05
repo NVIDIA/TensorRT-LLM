@@ -212,7 +212,6 @@ def test_separate_draft_chunked_prefill_fits_the_pool(extra_tokens):
     """Without reuse, reserve the target chunk instead of the full draft prompt."""
     manager, cache = _manager(resume_ok=True)
     manager._mirror_uses_draft_view = True
-    manager.has_separate_draft_kv_cache = True
     manager.num_extra_kv_tokens = extra_tokens
     manager.kv_cache_map = {7: cache}
     manager._gpu_max_tokens = 1024 + extra_tokens
@@ -233,7 +232,6 @@ def test_separate_draft_chunked_prefill_fits_the_pool(extra_tokens):
 def test_separate_draft_does_not_add_draft_tokens_before_last_chunk():
     manager, cache = _manager(resume_ok=True)
     manager._mirror_uses_draft_view = True
-    manager.has_separate_draft_kv_cache = True
     manager.num_extra_kv_tokens = 2
     req = _Req(7)
     req.prompt_len = 4096

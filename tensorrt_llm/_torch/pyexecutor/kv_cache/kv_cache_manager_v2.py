@@ -1850,8 +1850,6 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
-    # Separate one-model draft pools follow the target request cursor.
-    has_separate_draft_kv_cache: bool = False
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (MambaHybridCacheManagerV2); 0 = none.
     inforward_snapshot_rows: int = 0
@@ -1937,7 +1935,6 @@ class KVCacheManagerV2(BaseResourceManager):
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
-        has_separate_draft_kv_cache: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
@@ -2180,7 +2177,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # KvCacheCreator owns the pairing decision; never re-derive it here, or
         # the two predicates drift apart and so do the two pools.
         self.enable_joint_kv_cache_reuse = joint_kv_cache_reuse
-        self.has_separate_draft_kv_cache = is_draft and has_separate_draft_kv_cache
         # A draft manager only publishes to its radix tree when it is paired.
         self._can_publish_block_reuse = joint_kv_cache_reuse or not self.is_draft
         # Prompt tokens past a position that one-model draft layers read. The lender's refusal
@@ -6289,10 +6285,8 @@ class KVCacheManagerV2(BaseResourceManager):
         IndexMapper contains the correct request IDs. With block reuse, the
         scheduler pre-creates context caches to coordinate the reusable prefix.
         """
-        # Separate one-model draft pools and joint reuse follow target progress.
-        use_draft_view = self._mirror_uses_draft_view and not (
-            self.enable_joint_kv_cache_reuse or self.has_separate_draft_kv_cache
-        )
+        # Draft mirrors follow target progress when sizing the cache.
+        use_draft_view = False
         with request_context(use_draft_view, scheduled_batch):
             for req in scheduled_batch.context_requests:
                 kv_cache = self._mirror_draft_kv_cache(req)
