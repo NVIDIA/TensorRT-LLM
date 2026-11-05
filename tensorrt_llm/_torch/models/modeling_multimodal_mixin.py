@@ -16,6 +16,7 @@
 
 import contextlib
 import copy
+import functools
 import itertools
 from dataclasses import dataclass
 from typing import (
@@ -45,6 +46,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
+    _batch_item_values,
     select_multimodal_fields,
 )
 from tensorrt_llm.logger import logger
@@ -93,6 +95,12 @@ class EncoderGroup:
     splits the output back per-modality and reorders it into prompt order
     via each request's `MultimodalItemMetadata.item_refs` manifest.
 
+    By default the group batches the payload keys that each request declares
+    in `MultimodalItemMetadata.input_partitions`
+    (`build_batched_input_by_partitions`), so `encoder_fn` takes those keys
+    as kwargs. A model passes its own `build_batched_input` only when its
+    packing differs.
+
     Contract between `build_batched_input` and `encoder_fn`:
 
     * `build_batched_input` must concatenate items across requests in
@@ -113,18 +121,298 @@ class EncoderGroup:
     `modalities[0]`, then all items of `modalities[1]`, etc."""
 
     encoder_fn: Callable[..., torch.Tensor]
-    """Encoder call invoked as `encoder_fn(**build_batched_input(params))`.
-    Returns a single tensor with one row per embedding, laid out per the
+    """Encoder call invoked as `encoder_fn(**build_batched_input(params))`,
+    normally once per group (see `encode_multimodal_by_groups`). Returns a
+    single tensor with one row per embedding, laid out per the
     contract above. When those rows are already in prompt order, the
     framework may return a row slice of this tensor without a copy, so it
     must not alias storage that a later call overwrites (for example, a CUDA
     graph's static output buffer); clone such outputs before returning
     them."""
 
-    build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
+    build_batched_input: Optional[Callable[[List[MultimodalParams]], Dict[str, Any]]] = None
     """Builds the kwargs dict passed to `encoder_fn`. Responsible for
     concatenating raw per-item tensors from `multimodal_data` across
-    requests in the order described in the class docstring."""
+    requests in the order described in the class docstring. None binds
+    `build_batched_input_by_partitions` for this group's modalities."""
+
+    def __post_init__(self) -> None:
+        if self.build_batched_input is None:
+            # Frozen dataclasses require object.__setattr__ during construction.
+            object.__setattr__(
+                self,
+                "build_batched_input",
+                functools.partial(build_batched_input_by_partitions, self.modalities),
+            )
+
+
+def build_batched_input_by_partitions(
+    modalities: Sequence[str], multimodal_params: Sequence[MultimodalParams]
+) -> Dict[str, Any]:
+    """Batch each declared payload key across requests (default builder).
+
+    Visits payloads in `modalities` order, then request order, and batches each
+    key declared in the request's `MultimodalItemMetadata.input_partitions`
+    as `batch_by_item_partitions` does. Only declared keys reach the encoder;
+    a key that several modalities declare (for example `pixel_values` for
+    image and video) batches their items in modality order.
+    """
+    return _batch_fields(_gather_fields(modalities, multimodal_params)[0])
+
+
+# Marks a key whose payloads declare different item axes or padding values.
+_MIXED_POLICY = object()
+
+
+def _gather_fields(
+    modalities: Sequence[str], multimodal_params: Sequence[MultimodalParams]
+) -> Tuple[Dict[str, List[Any]], bool]:
+    """Collect every declared key's values in one pass, modality then request order.
+
+    Returns `{key: [item_axis, padding_value, values]}` and whether the
+    payloads of each modality provide the same keys. Each key's partition,
+    declared by the input processor, says how to batch it, so batching needs
+    no per-item inspection.
+    """
+    fields: Dict[str, List[Any]] = {}
+    same_keys = True
+    for modality in modalities:
+        modality_fields: Dict[str, List[Any]] = {}
+        payloads = 0
+        for param in multimodal_params:
+            data = param.multimodal_data.get(modality)
+            if data is None:
+                continue
+            metadata = param.multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+            partitions = (
+                metadata.input_partitions.get(modality)
+                if isinstance(metadata, MultimodalItemMetadata)
+                else None
+            )
+            if partitions is None:
+                # No record, a record of the wrong type or no partitions: raises its error.
+                partitions = _declared_partitions(param, modality)
+            payloads += 1
+            for key, value in data.items():  # Present keys; only declared ones are kept.
+                partition = partitions.get(key)
+                if partition is None or value is None:
+                    continue
+                axis, lengths = partition.item_axis, partition.item_lengths
+                if (
+                    lengths is not None
+                    and axis is not None
+                    and sum(lengths)
+                    != (len(value) if isinstance(value, (list, tuple)) else value.shape[axis])
+                ):
+                    raise ValueError("Packed field size does not match its item lengths")
+                field = modality_fields.get(key)
+                if field is None:
+                    modality_fields[key] = [axis, partition.padding_value, [value]]
+                    continue
+                if field[0] != axis or field[1] != partition.padding_value:
+                    field[0] = _MIXED_POLICY
+                field[2].append(value)
+        for key, (axis, padding_value, values) in modality_fields.items():
+            same_keys = same_keys and len(values) == payloads
+            field = fields.get(key)
+            if field is None:
+                fields[key] = [axis, padding_value, values]
+                continue
+            if field[0] != axis or field[1] != padding_value:
+                field[0] = _MIXED_POLICY
+            field[2].extend(values)
+    return fields, same_keys
+
+
+def _batch_fields(fields: Dict[str, List[Any]]) -> Dict[str, Any]:
+    """Batch each gathered key once: a shared value as is, item values in one pass."""
+    batch = {}
+    for key, (axis, padding_value, values) in fields.items():
+        if axis is _MIXED_POLICY:
+            raise ValueError("Pieces of one field must share their item axis and padding value")
+        batch[key] = values[0] if axis is None else _batch_item_values(values, axis, padding_value)
+    return batch
+
+
+def _share_one_call(fields: Dict[str, List[Any]], same_keys: bool) -> bool:
+    """Whether gathered payloads can share one encoder call, the usual case.
+
+    One check per key: its payloads share an item axis and padding value,
+    shared values are one object or equal records, and item values are
+    tensors of one dtype or all lists. Otherwise `_call_units` decides how to
+    split, which also covers shared tensors that are not one object.
+    """
+    if not same_keys:
+        return False
+    for axis, _, values in fields.values():
+        first = values[0]
+        if axis is _MIXED_POLICY:
+            return False
+        if axis is None:
+            for value in values:
+                if value is not first and (
+                    isinstance(value, torch.Tensor)
+                    or isinstance(first, torch.Tensor)
+                    or not first == value
+                ):
+                    return False
+        elif len({getattr(value, "dtype", None) for value in values}) > 1:
+            return False
+    return True
+
+
+def _declared_partitions(
+    param: MultimodalParams, modality: str
+) -> Dict[str, MultimodalItemPartition]:
+    """Read the input partitions a request declares for one modality."""
+    metadata = param.item_metadata
+    partitions = None if metadata is None else metadata.input_partitions.get(modality)
+    if partitions is None:
+        raise MultimodalEncoderContractError(
+            f"The {modality} payload declares no input partitions; declare them in its "
+            "MultimodalItemMetadata or give the EncoderGroup a build_batched_input"
+        )
+    return partitions
+
+
+def _payload_signature(param: MultimodalParams, modality: str) -> Dict[str, Tuple[Any, ...]]:
+    """What payloads in one encoder call must share, per present declared key."""
+    data = param.multimodal_data[modality]
+    signature = {}
+    for key, partition in _declared_partitions(param, modality).items():
+        value = data.get(key)
+        if value is None:
+            continue
+        if partition.item_axis is None:
+            signature[key] = ("shared", value)
+        elif isinstance(value, torch.Tensor):
+            signature[key] = ("tensor", value.dtype)
+        else:
+            signature[key] = ("items",)
+    return signature
+
+
+def _same_signature_entry(first: Tuple[Any, ...], second: Tuple[Any, ...]) -> bool:
+    """Compare signature entries; shared tensors compare by content."""
+    if first[0] != "shared" or second[0] != "shared":
+        return first == second
+    a, b = first[1], second[1]
+    if a is b:
+        return True
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return (
+            isinstance(a, torch.Tensor)
+            and isinstance(b, torch.Tensor)
+            and a.dtype == b.dtype
+            and a.device == b.device
+            and a.shape == b.shape
+            and torch.equal(a, b)
+        )
+    return bool(a == b)
+
+
+def _uses_default_builder(group: EncoderGroup) -> bool:
+    """Own builders may not read partitions, so only the default builder's calls are split."""
+    builder = group.build_batched_input
+    return (
+        isinstance(builder, functools.partial) and builder.func is build_batched_input_by_partitions
+    )
+
+
+def _call_units(
+    group: EncoderGroup, params: List[MultimodalParams]
+) -> List[Tuple[List[MultimodalParams], List[Tuple[str, int]]]]:
+    """Split a group's payloads into encoder calls that can share one batch.
+
+    Returns `(params, payloads)` per call, payloads being `(modality, request
+    index)` in the group layout. Payloads of one call agree on every shared
+    value and tensor dtype of a key, and payloads of one modality provide the
+    same keys. If they all agree, there is one call over `params` unchanged;
+    otherwise each call gets views of the requests that hold only its
+    payloads. Only groups with the default builder are split.
+    """
+    # Each unit: one signature per modality, one entry per key, its payloads.
+    units: List[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], List[Tuple[str, int]]]] = []
+    for modality in group.modalities:
+        for index, param in enumerate(params):
+            if param.multimodal_data.get(modality) is None:
+                continue
+            signature = _payload_signature(param, modality)
+            for unit in units:  # First unit the payload fits, else a new one.
+                by_modality, by_key, _ = unit
+                known = by_modality.get(modality)
+                if (known is None or known.keys() == signature.keys()) and all(
+                    key not in by_key or _same_signature_entry(by_key[key], entry)
+                    for key, entry in signature.items()
+                ):
+                    break
+            else:
+                unit = ({}, {}, [])
+                units.append(unit)
+            unit[0].setdefault(modality, signature)
+            unit[1].update(signature)
+            unit[2].append((modality, index))
+    if len(units) == 1:
+        return [(params, units[0][2])]
+    calls = []
+    for _, _, payloads in units:
+        kept: Dict[int, set] = {}
+        for modality, index in payloads:
+            kept.setdefault(index, set()).add(modality)
+        views = [
+            MultimodalParams(
+                multimodal_data={
+                    key: value
+                    for key, value in params[index].multimodal_data.items()
+                    if key not in group.modalities or key in modalities
+                }
+            )
+            for index, modalities in sorted(kept.items())
+        ]
+        calls.append((views, payloads))
+    return calls
+
+
+def _check_encoder_rows(out: torch.Tensor, expected: int) -> None:
+    """Encoder rows must match the item metadata, or slicing would hide the error."""
+    if out.shape[0] != expected:
+        raise MultimodalEncoderContractError(
+            f"MM encoder returned {out.shape[0]} rows, item metadata expects {expected}"
+        )
+
+
+def _encode_group(
+    group: EncoderGroup,
+    params: List[MultimodalParams],
+    item_layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
+) -> torch.Tensor:
+    """Batch and encode one group's payloads; return rows in the group layout.
+
+    Groups with their own `build_batched_input` make one call. With the
+    default builder, one gather finds whether all payloads fit one call;
+    only when they do not does `_call_units` look at each payload.
+    """
+    if not _uses_default_builder(group):
+        return group.encoder_fn(**group.build_batched_input(params))
+    fields, same_keys = _gather_fields(group.modalities, params)
+    if _share_one_call(fields, same_keys):
+        return group.encoder_fn(**_batch_fields(fields))
+    calls = _call_units(group, params)
+    outputs = [group.encoder_fn(**group.build_batched_input(views)) for views, _ in calls]
+    if len(outputs) == 1:
+        return outputs[0]
+    # Split each call's rows per payload and put them back in the group layout.
+    rows: Dict[Tuple[str, int], int] = {}
+    for index, (item_refs, lengths) in enumerate(item_layouts):
+        for (modality, _), length in zip(item_refs, lengths, strict=True):
+            rows[modality, index] = rows.get((modality, index), 0) + length
+    pieces: Dict[Tuple[str, int], torch.Tensor] = {}
+    for (_, payloads), out in zip(calls, outputs, strict=True):
+        payload_rows = [rows.get(payload, 0) for payload in payloads]
+        _check_encoder_rows(out, sum(payload_rows))
+        pieces.update(zip(payloads, out.split(payload_rows)))
+    order = {modality: position for position, modality in enumerate(group.modalities)}
+    return torch.cat([pieces[p] for p in sorted(pieces, key=lambda p: (order[p[0]], p[1]))])
 
 
 def _lengths_by_modality(
@@ -154,16 +442,14 @@ def _lengths_by_modality(
         if not item_refs:
             continue
         modality = item_refs[0][0]
-        if (
-            len(item_refs) == len(lengths)
-            and modality in by_modality
-            and all(
-                item_modality == modality and index == expected
-                for expected, (item_modality, index) in enumerate(item_refs)
-            )
-        ):
-            by_modality[modality].extend(lengths)
-            continue
+        if len(item_refs) == len(lengths) and modality in by_modality:
+            # The usual request: one modality in local order (a plain loop, no call per item).
+            for expected, (item_modality, index) in enumerate(item_refs):
+                if item_modality != modality or index != expected:
+                    break
+            else:
+                by_modality[modality].extend(lengths)
+                continue
         request_lengths: dict[str, list[tuple[int, int]]] = {m: [] for m in modalities}
         for (modality, index), length in zip(item_refs, lengths, strict=True):
             if modality in request_lengths:
@@ -238,11 +524,15 @@ def encode_multimodal_by_groups(
     """Run each group's encoder over its batched items and reorder into
     per-request prompt order.
 
-    For each group present in the batch, one encoder call is issued over all
-    items across all requests belonging to that group's modalities
-    (arithmetic-intensity win). The output is split back per-modality using
-    the prompt-ordered output lengths in `MultimodalItemMetadata`,
-    then reordered by the same metadata's `item_refs`.
+    For each group present in the batch: collect the requests that hold its
+    modalities, batch their items across requests (`build_batched_input`),
+    run `encoder_fn` once over the batch (arithmetic-intensity win), check
+    that the encoder rows match the item metadata, split the rows back
+    per-modality using the prompt-ordered output lengths in
+    `MultimodalItemMetadata`, and reorder them by the same metadata's
+    `item_refs`. With the default builder, payloads whose shared values or
+    tensor dtypes differ are encoded in separate calls, and their rows are
+    put back in the group layout first.
 
     Shared entry point for both the aggregated (`MultimodalModelMixin`) and
     mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
@@ -250,29 +540,58 @@ def encode_multimodal_by_groups(
     """
     per_modality_embeds: Dict[str, torch.Tensor] = {}
     per_modality_lengths: Dict[str, List[int]] = {}
-    item_layouts = [mp.get_item_layout() for mp in multimodal_params]
+    item_layouts = _item_layouts(multimodal_params)
     for group in mm_encoder_groups:
         group_params = []
         group_layouts = []
         for mp, layout in zip(multimodal_params, item_layouts, strict=True):
-            if any(mp.multimodal_data.get(m) is not None for m in group.modalities):
-                if not layout[0]:
-                    raise MultimodalEncoderContractError(
-                        "MM item metadata with output lengths is required for grouped encoding"
-                    )
-                group_params.append(mp)
-                group_layouts.append(layout)
+            data = mp.multimodal_data
+            for m in group.modalities:
+                if data.get(m) is not None:
+                    if not layout[0]:
+                        raise MultimodalEncoderContractError(
+                            "MM item metadata with output lengths is required for grouped encoding"
+                        )
+                    group_params.append(mp)
+                    group_layouts.append(layout)
+                    break
         if not group_params:
             continue
-        out = group.encoder_fn(**group.build_batched_input(group_params))
+        out = _encode_group(group, group_params, group_layouts)
         lengths = _lengths_by_modality(group_layouts, group.modalities)
+        rows = out.shape[0]
         cursor = 0
         for m in group.modalities:
+            if rows and not lengths[m]:
+                # No items: nothing reads this modality's rows, so skip the empty view.
+                continue
             total = sum(lengths[m])
-            per_modality_embeds[m] = out[cursor : cursor + total]
+            per_modality_embeds[m] = out if total == rows else out[cursor : cursor + total]
             cursor += total
+        _check_encoder_rows(out, cursor)
         per_modality_lengths.update(lengths)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
+
+
+def _item_layouts(
+    multimodal_params: Sequence[MultimodalParams],
+) -> List[tuple[Sequence[tuple[str, int]], Sequence[int]]]:
+    """`MultimodalParams.get_item_layout` of every request, read in one pass."""
+    layouts = []
+    for param in multimodal_params:
+        data = param.multimodal_data
+        metadata = (
+            data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY) if isinstance(data, dict) else None
+        )
+        if (
+            isinstance(metadata, MultimodalItemMetadata)
+            and metadata.output_embedding_lengths is not None
+        ):
+            layouts.append((metadata.item_refs, metadata.output_embedding_lengths))
+        else:
+            # No record, or one the getter rejects: its empty layout or its error.
+            layouts.append(param.get_item_layout())
+    return layouts
 
 
 if TYPE_CHECKING:
