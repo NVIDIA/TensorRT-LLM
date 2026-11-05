@@ -19,7 +19,7 @@ No GPU required.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
 
@@ -5387,13 +5387,26 @@ class TestAppendReserveShortestFirst:
         assert requests[1].context_chunk_size == 6144
         assert requests[2].context_chunk_size == 2048
 
-    def test_last_chunk_drafts_do_not_spend_append_reserve(self) -> None:
-        head = make_ctx_request(0, context_remaining_length=6144, num_draft_tokens=31)
+    @pytest.mark.parametrize("drafts,expected", [(0, 6144), (31, 6080)])
+    def test_last_chunk_drafts_do_not_spend_append_reserve(
+        self, drafts: int, expected: int
+    ) -> None:
+        head = make_ctx_request(0, context_remaining_length=6144, num_draft_tokens=drafts)
         next_request = make_ctx_request(1, context_remaining_length=2048)
-        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, next_request])
+        manager = make_kv_cache_manager(tokens_per_block=64)
+        with patch.object(
+            type(head),
+            "is_last_context_chunk",
+            new_callable=PropertyMock,
+            create=True,
+            side_effect=lambda: head.context_chunk_size >= head.context_remaining_length,
+        ):
+            out = self._schedule(manager, [head, next_request])
+            assert head.is_last_context_chunk is (drafts == 0)
         assert ids(out.context_requests) == [0, 1]
-        assert head.context_chunk_size == 6080
+        assert head.context_chunk_size == expected
         assert next_request.context_chunk_size == 2048
+        assert manager.resize_context.call_args_list[0] == call(head, expected)
         head.discard_draft_tokens.assert_not_called()
 
     def test_kill_switch_keeps_arrival_order(self, monkeypatch):

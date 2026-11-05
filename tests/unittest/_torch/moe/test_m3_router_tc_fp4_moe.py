@@ -63,11 +63,11 @@ def _build(tokens):
 
 @pytest.mark.parametrize("tokens", [9, 12, 16])
 def test_router_tc_payload_feeds_experts_bitwise(tokens, monkeypatch) -> None:
-    if not torch.ops.trtllm.minimax_m3_router_tc_cluster16(H):
+    if not torch.ops.trtllm.minimax_m3_router_tc_cluster16(H, full_fp32=True):
         pytest.skip("this device cannot co-schedule 16-CTA clusters (router_tc not used)")
     monkeypatch.setattr(
         mm, "_ROUTER_TC_GEN", True
-    )  # default OFF until its gates pass: the gate below must take router_tc
+    )  # The gate below must take router_tc independently of the process environment.
     with torch.device("cuda"), torch.inference_mode():
         moe, gate, x = _build(tokens)
         backend = moe.backend

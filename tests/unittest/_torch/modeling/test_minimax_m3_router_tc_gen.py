@@ -42,11 +42,11 @@ def _stock(x, w):
         torch.backends.cuda.matmul.allow_tf32 = prev
 
 
-def _fp32_exact(x, w):
+def _fp32_exact(x: torch.Tensor, w: torch.Tensor, full_fp32: bool = False) -> torch.Tensor:
     prev = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
-        return x.float() @ tf32_rna(w).t()
+        return x.float() @ (w if full_fp32 else tf32_rna(w)).t()
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
 
@@ -70,15 +70,18 @@ def test_router_tc_vs_stock_and_fp32(m):
 
 
 @pytest.mark.parametrize("m", [9, 16])
-def test_router_tc_eager_equals_graph_and_fp4_payload(m):
+@pytest.mark.parametrize("full_fp32", [False, True])
+def test_router_tc_eager_equals_graph_and_fp4_payload(m: int, full_fp32: bool) -> None:
     if not torch.ops.trtllm.minimax_m3_router_tc_cluster16(K):
         pytest.skip("this device cannot co-schedule 16-CTA clusters")
     x, w = _inputs(m, 2000 + m)
     sf_scale = torch.tensor([448.0 * 6.0 / 8.0], device="cuda", dtype=torch.float32)
-    eager = torch.ops.trtllm.minimax_m3_router_tc(x, w, sf_scale, True)
+    if full_fp32:
+        assert torch.ops.trtllm.minimax_m3_router_tc_cluster16(K, full_fp32=True)
+    eager = torch.ops.trtllm.minimax_m3_router_tc(x, w, sf_scale, True, full_fp32=full_fp32)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = torch.ops.trtllm.minimax_m3_router_tc(x, w, sf_scale, True)
+        out = torch.ops.trtllm.minimax_m3_router_tc(x, w, sf_scale, True, full_fp32=full_fp32)
     graph.replay()
     torch.cuda.synchronize()
     for a, b in zip(eager, out):
@@ -99,11 +102,12 @@ def test_gate_dispatch(monkeypatch):
         pytest.skip("this device cannot co-schedule 16-CTA clusters")
     monkeypatch.setattr(
         mm, "_ROUTER_TC_GEN", True
-    )  # default OFF until its gates pass: enable for the dispatch check
+    )  # Exercise dispatch independently of the process environment.
     gate = mm.MiniMaxM3Gate(K, E, 4, 1.0).cuda()
     x16, w = _inputs(16, 3000)
     gate.weight.data.copy_(w)
-    tc = torch.ops.trtllm.minimax_m3_router_tc(x16, w, None, False)[0]
+    assert torch.ops.trtllm.minimax_m3_router_tc_cluster16(K, full_fp32=True)
+    tc = torch.ops.trtllm.minimax_m3_router_tc(x16, w, None, False, full_fp32=True)[0]
     assert torch.equal(gate(x16, generation_only=True), tc)  # 9..16 generation rows: router_tc
 
     def stock_path(
@@ -125,3 +129,27 @@ def test_gate_dispatch(monkeypatch):
     assert torch.equal(
         killed(x16, generation_only=True), stock_path(x16)
     )  # kill switch: the stock router
+
+
+@pytest.mark.parametrize("m", [1, 9, 16, 48])
+@pytest.mark.parametrize("strided", [False, True])
+def test_full_precision_router_retains_weight_residuals(m: int, strided: bool) -> None:
+    if not torch.ops.trtllm.minimax_m3_router_tc_cluster16(K):
+        pytest.skip("this device cannot co-schedule 16-CTA clusters")
+    assert torch.ops.trtllm.minimax_m3_router_tc_cluster16(K, full_fp32=True)
+    x, w = _inputs(m, 4000 + m)
+    if strided:
+        padded = torch.empty((m, K + 8), dtype=x.dtype, device=x.device)
+        padded[:, :K].copy_(x)
+        x = padded[:, :K]
+    result = torch.ops.trtllm.minimax_m3_router_tc(x, w, None, False, full_fp32=True)[0]
+    reference = x.double() @ w.double().t()
+    assert (result.double() - reference).abs().max().item() <= 1e-5
+    assert (result - _fp32_exact(x, w, full_fp32=True)).abs().max().item() <= 1e-5
+    # A cancellation pair makes the discarded FP32 weight bits the entire signal.
+    x = torch.ones_like(x)
+    w = torch.zeros_like(w)
+    w[:, 0] = 1.0
+    w[:, 1] = -1.0 + 2.0**-23
+    result = torch.ops.trtllm.minimax_m3_router_tc(x, w, None, False, full_fp32=True)[0]
+    torch.testing.assert_close(result, torch.full_like(result, 2.0**-23), rtol=0, atol=0)

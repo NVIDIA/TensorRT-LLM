@@ -509,7 +509,7 @@ diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
              decode_kv_indices = kv_indices[:kv_page_split]
              prefill_kv_indices = kv_indices[kv_page_split:]
          else:
-@@ -1129,27 +1449,38 @@
+@@ -1129,27 +1449,39 @@
              decode_qo_offset = None
              prefill_qo_offset = None
  
@@ -520,6 +520,7 @@ diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
 +        write_in_place = (
 +            out is not None and out.is_contiguous()
 +            and out.dtype == torch.bfloat16 and out.device == q.device
++            and out.data_ptr() % 16 == 0
 +        )
 +
          # ---- Run kernels ----
@@ -6865,10 +6866,9 @@ index 7006fcd..9a09324 100644
      "nvfp4_global_scale_from_amax",
  ]
 diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse_fmha_adapter.py
-index 306b416..a564d47 100644
 --- a/python/fmha_sm100/sparse_fmha_adapter.py
 +++ b/python/fmha_sm100/sparse_fmha_adapter.py
-@@ -129,11 +129,19 @@ def sparse_fmha_plan(
+@@ -129,11 +129,19 @@
      batch = qo_segment_lens.shape[0]
      gpu_device = torch.device('cuda')
  
@@ -6890,23 +6890,27 @@ index 306b416..a564d47 100644
  
      max_seqlen_q = int(qo_segment_lens.max().item())
      max_seqlen_k = int(kv_segment_lens.max().item())
-@@ -144,11 +152,12 @@ def sparse_fmha_plan(
+@@ -144,11 +152,15 @@
      total_rows = sum((int(kl) + blk_kv - 1) // blk_kv for kl in kv_lens)
  
      if qo_offset is not None:
 -        seqused_k = (qo_segment_lens + qo_offset).to(torch.int32).to(gpu_device)
-+        seqused_k = (qo_segment_lens + qo_offset).to(torch.int32).to(gpu_device, non_blocking=True)
++        if qo_segment_lens.device == qo_offset.device and qo_offset.device.type == 'cpu':
++            seqused_k = (qo_segment_lens + qo_offset).to(torch.int32).to(gpu_device, non_blocking=True)
++        else:
++            seqused_k = qo_lens_gpu + qo_offset.to(torch.int32).to(gpu_device, non_blocking=True)
      else:
 -        seqused_k = kv_segment_lens.to(torch.int32).to(gpu_device)
-+        seqused_k = kv_lens_gpu.clone()
- 
+-
 -    total_q = int(cu_seqlens_q[-1].item())
++        seqused_k = kv_lens_gpu.clone()
++
 +    # Equals cu_seqlens_q[-1], read on the host.
 +    total_q = int(qo_segment_lens.sum())
      qhead_per_kv = num_qo_heads // num_kv_heads if num_kv_heads > 0 else 1
  
      target_q_per_cta = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta(
-@@ -169,11 +178,14 @@ def sparse_fmha_plan(
+@@ -169,11 +181,14 @@
      )
  
      return {
@@ -6923,7 +6927,7 @@ index 306b416..a564d47 100644
          "seqused_k": seqused_k,
          "max_seqlen_q": max_seqlen_q,
          "max_seqlen_k": max_seqlen_k,
-@@ -228,23 +240,83 @@ def _build_page_table(
+@@ -228,23 +243,83 @@
      page_size: int,
      batch: int,
  ) -> torch.Tensor:
@@ -6961,6 +6965,12 @@ index 306b416..a564d47 100644
      assert page_table.data_ptr() % 16 == 0, (
 -        f"_build_page_table failed to align: buf=0x{buf.data_ptr():x} "
 -        f"shift={shift} page_table=0x{page_table.data_ptr():x}"
+-    )
+-    offset = 0
+-    for b in range(batch):
+-        n = pages_per_batch[b]
+-        page_table[b, :n] = kv_indices[offset : offset + n].to(torch.int32)
+-        offset += n
 +        f"_build_page_table failed to align: page_table=0x{page_table.data_ptr():x}"
 +    )
 +    return page_table
@@ -7013,16 +7023,11 @@ index 306b416..a564d47 100644
 +        (_version_token(kv_indices), _version_token(kv_segment_lens)),
 +        (page_size, batch),
 +        page_table,
-     )
--    offset = 0
--    for b in range(batch):
--        n = pages_per_batch[b]
--        page_table[b, :n] = kv_indices[offset : offset + n].to(torch.int32)
--        offset += n
++    )
      return page_table
  
  
-@@ -351,8 +423,8 @@ def sparse_fmha(
+@@ -351,8 +426,8 @@
      if is_paged:
  
          if kv_indices is not None:
@@ -7033,7 +7038,7 @@ index 306b416..a564d47 100644
              )
  
      # build_k2q_csr(return_schedule=True) builds schedule using hardware SM count internally
-@@ -382,6 +454,17 @@ def sparse_fmha(
+@@ -382,6 +457,17 @@
  
      softmax_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
  
@@ -7051,14 +7056,16 @@ index 306b416..a564d47 100644
      # print(q.shape, k.shape)
      result = sparse_atten_func(
          q, k, v,
-@@ -398,9 +481,10 @@ def sparse_fmha(
+@@ -398,9 +484,10 @@
          seqused_k=seqused_k,
          schedule=schedule,
          usable_SM_count=usable_SM_count,
-+        out=out if writable_out else None,
-     )
- 
+-    )
+-
 -    if out is not None:
++        out=out if writable_out else None,
++    )
++
 +    if out is not None and not writable_out:
          out.copy_(result)
          return out, None

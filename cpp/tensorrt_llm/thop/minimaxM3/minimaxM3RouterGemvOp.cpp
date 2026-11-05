@@ -101,8 +101,8 @@ std::vector<torch::Tensor> minimaxM3RouterGemvFp4(
 
 //! TF32 tensor-core router logits for 128 experts and 1..48 rows: [logits fp32 [M, 128]] or, with `sf_scale`,
 //! [logits, packed e2m1 [M, K / 2], linear E4M3 scales [M * K / 16]].
-std::vector<torch::Tensor> minimaxM3RouterTc(
-    torch::Tensor const& x, torch::Tensor const& w, std::optional<torch::Tensor> const& sfScale, bool pdl)
+std::vector<torch::Tensor> minimaxM3RouterTc(torch::Tensor const& x, torch::Tensor const& w,
+    std::optional<torch::Tensor> const& sfScale, bool pdl, bool fullFp32)
 {
     checkSmVersionTc("minimax_m3_router_tc");
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.stride(1) == 1,
@@ -114,7 +114,7 @@ std::vector<torch::Tensor> minimaxM3RouterTc(
     TORCH_CHECK(K % 1024 == 0 && (x.stride(0) * 2) % 16 == 0, "K must be a multiple of 1024 with 16-byte rows");
     c10::cuda::CUDAGuard const deviceGuard{x.device()};
     TORCH_CHECK(tensorrt_llm::common::getSMVersion() != 107
-            || tensorrt_llm::kernels::minimaxM3RouterTcCluster(static_cast<int32_t>(K)) == 16,
+            || tensorrt_llm::kernels::minimaxM3RouterTcCluster(static_cast<int32_t>(K), fullFp32) == 16,
         "minimax_m3_router_tc on SM107 runs only with 16-CTA clusters; this device cannot co-schedule them (use the "
         "stock router)");
     auto out = torch::empty({M, w.size(0)}, x.options().dtype(at::kFloat));
@@ -134,7 +134,7 @@ std::vector<torch::Tensor> minimaxM3RouterTc(
     }
     tensorrt_llm::kernels::invokeMinimaxM3RouterTc(reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
         static_cast<int32_t>(x.stride(0)), static_cast<int32_t>(M), static_cast<int32_t>(K), w.data_ptr<float>(),
-        out.data_ptr<float>(), qp, sfp, scp, pdl, at::cuda::getCurrentCUDAStream(x.get_device()));
+        out.data_ptr<float>(), qp, sfp, scp, pdl, at::cuda::getCurrentCUDAStream(x.get_device()), fullFp32);
     if (sfScale.has_value())
     {
         return {out, q, sf};
@@ -144,10 +144,10 @@ std::vector<torch::Tensor> minimaxM3RouterTc(
 
 //! Whether `minimax_m3_router_tc` runs on this device with 16-CTA clusters for hidden size `k` (device-static; the
 //! SM107 caller falls back to the stock router otherwise).
-bool minimaxM3RouterTcCluster16(int64_t k)
+bool minimaxM3RouterTcCluster16(int64_t k, bool fullFp32)
 {
     checkSmVersionTc("minimax_m3_router_tc_cluster16");
-    return tensorrt_llm::kernels::minimaxM3RouterTcCluster(static_cast<int32_t>(k)) == 16;
+    return tensorrt_llm::kernels::minimaxM3RouterTcCluster(static_cast<int32_t>(k), fullFp32) == 16;
 }
 
 } // namespace torch_ext
@@ -158,8 +158,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("minimax_m3_router_gemv(Tensor x, Tensor w, int rows, bool pdl) -> Tensor");
     m.def("minimax_m3_router_gemv_fp4(Tensor x, Tensor w, Tensor sf_scale, bool pdl) -> Tensor[]");
-    m.def("minimax_m3_router_tc(Tensor x, Tensor w, Tensor? sf_scale, bool pdl) -> Tensor[]");
-    m.def("minimax_m3_router_tc_cluster16(int k) -> bool", &tensorrt_llm::torch_ext::minimaxM3RouterTcCluster16);
+    m.def("minimax_m3_router_tc(Tensor x, Tensor w, Tensor? sf_scale, bool pdl, bool full_fp32=False) -> Tensor[]");
+    m.def("minimax_m3_router_tc_cluster16(int k, bool full_fp32=False) -> bool",
+        &tensorrt_llm::torch_ext::minimaxM3RouterTcCluster16);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

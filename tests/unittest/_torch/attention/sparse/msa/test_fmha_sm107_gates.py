@@ -287,6 +287,8 @@ def test_plan_consumer_uses_requested_device(
     side.cuda_stream = 456
     consumer = Mock(spec_set=["wait_stream"])
     result = object()
+    buffer = Mock(spec_set=["is_cuda", "record_stream"])
+    buffer.is_cuda = True
 
     def plan_impl(device: int, stream: int | None = None) -> object:
         assert device == 1 and stream == side.cuda_stream
@@ -301,7 +303,7 @@ def test_plan_consumer_uses_requested_device(
     monkeypatch.setattr(api, "_SS_STATS", {"n": 0, "waits": [], "logged": True})
     monkeypatch.setattr(api, "_ss_eligible", lambda bound: True)
     monkeypatch.setattr(api, "_ss_stream", side_for_device)
-    monkeypatch.setattr(api, "_ss_tensors", lambda output: ())
+    monkeypatch.setattr(api, "_ss_tensors", lambda output: (buffer,))
     monkeypatch.setattr(api, "_fmha_sm100_plan_impl", plan_impl)
     monkeypatch.setattr(torch.cuda, "ExternalStream", external)
     monkeypatch.setattr(torch.cuda, "current_stream", current)
@@ -309,6 +311,7 @@ def test_plan_consumer_uses_requested_device(
     assert api._fmha_sm100_plan(device=1, stream=caller) is result
     side_for_device.assert_called_once_with(1)
     consumer.wait_stream.assert_called_once_with(side)
+    buffer.record_stream.assert_called_once_with(consumer)
     if caller:
         external.assert_called_once_with(caller, device=1)
         current.assert_not_called()
@@ -334,11 +337,18 @@ def test_split_boundaries_handle_nonpaged_metadata(api: types.ModuleType, kind: 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("storage_offset", [0, 1])
 def test_mixed_split_output_preserves_copy_conversion(
-    api: types.ModuleType, monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, contiguous: bool
+    api: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    contiguous: bool,
+    storage_offset: int,
 ) -> None:
-    q = torch.arange(24, dtype=torch.bfloat16).view(4, 1, 6)
-    destination = torch.empty((4, 1, 6 if contiguous else 12), dtype=dtype)
+    q = torch.arange(512, dtype=torch.bfloat16).view(4, 1, 128)
+    width = 128 if contiguous else 256
+    storage = torch.empty(4 * width + storage_offset, dtype=dtype)
+    destination = storage[storage_offset:].view(4, 1, width)
     out = destination if contiguous else destination[..., ::2]
     calls = []
 
@@ -355,6 +365,7 @@ def test_mixed_split_output_preserves_copy_conversion(
         expected = q + 1
         if out is not None:
             assert out.dtype == torch.bfloat16 and out.device == q.device
+            assert out.data_ptr() % 16 == 0
             out.copy_(expected)
             return out, None
         return expected, None
@@ -364,4 +375,68 @@ def test_mixed_split_output_preserves_copy_conversion(
     result, scores = api.fmha_sm100(q, q, q, (True, 1, 2, decode, {}), out=out)
     assert result is out and scores is None
     torch.testing.assert_close(out, (q + 1).to(dtype), rtol=0, atol=0)
-    assert all(value is not None for value in calls) is (dtype == torch.bfloat16 and contiguous)
+    assert all(value is not None for value in calls) is (
+        dtype == torch.bfloat16 and contiguous and storage_offset == 0
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "target,offset_device", [("cpu", "cpu"), ("meta", "cpu"), ("meta", "meta"), ("meta", None)]
+)
+def test_sparse_plan_accepts_host_lengths_and_device_offset(
+    target: str, offset_device: str | None
+) -> None:
+    # Execute the installed planner with CUDA allocations mapped to CPU/meta.
+    source = Path(_fmha_sm100_dir()) / "sparse_fmha_adapter.py"
+    tree = ast.parse(source.read_text())
+    function = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "sparse_fmha_plan"
+    )
+    torch_api = Mock(spec_set=torch)
+    torch_api.device = Mock(return_value=torch.device(target))
+    torch_api.zeros = torch.zeros
+    torch_api.cumsum = torch.cumsum
+    torch_api.int32 = torch.int32
+    torch_api.bfloat16 = torch.bfloat16
+    schedule = Mock(spec_set=["balanced_target_q_per_cta", "flat_schedule_capacity"])
+    schedule.balanced_target_q_per_cta.return_value = 64
+    schedule.flat_schedule_capacity.return_value = 128
+    namespace = {
+        "torch": torch_api,
+        "SPARSE_SCHEDULE_MODEL": schedule,
+        "_compute_aot_kernel_paths": Mock(return_value={}),
+    }
+    unit = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            function,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(unit)
+    exec(compile(unit, str(source), "exec"), namespace)
+    lengths = torch.tensor([16, 32], dtype=torch.int32)
+    kv_lengths = torch.tensor([128, 256], dtype=torch.int32)
+    offset = (
+        torch.tensor([112, 224], dtype=torch.int32, device=offset_device)
+        if offset_device is not None
+        else None
+    )
+    plan = namespace["sparse_fmha_plan"](
+        lengths,
+        kv_lengths,
+        num_qo_heads=2,
+        num_kv_heads=1,
+        qo_offset=offset,
+        page_size=128,
+        kv_block_num=4,
+    )
+    assert plan["seqused_k"].device == torch.device(target)
+    assert plan["qo_segment_lens"].device == torch.device(target)
+    assert plan["kv_segment_lens"].device.type == "cpu"
+    assert plan["total_rows"] == 3 and plan["total_k"] == 384
+    assert plan["max_seqlen_q"] == 32 and plan["max_seqlen_k"] == 256
+    assert schedule.balanced_target_q_per_cta.call_args.kwargs["total_q"] == 48
+    if target == "cpu":
+        torch.testing.assert_close(plan["seqused_k"], kv_lengths, rtol=0, atol=0)

@@ -866,7 +866,7 @@ _ROUTER_TC_GEN = os.environ.get("TRTLLM_M3_ROUTER_TC_GEN", "1") == "1"
 _ROUTER_TC_GEN_MIN_ROWS = 9
 # The router_tc launch also emits the routed experts' NVFP4 input (packed e2m1 + linear block scales, bit-identical to
 # fp4_quantize(x, fc31_input_scale, 16, False, False)), which MiniMaxM3MoE hands to the experts in place of their own
-# quantize_input. Default OFF with the router above; enable with TRTLLM_M3_ROUTER_TC_FP4_MOE=1 (needs
+# quantize_input. Payload handoff defaults OFF; enable with TRTLLM_M3_ROUTER_TC_FP4_MOE=1 (needs
 # TRTLLM_M3_ROUTER_TC_GEN=1). Off: the experts quantize again; the router is unchanged.
 _ROUTER_TC_FP4_MOE = os.environ.get("TRTLLM_M3_ROUTER_TC_FP4_MOE", "0") == "1"
 _ROUTER_TC_FP4_MOE_LOGGED = False
@@ -880,7 +880,7 @@ def _router_tc_gen_ok(hidden_size: int) -> bool:
     ok = _ROUTER_TC_GEN_OK.get(hidden_size)
     if ok is None:
         ok = _ROUTER_TC_GEN_OK[hidden_size] = bool(
-            torch.ops.trtllm.minimax_m3_router_tc_cluster16(hidden_size)
+            torch.ops.trtllm.minimax_m3_router_tc_cluster16(hidden_size, full_fp32=True)
         )
         if ok:
             logger.info(
@@ -1126,7 +1126,7 @@ class MiniMaxM3Gate(nn.Module):
         """forward()'s router_tc logits plus the NVFP4 activation of the same launch: (logits, packed e2m1 [M, K / 2],
         linear block scales [M * K / 16]); only where router_tc_applies()."""
         logits, q, sf = torch.ops.trtllm.minimax_m3_router_tc(
-            hidden_states, self.weight, fp4_scale, get_env_enable_pdl()
+            hidden_states, self.weight, fp4_scale, get_env_enable_pdl(), full_fp32=True
         )
         return logits, q, sf
 
@@ -1146,7 +1146,7 @@ class MiniMaxM3Gate(nn.Module):
             return torch.ops.trtllm.router_gemm(hidden_states, self.split_weight)
         if self.router_tc_applies(hidden_states, generation_only):
             return torch.ops.trtllm.minimax_m3_router_tc(
-                hidden_states, self.weight, None, get_env_enable_pdl()
+                hidden_states, self.weight, None, get_env_enable_pdl(), full_fp32=True
             )[0]
         if self._use_fixed_router and generation_only and not is_torch_compiling():
             logger.info_once(
