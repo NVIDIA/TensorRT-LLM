@@ -931,13 +931,12 @@ def launchReleaseCheck(pipeline, globalVars)
     })
 }
 
-def skipTestListCheck(String message)
+// Inside a parallel branch, pass a nested stage name: Blue Ocean shows a skip marked on the branch's own stage as NOT_BUILT.
+def skipStage(String stageName, String message)
 {
-    // Mark a nested stage so Blue Ocean renders the skip; a mark on the parallel branch's own stage shows as NOT_BUILT.
-    def runStage = "[Check-Test-List] Run"
-    stage(runStage) {
+    stage(stageName) {
         echo message
-        jUtils.markStageSkippedForConditional(runStage)
+        jUtils.markStageSkippedForConditional(stageName)
     }
 }
 
@@ -2570,19 +2569,19 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Check-Test-List": {
             script {
                 if (testFilter[INFRA_DRY_RUN]) {
-                    skipTestListCheck("Skipping Check Test List for the infrastructure dry run.")
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for the infrastructure dry run.")
                     return
                 } else if (GEN_POST_MERGE_BUILDS_ONLY) {
-                    skipTestListCheck("Skipping Check Test List (GenPostMergeBuilds mode: builds only)")
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List (GenPostMergeBuilds mode: builds only)")
                     return
                 } else if (runMode == "nightly_release") {
-                    skipTestListCheck("Skipping Check Test List for nightly_release.")
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for nightly_release.")
                     return
                 } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
-                    skipTestListCheck("Skipping Check Test List for Docs-only changes.")
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for Docs-only changes.")
                     return
                 } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
-                    skipTestListCheck("Skipping Check Test List for BuildDockerImageSanityTest.")
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for BuildDockerImageSanityTest.")
                     return
                 }
                 launchTestListCheck(this, globalVars)
@@ -3355,13 +3354,9 @@ pipeline {
                             "Check-Test-List": {
                                 stage("Check-Test-List") {
                                     if (testFilter[INFRA_DRY_RUN]) {
-                                        skipTestListCheck("Skipping Check Test List for the infrastructure dry run.")
-                                    } else if (runMode == "nightly_release") {
-                                        skipTestListCheck("Skipping Check Test List for nightly_release.")
+                                        skipStage("[Check-Test-List] Run", "Skipping Check Test List for the infrastructure dry run.")
                                     } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
-                                        skipTestListCheck("Skipping Check Test List for Docs-only changes.")
-                                    } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
-                                        skipTestListCheck("Skipping Check Test List for BuildDockerImageSanityTest.")
+                                        skipStage("[Check-Test-List] Run", "Skipping Check Test List for Docs-only changes.")
                                     } else {
                                         launchTestListCheck(this, globalVars)
                                     }
