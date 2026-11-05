@@ -6212,10 +6212,10 @@ def test_moe_backend(
         with torch.inference_mode(), autotune(cache_path=cache_path):
             _ = run_moe()
         if enable_locality_domains and quant_algo == QuantAlgo.MXFP8:
-            # The MXFP8 split is a separate autotuned op next to the unchanged
-            # full-GPU op; both are profiled for the admitted decode shapes.
+            # A split layer always runs the locality-domain op, so only its
+            # outer key and the concurrent shard tuning are profiled, under one
+            # key each whatever the input dtype.
             expected_tuning_ops = (
-                "CuteDslFusedMoE::run_moe_mxfp8",
                 "CuteDslFusedMoE::run_moe_mxfp8::locality_domain",
                 "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin"
                 "::locality_domain::locality_domain_concurrent",

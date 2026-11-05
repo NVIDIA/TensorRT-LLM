@@ -6799,6 +6799,7 @@ def _mxfp8_leaf_stub(monkeypatch: pytest.MonkeyPatch) -> tuple:
         quant_method=SimpleNamespace(BLOCK_SIZE=32),
         FUSED_INPUT_QUANT_MAX_ELEMENTS=impl.FUSED_INPUT_QUANT_MAX_ELEMENTS,
         _TUNER_KEY=impl._TUNER_KEY,
+        _locality_domain_runtime=None,
     )
     leaf._fuses_input_quant = impl._fuses_input_quant.__get__(leaf)
     impl_calls, tuned = [], []
@@ -6851,6 +6852,7 @@ def test_mxfp8_deferred_input_runs_with_shape_only_scales(monkeypatch: pytest.Mo
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("locality_domain", [False, True], ids=["full_gpu", "locality_domain"])
 @pytest.mark.parametrize("over_limit", [False, True])
 @pytest.mark.parametrize(
     "enable_alltoall,moe_ep_size,top_k,dense",
@@ -6872,6 +6874,7 @@ def test_mxfp8_deferred_input_runs_with_shape_only_scales(monkeypatch: pytest.Mo
 def test_mxfp8_output_past_int32_falls_back_to_memset(
     monkeypatch: pytest.MonkeyPatch,
     over_limit: bool,
+    locality_domain: bool,
     enable_alltoall: bool,
     moe_ep_size: int,
     top_k: int,
@@ -6879,7 +6882,8 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(
 ) -> None:
     """The op clears the output inside its workspace reset only in the dense
     case (no alltoall, or ep <= top_k), and only while the output fits the
-    reset kernel's Int32 extent; otherwise the leaf runs the row memset."""
+    reset kernel's Int32 extent; otherwise the leaf runs the row memset. This
+    holds on both the full-GPU and the locality-domain path."""
     impl = TrtllmCutedslFusedFc12Mxfp8Impl
     leaf = impl.__new__(impl)
     torch.nn.Module.__init__(leaf)
@@ -6889,6 +6893,15 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(
     leaf.mapping = SimpleNamespace(moe_ep_size=moe_ep_size)
     leaf._sm_version = 107
     leaf.act_clamp = float("inf")
+    leaf._locality_domain_weight_shards = [
+        {
+            "w3_w1_weight": torch.empty(0),
+            "fc31_weight_block_scale": torch.empty(0, dtype=torch.int32),
+            "w2_weight": torch.empty(0),
+            "fc2_weight_block_scale": torch.empty(0, dtype=torch.int32),
+        }
+        for _ in range(2)
+    ]
     leaf.w3_w1_weight = torch.empty(0)
     leaf.w2_weight = torch.empty(0)
     leaf.quant_scales = SimpleNamespace(
@@ -6904,18 +6917,23 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(
         lambda **kwargs: tuple(torch.empty(1, dtype=torch.int32) for _ in range(6)),
         raising=False,
     )
-    monkeypatch.setattr(
-        torch.ops.trtllm,
+    for op_name in (
         "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
-        lambda **kwargs: op_calls.append(kwargs),
-        raising=False,
-    )
+        "cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin",
+    ):
+        monkeypatch.setattr(
+            torch.ops.trtllm,
+            op_name,
+            lambda op_name=op_name, **kwargs: op_calls.append((op_name, kwargs)),
+            raising=False,
+        )
     num_tokens, hidden = 8, 64
     moe_output = torch.empty((num_tokens, hidden), dtype=torch.bfloat16)
     limit = moe_output.numel() - 1 if over_limit else moe_output.numel()
     monkeypatch.setattr(impl, "_ZERO_OUTPUT_MAX_ELEMENTS", limit)
 
-    impl.run_moe_mxfp8_impl(
+    run = impl._run_moe_mxfp8_locality_domain if locality_domain else impl.run_moe_mxfp8_impl
+    run(
         leaf,
         x=torch.empty((num_tokens, hidden), dtype=torch.float8_e4m3fn),
         token_selected_experts=torch.zeros((num_tokens, top_k), dtype=torch.int32),
@@ -6927,7 +6945,9 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(
 
     zero_in_op = dense and not over_limit
     assert len(op_calls) == 1
-    assert op_calls[0]["zero_output"] is zero_in_op
+    op_name, kwargs = op_calls[0]
+    assert ("locality_domain" in op_name) is locality_domain
+    assert kwargs["zero_output"] is zero_in_op
     assert len(memsets) == (0 if zero_in_op else 1)
 
 
