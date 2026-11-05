@@ -29,6 +29,43 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
 
+NVFP4_MLA_KV_CACHE_LAYOUT_ENV = "TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT"
+NVFP4_MLA_RESIDUAL_LAYOUT = "residual"
+NVFP4_MLA_RECORD_LAYOUT = "fp8rope"
+
+
+def get_nvfp4_mla_kv_cache_layout() -> str:
+    """Return the NVFP4 DSA latent-cache layout selected by ``TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT``.
+
+    ``residual`` (default) keeps the 576 E2M1 values, plus residual E2M1 codes for the RoPE part
+    when ``TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION`` is on, in the data pool and their E4M3 block
+    scales in the scale pool, all under one global scale. ``fp8rope`` stores the 352-byte record
+    that FlashInfer PrimTS's D576 sparse MLA reads as ``kv_cache_format="nvfp4.fp8rope"``: 256 B of
+    E2M1 NoPE, 64 B of E4M3 RoPE and the 32 NoPE block scales (block ``b`` at byte
+    ``320 + 8 * (b % 4) + b // 4``), with real-valued block scales and no global scale.
+    """
+    layout = os.environ.get(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_RESIDUAL_LAYOUT)
+    if layout not in (NVFP4_MLA_RESIDUAL_LAYOUT, NVFP4_MLA_RECORD_LAYOUT):
+        raise ValueError(
+            f"{NVFP4_MLA_KV_CACHE_LAYOUT_ENV} must be {NVFP4_MLA_RESIDUAL_LAYOUT!r} or "
+            f"{NVFP4_MLA_RECORD_LAYOUT!r}, got {layout!r}"
+        )
+    return layout
+
+
+def get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim: int) -> int:
+    """Return the FP4 element slots each NVFP4 DSA cache row stores beyond the latent width.
+
+    The native cache ops take this as ``residual_dim``: ``rope_head_dim`` for the residual RoPE
+    codes, and ``2 * rope_head_dim`` for the record layout, whose E4M3 RoPE and inline NoPE scales
+    take 64 more bytes per row than 576 E2M1 values.
+    """
+    if get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
+        return 2 * rope_head_dim
+    if os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1":
+        return rope_head_dim
+    return 0
+
 
 def _get_indexer_k_cache_bytes_per_token(
     index_head_dim: int, quant_block_size: int, use_fp4: bool
@@ -159,6 +196,11 @@ class DSACacheManager(KVCacheManager):
         # quantization is enabled by DSACacheManagerV2, whose buffer sizes are
         # role-configurable.
         self.mla_kv_cache_residual_dim = 0
+        self.mla_kv_cache_layout = NVFP4_MLA_RESIDUAL_LAYOUT if dtype == DataType.NVFP4 else None
+        if dtype == DataType.NVFP4 and get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
+            raise ValueError(
+                f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout requires DSACacheManagerV2"
+            )
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
@@ -437,12 +479,25 @@ class DSACacheManagerV2(KVCacheManagerV2):
             else getattr(model_config, "pretrained_config", None)
         )
         rope_head_dim = int(getattr(residual_config, "qk_rope_head_dim", 0))
-        residual_quantization_enabled = (
-            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
+        self.mla_kv_cache_layout = (
+            get_nvfp4_mla_kv_cache_layout() if dtype == DataType.NVFP4 else None
         )
         self.mla_kv_cache_residual_dim = (
-            rope_head_dim if dtype == DataType.NVFP4 and residual_quantization_enabled else 0
+            get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim)
+            if dtype == DataType.NVFP4
+            else 0
         )
+        if self.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT:
+            if head_dim != 576 or rope_head_dim != 64:
+                raise ValueError(
+                    f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout requires a 512 + 64 "
+                    f"latent, got head_dim={head_dim} and qk_rope_head_dim={rope_head_dim}"
+                )
+            if getattr(kv_cache_config, "mixed_precision_kv", None) is not None:
+                raise ValueError(
+                    f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout does not support "
+                    "mixed-precision KV caches"
+                )
         if self.mla_kv_cache_residual_dim % 16 != 0:
             raise ValueError(
                 "NVFP4 MLA residual dimension must be divisible by 16, got "
@@ -700,16 +755,11 @@ class DSACacheManagerV2(KVCacheManagerV2):
             model_config, mapping, num_layers=num_layers, **kwargs
         )
         quant_config = model_config.quant_config
-        residual_quantization_enabled = (
-            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
-        )
-        if (
-            quant_config is not None
-            and quant_config.quant_mode.has_fp4_kv_cache()
-            and residual_quantization_enabled
-        ):
+        if quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
             config = model_config.pretrained_config
-            residual_dim = int(getattr(config, "qk_rope_head_dim", 0))
+            residual_dim = get_nvfp4_mla_kv_cache_storage_extra_dim(
+                int(getattr(config, "qk_rope_head_dim", 0))
+            )
             num_attention_layers = KVCacheManager._resolve_num_attention_layers(
                 model_config, mapping, num_layers
             )

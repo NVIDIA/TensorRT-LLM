@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
+from .cache_manager import NVFP4_MLA_RECORD_LAYOUT, get_nvfp4_mla_kv_cache_layout
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -124,8 +125,12 @@ class DSATrtllmAttention(TrtllmAttention):
         self._nvfp4_mla_kv_scale_quant_orig = self.kv_scale_quant_orig
         self._nvfp4_mla_kv_scale_orig_quant = self.kv_scale_orig_quant
         if quant_config is not None and quant_config.layer_quant_mode.has_fp4_kv_cache():
-            kv_cache_amax = _get_nvfp4_mla_kv_cache_amax()
-            dequant_scale = kv_cache_amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE)
+            if get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
+                # Records keep real-valued block scales and E4M3 RoPE without a global scale.
+                dequant_scale = 1.0
+            else:
+                kv_cache_amax = _get_nvfp4_mla_kv_cache_amax()
+                dequant_scale = kv_cache_amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE)
             self._nvfp4_mla_kv_scale_quant_orig = torch.full_like(
                 self.kv_cache_scaling_factor, dequant_scale
             )
@@ -247,6 +252,9 @@ class DSATrtllmAttention(TrtllmAttention):
         topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            if self._prims_ts_reads_nvfp4_records(metadata):
+                # PrimTS dequantizes the selected records itself; it takes the global rows.
+                return topk_indices_global, None
             scratch = metadata.nvfp4_mla_fp8_scratch
             compact_indices = metadata.nvfp4_mla_compact_indices
             if scratch is None or compact_indices is None:
@@ -285,6 +293,24 @@ class DSATrtllmAttention(TrtllmAttention):
             return compact_indices, None
 
         return topk_indices_global, None
+
+    def _prims_ts_reads_nvfp4_records(self, metadata: DSAtrtllmAttentionMetadata) -> bool:
+        """Whether generation runs on the PrimTS FMHA that reads NVFP4 records in place."""
+        if getattr(metadata.kv_cache_manager, "mla_kv_cache_layout", None) != (
+            NVFP4_MLA_RECORD_LAYOUT
+        ):
+            return False
+        manager = self._fmha_manager
+        cached = getattr(self, "_prims_ts_record_reader", None)
+        if cached is None or cached[0] is not manager:
+            from ...fmha.prims_ts_dsa_sparse_mla import PrimsTSDsaSparseMlaFmha
+
+            reads_records = manager is not None and any(
+                isinstance(fmha, PrimsTSDsaSparseMlaFmha) for fmha in manager.fmha_libs
+            )
+            cached = (manager, reads_records)
+            self._prims_ts_record_reader = cached
+        return cached[1]
 
     def _remap_topk_to_global(
         self,

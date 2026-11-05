@@ -45,6 +45,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
+    from .prims_ts_dsa_sparse_mla import PrimsTSDsaSparseMlaFmha
     from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 
     return {
@@ -64,6 +65,10 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # DeepSeek-V4 on SM100, so every other model and architecture never
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
+        # DSA generation on the PrimTS D576 sparse MLA kernel over NVFP4 KV records. It only
+        # reports itself available for DSA layers whose cache uses the ``fp8rope`` NVFP4 layout,
+        # and DSATrtllmAttention then hands it the records instead of gathered FP8 rows.
+        "prims_ts_dsa_sparse_mla": PrimsTSDsaSparseMlaFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
         # trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
