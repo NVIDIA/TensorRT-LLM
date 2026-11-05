@@ -52,15 +52,18 @@ The mid block operates at the smallest spatial resolution and includes attention
 
 At inference, each residual block computes
 
+<a id="eq-residual-block"></a>
+
 $$
 \begin{aligned}
-h_1 &= C_1\bigl(\operatorname{SiLU}(N_1(x))\bigr),\\
-h_2 &= C_2\bigl(\operatorname{SiLU}(N_2(h_1))\bigr),\\
+h_1 &= C_1\bigl(\operatorname{SiLU}(N_1(x))\bigr),\cr
+h_2 &= C_2\bigl(\operatorname{SiLU}(N_2(h_1))\bigr),\cr
 y &= S(x)+h_2.
 \end{aligned}
+\tag{1}
 $$
 
-Here, $N_1$ and $N_2$ are root-mean-square normalization (RMSNorm) over each pixel's channels. The activation is $\operatorname{SiLU}(x)=x\,\mathrm{sigmoid}(x)$. Each $C_j$ is a learned causal 3 × 3 × 3 convolution, including its bias. The shortcut $S(x)$ is $x$ when channel counts match, or a learned 1 × 1 × 1 projection otherwise. It bypasses both normalization, activation, and convolution sequences.
+In <a href="#eq-residual-block">Equation (1)</a>, $N_1$ and $N_2$ are root-mean-square normalization (RMSNorm) over each pixel's channels. The activation is $\operatorname{SiLU}(x)=x\,\mathrm{sigmoid}(x)$. Each $C_j$ is a learned causal 3 × 3 × 3 convolution, including its bias. The shortcut $S(x)$ is $x$ when channel counts match, or a learned 1 × 1 × 1 projection otherwise. It bypasses both normalization, activation, and convolution sequences.
 
 Early convolutions have many channels and small spatial maps. Later convolutions have fewer channels and many more pixels. One kernel decomposition need not be best at every stage.
 
@@ -102,37 +105,49 @@ The encoder maps pixels into latents by reducing spatial dimensions. A downsampl
 
 The first copy prepares the spatial stride-2 convolution. Let $a$ be the last residual block's convolution output and $s$ its shortcut. The reference first materializes $u=a+s$, then copies $u$ into a buffer with an extra zero row at the bottom and zero column at the right. WinoVAE combines the addition and padding into one write. For each frame and channel, it produces
 
+<a id="eq-padded-residual"></a>
+
 $$
 p_{i,j}=
 \begin{cases}
-a_{i,j}+s_{i,j}, & 0\le i<H,\quad 0\le j<W,\\
+a_{i,j}+s_{i,j}, & 0\le i<H,\quad 0\le j<W,\cr
 0, & i=H\ \text{or}\ j=W.
 \end{cases}
+\tag{2}
 $$
 
-The stride-2 convolution consumes $p$ directly. This removes the write and reread of the unpadded sum $u$ while retaining the same padding and convolution.
+The stride-2 convolution consumes the padded sum in <a href="#eq-padded-residual">Equation (2)</a> directly. This removes the write and reread of the unpadded sum $u$ while retaining the same padding and convolution.
 
 The second copy is in the downsampling block's averaged shortcut. Let $r$ be the block input, and let $f_t$ and $f_s$ be the temporal and spatial reduction factors. The reference gathers each $f_t\times f_s\times f_s$ neighborhood into channels using `reshape`, `permute`, and `contiguous`, then averages groups of
 
+<a id="eq-shortcut-group-size"></a>
+
 $$
 g=\frac{C_{\mathrm{in}}f_tf_s^2}{C_{\mathrm{out}}}
+\tag{3}
 $$
 
-values. The `contiguous` operation copies the rearranged tensor. For example, with spatial reduction by two, no temporal reduction, and twice as many output channels, $g=2$. One input channel's 2 × 2 patch supplies two output channels:
+values. The `contiguous` operation copies the rearranged tensor. For example, with spatial reduction by two, no temporal reduction, and twice as many output channels, <a href="#eq-shortcut-group-size">Equation (3)</a> gives $g=2$. One input channel's 2 × 2 patch supplies two output channels:
+
+<a id="eq-shortcut-average"></a>
 
 $$
 \begin{aligned}
 A(r)_{2c,t,i,j}
- &=\tfrac12\bigl(r_{c,t,2i,2j}+r_{c,t,2i,2j+1}\bigr),\\
+ &=\tfrac12\bigl(r_{c,t,2i,2j}+r_{c,t,2i,2j+1}\bigr),\cr
 A(r)_{2c+1,t,i,j}
  &=\tfrac12\bigl(r_{c,t,2i+1,2j}+r_{c,t,2i+1,2j+1}\bigr).
 \end{aligned}
+\tag{4}
 $$
 
-WinoVAE computes those source indices directly instead of materializing the rearrangement. The same kernel computes the mean and adds it to the main path's convolution output $z$ and deferred bias $b$:
+WinoVAE reads the source elements in <a href="#eq-shortcut-average">Equation (4)</a> directly instead of materializing the rearrangement. The same kernel computes the mean and adds it to the main path's convolution output $z$ and deferred bias $b$:
+
+<a id="eq-downsample-add"></a>
 
 $$
 y_{c,t,i,j}=z_{c,t,i,j}+b_c+A(r)_{c,t,i,j}.
+\tag{5}
 $$
 
 Other reduction factors use their corresponding groups, including the reference's leading temporal zeros when needed. The optimization preserves the grouping and averaging operation while removing the rearrangement buffer and separate addition passes. The measured encoder improvement appears in [Results](#gb200-decoder-timing-and-fusion-savings).
@@ -141,8 +156,11 @@ Other reduction factors use their corresponding groups, including the reference'
 
 A causal 3 × 3 × 3 convolution can be written as three spatial convolutions. Split its weights into temporal slices $W_0$, $W_1$, and $W_2$, each containing a 3 × 3 spatial filter for every input/output-channel pair. Then
 
+<a id="eq-causal-convolution"></a>
+
 $$
 y_t=W_0\ast x_{t-2}+W_1\ast x_{t-1}+W_2\ast x_t+b,
+\tag{6}
 $$
 
 where $\ast$ denotes spatial convolution with summation over input channels. The first two inputs are earlier feature frames, supplied from the causal history when available.
@@ -153,13 +171,16 @@ where $\ast$ denotes spatial convolution with summation over input channels. The
 
 *Figure 5. Splitting a causal 3D convolution along time. Each highlighted patch represents a 3 × 3 spatial neighborhood, with the same operation across all input channels. At sequence start, the two earlier feature frames are zero padding. Their convolution terms vanish. Bias is added once in either case.*
 
-At sequence start, $x_{-2}=x_{-1}=0$, so the first output reduces to
+At sequence start, $x_{-2}=x_{-1}=0$, so <a href="#eq-causal-convolution">Equation (6)</a> reduces to
+
+<a id="eq-first-frame"></a>
 
 $$
 y_0=W_2\ast x_0+b.
+\tag{7}
 $$
 
-WinoVAE selects the current-frame weight slice $W_2$ and runs a 2D convolution with the original spatial padding and bias. It avoids assembling a three-frame input and executing the two zero-valued temporal contributions. This is a threefold reduction in convolution products for that output, before accounting for kernel overhead.
+WinoVAE evaluates <a href="#eq-first-frame">Equation (7)</a> by selecting the current-frame weight slice $W_2$ and running a 2D convolution with the original spatial padding and bias. It avoids assembling a three-frame input and executing the two zero-valued temporal contributions. This is a threefold reduction in convolution products for that output, before accounting for kernel overhead.
 
 For an image-only decode, this first-frame case applies throughout the decoder. In a video, later frames need their history and use the full temporal computation. A one-frame chunk with nonzero history therefore cannot use this shortcut. The image and video gains are measured separately in [Results](#gb200-decoder-timing-and-fusion-savings).
 
@@ -169,25 +190,31 @@ The example below is Winograd's $F(2,3)$ minimal-filtering algorithm, reproduced
 
 Consider one channel and a three-tap filter. The inputs overlap between neighboring outputs:
 
+<a id="eq-direct-f23"></a>
+
 $$
 \begin{aligned}
-y_0 &= d_0g_0+d_1g_1+d_2g_2,\\
+y_0 &= d_0g_0+d_1g_1+d_2g_2,\cr
 y_1 &= d_1g_0+d_2g_1+d_3g_2.
 \end{aligned}
+\tag{8}
 $$
 
-Direct convolution computes six products. Winograd's $F(2,3)$ construction computes four:
+Direct convolution in <a href="#eq-direct-f23">Equation (8)</a> computes six products. Winograd's $F(2,3)$ construction computes four:
+
+<a id="eq-winograd-f23"></a>
 
 $$
 \begin{aligned}
-m_0&=(d_0-d_2)g_0,\\
-m_1&=(d_1+d_2)(g_0+g_1+g_2)/2,\\
-m_2&=(d_2-d_1)(g_0-g_1+g_2)/2,\\
+m_0&=(d_0-d_2)g_0,\cr
+m_1&=(d_1+d_2)(g_0+g_1+g_2)/2,\cr
+m_2&=(d_2-d_1)(g_0-g_1+g_2)/2,\cr
 m_3&=(d_1-d_3)g_2.
 \end{aligned}
+\tag{9}
 $$
 
-The outputs are recovered with $y_0=m_0+m_1+m_2$ and $y_1=m_1-m_2-m_3$. Expanding the expressions gives the original convolution. The filter combinations can be prepared once when loading the weights, while the input combinations and reconstruction must be evaluated for each tile.
+The outputs are recovered with $y_0=m_0+m_1+m_2$ and $y_1=m_1-m_2-m_3$. Substituting the products from <a href="#eq-winograd-f23">Equation (9)</a> into these expressions recovers <a href="#eq-direct-f23">Equation (8)</a>. The filter combinations can be prepared once when loading the weights, while the input combinations and reconstruction must be evaluated for each tile.
 
 In $F(m,r)$, $m$ is the number of outputs and $r$ the filter length. The construction replaces $mr$ direct products with $m+r-1$ transformed products. “Direct” below means ordinary convolution without the Winograd transforms.
 
@@ -201,15 +228,18 @@ In $F(m,r)$, $m$ is the number of outputs and $r$ the filter length. The constru
 
 With multiple input channels, each $m_i$ becomes a sum of products over channels. We can evaluate the same coordinate $i$ for many tiles in one GEMM. Put each tile's transformed input channels in a row of $V_i$, and the transformed filters in $U_i$:
 
+<a id="eq-coordinate-gemm"></a>
+
 $$
 \begin{aligned}
-M_i &= V_iU_i,\\
-V_i &: N_{\mathrm{tiles}}\times C_{\mathrm{in}},\\
+M_i &= V_iU_i,\cr
+V_i &: N_{\mathrm{tiles}}\times C_{\mathrm{in}},\cr
 U_i &: C_{\mathrm{in}}\times C_{\mathrm{out}}.
 \end{aligned}
+\tag{10}
 $$
 
-Figure 7 follows coordinate zero from the scalar example. Window A reads positions 0 through 3, and window B reads positions 2 through 5. Subtracting the third sample from the first in each window produces two rows of $V_0$. Multiplication by $U_0$ sums over channels for every output filter. Repeating this for the four coordinates supplies everything needed to reconstruct both output pairs.
+Figure 7 follows coordinate zero from <a href="#eq-winograd-f23">Equation (9)</a> into the GEMM layout of <a href="#eq-coordinate-gemm">Equation (10)</a>. Window A reads positions 0 through 3, and window B reads positions 2 through 5. Subtracting the third sample from the first in each window produces two rows of $V_0$. Multiplication by $U_0$ sums over channels for every output filter. Repeating this for the four coordinates supplies everything needed to reconstruct both output pairs.
 
 <a id="figure-7"></a>
 
@@ -475,15 +505,18 @@ The complete-model measurements put the chosen FP16 Winograd paths near the BF16
 
 ### Where rounding error enters and how it propagates
 
-The four-product identity is exact, but its terms can be much larger than the final output. Large intermediate values may cancel during reconstruction while their rounding errors remain. FP32 accumulation cannot recover bits already lost when the GEMM operands were stored.
+The four-product construction in <a href="#eq-winograd-f23">Equation (9)</a> is exact, but its terms can be much larger than the final output. Large intermediate values may cancel during reconstruction while their rounding errors remain. FP32 accumulation cannot recover bits already lost when the GEMM operands were stored.
 
 For a spatial tile, the input transform $V=B^TdB$ and filter transform $U=GgG^T$ create the GEMM operands. Their coefficients can increase magnitudes before storage rounding occurs. The coordinate products accumulate over input channels to form $M$. The output transform then reconstructs $Y=A^TMA$. If the accumulated error in those coordinates is $\Delta M$, its contribution to the output is
 
+<a id="eq-reconstruction-error"></a>
+
 $$
 \Delta Y \approx A^T(\Delta M)A + \Delta Y_{\mathrm{out}},
+\tag{11}
 $$
 
-where $\Delta Y_{\mathrm{out}}$ represents rounding in reconstruction itself. Errors introduced in V, U, or stored M pass through the output transform. Cancellation can make the exact output small without making the independently rounded errors small. Point optimization must account for the input, filter, and output transforms together. The size of the GEMM operands alone does not determine output error.
+In <a href="#eq-reconstruction-error">Equation (11)</a>, $\Delta Y_{\mathrm{out}}$ represents rounding in reconstruction itself. Errors introduced in V, U, or stored M pass through the output transform. Cancellation can make the exact output small without making the independently rounded errors small. Point optimization must account for the input, filter, and output transforms together. The size of the GEMM operands alone does not determine output error.
 
 This makes intermediate precision a separate choice from model precision. WinoVAE keeps BF16 model inputs and outputs but stores transformed intermediates in FP16. Both formats occupy 16 bits. FP16 spends three more bits on the fraction, giving roughly eightfold finer spacing in its normal range, in exchange for a narrower exponent range.
 
@@ -491,40 +524,49 @@ This makes intermediate precision a separate choice from model precision. WinoVA
 
 The transform coefficients come from polynomial arithmetic. To see the construction, take an auxiliary two-element sequence $a=[a_0,a_1]$ and the three filter coefficients $g=[g_0,g_1,g_2]$, and write
 
+<a id="eq-polynomials"></a>
+
 $$
 \begin{aligned}
-a(z)&=a_0+a_1z,\\
+a(z)&=a_0+a_1z,\cr
 g(z)&=g_0+g_1z+g_2z^2.
 \end{aligned}
+\tag{12}
 $$
 
-Their product $c(z)=a(z)g(z)$ has four coefficients. Those coefficients are the full convolution of the two sequences: for example, the coefficient of $z$ is $c_1=a_0g_1+a_1g_0$. The variable $z$ records coefficient positions. It is not a pixel coordinate.
+The product of the polynomials in <a href="#eq-polynomials">Equation (12)</a>, $c(z)=a(z)g(z)$, has four coefficients. Those coefficients are the full convolution of the two sequences: for example, the coefficient of $z$ is $c_1=a_0g_1+a_1g_0$. The variable $z$ records coefficient positions. It is not a pixel coordinate.
 
 Instead of forming all six pairwise products, evaluate the polynomials at $0$, $1$, and $-1$, multiply their values, and also multiply their leading coefficients:
 
+<a id="eq-polynomial-products"></a>
+
 $$
 \begin{aligned}
-q_0 &= a_0g_0,\\
-q_+ &= (a_0+a_1)(g_0+g_1+g_2),\\
-q_- &= (a_0-a_1)(g_0-g_1+g_2),\\
+q_0 &= a_0g_0,\cr
+q_+ &= (a_0+a_1)(g_0+g_1+g_2),\cr
+q_- &= (a_0-a_1)(g_0-g_1+g_2),\cr
 q_\infty &= a_1g_2.
 \end{aligned}
+\tag{13}
 $$
 
-The notation $\infty$ means selecting the leading coefficient, not evaluating floating-point arithmetic at infinity. These four products determine all four coefficients of $c(z)$:
+The notation $\infty$ means selecting the leading coefficient, not evaluating floating-point arithmetic at infinity. The four products in <a href="#eq-polynomial-products">Equation (13)</a> determine all four coefficients of $c(z)$:
+
+<a id="eq-interpolation"></a>
 
 $$
 \begin{aligned}
-c_0 &= q_0,\\
-c_1 &= (q_+-q_-)/2-q_\infty,\\
-c_2 &= (q_++q_-)/2-q_0,\\
+c_0 &= q_0,\cr
+c_1 &= (q_+-q_-)/2-q_\infty,\cr
+c_2 &= (q_++q_-)/2-q_0,\cr
 c_3 &= q_\infty.
 \end{aligned}
+\tag{14}
 $$
 
-Recovering polynomial coefficients from these values is **interpolation**. Evaluation at $0$ and $\pm1$ requires only sums and differences because their powers are zeros, ones, or signs. The interpolation step supplies the fixed factors such as $1/2$.
+Recovering polynomial coefficients with <a href="#eq-interpolation">Equation (14)</a> from the values in <a href="#eq-polynomial-products">Equation (13)</a> is **interpolation**. Evaluation at $0$ and $\pm1$ requires only sums and differences because their powers are zeros, ones, or signs. The interpolation step supplies the fixed factors such as $1/2$.
 
-This example maps two sequence elements to four full-convolution coefficients. To obtain the sliding filter used earlier, hold $g$ fixed and transpose that $4\times2$ linear map: its transpose maps the four inputs $d_0,\ldots,d_3$ to $y_0,y_1$. Transposing the evaluation and interpolation steps produces the Winograd input and output transforms. For example, $q_0$ contributes $+q_0$ to $c_0$ and $-q_0$ to $c_2$. The transposed step combines inputs as $d_0-d_2$. This is the first input combination in our $F(2,3)$ example. The [Cook–Toom construction described by Lavin and Gray](https://arxiv.org/abs/1509.09308) generalizes this approach to larger tiles. <!-- codespell:ignore toom -->
+This example maps two sequence elements to four full-convolution coefficients. To obtain the sliding filter in <a href="#eq-direct-f23">Equation (8)</a>, hold $g$ fixed and transpose that $4\times2$ linear map: its transpose maps the four inputs $d_0,\ldots,d_3$ to $y_0,y_1$. Transposing the evaluation and interpolation steps produces the Winograd input and output transforms. For example, $q_0$ contributes $+q_0$ to $c_0$ and $-q_0$ to $c_2$. The transposed step combines inputs as $d_0-d_2$. This is the first input combination in <a href="#eq-winograd-f23">Equation (9)</a>. The [Cook–Toom construction described by Lavin and Gray](https://arxiv.org/abs/1509.09308) generalizes this approach to larger tiles. <!-- codespell:ignore toom -->
 
 For one-dimensional $F(m,r)$, the polynomial product has $m+r-1$ coefficients, so the construction needs that many independent values: four for $F(2,3)$, six for $F(4,3)$. Applying the six-point construction along both spatial axes gives the 36 coordinates of spatial F4. Other valid point sets give the same convolution in exact arithmetic, but change the transform coefficients, intermediate magnitudes, and cancellation during reconstruction. That changes how much rounding error reaches the output. [Barabasz et al.](https://arxiv.org/abs/1803.10986) analyze this floating-point behavior.
 
