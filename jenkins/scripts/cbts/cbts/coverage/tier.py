@@ -35,6 +35,8 @@ from cbts.blocks import (
     _estimate_entries_seconds,
     _target_in_filter_subtree,
     block_matches_stage,
+    find_context_files,
+    write_context_file,
 )
 from cbts.coverage.selection.selector import (  # noqa: F401
     DEFAULT_NO_DATA_POLICY,
@@ -295,9 +297,10 @@ def write_coverage_test_db(
     # Clear first: a leftover YAML from an earlier run would ship in the artifact.
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    context_files = find_context_files(src_dir)
     for stem in sorted({stem for stem, _ in removed}):
-        src = src_dir / f"{stem}.yml"
-        if not src.exists():
+        src = context_files.get(stem)
+        if src is None:
             continue
         data = yaml.safe_load(src.read_text()) or {}
         blocks = data.get(stem)
@@ -310,9 +313,7 @@ def write_coverage_test_db(
             if not rm:
                 continue
             block_data["tests"] = [t for t in (block_data.get("tests") or []) if t not in rm]
-        (out_dir / src.name).write_text(
-            yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
-        )
+        write_context_file(out_dir, data, stem, blocks)
 
 
 def compute_coverage_stage_counts(

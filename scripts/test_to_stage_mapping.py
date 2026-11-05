@@ -127,7 +127,9 @@ class StageQuery:
                     backend = terms.get('backend', '')  # Default to empty
 
                     tests = entry.get('tests', [])
-                    yml = os.path.basename(path)
+                    # A stage names a test-db context (top-level key), and one
+                    # file may hold several, so key by context, not file name.
+                    yml = f'{key}.yml'
                     for t in tests:
                         test_map[t].append((yml, stage, backend))
                         yaml_stage_tests[yml][stage].append(t)

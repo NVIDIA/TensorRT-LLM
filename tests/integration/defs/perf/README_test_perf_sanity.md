@@ -445,13 +445,18 @@ JSON. To reproduce the uploaded numbers offline, run
 
 Test lists are defined in `tests/integration/test_lists/test-db/`.
 
-### YAML File Naming Convention
+### Test List Naming Convention
 
-| Test Type | File Pattern | Example |
-|-----------|--------------|---------|
-| Single-node aggregated | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_b200_multi_gpus_perf_sanity.yml` |
-| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml` |
-| Multi-node disaggregated | `l0_{gpu_type}_multi_gpus_perf_sanity_ctx{ctx worker count}node{node count per ctx worker}_gpu{gpu count per ctx worker}_gen{gen worker count}node{node count per gen worker}_gpu{gen gpus per gen worker}.yml` | `l0_b200_multi_gpus_perf_sanity_ctx1node1_gpu8_gen1node1_gpu8.yml` |
+A test list is a top-level key of a test-db YAML file, and a Jenkins stage names its list (`trt-test-db --context`). One file can hold several lists: the perf-sanity lists of a GPU type share one file for single-node and one for multi-node stages, so CODEOWNERS (`*multi_gpu*`, `*multi_node*`) still routes their reviews.
+
+| Test Type | File | Test list | Example list |
+|-----------|------|-----------|--------------|
+| Single-node | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_{gpu_type}_multi_gpus_perf_sanity[_{suffix}]` | `l0_gb300_multi_gpus_perf_sanity_glm5` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count}` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8` |
+| Multi-node gen_only_no_context | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_gen1_node{node count}_gpu{gpu count}[_{suffix}]` | `l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_glm5` |
+| Multi-node disaggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_ctx{ctx workers}_node{nodes per ctx worker}_gpu{gpus per ctx worker}_gen{gen workers}_node{nodes per gen worker}_gpu{gpus per gen worker}[_{suffix}]` | `l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8_e2e` |
+
+The optional `{suffix}` (`glm5`, `e2e`) separates cases that share a topology but run at a different post-merge frequency (see below).
 
 ### Jenkins Pipeline Configuration
 
