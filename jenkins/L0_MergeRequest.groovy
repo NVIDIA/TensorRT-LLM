@@ -1965,6 +1965,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/disagg_auto_scaling.py",
         "tensorrt_llm/serve/extensions/",
         "tensorrt_llm/serve/metadata_server.py",
+        "tensorrt_llm/serve/middleware/",
         "tensorrt_llm/serve/openai_client.py",
         "tensorrt_llm/serve/openai_disagg_server.py",
         "tensorrt_llm/serve/openai_disagg_service.py",

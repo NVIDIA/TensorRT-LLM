@@ -36,6 +36,8 @@ from tensorrt_llm.serve.disagg_auth import (
     validate_internal_disagg_request,
     validate_subagent_affinity,
 )
+from tensorrt_llm.serve.middleware.arrival_time import ServerArrivalTimeMiddleware
+from tensorrt_llm.serve.middleware.perf_metrics import PerfMetricsMiddleware
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient, _encode_request_body
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -53,10 +55,9 @@ from tensorrt_llm.serve.perf_metrics import (
     SERVER_TIMING_HEADER,
     SSE_METRICS_EVENT,
     START_END_TIME_HEADER,
-    PerfMetricsMiddleware,
     adjusted_clock_from_headers,
 )
-from tensorrt_llm.serve.responses_utils import ResponseHooks, ServerArrivalTimeMiddleware
+from tensorrt_llm.serve.responses_utils import ResponseHooks
 from tensorrt_llm.serve.router import Router
 
 pytestmark = pytest.mark.cpu_only

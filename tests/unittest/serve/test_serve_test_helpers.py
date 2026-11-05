@@ -159,7 +159,7 @@ def test_conflict_rule(record_a, record_b, conflict):
 
 
 def test_middleware_snapshot_format():
-    from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
+    from tensorrt_llm.serve.middleware.arrival_time import ServerArrivalTimeMiddleware
 
     app = FastAPI()
     app.add_middleware(ServerArrivalTimeMiddleware, adjusted_clock=None)

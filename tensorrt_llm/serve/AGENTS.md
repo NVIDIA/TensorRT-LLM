@@ -43,8 +43,9 @@ Name files and symbols here, never line numbers.
   `tests/unittest/api_stability/references/trtllm_serve_routes.yaml`. A route change
   regenerates it and needs the API review committee.
   Check: `tests/unittest/api_stability/test_serve_routes.py`.
-- Middleware order matters: `add_middleware` inserts at the front, so the last one added is
-  outermost. Do not reorder. Check: `tests/unittest/serve/test_middleware_order.py`.
+- Middleware: register built-in middleware in `serve/middleware/register.py`, which both apps
+  call. Order matters (`add_middleware` inserts at the front, so the last one added is
+  outermost); do not reorder. Check: `tests/unittest/serve/test_middleware_order.py`.
 - Import directions between layers are tests; a PR that creates a package adds its contract.
   Check: `tests/unittest/serve/test_layering.py`.
 - VisualGen serve tests live under a path that contains `visual_gen/`

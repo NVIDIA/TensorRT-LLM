@@ -16,8 +16,6 @@ import asyncio
 import atexit
 import contextlib
 import gc
-import importlib
-import inspect
 import json
 import os
 import secrets
@@ -74,6 +72,8 @@ from tensorrt_llm.serve._frontend_processes import (
     _frontend_affinity_sockets, _init_multi_frontend_mode,
     _signal_frontend_ready, _spawn_attached_frontends,
     _terminate_attached_frontends, _watch_attached_frontends)
+from tensorrt_llm.serve.middleware.user_middleware import \
+    _apply_fastapi_middlewares
 from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
                                                LAUNCHER_UDS_NAME,
                                                MultiFrontendServing)
@@ -156,25 +156,6 @@ def _apply_effective_telemetry_config(llm_args: dict,
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
-
-
-def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
-    """Import and register middleware objects on a FastAPI app."""
-    for middleware in middlewares:
-        try:
-            module_path, object_name = middleware.rsplit(".", 1)
-        except ValueError as e:
-            raise ValueError(f"Invalid middleware import path '{middleware}'. "
-                             "Expected format: <module>.<object>.") from e
-
-        imported = getattr(importlib.import_module(module_path), object_name)
-        if inspect.isclass(imported):
-            app.add_middleware(imported)
-        elif inspect.iscoroutinefunction(imported):
-            app.middleware("http")(imported)
-        else:
-            raise ValueError(f"Invalid middleware {middleware}. "
-                             "Must be a class or an async function.")
 
 
 def is_non_default_or_required(param_name, value, explicit_cli_keys):

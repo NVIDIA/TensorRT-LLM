@@ -15,10 +15,10 @@
 """Middleware-order snapshot of the aggregated and disaggregated apps.
 
 Starlette's ``add_middleware`` inserts at position 0, so the last one added is
-outermost. ``ServerArrivalTimeMiddleware`` assigns ``scope['state'] = {}`` and
-``PerfMetricsMiddleware`` only ``setdefault``s into it, so their relative order
-is load-bearing: swapping them wipes every perf-metrics record. VisualGen is not
-listed: it takes the default code path without perf metrics, and no VisualGen
+outermost. ``ServerArrivalTimeMiddleware`` and ``PerfMetricsMiddleware`` both
+``setdefault`` into ``scope['state']``; the order stays load-bearing because the
+arrival time must be stamped before ``PerfMetricsMiddleware`` runs. VisualGen is
+not listed: it takes the default code path without perf metrics, and no VisualGen
 path can change middleware registration.
 """
 
@@ -95,8 +95,8 @@ def _failure(name, expected, got):
     return (
         f"Middleware stack of '{name}' changed: expected {expected}, got {got}. "
         "Starlette's add_middleware inserts at position 0, so the last one added is "
-        "outermost. ServerArrivalTimeMiddleware assigns scope['state'] = {} and must stay "
-        "outside PerfMetricsMiddleware, or every perf-metrics record is wiped. Agg passes "
+        "outermost. ServerArrivalTimeMiddleware must stay outside PerfMetricsMiddleware, so "
+        "the arrival time is stamped before PerfMetricsMiddleware runs. Agg passes "
         "adjusted_clock to both, disagg to neither. If the change is intended, update "
         "EXPECTED in tests/unittest/serve/test_middleware_order.py and say why in the PR "
         "body."
@@ -124,7 +124,7 @@ def test_arrival_time_stays_outside_perf_metrics(name, serve_env):
 
 def test_user_middleware_is_outermost(serve_env):
     """``--middleware`` classes are applied after construction, so they end up outermost."""
-    from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
+    from tensorrt_llm.serve.middleware.user_middleware import _apply_fastapi_middlewares
 
     server = serve_env.build_openai_server(AggConfig())
     _apply_fastapi_middlewares(server.app, ["test_common.serve.fakes.UserProbeMiddleware"])

@@ -53,6 +53,7 @@ from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
+from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._base.routing import (RoleGroup, ServerCapabilities,
                                               attach_routers, role_group_of)
@@ -74,6 +75,7 @@ from tensorrt_llm.serve.chat_utils import load_chat_template
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
@@ -90,16 +92,14 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 to_llm_conversation_params,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
-from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
-                                             PerfMetricsMiddleware)
+from tensorrt_llm.serve.perf_metrics import PerfMetricsJsonlWriter
 from tensorrt_llm.serve.postprocess_handlers import (
     PostprocStrategy, ResponsesAPIPostprocArgs, responses_api_post_processor,
     responses_api_streaming_post_processor, select_postproc_strategy)
 from tensorrt_llm.serve.render import RenderResources, mount_render_endpoints
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
-                                                ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ResponsesStreamingProcessor)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
@@ -120,7 +120,6 @@ from tensorrt_llm.version import __version__ as VERSION
 from .._utils import (AdjustedSteadyClock,
                       get_global_steady_clock_now_in_seconds,
                       set_prometheus_multiproc_dir)
-from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 if TYPE_CHECKING:
@@ -548,12 +547,6 @@ class OpenAIServer(_VideoRoutesMixin):
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
 
-        self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
-                                                  "0") == "1"
-        self.app.router.route_class = _MsgspecRoute
-
-        @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request, exc):
             if request.url.path.startswith("/v1/messages"):
                 # Anthropic clients expect a 400 with the Anthropic error
@@ -578,10 +571,29 @@ class OpenAIServer(_VideoRoutesMixin):
                     len(detail) - 4096)
             return JSONResponse(status_code=400, content={"error": detail})
 
+        self.app = build_http_app(
+            lifespan=lifespan,
+            route_class=_MsgspecRoute,
+            dialect_error_renderers=lambda app: app.add_exception_handler(
+                RequestValidationError, validation_exception_handler),
+            routers=(self._attach_role_routes, ),
+            middleware=lambda app: register_middlewares(
+                app,
+                collect_perf_metrics=self._collect_perf_metrics,
+                expose_perf_metrics=self._expose_perf_metrics,
+                perf_metrics_writer=self._perf_metrics_writer,
+                adjusted_clock=self._adjusted_steady_clock),
+        )
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
+                                                  "0") == "1"
+
+    def _attach_role_routes(self, app: FastAPI) -> None:
+        # The register_* methods below add their routes through self.app.
+        self.app = app
         # /health, /version and /v1/models for every role. The health
         # probe stays here, with its private accesses, until the public
         # health API exists.
-        self.app.state.ops_serving_system = SystemServing(
+        app.state.ops_serving_system = SystemServing(
             model=self.model, health_probe=self._health_probe)
         if role_group_of(self.server_role) is RoleGroup.LLM:
             # An attached frontend of a multi-frontend server forwards the
@@ -601,15 +613,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 harmony_adapter=self.harmony_adapter,
                 render_resources=self._render_resources,
                 **self._generate_serving_kwargs())
-            setattr(self.app.state, chat_router.APP_STATE_KEY,
-                    self._chat_serving)
+            setattr(app.state, chat_router.APP_STATE_KEY, self._chat_serving)
             messages_serving = AnthropicMessagesServing(self._chat_serving)
-            self.app.state.anthropic_serving_messages = messages_serving
+            app.state.anthropic_serving_messages = messages_serving
             # Transitional: RenderResources per request until it is built once.
-            self.app.state.anthropic_serving_count_tokens = (
+            app.state.anthropic_serving_count_tokens = (
                 AnthropicCountTokensServing(
                     render_resources=lambda: RenderResources.from_server(self)))
-            self.app.state.anthropic_serving_batches = AnthropicBatchesServing(
+            app.state.anthropic_serving_batches = AnthropicBatchesServing(
                 runner=messages_serving.run_batched_message)
 
         if self.server_role is ServerRole.VISUAL_GEN:
@@ -625,7 +636,7 @@ class OpenAIServer(_VideoRoutesMixin):
             from tensorrt_llm.serve.api.openai.mm_encoder.serving import \
                 MMEncoderServing
             setattr(
-                self.app.state, mm_encoder_router.APP_STATE_KEY,
+                app.state, mm_encoder_router.APP_STATE_KEY,
                 MMEncoderServing(
                     render_resources=self._render_resources,
                     multimodal_server_config=self.multimodal_server_config,
@@ -649,38 +660,30 @@ class OpenAIServer(_VideoRoutesMixin):
             # The lifespan starts and stops the batcher and the health probe
             # reports it; both read it here.
             self.embedding_batcher = embedding_serving.embedding_batcher
-            setattr(self.app.state, embeddings_router.APP_STATE_KEY,
+            setattr(app.state, embeddings_router.APP_STATE_KEY,
                     embedding_serving)
         else:
             from tensorrt_llm.serve.api.openai.tokenize import \
                 api_router as tokenize_router
             from tensorrt_llm.serve.api.openai.tokenize.serving import \
                 TokenizeServing
-            setattr(self.app.state, tokenize_router.APP_STATE_KEY,
+            setattr(app.state, tokenize_router.APP_STATE_KEY,
                     TokenizeServing(model=self.model, tokenizer=self.tokenizer))
             from tensorrt_llm.serve.api.openai.completions import \
                 api_router as completions_router
             from tensorrt_llm.serve.api.openai.completions.serving import \
                 CompletionServing
-            setattr(self.app.state, completions_router.APP_STATE_KEY,
+            setattr(app.state, completions_router.APP_STATE_KEY,
                     CompletionServing(**self._generate_serving_kwargs()))
             self.register_routes()
 
         # Attach routers after the role switch: every attach_router checks
         # that its serving objects are on app.state.
         attach_routers(
-            self.app,
+            app,
             dataclasses.replace(ServerCapabilities.for_role(self.server_role),
                                 harmony_model=(not self._is_visual_gen)
                                 and self.use_harmony))
-
-        if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer,
-                                    adjusted_clock=self._adjusted_steady_clock)
-        self.app.add_middleware(ServerArrivalTimeMiddleware,
-                                adjusted_clock=self._adjusted_steady_clock)
 
     def _init_visual_gen(self):
         self.processor = None
@@ -2377,26 +2380,24 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        server = create_uvicorn_server(config)
+        await serve_uvicorn(self.app,
+                            host=host,
+                            port=port,
+                            sockets=sockets,
+                            log_level="info",
+                            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                            after_start=self._register_after_serving)
 
-        async def _register_after_serving():
-            with _StartupTimer("http_server_start"):
-                while not server.started:
-                    await asyncio.sleep(0.1)
-            if self.disagg_cluster_worker:
-                try:
-                    with _StartupTimer(
-                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
-                    ):
-                        await self.disagg_cluster_worker.register_worker()
-                except Exception as e:
-                    logger.error(f"Worker registration failed: {e}")
-                    server.should_exit = True
-
-        asyncio.create_task(_register_after_serving())
-        await server.serve(sockets=sockets)
+    async def _register_after_serving(self, server: uvicorn.Server) -> None:
+        with _StartupTimer("http_server_start"):
+            while not server.started:
+                await asyncio.sleep(0.1)
+        if self.disagg_cluster_worker:
+            try:
+                with _StartupTimer(
+                        f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                ):
+                    await self.disagg_cluster_worker.register_worker()
+            except Exception as e:
+                logger.error(f"Worker registration failed: {e}")
+                server.should_exit = True
