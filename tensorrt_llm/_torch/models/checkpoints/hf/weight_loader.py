@@ -348,45 +348,48 @@ class HfWeightLoader(BaseWeightLoader):
             return communicator.allreduce(available_host_memory, op=_MPI.MIN)
         return available_host_memory
 
-    def _with_weight_cache(self,
-                           weight_files: List[str],
-                           use_consolidated: bool,
-                           mirror_load_collectives: bool,
-                           load_fn,
-                           local_communicator=None) -> ConsumableWeightsDict:
+    @staticmethod
+    def _has_cached_weights(cache_key: tuple) -> bool:
+        with _WEIGHT_CACHE_LOCK:
+            return cache_key in _WEIGHT_CACHE
+
+    def _with_weight_cache(
+            self,
+            weight_files: List[str],
+            use_consolidated: bool,
+            load_fn: Callable[[], ConsumableWeightsDict],
+            prefetch_fn: Callable[[], None] | None = None
+    ) -> ConsumableWeightsDict:
         """Wrap ``load_fn`` with the optional raw-weight cache.
 
-        Key -> hit (optionally joining the local barrier the miss path is
-        about to enter) -> evict-before-load (so CPU never holds the old
-        cached and the new loading weights at once) -> load -> store.
-        A checkpoint that host memory cannot keep resident is loaded like a
-        miss, without the lookup and the store.
+        Key -> evict-before-load on a miss (so CPU never holds the old cached
+        and the new loading weights at once) -> ``prefetch_fn`` -> hit, or
+        load -> store. A checkpoint that host memory cannot keep resident is
+        loaded like a miss, without the lookup and the store.
+
+        ``prefetch_fn`` warms the page cache with the checkpoint files and
+        holds all collectives of the load. Every rank runs it exactly once
+        per load, on a hit as on a miss: rank-local caches can diverge, and
+        ranks that enqueue different collectives deadlock. A hit runs it
+        before checking the cached entry, because cached SafeTensors tensors
+        read the checkpoint's file pages, and the page cache may have dropped
+        them since the entry was stored.
         """
         cache_key = None
+        cache_hit = False
         if self._is_weight_cache_enabled():
             if self._can_cache_weights(weight_files):
                 cache_key = self._weight_files_cache_key(
                     weight_files, use_consolidated)
-            else:
+                cache_hit = self._has_cached_weights(cache_key)
+            if not cache_hit:
                 self._evict_to_make_room()
-        if cache_key is not None:
+        if prefetch_fn is not None:
+            prefetch_fn()
+        if cache_hit:
             cached_weights = self._get_cached_weights(cache_key)
             if cached_weights is not None:
                 logger.info("Reusing cached HF checkpoint weights.")
-                if mirror_load_collectives:
-                    # Rank-local caches can diverge, so a hit on one rank must
-                    # enqueue EXACTLY the collectives a miss on another rank
-                    # enqueues, in the same order, or the job deadlocks. The
-                    # safetensors miss path performs an Allreduce (inside
-                    # _get_local_available_host_memory) and then a Barrier;
-                    # mirror both here (the allreduce result is unused).
-                    if local_communicator is None:
-                        self._get_local_available_host_memory()
-                        local_mpi_barrier()
-                    else:
-                        self._get_local_available_host_memory(
-                            local_communicator)
-                        local_communicator.Barrier()
                 return cached_weights
             self._evict_to_make_room()
         weights = load_fn()
@@ -965,19 +968,14 @@ class HfWeightLoader(BaseWeightLoader):
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
         if weight_files:
-            if _local_communicator is None and _allow_prefetch:
-                return self._with_weight_cache(
-                    weight_files,
-                    use_consolidated,
-                    mirror_load_collectives=True,
-                    load_fn=lambda: self._prefetch_and_load(weight_files))
             return self._with_weight_cache(
                 weight_files,
                 use_consolidated,
-                mirror_load_collectives=_allow_prefetch,
-                load_fn=lambda: self._prefetch_and_load(
-                    weight_files, _local_communicator, _allow_prefetch),
-                local_communicator=_local_communicator)
+                load_fn=lambda: self._load_weights_in_parallel(
+                    weight_files, self._load_safetensors_file,
+                    "Loading safetensors weights in parallel"),
+                prefetch_fn=lambda: self._prefetch_weight_files(
+                    weight_files, _local_communicator, _allow_prefetch))
 
         weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
         if not weight_files:
@@ -987,18 +985,22 @@ class HfWeightLoader(BaseWeightLoader):
             return self._with_weight_cache(
                 weight_files,
                 use_consolidated,
-                mirror_load_collectives=False,
                 load_fn=lambda: self._load_weights_in_parallel(
                     weight_files, self._load_bin_or_path_file,
                     "Loading bin weights in parallel"))
 
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
-    def _prefetch_and_load(
-            self,
-            weight_files: List[str],
-            local_communicator=None,
-            allow_prefetch: bool = True) -> ConsumableWeightsDict:
+    def _prefetch_weight_files(self,
+                               weight_files: List[str],
+                               local_communicator=None,
+                               allow_prefetch: bool = True) -> None:
+        """Warm the page cache with the SafeTensors files before they are read.
+
+        With ``allow_prefetch``, the node-local ranks agree on the available
+        host memory (an allreduce), prefetch if the files fit, and meet at a
+        barrier; otherwise this does nothing and enqueues no collectives.
+        """
         # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
         # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
         prefetch_size = sum(os.path.getsize(file) for file in weight_files)
@@ -1032,10 +1034,6 @@ class HfWeightLoader(BaseWeightLoader):
                 local_mpi_barrier()
             else:
                 local_communicator.Barrier()
-
-        return self._load_weights_in_parallel(
-            weight_files, self._load_safetensors_file,
-            "Loading safetensors weights in parallel")
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
                                   description: str) -> ConsumableWeightsDict:
