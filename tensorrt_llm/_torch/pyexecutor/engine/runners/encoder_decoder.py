@@ -57,18 +57,13 @@ from .encoder import EncoderConfig, EncoderMixin, EncoderPreparedInputs
 from .interface import PreparedInputs, ScheduledInputs
 
 
-@dataclass(frozen=True)
-class EncoderStageConfig(EncoderConfig):
-    """Configuration for the encoder stage of an encoder-decoder model."""
-
-
 class EncoderStage(EncoderMixin):
     """Run the independent encoder phase of an encoder-decoder model."""
 
     def __init__(
         self,
         model: nn.Module,
-        config: EncoderStageConfig,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
@@ -1330,7 +1325,7 @@ class EncoderDecoderRunner(DecoderRunner):
         model: nn.Module,
         config: EncoderDecoderRunnerConfig,
         *,
-        encoder_config: EncoderStageConfig,
+        encoder_config: EncoderConfig,
         input_processor: InputProcessor | BaseMultimodalInputProcessor,
         attention_runtime_features: AttentionRuntimeFeatures,
         mapping: Mapping,
