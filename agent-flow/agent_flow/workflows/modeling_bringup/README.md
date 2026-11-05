@@ -282,11 +282,13 @@ completion_criteria:
 ```
 
 The PlanDrafter then plans the MX work from the start, and QA checks it like
-any other criterion. The donor/receiver test needs a ModelExpress server and at
-least two GPUs. Without them, the run is left to the ModelExpress CI stages, and
-MX stays pending in `final-report.md` until those stages pass it. Every bring-up
-already keeps post-load work in the staged hooks MX relies on, so a model stays
-ready for MX even without this criterion.
+any other criterion. The donor/receiver test needs a ModelExpress server and
+twice as many GPUs as its TP size, because the donor and the receiver each hold
+one TP group: two GPUs for TP=1 and four for TP=2. Runs the bring-up host
+cannot do are left to the ModelExpress CI stages, and MX stays pending in
+`final-report.md` until those stages pass them. Every bring-up already keeps
+post-load work in the staged hooks MX relies on, so a model stays ready for MX
+even without this criterion.
 
 ## Environment
 
