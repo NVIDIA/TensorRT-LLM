@@ -543,8 +543,11 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
 
         # Same rule as run_moe_mxfp8_impl: in the dense case the op's parent
         # reset launch clears the whole output for both shards before the
-        # fork; alltoall with ep > top_k keeps the sparse row memset.
-        zero_output_in_kernel = not enable_alltoall or self.mapping.moe_ep_size <= effective_top_k
+        # fork; alltoall with ep > top_k, or an output past the reset kernel's
+        # Int32 element count, keeps the row memset.
+        zero_output_in_kernel = (
+            not enable_alltoall or self.mapping.moe_ep_size <= effective_top_k
+        ) and moe_output.numel() <= self._ZERO_OUTPUT_MAX_ELEMENTS
         if not zero_output_in_kernel:
             self._memset_moe_output(
                 moe_output,

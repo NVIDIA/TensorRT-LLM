@@ -5524,13 +5524,18 @@ def test_moe_backend(
         with torch.inference_mode(), autotune(cache_path=cache_path):
             _ = run_moe()
         if enable_locality_domains and quant_algo == QuantAlgo.MXFP8:
-            # The MXFP8 split is a separate autotuned op next to the unchanged
-            # full-GPU op; both are profiled for the admitted decode shapes.
+            # A split layer always runs the locality-domain op, so only its
+            # outer key and the concurrent shard tuning are profiled. Both keys
+            # carry the dtype the op receives: run_moe defers quantization, so
+            # small BF16 inputs reach it raw and add an ``::input_quant`` suffix.
+            op_input_dtype = backend.quantize_input(x, post_quant_comm=False)[0].dtype
+            input_quant = (
+                "" if op_input_dtype == torch.float8_e4m3fn else f"::input_quant::{op_input_dtype}"
+            )
             expected_tuning_ops = (
-                "CuteDslFusedMoE::run_moe_mxfp8",
-                "CuteDslFusedMoE::run_moe_mxfp8::locality_domain",
-                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin"
-                "::locality_domain::locality_domain_concurrent",
+                type(backend)._tuner_key(op_input_dtype, locality=True),
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin::locality_domain"
+                f"{input_quant}::locality_domain_concurrent",
             )
         elif enable_locality_domains:
             quant_name = "nvfp4" if quant_algo == QuantAlgo.NVFP4 else "bf16"
