@@ -3685,8 +3685,46 @@ class SpecWorkerBase(nn.Module, ABC):
                 "remove watermark_config")
         if isinstance(logits, VocabShardedLogits):
             return logits.select_tokens(spec_metadata)
-        sampled_tokens, _ = self._sample_tokens_and_watermark_plans(
-            logits, spec_metadata, num_contexts, batch_size)
+        if not spec_metadata.is_all_greedy_sample:
+            # Use logits.shape[0] directly: for PARD under CUDA graph capture
+            # runtime_draft_len may reflect the PARD-max while the captured
+            # graph was built for a shorter draft_len, causing a shape mismatch
+            # in sample_from_logits_op (which is torch.compiled).
+            num_tokens = logits.shape[0]
+
+            temperatures = spec_metadata.temperatures[:num_tokens]
+            if spec_metadata.sharded_target_logits:
+                # Temperature-only batch: the logits are this rank's
+                # vocabulary shard.
+                return self._sample_sharded_temperature(logits, temperatures)
+            top_ks = spec_metadata.top_ks[:num_tokens]
+            top_ps = spec_metadata.top_ps[:num_tokens]
+            min_ps = spec_metadata.min_ps[:num_tokens]
+
+            # One row per logits row here, the same slice the per-token
+            # sampling params above use.
+            seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
+            sampled_tokens = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
+        elif spec_metadata.sharded_target_logits:
+            # The logits are this rank's vocabulary shard; global greedy
+            # tokens from one launch (local first maximum + LL key exchange;
+            # same tokens as torch.argmax).
+            sampled_tokens = self.key_exchange.argmax_logits(
+                logits,
+                vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+                channel=1)
+        else:
+            sampled_tokens = greedy_argmax(
+                logits, small_rows=spec_metadata.is_cuda_graph)
+
         return sampled_tokens
 
     def _sample_tokens_and_watermark_plans(
@@ -3704,14 +3742,15 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns the sampled tokens and, when a watermark is in play, the plans to hand to
         ``_commit_watermark`` once the accepted tokens are known (else None).
         """
+        if not spec_metadata.watermark_ready:
+            return self._sample_tokens_for_batch(logits, spec_metadata,
+                                                 num_contexts, batch_size), None
         watermark_plans = None
         if isinstance(logits, VocabShardedLogits):
             # A sampled, watermarked row needs the whole distribution, not this rank's shard.
-            if (spec_metadata.watermark_ready
-                    and not spec_metadata.is_all_greedy_sample):
-                logits = logits.gather()
-            else:
+            if spec_metadata.is_all_greedy_sample:
                 return logits.select_tokens(spec_metadata), None
+            logits = logits.gather()
         if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
@@ -3741,23 +3780,20 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
-            if spec_metadata.watermark_ready:
-                # Rows of watermarked requests replace the ordinary draw by the keyed
-                # Gumbel-max draw over the same filtered distribution.
-                watermark_plans = self._plan_watermark(spec_metadata,
-                                                       num_contexts, batch_size,
-                                                       draft_tokens)
-                planned = [plan for plan in watermark_plans if plan is not None]
-                seeds = torch.cat([plan.seeds.reshape(-1) for plan in planned])
-                active = torch.cat(
-                    [plan.active.reshape(-1) for plan in planned])
-                assert seeds.shape[0] == num_tokens, (
-                    "watermark windows do not match the sampled rows")
-                probs = self._compute_probs_from_logits(
-                    spec_metadata.advanced_sampling_mode, logits, temperatures,
-                    top_ks, top_ps, min_ps)
-                keyed = gumbel_sample_from_probs(probs, seeds, active)
-                sampled_tokens = torch.where(active, keyed, sampled_tokens)
+            # Rows of watermarked requests replace the ordinary draw by the keyed
+            # Gumbel-max draw over the same filtered distribution.
+            watermark_plans = self._plan_watermark(spec_metadata, num_contexts,
+                                                   batch_size, draft_tokens)
+            planned = [plan for plan in watermark_plans if plan is not None]
+            seeds = torch.cat([plan.seeds.reshape(-1) for plan in planned])
+            active = torch.cat([plan.active.reshape(-1) for plan in planned])
+            assert seeds.shape[0] == num_tokens, (
+                "watermark windows do not match the sampled rows")
+            probs = self._compute_probs_from_logits(
+                spec_metadata.advanced_sampling_mode, logits, temperatures,
+                top_ks, top_ps, min_ps)
+            keyed = gumbel_sample_from_probs(probs, seeds, active)
+            sampled_tokens = torch.where(active, keyed, sampled_tokens)
         elif spec_metadata.sharded_target_logits:
             # The logits are this rank's vocabulary shard; global greedy
             # tokens from one launch (local first maximum + LL key exchange;

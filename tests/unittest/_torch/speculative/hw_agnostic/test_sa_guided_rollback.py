@@ -358,9 +358,7 @@ def test_sa_worker_skips_the_rollback_when_not_drafting(monkeypatch):
     batch_size = 2
     meta, attn, *inputs = _worker_inputs(batch_size, 0, runtime_draft_len=0)
     sampled = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
-    monkeypatch.setattr(
-        worker, "_sample_tokens_and_watermark_plans", lambda *a, **k: (sampled, None)
-    )
+    monkeypatch.setattr(worker, "_sample_tokens_for_batch", lambda *a, **k: sampled)
 
     out = worker.forward(*inputs, attn, meta)
 
