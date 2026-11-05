@@ -37,6 +37,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_model_config(
     act_dtype: torch.dtype = torch.bfloat16,

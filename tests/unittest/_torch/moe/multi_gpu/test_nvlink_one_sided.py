@@ -686,6 +686,7 @@ def test_nvlink_one_sided(case: Case, mpi_pools: dict[tuple[int, bool], MPIPoolE
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("cft,fp8_combine", [(False, False), (True, False), (True, True)])
 def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
     from tensorrt_llm.bindings import internal as _tllm_internal
@@ -742,6 +743,7 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("force_env", "driver_version", "num_tokens", "device_supported", "expected"),
     [
@@ -788,6 +790,7 @@ def test_cft_selection(
     assert nvlink_one_sided.should_use_cft(can_use_cft, force_cft, 128, num_tokens) is expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capability", "unsupported_index"),
     [
