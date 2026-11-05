@@ -54,13 +54,9 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture(scope="module", autouse=True)
 def _limit_cpu_threads() -> Iterator[None]:
-    """Keep small tensor transforms within CPU-constrained workers' thread budget."""
-    previous_threads = torch.get_num_threads()
-    torch.set_num_threads(min(previous_threads, 2))
-    try:
-        yield
-    finally:
-        torch.set_num_threads(previous_threads)
+    """Leave torch's CPU thread count alone. Lowering it to 2 and restoring it afterwards made the
+    next wide CPU OpenMP op in the same process segfault (NGC PyTorch 26.09, libgomp + MKL)."""
+    yield
 
 
 _LAYOUTS = sorted(routing._DEFAULT_LAYOUTS)
