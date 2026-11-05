@@ -276,6 +276,8 @@ def _draft_pool_ratio_manager_and_config(pool_ratio):
             ),
         ],
         initial_pool_ratio=pool_ratio,
+        # SSM layers require it; MambaHybridCacheManagerV2._build_cache_config sets it.
+        commit_min_snapshot=True,
     )
     return manager, config
 
