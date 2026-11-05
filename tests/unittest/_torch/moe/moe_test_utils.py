@@ -128,9 +128,7 @@ def find_backend_class(
     not one class each but sets of leaves keyed by quant, so each needs
     ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice, once per SM
     family, so for that format the leaf is the one this device runs.
-    TRTLLM-Gen has one leaf per format: native for every quantized one, and
-    ``FlashinferTrtllmGenBf16Impl`` for the unquantized one, so only bf16 tests
-    are exercising a FlashInfer class.
+    TRTLLM-Gen has one leaf per format, the unquantized one included.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
@@ -257,27 +255,6 @@ def _is_fp4_fp8_standalone_gemm_available() -> bool:
 
     _is_fp4_fp8_standalone_gemm_available._cached_result = result
     return result
-
-
-def _is_sm103_gpu() -> bool:
-    """Return whether the current test GPU is an SM103 device such as B300."""
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability(0) == (10, 3)
-
-
-def skip_trtllm_bf16_on_sm103(
-    backend_type: MoeBackendType,
-    quant_algo: Optional[QuantAlgo],
-    dtype: torch.dtype,
-) -> None:
-    """Explicitly skip TRTLLM BF16 tests on SM103."""
-    if backend_type == MoeBackendType.TRTLLM and quant_algo is None and dtype == torch.bfloat16:
-        if _is_sm103_gpu():
-            pytest.skip(
-                "FIXME: TRTLLMGenFusedMoE BF16 (FlashInfer backend) is skipped on SM103 "
-                "due to CUDA errors"
-            )
 
 
 def should_skip_trtllm(
@@ -1101,7 +1078,6 @@ def should_skip_routing_method(
 def supports_autotuner_capture(
     backend_type: MoeBackendType,
     _quant_algo: Optional[QuantAlgo],
-    use_flashinfer: bool,
 ) -> bool:
     """
     Determine if a backend+quant_algo combination supports AutoTuner capture/replay.
@@ -1124,9 +1100,6 @@ def supports_autotuner_capture(
         MoeBackendType.CUTE_DSL_B12X,
         MoeBackendType.MARLIN,
     ):
-        return False
-
-    if use_flashinfer:
         return False
 
     return True
@@ -1522,8 +1495,8 @@ def should_skip_to_accelerate_ci(
         return None
 
     # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
-    # Keep TRTLLM BF16 for FlashInfer and CuteDSL BF16 with locality domain for the
-    # dedicated locality domain backend matrix.
+    # Keep TRTLLM BF16, and CuteDSL BF16 with locality domain for the dedicated
+    # locality domain backend matrix.
     keeps_unquantized_bf16_coverage = dtype == torch.bfloat16 and (
         backend_type == MoeBackendType.TRTLLM
         or (backend_type == MoeBackendType.CUTEDSL and enable_locality_domains)

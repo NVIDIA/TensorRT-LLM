@@ -286,14 +286,14 @@ Still on old path (standalone, with embedded communication):
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
 | `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, and HALO-Q/TMA `planner` |
-| `moe_op_backend.py` | Op backend registry for TRTLLMGen: `trtllm` ops for every quantized leaf, the FlashInfer bf16 runner for the unquantized one |
+| `moe_op_backend.py` | Op backend registry for TRTLLMGen: the in-tree `trtllm` ops every leaf runs on |
 
 ### Backends (`fused_moe/`)
 
 | File | Backend | Hardware | Scenario | Scheduler |
 |------|---------|----------|----------|-----------|
 | `cutlass/` (+ the `fused_moe_cutlass.py` alias module) | the abstract `CutlassFusedMoEBase` and its twelve leaves (`CUTLASS_LEAVES`): one per quantization format, two for FP8 block scales (see [CUTLASS leaves](#cutlass-leaves-fused_moecutlass)) | SM80+ | High throughput, the widest quant support; the fallback family | `EXTERNAL_COMM` |
-| `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103/SM107 | Min-latency and high-throughput on Blackwell/Rubin; also serves unquantized BF16 through FlashInfer, on a gate of its own (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
+| `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103/SM107 | Min-latency and high-throughput on Blackwell/Rubin; also serves unquantized BF16 (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
 | `cutedsl/dense_gemm.py` (+ the `fused_moe_densegemm.py` alias module) | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its three leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`), `TrtllmCutedslGroupedGemmNvfp4PlusImpl` (`trtllm.cutedsl.grouped_gemm.nvfp4_plus`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; NVFP4_PLUS and BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; NVFP4_PLUS (MXFP4 checkpoints, UE5M3 scales) and unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
@@ -377,17 +377,14 @@ holds no code: it defines `TRTLLMGenFusedMoE` (the abstract
 | `fp8_block_scale.py` | DeepSeek-style FP8 with 1x128 block scales: `run_fp8_block_scale_moe`, the narrowed activation ABI (scalar clamp), and shared-expert fusion. One leaf. Shares nothing with the fp4 module, which is why the two sit side by side rather than under a common quant layer |
 | `eligibility.py` | the eligibility checks each leaf's `can_implement` composes, as free functions — every caller is a leaf |
 | `kernel_inputs.py` | the `run_moe` prologue the kernel bodies share, as free functions taking the impl |
-| `trtllm_<quant>.py` | one registered native leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
-| `flashinfer_bf16.py` | the one registered FlashInfer leaf: the unquantized format, which TRT-LLM's own cubins do not cover |
+| `trtllm_<quant>.py` | one registered leaf each: `bf16` (quant `none`), `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
 
 #### The leaves
 
-Module names carry the two identity segments that differ: `provider` — the
-in-tree `trtllm` ops or the FlashInfer package — and `quant`. Technique and
-kernel are `trtllm_gen` / `fused_moe` for every leaf, which the package name
-says once. Each format has exactly one leaf: every quantized format runs on the
-native provider, and FlashInfer serves only the unquantized format, for which
-TRT-LLM ships no bf16 x bf16 cubins.
+Module names carry the `provider` segment — the in-tree `trtllm` ops, for
+every leaf — and the `quant` one. Technique and kernel are `trtllm_gen` /
+`fused_moe` for every leaf, which the package name says once. Each format has
+exactly one leaf.
 
 | `quant` segment | Leaf |
 |---|---|
@@ -397,11 +394,11 @@ TRT-LLM ships no bf16 x bf16 cubins.
 | `w4a8_mxfp4_mxfp8` | `TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl` |
 | `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` |
 | `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` |
-| `none` (BF16) | `FlashinferTrtllmGenBf16Impl` |
+| `none` (BF16) | `TrtllmTrtllmGenBf16Impl` |
 
 Ids follow the class names (`trtllm.trtllm_gen.fused_moe.nvfp4`,
-`flashinfer.trtllm_gen.fused_moe.none`), keeping the technique and kernel
-segments so a future non-TRTLLM-Gen kernel from the same wheel stays
+`trtllm.trtllm_gen.fused_moe.none`), keeping the technique and kernel
+segments so a future non-TRTLLM-Gen kernel from the same provider stays
 distinguishable. The two native formats on runner ops of their own subclass the
 family base directly: a per-quant parent implementing three methods for one
 subclass buys nothing. Because the `quant` segments are disjoint, the order of
@@ -715,7 +712,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 
 | Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | Vanilla |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103/107, BF16, needs FlashInfer)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
+| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103/107, BF16)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
 | NVFP4 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
@@ -730,19 +727,16 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |
 
-§ The unquantized TRTLLM-Gen path is `FlashinferTrtllmGenBf16Impl`, and it is
-not a TRTLLM-Gen kernel at all: it calls FlashInfer's `trtllm_bf16_moe` /
-`trtllm_bf16_routed_moe`, which is why it is gated on
-`MoEDep.FLASHINFER_BF16_MOE` and why `TRTLLMOpBackend` raises
-`NotImplementedError` for it. It is the only leaf reachable on a host with no
-quantization configured at all. The row reads `Y` because `can_implement`
-really can select it; without the FlashInfer symbols the layer degrades to
-Cutlass with `DEP_MISSING` recorded in `degraded_from`, where the pre-resolver
-code raised `RuntimeError` instead. One shape gate applies:
-`Bf16MoeLauncher::check_moe` requires a multiple of 128, and what the wrapper
-passes it is `intermediate_size_per_partition`, so a non-aligned shard is
-`SHAPE_UNALIGNED` and falls back to Cutlass rather than dying in the kernel
-launcher — Qwen3.5-35B BF16 TP8 shards 512 → 64 and takes that path.
+§ The unquantized TRTLLM-Gen leaf is `TrtllmTrtllmGenBf16Impl`: BF16
+activations and weights on the `Bmm_Bfloat16_Bfloat16Bfloat16` batched-GEMM
+cubins through `trtllm::bf16_moe_runner`, with the weights in the shuffled
+BlockMajorK layout `BF16TRTLLMGenFusedMoEMethod` produces. It is the only
+TRTLLM-Gen leaf reachable on a host with no quantization configured at all. Its
+cubins ship gated SwiGLU and Relu2 gemm1 epilogues and take no expert bias or
+activation constants. One shape gate applies: `intermediate_size_per_partition`
+has to be a multiple of 128, so a non-aligned shard is `SHAPE_UNALIGNED` and
+falls back to Cutlass rather than failing in the op — Qwen3.5-35B BF16 TP8
+shards 512 → 64 and takes that path.
 
 ¶ On SM107 both CuteDSL grouped-GEMM leaves need `MoEDep.CUTEDSL_RUBIN` (the
 installed CuTe DSL exposes the Rubin helpers), and the family carries three
@@ -1108,7 +1102,7 @@ out between technique and quant, in id order
 (`mega_moe`, `fused_fc12`, `dense_gemm`, `grouped_gemm`) differ in
 `kernel_name` alone, so their classes spell the kernel out;
 `TrtllmCutedslGroupedGemmBf16Impl` keeps it to match its NVFP4 sibling. Quant
-`none` is `Bf16` on a BF16-only kernel (`FlashinferTrtllmGenBf16Impl`,
+`none` is `Bf16` on a BF16-only kernel (`TrtllmTrtllmGenBf16Impl`,
 `TrtllmCutedslGroupedGemmBf16Impl`) and `Unquantized` on
 `TrtllmCutlassUnquantizedImpl`, which also takes FP16. A bare `cutedsl` token
 matches several leaves; name the kernel segment to pin one. A partial pin can

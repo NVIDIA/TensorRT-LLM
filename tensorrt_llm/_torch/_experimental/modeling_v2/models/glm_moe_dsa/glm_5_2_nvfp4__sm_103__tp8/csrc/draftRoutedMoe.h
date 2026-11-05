@@ -30,7 +30,7 @@ namespace draft_routed_moe
 {
 
 //! The routed experts of the GLM-5.2 MTP draft layer (BF16 weights, TP8/EP1 rank shard) on the
-//! FlashInfer TRT-LLM-Gen BF16 layouts, bit-identical to ``trtllm_bf16_moe`` (DeepSeek-V3 routing with
+//! TRT-LLM-Gen BF16 layouts, bit-identical to ``trtllm::bf16_moe_runner`` (DeepSeek-V3 routing with
 //! ``n_group <= 1``, SwiGLU, ``do_finalize=True``).
 //!
 //! Two kernels, chained with programmatic dependent launch:
