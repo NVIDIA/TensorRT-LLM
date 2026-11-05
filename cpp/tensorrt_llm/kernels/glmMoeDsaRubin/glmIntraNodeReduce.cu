@@ -194,7 +194,6 @@ __global__ void __launch_bounds__(1024) reduceKernel(IntraNodeReduceParams param
     int tot_access = params.size / 8;
     float4 clear_vec = get_neg_zero();
     float4 const gamma = reinterpret_cast<float4 const*>(params.rms_gamma)[access_id_in_token];
-    float4 const residual = reinterpret_cast<float4 const*>(params.residual_in)[access_id];
     ipc::LamportCommSplit<NRanks> comm(params.workspace, params.rank, params.flags, params.layout);
     if (cg::this_cluster().num_blocks() > 1)
     {
@@ -206,6 +205,7 @@ __global__ void __launch_bounds__(1024) reduceKernel(IntraNodeReduceParams param
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
+    float4 const residual = reinterpret_cast<float4 const*>(params.residual_in)[access_id];
     alignas(16) float val[4];
     *reinterpret_cast<float4*>(val) = reinterpret_cast<float4 const*>(params.allreduce_in)[access_id];
     comm.loadFlags();
