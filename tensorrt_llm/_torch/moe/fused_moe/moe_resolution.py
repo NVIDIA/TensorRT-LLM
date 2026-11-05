@@ -145,7 +145,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({TrtllmCutedslDenseGemmNvfp4Impl}),
     # The coarse literal still names the whole family, so ``moe_backend:
-    # TRTLLM`` keeps meaning "any TRTLLM-Gen leaf" and IMPL_PRIORITY picks
+    # TRTLLM`` keeps meaning "any TRTLLM-Gen leaf" and the format picks
     # which. A pinned ``impl_id`` names exactly one of them.
     "TRTLLM": frozenset(
         {

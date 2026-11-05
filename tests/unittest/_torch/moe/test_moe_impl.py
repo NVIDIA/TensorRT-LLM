@@ -582,8 +582,8 @@ def _trtllm_gen_model_config(quant_algo=QuantAlgo.NVFP4):
     return cfg
 
 
-def test_trtllm_gen_registers_exactly_seven_identities():
-    """The grid is the deliverable: seven addressable ids, no more, no fewer."""
+def test_trtllm_gen_registers_exactly_the_listed_identities() -> None:
+    """The grid is the deliverable: the ids in ``_TRTLLM_GEN_IDS``, no more, no fewer."""
     registered = sorted(
         identity.canonical()
         for identity in MOE_IMPL_REGISTRY.identities()
@@ -626,14 +626,21 @@ def test_trtllm_gen_leaf_provider_agrees_with_its_identity(impl_id):
 
 
 @pytest.mark.parametrize("impl_id", _TRTLLM_GEN_IDS)
-def test_trtllm_gen_leaf_admits_only_its_own_format(impl_id):
+def test_trtllm_gen_leaf_admits_only_its_own_format(impl_id: str) -> None:
     """Each leaf admits its own format and no other."""
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     quant = impl.descriptor.identity.quant
+    deployment = _single_rank_deployment(_trtllm_gen_environment(flashinfer=True))
+    own = impl.can_implement(
+        MoEProblem(quant=None if quant == "none" else quant.upper(), dtype_act=torch.bfloat16),
+        deployment,
+    )
+    assert own.eligible, own.detail
+
     other = "nvfp4" if quant != "nvfp4" else "w4a16_mxfp4"
     verdict = impl.can_implement(
         MoEProblem(quant=other.upper(), dtype_act=torch.bfloat16),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
+        deployment,
     )
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
@@ -660,7 +667,7 @@ def test_every_trtllm_gen_leaf_descends_from_the_surviving_name():
         assert issubclass(impl, TRTLLMGenFusedMoE)
 
 
-def test_trtllm_literal_picks_the_native_leaf_with_flashinfer_installed():
+def test_trtllm_literal_picks_the_native_leaf_with_flashinfer_installed() -> None:
     """A quantized format stays on the native leaf when FlashInfer is present."""
     with override_moe_environment(_trtllm_gen_environment(flashinfer=True)):
         report = resolve_moe_impl(_trtllm_gen_model_config())
@@ -688,23 +695,14 @@ def test_deepseek_v4_routing_is_its_own_problem_but_keeps_v3s_kernel_encoding():
     assert canonical_routing(routing) == RoutingMethodType.DeepSeekV4.name
 
 
-def test_flashinfer_leaves_report_dep_missing_without_the_wheel():
-    """On a host with no FlashInfer, every FlashInfer leaf declines for that reason."""
-    deployment = _single_rank_deployment(_trtllm_gen_environment())
-    for impl_id in _TRTLLM_GEN_IDS:
-        impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
-        if impl.provider != "flashinfer":
-            continue
-        quant = impl.descriptor.identity.quant
-        verdict = impl.can_implement(
-            MoEProblem(
-                quant=None if quant == "none" else quant.upper(),
-                dtype_act=torch.bfloat16,
-            ),
-            deployment,
-        )
-        assert not verdict.eligible
-        assert verdict.reject_reason is MoERejectReason.DEP_MISSING
+def test_flashinfer_bf16_leaf_reports_dep_missing_without_the_wheel() -> None:
+    """On a host with no FlashInfer, the FlashInfer bf16 leaf declines for that reason."""
+    verdict = FlashinferTrtllmGenBf16Impl.can_implement(
+        MoEProblem(quant=None, dtype_act=torch.bfloat16),
+        _single_rank_deployment(_trtllm_gen_environment()),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.DEP_MISSING
 
 
 # The leaves whose runner reads no expert bias: two because the fp8/fp4
@@ -811,7 +809,7 @@ def test_nvfp4_leaves_admit_the_calibration_aliases(alias):
     assert verdict.eligible, verdict.detail
 
 
-def test_trtllm_gen_lookup_finds_the_one_leaf_per_format():
+def test_trtllm_gen_lookup_finds_the_one_leaf_per_format() -> None:
     """Each format has exactly one leaf, on whichever provider serves it.
 
     The quantized formats land on the native provider and the unquantized one
@@ -2544,6 +2542,28 @@ def test_cutlass_build_mode_probe(monkeypatch: pytest.MonkeyPatch, mode: bool | 
             debug.assert_not_called()
     finally:
         impl_environment.reset_moe_environment_cache()
+
+
+@pytest.mark.parametrize("value", [None, "0", "1"])
+def test_removed_flashinfer_opt_in_warns_when_set(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    """A deployment still exporting the removed opt-in hears about it, whatever its value."""
+    from tensorrt_llm._torch.moe.fused_moe import impl_environment
+
+    name = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    warned: list[str] = []
+    monkeypatch.setattr(
+        impl_environment.logger, "warning_once", lambda *msg, key: warned.append(key)
+    )
+
+    impl_environment._warn_on_removed_env_flags()
+
+    assert warned == ([] if value is None else [f"removed_env_{name}"])
 
 
 def test_cutlass_build_mode_fingerprint() -> None:

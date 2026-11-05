@@ -15,17 +15,19 @@
 
 """Per-provider kernel entry points for the TRTLLM-Gen MoE leaves.
 
-Every quantized leaf runs on :class:`TRTLLMOpBackend`, the in-tree ``trtllm``
-ops, which validates SiTu inputs and picks between the NVFP4 and MXFP4 runners.
-The unquantized leaf runs on :class:`FlashinferOpBackend`, whose only runner is
+The NVFP4, FP8 block-scale, W4A16_MXFP4 and W4A8_MXFP4_MXFP8 leaves run on
+:class:`TRTLLMOpBackend`, the in-tree ``trtllm`` ops, which validates SiTu
+inputs and picks between the NVFP4 and MXFP4 runners. The W4A8_NVFP4_FP8 and
+W4A8_MXFP4_FP8 leaves bypass this module and call their ``torch.ops.trtllm``
+runners directly, so a check added here does not reach them. The unquantized
+leaf runs on :class:`FlashinferOpBackend`, whose only runner is
 ``run_bf16_moe``: TRT-LLM's own cubins have no bf16 x bf16 kernel. A method a
 provider does not implement raises ``NotImplementedError`` from
 :class:`MoEOpBackend`.
 
-Follow-up (TRTLLM-16387): this is a vtable, not a factory. Provider choice now
-happens in ``can_implement`` plus ``IMPL_PRIORITY``, so
-``get_op_backend(self.provider)`` is a constant of the leaf class, and the
-provider is already settled by the leaf's identity before this object is
+Follow-up (TRTLLM-16387): this is a vtable, not a factory. Each format has one
+leaf with a fixed provider, so ``get_op_backend(self.provider)`` is a constant
+of the leaf class, settled by the leaf's identity before this object is
 built. Collapsing the two means giving each provider one class that holds
 these methods and having a leaf inherit it, which touches every kernel call
 site. An earlier plan named the provider traits in ``trtllm_gen/identity.py``
