@@ -53,6 +53,7 @@ class RubinMTPEagleWorker(MTPEagleWorker):
         if (
             head.has_any_quant
             or head.weight.dtype != torch.bfloat16
+            or head.output_dtype not in (None, torch.bfloat16)
             or head_mapping.tp_size < 2
             or head.out_features % (8 * head_mapping.tp_size) != 0
         ):
