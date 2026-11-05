@@ -253,9 +253,7 @@ class DSATrtllmAttention(TrtllmAttention):
         if metadata.has_mixed_precision_high_rows and (
             manager.mixed_precision_low_dtype == manager.mixed_precision_high_dtype
         ):
-            # The history pool keeps the high precision (cold-page first/last-N) and the high
-            # layer shares that pool, so a selected token the high layer holds is read from the
-            # high layer's row instead of the history row.
+            # Cold-page window: a selected token the high layer holds is read from its row.
             requests = (
                 metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens]
                 if is_generation

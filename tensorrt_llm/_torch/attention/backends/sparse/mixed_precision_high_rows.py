@@ -1,13 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Mixed-precision high pool for the sparse MLA backends.
+"""Mixed-precision high pool of the sparse MLA backends and the cold-page window.
 
-Each new token is also written to the mixed-precision high pool. With an NVFP4 history pool,
-rows the mixed-precision high pool still holds overwrite the dequantized rows in the FP8
-scratch after the top-k gather. A plain FP8/BF16 pool (cold-page first/last-N) shares its
-memory with the mixed-precision high pool, so the positions it holds are read from its rows in
-place: the sparse backends redirect the selected rows, dense attention the block offsets.
-Mixed-precision high page table: a page index if the token is held there, else -1.
+New tokens are written to the high pool as well; with an NVFP4 history its rows overwrite the
+dequantized scratch after the top-k gather, with a plain history (cold-page window) the held
+positions are read from its rows in place. High page table: the page index if held, else -1.
 """
 
 from typing import TYPE_CHECKING
@@ -513,20 +510,8 @@ def mixed_precision_high_row_indices(
 ) -> torch.Tensor:
     """Point the selected positions the mixed-precision high pool holds at its rows, in place.
 
-    On a plain pool (DSA's K pool, a DeepSeek-V4 COMPRESS pool) the mixed-precision high pool
-    shares the pool's memory (the manager checks the layout), so its rows have row indices like
-    any other; positions it no longer holds map to -1 and keep the pool's row.
-
-    Args:
-        metadata: Attention metadata of the batch.
-        attention: Attention layer whose mixed-precision high pool supplies the rows.
-        topk_indices: `[num_rows, topk]` int32 KV positions each query token selected, -1 for
-            none; contiguous in the last dimension.
-        topk_indices_global: `[num_rows, topk]` int32 pool rows of those positions; rewritten.
-        requests: `[num_rows]` int32 batch index of each query token's request.
-
-    Returns:
-        `topk_indices_global`, with the held positions redirected.
+    `topk_indices` are the selected KV positions (-1 for none), `topk_indices_global` their pool
+    rows (rewritten and returned), `requests` the batch index of each query row.
     """
     block_table = metadata.mixed_precision_high_block_table
     if isinstance(block_table, dict):
@@ -597,8 +582,7 @@ def _store_mixed_precision_low_rows_kernel(
 
 
 def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> None:
-    """Copy this step's rows of the held blocks from the mixed-precision high layer's blocks, where
-    dense attention wrote them through the redirected block offsets, to the layer's own blocks."""
+    """Copy this step's rows of the held blocks from the high layer's blocks to the layer's own."""
     manager = metadata.kv_cache_manager
     local = manager.layer_offsets[layer_idx]
     num_seqs = metadata.num_seqs

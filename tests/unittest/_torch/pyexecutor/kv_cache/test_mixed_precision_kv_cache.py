@@ -289,8 +289,7 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert [buffer.size for buffer in config.layers[1].buffers] == [
         buffer.size for buffer in config.layers[0].buffers
     ]
-    # The high layer's pages are pages of the layer's own pool with the same slot layout, so a
-    # held block's high rows are the high page's rows at the layer's slot: no block distance.
+    # A high page is a page of the layer's own pool with the layer's slot layout.
     assert manager.mixed_precision_high_layer_offsets == {0: 0}
     assert manager.mixed_precision_high_block_deltas == {0: 0}
 
@@ -714,7 +713,6 @@ def test_deepseek_v4_cold_page_window_high_layers_share_the_compress_pools():
         DeepseekV4AttentionType,
     )
     from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
     ratios = [1, 4, 128]
     manager = DeepseekV4CacheManager(
@@ -738,21 +736,19 @@ def test_deepseek_v4_cold_page_window_high_layers_share_the_compress_pools():
         cold_page_codec_provider=_ColdPageProvider(),
     )
     try:
-        # Only the compressed layers (ratios 4 and 128) get a high layer.
+        # Only the compressed layers (ratios 4 and 128) get a high layer; the manager checked at
+        # init that each sits in its ratio's COMPRESS pool at the compress layer's slot.
         assert sorted(manager.mixed_precision_high_layers) == [1, 2]
+        assert sorted(manager.mixed_precision_high_layer_offsets) == [1, 2]
+        assert set(manager.mixed_precision_high_block_deltas.values()) == {0}
         layers = manager.kv_cache_manager_py_config.layers
-        compress = DeepseekV4AttentionType.COMPRESS
         for local, high_layer in manager.mixed_precision_high_layers.items():
-            compress_layer = manager._layer_attn_to_layer_id[local, compress]
+            compress_layer = manager._layer_attn_to_layer_id[
+                local, DeepseekV4AttentionType.COMPRESS
+            ]
             assert [b.size for b in layers[high_layer].buffers] == [
                 b.size for b in layers[compress_layer].buffers
             ]
-            offset = manager.mixed_precision_high_layer_offsets[local]
-            address = manager.impl.get_mem_pool_base_address(
-                high_layer, Role.KEY, PageIndexMode.SHARED
-            )
-            stride = manager.impl.get_page_stride(compress_layer, compress.role)
-            assert address == manager.compress_pool_ptrs[ratios[local]] + offset * stride
     finally:
         manager.shutdown()
 
@@ -854,7 +850,6 @@ def test_dsa_cold_page_window_high_layers_share_the_pool():
     """On a plain DSA pool a mixed-precision high layer mirrors its layer's buffers, in one pool."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
     from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
     manager = DSACacheManagerV2(
         kv_cache_config=cold_page_config(pool_ratio=None),
@@ -878,16 +873,9 @@ def test_dsa_cold_page_window_high_layers_share_the_pool():
             assert [(b.role, b.size) for b in layers[high_layer].buffers] == [
                 (b.role, b.size) for b in layers[local].buffers
             ]
-        pool = manager.get_unique_primary_pool()
-        assert pool.shape[1] == 2
-        base = manager.impl.get_mem_pool_base_address(0, Role.KEY, PageIndexMode.SHARED)
-        stride = manager.impl.get_page_stride(0, Role.KEY)
-        assert sorted(manager.mixed_precision_high_layer_offsets) == [0, 1]
-        for local, high_layer in manager.mixed_precision_high_layers.items():
-            offset = manager.mixed_precision_high_layer_offsets[local]
-            address = manager.impl.get_mem_pool_base_address(
-                high_layer, Role.KEY, PageIndexMode.SHARED
-            )
-            assert address == base + offset * stride
+        assert manager.get_unique_primary_pool().shape[1] == 2
+        # Checked at init: each high layer sits in the K pool at its layer's slot.
+        assert manager.mixed_precision_high_layer_offsets == {0: 0, 1: 1}
+        assert manager.mixed_precision_high_block_deltas == {0: 0}
     finally:
         manager.shutdown()

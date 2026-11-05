@@ -1873,8 +1873,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and getattr(kv_cache_config, "mixed_precision_kv", None) is not None
         ):
             raise ValueError("layer_specs does not support mixed-precision KV cache.")
-        # Like mixed_precision_kv: MTP draft layers get the cold-page window, a drafter with
-        # its own architecture keeps a plain cache.
+        # A separate drafter manager without MTP keeps a plain cache.
         window_provider = cold_page_codec_provider
         if (
             is_draft
@@ -1930,10 +1929,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 and global_layer_id >= first_draft_layer
             )
         }
-        # MTP layers use mixed-precision KV like the model's own layers; the layers that another
-        # drafter (Eagle3, ...) adds to this manager keep a plain cache. With the cold-page window
-        # they keep their first/last tokens too: the high layers must share the pool of the group
-        # they copy, which a group with an extra plain layer would not have.
+        # Appended Eagle3 layers keep a plain cache in hot mode; in cold mode they need a high
+        # layer so their group keeps the high layers' page geometry.
         self._plain_draft_layers = set()
         if (
             self.mixed_precision_low_dtype is not None
@@ -4048,8 +4045,7 @@ class KVCacheManagerV2(BaseResourceManager):
         dtype: DataType,
         cold_page_codec_provider: Optional[object] = None,
     ) -> None:
-        """Record the mixed-precision layout requested through kv_cache_config.dtype or
-        through the cold-page codec provider's mixed_precision_high_window."""
+        """Record the mixed-precision layout from kv_cache_config.dtype or the cold-page window."""
         # Local layer id -> layer id of its mixed-precision high layer.
         self.mixed_precision_high_layers: dict[int, int] = {}
         self.mixed_precision_low_dtype: DataType | None = None
@@ -4081,8 +4077,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.first_n, self.last_n = mixed.first_n, mixed.last_n
             self.mixed_precision_low_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
             self.mixed_precision_high_dtype = str_dtype_to_binding(mixed.high)
-            # The model's KV dtype must be the mixed-precision high dtype, except on a manager
-            # whose own pool already holds the mixed-precision low format.
+            # The model's KV dtype is the high dtype unless the manager's own pool is the low format.
             if (
                 not self._own_pool_is_mixed_precision_low
                 and dtype != self.mixed_precision_high_dtype
@@ -4092,8 +4087,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"tokens in {mixed.high}, but the model's KV cache dtype resolved to {dtype}."
                 )
         else:
-            # Cold-page window: the history pool keeps the model's KV dtype and only its cold
-            # pages are quantized; the high layers hold the first/last tokens unchanged.
+            # Cold-page window: the history keeps the model's KV dtype; only cold pages are quantized.
             self.first_n, self.last_n = window
             self.mixed_precision_low_dtype = self.mixed_precision_high_dtype = dtype
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
@@ -4134,11 +4128,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _init_mixed_precision_high_layer_offsets(self) -> None:
-        """Record where each cold-page mixed-precision high layer sits in the slot of the page it
-        copies: the sparse backends redirect selected rows with it, dense attention block offsets."""
-        # Local layer -> page offset of its mixed-precision high layer inside the shared slot.
+        """Record each cold-page high layer's slot offset and the per-pool block delta."""
         self.mixed_precision_high_layer_offsets: dict[int, int] = {}
-        # Pool -> block distance from a layer's block to its high layer's block (None: not uniform).
         self.mixed_precision_high_block_deltas: dict[int, int | None] = {}
         if self.mixed_precision_low_dtype != self.mixed_precision_high_dtype:
             return
@@ -4196,9 +4187,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if not self._is_mixed_precision_layer(local):
                 continue
             if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
-                # Cold-page window: the high layer's page is a copy of its layer's page (KV rows
-                # under Role.KEY), so the core keeps both in one pool and sparse attention
-                # addresses its rows directly.
+                # Cold-page window: the high layer copies its layer's page, so both sit in one pool.
                 source_layer, row_role = self._mixed_precision_layer_page(local)
                 buffers = [
                     BufferConfig(
@@ -7583,9 +7572,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 return layer.bytes_per_token()
             return layer.bytes_per_token(data_role)
 
-        # Size a mixed-precision layer's pool for the mixed-precision low format, unless the
-        # manager's own pool already holds that format or the cold-page window keeps the
-        # history at the model's KV dtype.
+        # Size the pool for the low format unless the manager's own pool holds it or the
+        # cold-page window keeps the history at the model's KV dtype.
         if (
             self._is_mixed_precision_layer(local_layer_idx)
             and not self._own_pool_is_mixed_precision_low

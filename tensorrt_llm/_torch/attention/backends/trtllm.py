@@ -271,14 +271,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
-    # Cold-page window: the mixed-precision high page table (-1 = not held; a dict
-    # per compression ratio on DeepSeek-V4) and the block offsets before the redirect.
+    # Cold-page window: the high page table (-1 = not held) and the block
+    # offsets before the redirect.
     mixed_precision_high_block_table: Optional[Any] = None
     draft_mixed_precision_high_block_table: Optional[Any] = None
     mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
     draft_mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
-    # Dense attention reads the high rows through redirected block offsets; the
-    # sparse backends redirect the selected rows instead.
+    # The sparse backends redirect selected rows instead of block offsets.
     mixed_precision_block_offsets_redirect: ClassVar[bool] = True
     # Active block-ID buffers, defaulting to the target cache. Separate draft
     # storage lets CUDA graphs bind stable target and draft addresses.
@@ -1234,8 +1233,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def _create_mixed_precision_high_block_tables(self, buffers,
                                                   capture_graph: bool) -> None:
-        """Allocate the mixed-precision high page tables of the target and draft managers and,
-        for dense attention, the copies of the block offsets they redirect."""
+        """Allocate the high page tables and, for dense attention, the block-offset copies."""
         redirect = self.mixed_precision_block_offsets_redirect
         for prefix, manager in (("", self.kv_cache_manager),
                                 ("draft_", self.draft_kv_cache_manager)):
@@ -1267,8 +1265,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def _fill_mixed_precision_high_block_table(
             self, manager, high_layer: int, high_table: torch.Tensor) -> None:
-        """Refresh a mixed-precision high page table over its full width (the MTP draft
-        loop writes past this step's kv lengths); the rest stay -1."""
+        """Refresh a high page table over its full width; the draft loop writes past this step."""
         table = torch.full((self.num_seqs, high_table.shape[1]),
                            -1,
                            dtype=torch.int32,
@@ -1277,10 +1274,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         high_table[:self.num_seqs].copy_(table, non_blocking=True)
 
     def _fill_mixed_precision_high_block_tables(self) -> None:
-        """Refresh the mixed-precision high page tables; dense attention then points the
-        block offsets of the held blocks at the high layers' blocks (the same page, a
-        fixed number of blocks further into the slot) and keeps the layers' own blocks
-        for the copy back after attention."""
+        """Refresh the high page tables; dense attention also points held blocks at the high blocks."""
         n = self.num_seqs
         for prefix, manager in (("", self.kv_cache_manager),
                                 ("draft_", self.draft_kv_cache_manager)):
@@ -1356,8 +1350,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @contextlib.contextmanager
     def mixed_precision_kv_staging(self, layer_idx: int):
-        """Cold-page window: attention reads the high rows through the block offsets and
-        this step's rows of the held blocks are copied back afterwards."""
+        """Cold-page window: read through the redirected block offsets, then copy the new rows back."""
         if (self.mixed_precision_high_block_table is None
                 or not self.mixed_precision_block_offsets_redirect):
             with super().mixed_precision_kv_staging(layer_idx):

@@ -4696,66 +4696,49 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         "mixed_precision_first_n": 64,
         "mixed_precision_last_n": 256,
     }
-    args = TorchLlmArgs(
-        model="/tmp/dummy_model",
-        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-        kv_cache_compression_config=cold_window)
-    assert args.kv_cache_compression_config.mixed_precision_high_window == (64,
-                                                                            256)
-    # The mixed-precision high layers share the mixed-precision KV cache's limits.
-    with pytest.raises(ValueError, match="use_kv_cache_manager_v2"):
-        TorchLlmArgs(
-            model="/tmp/dummy_model",
-            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False),
-            kv_cache_compression_config=cold_window)
-    # Dense attention reads the high rows through TRTLLM's block offsets.
-    for backend in ("VANILLA", "FLASHINFER"):
-        with pytest.raises(ValueError, match="TRTLLM attention backend;"):
-            TorchLlmArgs(
-                model="/tmp/dummy_model",
-                attn_backend=backend,
-                kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-                kv_cache_compression_config=cold_window)
-    with pytest.raises(ValueError, match="cold-page compression"):
-        TorchLlmArgs(model="/tmp/dummy_model",
-                     kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
-                                                   dtype="mixed_nvfp4_fp8"),
-                     kv_cache_compression_config=cold_window)
-    with pytest.raises(ValueError, match="fp8_ds_mla"):
-        TorchLlmArgs(model="/tmp/dummy_model",
-                     kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
-                                                   dtype="fp8_ds_mla"),
-                     kv_cache_compression_config=cold_window)
-    # Speculative decoding is allowed, except dynamic-tree drafting.
-    TorchLlmArgs(model="/tmp/dummy_model",
-                 kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-                 kv_cache_compression_config=cold_window,
-                 speculative_config={
-                     "decoding_type": "MTP",
-                     "num_nextn_predict_layers": 1
-                 })
-    with pytest.raises(ValueError, match="dynamic-tree"):
-        TorchLlmArgs(
+
+    def cold(**overrides):
+        kwargs = dict(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            kv_cache_compression_config=cold_window,
-            speculative_config={
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": 1,
-                "max_draft_len": 1,
-                "use_dynamic_tree": True,
-                "dynamic_tree_max_topK": 2,
-            })
-    # The sparse MLA backends read the mixed-precision high rows in place.
+            kv_cache_compression_config=cold_window)
+        return TorchLlmArgs(**{**kwargs, **overrides})
+
+    assert cold().kv_cache_compression_config.mixed_precision_high_window == (
+        64, 256)
+    # The limits of mixed-precision KV, narrowed to the TRTLLM backend.
+    for match, overrides in (
+        ("use_kv_cache_manager_v2",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False))),
+        ("TRTLLM attention backend;", dict(attn_backend="VANILLA")),
+        ("TRTLLM attention backend;", dict(attn_backend="FLASHINFER")),
+        ("cold-page compression",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="mixed_nvfp4_fp8"))),
+        ("fp8_ds_mla",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="fp8_ds_mla"))),
+        ("dynamic-tree",
+         dict(
+             speculative_config={
+                 "decoding_type": "MTP",
+                 "num_nextn_predict_layers": 1,
+                 "max_draft_len": 1,
+                 "use_dynamic_tree": True,
+                 "dynamic_tree_max_topK": 2
+             })),
+    ):
+        with pytest.raises(ValueError, match=match):
+            cold(**overrides)
+    cold(speculative_config={
+        "decoding_type": "MTP",
+        "num_nextn_predict_layers": 1
+    })
     for sparse in (DeepSeekSparseAttentionConfig(index_head_dim=128),
                    DeepSeekV4SparseAttentionConfig(index_head_dim=128,
                                                    window_size=128,
                                                    compress_ratios=[1, 4])):
-        TorchLlmArgs(
-            model="/tmp/dummy_model",
-            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            kv_cache_compression_config=cold_window,
-            sparse_attention_config=sparse)
+        cold(sparse_attention_config=sparse)
     # Plain cold-page compression keeps its unrestricted backend choice.
     TorchLlmArgs(
         model="/tmp/dummy_model",
