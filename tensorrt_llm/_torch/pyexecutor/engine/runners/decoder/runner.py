@@ -307,6 +307,7 @@ class DecoderRunner(ScheduledModelRunner):
             context_warmups_supported=self._context_warmups_supported,
             eager_workspace_reclaimable=self._eager_workspace_reclaim_supported,
             warmup_inputs=self._buffers.input_ids_cuda,
+            context_logits_heads=self._context_logits_heads,
         )
 
     def _make_dummy_requests(self) -> DummyRequestFactory:

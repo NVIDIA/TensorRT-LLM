@@ -20,7 +20,6 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
-from tensorrt_llm._torch.modules.context_logits import context_logits_heads
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -47,6 +46,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.modules.embedding import LMHead
     from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -260,6 +260,7 @@ class DecoderWarmup:
         context_warmups_supported: bool,
         eager_workspace_reclaimable: bool,
         warmup_inputs: torch.Tensor | None = None,
+        context_logits_heads: tuple[LMHead, ...] = (),
     ) -> None:
         self._config = config
         self.mapping = mapping
@@ -279,6 +280,9 @@ class DecoderWarmup:
         # Warmups that synthesize context batches.
         self._context_warmups_supported = context_warmups_supported
         self._eager_workspace_reclaimable = eager_workspace_reclaimable
+        # Heads that project context logits eagerly; their workspaces are
+        # reserved during warmup.
+        self._context_logits_heads = context_logits_heads
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
 
@@ -371,9 +375,7 @@ class DecoderWarmup:
             warmup_sampling_module()
             if self._config.max_beam_width > 1:
                 warmup_topk_module()
-            for head in context_logits_heads(
-                self.model, self.mapping, is_spec_decode=self._config.is_spec_decode
-            ):
+            for head in self._context_logits_heads:
                 head.prepare_context_logits_workspace()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
