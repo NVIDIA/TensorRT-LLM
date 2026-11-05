@@ -91,6 +91,11 @@ class MetricsCollector:
             trtllm_num_requests_completed_total
             trtllm_max_num_active_requests
             trtllm_iteration_latency_seconds
+            trtllm_host_step_time_seconds
+            trtllm_prev_device_step_time_seconds
+            trtllm_gpu_forward_time_seconds
+            trtllm_host_step_duration_seconds
+            trtllm_gpu_forward_duration_seconds
             trtllm_gpu_memory_usage_bytes
             trtllm_cpu_memory_usage_bytes
             trtllm_pinned_memory_usage_bytes
@@ -397,6 +402,38 @@ class MetricsCollector:
             name=self.metric_prefix + "iteration_latency_seconds",
             documentation="Iteration latency in seconds",
             labelnames=self.labels.keys())
+
+        # Timing values shared across ADP rows are owned by rank 0.
+        timing_labelnames = (*self.labels, "scheduler_mode")
+        self.host_step_time_seconds = Gauge(
+            name=self.metric_prefix + "host_step_time_seconds",
+            documentation="Latest rank-0 executor loop wall time in seconds",
+            labelnames=timing_labelnames)
+        self.prev_device_step_time_seconds = Gauge(
+            name=self.metric_prefix + "prev_device_step_time_seconds",
+            documentation="Latest rank-0 lagged device step time in seconds",
+            labelnames=timing_labelnames)
+        self.gpu_forward_time_seconds = Gauge(
+            name=self.metric_prefix + "gpu_forward_time_seconds",
+            documentation=
+            "Latest rank-0 batch-matched GPU forward time in seconds",
+            labelnames=timing_labelnames)
+        timing_buckets = [
+            0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+            0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+        ]
+        self.histogram_host_step_duration = Histogram(
+            name=self.metric_prefix + "host_step_duration_seconds",
+            documentation=
+            "Rank-0 executor loop wall times from exported iteration samples",
+            buckets=timing_buckets,
+            labelnames=timing_labelnames)
+        self.histogram_gpu_forward_duration = Histogram(
+            name=self.metric_prefix + "gpu_forward_duration_seconds",
+            documentation=
+            "Rank-0 batch-matched GPU forward times from exported iteration samples",
+            buckets=timing_buckets,
+            labelnames=timing_labelnames)
 
         # Memory usage
         self.gpu_memory_usage_bytes = Gauge(
@@ -951,6 +988,8 @@ class MetricsCollector:
                 Top-level fields: numActiveRequests, numQueuedRequests, numCompletedRequests,
                 maxNumActiveRequests, iterLatencyMS, gpuMemUsage, cpuMemUsage, pinnedMemUsage,
                 maxBatchSizeStatic, maxBatchSizeRuntime, maxNumTokensRuntime.
+                Optional loop timings: hostStepTimeMS, prevDeviceStepTimeMS,
+                gpuForwardTimeMS, with schedulerMode describing the scheduler.
                 Nested dicts: kvCacheStats, inflightBatchingStats, specDecodingStats.
 
         Note:
@@ -959,6 +998,10 @@ class MetricsCollector:
             - KV and local scheduling metrics use the dp_rank label, resolved from
               attentionDpRank, then rank, then 0 for unranked rows. Other iteration
               metrics are rank-0-owned measurements, not global aggregates.
+            - Timing histograms observe exported rank-0 records only. With
+              iter_perf_stats_interval > 1, they describe sampled iterations.
+              prevDeviceStepTimeMS lags hostStepTimeMS and must not be
+              subtracted from it to estimate CPU overhead.
             - Rows must arrive once, in producer order within each rank. A decrease
               in a rank's cumulative KV count emits a warning and updates its baseline
               without incrementing the counter. Stale or reordered rows are unsupported.
@@ -1001,6 +1044,8 @@ class MetricsCollector:
         if "iterLatencyMS" in iteration_stats:
             self._log_gauge(self.iteration_latency_seconds,
                             iteration_stats["iterLatencyMS"] / 1000.0)
+
+        self._log_iteration_timing(iteration_stats)
 
         # Memory usage
         if "gpuMemUsage" in iteration_stats:
@@ -1048,6 +1093,27 @@ class MetricsCollector:
             if "draftOverhead" in spec_stats:
                 self._log_gauge(self.spec_decode_draft_overhead,
                                 spec_stats["draftOverhead"])
+
+    def _log_iteration_timing(self, iteration_stats: dict) -> None:
+        """Export rank-0 timing samples without treating lagged GPU time as CPU overhead."""
+        mode = iteration_stats.get("schedulerMode")
+        if mode not in ("overlap", "non_overlap"):
+            mode = "unknown"
+        labels = {"scheduler_mode": mode}
+        for field, gauge, histogram in (
+            ("hostStepTimeMS", self.host_step_time_seconds,
+             self.histogram_host_step_duration),
+            ("prevDeviceStepTimeMS", self.prev_device_step_time_seconds, None),
+            ("gpuForwardTimeMS", self.gpu_forward_time_seconds,
+             self.histogram_gpu_forward_duration),
+        ):
+            value_ms = iteration_stats.get(field)
+            if value_ms is None or not math.isfinite(value_ms) or value_ms < 0:
+                continue
+            value_seconds = value_ms / 1000.0
+            self._log_gauge(gauge, value_seconds, labels=labels)
+            if histogram is not None:
+                self._log_histogram(histogram, value_seconds, labels=labels)
 
     def _log_rank_iteration_stats(self, iteration_stats: dict,
                                   rank: str) -> None:

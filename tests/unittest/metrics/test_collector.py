@@ -160,6 +160,57 @@ class TestKVCacheStats:
         assert _get_gauge_value(collector, "kv_cache_hit_rate", dp_rank=0) == pytest.approx(0.85)
 
 
+class TestIterationLogTimingMetrics:
+    @staticmethod
+    def _sample(collector, name, mode="overlap"):
+        return collector._registry.get_sample_value(
+            "trtllm_" + name, {**collector.labels, "scheduler_mode": mode}
+        )
+
+    def test_units_histograms_and_rank_ownership(self, collector):
+        for host_ms, device_ms, forward_ms in [(1.0, 0.8, 0.5), (3.0, 2.5, 1.5)]:
+            for rank in [1, 0]:
+                collector.log_iteration_stats(
+                    {
+                        "attentionDpRank": rank,
+                        "schedulerMode": "overlap",
+                        "hostStepTimeMS": host_ms,
+                        "prevDeviceStepTimeMS": device_ms,
+                        "gpuForwardTimeMS": forward_ms,
+                    }
+                )
+
+        for name, expected in [
+            ("host_step_time_seconds", 0.003),
+            ("prev_device_step_time_seconds", 0.0025),
+            ("gpu_forward_time_seconds", 0.0015),
+            ("host_step_duration_seconds_count", 2),
+            ("host_step_duration_seconds_sum", 0.004),
+            ("gpu_forward_duration_seconds_count", 2),
+            ("gpu_forward_duration_seconds_sum", 0.002),
+        ]:
+            assert self._sample(collector, name) == pytest.approx(expected)
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_host_step_duration_seconds_bucket",
+                {**collector.labels, "scheduler_mode": "overlap", "le": "0.001"},
+            )
+            == 1
+        )
+
+    def test_optional_fields_and_legacy_scheduler_mode(self, collector):
+        collector.log_iteration_stats({"iterLatencyMS": 8.0})
+        assert self._sample(collector, "host_step_time_seconds", "unknown") is None
+        collector.log_iteration_stats({"hostStepTimeMS": 0.0, "gpuForwardTimeMS": 2.0})
+        collector.log_iteration_stats({"hostStepTimeMS": 4.0})
+        assert self._sample(collector, "host_step_duration_seconds_count", "unknown") == 2
+        assert self._sample(collector, "host_step_duration_seconds_sum", "unknown") == 0.004
+        assert self._sample(collector, "gpu_forward_duration_seconds_count", "unknown") == 1
+        assert self._sample(collector, "gpu_forward_time_seconds", "unknown") == 0.002
+        assert self._sample(collector, "prev_device_step_time_seconds", "unknown") is None
+        assert _get_gauge_value(collector, "iteration_latency_seconds") == 0.008
+
+
 class TestAttentionDpIterationMetrics:
     """Keep independent rank histories and shared measurement ownership."""
 
