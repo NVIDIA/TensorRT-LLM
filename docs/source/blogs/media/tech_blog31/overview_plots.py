@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import FancyBboxPatch, Patch
+from matplotlib.patches import FancyBboxPatch, Patch, Rectangle
 
 ROOT = Path(__file__).resolve().parent
 INK, GREY, GREEN, BLUE = "#203044", "#697586", "#507C0C", "#2563A6"
@@ -108,6 +108,111 @@ def decoder_graph() -> None:
             arrow(ax, (2.8, y - 0.04), (2.8, y - 0.26))
         y -= 0.30
     save(fig, "decoder_graph")
+
+
+def causal_first_frame() -> None:
+    fig, ax = plt.subplots(figsize=(6.4, 5.8))
+    ax.set(xlim=(0, 6.4), ylim=(0, 5.8))
+    ax.axis("off")
+    for first, top in [(False, 5.65), (True, 2.80)]:
+        ax.text(
+            0.1,
+            top,
+            "First frame: zero history" if first else "With temporal history",
+            fontsize=15,
+            weight="bold",
+            color=INK,
+            va="top",
+        )
+        tile_y = top - 1.65
+        line_y = tile_y - 0.60
+        for k, x in enumerate([0.15, 1.62, 3.09]):
+            zero = first and k < 2
+            label = (
+                [r"$x_{-2}=0$", r"$x_{-1}=0$", r"$x_0$"][k]
+                if first
+                else [r"$x_{t-2}$", r"$x_{t-1}$", r"$x_t$"][k]
+            )
+            ax.text(
+                x + 0.45,
+                tile_y + 1.08,
+                label,
+                ha="center",
+                fontsize=14,
+                color=GREY if zero else INK,
+            )
+            ax.add_patch(
+                Rectangle(
+                    (x, tile_y),
+                    0.9,
+                    0.9,
+                    facecolor="#F0F2F4" if zero else "#EAF0F6",
+                    edgecolor="#9AA7B3",
+                    linewidth=0.8,
+                )
+            )
+            if zero:
+                ax.text(
+                    x + 0.45,
+                    tile_y + 0.45,
+                    "0",
+                    ha="center",
+                    va="center",
+                    fontsize=24,
+                    color="#9AA7B3",
+                )
+                ax.text(
+                    x + 0.45, tile_y - 0.25, "Term vanishes", ha="center", fontsize=10, color=GREY
+                )
+            else:
+                for n in range(1, 5):
+                    ax.plot([x + n * 0.18] * 2, [tile_y, tile_y + 0.9], color="white", lw=0.7)
+                    ax.plot([x, x + 0.9], [tile_y + n * 0.18] * 2, color="white", lw=0.7)
+                ax.add_patch(
+                    Rectangle(
+                        (x + 0.18, tile_y + 0.18),
+                        0.54,
+                        0.54,
+                        facecolor="#B5DC6A",
+                        edgecolor=GREEN,
+                        alpha=0.8,
+                    )
+                )
+                ax.annotate(
+                    "",
+                    xy=(x + 0.45, line_y),
+                    xytext=(x + 0.45, tile_y - 0.02),
+                    arrowprops={"arrowstyle": "->", "color": GREEN, "lw": 1.4},
+                )
+                ax.text(x + 0.56, tile_y - 0.28, rf"$W_{k}\ast$", fontsize=12, color=GREEN)
+        start_x = 3.54 if first else 0.6
+        ax.plot([start_x, 5.65], [line_y, line_y], color=GREEN, lw=1.4)
+        ax.annotate(
+            "",
+            xy=(5.65, tile_y + 0.1),
+            xytext=(5.65, line_y),
+            arrowprops={"arrowstyle": "->", "color": GREEN, "lw": 1.4},
+        )
+        ax.text(
+            4.7,
+            line_y,
+            "+ b" if first else "Σ + b",
+            ha="center",
+            va="center",
+            fontsize=13,
+            color=GREEN,
+            bbox={"facecolor": "white", "edgecolor": "none", "pad": 2},
+        )
+        node(ax, 5.2, tile_y + 0.1, 0.9, 0.7, r"$y_0$" if first else r"$y_t$", "#E3EFD3", 17)
+        ax.text(
+            3.2,
+            line_y - 0.31,
+            "One spatial convolution" if first else "Three spatial convolutions, summed",
+            ha="center",
+            fontsize=12,
+            color=INK,
+        )
+    save(fig, "causal_first_frame")
 
 
 def transform_stages() -> None:
@@ -299,6 +404,7 @@ def main() -> None:
     data = json.loads((ROOT / "data.json").read_text())
     decoder_graph()
     transform_stages()
+    causal_first_frame()
     decoder_breakdown(data)
     hardware(data, "hardware_b300")
     hardware(data, "hardware_h200")
