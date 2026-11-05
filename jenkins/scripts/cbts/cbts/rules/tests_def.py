@@ -49,6 +49,7 @@ from ._helpers import (
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
 from .out_of_scope import is_out_of_scope
+from .perf_model_paths import MODEL_PATHS, model_path_filters
 
 # Changes touching at least this fraction of all blocks (top-level conftest,
 # common.py, …) are too broad to narrow usefully and trigger fallback.
@@ -501,8 +502,25 @@ class TestsDefRule(Rule):
                 out_of_namespace.add(git_path)
                 continue
             handled.add(git_path)
-            anchors = self._compute_anchors(git_path, yaml_path, pr.diffs.get(git_path, ""))
-            file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
+            diff = pr.diffs.get(git_path, "")
+            file_bf = None
+            if git_path == MODEL_PATHS:
+                consumers = _direct_test_importers(self._repo_root, git_path, self._reference_index)
+                if consumers is not None:
+                    try:
+                        source = (self._repo_root / git_path).read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        source = ""
+                    file_bf = model_path_filters(
+                        self._repo_root,
+                        source,
+                        pr.raw_diffs.get(git_path, diff),
+                        consumers,
+                        self.yaml_index,
+                    )
+            if file_bf is None:
+                anchors = self._compute_anchors(git_path, yaml_path, diff)
+                file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
             if not file_bf:
                 # In-namespace but no YAML entry covers this path → no
                 # narrow contribution; claimed as noop.
