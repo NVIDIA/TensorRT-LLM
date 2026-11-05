@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,11 +26,10 @@
 namespace
 {
 
-template <typename T>
+template <typename T, int HeadSize>
 struct MergeSoftmaxTraits
 {
-    static constexpr int kQKNopeSize = 128;
-    static constexpr int kHeadSize = kQKNopeSize;
+    static constexpr int kHeadSize = HeadSize;
 
     static constexpr int kBytesPerElem = sizeof(T);
     static constexpr int kBytesPerLoad = 16;
@@ -38,6 +37,8 @@ struct MergeSoftmaxTraits
     static_assert((kHeadSize * kBytesPerElem) % kBytesPerLoad == 0,
         "kHeadSize * kBytesPerElem must be multiple of kBytesPerLoad (16Bytes)");
     static constexpr int kVecPerHead = (kHeadSize * kBytesPerElem) / kBytesPerLoad;
+    // All readers of aliased softmax stats must stay in the same warp as their writer.
+    static_assert(kVecPerHead <= 32, "In-place softmax stats require at most one warp per head");
     static constexpr int kTokenPerBlock
         = std::is_same_v<T, float> ? 4 : 8; // for each block, we fetch 8 token for fp16, 4 tokens for fp32.
     static constexpr int kNumThreads = kVecPerHead * kTokenPerBlock;
@@ -136,14 +137,14 @@ inline __device__ void dequantCopy(
     }
 }
 
-// merged_attn [q_total_len, H=128, D=128] (T)
+// merged_attn [q_total_len, num_heads, HeadSize] (T)
 // merged_softmax_sum [q_total_len, H, 2] (float, max/sum)
-template <typename T>
+template <typename T, int HeadSize>
 __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softmax_stats, T const* pre_attn,
     float2 const* pre_softmax_stats, T const* curr_attn, float2 const* curr_softmax_stats, int64_t const* cu_q_seq_len,
     int64_t const* merge_op, int const num_heads, int const head_size)
 {
-    using KT = MergeSoftmaxTraits<T>;
+    using KT = MergeSoftmaxTraits<T, HeadSize>;
     int const batch_idx = static_cast<int>(blockIdx.y);
     int const head_idx = static_cast<int>(blockIdx.z);
 
@@ -221,6 +222,20 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
     }
 }
 
+template <typename T, int HeadSize>
+void launchMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
+    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
+    int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, cudaStream_t stream)
+{
+    using KT = MergeSoftmaxTraits<T, HeadSize>;
+    dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_q_seq_len, KT::kTokenPerBlock)), batch_size, num_heads);
+    dim3 block(KT::kNumThreads);
+
+    mergeAttnWithSoftmaxKernel<T, HeadSize><<<grid, block, 0, stream>>>(merged_attn,
+        reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2 const*>(pre_softmax_stats),
+        curr_attn, reinterpret_cast<float2 const*>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, HeadSize);
+}
+
 // kv_output {total_chunk_token=b*chunk_size, h=1, d_lora}
 // k_pe_output {total_chunk_token, h=1, d_rope}
 template <typename T, typename TCache>
@@ -296,7 +311,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// merged_attn [q_total_len, H=128, D=128] (T)
+// merged_attn [q_total_len, num_heads, head_size] (T)
 // merged_softmax_sum [q_total_len, H, 2] (float), the first part is the max value for each
 // row of P = QK^T, the second part is the softmax sum
 // if merge_op[b] == 0, we just skip this batch, if merge_op[b] == 1, we merge the pre-attn and curr-attn, if
@@ -308,15 +323,23 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T c
     int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size,
     cudaStream_t stream)
 {
-    using KT = MergeSoftmaxTraits<T>;
-    TLLM_CHECK_WITH_INFO(head_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
-
-    dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_q_seq_len, KT::kTokenPerBlock)), batch_size, num_heads);
-    dim3 block(KT::kNumThreads);
-
-    mergeAttnWithSoftmaxKernel<T><<<grid, block, 0, stream>>>(merged_attn,
-        reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2 const*>(pre_softmax_stats),
-        curr_attn, reinterpret_cast<float2 const*>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, head_size);
+    constexpr int kHeadSize128 = 128;
+    constexpr int kHeadSize256 = 256;
+    if (head_size == kHeadSize128)
+    {
+        launchMergeAttnWithSoftmax<T, kHeadSize128>(merged_attn, merged_softmax_stats, pre_attn, pre_softmax_stats,
+            curr_attn, curr_softmax_stats, batch_size, cu_q_seq_len, max_q_seq_len, merge_op, num_heads, stream);
+    }
+    else if constexpr (!std::is_same_v<T, float>)
+    {
+        TLLM_CHECK_WITH_INFO(head_size == kHeadSize256, "head dim should be 128 or 256 for FP16/BF16");
+        launchMergeAttnWithSoftmax<T, kHeadSize256>(merged_attn, merged_softmax_stats, pre_attn, pre_softmax_stats,
+            curr_attn, curr_softmax_stats, batch_size, cu_q_seq_len, max_q_seq_len, merge_op, num_heads, stream);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "head dim should be equal to 128 for FP32");
+    }
 }
 
 // load single chunk kv from kv_cache for each request

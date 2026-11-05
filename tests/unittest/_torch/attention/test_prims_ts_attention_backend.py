@@ -573,14 +573,88 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     run_case(case)
 
 
+@pytest.mark.parametrize("head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided_v", [False, True])
+@pytest.mark.parametrize("kv_length", [0, 5])
+def test_prims_ts_mla_context_quantize_layout(
+    head_dim: int, v_head_dim: int, dtype: torch.dtype, strided_v: bool, kv_length: int
+) -> None:
+    """Cached-partition preprocessing preserves Q/K and packs the actual V row stride."""
+    from tensorrt_llm.quantization.mode import QuantMode
+
+    torch.manual_seed(1729)
+    heads, query_length, page_size = 6, 3, 32
+    q = torch.randn(query_length, heads * head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(kv_length, heads * head_dim, device="cuda", dtype=dtype)
+    padding = heads * (head_dim - 64) if strided_v else 0
+    v_storage = torch.full(
+        (kv_length, padding + heads * v_head_dim), float("nan"), device="cuda", dtype=dtype
+    )
+    v = v_storage[:, padding:]
+    v.copy_(torch.randn_like(v))
+    originals = tuple(tensor.clone() for tensor in (q, k, v))
+    processed = tuple(
+        torch.empty(tensor.shape, dtype=torch.float8_e4m3fn, device="cuda") for tensor in (q, k, v)
+    )
+    # No RoPE/cache append is performed for an already-prepared cached partition.
+    # Supply a real pool so the native page-table carrier is valid nonetheless.
+    pool = torch.zeros(1, page_size, 576, device="cuda", dtype=torch.float8_e4m3fn)
+    block_offsets = torch.zeros(1, 1, 2, 1, device="cuda", dtype=torch.int32)
+    pool_pointers = torch.tensor([[pool.data_ptr(), 0]], dtype=torch.int64)
+    pool_mapping = torch.zeros(1, 2, dtype=torch.int32)
+    q_offsets = torch.tensor([0, query_length], device="cuda", dtype=torch.int32)
+    kv_lengths = torch.tensor([kv_length], device="cuda", dtype=torch.int32)
+    rope = torch.zeros(page_size, 128, device="cuda", dtype=torch.float32)
+    quant_scale = torch.tensor([2.0], device="cuda")
+    dequant_scale = torch.tensor([0.5], device="cuda")
+    bmm1_scale = torch.empty(2, device="cuda")
+    bmm2_scale = torch.empty(1, device="cuda")
+    torch.ops.trtllm.mla_context_preprocess(
+        q,
+        k,
+        v,
+        None,
+        q_offsets,
+        kv_lengths,
+        rope,
+        block_offsets,
+        pool_pointers,
+        pool_mapping,
+        quant_scale,
+        dequant_scale,
+        heads,
+        query_length,
+        0,
+        page_size,
+        page_size,
+        int(QuantMode.FP8_KV_CACHE),
+        0.125,
+        *processed,
+        bmm1_scale,
+        bmm2_scale,
+    )
+    for original, actual, result in zip(originals, (q, k, v), processed, strict=True):
+        torch.testing.assert_close(actual, original, atol=0, rtol=0)
+        expected = (original.float() * 2.0).to(torch.float8_e4m3fn).float()
+        torch.testing.assert_close(result.float(), expected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        bmm1_scale, torch.tensor([0.03125, 0.03125 * math.log2(math.e)], device="cuda")
+    )
+    torch.testing.assert_close(bmm2_scale, dequant_scale)
+
+
 @pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("qk_head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
 def test_prims_ts_mla_preprocessing(
     monkeypatch: pytest.MonkeyPatch,
     num_heads: int,
     use_kv_cache_manager_v2: bool,
     kv_cache_dtype: torch.dtype,
+    qk_head_dim: int,
+    v_head_dim: int,
 ) -> None:
     from test_attention_mla import RopeConfig, _run_test_for_backend
 
@@ -623,9 +697,9 @@ def test_prims_ts_mla_preprocessing(
         num_layers=2,
         q_lora_rank=1536,
         kv_lora_rank=512,
-        qk_nope_head_dim=128,
+        qk_nope_head_dim=qk_head_dim - 64,
         qk_rope_head_dim=64,
-        v_head_dim=128,
+        v_head_dim=v_head_dim,
         rope_config=RopeConfig(
             num_attention_heads=num_heads,
             max_position_embeddings=4096,
