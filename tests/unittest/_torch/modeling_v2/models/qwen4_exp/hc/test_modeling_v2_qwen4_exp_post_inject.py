@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_post_inject catalog entry.
 
-The cells are gated bitwise (16-bit) by `_compare`.
+The cells are gated bitwise (16-bit) by `_compare`. Beyond them: the
+leading-dim guard and graph capture.
 """
 
 import zlib
@@ -74,3 +75,35 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert out.data_ptr() != hyper_input.data_ptr(), "the result is a fresh tensor"
     assert torch.equal(hyper_input, before), "the residual it was given is read-only"
     _compare(out, op.reference(hyper_input, block_out, inject))
+
+
+def test_guard_refuses_unequal_leading_dims() -> None:
+    """Unguarded, a 1-D `inject` broadcasts one row over every token."""
+    hyper_input, block_out, inject = _operands((8,), seed=10)
+    unguarded = op(hyper_input, block_out, inject[0])
+    assert unguarded.shape == hyper_input.shape, "the hazard this guard covers is gone"
+    assert not torch.equal(unguarded, op.reference(hyper_input, block_out, inject))
+
+    with pytest.raises(AssertionError, match="leading dims must match"):
+        with validating(op):
+            op(hyper_input, block_out, inject[0])
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    hyper_input, block_out, inject = _operands((64,), seed=14)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            op(hyper_input, block_out, inject)
+    torch.cuda.current_stream().wait_stream(warmup)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(hyper_input, block_out, inject)
+
+    fresh, _, _ = _operands((64,), seed=15)
+    hyper_input.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, op.reference(hyper_input, block_out, inject))

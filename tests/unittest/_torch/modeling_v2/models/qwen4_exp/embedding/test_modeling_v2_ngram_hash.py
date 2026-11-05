@@ -4,7 +4,8 @@
 
 Exact integer arithmetic, gated bitwise against the entry's scalar reference.
 Beyond the cells: the EOS reset that `ngram_token_history`'s EOS seed relies
-on.
+on, the narrow-multiplier and query-count guards, and graph capture at the
+captured decode and MTP-7 verify widths.
 """
 
 import zlib
@@ -97,3 +98,49 @@ def test_eos_restarts_the_window() -> None:
     no_eos = torch.tensor([[11, 22, 33, 44, token]], device=DEV)
     assert torch.equal(_hash(fresh, 1), _hash(after_eos, 1))
     assert not torch.equal(_hash(fresh, 1), _hash(no_eos, 1))
+
+
+def test_guard_refuses_narrow_multipliers() -> None:
+    ids = _tokens(1, CKPT_CONTEXT_LEN + 4, seed=47)
+    multipliers, sizes, offsets = _constants()
+    narrow = multipliers.to(torch.int32)
+    unguarded = op(ids, narrow, sizes, offsets, EOS, 4)
+    assert not torch.equal(unguarded, _hash(ids, 4)), "the hazard this guard covers is gone"
+    assert int(unguarded.min()) >= 0 and int(unguarded.max()) < PADDED_TABLE_ROWS
+    with pytest.raises(AssertionError, match="int64"):
+        with validating(op):
+            op(ids, narrow, sizes, offsets, EOS, 4)
+
+
+def test_guard_refuses_more_queries_than_history() -> None:
+    """A history of 3 asked for 8 query tokens returns 3 of them, without an error."""
+    ids = _tokens(128, CKPT_CONTEXT_LEN + 1, seed=59, lead_eos=False, eos_density=0.05)
+    unguarded = _hash(ids, 8)
+    assert unguarded.shape == (128, CKPT_CONTEXT_LEN + 1, NGRAM_HEADS), (
+        "the hazard this guard covers is gone"
+    )
+    with pytest.raises(AssertionError, match="num_query_tokens must be in"):
+        with validating(op):
+            _hash(ids, 8)
+
+
+@pytest.mark.parametrize("windows", [128, 1024], ids=["decode_128", "mtp7_verify_1024"])
+def test_cuda_graph_capture_and_replay(windows) -> None:
+    ids = _tokens(windows, CKPT_CONTEXT_LEN + 1, seed=53, lead_eos=False, eos_density=0.2)
+    constants = _constants()
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            op(ids, *constants, EOS, 1)
+    torch.cuda.current_stream().wait_stream(warmup)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(ids, *constants, EOS, 1)
+
+    fresh = _tokens(windows, CKPT_CONTEXT_LEN + 1, seed=54, lead_eos=False, eos_density=0.2)
+    ids.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, op.reference(fresh, *constants, EOS, 1))

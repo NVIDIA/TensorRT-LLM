@@ -227,6 +227,23 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Default::tp1_mtp7_nvfp4_kv_bf16_state_long_co
   min_al: 6.69
 
 # Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context
+# (test_qwen4_exp.py), over gsm8k at tep4: three drafts with IndexShare on, bf16 KV.
+# modeling_v2's own full-gsm8k reading on GB300; min_al is 95% of it, above the 2.8 that a
+# never-accepted third draft reads.
+ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3:
+  ref_al: 3.689
+  min_al: 3.50
+# Read by test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable]: tp4 over NVFP4 KV with the
+# breakable prefill graph. Measured and floored as the mtp3 entry.
+ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_nvfp4_kv:
+  ref_al: 3.535
+  min_al: 3.36
+# Read by test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv]: dep4 (MTP under attention DP) over FP8 KV.
+# Measured and floored as the mtp3 entry.
+ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_fp8_kv:
+  ref_al: 3.512
+  min_al: 3.34
+# Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context
 # (test_qwen4_exp.py), over the pass keys of tp1_mtp3_long_context at tep4: three drafts with
 # IndexShare on, bf16 KV.
 ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context:

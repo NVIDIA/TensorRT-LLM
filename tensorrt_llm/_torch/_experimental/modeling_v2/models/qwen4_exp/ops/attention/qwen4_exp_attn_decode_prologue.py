@@ -3,7 +3,7 @@
 """A sparse decode attention layer's work between its input projection and its index
 scores, one PDL launch.
 
-The composition it replaces ran four launches over two streams: the QK norm + rope of
+The composition of entries it fuses is four launches over two streams: the QK norm + rope of
 both planes (`qwen4_exp_qk_norm_rope`), the paged K/V append (`qsa_paged_kv_store`), and on
 the side stream the index plane's raw-key and coordinate store (`qsa_paged_index_store`)
 and the group compression (`qsa_prefill_compress`), then a cross-stream join. Here the

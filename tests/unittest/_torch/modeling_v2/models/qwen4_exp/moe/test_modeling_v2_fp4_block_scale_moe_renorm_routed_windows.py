@@ -4,7 +4,7 @@
 are in test_modeling_v2_fp4_block_scale_moe_renorm_routed.py).
 
 Two claims per cell: the logits-routed call over a rank's expert window is **bitwise**
-the composition it replaces at the call site (`renorm_moe_routing_op` -> pre-routed
+the two-entry composition (`renorm_moe_routing_op` -> pre-routed
 `fp4_block_scale_moe_runner` over the same window), and it sits inside the pre-routed
 entry's band against this entry's own fp32 reference. The NVFP4 operand construction
 (layout, the 512-expert stack, windows, activations, scalars, the band) is the pre-routed
@@ -173,7 +173,7 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     y = _routed(win_args, data, sf, logits, scalars, spec)
     assert y.shape == (spec["tokens"], spec["hidden"]) and y.dtype == torch.bfloat16
 
-    # 1. Bitwise the composition it replaces, on identical operands.
+    # 1. Bitwise the two-entry composition, on identical operands.
     y_pre = H._call(
         data,
         sf,

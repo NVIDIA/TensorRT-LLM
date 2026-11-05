@@ -30,6 +30,10 @@ def _z_offset(row_stride: int, heads: int, n: int) -> int:
     return offset
 
 
+#: The checkpoint's GDN epilogue geometry over a packed `z`, for the guard test.
+_PACKED = dict(op.CELLS[0].spec, tokens=4, z="packed")
+
+
 def _seed(text: str) -> int:
     return zlib.crc32(text.encode())
 
@@ -76,3 +80,17 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     for t, b in zip((x, z, weight), before):
         assert torch.equal(t, b), "inputs are read-only"
     torch.testing.assert_close(out, op.reference(*args))
+
+
+def test_guard_refuses_a_weight_of_the_wrong_length() -> None:
+    """Unguarded, a length-192 weight is silently truncated to weight[:128]."""
+    x, z, weight, eps, _, act = _build(_PACKED, seed=12)
+    long_weight = torch.cat([weight, torch.randn(64, dtype=weight.dtype, device="cuda")])
+    assert torch.equal(
+        torch.ops.trtllm.rms_norm_gated_token_major(x, z, long_weight, eps, None, act),
+        torch.ops.trtllm.rms_norm_gated_token_major(x, z, weight, eps, None, act),
+    ), "the hazard this guard covers is gone"
+
+    with pytest.raises(AssertionError, match="weight must be 1-D of length"):
+        with validating(op):
+            op(x, z, long_weight, eps, None, act)

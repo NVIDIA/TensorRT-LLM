@@ -15,6 +15,9 @@ shows. A cell's pool is one of two:
   memory mapped under the pages the rows touch only (`_EnginePool`); the pool's last page is
   always one of them. The reference runs on a dense copy of those pages, and every other mapped
   byte is checked unchanged.
+
+Beyond the cells: graph replay at the 32 MTP7 verify blocks and at 128 tep4 decode rows over
+the engine pool, and the contiguity guard on the row metadata.
 """
 
 import zlib
@@ -319,6 +322,9 @@ def _decode_args(seed: int, **overrides):
 _MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("fp8 decode MTP7: 32 requests"))
 _MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots")}
 
+#: The tep4 decode cell of 128 rows, over its engine pool.
+_TEP4_128 = next(c.spec for c in op.CELLS if c.why.startswith("tep4 decode, 128 rows"))
+
 
 def test_cuda_graph_replay_follows_updated_positions() -> None:
     """Captured once at 32 MTP7 verify blocks, replayed against new positions written
@@ -344,3 +350,64 @@ def test_cuda_graph_replay_follows_updated_positions() -> None:
     graph.replay()
     torch.cuda.synchronize()
     _compare((args["k_cache"], args["v_cache"]), ref)
+
+
+def test_cuda_graph_replay_on_the_tep4_engine_pool() -> None:
+    """The tep4 decode site as the engine captures it: 128 rows of one KV head into a
+    257109-page pool. Captured with every row on its page's first slot, replayed after the
+    real positions are written into the same buffer."""
+    args, pool = _build(_TEP4_128, seed=11)
+    try:
+        positions = args["logical_positions"]
+        saved = positions.clone()
+        tpb = args["tokens_per_block"]
+        positions.copy_(saved - saved % tpb)  # the same pages, so only mapped memory is written
+
+        def call():
+            op(**args)
+
+        for _ in range(3):  # compile the Triton kernel before capture
+            call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+
+        pool.fill()
+        positions.copy_(saved)
+        ref = _engine_reference(args, pool)
+        graph.replay()
+        torch.cuda.synchronize()
+        _compare(pool.gathered(), ref)
+        pool.assert_rest_unchanged()
+    finally:
+        pool.close()
+
+
+def test_guard_refuses_strided_row_metadata() -> None:
+    """`is_valid`'s one guard, after the hazard it exists for.
+
+    The kernel receives strides for k, v, both caches and the table, but reads
+    the two metadata vectors as flat unit-stride buffers. A column of a 2-wide
+    buffer is read through its base pointer: accepted, and rows land elsewhere.
+    """
+    args, pool = _decode_args(seed=10)
+    requests = args["request_indices"]
+    rows = requests.numel()
+    wide_requests = torch.full((rows, 2), rows - 1, dtype=requests.dtype, device=DEV)
+    wide_requests[:, 0] = requests
+    ref = op.reference(**args)
+    strided = {**args, "request_indices": wide_requests[:, 0]}
+
+    pool.fill_(FILL)
+    out = op(**strided)  # unguarded: accepted
+    assert not all(torch.equal(_bits(got), _bits(want)) for got, want in zip(out, ref)), (
+        "strided metadata was expected to place rows elsewhere"
+    )
+
+    pool.fill_(FILL)
+    before = pool.clone()
+    with pytest.raises(AssertionError, match="must be a contiguous 1-D tensor"):
+        with validating(op):
+            op(**strided)
+    assert torch.equal(_bits(pool), _bits(before)), "a refused call still wrote"

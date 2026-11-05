@@ -3,11 +3,12 @@
 """GPU test for the qsa_canonical_selection entry.
 
 The rewrite fixes every slot of every row, so `_compare` is index equality against a
-composite-key top-k, and against `_torch_rewrite`, the composed-torch rewrite the fused
-kernel replaced, which also pins the rows outside the contract (NaN in a window, a
-window cut by the table's width). The input rows come from an adversary that keeps a
-random part of the tie class at the k-th value in a random order, or from the radix
-engine the target calls.
+composite-key top-k, and against `_torch_rewrite`, the same rule as composed torch ops,
+which also pins the rows outside the contract (NaN in a window, a window cut by the
+table's width). The input rows come from an adversary that keeps a random part of the
+tie class at the k-th value in a random order, or from the radix engine the target
+calls. Beyond the cells: graph replay at 256 and 1024 rows, and the guard against a
+one-element `row_starts`.
 """
 
 import pytest
@@ -49,9 +50,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 
 def _torch_rewrite(logits, row_starts, row_ends, indices) -> torch.Tensor:
-    """The rewrite as composed torch ops, in row tiles of 2^24 elements: the
-    implementation the fused kernel replaced, kept as a second oracle that is bitwise the
-    old rows wherever they disagree with `reference` (outside the contract)."""
+    """The rewrite as composed torch ops, in row tiles of 2^24 elements: a second oracle,
+    and the one that fixes the rows outside the contract, where it and `reference` may
+    disagree."""
     num_rows, num_cols = logits.shape
     index_topk = indices.shape[1]
     tile = max(1, (1 << 24) // max(num_cols, 1))
@@ -173,11 +174,11 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     for rows in row_counts:
         args = _build(spec, rows, seed + rows)
         expected = op.reference(*args)
-        old = _torch_rewrite(args[0], args[1], args[2], args[3].clone())
+        composed = _torch_rewrite(args[0], args[1], args[2], args[3].clone())
         out = op(*args)
         assert out is args[3], "the rewrite writes `indices` and returns it"
         _compare(out, expected)
-        _compare(out, old)
+        _compare(out, composed)
 
 
 def _random_windows(rows: int, cols: int, gen: torch.Generator):
@@ -266,6 +267,37 @@ def test_rows_outside_the_contract_match_the_torch_rewrite(rows) -> None:
         _compare(op(scores, starts, ends, raw.clone()), expected)
 
 
+@pytest.mark.parametrize("rows", (256, _SPLIT_ROWS))
+def test_replays_in_a_cuda_graph(rows) -> None:
+    """Captured once, replayed over new scores and new picks in the same buffers."""
+    gen = torch.Generator(device=DEV).manual_seed(77)
+    cols = 32768
+    logits = torch.empty(rows, cols, device=DEV)
+    starts = torch.empty(rows, dtype=torch.int32, device=DEV)
+    ends = torch.empty(rows, dtype=torch.int32, device=DEV)
+    indices = torch.empty(rows, BLOCK_TOPK, dtype=torch.int32, device=DEV)
+
+    def stage(kind):
+        scores = _logits(kind, rows, cols, gen)
+        lo, hi = _random_windows(rows, cols, gen)
+        _poison(scores, lo, hi, "poison")
+        logits.copy_(scores)
+        starts.copy_(lo)
+        ends.copy_(hi)
+        indices.copy_(_adversary(scores, lo, hi, BLOCK_TOPK, gen))
+        return op.reference(logits, starts, ends, indices)
+
+    stage("relu")
+    op(logits, starts, ends, indices)  # compile outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(logits, starts, ends, indices)
+    for kind in ("relu_rare", "quantized"):
+        expected = stage(kind)
+        graph.replay()
+        _compare(indices, expected)
+
+
 def test_narrowing_the_table_to_a_bound_on_the_windows_changes_nothing() -> None:
     """A caller that knows every window ends by column 1500 passes `logits[:, :1500]` of a
     wide table: the rows are the full table's."""
@@ -280,3 +312,22 @@ def test_narrowing_the_table_to_a_bound_on_the_windows_changes_nothing() -> None
     narrow = op(logits[:, :bound], starts, ends, raw.clone())
     _compare(wide, op.reference(logits, starts, ends, raw))
     assert torch.equal(wide, narrow)
+
+
+def test_guard_refuses_a_broadcast_row_start() -> None:
+    """A one-element `row_starts` broadcasts over every row without an error and frames
+    every row by row 0's start. Shown unguarded first, then refused."""
+    gen = torch.Generator(device=DEV).manual_seed(9)
+    rows = 4
+    logits = torch.relu(torch.randn(rows, COLS, generator=gen, device=DEV))
+    starts = torch.tensor([0, 10, 20, 30], dtype=torch.int32, device=DEV)
+    ends = torch.full((rows,), 2000, dtype=torch.int32, device=DEV)
+    raw = _adversary(logits, starts, ends, BLOCK_TOPK, gen)
+    expected = op.reference(logits, starts, ends, raw)
+    out = op(logits, starts[:1], ends, raw.clone())
+    assert out.shape == expected.shape and not torch.equal(out, expected), (
+        "the broadcast hazard stopped reproducing"
+    )
+    with pytest.raises(AssertionError, match="one entry per logits row"):
+        with validating(op):
+            op(logits, starts[:1], ends, raw.clone())

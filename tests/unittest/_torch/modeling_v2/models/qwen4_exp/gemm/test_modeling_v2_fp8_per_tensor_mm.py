@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: `fp8_per_tensor_mm` against its fp32 reference (the activation quantized as the
 op does, both operands dequantized) per cell, the activation quantization bitwise against
-torch's e4m3 cast, and a zero activation and strided rows."""
+torch's e4m3 cast, a zero activation and strided rows, and CUDA-graph replay with a new
+activation."""
 
 import pytest
 import torch
@@ -68,3 +69,16 @@ def test_zero_activation_and_strided_rows() -> None:
     assert torch.equal(
         fp8_per_tensor_mm(wide[:, :2560], codes_t, scale), fp8_per_tensor_mm(x, codes_t, scale)
     )
+
+
+def test_graph_replay_matches_eager() -> None:
+    x, _, codes_t, scale = _operands(64, 2560, 16480, 7)
+    fp8_per_tensor_mm(x, codes_t, scale)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fp8_per_tensor_mm(x, codes_t, scale)
+    x.copy_(_operands(64, 2560, 16480, 8)[0] * 4)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, fp8_per_tensor_mm(x, codes_t, scale))

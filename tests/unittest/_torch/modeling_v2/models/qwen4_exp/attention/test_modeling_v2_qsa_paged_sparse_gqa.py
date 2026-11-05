@@ -15,10 +15,13 @@ The call has two kernels behind it (and a merge). The `launches` fixture
 records which ones a call indexed with a grid, and whether each launched with
 PDL, so every cell asserts its branch (and, where it names `splits`, the
 split count). A cell marked `capture` is also captured in a CUDA graph,
-refilled in place and replayed, as the engine's decode step is.
+refilled in place and replayed, as the engine's decode step is. Beyond the cells:
+bitwise determinism on a 32-split launch, and the refusal of positions passed
+without a compress ratio.
 """
 
 import math
+import re
 
 import pytest
 import torch
@@ -351,3 +354,21 @@ assert (CKPT["q_heads"], CKPT["kv_heads"], CKPT["head_dim"]) == (24, 2, 256)
 
 def _with(**overrides):
     return {**CKPT, **overrides}
+
+
+def test_calls_are_bitwise_deterministic() -> None:
+    """Including a 32-split launch whose merge is a second kernel."""
+    spec = _with(segments=tuple((4000 + 37 * i, 2) for i in range(4)), gate=None)
+    args = _build(spec, seed=8800)
+    assert torch.equal(op(**args), op(**args))
+
+
+def test_rejects_positions_without_a_compress_ratio() -> None:
+    """The op's own loud refusal, verbatim -- the reason `is_valid` is empty: half of
+    the prefill pair."""
+    args = _build(_with(segments=((600, 1),) * 4, gate=None), seed=9100)
+    args["selected_tokens"] = args["selected_tokens"][:, :64].contiguous()
+    args["query_positions"] = torch.zeros(4, dtype=torch.int64, device=DEV)
+    message = "QSA causal-prefix bounds require positions and compression ratio"
+    with pytest.raises(ValueError, match=re.escape(message)):
+        op(**args)

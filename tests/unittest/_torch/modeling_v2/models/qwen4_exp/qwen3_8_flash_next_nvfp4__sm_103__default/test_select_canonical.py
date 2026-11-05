@@ -56,6 +56,9 @@ def test_rows_equal_the_canonical_definition(rows: int, cols: int) -> None:
 
 def test_live_cols_returns_the_same_rows() -> None:
     scores, row_starts, row_ends, indices = _case(16, 2304, seed=7)
+    # Every window ends short of the table, so the bound drops columns the rewrite would read.
+    row_ends.clamp_(max=1500)
+    assert int(row_ends.max()) < scores.shape[1]
     bounded = indices.clone()
     U._select(types.SimpleNamespace(block_topk=K), scores, row_starts, row_ends, indices)
     U._select(

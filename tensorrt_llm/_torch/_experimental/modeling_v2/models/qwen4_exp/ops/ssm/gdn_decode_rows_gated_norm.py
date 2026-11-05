@@ -892,9 +892,11 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     Source: the CuTe DSL kernel in this file, JIT-compiled (`cute.compile`) for the running
     device at the first call per geometry; the cells ran that path on sm_103 (GB300).
 
-    The default target: its routing admits a bf16 recurrent-state cache only, so its decode step
-    runs this entry over the bf16 pool at every batch size (the fp32-only one-launch kernel,
-    `gdn_decode_gated_norm_pdl`, is never launched here; its references are this entry's).
+    The default target (`DecodeTarget._gdn_block`, a decode step without verify rows): at
+    tp4, tep4 and dep4 its routing admits a bf16 recurrent-state cache only, so the decode
+    step runs this entry over the bf16 pool at every batch size. At tp1 it also serves an
+    fp32 cache; there a captured step of at most `gdn_decode_gated_norm_pdl.MAX_ROWS` rows
+    over an fp32 pool runs that one-launch kernel, and every other decode step this entry.
     A tp4/tep4 rank holds 4 k / 12 v heads, its projection `[rows, 4120]`; a dep4 rank all
     16 / 48, `[rows, 16480]`. The pool is the stock manager's coalesced page: every GDN
     layer's state of a slot in one page, slot stride 36 layers' states (7077888 elements at
@@ -933,8 +935,7 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     `Int64(slot) * s_slot`: any slot count an int32 index can name.
 
     Not certified: `pdl=False`; the slot counts of the members' variants (kv_fp8, kv_nvfp4,
-    chunked, reuse at dep4; MTP at tep4, `max_seq_len` 16384) and of tp4's own engine; this
-    target's own call, which its modeling does not make yet.
+    chunked, reuse at dep4; MTP at tep4, `max_seq_len` 16384) and of tp4's own engine.
     """
 
     def __call__(

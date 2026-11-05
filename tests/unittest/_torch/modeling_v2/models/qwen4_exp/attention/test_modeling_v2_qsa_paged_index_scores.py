@@ -17,7 +17,8 @@ The call has four kernels behind it: the entry's own visible-split kernel for
 ungrouped decode-sized visible-only calls and request-group kernel for verify-shaped
 ones, and the engine's row-wise and query-tile kernels. `_watch_launches` swaps the four Triton entry points
 for recording proxies that still launch the real kernel, so every cell asserts
-the branch it names.
+the branch it names. Beyond the cells: capture and replay at every measured-pool decode
+and verify cell, and the refusal of metadata shorter than the rows by both launchers.
 """
 
 import math
@@ -330,6 +331,36 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
 _CAPTURED = tuple(c for c in op.CELLS if "pool_pages" in c.spec and not c.spec["context_rows"])
 
 
+@pytest.mark.parametrize("cell", _CAPTURED, ids=[c.why[:44] for c in _CAPTURED])
+def test_captured_call_replays_like_eager(cell) -> None:
+    """Capture the call at the cell's batch and flags over the measured pool, rewrite q and
+    every mapped key in place, replay, and match an eager call bitwise on every specified
+    column.
+    """
+    args = _build(cell.spec, seed=sum(map(ord, cell.why)) + 1)
+    visible = _visible(args)
+    table = args["block_table"]
+    mapped = torch.unique(table[table >= 0]).long()
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        op(**args)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(**args)
+    gen = torch.Generator(device=DEV).manual_seed(7)
+    q, cache = args["q"], args["index_cache"]
+    for trial in range(2):
+        q.copy_(torch.randn(q.shape, generator=gen, device=DEV).to(q.dtype))
+        cache[mapped] = torch.randn(
+            (mapped.numel(), *cache.shape[1:]), generator=gen, device=DEV
+        ).to(cache.dtype)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured[visible], op(**args)[visible]), f"replay {trial}"
+
+
 #: The visible-split cells on the tune's table: their grid is fixed at capture, the windows not.
 _SPLIT_CAPTURED = tuple(
     c for c in _CAPTURED if c.spec["branch"] == "visible_split" and c.spec["pages"] > 516
@@ -458,3 +489,14 @@ def test_request_group_is_bitwise_the_row_wise_kernel(group, rows, heads, mixed,
         "the request-group kernel's bits differ from the row-wise kernel's"
     )
     _compare(grouped, op.reference(**args))
+
+
+@pytest.mark.parametrize("only_visible_blocks", [False, True], ids=["engine", "visible_split"])
+def test_rejects_metadata_shorter_than_the_rows(only_visible_blocks) -> None:
+    """The callable's own refusal, message as observed -- the reason this entry has no
+    `is_valid`: positions for fewer rows than `q` carries. Both kernels' launchers refuse.
+    """
+    args = _build(_case(16, 2, only_visible_blocks=only_visible_blocks), seed=1701)
+    args["query_positions"] = args["query_positions"][:4]
+    with pytest.raises(ValueError, match="one entry per row"):
+        op(**args)

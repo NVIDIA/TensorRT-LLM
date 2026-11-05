@@ -13,7 +13,8 @@ A cell's pool is one of two:
   reference runs on a dense copy of those slots, and every other byte of their pages is
   checked unchanged; a write to any other slot would fault.
 
-Beyond the cells: the has_initial_state equivalence.
+Beyond the cells: the has_initial_state equivalence, and a negative control that the band
+refuses a value head reading the wrong key head at 4/12.
 """
 
 import warnings
@@ -27,6 +28,7 @@ from flashinfer.utils import get_compute_capability, get_device_name, get_device
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     INPLACE_MAX_TOKENS,
+    RANK4_GEOMETRY,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     flashinfer_chunk_gated_delta_rule as op,
@@ -42,7 +44,7 @@ DEV = "cuda"
 #: on `o`, 2e-2 on states), derived for a chunked WY reformulation with bf16
 #: operands. This op is the same class of sum and sits inside it against fp64, CP
 #: pipeline and chunked kernel alike; a value head reading the wrong key head at 4/12
-#: lands far outside it (measured).
+#: lands far outside it (`test_band_refuses_a_misgrouped_key_head`).
 RTOL, ATOL_OUTPUT, ATOL_STATE = 1.6e-2, 2e-3, 2e-2
 #: Rows past the call's own in the output buffer of a `slice` cell: the target passes
 #: `out[:, :num_tokens]` of a wider buffer, and the rows past it must stay as they were.
@@ -353,9 +355,9 @@ _CARRIED = next(c for c in op.CELLS if "initial" in c.spec)
 
 
 def test_has_initial_state_is_the_reset_then_the_plain_call() -> None:
-    """The flags replace `reset_recurrent_state_rows` before the call: zeroing the fresh
-    slots and running the plain in-place call gives the same output and pool, bitwise; a
-    linear gate that is `torch.exp` of the plain call's log gate changes nothing."""
+    """The flags are zeroing the fresh slots before the call: zeroing them and running the
+    plain in-place call gives the same output and pool, bitwise; a linear gate that is
+    `torch.exp` of the plain call's log gate changes nothing."""
     args, _ = _build(_CARRIED.spec, seed=5)
     flags = args.pop("has_initial_state")
     linear_gate = args.pop("linear_gate", False)
@@ -375,3 +377,28 @@ def test_has_initial_state_is_the_reset_then_the_plain_call() -> None:
     assert final_state is None
     assert torch.equal(o, o_plain)
     assert torch.equal(pool, plain["initial_state"])
+
+
+def test_band_refuses_a_misgrouped_key_head() -> None:
+    """The band is wider than torch's bf16 default, so it has to refuse the error a 4/12
+    rank can make and 16/48 shares: a value head reading the wrong key head. Rolling the
+    key heads by one makes value head i read key head (i // 3 - 1) mod 4; the op's answer
+    then has to fall outside the band around the true reference."""
+    spec = dict(
+        geometry=RANK4_GEOMETRY,
+        seqlens=(200, 37, 91),
+        slots=64,
+        indices=(63, 0, 17),
+        pool_dtype=torch.bfloat16,
+        output="buffer",
+        initial=(True, False, True),
+        linear_gate=True,
+    )
+    args, _ = _build(spec, seed=11)
+    pool = args["initial_state"]
+    ref = op.reference(**args)
+    rolled = dict(args, q=args["q"].roll(1, dims=2), k=args["k"].roll(1, dims=2))
+    o, _ = op(**rolled)
+    print(f"\n[misgrouped key head] {_stats('o', o, ref[0])}; {_stats('state', pool, ref[2])}")
+    with pytest.raises(AssertionError):
+        _compare((o, None, pool), ref)

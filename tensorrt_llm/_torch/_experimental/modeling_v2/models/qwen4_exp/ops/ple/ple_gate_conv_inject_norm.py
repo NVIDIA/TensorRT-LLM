@@ -7,11 +7,11 @@ residual add into the hyper-connection stream, and the next site's grouped
 norm -- three Triton launches behind one call.
 
 Called by the qwen4_exp target at every layout; uses the row-to-sequence
-search of ``ple_ngram_embed``. It computes the composition of three grouped
-norms, ``gated_ngram_injection``, ``dilated_short_conv_paged``, two adds and
-the norm-only ``qwen4_exp_hc_inject_norm`` after the PLE add. No
-``torch.ops.trtllm`` op or FlashInfer callable takes a dilation (see
-``dilated_short_conv_paged``).
+search of ``ple_ngram_embed``. Its ``reference`` is that chain in float64,
+rounded to the activation dtype after each step: three grouped norms, the
+sigmoid-gated value, the dilated depthwise conv over the carried window, two
+adds and the next site's grouped norm. No ``torch.ops.trtllm`` op or FlashInfer
+callable takes a dilation.
 
 The three launches split where the parallelism changes shape. The norms and
 the gate are row reductions, one program per (row, stream). The conv and the
@@ -302,7 +302,8 @@ CKPT_HC_COUNT = 4
 CKPT_HIDDEN = 2560
 CKPT_DILATION = 3
 CKPT_CLAMP_MIN = 1e-6
-#: Largest PLE-conv pool seen for this checkpoint at tp1 (see `dilated_short_conv_paged`).
+#: The PLE-conv slot count of a full-size tp1 engine run (the n-gram pool's slot space). The
+#: op addresses a slot by its index alone, so a pool of another size takes the same path.
 ENGINE_SLOTS = 461
 #: The default target's per-rank PLE-conv pools: the conv state and the n-gram context are
 #: bound over one slot space (the stock manager asserts their slot counts equal), so the
@@ -319,18 +320,18 @@ def _spec(lengths, **spec) -> dict:
 class PleGateConvInjectNorm(OpWrapper):
     """With `C = hc_count`, `D = value.shape[-1]`, every grouped norm a gemma
     RMS norm over each `D`-wide stream (`n(x, w) = x * rsqrt(mean(x^2) + eps)
-    * (1 + w)`), and each step rounded to the activation dtype where the
-    unfused composition rounds -- for row `t` of sequence `s`, stream `c`::
+    * (1 + w)`), and each step rounded to the activation dtype as `reference`
+    rounds it -- for row `t` of sequence `s`, stream `c`::
 
         kn   = round(n(key[t, c], key_norm[c]))
         qn   = round(n(hc[t, c], query_norm[c]))
         g    = sum(kn * qn) / sqrt(D);  sg = sign(g) * sqrt(max(|g|, clamp_min))
-        gt   = round(sigmoid(sg) * value[t])                    # gated_ngram_injection
+        gt   = round(sigmoid(sg) * value[t])
         xc   = round(n(gt, conv_norm[c]))
         conv = round(sum_k conv_weight[c, k] * window[c, t' + k * dilation])
-        ple  = round(gt + round(silu(conv)))                     # dilated_short_conv_paged
+        ple  = round(gt + round(silu(conv)))
         hc_out[t, c] = round(hc[t, c] + ple)
-        normed[t, c] = round(n(hc_out[t, c], next_norm[c]))      # hc_inject_norm, norm only
+        normed[t, c] = round(n(hc_out[t, c], next_norm[c]))
 
     where `window` is `[conv_states[slot] | xc of the sequence's rows]` and
     `t'` the row's offset in its sequence; the state part is zero for a

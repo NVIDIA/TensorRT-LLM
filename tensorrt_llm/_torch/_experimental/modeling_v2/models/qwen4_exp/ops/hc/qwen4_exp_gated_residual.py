@@ -9,8 +9,11 @@ computes a different hyper-connection (a per-stream scalar gate, a weighted sum,
 the raw stream gated) and does not instantiate hidden 2560. The semantics follow
 the HuggingFace ``Qwen4ExpTextGatedResidual`` minus its norm.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at every
-layout.
+No target calls it: the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`)
+runs every mixer, the MTP layer's included, on the fused hyper-connection entries. This
+entry is their unfused form: `gate_ratio` is the band their tests gate `low`, `inject` and
+`mixed` in, and the target's MTP draft hyper-connection test takes `reference` as the
+float64 mixer and runs the entry as the unfused composition the fused sites are held to.
 """
 
 from __future__ import annotations
@@ -83,7 +86,7 @@ class Qwen4ExpGatedResidual(OpWrapper):
             spec=dict(leading=(256,), inject=False),
         ),
         # The MTP layer's shared_head mixer (block_inject_weight None) at the
-        # rows DecodeTarget.mtp_forward runs: one request, the largest decode
+        # rows a draft step's head mixes: one request, the largest decode
         # graph batch, and mtp7's first draft over 128 x (1 + 7) verify rows.
         Cell(
             why="1 row, no injection: one request's MTP shared_head",
@@ -104,10 +107,11 @@ class Qwen4ExpGatedResidual(OpWrapper):
     )
 
     note = """
-    Metadata consumed: none; every row independent. Call sites: twice per
-    decoder layer (attention and MoE hyper-connections, 96 calls) plus the
-    stack-final mixer with `block_inject_weight=None` -- whose `mixed` *is*
-    the checkpoint's final norm -- and three more in the MTP layer (two
+    Metadata consumed: none; every row independent. Call sites: none in a
+    target (see the module docstring). The formula is every hyper-connection
+    mixer's: twice per decoder layer (attention and MoE hyper-connections),
+    the stack-final mixer with `block_inject_weight=None` -- whose `mixed`
+    *is* the checkpoint's final norm -- and three in the MTP layer (two
     blocks and `shared_head`'s own mixer).
 
     Preconditions, all loud (`RuntimeError` before producing anything): the
@@ -130,13 +134,12 @@ class Qwen4ExpGatedResidual(OpWrapper):
     `mixed` within 0.40 of the test's band, cosine >= 0.9999982 and relative
     L2 <= 1.88e-3 against float64.
 
-    Not certified: other row counts; `inject` at 128 and 1024 rows (the MTP
-    layer's unfused attention and MoE sites; `mixed` there is bitwise the
-    no-injection cells'); more than one leading dim, hc_count other than 4,
-    hidden other than 2560, lowrank other than 320, float16 and float32,
-    weight/activation dtype mixing; the operand-range bounds above are
-    measured. Hard limits: not probed; a 2^31-element operand would take
-    209716 rows, past the 8192-row envelope.
+    Not certified: other row counts; `inject` at 128 and 1024 rows (`mixed`
+    there is bitwise the no-injection cells'); more than one leading dim,
+    hc_count other than 4, hidden other than 2560, lowrank other than 320,
+    float16 and float32, weight/activation dtype mixing; the operand-range
+    bounds above are measured. Hard limits: not probed; a 2^31-element
+    operand would take 209716 rows, past the 8192-row envelope.
     """
 
     def __call__(

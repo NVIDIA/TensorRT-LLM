@@ -17,9 +17,9 @@ dtype (fp32 or bf16). A cell's pool is one of three:
 Beyond the cells: a fixed row bitwise across batch sizes over a bf16 pool, a stale-read
 check under graph replay (a producer rewrites the projection inside the graph right
 before the op), the two launch variants (state rows by bulk copy into shared memory, or
-loaded into registers) bitwise each other, and the variant choice over an unaligned
-pool, each at tp1's 16 / 48 heads and a tp4/tep4 rank's 4 / 12. The `gdn_decode_rows`
-entry (the recurrence alone) has its own cells below.
+loaded into registers) bitwise each other, the variant choice over an unaligned pool,
+and the guards, each at tp1's 16 / 48 heads and a tp4/tep4 rank's 4 / 12. The
+`gdn_decode_rows` entry (the recurrence alone) has its own cells below.
 """
 
 import zlib
@@ -437,6 +437,18 @@ def test_variant_choice_and_unaligned_pool(v_heads) -> None:
     want = rows_mod.launch(args[0], pool, *args[2:], bulk=True)
     got = rows_mod.launch(args[0], shifted, *args[2:], bulk=True)
     assert torch.equal(got, want) and torch.equal(shifted, pool)
+
+
+@pytest.mark.parametrize("k_heads, v_heads", [(H, HV), RANK_HEADS], ids=["16x48", "4x12"])
+def test_guards(k_heads, v_heads) -> None:
+    """An fp16 pool, int64 slot indices and a projection of the wrong width are refused."""
+    args = _build(dict(rows=4, k_heads=k_heads, v_heads=v_heads), seed=5)[0]
+    with validating(op), pytest.raises(AssertionError):
+        op(args[0], args[1].to(torch.float16), *args[2:])
+    with validating(op), pytest.raises(AssertionError):
+        op(args[0], args[1], args[2].long(), *args[3:])
+    with validating(op), pytest.raises(AssertionError):
+        op(args[0][:, :-2], *args[1:])
 
 
 # ---- gdn_decode_rows: the recurrence alone, into a row range of a step's output ----------

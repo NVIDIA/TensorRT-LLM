@@ -4,7 +4,8 @@
 (models/qwen4_exp/ops/moe/renorm_moe_routing_op).
 
 The entry owns the contract. This file turns a cell into logits and holds the
-claim no cell carries: equivalence to HF's `norm_topk_prob` routing.
+claims no cell carries: equivalence to HF's `norm_topk_prob` routing, CUDA-graph
+replay at the 128-row captured batch, and the contiguity guard.
 """
 
 import zlib
@@ -113,3 +114,37 @@ def test_equivalent_to_hf_norm_topk_prob():
         atol=1e-7,
     )
     assert (weights - hf_values).abs().max().item() > 1e-2
+
+
+def test_cuda_graph_replay_at_the_captured_batch():
+    """The trunk's decode router runs inside the engine's CUDA graphs: captured
+    once at the largest captured batch (128 rows), each replay over refilled
+    logits answers bit-exactly what the reference does on them."""
+    tokens, num_experts, topk = 128, 512, 10
+    logits = _logits(tokens, num_experts, torch.bfloat16, seed=21)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(logits, topk, torch.bfloat16)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ids, weights = op(logits, topk, torch.bfloat16)
+    for seed in (22, 23):
+        logits.copy_(_logits(tokens, num_experts, torch.bfloat16, seed=seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        _compare(
+            (ids.clone(), weights.clone()),
+            op.reference(logits, topk, torch.bfloat16),
+        )
+
+
+# ── the guard ─────────────────────────────────────────────────────────────
+
+
+def test_guard_refuses_a_column_slice():
+    """What `is_valid` exists for: the raw op reads a slice as the dense buffer."""
+    wide = _logits(8, 1024, torch.bfloat16, seed=12)
+    with validating(op), pytest.raises(AssertionError, match="contiguous"):
+        op(wide[:, :512], 10)

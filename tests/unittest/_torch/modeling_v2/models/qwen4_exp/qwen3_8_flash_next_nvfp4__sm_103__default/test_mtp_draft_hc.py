@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MTP draft layer: its hyper-connection sites on the trunk's fused entries, against the
-HuggingFace math in float64 and against the composition they replace, and its token embedding
-under rejection sampling.
+"""The MTP draft layer's hyper-connection sites on the trunk's fused entries, against the
+HuggingFace math in float64 and against the unfused composition of the same math.
 
 `_mtp_front`, `_mtp_tail` and `MTPLayer.shared_head` run over a stand-in core that holds the
 draft layer's hyper-connection weights (synthetic, at the checkpoint's element statistics): the
@@ -16,7 +15,7 @@ attention-DP rank's decode batch -- and a prefill).
 The float64 reference rounds to bf16 where the runtime's activations are bf16 between modules
 (the norm outputs, the projections, the residual) and once at each mixer output; the mixers of
 the fused path keep their logits in fp32 (the trunk's numerics). Each output must be within
-the band of that reference that the replaced composition (per-stream `flashinfer_gemma_rmsnorm`
+the band of that reference that the unfused composition (per-stream `flashinfer_gemma_rmsnorm`
 and `qwen4_exp_gated_residual`) reaches, widened by half.
 """
 
@@ -43,7 +42,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.fla
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     modeling as MOD,
 )
-from tensorrt_llm._torch.speculative.interface import rejection_sampling_one_model
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
@@ -200,7 +198,7 @@ def _grouped(x, gamma):
     )
 
 
-def _mixer_old(raw, tag, normed, inject=True):
+def _mixer_unfused(raw, tag, normed, inject=True):
     return qwen4_exp_gated_residual(
         normed,
         raw[f"{P}{tag}_down"],
@@ -210,7 +208,7 @@ def _mixer_old(raw, tag, normed, inject=True):
     )
 
 
-def _front_old(raw, ids, hs):
+def _front_unfused(raw, ids, hs):
     rows = hs.shape[0]
     e = torch.nn.functional.embedding(ids, raw["embed"])
     x_e = mtp_cublas_mm(
@@ -219,17 +217,17 @@ def _front_old(raw, ids, hs):
     h_n = _grouped(hs, raw[f"{P}pre_h_norm"])
     x_h = mtp_cublas_mm(h_n.reshape(rows * HC, HIDDEN), raw[f"{P}fc_h"].t()).reshape(rows, WIDTH)
     x = torch.add(x_h, torch.cat([x_e] * HC, -1))
-    return (x, *_mixer_old(raw, "ahc", _grouped(x, raw[f"{P}ahc_norm"])))
+    return (x, *_mixer_unfused(raw, "ahc", _grouped(x, raw[f"{P}ahc_norm"])))
 
 
-def _tail_old(raw, x, attn, inject):
+def _tail_unfused(raw, x, attn, inject):
     x = qwen4_exp_post_inject(x, mtp_cublas_mm(attn, raw[f"{P}o_w"].t()), inject)
-    mixed, inject = _mixer_old(raw, "mhc", _grouped(x, raw[f"{P}mhc_norm"]))
+    mixed, inject = _mixer_unfused(raw, "mhc", _grouped(x, raw[f"{P}mhc_norm"]))
     return qwen4_exp_post_inject(x, mixed, inject)
 
 
-def _head_old(raw, hs):
-    return _mixer_old(raw, "fhc", _grouped(hs, raw[f"{P}fhc_norm"]), inject=False)[0]
+def _head_unfused(raw, hs):
+    return _mixer_unfused(raw, "fhc", _grouped(hs, raw[f"{P}fhc_norm"]), inject=False)[0]
 
 
 def _err(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -244,16 +242,16 @@ def _rel_l2(got: torch.Tensor, ref: torch.Tensor) -> float:
     return ((got.double() - ref64).norm() / ref64.norm()).item()
 
 
-def _within(name, got, ref, old) -> None:
-    """`got` as close to `ref` as the replaced composition `old` is, widened by half (and
+def _within(name, got, ref, unfused) -> None:
+    """`got` as close to `ref` as the unfused composition `unfused` is, widened by half (and
     never tighter than one eps of max|ref| / 1e-3 relative L2, both below the noise of one
     bf16 rounding of a mixer output)."""
     assert got.shape == ref.shape and got.dtype == ref.dtype, (name, got.shape, ref.shape)
     assert bool(torch.isfinite(got).all()), name
-    e_new, e_old = _err(got, ref), _err(old, ref)
-    l_new, l_old = _rel_l2(got, ref), _rel_l2(old, ref)
+    e_new, e_old = _err(got, ref), _err(unfused, ref)
+    l_new, l_old = _rel_l2(got, ref), _rel_l2(unfused, ref)
     print(
-        f"{name}: max {e_new:.3f} (old {e_old:.3f}) eps*max|ref|, relL2 {l_new:.3g} (old {l_old:.3g})"
+        f"{name}: max {e_new:.3f} (unfused {e_old:.3f}) eps*max|ref|, relL2 {l_new:.3g} (unfused {l_old:.3g})"
     )
     assert e_new <= max(1.5 * e_old, 1.0), (name, e_new, e_old)
     assert l_new <= max(1.5 * l_old, 1e-3), (name, l_new, l_old)
@@ -289,8 +287,8 @@ def test_the_front_site(rows, strided) -> None:
     core, M = _core(raw)
     ids, hs, _, _ = _inputs(rows, 101 + rows, strided)
     x, mixed, inject = MOD._mtp_front(core, M, raw["embed"], ids, hs)
-    ref, old = _front64(raw, ids, hs), _front_old(raw, ids, hs)
-    for name, got, r, o in zip(("x", "mixed", "inject"), (x, mixed, inject), ref, old):
+    ref, unfused = _front64(raw, ids, hs), _front_unfused(raw, ids, hs)
+    for name, got, r, o in zip(("x", "mixed", "inject"), (x, mixed, inject), ref, unfused):
         _within(f"front[{rows}].{name}", got, r, o)
     # The unit injection is the bf16 add: the residual is bitwise the replaced one's, whose
     # projections are the same calls.
@@ -307,7 +305,9 @@ def test_the_tail_sites(rows, moe_identity) -> None:
     core, M = _core(raw)
     _, x, attn, inject = _inputs(rows, 201 + rows)
     out = MOD._mtp_tail(core, M, x, attn, inject, 0)
-    _within(f"tail[{rows}]", out, _tail64(raw, x, attn, inject), _tail_old(raw, x, attn, inject))
+    _within(
+        f"tail[{rows}]", out, _tail64(raw, x, attn, inject), _tail_unfused(raw, x, attn, inject)
+    )
 
 
 # 32: a shared head over one attention-DP rank's decode batch (ht_dep4 drafts under MTP).
@@ -320,7 +320,7 @@ def test_the_head_site(rows) -> None:
         core=core, logits_processor=SimpleNamespace(forward=lambda final, *args: final)
     )
     final = MOD.MTPLayer.shared_head(head, hs, None, None, False)
-    _within(f"head[{rows}]", final, _head64(raw, hs), _head_old(raw, hs))
+    _within(f"head[{rows}]", final, _head64(raw, hs), _head_unfused(raw, hs))
 
 
 def test_a_captured_draft_step_replays_the_eager_bits(moe_identity) -> None:
@@ -351,32 +351,3 @@ def test_a_captured_draft_step_replays_the_eager_bits(moe_identity) -> None:
     torch.cuda.synchronize()
     for got, want in zip(captured, eager):
         assert torch.equal(got, want)
-
-
-def test_draft_embedding_reads_row_0_for_rejected_slots() -> None:
-    """Rejection sampling pads the slots past a request's accepted count with -1 (here every
-    draft is rejected at slot 0); the front end embeds those as row 0 and every valid id as
-    the plain lookup does."""
-    batch, draft, vocab, hidden = 8, 3, 4096, 256
-    draft_tokens = torch.arange(batch * draft, dtype=torch.int32, device="cuda").reshape(
-        batch, draft
-    )
-    draft_probs = torch.zeros(batch, draft, vocab, device="cuda")
-    draft_probs.scatter_(2, draft_tokens.long().unsqueeze(-1), 1.0)
-    target_probs = torch.zeros(batch, draft + 1, vocab, device="cuda")
-    target_probs[..., vocab - 1] = 1.0
-    seed = torch.zeros(batch, dtype=torch.int64, device="cuda")
-    offset = torch.arange(batch, dtype=torch.int64, device="cuda")
-    accepted, _ = rejection_sampling_one_model(
-        draft_probs, draft_tokens, target_probs, seed, offset
-    )
-    assert bool((accepted[:, 1:] == -1).all()) and bool((accepted[:, 0] == vocab - 1).all())
-
-    g = torch.Generator(device="cuda").manual_seed(0)
-    table = torch.randn(vocab, hidden, generator=g, device="cuda").to(torch.bfloat16)
-    valid_ids = torch.randint(0, vocab, (257,), generator=g, device="cuda", dtype=torch.int32)
-    for ids in (accepted.flatten(), valid_ids, valid_ids.long()):
-        e = MOD._draft_embedding(ids, table)
-        valid = ids >= 0
-        assert torch.equal(e[valid], table[ids[valid].long()])
-        assert torch.equal(e[~valid], table[0].expand(int((~valid).sum()), -1))

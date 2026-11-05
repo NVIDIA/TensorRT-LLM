@@ -101,6 +101,9 @@ class _RowtileAttentionKernel:
             "the TMEM plan (O 256 + 2 x S 64 + Q 128 columns) is laid out for D = 256"
         )
         assert group_size * rows_per_tile <= 128
+        # The O staging's four SW128 boxes sit `64 G R` elements apart: each must start on
+        # a 1024-byte swizzle atom, so the live MMA rows come in whole 8-row atoms.
+        assert group_size * rows_per_tile % 8 == 0, (group_size, rows_per_tile)
         self.group_size = group_size
         self.rows_per_tile = rows_per_tile
         self.d = head_dim

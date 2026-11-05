@@ -52,15 +52,15 @@ There is **no** `model.language_model.norm.weight`: the stack-final mixer is the
 of its own, settled at construction (`one_rank`): the decode projections' one-rank dispatch
 (`_one_rank_projection`); the hyper-connection sites' row-count forms (`hc_fast_sites`: the
 decode GEMV and tcgen05 rows pairs, the prefill rstd sites), which the other layouts leave
-out so that a request's tokens do not depend on what its steps carry beside it; a trtllm-gen
+out; a trtllm-gen
 decode MoE whose finalize the next site folds in (`moe_fold`); the CuteDSL copy of the
 routed experts for prefill steps past `_CUTE_DSL_MOE_MIN_ROWS` (`moe_prefill_copy`), or the
 CuteDSL pipeline for every step (`moe_config.backend: CUTEDSL`, `_cute_dsl_routed`); an fp32
 recurrent state, whose captured single-token decode runs `gdn_decode_gated_norm_pdl`; the
 decode draft layer and its FP8 head; the NVFP4 pool's context rows attended a group of
 requests at a time (`_nvfp4_context_plan`); and the opt-in FP8 / NVFP4 copies of the dense
-projections and heads (`_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP4_ENV`, `_TARGET_HEAD_NVFP4_ENV`,
-`_MTP_HEAD_NVFP4_ENV`, `_MTP_MOE_NVFP4_ENV`).
+projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP4_ENV`,
+`_TARGET_HEAD_NVFP4_ENV`, `_MTP_HEAD_NVFP4_ENV`, `_MTP_MOE_NVFP4_ENV`, `_MTP_DENSE_FP8_ENV`).
 
 **QSA sparse attention.** The index plane is maintained on every step so a request can
 cross `dense_seq_len_threshold` later without rebuilding its prefix; above it the sparse
@@ -150,9 +150,6 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_con
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    fused_qk_norm_rope as mtp_fused_qk_norm_rope,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     QM_FP8_KV_CACHE,
     QM_NVFP4_KV_CACHE,
@@ -165,9 +162,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import (
-    cublas_mm as mtp_cublas_mm,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
@@ -179,9 +173,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (
     fused_sigmoid_mul_inplace,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (
-    fused_sigmoid_mul_inplace as mtp_fused_sigmoid_mul_inplace,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.silu_and_mul_rows import (
     silu_and_mul_rows,
@@ -433,6 +424,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
@@ -474,7 +466,8 @@ _CUTEDSL_MAX_DRAFT_LEN = 3
 # one without the GDN cached replay (the per-step recurrent states).
 _MAX_VERIFY_WIDTH = _pool.MAX_VERIFY_WIDTH
 
-# Recurrent-state cache dtypes the target serves: at one rank the checkpoint's fp32 too.
+# Recurrent-state cache dtypes the target serves, checked at bind: at one rank the checkpoint's
+# fp32 too.
 _SSM_STATE_DTYPES = (torch.bfloat16,)
 _ONE_RANK_SSM_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
@@ -562,8 +555,8 @@ _ACT_TYPE_SWIGLU = 0
 _PAD_SLOT_ID = -1
 #: Whether a captured decode step's projections on `low_m_bf16_mm` launch with programmatic
 #: dependent launch (their FlashInfer kernels stream the weight before waiting on the
-#: activation's producer; the cuBLAS branch ignores it).
-_DECODE_PROJ_PDL = True
+#: activation's producer; the cuBLAS branch ignores it): `TRTLLM_ENABLE_PDL`, on by default.
+_DECODE_PROJ_PDL = get_env_enable_pdl()
 #: The K at which `_decode_projection` runs `bf16_gemv_pdl` up to `_GEMV_MAX_ROWS` rows: a
 #: tp4/tep4 rank's o and GDN out projections.
 _GEMV_TP4_K = 1536
@@ -574,8 +567,8 @@ _GEMV_NARROW_N = 8  # capacity: fixed: a dispatch threshold, not a buffer size
 #: Whether a verify step's conv signals its dependents at its start and the CuTe replay after it
 #: launches with programmatic dependent launch: the replay then streams the checkpoint and the
 #: history (which nothing in the step writes ahead of it) while the conv runs, and reads the
-#: conv's output only after `griddepcontrol.wait`.
-_GDN_REPLAY_PDL = True
+#: conv's output only after `griddepcontrol.wait`. `TRTLLM_ENABLE_PDL`, on by default.
+_GDN_REPLAY_PDL = get_env_enable_pdl()
 _SOFTPLUS_THRESHOLD = 20.0
 _L2_NORM_EPS = 1e-6
 _PLE_CLAMP_MIN = 1e-6
@@ -591,8 +584,8 @@ _HC_TC_FIRST_MAX_ROWS = _HC_TC_FIRST_ROWS
 #: there up to `_HC_DECODE_ROWS_MAX` the tcgen05 pair `qwen4_exp_hc_decode_rows_first` +
 #: `qwen4_exp_hc_decode_rows_mix`; larger steps, and every step at the other layouts,
 #: `qwen4_exp_hc_inject_norm` and the mixer. The two fast pairs form the mixer's low-rank
-#: activations within 1-2 bf16 ulp of that path, not bitwise, so a request's tokens would depend
-#: on how many rows its step carries; the other layouts keep one path at every batch size.
+#: activations within 1-2 bf16 ulp of that path, not bitwise; the other layouts do not take
+#: them.
 _HC_DECODE_GEMV_MAX_ROWS = 1  # capacity: fixed: dispatch threshold, not a buffer bound
 #: Decode rows from which a folded MoE block (`DecodeTarget._moe`) launches its router before
 #: the shared expert: launched after the side stream's gate|up GEMM its CTAs waited for SMs
@@ -701,10 +694,23 @@ _VERIFY_CONV_FUSED_MAX_ROWS = 16  # capacity: fixed: the entry's certified rows
 _FP8_CONV_FUSED_MAX_ROWS = 8  # capacity: fixed: a dispatch threshold
 
 
-def _switch(env: str) -> bool:
-    mode = os.environ.get(env, "0")
-    assert mode in ("0", "1"), f"{env}={mode!r}: expected 0 or 1"
-    return mode == "1"
+#: The spellings of a `TRTLLM_MODELING_V2_*` switch: these turn it on, these off.
+_SWITCH_ON = frozenset({"1", "true", "yes", "on"})
+_SWITCH_OFF = frozenset({"0", "false", "no", "off"})
+
+
+def _switch(env: str, default: bool = False) -> bool:
+    """A `TRTLLM_MODELING_V2_*` switch: unset or empty is `default`; any spelling outside
+    `_SWITCH_ON` / `_SWITCH_OFF` raises."""
+    raw = os.environ.get(env, "")
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in _SWITCH_ON:
+        return True
+    if value in _SWITCH_OFF:
+        return False
+    raise ValueError(f"{env}={raw!r}: expected 1 / 0 (or true / false, yes / no, on / off)")
 
 
 def _gemv_ready(x: torch.Tensor) -> bool:
@@ -802,7 +808,34 @@ _MTP_MOE_NVFP4_FC1_MARGIN = 8.0
 _MTP_MOE_NVFP4_FC2_MARGIN = 4.0
 
 _PLE_HOST_OFFLOAD_ENV = "TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD"
-_PLE_HOST_OFFLOAD_OFF = frozenset({"0", "false", "no", "off"})
+
+#: The opt-in switches certified at tp1; every other layout runs the checkpoint's bf16 paths.
+_ONE_RANK_SWITCHES = (
+    _DENSE_FP8_ENV,
+    _GDN_INPROJ_NVFP4_ENV,
+    _TARGET_HEAD_NVFP4_ENV,
+    _MTP_HEAD_NVFP4_ENV,
+    _MTP_MOE_NVFP4_ENV,
+    _MTP_DENSE_FP8_ENV,
+)
+
+
+def _check_switches(one_rank: bool) -> None:
+    """Read every opt-in switch at construction, at any layout, so a misspelled value raises,
+    and warn about one set where it takes no effect: away from tp1, or the target head's NVFP4
+    copy without the dense FP8 mode whose head it replaces."""
+    on = [env for env in _ONE_RANK_SWITCHES if _switch(env)]
+    if on and not one_rank:
+        logger.warning(
+            f"{', '.join(on)}: certified at tp1 only; this layout runs the bf16 paths and "
+            "ignores them"
+        )
+    if one_rank and _TARGET_HEAD_NVFP4_ENV in on and _DENSE_FP8_ENV not in on:
+        logger.warning(
+            f"{_TARGET_HEAD_NVFP4_ENV}=1 takes effect only with {_DENSE_FP8_ENV}=1; the target "
+            "head stays bf16"
+        )
+
 
 #: At one rank, context-step MoE launches of at least this many rows (and at most
 #: `_CUTE_DSL_MOE_MAX_ROWS`, the op's certified top) run on the CuTe DSL MoE
@@ -813,7 +846,7 @@ _PLE_HOST_OFFLOAD_OFF = frozenset({"0", "false", "no", "off"})
 _CUTE_DSL_MOE_MIN_ROWS = 4096  # capacity: fixed: a dispatch threshold, not a buffer size
 _CUTE_DSL_MOE_MAX_ROWS = 16384  # capacity: fixed: the op's certified rows
 # Whether one rank keeps that second copy (about 1.3 GiB a layer). No engine arg owns it, hence
-# an env var read at construction; "off" (the spellings above) drops the copy and every launch
+# an env var read at construction (`_switch`, default on); off drops the copy and every launch
 # runs on trtllm-gen.
 _MOE_PREFILL_COPY_ENV = "TRTLLM_MODELING_V2_MOE_PREFILL_COPY"
 
@@ -823,18 +856,18 @@ def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: in
     is local, the layout the CuteDSL MoE is certified at), only under trtllm-gen, only when a
     step's rows (at most `max_num_tokens`) can reach the dispatch threshold, and not when the
     env var turns it off."""
+    wanted = _switch(_MOE_PREFILL_COPY_ENV, default=True)
     return (
         one_rank
         and trunk_moe_backend == "TRTLLM"
         and max_num_tokens >= _CUTE_DSL_MOE_MIN_ROWS
-        and os.environ.get(_MOE_PREFILL_COPY_ENV, "1").strip().lower() not in _PLE_HOST_OFFLOAD_OFF
+        and wanted
     )
 
 
 def _ple_host_offload_enabled() -> bool:
     """Whether the n-gram table is declared in host memory (the default)."""
-    value = os.environ.get(_PLE_HOST_OFFLOAD_ENV, "1").strip().lower()
-    return value not in _PLE_HOST_OFFLOAD_OFF
+    return _switch(_PLE_HOST_OFFLOAD_ENV, default=True)
 
 
 def _moe_layer_scalars(w, i: int, start: int, count: int) -> dict[str, torch.Tensor]:
@@ -929,6 +962,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
         mapping = model_config.mapping
+        # One rank holds the whole model (tp1), which takes forms of its own (module docstring).
+        self.one_rank = mapping.world_size == 1
         assert torch.cuda.get_device_capability() == _SM, (
             f"target certified on sm_{_SM[0]}{_SM[1]}, running on "
             f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}"
@@ -1065,7 +1100,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # Fixes the load-time layout of the expert stacks (`weights.py`).
         self.trunk_moe_backend = _TRUNK_MOE_BACKENDS[requested]
         # The CuteDSL pipeline runs every expert at once: one rank only.
-        assert self.trunk_moe_backend != "CUTEDSL" or mapping.world_size == 1, (
+        assert self.trunk_moe_backend != "CUTEDSL" or self.one_rank, (
             "moe_config.backend=CUTEDSL is implemented at one rank (tp1) only; this layout "
             f"has {mapping.world_size} ranks"
         )
@@ -1078,7 +1113,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # At one rank the CuteDSL-layout copy of the experts for prefill-sized launches
         # (`_moe_prefill_copy`); `weights.py` declares it from this.
         self.moe_prefill_copy = _moe_prefill_copy(
-            mapping.world_size == 1, self.trunk_moe_backend, model_config.max_num_tokens
+            self.one_rank, self.trunk_moe_backend, model_config.max_num_tokens
         )
         # The draft experts' NVFP4 copy at one rank (`_mtp_moe_nvfp4`), built once: it frees
         # the FP8 experts, and the shell's post-load walk reaches `post_load_weights` again.
@@ -1097,6 +1132,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
         self.ple_table_dtype = _weights.PLE_TABLE_DTYPE
         self.ple_host_offload = _ple_host_offload_enabled()
+        _check_switches(self.one_rank)
         # CPU allocation behind the offloaded table; the `ple_table` parameter is a
         # device-address view that owns none of those pages.
         self._ple_table_host = None
@@ -1122,7 +1158,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
 
         # ---- this rank's share ----------------------------------------------
         d = _weights.MODEL_WEIGHTS.dims(self)
-        assert d.expert_split in _weights.LOADED_EXPERT_SPLITS, d.expert_split
         self.heads_q = d.heads_q
         self.heads_kv = d.heads_kv
         self.kv_head_start = d.kv_head_start
@@ -1169,8 +1204,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # The shared expert's stream (see `_moe_block`); made after load, because a stream
         # created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
-        # The tensor-parallel sum of a block's partial output (`_tp_sum_op`), and the routed
-        # experts' completion over this rank's rows (`_expert_sum_op`).
+        # The tensor-parallel sum of a block's partial output (`_tp_sum_op`, over the engine's
+        # `allreduce_strategy`), and the routed experts' completion over this rank's rows
+        # (`_expert_sum_op`).
+        self.allreduce_strategy = int(model_config.allreduce_strategy)
         self.tp_sum = None
         self.expert_sum = None
         self._prefill: "PrefillTarget | None" = None
@@ -1262,6 +1299,12 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"sizes address {used_rows}"
         )
         assert table_rows % self.ngram_vocab_divisor == 0, (table_rows, self.ngram_vocab_divisor)
+        assert table_rows - used_rows < self.ngram_vocab_divisor, (
+            f"the n-gram table carries {table_rows - used_rows} padding rows, more than one "
+            f"divisor of {self.ngram_vocab_divisor}: its shards do not concatenate to the padded "
+            "id space the checkpoint declares, and every id past the first shard would read a "
+            "shifted row"
+        )
         self._cos_sin = self._index_rope_table(self.theta, device)
         # Before the draft layer's views, which read its fused first projections.
         self._fuse_hc_first_projections()
@@ -1295,14 +1338,13 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self.expert_sum = self._expert_sum_op()
         # A decode step's bf16 projection entry, and its GDN in_proj's: at tp1 the one-rank
         # dispatch (`_one_rank_projection`), at the other layouts the shapes' own.
-        one_rank = self.mapping.world_size == 1
+        one_rank = self.one_rank
         self.decode_mm = _one_rank_projection if one_rank else _decode_projection
         # At one rank a trtllm-gen decode MoE leaves its finalize to the next site
         # (`DecodeTarget._moe`).
         self.moe_fold = one_rank and self.trunk_moe_backend == "TRTLLM"
         # At one rank the hyper-connection sites' fast forms by row count (the decode GEMV and
-        # tcgen05 rows pairs, the prefill rstd sites); at the other layouts one form serves every
-        # batch size, so a request's tokens do not depend on what its steps carry beside it.
+        # tcgen05 rows pairs, the prefill rstd sites); the other layouts do not take them.
         self.hc_fast_sites = one_rank
         self.decode_in_mm = (
             _one_rank_projection
@@ -1319,7 +1361,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         packed FP8 copies of its dense projections; None / empty at every other layout."""
         self._mtp_attn_in = None
         self._mtp_gemv8 = {}
-        if self.mapping.world_size != 1:
+        if not self.one_rank:
             return
         w = self.w
         p = f"l{self.mtp_layer_idx}_mtp_"
@@ -1349,7 +1391,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         (`_GDN_INPROJ_NVFP4_ENV`), with every decode variant compiled now; both only at tp1,
         the layout they are certified at, and empty otherwise."""
         w = self.w
-        one_rank = self.mapping.world_size == 1
+        one_rank = self.one_rank
         self._dense8, self._gemv8, self._mid, self._gemv_nv = {}, {}, {}, {}
         if one_rank and _switch(_DENSE_FP8_ENV):
             for name in w:
@@ -1384,11 +1426,12 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
 
     def _tp_sum_op(self):
         """The sum that completes a block's per-rank partial output, settled once: under
-        attention TP the plain all-reduce over the TP group (`comm/allreduce`, op `NONE`),
-        which every rank gets the same bits back from; otherwise nothing to sum."""
+        attention TP the plain all-reduce over the TP group (`comm/allreduce`, op `NONE`, at
+        the engine's `allreduce_strategy`), which every rank gets the same bits back from;
+        otherwise nothing to sum."""
         if self.attn_tp_size == 1:
             return lambda x: x
-        group = allreduce_group_args(self.mapping)
+        group = allreduce_group_args(self.mapping, self.allreduce_strategy)
 
         def tp_sum(x: torch.Tensor) -> torch.Tensor:
             return allreduce(
@@ -1558,6 +1601,13 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         mm_missing = [name for name in _MAMBA_FIELDS if not hasattr(mm, name)]
         assert not mm_missing, f"mamba metadata fields missing: {mm_missing}"
         rank_pools = _pool.take_pools(cm, g, self.attn_layers, self.gdn_layers, self.ple_layer)
+        # The pool serves both state dtypes; this layout serves its own (routing declines the rest).
+        served = _ONE_RANK_SSM_STATE_DTYPES if self.one_rank else _SSM_STATE_DTYPES
+        state_dtype = rank_pools.ssm[self.gdn_layers[0]].dtype
+        assert state_dtype in served, (
+            f"a {state_dtype} recurrent-state cache; this layout serves "
+            f"{' or '.join(str(d) for d in served)} (kv_cache_config.mamba_ssm_cache_dtype)"
+        )
         # No sliding window: the targets pass `max_seq_len` as the window.
         windows = cm.max_attention_window_vec
         attn_windows = {windows[off] for off in rank_pools.pool_idx.values()}
@@ -2301,12 +2351,12 @@ def _mtp_front(core, M: _MtpWeights, embed_tokens, input_ids, hidden_states) -> 
         f"a draft step of {rows} rows exceeds max_num_tokens {M.unit_inject.shape[0]}"
     )
     e = _draft_embedding(input_ids, embed_tokens)
-    x_e = mtp_cublas_mm(flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e)
+    x_e = cublas_mm(flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e)
     _, h_n = qwen4_exp_hc_inject_norm(
         hidden_states, None, None, M.pre_h_norm, core.eps, core.hc_count
     )
     x_h = torch.reshape(
-        mtp_cublas_mm(torch.reshape(h_n, [rows * core.hc_count, core.hidden]), M.fc_h),
+        cublas_mm(torch.reshape(h_n, [rows * core.hc_count, core.hidden]), M.fc_h),
         [rows, core.stream],
     )
     x, normed = qwen4_exp_hc_inject_norm(
@@ -2322,7 +2372,7 @@ def _mtp_qkv(core, M: _MtpWeights, mixed, pos3) -> tuple:
     place at the module's rope base. Returns `(qkv, gate, k, v)`: `gate` is the
     `[T, heads_q, head_dim]` gate half of the q projection, `k` and v` views of `qkv`."""
     rows = mixed.shape[0]
-    qg = mtp_cublas_mm(mixed, M.q)
+    qg = cublas_mm(mixed, M.q)
     qkv = torch.empty([rows, core.qkv_width], dtype=mixed.dtype, device=mixed.device)
     q_dst, k_dst, v_dst = torch.split(
         torch.reshape(qkv, [rows, core.heads_q + 2 * core.heads_kv, core.head_dim]),
@@ -2335,9 +2385,9 @@ def _mtp_qkv(core, M: _MtpWeights, mixed, pos3) -> tuple:
         2,
     )
     q_dst.copy_(q_src)
-    k_dst.copy_(torch.reshape(mtp_cublas_mm(mixed, M.k), [rows, core.heads_kv, core.head_dim]))
-    v_dst.copy_(torch.reshape(mtp_cublas_mm(mixed, M.v), [rows, core.heads_kv, core.head_dim]))
-    mtp_fused_qk_norm_rope(
+    k_dst.copy_(torch.reshape(cublas_mm(mixed, M.k), [rows, core.heads_kv, core.head_dim]))
+    v_dst.copy_(torch.reshape(cublas_mm(mixed, M.v), [rows, core.heads_kv, core.head_dim]))
+    fused_qk_norm_rope(
         qkv,
         num_heads_q=core.heads_q,
         num_heads_k=core.heads_kv,
@@ -2366,7 +2416,7 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
     step completes. Returns the normalized, rotated index query."""
     req_idx, logical, block_table, tokens_per_block, pos, coords = qsa
     rows = mixed.shape[0]
-    qk_index = mtp_cublas_mm(mixed, M.idx)
+    qk_index = cublas_mm(mixed, M.idx)
     token_k = torch.split(
         torch.reshape(qk_index, [rows, core.index_heads + core.index_kv_heads, -1]),
         [core.index_heads, core.index_kv_heads],
@@ -2684,7 +2734,7 @@ def _decode_router_mid(core, L: _LayerWeights):
     """A decode step's router projection for layer `L`: `mid_rows_mm` over its view in the
     dense FP8 mode's rows (`_MID_MM_ROWS["router"]`), else at tp1 the step's projection entry
     (`core.decode_mm`) and at the other layouts `_decode_router`."""
-    fallback = core.decode_mm if core.mapping.world_size == 1 else _decode_router
+    fallback = core.decode_mm if core.one_rank else _decode_router
     if L.router_m is None:
         return fallback
     return lambda x, router: _dense_mm(x, router, None, fallback, "router", mid=L.router_m)
@@ -3070,6 +3120,64 @@ def _selection(
             token_topk=core.token_topk,
         )
     )
+
+
+#: Elements of one score table: `qsa_paged_index_scores` writes its output rows and
+#: `qsa_topk_expand_decode` lays out its rows with int32 index arithmetic (row times the
+#: table's width), so a call scores fewer rows than this over the table's columns.
+_SCORE_TABLE_ELEMENTS = 2**31
+
+
+def _score_and_select(
+    core,
+    index_cache,
+    q_index,
+    block_table,
+    logical,
+    req_idx,
+    tokens_per_block: int,
+    parts,
+    visible_blocks,
+    seq_lens_q,
+    topk_indices,
+    row_starts,
+    selected,
+    live_cols,
+) -> None:
+    """Score each part's rows against the index cache and select into their rows of
+    `selected` (`_selection`). A part's rows go in chunks of fewer than
+    `_SCORE_TABLE_ELEMENTS / columns` rows: a prefill step's context rows reach
+    `max_num_tokens`, and at `max_seq_len` 262144 (65568 columns) more than 32752 of them
+    pass the int32 range. A row's scores and selection read only that row's query, position
+    and request, so the chunks select what one call would; below the bound a part is one
+    call."""
+    columns = block_table.shape[1] * tokens_per_block // core.compress_ratio
+    chunk = max(1, (_SCORE_TABLE_ELEMENTS - 1) // columns)
+    for lo, hi, context_rows in parts:
+        for a in range(lo, hi, chunk):
+            b = min(a + chunk, hi)
+            scores = qsa_paged_index_scores(
+                q=q_index[a:b],
+                index_cache=index_cache,
+                block_table=block_table,
+                query_positions=logical[a:b],
+                request_indices=req_idx[a:b],
+                tokens_per_block=tokens_per_block,
+                compress_ratio=core.compress_ratio,
+                only_visible_blocks=True,
+                context_rows=context_rows,
+            )
+            _selection(
+                core,
+                scores,
+                visible_blocks[a:b],
+                logical[a:b],
+                seq_lens_q[a:b],
+                topk_indices[a:b],
+                row_starts[a:b],
+                selected[a:b],
+                live_cols,
+            )
 
 
 def _store_kv(core, kv, k, v, request_indices, logical_positions, block_table, tokens_per_block):
@@ -3594,9 +3702,7 @@ class PrefillTarget:
         qkv = proj_qkv[:num_tokens]
         qkv.copy_(proj[:, : core.qkv_width])
         if step.stage:
-            core.spec_rollback.stage_index(
-                core._bound.pools.index_cache[i], core._bound.pools.position_cache
-            )
+            core.spec_rollback.stage_index(core._bound.pools.position_cache)
         _index_plane(core, proj, i, L, (req_idx, logical, block_table, tokens_per_block, coords))
 
         if sparse:
@@ -3617,32 +3723,25 @@ class PrefillTarget:
                 dtype=torch.int32,
                 device=proj.device,
             )
-            for lo, hi, context_rows in parts:
-                scores = qsa_paged_index_scores(
-                    q=q_index[lo:hi],
-                    index_cache=core._bound.pools.index_cache[i],
-                    block_table=block_table,
-                    query_positions=logical[lo:hi],
-                    request_indices=req_idx[lo:hi],
-                    tokens_per_block=tokens_per_block,
-                    compress_ratio=core.compress_ratio,
-                    only_visible_blocks=True,
-                    context_rows=context_rows,
-                )
-                _selection(
-                    core,
-                    scores,
-                    visible_blocks[lo:hi],
-                    logical[lo:hi],
-                    seq_lens_q[lo:hi],
-                    topk_indices[lo:hi],
-                    topk_row_starts[lo:hi],
-                    selected[lo:hi],
-                    step.live_cols,
-                )
+            _score_and_select(
+                core,
+                core._bound.pools.index_cache[i],
+                q_index,
+                block_table,
+                logical,
+                req_idx,
+                tokens_per_block,
+                parts,
+                visible_blocks,
+                seq_lens_q,
+                topk_indices,
+                topk_row_starts,
+                selected,
+                step.live_cols,
+            )
             # Context rows with the prefill pair (a bound on a row's scan), generation rows
             # without.
-            if core.mapping.world_size == 1 and kv.k_scale is not None:
+            if core.one_rank and kv.k_scale is not None:
                 _sparse_gqa_nvfp4_context(
                     core,
                     kv,
@@ -4113,7 +4212,7 @@ class PrefillTarget:
             fp8_pages = _fp8_context_pages(md, md.tokens_per_block)
         nvfp4_context = None
         if (
-            core.mapping.world_size == 1
+            core.one_rank
             and sparse
             and core.quant_mode == QM_NVFP4_KV_CACHE
             and num_prefill_tokens > _NVFP4_ROWTILE_MIN_ROWS
@@ -4397,7 +4496,7 @@ class PrefillTarget:
                 self._capture_selection(md, topk_indices, visible_blocks, compact=True)
             q_att = _packed_q(core, qkv)[keep]
             attn = torch.empty([q_rows, core.q_width], dtype=qkv.dtype, device=qkv.device)
-            if kv.k_scale is not None and core.mapping.world_size == 1:
+            if kv.k_scale is not None and core.one_rank:
                 # One row per context request, then `p` per generation request: the split-K
                 # kernel for the first, the verify kernel for the rest where it serves.
                 _sparse_gqa_nvfp4_context(
@@ -4435,29 +4534,22 @@ class PrefillTarget:
                 dtype=torch.int32,
                 device=qkv.device,
             )
-            for lo, hi, context_rows in parts:
-                scores = qsa_paged_index_scores(
-                    q=q_index[lo:hi],
-                    index_cache=draft.index_cache,
-                    block_table=block_table,
-                    query_positions=logical[lo:hi],
-                    request_indices=req_idx[lo:hi],
-                    tokens_per_block=tokens_per_block,
-                    compress_ratio=core.compress_ratio,
-                    only_visible_blocks=True,
-                    context_rows=context_rows,
-                )
-                _selection(
-                    core,
-                    scores,
-                    visible_blocks[lo:hi],
-                    logical[lo:hi],
-                    seq_lens_q[lo:hi],
-                    topk_indices[lo:hi],
-                    row_starts[lo:hi],
-                    selected[lo:hi],
-                    _live_score_columns(core, md, batch),
-                )
+            _score_and_select(
+                core,
+                draft.index_cache,
+                q_index,
+                block_table,
+                logical,
+                req_idx,
+                tokens_per_block,
+                parts,
+                visible_blocks,
+                seq_lens_q,
+                topk_indices,
+                row_starts,
+                selected,
+                _live_score_columns(core, md, batch),
+            )
             if share:
                 self._capture_selection(md, topk_indices, visible_blocks)
             attn = torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device)
@@ -4487,7 +4579,7 @@ class PrefillTarget:
                 **step,
                 **_CALL_CONSTANTS,
             )
-        mtp_fused_sigmoid_mul_inplace(attn, gate)
+        fused_sigmoid_mul_inplace(attn, gate)
         out = x
         if keep is not None:
             # The sparse path attended the kept rows only; the dense call wrote every row.
@@ -4578,7 +4670,7 @@ class DecodeTarget:
                 1,
             )[1]
             if stage:
-                core.spec_rollback.stage_index(index_cache, pools.position_cache)
+                core.spec_rollback.stage_index(pools.position_cache)
             qsa_paged_index_store(
                 token_k,
                 coords,
@@ -4639,7 +4731,7 @@ class DecodeTarget:
         if fused_prologue and stage:
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                core.spec_rollback.stage_index(index_cache, pools.position_cache)
+                core.spec_rollback.stage_index(pools.position_cache)
         proj = _dense_mm(
             x, L.attn_in, L.attn_in8, core.decode_mm, "in", L.attn_in_g, mid=L.attn_in_m
         )
@@ -4829,7 +4921,7 @@ class DecodeTarget:
         index slots are staged for `SpeculativeRollback` before the store. At one rank
         `_attention_one_rank` runs instead."""
         core = self.core
-        if core.mapping.world_size == 1:
+        if core.one_rank:
             return self._attention_one_rank(x, i, L, qkv, index_scratch, attn_out, qsa, step, stage)
         (
             req_idx,
@@ -4857,7 +4949,7 @@ class DecodeTarget:
         # index store and compression are one launch; it writes the packed buffer itself.
         prologue = sparse and pools.kv[i].k_scale is None
         if stage:
-            core.spec_rollback.stage_index(pools.index_cache[i], pools.position_cache)
+            core.spec_rollback.stage_index(pools.position_cache)
         if prologue:
             kv = pools.kv[i]
             qwen4_exp_attn_decode_prologue(
@@ -5540,7 +5632,7 @@ class DecodeTarget:
             )
         if (
             captured
-            and core.mapping.world_size == 1
+            and core.one_rank
             and pools.ssm[i].dtype == torch.float32
             and num_tokens <= _GDN_DECODE_FUSED_MAX_ROWS
         ):
@@ -5905,7 +5997,7 @@ class DecodeTarget:
         block_table = md.qsa_block_table
         tokens_per_block = md.tokens_per_block
 
-        if core.mapping.world_size == 1:
+        if core.one_rank:
             return self._mtp_layer(
                 embed_tokens,
                 input_ids,
@@ -6018,7 +6110,7 @@ class DecodeTarget:
                 **step,
                 **_CALL_CONSTANTS,
             )
-        mtp_fused_sigmoid_mul_inplace(attn, gate)
+        fused_sigmoid_mul_inplace(attn, gate)
         return _mtp_tail(core, M, x, attn, inject, pad_rows)
 
 
@@ -6270,7 +6362,7 @@ class SpeculativeRollback:
         conv_x = torch.reshape(conv_input[prefix:], [n, p, -1])
         pending["conv_x"] = conv_x.clone() if prefix else conv_x
 
-    def stage_index(self, index_cache: torch.Tensor, position_cache: torch.Tensor) -> None:
+    def stage_index(self, position_cache: torch.Tensor) -> None:
         """Before an attention layer's index store: on the step's first attention layer (the
         first to write the shared plane) the generation rows' position slots. The index-K
         slots of every layer were gathered when the step was opened."""

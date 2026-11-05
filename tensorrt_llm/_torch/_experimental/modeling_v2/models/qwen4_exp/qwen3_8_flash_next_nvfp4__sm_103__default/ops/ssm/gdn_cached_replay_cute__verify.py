@@ -222,21 +222,6 @@ def _ldg_i32(gaddr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ldg_f32(gaddr, *, loc=None, ip=None):
-    return cutlass.Float32(
-        _asm(
-            _ty.f32(),
-            [_ir(gaddr, cutlass.Int64, loc, ip)],
-            "ld.global.f32 $0, [$1];",
-            "=f,l",
-            loc,
-            ip,
-            side=True,
-        )
-    )
-
-
-@dsl_user_op
 def _ldg_f32p(gaddr, pred, *, loc=None, ip=None):
     """An f32, or 0 where `pred` is 0 (nothing read)."""
     return cutlass.Float32(
@@ -278,52 +263,6 @@ def _b16_f32(x, *, loc=None, ip=None):
             [_ir(x, cutlass.Int32, loc, ip)],
             "{ .reg .b32 t; shl.b32 t, $1, 16; mov.b32 $0, t; }",
             "=f,r",
-            loc,
-            ip,
-            side=True,
-        )
-    )
-
-
-@dsl_user_op
-def _f32_bits(x, *, loc=None, ip=None):
-    return cutlass.Int32(
-        _asm(_ty.i32(), [_ir(x, cutlass.Float32, loc, ip)], "mov.b32 $0, $1;", "=r,f", loc, ip)
-    )
-
-
-@dsl_user_op
-def _bits_f32(x, *, loc=None, ip=None):
-    return cutlass.Float32(
-        _asm(_ty.f32(), [_ir(x, cutlass.Int32, loc, ip)], "mov.b32 $0, $1;", "=f,r", loc, ip)
-    )
-
-
-@dsl_user_op
-def _ldg_bf16p(gaddr, pred, *, loc=None, ip=None):
-    """A bf16 widened to f32, or 0 where `pred` is 0 (nothing read)."""
-    return cutlass.Float32(
-        _asm(
-            _ty.f32(),
-            [_ir(gaddr, cutlass.Int64, loc, ip), _ir(pred, cutlass.Int32, loc, ip)],
-            "{ .reg .pred q; .reg .b16 h; setp.ne.b32 q, $2, 0; mov.b16 h, 0; @q ld.global.b16 h, [$1]; "
-            "cvt.f32.bf16 $0, h; }",
-            "=f,l,r",
-            loc,
-            ip,
-            side=True,
-        )
-    )
-
-
-@dsl_user_op
-def _ldg_bf16(gaddr, *, loc=None, ip=None):
-    return cutlass.Float32(
-        _asm(
-            _ty.f32(),
-            [_ir(gaddr, cutlass.Int64, loc, ip)],
-            "{ .reg .b16 h; ld.global.b16 h, [$1]; cvt.f32.bf16 $0, h; }",
-            "=f,l",
             loc,
             ip,
             side=True,
@@ -738,31 +677,6 @@ def _mbar_wait(mbar, phase, *, loc=None, ip=None):
         ip,
         side=True,
     )
-
-
-@dsl_user_op
-def _mbar_arrive(mbar, *, loc=None, ip=None):
-    _asm(
-        _ty.i32(),
-        [_ir(mbar, cutlass.Int32, loc, ip)],
-        "{ mbarrier.arrive.shared::cta.b64 _, [$1]; mov.u32 $0, 0; }",
-        "=r,r",
-        loc,
-        ip,
-        side=True,
-    )
-
-
-@dsl_user_op
-def _fence_proxy_async(*, loc=None, ip=None):
-    _asm(
-        _ty.i32(), [], "{ fence.proxy.async.shared::cta; mov.u32 $0, 0; }", "=r", loc, ip, side=True
-    )
-
-
-@dsl_user_op
-def _cp_wait1(*, loc=None, ip=None):
-    _asm(_ty.i32(), [], "{ cp.async.wait_group 1; mov.u32 $0, 0; }", "=r", loc, ip, side=True)
 
 
 def _exp(x):
@@ -1946,6 +1860,8 @@ def cached_replay_update(
 
 #: A tp4/tep4 rank's GDN heads: 16 key / 48 value split four ways.
 RANK_K_HEADS, RANK_V_HEADS = 4, 12
+#: A tp1 or dep4 rank's GDN heads: the whole layer's.
+ONE_RANK_K_HEADS, ONE_RANK_V_HEADS = 16, 48
 #: The stock tep4 engine's recurrent-state slots a rank (bf16 state), and the GDN layers whose
 #: states share one slot page in the stock manager: the slot stride is 36 layers' states.
 TEP4_SLOTS, PAGE_LAYERS = 1874, 36
@@ -1965,6 +1881,23 @@ def _tep4_cell(why, path, n, t, **spec) -> Cell:
             history_size=HIST,
             slots=TEP4_SLOTS,
             page_layers=PAGE_LAYERS,
+            **spec,
+        ),
+    )
+
+
+def _whole_layer_cell(why, path, n, t, **spec) -> Cell:
+    """The whole layer's heads (tp1, dep4) over a bf16 state pool."""
+    return Cell(
+        why=f"16/48 {why}",
+        spec=dict(
+            path=path,
+            n=n,
+            t=t,
+            state_dtype=torch.bfloat16,
+            H=ONE_RANK_K_HEADS,
+            HV=ONE_RANK_V_HEADS,
+            history_size=HIST,
             **spec,
         ),
     )
@@ -2038,12 +1971,47 @@ class GdnCachedReplayCute(OpWrapper):
             strided_gates=True,
         ),
         _tep4_cell("all_layer n=128 T=4: a large partitioned batch", "all_layer", 128, 4, steps=4),
+        _whole_layer_cell(
+            "small n=1 T=3: MTP2 verify at con1 (the tp1 AgentX engines), in-kernel commit",
+            "small",
+            1,
+            3,
+            steps=6,
+            strided_gates=True,
+        ),
+        _whole_layer_cell(
+            "small n=1 T=4: MTP3 verify at con1, in-kernel commit",
+            "small",
+            1,
+            4,
+            steps=6,
+            strided_gates=True,
+        ),
+        _whole_layer_cell(
+            "all_layer n=32 T=4: work items + the all-layer commit",
+            "all_layer",
+            32,
+            4,
+            steps=4,
+            slots=72,
+            strided_gates=True,
+        ),
+        _whole_layer_cell(
+            "all_layer n=256 T=4: a large partitioned batch",
+            "all_layer",
+            256,
+            4,
+            steps=3,
+            slots=300,
+            layers=1,
+        ),
     )
 
     note = """
     Call site: `_gdn_verify` (`DecodeTarget._gdn_block` / `PrefillTarget._gdn_block` of a verify
-    step) over the bf16 recurrent pool, at a tp4/tep4 rank's 4 / 12 heads: q/k/v from the conv's
-    fresh contiguous `[N*T, 2560]` rows (`packed_qkv`), `g` / `beta` the input projection's raw
+    step) over the bf16 recurrent pool, at a tp4/tep4 rank's 4 / 12 heads (tp1 and dep4: the
+    whole layer's 16 / 48): q/k/v from the conv's fresh contiguous `[N*T, 2560]` rows
+    (`packed_qkv`; 10240 at 16 / 48), `g` / `beta` the input projection's raw
     a / b columns read through its row stride (no copies), `A_log` / `dt_bias` fp32, the
     layer's view of the stock manager's bf16 state page (slot stride 36 layers' states), the
     history buffers `[slots, 2, 16, 12|4, 128]` / `[slots, 2, 12, 16]`, and work items +
@@ -2055,7 +2023,9 @@ class GdnCachedReplayCute(OpWrapper):
     T, launch mapping, commit, PDL, ...) on first use (5-10 s): the warm-up before CUDA-graph
     capture covers it.
 
-    Certified at 4 / 12 heads over a bf16 checkpoint (cells: the stock tep4 engine's 36-layer
+    Certified at the whole layer's 16 / 48 heads (tp1, dep4) over a bf16 state: the in-kernel
+    commit at N = 1 and T = 3, 4, the all-layer commit at N = 32 and 256 (T = 4). Certified at
+    4 / 12 heads over a bf16 checkpoint (cells: the stock tep4 engine's 36-layer
     state page at 1874 slots, rows on both ends of it, several consecutive verify steps from
     warm histories with random acceptance): the in-kernel commit at N = 1, 2, 4 and T = 2, 4,
     8 (T = 8 with full acceptance appending to the history's end, then wrapping), CUDA-graph
@@ -2065,8 +2035,8 @@ class GdnCachedReplayCute(OpWrapper):
     <= 0.71 of 1.5 ulps, bf16 checkpoint <= 0.68 of 2 ulps of its head's absmax, `old_u` <=
     0.50 of 4 ulps, `old_G` <= 0.06 -- the Triton entry's own margins (0.52 / 0.64 / 0.84 /
     0.50 / 0.08). A reference with the key heads reversed is refused by the output gate.
-    CUDA-graph replay (PDL on and off, N = 1, 4 and 16) is bitwise eager, and the launch
-    mappings are bitwise each other at N = 1, 2, 4 and T = 2, 4, 8.
+    CUDA-graph replay (PDL on and off, N = 1, 4 and 16, at both geometries) is bitwise eager,
+    and the 4 / 12 launch mappings are bitwise each other at N = 1, 2, 4 and T = 2, 4, 8.
 
     Numerics: the Triton kernel's rounding points (bf16 L2-normalized q / k and history
     coefficients into the tensor-core dots, fp32 recurrence, fp32 commit rounded once to the

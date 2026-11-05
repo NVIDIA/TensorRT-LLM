@@ -5,8 +5,9 @@ per token, its out-of-slice predecessors read from -- and its tail published
 back to -- the per-slot n-gram context pool.
 
 A macro entry, composed from native torch integer ops (~20 small launches);
-exact, so gated bitwise. Called by the qwen4_exp target at every layout; its
-per-rank slot pools are among the cells. Nothing registered
+exact, so gated bitwise. The qwen4_exp target calls ``ple_ngram_embed``, whose
+``reference`` composes this entry's; the default target's per-rank slot pools
+are among the cells. Nothing registered
 under ``torch.ops.trtllm`` assembles an n-gram id window, and
 ``EngramHashProvider.compute_hashes`` / ``NgramHashMapping._get_ngram_hashes``
 (``tensorrt_llm/_torch/modules/engram/engram.py``) has no cross-step state: it
@@ -219,8 +220,8 @@ class NgramTokenHistory(OpWrapper):
     The pool the manager hands over is a contiguous `[slots, 2]` int64
     (stride (2, 1), offset 0) at tp4, tep4 and dep4, with the GDN pools'
     slot count. The call site is `ple_ngram_embed`, whose `reference`
-    composes this entry's `reference`; the tp1 forward launches the fused
-    entry, not this op.
+    composes this entry's `reference`; the target launches the fused entry,
+    not this op.
 
     Not certified: tp4's pool (pure tp4 is not served), the MTP and
     multimodal members' pools, and the dep4 variants' pools (kv_fp8,

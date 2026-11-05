@@ -43,8 +43,6 @@ assert torch.cuda.is_available(), "gdn_cached_replay_cute requires a CUDA device
 op = cr.gdn_cached_replay_cute
 DEV = "cuda"
 K, V = cr.K, cr.V
-#: The input projection's column split at a tp4/tep4 rank: conv (q|k|v), z, a, b.
-_CONV, _Z = 2 * cr.RANK_K_HEADS * K + cr.RANK_V_HEADS * V, cr.RANK_V_HEADS * V
 
 
 def _gates(bench, act, strided):
@@ -52,10 +50,12 @@ def _gates(bench, act, strided):
     column views of a `[N*T, conv + z + 2 HV]` projection (row stride = its width)."""
     if not strided:
         return act["a"], act["b"]
-    n, t, hv = bench.n, bench.t, bench.hv
-    proj = torch.randn(n * t, _CONV + _Z + 2 * hv, device=DEV, dtype=torch.bfloat16)
-    a = proj[:, _CONV + _Z : _CONV + _Z + hv]
-    b = proj[:, _CONV + _Z + hv :]
+    n, t, h, hv = bench.n, bench.t, bench.h, bench.hv
+    # The input projection's column split at the rank's heads: conv (q|k|v), z, a, b.
+    conv, z = 2 * h * K + hv * V, hv * V
+    proj = torch.randn(n * t, conv + z + 2 * hv, device=DEV, dtype=torch.bfloat16)
+    a = proj[:, conv + z : conv + z + hv]
+    b = proj[:, conv + z + hv :]
     a.copy_(act["a"].reshape(n * t, hv))
     b.copy_(act["b"].reshape(n * t, hv))
     a, b = a.reshape(n, t, hv), b.reshape(n, t, hv)
@@ -185,19 +185,20 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     )
 
 
-def _rank_spec(**spec):
-    return dict(state_dtype=torch.bfloat16, H=cr.RANK_K_HEADS, HV=cr.RANK_V_HEADS, **spec)
+def _rank_spec(heads=(cr.RANK_K_HEADS, cr.RANK_V_HEADS), **spec):
+    return dict(state_dtype=torch.bfloat16, H=heads[0], HV=heads[1], **spec)
 
 
+@pytest.mark.parametrize("heads", cr.GEOMETRIES, ids=[f"{h}x{hv}" for h, hv in cr.GEOMETRIES])
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize("n,path", [(1, "small"), (4, "small"), (16, "all_layer")])
-def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, path, pdl) -> None:
+def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, path, pdl, heads) -> None:
     """Two layers captured once (strided a / b, the all-layer commit after them when
     partitioned), replayed three times on new activations with acceptance in between,
     bitwise against the same steps run eagerly on a twin state; with `pdl` the replay
     launches with programmatic dependent launch, as the target's verify step does."""
     t = 4
-    spec = _rank_spec(path=path, n=n, t=t, layers=2, slots=40)
+    spec = _rank_spec(heads, path=path, n=n, t=t, layers=2, slots=40)
     seed = 9100 + n
     eager, graph, warm = (trep._Bench(spec, seed, exact=False) for _ in range(3))
     acts = [warm.inputs() for _ in range(2)]

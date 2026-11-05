@@ -8,7 +8,7 @@ bitwise against the runner's finalize (`fp4_block_scale_moe_renorm_permuted.fina
 runner's arithmetic) followed by the unfolded site. `hc_out` must be bitwise; `mixed` within
 1e-2 of the reference's largest magnitude (1-2 bf16 ulp: the projections take bf16 operands on
 tensor cores); the injection weights within one bf16 ulp; the NVFP4 codes may differ where
-`mixed` does."""
+`mixed` does. Beyond the cells: CUDA-graph replay of the MoE site at 8 rows, bitwise eager."""
 
 import importlib
 
@@ -170,3 +170,19 @@ def test_fold_bitwise_vs_runner_finalize(rows, n_cols) -> None:
     want = first_op(o["hc"], routed, o["inject"], o["norm"], o["first"], C, n_cols, EPS, **kw)
     for a, b in zip(got, want):
         assert (a is None and b is None) or torch.equal(a, b)
+
+
+def test_replay_matches_eager() -> None:
+    o = _operands(8, 77)
+    _site(o, "inject", True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _site(o, "inject", True)
+    fresh = _operands(8, 78)
+    o["hc"].copy_(fresh["hc"])
+    o["block"].copy_(fresh["block"])
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = _site(o, "inject", True)
+    assert torch.equal(captured[1], eager[1]) and torch.equal(captured[0], eager[0])

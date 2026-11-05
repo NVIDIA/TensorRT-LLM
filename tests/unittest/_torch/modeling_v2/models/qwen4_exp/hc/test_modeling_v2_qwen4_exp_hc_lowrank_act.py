@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the default target's qwen4_exp_hc_lowrank_act variant
 (models/qwen4_exp/ops/hc/qwen4_exp_hc_lowrank_act): cells within one ulp of the float64
-reference."""
+reference, the fp32-logits guard, graph capture."""
 
 import zlib
 
@@ -55,3 +55,26 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     low, inject = op(*args)
     assert low.shape == (cell.spec["rows"], RANK)
     _compare((low, inject), op.reference(*args))
+
+
+def test_guard_refuses_bf16_logits() -> None:
+    logits, rank, c, wi, dt = _build(dict(rows=4), seed=4)
+    with validating(op), pytest.raises(AssertionError):
+        op(logits.to(torch.bfloat16), rank, c, wi, dt)
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    logits, rank, c, wi, dt = _build(dict(rows=8), seed=5)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(logits, rank, c, wi, dt)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_low, g_inject = op(logits, rank, c, wi, dt)
+    logits.copy_(_build(dict(rows=8), seed=6)[0])
+    graph.replay()
+    torch.cuda.synchronize()
+    e_low, e_inject = op(logits, rank, c, wi, dt)
+    assert torch.equal(g_low, e_low) and torch.equal(g_inject, e_inject)

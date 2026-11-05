@@ -28,6 +28,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 )
 from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi import QSASparseAttentionConfig
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -128,8 +129,9 @@ _DEP2 = dict(enable_attention_dp=True, moe_tp_size=1, moe_ep_size=2)
 _TP4 = dict(enable_attention_dp=False, moe_tp_size=4, moe_ep_size=1)
 
 
-def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD):
-    """The core of rank `rank` of a `world`-rank engine at `layout`, every parameter on meta."""
+def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD, **config):
+    """The core of rank `rank` of a `world`-rank engine at `layout`, every parameter on meta;
+    `config` sets further `ModelConfig` fields."""
     model_config = ModelConfig(
         pretrained_config=Qwen4ExpTextConfig(**_TEXT),
         mapping=Mapping(world_size=world, tp_size=world, rank=rank, **layout),
@@ -138,6 +140,7 @@ def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD):
         moe_backend_requested="TRTLLM",
         sparse_attention_config=QSASparseAttentionConfig(),
         spec_config=spec_config,
+        **config,
     )
     composite = SimpleNamespace(
         vision_config=Qwen4ExpVisionConfig(**_VISION), image_token_id=248056, video_token_id=248057
@@ -155,7 +158,7 @@ def test_a_tep4_rank_runs_its_share_of_the_heads(rank) -> None:
     """Six q heads and one of the two KV heads (repeated on rank pairs) over a 4352-wide
     fused row: `[q 1536 | k 256 | v 256 | gate 1536 | index q 512, k 128 | v slot 128]`.
     The main norm + rope reads it as 6 q, 1 k and 10 "v" heads of 256 (the row stride
-    alone), which is the cell `fused_qk_norm_rope` certifies."""
+    alone)."""
     core = _core(rank, _TEP4)
     assert (core.heads_q, core.heads_kv, core.kv_head_start) == (6, 1, rank * 2 // WORLD)
     assert (core.q_width, core.kv_width, core.qkv_width) == (1536, 256, 2048)
@@ -767,3 +770,42 @@ def test_both_draft_targets_pad_the_draft_moe_by_the_workers_counts(target) -> N
     (tail,) = _calls(fn, "_mtp_tail")
     assert ast.unparse(tail.args[-1]) == "pad_rows"
     assert "_dp_pad_rows" not in ast.unparse(fn)
+
+
+# ---- engine knobs the target reads ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("strategy", [AllReduceStrategy.AUTO, AllReduceStrategy.NCCL])
+def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, monkeypatch) -> None:
+    core = _core(0, _TEP4, allreduce_strategy=strategy)
+    seen = []
+    monkeypatch.setattr(M, "allreduce_group_args", lambda mapping, s: seen.append(s) or {})
+    core._tp_sum_op()
+    assert seen == [int(strategy)]
+
+
+@pytest.mark.parametrize("value", ["1", "true", "On", "0", "no", ""])
+def test_a_switch_takes_the_usual_spellings(value, monkeypatch) -> None:
+    monkeypatch.setenv(M._DENSE_FP8_ENV, value)
+    assert M._switch(M._DENSE_FP8_ENV) is (value.lower() in ("1", "true", "on"))
+    monkeypatch.setenv(M._PLE_HOST_OFFLOAD_ENV, value)
+    assert M._ple_host_offload_enabled() is (value.lower() not in ("0", "no"))
+
+
+@pytest.mark.parametrize(
+    "env", [M._DENSE_FP8_ENV, M._PLE_HOST_OFFLOAD_ENV, M._MOE_PREFILL_COPY_ENV]
+)
+def test_a_misspelled_switch_refuses_the_build(env, monkeypatch) -> None:
+    monkeypatch.setenv(env, "disable")
+    with pytest.raises(ValueError, match=env):
+        _core(0, _TEP4)
+
+
+def test_a_tp1_switch_away_from_tp1_is_reported(monkeypatch) -> None:
+    monkeypatch.setenv(M._DENSE_FP8_ENV, "1")
+    monkeypatch.setenv(M._MTP_HEAD_NVFP4_ENV, "1")
+    warning = mock.Mock()
+    monkeypatch.setattr(M.logger, "warning", warning)
+    _core(0, _TEP4)
+    (message,) = [c.args[0] for c in warning.call_args_list if "certified at tp1" in c.args[0]]
+    assert M._DENSE_FP8_ENV in message and M._MTP_HEAD_NVFP4_ENV in message

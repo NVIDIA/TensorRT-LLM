@@ -4,7 +4,7 @@
 `mixed` in the gate band of the float64 reference, the epilogue's fp32 operation
 sequence bitwise (gate at zero logits), the NVFP4 outputs against the native-torch
 quantization of the returned `mixed` outside the reciprocal tie window, the NVFP4
-build's `mixed` bitwise the bf16 build's.
+build's `mixed` bitwise the bf16 build's, the global-scale guard, graph capture.
 """
 
 import zlib
@@ -135,3 +135,41 @@ def test_epilogue_operation_sequence_bitwise(rows) -> None:
 def test_fp4_mixed_is_the_bf16_entry_bitwise(rows) -> None:
     args = _build(dict(rows=rows), seed=100 + rows)
     assert torch.equal(op4(*args)[0], op(*args[:6]))
+
+
+def test_guards() -> None:
+    """The kernel loads `global_scale[0]` only; a per-row scale is refused. rstd must be
+    fp32.
+    """
+    low, up, hc_out, rstd, w1, c, gs = _build(dict(rows=4), seed=4)
+    with validating(op4), pytest.raises(AssertionError):
+        op4(low, up, hc_out, rstd, w1, c, torch.cat([gs, gs]))
+    with validating(op), pytest.raises(AssertionError, match="rstd"):
+        op(low, up, hc_out, rstd.to(torch.bfloat16), w1, c)
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+def test_cuda_graph_capture_and_replay(fp4) -> None:
+    args = list(_build(dict(rows=8), seed=5))
+    if not fp4:
+        args = args[:6]
+    entry = op4 if fp4 else op
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        entry(*args)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out = entry(*args)
+    fresh = _build(dict(rows=8), seed=6)
+    for i in (0, 2, 3):
+        args[i].copy_(fresh[i])
+    if fp4:
+        args[6].mul_(0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    want = entry(*args)
+    g_out, want = (g_out, want) if fp4 else ((g_out,), (want,))
+    for got, exp in zip(g_out, want):
+        assert torch.equal(got, exp)

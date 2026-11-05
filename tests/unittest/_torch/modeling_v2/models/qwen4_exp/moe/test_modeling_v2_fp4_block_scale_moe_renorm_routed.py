@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for ops/moe/fp4_block_scale_moe_renorm_routed.
 
-Two claims per cell: the logits-routed call is **bitwise** the composition it
-replaces (`renorm_moe_routing_op` -> pre-routed `fp4_block_scale_moe_runner`),
+Two claims per cell: the logits-routed call is **bitwise** the two-entry composition
+(`renorm_moe_routing_op` -> pre-routed `fp4_block_scale_moe_runner`),
 and it sits inside the pre-routed entry's band against this entry's own
 fp32 reference. The NVFP4 operand construction (layout, activations, scalars,
-the band) uses ordinary shared test helpers. Beyond the cells: the prefill
-tactic resolution bitwise the custom op's, and per `DECODE_TACTICS` bucket
+the band) uses ordinary shared test helpers. Beyond the cells: the refusal
+of an uncertified (num_experts, top_k) pair, the prefill tactic resolution
+bitwise the custom op's, and per `DECODE_TACTICS` bucket
 that the pinned tactic is a valid runner config and answers bitwise what the
 AutoTuner path's untuned (runner-default) tactic answers.
 """
@@ -19,6 +20,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     ACT_SWIGLU,
+    CERTIFIED_PAIRS,
     DECODE_TACTICS,
     DECODE_TACTICS_GEOMETRY,
     ROUTING_RENORMALIZE,
@@ -76,7 +78,7 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     y = _routed(args, data, sf, logits, (s1, sg, s2), spec)
     assert y.shape == (spec["tokens"], spec["hidden"]) and y.dtype == torch.bfloat16
 
-    # 1. Bitwise the composition it replaces, on identical operands.
+    # 1. Bitwise the two-entry composition, on identical operands.
     y_pre = H._call(
         data,
         sf,
@@ -96,6 +98,16 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     with true_fp32_matmul():
         exp = op.reference(logits, x, spec["top_k"], ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
+
+
+def test_uncertified_pair_refused(many_expert_layer):  # noqa: F811
+    spec = op.CELLS[0].spec
+    assert (spec["num_experts"], 9) not in CERTIFIED_PAIRS
+    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
+        many_expert_layer(), spec, 13, renorm_moe_routing_op
+    )
+    with validating(op), pytest.raises(AssertionError, match="certified Renormalize"):
+        _routed(args, data, sf, logits, scalars, spec, top_k=9)
 
 
 def test_prefill_tactic_resolution_matches_the_custom_op_bitwise(

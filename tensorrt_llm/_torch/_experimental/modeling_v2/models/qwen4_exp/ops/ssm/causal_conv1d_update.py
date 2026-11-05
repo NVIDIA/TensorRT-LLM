@@ -25,6 +25,9 @@ from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240
+#: TRT-LLM's kernel forms a slot's offset as `int slot * uint32_t conv_state_batch_stride`:
+#: a pool of this many elements or more (slots x slot stride) wraps, so the op refuses it.
+TRTLLM_SLOT_OFFSET_LIMIT = 2**32
 #: Largest conv-pool slot count the cache manager allocates for this checkpoint at a batch
 #: of at most 32. The decode step hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
@@ -504,8 +507,9 @@ class CausalConv1dUpdate(OpWrapper):
       conv_state_batch_stride`, 32-bit unsigned elements: it wraps from slot
       15535 at stride 276480 (tp4 / tep4) and slot 3884 at 1105920 (dep4).
       The measured pools reach 518,123,519 (tep4) and 940,031,999 (dep4)
-      elements, under 2^31 elements and bytes. The CuTe kernel forms slot and
-      row offsets in 64 bits.
+      elements, under 2^31 elements and bytes. A call that would run it over a
+      pool of 2^32 elements or more (`TRTLLM_SLOT_OFFSET_LIMIT`) raises
+      ValueError instead. The CuTe kernel forms slot and row offsets in 64 bits.
     """
 
     def __call__(
@@ -524,6 +528,13 @@ class CausalConv1dUpdate(OpWrapper):
         ):
             _decode_conv(x, conv_state, weight, conv_state_indices, pad_slot_id)
             return x
+        if conv_state.shape[0] * conv_state.stride(0) >= TRTLLM_SLOT_OFFSET_LIMIT:
+            raise ValueError(
+                f"a conv-state pool of {conv_state.shape[0]} slots at stride "
+                f"{conv_state.stride(0)}: TRT-LLM's causal_conv1d_update forms a slot's offset "
+                f"in 32 bits and would wrap past slot {(TRTLLM_SLOT_OFFSET_LIMIT - 1) // conv_state.stride(0)}; "
+                "lower free_gpu_memory_fraction or the recurrent-state share of the KV cache"
+            )
         torch.ops.trtllm.causal_conv1d_update(
             x.unsqueeze(-1) if x.dim() == 2 else x,
             conv_state,

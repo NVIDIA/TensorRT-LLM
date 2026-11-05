@@ -818,9 +818,8 @@ class GdnPrefillConvPost(OpWrapper):
         beta = sigmoid(b)                                     (fp32)
         conv_states[slot] = xpad[e - b : e - b + W - 1]       (raw input, exact)
 
-    -- the composition `extract_transpose_prefill_slice` -> `causal_conv1d_fwd`
-    (SiLU, no bias) -> `fused_gdn_post_conv(prefill, None, ...)`, in one pass
-    over the activation plus a per-sequence window publish.
+    -- in one pass over the activation plus a per-sequence window publish;
+    `reference` evaluates each line above per sequence.
 
     Fusion boundary: the conv-state read, conv, SiLU, split, q/k norm, gates
     and the state publish are inside. The projection, the generation rows'
@@ -939,7 +938,7 @@ class GdnPrefillConvPost(OpWrapper):
     (`cache_indices`, int32 `[N]`) and carry flags (`has_initial_state`, bool
     `[N]`) are explicit.
 
-    Call sites (`PrefillTarget._gdn_prefill_prep`, from `_gdn_block`): the
+    Call sites (`PrefillTarget._gdn_prefill_prep`, from `_gdn_core`): the
     context rows of every prefill-carrying step -- prefill-only `(mixed_qkv,
     a, b, qsl_all, si_all, hi_all)`, mixed and MTP-verify `(mq_p, a_p, b_p,
     qsl_p, si_p, hi_p)` -- with the layer's `[10240, 4]` conv weight, its
@@ -960,9 +959,8 @@ class GdnPrefillConvPost(OpWrapper):
     dep4): one slot holds all 36 GDN layers' `[C, 3]` states, so the view
     has strides `(36 * C * 3, 3, 1)` --
     (276480, 3, 1) at C 2560, (1105920, 3, 1) at C 10240 -- and layer `i`
-    starts `i * C * 3` elements into the page. The target's forward does
-    not call this variant yet; the rank cells mirror tp1's call at the
-    rank's widths.
+    starts `i * C * 3` elements into the page. The rank cells below are that
+    call at the rank's widths.
 
     Three launches. The conv pass (CuTe DSL, `_ConvPassKernel`): grid
     `heads x cdiv(T, 64)` (80 heads at tp1 and dep4, 20 on a tp4/tep4

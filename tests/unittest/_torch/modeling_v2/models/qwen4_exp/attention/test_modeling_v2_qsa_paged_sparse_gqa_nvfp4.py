@@ -12,9 +12,11 @@ top-k + expansion lay them out, packed at the front.
 Beside `_compare` against the reference, every cell runs QSA's bf16 sparse GQA
 over a bf16 pool that holds the dequantized values and holds the two outputs to
 the same band: the NVFP4 kernels are the bf16 ones with a dequantizing load.
+Beyond the cells: bitwise determinism and the half-passed prefill pair's refusal.
 """
 
 import math
+import re
 
 import pytest
 import torch
@@ -330,3 +332,20 @@ CKPT = op.CELLS[0].spec
 
 def _with(**overrides):
     return {**CKPT, **overrides}
+
+
+def test_calls_are_bitwise_deterministic() -> None:
+    args = _build(_with(segments=tuple((4000 + 37 * i, 2) for i in range(4))), seed=8800)
+    assert torch.equal(op(**args), op(**args))
+
+
+def test_rejects_positions_without_a_compress_ratio() -> None:
+    """The op's own loud refusal -- the reason the entry carries no `is_valid`: half of
+    the prefill pair."""
+    args = _build(_with(segments=((600, 1),) * 4), seed=9100)
+    args["selected_tokens"] = args["selected_tokens"][:, :64].contiguous()
+    args["query_positions"] = torch.zeros(4, dtype=torch.int64, device=DEV)
+    message = "pass both query_positions and compress_ratio, or neither"
+    with pytest.raises(ValueError, match=re.escape(message)):
+        with validating(op):
+            op(**args)

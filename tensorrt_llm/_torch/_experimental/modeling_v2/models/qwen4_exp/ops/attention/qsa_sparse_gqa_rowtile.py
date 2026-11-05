@@ -853,8 +853,7 @@ class QsaSparseGqaRowtile(OpWrapper):
     it is slower than the per-row kernel (generation-only launches 1.4-2x);
     the target's served context launches are thousands of rows. The tensor-core
     row-tile pass alone, on six dumped 16384-row context launches of the
-    target (GB300, layers 0-5 of one step): 581-775 us, against 694-886 us for
-    the one-program-per-item pass it replaced (the same output, bit for bit).
+    target (GB300, layers 0-5 of one step): 581-775 us.
 
     Compiled once per (group size, rows per tile, tokens per block, PDL):
     nothing in the row-tile pass's compile key depends on the row count or

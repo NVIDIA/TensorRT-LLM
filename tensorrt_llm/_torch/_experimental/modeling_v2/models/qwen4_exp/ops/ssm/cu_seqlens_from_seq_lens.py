@@ -18,7 +18,7 @@ _INTEGER_DTYPES = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int6
 
 #: Batch shapes this checkpoint's serving path produces where it calls this entry.
 #: ``p`` is the trunk's query rows per generation request, ``1 + runtime_draft_len``
-#: under MTP (2..8: `max_draft_len` 1..7); at ``p = 1`` the target at tp1 reuses the
+#: under MTP (2..8: `max_draft_len` 1..7); at ``p = 1`` the target reuses the
 #: recurrent metadata's vector instead, and ``decode_p1_128`` certifies the call
 #: there all the same.
 #: The ``_128`` batches are the serving envelope's widest step at every member of
@@ -123,8 +123,9 @@ class CuSeqlensFromSeqLens(OpWrapper):
     device-side assert in the consumers); a padded row is length 0, never -1;
     `out[-1]` equals the packed activation's row count.
 
-    `dtype` has no default: `causal_conv1d_fwd` requires int32 and
-    `chunk_gated_delta_rule` keys its autotuner on `cu_seqlens`' dtype.
+    `dtype` has no default: it is the consumer's index dtype. The target asks
+    for int64, the `query_start_loc` that `ple_ngram_embed` and
+    `ple_gate_conv_inject_norm` take.
 
     Certified bitwise at the call site's prefix view of `seq_lens_cuda` (a
     mixed step at p 2, and the p 8 verify of 32 requests) and at a decode

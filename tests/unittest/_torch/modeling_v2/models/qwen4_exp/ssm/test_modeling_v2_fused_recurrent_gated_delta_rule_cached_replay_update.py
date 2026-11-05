@@ -25,6 +25,10 @@ engine's slot count (36 layers' states a slot): 26.5 GB at tep4's 1874 bf16 slot
 reserved virtual range with memory mapped under the touched slots only (`_SparsePage`).
 The reference and the twin run on a dense copy of those slots, and every byte of their
 pages outside the cell's sub-pages is checked unchanged.
+
+Beyond the cells: a reference with the key heads reversed that the output gate must
+refuse, CUDA-graph replay against the same steps run eagerly, and the `state_indices`
+length guard.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.fuse
     NUM_K_HEADS,
     NUM_V_HEADS,
     PACKED_QKV_WIDTH,
+    RANK_V_HEADS,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     fused_recurrent_gated_delta_rule_cached_replay_update as op,
@@ -710,6 +715,37 @@ def _drive_cell(cell, bench) -> None:
         )
 
 
+def test_the_band_refuses_a_wrong_head_pairing() -> None:
+    """The output gate is wider than torch's per-element default near a block's small
+    elements, so it has to refuse a plausible wrong answer. At a tp4/tep4 rank's 4 / 12
+    heads value head `hv` reads key head `hv // 3`; the same call's reference with the
+    key heads reversed (value heads 0..2 on key head 3) must fall outside it, by a margin
+    printed with the passing reference's."""
+    cell = next(
+        c
+        for c in op.CELLS
+        if c.spec.get("HV") == RANK_V_HEADS and c.spec["n"] == 128 and c.spec["t"] == 8
+    )
+    bench = _Bench(dict(cell.spec, start="fresh", steps=1), seed=4646, exact=False)
+    try:
+        kw = bench.kwargs(0, bench.inputs())
+        reversed_heads = dict(
+            kw, q=kw["q"].flip(2).contiguous(), k=kw["k"].flip(2).contiguous(), packed_qkv=None
+        )
+        right, wrong = bench.reference(kw)[0], bench.reference(reversed_heads)[0]
+        bench.prepare()
+        got = op(**kw)
+        _MEASURED.clear()
+        _compare((got, None, None, None, None), (right, None, None, None, None))
+        passing = dict(_MEASURED)
+        _MEASURED.clear()
+        with pytest.raises(AssertionError, match="output"):
+            _compare((got, None, None, None, None), (wrong, None, None, None, None))
+        print(f"\n[wrong head pairing] passing {passing}, wrong {dict(_MEASURED)}")
+    finally:
+        bench.close()
+
+
 # ── CUDA graphs ───────────────────────────────────────────────────────────
 
 
@@ -757,3 +793,24 @@ def test_cuda_graph_replay_on_new_data_is_bitwise_eager() -> None:
         accepted = eager.draw_acceptance()
         eager.accept(accepted)
         graph.accept(accepted)
+
+
+# ── guards: accepted and silently wrong ──────────────────────────────────
+
+
+def test_a_short_state_indices_reads_past_its_end_and_is_refused() -> None:
+    """Unguarded, three indices for four rows: the fourth row reads whatever
+    follows the view -- here a slot the call never named -- and writes its
+    history."""
+    bench = _Bench(dict(path="small", n=4, t=2, layers=1), seed=101, exact=False)
+    stranger = next(s for s in range(bench.slots) if s not in bench.live.tolist())
+    parent = torch.cat(
+        [bench.state_indices[:3], torch.tensor([stranger], dtype=torch.int32, device=DEV)]
+    )
+    kw = dict(bench.kwargs(0, bench.inputs()), state_indices=parent[:3])
+    before = bench.old_x[0, stranger].clone()
+    op(**kw)
+    assert not torch.equal(bench.old_x[0, stranger], before), "the hazard this guard covers is gone"
+    with pytest.raises(AssertionError, match="state_indices has shape"):
+        with validating(op):
+            op(**kw)

@@ -213,7 +213,7 @@ def _verify_step(b, rollback, fused):
     rollback.stage_ple_conv_input(b.x)
     _conv_state(b.conv, b.x, b.lengths, b.slots, [False] * b.num_contexts + [True] * b.n)
     for layer in range(LAYERS):
-        rollback.stage_index(b.index[layer], b.position)
+        rollback.stage_index(b.position)
         _write_planes(
             b,
             b.index[layer],

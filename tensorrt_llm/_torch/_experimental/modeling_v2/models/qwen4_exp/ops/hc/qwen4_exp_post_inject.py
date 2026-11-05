@@ -35,8 +35,8 @@ class Qwen4ExpPostInject(OpWrapper):
     identity: no stream's value enters another.
 
     Fusion boundary: the accumulate only. The grouped norm, the input mixer
-    that produced the block's input and `inject` (`qwen4_exp_gated_residual`),
-    and the block itself are the caller's.
+    that produced the block's input and `inject` (`qwen4_exp_gated_residual`'s
+    formula), and the block itself are the caller's.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -77,10 +77,13 @@ class Qwen4ExpPostInject(OpWrapper):
     )
 
     note = """
-    Metadata consumed: none. Call sites: twice per decoder layer (after the
-    attention/GDN block and after the MoE) and twice in the MTP layer, with
-    `inject` the `[T, 4]` weights `qwen4_exp_gated_residual` returned for that
-    block -- in `[0, 2]`, because they are `2 * sigmoid(.)`.
+    Metadata consumed: none. Call sites: the MTP layer's MoE injection
+    (`_mtp_tail` and `DecodeTarget`'s draft tail), and in `DecodeTarget`'s
+    trunk the block output still pending before the PLE layer; every other
+    site's accumulate is fused into the next site's first kernel
+    (`qwen4_exp_hc_inject_norm` and its rstd and decode forms). `inject` is
+    the `[T, 4]` weights the site's mixer returned for that block -- in
+    `[0, 2]`, because they are `2 * sigmoid(.)`.
 
     Preconditions, all loud except the guarded one: the packed width must equal
     `inject.shape[-1] * block_out.shape[-1]` (the unflatten raises); all three

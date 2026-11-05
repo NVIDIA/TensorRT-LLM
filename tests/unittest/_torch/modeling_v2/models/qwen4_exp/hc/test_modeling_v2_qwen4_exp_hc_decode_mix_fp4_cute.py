@@ -4,8 +4,9 @@
 (`qwen4_exp_hc_decode_mix_fp4_cute`) and the plain build (`qwen4_exp_hc_decode_mix_cute`)
 of the CuTe mix kernel. Each entry's cells against its float64 reference in its band
 (`mixed` and `inject_out` in `rtol = eps`, `atol = eps * max|ref|`; for the NVFP4 build,
-the NVFP4 exact on the returned `mixed` outside the reciprocal tie window), and a
-stale-read check under CUDA-graph replay with PDL for the NVFP4 build."""
+the NVFP4 exact on the returned `mixed` outside the reciprocal tie window), a
+stale-read check under CUDA-graph replay with PDL for the NVFP4 build, the one-row
+guard."""
 
 import zlib
 
@@ -150,3 +151,12 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
         torch.cuda.synchronize()
         for a, b in zip(graph_out, op(*args)):
             assert torch.equal(a, b), f"replay {trial}"
+
+
+def test_guards() -> None:
+    """Both entries share the shape checks; the NVFP4 build's `is_valid` refuses two rows."""
+    op = qwen4_exp_hc_decode_mix_fp4_cute
+    args = _build(dict(), seed=6)
+    two = args[3].expand(2, -1).contiguous()
+    with validating(op), pytest.raises(AssertionError, match="one row"):
+        op(args[0].expand(-1, 2, -1), args[1].expand(-1, 2), args[2], two, *args[4:])

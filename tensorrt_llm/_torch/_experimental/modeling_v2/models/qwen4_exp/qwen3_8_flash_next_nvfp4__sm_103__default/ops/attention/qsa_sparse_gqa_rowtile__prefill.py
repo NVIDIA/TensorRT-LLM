@@ -35,13 +35,21 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (
     qsa_paged_sparse_gqa as _per_row_entry,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rowtile_attention_cute import (  # noqa: E501
+    BLOCK_M,
+    BLOCK_N,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rowtile_attention_cute import (  # noqa: E501
+    eligible as _cute_eligible,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rowtile_attention_cute import (  # noqa: E501
+    num_ctas as _rowtile_ctas,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rowtile_attention_cute import (  # noqa: E501
+    rowtile_attention_cute as _rowtile_attention_cute,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-
-from .qsa_rowtile_attention_cute__prefill import BLOCK_M, BLOCK_N
-from .qsa_rowtile_attention_cute__prefill import eligible as _cute_eligible
-from .qsa_rowtile_attention_cute__prefill import num_ctas as _rowtile_ctas
-from .qsa_rowtile_attention_cute__prefill import rowtile_attention_cute as _rowtile_attention_cute
 
 _INTEGER_DTYPES = (torch.int32, torch.int64)
 # The per-row kernel's scan tile: the prefill bound is rounded up to it, so the

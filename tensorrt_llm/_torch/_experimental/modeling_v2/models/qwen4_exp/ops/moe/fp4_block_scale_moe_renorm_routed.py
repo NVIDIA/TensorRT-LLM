@@ -309,7 +309,7 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
     )
 
     note = """
-    Routing semantics, measured against the composition it replaces
+    Routing semantics, measured against the two-entry composition
     (`renorm_moe_routing_op` -> pre-routed runner): bitwise-equal finalized
     output at every cell (the test re-drives this), and at bring-up on randn /
     coarse / large-magnitude / all-equal logits, bf16 and fp32 logits,

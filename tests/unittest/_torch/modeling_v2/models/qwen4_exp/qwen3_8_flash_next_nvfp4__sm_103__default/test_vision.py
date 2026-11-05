@@ -553,10 +553,16 @@ def test_missing_or_mis_sized_position_ids_fail_the_request():
 def test_a_mixed_request_lists_its_items():
     with pytest.raises(ValueError, match="needs item metadata"):
         _admit(_request(image=IMAGES, video=VIDEOS))
+    with pytest.raises(ValueError, match="needs item metadata"):
+        _admit(_request(image=IMAGES, video=VIDEOS, order=[]))
     with pytest.raises(ValueError, match="lists image items \\[0\\]; the payload carries 2"):
         _admit(_request(image=IMAGES, video=VIDEOS, order=MIXED_ORDER[:3]))
+    with pytest.raises(ValueError, match="lists video items \\[0, 1, 0\\]"):
+        _admit(_request(image=IMAGES, video=VIDEOS, order=MIXED_ORDER + [_item("video", 0)]))
     with pytest.raises(ValueError, match="is not an item of this request"):
         _admit(_request(image=IMAGES, video=VIDEOS, order=MIXED_ORDER + [_item("audio", 0)]))
+    with pytest.raises(ValueError, match="is not an item of this request"):
+        _admit(_request(image=IMAGES, video=VIDEOS, order=[("image",)]))
 
 
 def test_the_placeholder_count_is_the_sum_over_both_modalities():

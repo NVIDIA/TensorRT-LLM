@@ -7,10 +7,13 @@ HND pool, the engine's slot table (more slots than requests, a seeded
 permutation, `-1` past each sequence), and selection rows laid out the way
 QSA's top-k + expansion emit them (complete groups expanded to tokens, the
 trailing partial group, then `-1`, packed at the front). The band and the
-reference are that entry's: this op replaces it on context launches.
+reference are that entry's: the target calls this op in its place on context
+launches. Beyond the cells: bitwise determinism and the refusal of a call without
+the prefill pair.
 """
 
 import math
+import re
 
 import pytest
 import torch
@@ -236,3 +239,16 @@ def test_long_context_disjoint_groups_match_the_reference() -> None:
     pass, however long its list."""
     args = _build(_with([(86000, 197)], slots=4, pages=2700), seed=9300)
     _compare(op(**args), op.reference(**args))
+
+
+def test_calls_are_bitwise_deterministic() -> None:
+    args = _build(_with([(0, 2000), (500, 300), (7000, 1)], slots=8), seed=8800)
+    assert torch.equal(op(**args), op(**args))
+
+
+def test_rejects_a_call_without_the_prefill_pair() -> None:
+    """The op's own loud refusal: the row-tile pass is bounded by the prefill pair."""
+    args = _build(_with([(600, 4)], slots=8), seed=9100)
+    args.update(query_positions=None, compress_ratio=None)
+    with pytest.raises(ValueError, match=re.escape("the row-tile kernel needs the prefill pair")):
+        op(**args)

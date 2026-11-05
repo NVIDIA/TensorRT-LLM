@@ -461,13 +461,11 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
         prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
     )
 
-    # A collapsed or miscomputed draft path accepts nothing and reads 1.0; every draft
-    # accepted reads 1 + max_draft_len. The midpoint of that range is the gsm8k MTP
-    # cases' tripwire: at or above it, more than half the drafts are accepted.
-    MTP3_COLLAPSE_FLOOR = 1.0 + MTP3.max_draft_len / 2
-
     # The pass keys' acceptance-length floor in references/acceptance_length.yaml.
     ACCEPTANCE_KEY_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context"
+    # The four-GPU gsm8k cases' floors there: tep4 over bf16 KV, and per quantized KV dtype
+    # (`mtp3_{kv_dtype}_kv`), each 95% of its GB300 reading.
+    ACCEPTANCE_KEY_MTP3 = "ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3"
 
     # ---- one rank (tp1) ----------------------------------------------------------------
     # At tp1 `mamba_ssm_cache_dtype` is float32 because the checkpoint declares
@@ -537,12 +535,11 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
         "ModelingV2Qwen38FlashNextNvfp4Sm103Default::tp1_mtp7_nvfp4_kv_bf16_state_long_context"
     )
 
-    def _gsm8k(self, mocker, llm, label: str, key: str | None = None) -> None:
+    def _gsm8k(self, mocker, llm, label: str, key: str) -> None:
         """gsm8k against the engine's reference row, then its acceptance length.
 
         The acceptance length is held to the floor under `key` in
-        references/acceptance_length.yaml, or without one above the three-draft collapse
-        tripwire. Rejection sampling holds the emitted distribution to the target model's, so
+        references/acceptance_length.yaml. Rejection sampling holds the emitted distribution to the target model's, so
         a miscomputed draft layer leaves the score in place and only slows generation; the
         acceptance length is what sees it. It comes from the engine's iteration statistics,
         so the engine needs ``enable_iter_perf_stats``.
@@ -551,13 +548,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
         GSM8K(self.MODEL_NAME).evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
         acceptance_length = compute_acceptance_length(llm)
         print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
-        if key is not None:
-            assert_acceptance_length(key, acceptance_length)
-            return
-        assert acceptance_length >= self.MTP3_COLLAPSE_FLOOR, (
-            f"{label}: acceptance length {acceptance_length:.3f} is below "
-            f"{self.MTP3_COLLAPSE_FLOOR}: the draft path is rejected more often than accepted"
-        )
+        assert_acceptance_length(key, acceptance_length)
 
     def _passkeys(self, llm, lengths, draft_len, key, label) -> None:
         """Pass keys over prompts of `lengths` tokens, the acceptance length held to `key`."""
@@ -691,12 +682,13 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
     def test_mtp3_gsm8k_and_long_context(self, mocker):
         """tep4 with three drafts and IndexShare: gsm8k, then pass keys over 3k-6k tokens.
 
-        gsm8k reads the MTP row of references/gsm8k.yaml, its acceptance length held above
-        the collapse tripwire. The pass keys are past the QSA indexer's 2048-token budget, so
-        the target's decode steps and its draft layer's take the sparse attention path, which
-        gsm8k never leaves, and IndexShare makes the draft loop reuse the selection of its
-        first step. A miscomputed draft path keeps the text correct and only lowers the
-        acceptance length, which is held to its floor in references/acceptance_length.yaml.
+        gsm8k reads the MTP row of references/gsm8k.yaml, its acceptance length held to the
+        `mtp3` floor in references/acceptance_length.yaml. The pass keys are past the QSA
+        indexer's 2048-token budget, so the target's decode steps and its draft layer's take the
+        sparse attention path, which gsm8k never leaves, and IndexShare makes the draft loop
+        reuse the selection of its first step. A miscomputed draft path keeps the text correct
+        and only lowers the acceptance length, which is held to its floor in
+        references/acceptance_length.yaml.
         """
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
         prompts = _passkey_prompts(tokenizer, _PASSKEY_LENGTHS)
@@ -715,7 +707,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
                 env_overrides=rank_env,
             ) as llm,
         ):
-            self._gsm8k(mocker, llm, "tep4 mtp3 gsm8k")
+            self._gsm8k(mocker, llm, "tep4 mtp3 gsm8k", self.ACCEPTANCE_KEY_MTP3)
             acceptance_length = self._passkey_acceptance(llm, prompts, "tep4 mtp3 long context")
         assert_acceptance_length(self.ACCEPTANCE_KEY_LONG_CONTEXT, acceptance_length)
 
@@ -726,7 +718,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
         """gsm8k with three drafts over a quantized KV pool, block reuse and chunked prefill.
 
         gsm8k reads the MTP row of references/gsm8k.yaml for that KV dtype, its acceptance
-        length held above the collapse tripwire.
+        length held to that dtype's floor in references/acceptance_length.yaml.
         """
         kv_cache_config = KvCacheConfig(
             dtype=kv_dtype,
@@ -749,7 +741,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
                 env_overrides=rank_env,
             ) as llm,
         ):
-            self._gsm8k(mocker, llm, f"mtp3 {kv_dtype} kv")
+            self._gsm8k(
+                mocker, llm, f"mtp3 {kv_dtype} kv", f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
+            )
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
@@ -1080,7 +1074,6 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
     AGENTX_ENV = {
         "TRTLLM_ENABLE_PDL": "1",
         "TRTLLM_KV_TRANSFER_NUM_THREADS": "8",
-        "TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD": "1",
         "TRTLLM_MODELING_V2_DENSE_FP8": "1",
         "TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4": "1",
         "TRTLLM_MODELING_V2_MTP_MOE_NVFP4": "1",
@@ -1110,7 +1103,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": True,
             "disable_mm_encoder": True,
             "moe_config": {"backend": "TRTLLM"},
-            "scheduler_config": {"capacity_scheduler_policy": "GUARANTEED_NO_EVICT"},
+            # What KV cache manager v2 runs; it overrides any other policy with a warning.
+            "scheduler_config": {"capacity_scheduler_policy": "MAX_UTILIZATION"},
             "cache_transceiver_config": {"backend": "NIXL", "transceiver_runtime": "PYTHON"},
         }
         kv_cache_config = {

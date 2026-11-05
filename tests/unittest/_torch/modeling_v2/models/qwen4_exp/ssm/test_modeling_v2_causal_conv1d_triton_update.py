@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the causal_conv1d_triton_update entry."""
+"""GPU test for the causal_conv1d_triton_update entry. Beyond the cells: the
+snapshot-depth guard."""
 
 import zlib
 
@@ -128,3 +129,15 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     # Non-vacuity of the whole-pool gate: every slot the batch named moved.
     for slot in cell.spec["slots"]:
         assert not torch.equal(got[1][slot], args[1][slot]), slot
+
+
+def test_guard_refuses_undersized_buffers() -> None:
+    """A snapshot buffer shallower than seqlen is accepted by the kernel and
+    written past the row it was given (measured); the guard refuses it
+    before the launch."""
+    spec = dict(dim=512, batch=2, seqlen=2, pool_slots=8, slots=(0, 2), snapshots=2)
+    args, _ = _build(spec, seed=15)
+    args[8] = torch.zeros(2, 1, 512, 3, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(AssertionError, match="intermediate_conv_window must be at least"):
+        with validating(op):
+            op(*args)

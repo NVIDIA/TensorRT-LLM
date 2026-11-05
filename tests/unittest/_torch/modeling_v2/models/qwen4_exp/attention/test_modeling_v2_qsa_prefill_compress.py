@@ -15,6 +15,9 @@ the 12 sparse layers' index pages sharing each slot as KV cache manager V2 lays
 them out at bf16, the other 11 layers' planes holding a sentinel that must
 survive. Those pools are drawn on the device.
 
+Beyond the cells: graph capture and replay at the 32 MTP7 verify blocks and at 128 decode
+rows over the tep4 pool, and the contiguity guard on `logical_positions`.
+
 A padding row at logical position -1 is deliberately absent: it is an illegal
 memory access that poisons the process for every test after it.
 """
@@ -221,9 +224,52 @@ def test_certified_cells(cell, certifying):  # noqa: F811
         assert top * out.stride(0) >= 2**31, top * out.stride(0)
 
 
+def _scene(seed: int, **overrides):
+    """Two requests of 64 tokens from 0, the target's call, at the checkpoint geometry."""
+    spec = {**op.CELLS[0].spec, "segments": ((0, 64),) * 2, "pages": 4, **overrides}
+    return _build(spec, seed=seed)[0]
+
+
 #: The cell of 32 MTP7 verify blocks (256 rows, two anchors each): the segments, pool and table.
 _MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 requests"))
 _MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots", "rounding_flips")}
+
+
+#: The 128-request decode over the default target's tep4 pool, at its cell's seed.
+_DECODE_128 = next(c for c in op.CELLS if c.why.startswith("tep4 decode: 128 requests"))
+
+
+@pytest.mark.parametrize("batch", ["mtp7_32", "tep4_decode_128"])
+def test_cuda_graph_capture_and_replay(batch) -> None:
+    """The launch grid is fixed by the row count, so it captures and replays: 32 MTP7
+    verify blocks, and 128 decode rows over the default target's coalesced tep4 pool, the
+    decode target's captured batches."""
+    if batch == "mtp7_32":
+        args, flips = _scene(seed=16, **_MTP7_BATCH), _MTP7_BATCH["rounding_flips"]
+    else:
+        spec = _DECODE_128.spec
+        args = _build(spec, seed=zlib.crc32(_DECODE_128.why.encode()))[0]
+        flips = spec.get("rounding_flips", 0)
+    cache = args["index_cache"]
+    before = cache.clone()
+    ref = op.reference(**args)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            cache.copy_(before)
+            op(**args)
+    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    cache.copy_(before)
+    with torch.cuda.graph(graph):
+        op(**args)
+    for _ in range(2):
+        cache.copy_(before)
+        graph.replay()
+        torch.cuda.synchronize()
+        _compare(cache, ref, flips)
 
 
 def _strided(tensor: torch.Tensor, dim: int) -> torch.Tensor:
@@ -235,3 +281,28 @@ def _strided(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     index[dim] = slice(None, None, 2)
     wide[tuple(index)] = tensor
     return wide[tuple(index)]
+
+
+def test_guard_refuses_strided_logical_positions() -> None:
+    """Shown unguarded first -- accepted and wrong -- then refused: a 1-D operand the
+    kernel reads flat (`request_indices` and `k_norm_weight` carry the same
+    `is_contiguous` guard). One measured max abs error against the right answer: 4.72;
+    the floor below states a bound, not one draw.
+    """
+    args = _scene(seed=12)
+    before = args["index_cache"].clone()
+    ref = op.reference(**args)
+    bad = dict(args, logical_positions=_strided(args["logical_positions"], 0))
+    assert not bad["logical_positions"].is_contiguous()
+
+    out = op(**bad)
+    error = (out.float() - ref.float()).abs().max().item()
+    assert error > 0.25, (
+        f"strided logical_positions was expected to be read wrongly; off by {error}"
+    )
+
+    args["index_cache"].copy_(before)
+    with pytest.raises(AssertionError, match="logical_positions must be contiguous"):
+        with validating(op):
+            op(**bad)
+    assert torch.equal(args["index_cache"], before), "a refused call still wrote"

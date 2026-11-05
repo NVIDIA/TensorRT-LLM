@@ -34,6 +34,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 
 class _Plan(NamedTuple):
@@ -221,6 +222,8 @@ class LowMBf16Mm(OpWrapper):
         m, k = mat_a.shape
         n = mat_b.shape[1]
         p = plan(m, n, k)
+        # `TRTLLM_ENABLE_PDL=0` turns programmatic dependent launch off, as for every PDL op.
+        pdl = bool(pdl and get_env_enable_pdl())
         if p.kind == "direct":
             out = torch.empty((m, n), dtype=mat_a.dtype, device=mat_a.device)
             return _fi_direct.run_direct_dense(

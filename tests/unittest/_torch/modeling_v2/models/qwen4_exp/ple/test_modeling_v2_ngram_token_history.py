@@ -6,7 +6,8 @@ Integer bookkeeping, gated bitwise -- window and the whole published pool --
 against the entry's scalar reference, which builds each sequence's stream as
 a list and shares no structure with the masked per-shift select under test.
 Beyond the cells: chunked prefill against one-shot (the cross-step carry
-the forward relies on).
+the forward relies on), the `query_start_loc` length guard and CUDA-graph
+replay.
 """
 
 import zlib
@@ -18,6 +19,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ngra
     CKPT_EOS_TOKEN_ID,
     CKPT_NGRAM_SIZE,
     CKPT_VOCAB_SIZE,
+    ENGINE_SLOTS,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (  # noqa: E501
     ngram_token_history as op,
@@ -132,3 +134,79 @@ def test_chunked_prefill_matches_one_shot() -> None:
     split = torch.cat([call(pool, ids[:41], False), call(pool, ids[41:], True)])
     assert torch.equal(split, one_shot)
     assert torch.equal(pool, one_shot_pool)
+
+
+# ----------------------------------------------------------- guards
+
+
+def _two_sequences():
+    pool = torch.randint(0, CKPT_VOCAB_SIZE, (4, CONTEXT_LEN), device=DEV)
+    return (
+        torch.tensor([11, 12, 13, 21], device=DEV),
+        pool,
+        torch.tensor([0, 1], dtype=torch.int32, device=DEV),
+        torch.tensor([True, False], device=DEV),
+        torch.tensor([0, 3, 4], dtype=torch.int32, device=DEV),
+        EOS,
+        NGRAM,
+    )
+
+
+def _misses(args, bad_index, bad_value):
+    """Run the op unguarded with one argument swapped; True if it returned
+    and its answer differs from the reference on the intended arguments."""
+    expected = _expect(args)
+    bad = list(args)
+    bad[1] = args[1].clone()
+    bad[bad_index] = bad_value
+    window = op(*bad)
+    return not (torch.equal(window, expected[0]) and torch.equal(bad[1], expected[1]))
+
+
+def test_guard_refuses_a_short_query_start_loc() -> None:
+    """Unguarded, a 2-entry vector for 2 sequences misattributes the tail."""
+    args = _two_sequences()
+    short = torch.tensor([0, 3], dtype=torch.int32, device=DEV)
+    assert _misses(args, 4, short), "the hazard this guard covers is gone"
+    bad = list(args)
+    bad[4] = short
+    with pytest.raises(AssertionError, match=r"query_start_loc must be \[num_seqs"):
+        with validating(op):
+            op(*bad)
+
+
+# ----------------------------------------------------------- capture
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    """The captured decode shape, 8 sequences at the engine pool width."""
+    spec = dict(
+        lengths=(1,) * 8,
+        slots=(0, ENGINE_SLOTS - 1, 4, 17, 30, 43, 56, 69),
+        carries=(True,) * 8,
+        pool_slots=ENGINE_SLOTS,
+        ids_dtype=torch.int32,
+        qsl_dtype=torch.int64,
+    )
+    args = _build(spec, seed=11001)
+    start = args[1].clone()
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            op(*args)
+    torch.cuda.current_stream().wait_stream(side)
+
+    args[1].copy_(start)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(*args)
+
+    replay_ids = torch.randint(0, CKPT_VOCAB_SIZE, (8,), dtype=torch.int32, device=DEV)
+    args[0].copy_(replay_ids)
+    args[1].copy_(start)
+    expected = op.reference(replay_ids, start.clone(), *args[2:])
+    graph.replay()
+    torch.cuda.synchronize()
+    _compare((captured, args[1]), expected)

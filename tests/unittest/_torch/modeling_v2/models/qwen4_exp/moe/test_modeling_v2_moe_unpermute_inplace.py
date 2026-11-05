@@ -6,7 +6,7 @@ The entry owns the contract. This file lays a cell's FC2 rows out the way the
 CuteDSL FC2 hands them over -- placed by moe_sort, every row the op must not read
 filled with NaN, the output pre-filled with NaN -- and holds the claims no cell
 carries: CUDA-graph replay at the largest captured row count, bitwise equal to
-eager.
+eager, and the contiguity guard.
 """
 
 import zlib
@@ -240,3 +240,29 @@ def test_captured_rows_replay_on_new_data(certifying):  # noqa: F811
     del graph, e2p
     torch.cuda.synchronize()
     assert stale_rows > 0, "no replay ran over a stale row: the stale-row claim is untested"
+
+
+# ── the guards ────────────────────────────────────────────────────────────
+
+
+def _strided(t: torch.Tensor, pad: int) -> torch.Tensor:
+    """The same values in a view whose rows are `pad` elements wider apart."""
+    wide = torch.zeros(t.shape[0], t.shape[1] + pad, dtype=t.dtype, device=t.device)
+    wide[:, : t.shape[1]] = t
+    return wide[:, : t.shape[1]]
+
+
+def test_noncontiguous_operand_answers_wrongly_and_is_refused():
+    """The FC2 rows the op reads; the guard checks all four operands the same way."""
+    name = "permuted_input"
+    args = _problem(_spec(300), seed=61)
+    ref = op.reference(**args)
+    bad = dict(args, **{name: _strided(args[name], 64)})
+    out = op(**bad)
+    with pytest.raises(AssertionError, match="differ bitwise"):
+        _compare(out.contiguous(), ref)
+    with validating(op):
+        with pytest.raises(AssertionError, match=f"{name} must be contiguous"):
+            op(**bad)
+        out = op(**dict(args, output=_output(300)))
+    _compare(out, ref)

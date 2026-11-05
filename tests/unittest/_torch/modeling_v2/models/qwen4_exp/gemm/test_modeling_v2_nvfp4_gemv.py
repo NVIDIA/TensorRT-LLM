@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: `nvfp4_gemv` against an fp32 reference over the dequantized NVFP4 weight, per
-cell; the quantizer against its definition; one compiled kernel per row
-octet. The split entries (NVFP4 units on `fp8_gemv`'s kernel) per cell:
-the projection against the fp32 reference, the conv entries also against the two-launch
-paths they replace (the split projection + `causal_conv1d_update` /
-`causal_conv1d_triton_update`)."""
+cell; the quantizer against its definition; CUDA-graph replay; one compiled kernel per row
+octet; the f16-range guard. The split entries (NVFP4 units on `fp8_gemv`'s kernel) per cell:
+the projection against the fp32 reference, the conv entries also against the same steps in
+two launches (the split projection + `causal_conv1d_update` /
+`causal_conv1d_triton_update`); the split projection under CUDA-graph replay."""
 
 import pytest
 import torch
@@ -103,6 +103,29 @@ def test_one_kernel_per_row_octet() -> None:
             nv.dequantize_nvfp4(codes, scales, gscale),
         )
     assert nv._compiled.cache_info().currsize - before <= 2
+
+
+def test_graph_replay_matches_eager() -> None:
+    _, _, _, _, packed = _weight(4096, 2560, 9)
+    x = torch.randn(4, 2560, device=DEV).to(torch.bfloat16)
+    nvfp4_gemv_op(x, packed)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = nvfp4_gemv_op(x, packed)
+    x.copy_(torch.randn(4, 2560, device=DEV).to(torch.bfloat16))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, nvfp4_gemv_op(x, packed))
+
+
+def test_is_valid_rejects_activation_beyond_f16() -> None:
+    _, _, _, _, packed = _weight(256, 256, 1)
+    x = torch.randn(2, 256, device=DEV).to(torch.bfloat16)
+    nvfp4_gemv_op.is_valid(x, packed)
+    x[1, 3] = 1e5
+    with pytest.raises(AssertionError):
+        nvfp4_gemv_op.is_valid(x, packed)
 
 
 # ------------------------------------------------------------------------------------------
@@ -286,3 +309,18 @@ def test_split_precompile_covers_the_decode_variants() -> None:
                     x, packed, conv_state, conv_weight, ids, window, ids, GDN_CONV, p, -1
                 )
     assert f8._compiled.cache_info().misses == before
+
+
+def test_split_graph_replay_matches_eager() -> None:
+    _, codes, scales, gscale, _ = _weight(GDN_N, GDN_K, 9)
+    packed = nv.pack_split(codes, scales, gscale)
+    x = torch.randn(4, GDN_K, device=DEV).to(torch.bfloat16)
+    split_op(x, packed)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = split_op(x, packed)
+    x.copy_(torch.randn(4, GDN_K, device=DEV).to(torch.bfloat16))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, split_op(x, packed))

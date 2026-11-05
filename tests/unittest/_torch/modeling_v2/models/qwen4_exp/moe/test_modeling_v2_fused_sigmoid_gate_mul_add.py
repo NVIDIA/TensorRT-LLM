@@ -5,8 +5,9 @@
 
 The entry owns the contract. This file turns a cell into operands (a strided gate
 is the call site's `gug` column), locks both sides of the in-place write, and holds
-the claims no cell carries: the strided gate equal to the dense column, and the
-empty batch.
+the claims no cell carries: the strided gate equal to the dense column, CUDA-graph
+capture and replay at the 128-row site, the empty batch and the loud rejection of
+a wrong-length gate.
 """
 
 import zlib
@@ -93,9 +94,42 @@ def test_strided_gate_is_the_dense_column_bit_for_bit() -> None:
     assert torch.equal(final, dense_final)
 
 
+def test_cuda_graph_capture_and_replay() -> None:
+    """The decode sites run captured: one capture at the 128-row site, replayed on
+    refilled operands (the strided gate's densifying copy is captured with it)."""
+    spec = _strided_spec(128)
+    final, gate, shared = _operands(spec, seed=5)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(final.clone(), gate, shared)  # warm-up: the Triton JIT compiles outside capture
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(final, gate, shared)
+    assert out.data_ptr() == final.data_ptr()
+
+    for seed in (21, 22):
+        new_final, new_gate, new_shared = _operands(spec, seed=seed)
+        final.copy_(new_final)
+        gate.copy_(new_gate)
+        shared.copy_(new_shared)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(final, op.reference(new_final, new_gate, new_shared))
+
+
 def test_zero_tokens_is_a_no_op():
     final = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device=DEV)
     shared = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device=DEV)
     gate = torch.empty(0, 1, dtype=torch.bfloat16, device=DEV)
     returned = op(final, gate, shared)
     assert returned.shape == (0, HIDDEN) and returned.data_ptr() == final.data_ptr()
+
+
+def test_a_gate_of_the_wrong_length_raises() -> None:
+    """Metadata violations are loud, which is why the entry has no guard."""
+    bf = dict(dtype=torch.bfloat16, device=DEV)
+    final, shared = torch.randn(4, 128, **bf), torch.randn(4, 128, **bf)
+    with pytest.raises(AssertionError):
+        op(final, torch.randn(3, 1, **bf), shared)

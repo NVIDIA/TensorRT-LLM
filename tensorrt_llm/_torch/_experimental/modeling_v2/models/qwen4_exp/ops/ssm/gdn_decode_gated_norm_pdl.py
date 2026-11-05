@@ -438,13 +438,14 @@ class GdnDecodeGatedNormPdl(OpWrapper):
     Source: the CuTe DSL kernel in this file, JIT-compiled (`cute_ext.compile`) for the
     running device at the first call per geometry; the cells ran that path on sm_103.
 
-    The default target: its routing admits a bf16 recurrent-state cache only, and this kernel takes
-    an fp32 pool only -- a bf16 pool fails its compile loudly ("`copy` currently only
-    supports equal source and destination element type bit width") -- so the default target's
-    decode step does not launch it. Its bf16 decode recurrence is
-    `gdn_decode_rows_gated_norm`, which reads this entry's `reference` and
-    `_recurrence_reference` (both round the state to the pool's own dtype) and not its
-    kernel.
+    The default target: this kernel takes an fp32 pool only -- a bf16 pool fails its
+    compile loudly ("`copy` currently only supports equal source and destination element
+    type bit width") -- and the routing admits an fp32 recurrent-state cache at tp1 alone.
+    There `DecodeTarget._gdn_block` launches it for a captured decode step of at most
+    `MAX_ROWS` rows over an fp32 pool; every other decode step, and every bf16 pool (the
+    only one at tp4, tep4 and dep4), runs `gdn_decode_rows_gated_norm`, which reads this
+    entry's `reference` and `_recurrence_reference` (both round the state to the pool's own
+    dtype) and not its kernel.
 
     Certified, sm_103:
     - tp1's 16 / 48 heads: 1 and 4 rows over a contiguous 461-slot pool, and 2 rows over a

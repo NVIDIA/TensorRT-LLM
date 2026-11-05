@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_attn_decode_prologue entry: every cell bitwise the
-composition it replaces (`qwen4_exp_qk_norm_rope`, `qsa_paged_kv_store` or
+composition of the entries it fuses (`qwen4_exp_qk_norm_rope`, `qsa_paged_kv_store` or
 `qsa_paged_kv_store_nvfp4`, `qsa_paged_index_store`, `qsa_prefill_compress`) on every
 allocation either writes -- the projection, the index query, the K/V pool (with its block
 scales over NVFP4), the index plane, the position cache; a stale-read check under graph

@@ -10,7 +10,8 @@ qkv_dim 2560, a 4120-wide projection) on a tp4 or tep4 rank. The pool is a view 
 bigger buffer, which the test also checks the call leaves alone outside the view: a
 two-layer buffer for the tp1 cells, the stock manager's page (36 GDN layers a slot,
 the view at the last) for a rank's cells: at an engine's measured slot count, or at
-slots whose offset passes 2^31 elements.
+slots whose offset passes 2^31 elements. Beyond the cells: `linear_gate` against the
+log-space gate, and the unit-channel-stride guard.
 """
 
 import math
@@ -28,6 +29,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
     IN_PROJ_WIDTH,
     NUM_K_HEADS,
     NUM_V_HEADS,
+    QKV_DIM,
     SOFTPLUS_THRESHOLD,
     _engine_slots,
 )
@@ -195,3 +197,12 @@ def test_linear_gate_is_torch_exp_of_the_log_gate() -> None:
     for got, want in zip(lin_out[:3] + lin_out[4:], log_out[:3] + log_out[4:]):
         assert torch.equal(got, want)
     assert torch.equal(pool_lin, log_args[2])
+
+
+def test_guard_refuses_channel_strided_x() -> None:
+    args = _build(dict(lengths=(16,), pool_slots=2, slots=(0,), initial=(True,)), seed=302)
+    bad = list(args)
+    bad[0] = torch.empty(QKV_DIM, 16, dtype=DTYPE, device=DEV).t()
+    with pytest.raises(AssertionError, match="unit channel stride"):
+        with validating(op):
+            op(*bad)

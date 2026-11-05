@@ -58,3 +58,44 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert out.data_ptr() != x.data_ptr(), "the op must return a new tensor"
     assert torch.equal(buffer, buffer_before), "x (and the stream it slices) is read-only"
     torch.testing.assert_close(out, op.reference(x, weight, eps))
+
+
+def test_cuda_graph_replay_at_the_decode_stream_slice() -> None:
+    """The decode site is captured: a graph over the 128-row stream slice, replayed
+    after the residual is refilled, answers bitwise what the eager call does."""
+    spec = next(
+        c.spec
+        for c in op.CELLS
+        if c.spec["shape"] == (128, 2560) and c.spec.get("row_width") == 10240
+    )
+    buffer, x, weight, eps = _build(spec, seed=_seed("graph replay"))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            op(x, weight, eps)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(x, weight, eps)
+
+    g = torch.Generator(device="cuda").manual_seed(_seed("graph refill"))
+    buffer.copy_(torch.randn(buffer.shape, generator=g, device="cuda").to(buffer.dtype))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, op(x, weight, eps)), "replay differs from the eager call"
+    torch.testing.assert_close(out, op.reference(x, weight, eps))
+
+
+def test_guard_refuses_fp8_before_the_kernel_answers() -> None:
+    """fp8 is in the DSL dtype table: accepted, and a tensor comes back."""
+    x = torch.randn(4, 2560, device="cuda").to(torch.float8_e4m3fn)
+    w = torch.randn(2560, device="cuda").to(torch.float8_e4m3fn)
+    unguarded = torch.ops.trtllm.flashinfer_gemma_rmsnorm(x, w, 1e-6)
+    assert unguarded.dtype is x.dtype and unguarded.shape == x.shape, (
+        "the hazard this guard covers is gone"
+    )
+    with pytest.raises(AssertionError, match="dequantize"):
+        with validating(op):
+            op(x, w, 1e-6)

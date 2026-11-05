@@ -4,9 +4,10 @@
 table gather and per-tensor fp8 dequantization in one Triton launch, with the
 per-slot n-gram context published back in the same pass.
 
-Called by the qwen4_exp target at every layout. It computes the composition
-``ngram_token_history`` + ``ngram_hash`` + ``nn.functional.embedding`` +
-``dequantize_e4m3_per_tensor``, whose references it reads. Nothing registered
+Called by the qwen4_exp target at every layout. Its ``reference`` is the
+scalar references of ``ngram_token_history`` (window and published pool) and
+``ngram_hash`` (rows), then a float64 gather of the fp8 table rows times the
+per-tensor scale, rounded once. Nothing registered
 under ``torch.ops.trtllm`` or in the installed FlashInfer gathers and
 dequantizes n-gram rows (``torch.ops.trtllm.qwen4_exp_ple_ngram_hash`` hashes a
 window only).
@@ -303,7 +304,7 @@ class PleNgramEmbed(OpWrapper):
 
         out[t, h * D : (h + 1) * D] = to(scale.dtype)(float(table[row[t, h]]) * float(scale))
 
-    with `D = table.shape[1]` -- `dequantize_e4m3_per_tensor`'s one rounding.
+    with `D = table.shape[1]` -- one rounding of the scaled fp8 value.
     Then, **in place**, `context_pool[slot]` becomes the last `ngram_size - 1`
     ids of the stream (a zero-row sequence republishes its carry). Unnamed slots
     are untouched.
@@ -432,8 +433,9 @@ class PleNgramEmbed(OpWrapper):
     stock PLE host offload's placement. The checkpoint-height cells allocate
     the 47.7 GiB table on the device.
 
-    Bitwise equal to `ngram_token_history` + `ngram_hash` + embedding +
-    `dequantize_e4m3_per_tensor`, window, rows, values and pool alike.
+    Bitwise equal to `reference` (`ngram_token_history`'s and `ngram_hash`'s
+    references, then the gather and one rounding of the scale), rows, values
+    and pool alike.
     CUDA-graph capturable: no host sync, one launch, output allocated per call.
     Reads the table through its device address, so a host-mapped table needs
     no copy.

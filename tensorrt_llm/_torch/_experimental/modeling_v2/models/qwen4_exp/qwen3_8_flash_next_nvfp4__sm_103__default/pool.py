@@ -357,8 +357,8 @@ def check_replay_width(replay, rows: int) -> None:
     assert replay is None or rows == replay.width, (
         f"the batch carries {rows} query rows per generation sequence and the GDN cached "
         f"replay runs at step width {replay.width}; a runtime_draft_len of {rows - 1} (a "
-        "draft-length schedule, or skipped drafting) cannot run under it. Export "
-        "TRTLLM_USE_GDN_REPLAY=0 for variable draft lengths"
+        "draft-length schedule, or skipped drafting) cannot run under it: this target runs "
+        "one draft length, and routing declines a variable one"
     )
 
 

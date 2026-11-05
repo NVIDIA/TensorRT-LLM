@@ -5,7 +5,7 @@
 Cells are gated at one ulp of the activation dtype against the float64
 reference; the MoE-combine cells widen the residual's band by the combine's own
 rounding (see `_compare_moe`). Beyond them: the CuTe fold kernel bitwise the
-Triton kernel at the last row count before the switch.
+Triton kernel at the last row count before the switch, and the slot-map guard.
 """
 
 import sys
@@ -204,3 +204,10 @@ def test_fold_cute_is_the_triton_kernel_bitwise(monkeypatch) -> None:
     want_hc, want_normed = op(*args)
     assert torch.equal(hc, want_hc)
     assert torch.equal(normed, want_normed)
+
+
+def test_guard_refuses_an_int64_slot_map() -> None:
+    """The fold's slot map is the runner's int32 index map; `is_valid` refuses an int64 one."""
+    fold = _build(dict(rows=4, moe=True, fold=10), seed=9)
+    with validating(op), pytest.raises(AssertionError, match="int32"):
+        op(*fold[:9], fold[9].long())

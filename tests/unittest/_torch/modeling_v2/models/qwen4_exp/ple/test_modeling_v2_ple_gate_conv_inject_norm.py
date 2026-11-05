@@ -6,8 +6,9 @@ Cells are gated against the float64 reference that rounds where the op rounds:
 the stream (`hc_out`) and the normed stream in units of their row's scale, the
 published conv state per element (see `_compare`); a verify cell's staged conv
 input is checked bitwise against the state it published. Beyond the cells: the
-staged conv input is what the conv consumed, and `out` writes only its rows of a
-larger buffer.
+staged conv input is what the conv consumed, `out` writes only its rows of a
+larger buffer, the operand-width guard, and graph capture at the 461-slot pool and
+over a rank's whole pool (the tep4 decode and MTP7 verify graphs).
 """
 
 import zlib
@@ -20,6 +21,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_
     CKPT_DILATION,
     CKPT_HC_COUNT,
     CKPT_HIDDEN,
+    ENGINE_SLOTS,
+    TEP4_SLOTS,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_gate_conv_inject_norm import (  # noqa: E501
     ple_gate_conv_inject_norm as op,
@@ -61,17 +64,17 @@ def _stats(out: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
 #: (`hc ~ -ple`), so a per-element ulp is unbounded there: 73 ulp of a
 #: 0.003-sized element in a row whose largest is ~10. The stream and its norm
 #: are therefore gated in units of their row's scale (`assert_within_ulp`):
-#: 2 ulp of the row maximum per element and 0.1 ulp relative RMS. The
-#: composition this replaces sits at 0.87 / 0.33 of a row-max ulp against the
-#: same reference (measured: normed / hc_out at 128 rows), the op at 0.72 /
-#: 0.38. The published conv state is one rounding of the conv-input norm,
-#: whose only perturbation is a one-ulp flip of a gated element: 2 ulp per
-#: element (measured worst 1.78, the old composition 1.56).
+#: 2 ulp of the row maximum per element and 0.1 ulp relative RMS. The same
+#: steps unfused (one bf16 kernel per step) sit at 0.87 / 0.33 of a row-max ulp
+#: against the same reference (measured: normed / hc_out at 128 rows), the op
+#: at 0.72 / 0.38. The published conv state is one rounding of the conv-input
+#: norm, whose only perturbation is a one-ulp flip of a gated element: 2 ulp
+#: per element (measured worst 1.78, the unfused steps 1.56).
 ROW_ULP, RMS_ULP, STATE_ULP = 2.0, 0.1, 2.0
 #: The per-element row-max gate is a tail statistic, and a context-shaped cell
 #: draws ~100x more elements than a 128-row one. Against the same float64
-#: reference over three seeds at 16384 rows, the composition this replaces
-#: reaches 2.91 row-max ulp (normed) and the op 2.94; at 8192 rows 1.89 / 1.89.
+#: reference over three seeds at 16384 rows, the unfused steps reach 2.91
+#: row-max ulp (normed) and the op 2.94; at 8192 rows 1.89 / 1.89.
 #: Cells above 1024 rows are therefore gated at 4; the RMS gate is unchanged.
 #: The default target's per-rank pools (1874 / 850 slots) sit inside the same gates; a
 #: reference reading each sequence's neighbouring slot falls far outside the RMS gate
@@ -197,3 +200,51 @@ def test_out_writes_the_rows_of_larger_buffers() -> None:
     assert torch.equal(bufs[0][:rows], plain[0]) and torch.equal(bufs[1][:rows], plain[1])
     assert torch.equal(args[7], plain[2])
     assert bool((bufs[0][rows:] == 7.0).all()) and bool((bufs[1][rows:] == 7.0).all())
+
+
+def test_guard_refuses_a_short_value() -> None:
+    args = _build(dict(lengths=(1, 1)), seed=4)
+    args[2] = args[2][:, :-1]
+    with validating(op), pytest.raises(AssertionError):
+        op(*args)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        dict(lengths=(1,) * 8, pool_slots=ENGINE_SLOTS),
+        # The tep4 decode graph and the MTP7 verify graph (packed-row conv, staged
+        # conv input) over a rank's whole pool.
+        dict(lengths=(1,) * 128, pool_slots=TEP4_SLOTS),
+        dict(lengths=(8,) * 128, pool_slots=TEP4_SLOTS, conv_input=True),
+    ],
+    ids=lambda s: f"{len(s['lengths'])}x{s['lengths'][0]}-{s['pool_slots']}slots",
+)
+def test_cuda_graph_capture_and_replay(spec) -> None:
+    args = _build(spec, seed=8)
+    xc = torch.empty_like(args[0]) if spec.get("conv_input") else None
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    pool = args[7].clone()
+    with torch.cuda.stream(warmup):
+        for _ in range(2):
+            op(*args, conv_input=xc)
+    torch.cuda.current_stream().wait_stream(warmup)
+    args[7].copy_(pool)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_hc, graph_normed = op(*args, conv_input=xc)
+    fresh = _build(spec, seed=18)
+    args[0].copy_(fresh[0])
+    args[1].copy_(fresh[1])
+    args[2].copy_(fresh[2])
+    args[7].copy_(pool)
+    eager_xc = None if xc is None else torch.empty_like(xc)
+    eager = _run(args, conv_input=eager_xc)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(graph_hc, eager[0])
+    assert torch.equal(graph_normed, eager[1])
+    assert torch.equal(args[7], eager[2])
+    if xc is not None:
+        assert torch.equal(xc, eager_xc)

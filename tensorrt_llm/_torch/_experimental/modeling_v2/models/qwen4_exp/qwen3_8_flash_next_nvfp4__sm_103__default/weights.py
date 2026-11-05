@@ -312,11 +312,6 @@ FP8_BLOCK = 128
 #: stored (the gather dequantizes the rows it reads).
 PLE_TABLE_DTYPE = torch.float8_e4m3fn
 
-#: How the trunk's routed experts are split (`rank_dims`'s `expert_split`) that this table
-#: declares and `load` fills: by expert (`ep`, a window of whole experts) or by each
-#: expert's intermediate (`tp`, every expert at a zero-padded slice).
-LOADED_EXPERT_SPLITS = ("ep", "tp")
-
 #: The multiple a rank's stored routed-expert intermediate is padded up to. It is the
 #: engine's own storage rule for an NVFP4 trtllm-gen shard
 #: (`NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments`: a padded intermediate that is not a
@@ -696,9 +691,9 @@ def _gdn_layers(d):
 
 
 def _trunk_expert_layers(d):
-    """Every layer when the routed experts are split in a way this table declares
-    (`LOADED_EXPERT_SPLITS`); none otherwise."""
-    return range(d.num_layers) if d.expert_split in LOADED_EXPERT_SPLITS else ()
+    """Every layer: each holds routed experts, split by expert (`ep`, a window of whole
+    experts) or by each expert's intermediate (`tp`, every expert at a zero-padded slice)."""
+    return range(d.num_layers)
 
 
 def _cute_dsl_copy_layers(d):
@@ -1486,14 +1481,11 @@ class Qwen4ExpDefaultWeights:
         whole `mtp.` subtree. The windows are enumerated from `d`, not read off the
         checkpoint, so a key that belongs to a real weight can never land here."""
         out = set()
-        if d.expert_split in LOADED_EXPERT_SPLITS:
-            start, count = _trunk_window(d)
-            for i in range(d.num_layers):
-                for e in range(d.num_experts):
-                    if not start <= e < start + count:
-                        out.update(
-                            f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _TRUNK_EXPERT_TENSORS
-                        )
+        start, count = _trunk_window(d)
+        for i in range(d.num_layers):
+            for e in range(d.num_experts):
+                if not start <= e < start + count:
+                    out.update(f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _TRUNK_EXPERT_TENSORS)
         if not d.mtp_enabled:
             return out | {k for k in keys if k.startswith(f"{_MTP}.")}
         start, count = _mtp_window(d)
@@ -1567,10 +1559,6 @@ class Qwen4ExpDefaultWeights:
         tensors at once, and coverage is asserted in both directions."""
         core = model.model
         d = self.dims(core)
-        assert d.expert_split in LOADED_EXPERT_SPLITS, (
-            f"routed experts split by {d.expert_split!r}: this table declares the splits "
-            f"{LOADED_EXPERT_SPLITS}"
-        )
         # The one load-time declaration, before the manifest is built: the table's
         # height comes from the shards, and the manifest addresses it by row range.
         rows_per_shard = _declare_ngram_table(core, d, weights)

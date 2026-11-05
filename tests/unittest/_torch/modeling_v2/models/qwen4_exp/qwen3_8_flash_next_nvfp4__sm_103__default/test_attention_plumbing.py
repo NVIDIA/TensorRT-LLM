@@ -18,6 +18,9 @@
   mixed-batch forms), and the reuse entry's order over canonical captures. The targets are
   built without weights: the capture methods read only their arguments, the metadata and the
   core's draft binding.
+* **Score tables past the int32 range.** A part whose rows times the table's columns would
+  reach 2^31 is scored and selected in chunks under it, each row once, with its part's
+  context flag; at the checkpoint's `max_seq_len` (65568 columns) 32752 rows are one call.
 """
 
 import math
@@ -384,3 +387,68 @@ def test_reuse_of_a_canonical_capture_stays_ascending():
             captured = [i for i in shared_row if i >= 0]
             kept = captured[max(0, len(captured) + fresh - K) :]
             assert ids == kept + list(range(vis, vis + fresh))
+
+
+# ---- score tables past the int32 range ----------------------------------------------------
+
+
+def _chunked_calls(monkeypatch, rows: int, pages: int, parts, limit=None):
+    """`_score_and_select` over `rows` rows and a `pages`-page table (32 tokens, compression
+    4), with the scoring and the selection recorded: `(first row, rows, context_rows)` per
+    scoring call, and `selected` with each row's position in its first column."""
+    columns = pages * 32 // 4
+    calls = []
+
+    def scores_op(*, q, query_positions, context_rows, **_):
+        calls.append((int(query_positions[0]), q.shape[0], context_rows))
+        assert q.shape[0] * columns < (limit or M._SCORE_TABLE_ELEMENTS)
+        return q[:, 0, :1].expand(q.shape[0], columns)
+
+    def selection(core, scores, visible, logical, seq_lens, topk, starts, out, live_cols):
+        assert scores.shape == (logical.shape[0], columns) and live_cols == 7
+        out.copy_(logical[:, None].to(out.dtype).expand_as(out))
+
+    monkeypatch.setattr(M, "qsa_paged_index_scores", scores_op)
+    monkeypatch.setattr(M, "_selection", selection)
+    if limit is not None:
+        monkeypatch.setattr(M, "_SCORE_TABLE_ELEMENTS", limit)
+    logical = torch.arange(rows)
+    selected = torch.full((rows, 3), -1, dtype=torch.int32)
+    table = torch.zeros(2, pages, dtype=torch.int32)
+    rows_q = logical.float()[:, None, None]
+    M._score_and_select(
+        SimpleNamespace(compress_ratio=4),
+        None,
+        rows_q,
+        table,
+        logical,
+        logical,
+        32,
+        parts,
+        logical,
+        logical,
+        logical,
+        logical,
+        selected,
+        7,
+    )
+    assert torch.equal(selected[:, 0], logical.to(torch.int32)), "every row selected once"
+    return calls
+
+
+@pytest.mark.cpu_only
+def test_a_part_past_the_score_table_bound_goes_in_chunks(monkeypatch) -> None:
+    # 4 pages: 32 columns; a bound of 5 x 32 + 1 elements takes 5 rows a call.
+    calls = _chunked_calls(monkeypatch, 13, 4, [(0, 11, True), (11, 13, False)], 5 * 32 + 1)
+    assert calls == [(0, 5, True), (5, 5, True), (10, 1, True), (11, 2, False)]
+
+
+@pytest.mark.cpu_only
+def test_at_max_seq_len_262144_a_call_takes_32752_rows(monkeypatch) -> None:
+    # 8196 pages (262144 tokens plus the generation lead, padded to 4 pages): 65568 columns.
+    assert 32752 * 65568 < 2**31 <= 32753 * 65568
+    assert _chunked_calls(monkeypatch, 8192, 8196, [(0, 8192, True)]) == [(0, 8192, True)]
+    assert _chunked_calls(monkeypatch, 40000, 8196, [(0, 40000, True)]) == [
+        (0, 32752, True),
+        (32752, 7248, True),
+    ]

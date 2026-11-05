@@ -121,3 +121,29 @@ def test_which_kernel_each_member_runs() -> None:
         spec = dict(dim=dim, x_row_stride=row_stride, batch=128, pool_slots=256, slots="random")
         args = _build(spec, seed=dim)[0]
         assert _decode_conv_ok(*args[:7]) is expect, (dim, expect)
+
+
+def test_a_pool_past_the_32_bit_slot_offset_is_refused() -> None:
+    """TRT-LLM's kernel forms a slot's offset in 32 bits: a pool of 2^32 elements or more is
+    refused before any launch (meta tensors: nothing is allocated)."""
+    stride = 1105920  # a dep4 rank's slot stride
+    slots = -(-(2**32) // stride)
+    x = torch.empty((4, 10240), dtype=torch.bfloat16, device="meta")
+    weight = torch.empty((10240, 4), dtype=torch.bfloat16, device="meta")
+    indices = torch.zeros(4, dtype=torch.int32, device="meta")
+    pool = torch.empty_strided(
+        (slots, 10240, 3), (stride, 3, 1), dtype=torch.bfloat16, device="meta"
+    )
+    with pytest.raises(ValueError, match="32 bits"):
+        op(x, pool, weight, None, True, None, indices, -1)
+
+
+def test_op_rejects_metadata_violations_loudly() -> None:
+    """Why the entry has no `is_valid`: the op raises on metadata violations
+    itself (probed here at int64 slot indices)."""
+    spec = dict(dim=512, batch=4, pool_slots=16, slots=(0, 1, 2, 3))
+    args = _build(spec, seed=14)[0]
+    args[6] = args[6].long()
+    with pytest.raises(RuntimeError, match="conv_state_indices.scalar_type"):
+        with validating(op):
+            op(*args)

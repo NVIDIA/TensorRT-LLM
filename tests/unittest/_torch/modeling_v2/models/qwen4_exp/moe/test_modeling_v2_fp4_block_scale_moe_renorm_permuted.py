@@ -7,7 +7,8 @@ finalized entry's output on identical operands (so the fold a consumer makes
 with the same arithmetic is bitwise what the runner's finalize stored), the
 outputs have the documented shapes, dtypes and index map, and the finalized
 rows sit inside the pre-routed entry's band against the fp32 reference. The
-operand construction uses the shared NVFP4 test helpers.
+operand construction uses the shared NVFP4 test helpers. Beyond the cells: the
+uncertified-pair refusal and CUDA-graph replay at one token.
 """
 
 import zlib
@@ -84,3 +85,34 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     with true_fp32_matmul():
         exp = op.reference(logits, x, k, ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
+
+
+def test_uncertified_pair_refused(many_expert_layer):  # noqa: F811
+    spec = op.CELLS[0].spec
+    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
+        many_expert_layer(), spec, 13, renorm_moe_routing_op
+    )
+    with validating(op), pytest.raises(AssertionError, match="certified Renormalize"):
+        op(*_args(args, data, sf, logits, scalars, spec, top_k=9))
+
+
+def test_cuda_graph_capture_and_replay(many_expert_layer):  # noqa: F811
+    spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 1)
+    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
+        many_expert_layer(), spec, 43, renorm_moe_routing_op
+    )
+    call = list(_args(args, data, sf, logits, scalars, spec))
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            op(*call)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_rows, g_w, g_idx = op(*call)
+    logits.copy_(torch.randn_like(logits.float()).to(logits.dtype))
+    graph.replay()
+    torch.cuda.synchronize()
+    want = finalized(*call)
+    assert torch.equal(finalize(g_rows, g_w, g_idx), want)

@@ -7,9 +7,9 @@ Each cell builds a packed `[T, 3 * 16, 72]` bf16 qkv projection and the caller's
 table from the cell's grid (spatial-merge positions, fp64 angles rounded once to fp32,
 fp32 cos / sin), rotates `qkv[:, :32]` in place, and gates:
   1. bitwise against the entry's `reference` on the same table;
-  2. bitwise against the whole-op reference of `vision_rope_2d__r52` (copied below:
-     positions by nested loops, fp64 angles, `polar`, complex multiply), q and k
-     separately, with that entry's distribution gates beside it;
+  2. bitwise against a whole-op reference from the grid (`_grid_reference`: positions by
+     nested loops, fp64 angles, `polar`, complex multiply), q and k separately, with
+     distribution gates beside it;
   3. the v heads of every row untouched.
 """
 
@@ -66,9 +66,8 @@ def _angle_table(grid_thw: torch.Tensor, merge: int, theta: float, head_dim: int
     return angles.cos().contiguous(), angles.sin().contiguous()
 
 
-def _r52_reference(q, k, grid_thw, spatial_merge_size, theta=THETA):
-    """`vision_rope_2d__r52.reference`, verbatim: the whole op from the grid, as a fresh
-    `(q_out, k_out)`."""
+def _grid_reference(q, k, grid_thw, spatial_merge_size, theta=THETA):
+    """The whole op from the grid, angle table included, as a fresh `(q_out, k_out)`."""
     rope_dim = q.shape[-1] // 2
     axis_dim = rope_dim // 2
     positions = _spatial_merge_positions(grid_thw.tolist(), spatial_merge_size)
@@ -110,7 +109,7 @@ def _distribution(got: torch.Tensor, want: torch.Tensor) -> Tuple[float, float, 
     return cos, rel_l2, torch.quantile(err, 0.999).item()
 
 
-#: `vision_rope_2d__r52`'s distribution gates: both sides round the same fp32 rotation to bf16
+#: The distribution gates against `_grid_reference`: both sides round the same fp32 rotation to bf16
 #: once, so they differ by at most one bf16 ulp per element, at most 2^-7 of its value: the
 #: relative L2 is bounded by that, and 1 - cosine by half its square.
 _REL_L2_BOUND = 2.0**-7
@@ -148,23 +147,25 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
     print(f"[{cell.why}] tokens={tokens} vs reference: {differing} differing, max {max_dev:.3e}")
     assert differing == 0, f"{differing} elements differ from reference (max {max_dev:.3e})"
 
-    # 2. vision_rope_2d__r52's whole-op reference from the grid: bitwise, plus its
+    # 2. The whole-op reference from the grid: bitwise, plus its
     # distribution gates.
-    q_r52, k_r52 = _r52_reference(
+    q_grid, k_grid = _grid_reference(
         before[:, :NUM_HEADS], before[:, NUM_HEADS : 2 * NUM_HEADS], grid_thw, MERGE, THETA
     )
     for name, got, ref in (
-        ("q", qkv[:, :NUM_HEADS], q_r52),
-        ("k", qkv[:, NUM_HEADS : 2 * NUM_HEADS], k_r52),
+        ("q", qkv[:, :NUM_HEADS], q_grid),
+        ("k", qkv[:, NUM_HEADS : 2 * NUM_HEADS], k_grid),
     ):
         differing, max_dev = _mismatch(got, ref)
         cos_sim, rel_l2, p999 = _distribution(got, ref)
         print(
-            f"[{cell.why}] {name} vs r52: {differing} differing, max {max_dev:.3e}, "
+            f"[{cell.why}] {name} vs the grid reference: {differing} differing, max {max_dev:.3e}, "
             f"cos={cos_sim:.9f} rel_l2={rel_l2:.3e} p99.9={p999:.3e}"
         )
         assert cos_sim >= _COS_BOUND and rel_l2 <= _REL_L2_BOUND, (name, cos_sim, rel_l2)
-        assert differing == 0, f"{name}: {differing} elements differ from r52 (max {max_dev:.3e})"
+        assert differing == 0, (
+            f"{name}: {differing} elements differ from the grid reference (max {max_dev:.3e})"
+        )
 
 
 def _small():

@@ -66,9 +66,9 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16).
-    # The default target's HC mixers run this form at every row count, on the fresh
-    # fp32 `cublas_mm` output over the first `hc_first_cols` = ceil((320 + 4) / 32) * 32
-    # = 352 columns of the first projection: hence the 352-wide cells.
+    # The default target's HC mixers run this form on the fresh fp32 `cublas_mm` output
+    # over the first `hc_first_cols` = ceil((320 + 4) / 32) * 32 = 352 columns of the
+    # first projection: hence the 352-wide cells.
     CELLS: tuple[Cell, ...] = (
         Cell(why="checkpoint rank 320 + 4, padded to 384, 128 rows", spec=dict(rows=128)),
         Cell(why="checkpoint rank 320 + 4, padded to 384, prefill 8192", spec=dict(rows=8192)),
@@ -96,14 +96,16 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     )
 
     note = """
-    Metadata consumed: none. Call sites: every hyper-connection mixer, between
-    the first projection (`cublas_mm`, fp32 out, 352 columns) and the up
-    projection. HC is replicated, so the rows are this rank's tokens at every
-    member: decode 1..128 (tp4 / tep4) or 1..32 (a dep4 rank), MTP verify up to
-    128 x 8 = 1024 rows (tep4, draft 7), prefill one chunk of up to 8192 rows
-    (`max_num_tokens`). Preconditions: `logits` fp32, unit column stride, at
-    least `rank (+ hc_count)` columns; `hc_count` a power of two.
-    Graph-capturable.
+    Metadata consumed: none. Call sites: `_hc_first`, every hyper-connection
+    mixer of a step past `_HC_TC_FIRST_MAX_ROWS` (256) rows -- smaller steps
+    run `qwen4_exp_hc_decode_tc_first` -- between the first projection
+    (`cublas_mm`, fp32 out, 352 columns) and the up projection. HC is
+    replicated, so the rows are this rank's tokens at every member: MTP verify
+    up to 128 x 8 = 1024 rows (tep4, draft 7) and prefill chunks of up to 8192
+    rows (`max_num_tokens`); at one rank, prefill steps from
+    `_HC_RSTD_MIN_ROWS` rows take `qwen4_exp_hc_first_rescale_tc` instead.
+    Preconditions: `logits` fp32, unit column stride, at least
+    `rank (+ hc_count)` columns; `hc_count` a power of two. Graph-capturable.
 
     Source: a Triton kernel JIT-compiled at first call for the running device;
     the cells ran on sm_103. One program per row with an int64 row offset;

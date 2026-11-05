@@ -391,26 +391,23 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     note = """
     Metadata consumed: none.
 
-    Call site as qwen3.8-flash-next-nvfp4's `_gdn_block` makes it (in place of
-    the Triton `chunk_gated_delta_rule`):
-    the same positional arguments, `(q, k, v, g, beta, None, ssm_states,
-    si, True, False, qsl_long, False, False, None)` with `head_first=False`
-    in the 12th slot, after `fused_gdn_post_conv` (q/k already normalized,
-    contiguous `[1, T, H, 128]`; `g` fp32 log-space; `beta` fp32). Give it
-    context rows only: single-token rows are slow here, and belong to
-    FlashInfer's decode kernel (`gdn_decode.gated_delta_rule_decode_pretranspose`).
+    Call site (`PrefillTarget._gdn_core`, every step with context rows, verify steps
+    included): the context rows by keyword after
+    `gdn_prefill_conv_post(linear_gate=True)` -- q/k already L2-normalized, contiguous
+    `[1, T, H, 128]`; `g` the linear decay `exp(g)`; `beta` fp32 -- with `scale=None`,
+    the layer's pool as `initial_state` indexed by the context rows' slots,
+    `inplace_indexed_state_update=True`, `output_final_state=False`, int64
+    `cu_seqlens`, `head_first=False`, `use_qk_l2norm_in_kernel=False`, `output=` a
+    prefix view, `has_initial_state` and `linear_gate=True`. Give it context rows
+    only: single-token rows are slow here, and belong to FlashInfer's decode kernel
+    (`gdn_decode.gated_delta_rule_decode_pretranspose`).
 
-    The target (`PrefillTarget._gdn_core`, `_gdn_core_verify`) passes the
-    context rows by keyword after `gdn_prefill_conv_post(linear_gate=True)`,
-    with `has_initial_state` and `linear_gate=True`.
-
-    Call site with `has_initial_state` (`hi_p` / `hi_all`, the flags
-    `reset_recurrent_state_rows` would zero the fresh slots by): a fresh
-    sequence's slot is never read, and the scatter writes every named slot,
-    so the reset of the recurrent pool before this call is not needed (the
-    conv pass reads no carry for such a sequence and its publish writes the
-    whole conv window). Bitwise the reset followed by the plain call; the
-    gather moves only the carried sequences' rows.
+    With `has_initial_state` (`hi_p` / `hi_all`): a fresh sequence's slot is never
+    read, and the scatter writes every named slot, so the fresh slots of the
+    recurrent pool need no zeroing before this call (the conv pass reads no carry
+    for such a sequence and its publish writes the whole conv window). Bitwise
+    zeroing the fresh slots followed by the plain call; the gather moves only the
+    carried sequences' rows.
 
     Certified at the 461-slot fp32 pool: three ragged context rows and one
     8192-token row, each into an `output=` buffer, and an 8-token context

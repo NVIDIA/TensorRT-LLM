@@ -355,12 +355,12 @@ class Bf16GemvPdl(OpWrapper):
     order differs from the fp32 reference.
 
     Hard limits
-      M     rows per launch          boundary MAX_ROWS=4      driven at 1 (cells)
+      M     rows per launch          boundary MAX_ROWS=4      driven at 1 and 4 (cells)
       K     a TILING key             2560, 6144, 640, 1536    all driven
       N     any; the outputs per CTA halve until they divide N    N=1 driven
 
     The test also replays a PDL chain of these GEMVs under a CUDA graph, each
-    reading the one before it.
+    reading the one before it, and pins the guard's refusal of a row-major `mat_b`.
 
     Not certified: M = 2..4 at K other than 1536; PDL disabled in the environment (the
     PDL-off cell is the same kernel without the attribute).

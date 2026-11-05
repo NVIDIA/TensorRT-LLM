@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: `fp8_gemv` / `fp8_gemv_conv1d` / `fp8_gemv_conv1d_verify` against an fp32
 reference over the dequantized weight (128x128-block e4m3), per cell; the verify entry also
-bitwise against the two-launch path it replaces (`fp8_gemv` + `causal_conv1d_triton_update`);
-strided activations."""
+bitwise against the same step in two launches (`fp8_gemv` + `causal_conv1d_triton_update`);
+strided activations; CUDA-graph replay of `fp8_gemv` and the verify entry."""
 
 import pytest
 import torch
@@ -114,8 +114,8 @@ def _verify_args(spec, seed):
 
 
 def _two_launch(x, packed, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad):
-    """The target's verify path before the fusion: the projection, then the Triton conv over
-    the transposed q|k|v view; returns `(conv, rest)` in the fused entry's layout."""
+    """The verify step in two launches: the projection, then the Triton conv over the
+    transposed q|k|v view; returns `(conv, rest)` in the fused entry's layout."""
     proj = fp8_gemv_op(x, packed)
     n = x.shape[0] // p
     x3 = torch.transpose(torch.reshape(proj[:, :conv_dim], [n, p, conv_dim]), 1, 2)
@@ -176,3 +176,46 @@ def test_conv1d_verify_cells(cell) -> None:
             assert not torch.equal(window_a[r, :p], window[r, :p]), r
     if spec["snapshot_steps"] > p:
         assert torch.equal(window_a[:, p:], window[:, p:]), "steps past p untouched"
+
+
+def test_graph_replay_matches_eager() -> None:
+    _, _, packed = _weight(2560, 6144, 5)
+    x = torch.randn(4, 6144, device=DEV).to(torch.bfloat16)
+    fp8_gemv_op(x, packed)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fp8_gemv_op(x, packed)
+    x.copy_(torch.randn(4, 6144, device=DEV).to(torch.bfloat16))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, fp8_gemv_op(x, packed))
+
+
+def test_conv1d_verify_graph_replay_matches_eager() -> None:
+    spec = fp8_gemv_conv1d_verify_op.CELLS[2].spec
+    _, _, packed = _weight(spec["n"], spec["k"], 5)
+    x, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad = _verify_args(spec, 9)
+    state0, window0 = conv_state.clone(), window.clone()
+    fp8_gemv_conv1d_verify_op(
+        x, packed, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        conv, rest = fp8_gemv_conv1d_verify_op(
+            x, packed, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad
+        )
+    x.copy_(torch.randn(x.shape, device=DEV).to(torch.bfloat16))
+    conv_state.copy_(state0)
+    window.copy_(window0)
+    graph.replay()
+    torch.cuda.synchronize()
+    got = (conv.clone(), rest.clone(), conv_state.clone(), window.clone())
+    conv_state.copy_(state0)
+    window.copy_(window0)
+    want = fp8_gemv_conv1d_verify_op(
+        x, packed, conv_state, conv_weight, idx, window, rows, conv_dim, p, pad
+    )
+    for a, b in zip(got, (*want, conv_state, window)):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))

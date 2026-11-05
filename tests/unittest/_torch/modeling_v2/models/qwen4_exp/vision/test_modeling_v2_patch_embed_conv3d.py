@@ -6,7 +6,8 @@ The reference is a true-fp32 matmul of the flattened patch against the
 flattened filter. The op is the same contraction made by cuBLASLt, so each
 cell also holds the reference to an fp32 `F.conv3d` of the 5-D patches: that
 pins the flatten order the two share to `nn.Conv3d`'s rather than letting one
-restate the other.
+restate the other. Beyond the cells: each guard against a measured silent
+answer, and graph capture.
 """
 
 import contextlib
@@ -92,6 +93,14 @@ def _operands(
     return pixel_values, weight, bias_t
 
 
+def _is_close(out, ref) -> bool:
+    try:
+        torch.testing.assert_close(out, ref)
+    except AssertionError:
+        return False
+    return True
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
@@ -111,3 +120,102 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     torch.testing.assert_close(ref32, _conv3d_fp32(pixel_values, weight, bias))
 
     _compare(out, op.reference(pixel_values, weight, bias))
+
+
+def test_guard_refuses_rows_that_are_not_one_patch() -> None:
+    """Two patches per row are split into twice the rows, without an error."""
+    pixel_values, weight, bias = _operands(8, seed=8)
+    doubled = pixel_values.reshape(4, 2 * PATCH_NUMEL)
+    assert op(doubled, weight, bias).shape == (8, EMBED_DIM)
+    with pytest.raises(AssertionError, match="each row must be exactly one patch"):
+        with validating(op):
+            op(doubled, weight, bias)
+
+
+def test_guard_refuses_strided_pixel_rows() -> None:
+    """A row-strided view (2-D, or 5-D with a batch stride) still views to
+    `[N, 1536]` and is read as if dense."""
+    pixel_values, weight, bias = _operands(256, seed=21)
+    ref = op.reference(pixel_values, weight, bias)
+    wide = torch.zeros(256, 2 * PATCH_NUMEL, dtype=pixel_values.dtype, device="cuda")
+    wide[:, :PATCH_NUMEL] = pixel_values
+    batched = torch.zeros(256, 2, IN_CHANNELS, KT, KH, KW, dtype=pixel_values.dtype, device="cuda")
+    batched[:, 0] = pixel_values.view(256, IN_CHANNELS, KT, KH, KW)
+    for strided in (wide[:, :PATCH_NUMEL], batched[:, 0]):
+        assert not strided.is_contiguous()
+        assert not _is_close(op(strided, weight, bias), ref), "the hazard this guard covers is gone"
+        with pytest.raises(AssertionError, match="pixel_values must be contiguous"):
+            with validating(op):
+                op(strided, weight, bias)
+
+
+def test_guard_refuses_a_strided_weight() -> None:
+    """A weight sliced along its output channels views to `[1152, 1536]` and is
+    read as if dense."""
+    pixel_values, weight, bias = _operands(256, seed=22)
+    ref = op.reference(pixel_values, weight, bias)
+    stacked = torch.zeros(2 * EMBED_DIM, IN_CHANNELS, KT, KH, KW, dtype=weight.dtype, device="cuda")
+    stacked[::2] = weight
+    sliced = stacked[::2]
+    assert not _is_close(op(pixel_values, sliced, bias), ref), (
+        "the hazard this guard covers is gone"
+    )
+    with pytest.raises(AssertionError, match="weight must be contiguous"):
+        with validating(op):
+            op(pixel_values, sliced, bias)
+
+
+def test_guard_refuses_a_bias_the_epilogue_misreads() -> None:
+    """A bias in another dtype, or strided, is read as dense output-dtype
+    elements: a plausible answer from the wrong bias. A short one is read past
+    its end, so it is refused without calling the op."""
+    pixel_values, weight, bias = _operands(256, seed=23)
+    ref = op.reference(pixel_values, weight, bias)
+    spread = torch.zeros(2 * EMBED_DIM, dtype=bias.dtype, device="cuda")
+    spread[::2] = bias
+    for bad, match in (
+        (bias.float(), "bias dtype"),
+        (bias.half(), "bias dtype"),
+        (spread[::2], "contiguous"),
+    ):
+        assert not _is_close(op(pixel_values, weight, bad), ref), (
+            "the hazard this guard covers is gone"
+        )
+        with pytest.raises(AssertionError, match=match):
+            with validating(op):
+                op(pixel_values, weight, bad)
+    with pytest.raises(AssertionError, match="contiguous \\[1152\\]"):
+        with validating(op):
+            op(pixel_values, weight, bias[: EMBED_DIM // 2].contiguous())
+
+
+def test_guard_refuses_fp32_with_a_bias() -> None:
+    """fp32 input drops the bias: the answer is the bias-free product."""
+    pixel_values, weight, bias = _operands(256, dtype=torch.float32, seed=24)
+    out = op(pixel_values, weight, bias)
+    torch.testing.assert_close(out, op.reference(pixel_values, weight, None))
+    assert not _is_close(out, op.reference(pixel_values, weight, bias))
+    with pytest.raises(AssertionError, match="dropped for fp32"):
+        with validating(op):
+            op(pixel_values, weight, bias)
+
+
+@pytest.mark.parametrize("num_patches", [64, 32768])
+def test_cuda_graph_capture_and_replay(num_patches) -> None:
+    pixel_values, weight, bias = _operands(num_patches, seed=12)
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            op(pixel_values, weight, bias)
+    torch.cuda.current_stream().wait_stream(warmup)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(pixel_values, weight, bias)
+
+    pixel_values.copy_(_operands(num_patches, seed=13)[0])
+    graph.replay()
+    torch.cuda.synchronize()
+    _compare(captured, op.reference(pixel_values, weight, bias))

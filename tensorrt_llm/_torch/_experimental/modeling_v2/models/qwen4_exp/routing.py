@@ -16,7 +16,7 @@ one node.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -28,6 +28,7 @@ from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.mapping import Mapping
 
 # The GPU the target is certified on.
 _SM = (10, 3)
@@ -74,14 +75,9 @@ _LAYOUTS = {
 # The attention-DP layouts MTP is admitted at: those its draft acceptance was measured at.
 _ATTENTION_DP_MTP_LAYOUTS = ("dep4",)
 
-# A prefill step scores and selects its context rows (at most max_num_tokens) in one call,
-# and `qsa_paged_index_scores` (output rows) and `qsa_topk_expand_decode` (row layouts) index
-# the score table in int32: rows x columns must stay below 2^31. The table has
-# `indexer_compress_ratio`-compressed columns over the KV manager's `max_blocks_per_seq`
-# pages: the sequence plus its generation lead (at most twice the widest verify step),
-# padded to a multiple of 4 pages.
-_SCORE_TABLE_ELEMENTS = 2**31
-_GENERATION_LEAD_TOKENS = 2 * (_MAX_DRAFT_LEN + 1)
+# The layouts with expert parallelism, where the engine builds an EPLB balancer for
+# `moe_config.load_balancer`; the target cuts fixed contiguous expert windows.
+_EXPERT_PARALLEL_LAYOUTS = tuple(member for key, member in _LAYOUTS.items() if key[3] > 1)
 
 
 class EngineChoices(NamedTuple):
@@ -93,6 +89,7 @@ class EngineChoices(NamedTuple):
     mamba_ssm_cache_dtype: torch.dtype  # the recurrent-state cache's dtype
     gdn_replay: bool  # TRTLLM_USE_GDN_REPLAY, which the engine reads for eligible MTP workloads
     prefill_cuda_graph_backend: str  # `prefill_cuda_graph_backend`: disabled, piecewise, breakable
+    load_balancer: bool  # `moe_config.load_balancer` is set (EPLB)
 
 
 def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineChoices:
@@ -109,10 +106,11 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
         ),
         gdn_replay=is_gdn_replay_enabled(),
         prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
+        load_balancer=llm_args.moe_config.load_balancer is not None,
     )
 
 
-def layout(mapping) -> Optional[str]:
+def layout(mapping: Mapping) -> Optional[str]:
     """The target's layout ``mapping`` describes (``tp1``, ``tp4``, ``tep4``, ``dep4``,
     ``dep2``), or None.
 
@@ -139,7 +137,7 @@ def layout(mapping) -> Optional[str]:
     )
 
 
-def _describe(mapping) -> str:
+def _describe(mapping: Mapping) -> str:
     return (
         f"world_size={mapping.world_size} (tp={mapping.tp_size}, pp={mapping.pp_size}, "
         f"cp={mapping.cp_size}, attention_dp={mapping.enable_attention_dp}, "
@@ -148,8 +146,8 @@ def _describe(mapping) -> str:
 
 
 def _check_engine(
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
+    spec_config: Optional[MTPDecodingConfig],
+    kv_cache_quant_algo: Optional[QuantAlgo],
     engine: EngineChoices,
     member: str,
 ) -> None:
@@ -190,6 +188,12 @@ def _check_engine(
             f"a {engine.mamba_ssm_cache_dtype} recurrent-state cache; at {member} the target "
             f"serves {served} (kv_cache_config.mamba_ssm_cache_dtype)"
         )
+    if engine.load_balancer and member in _EXPERT_PARALLEL_LAYOUTS:
+        raise NoTarget(
+            f"moe_config.load_balancer (EPLB) at {member}: the target runs fixed contiguous "
+            "expert windows and registers no layer with the balancer, so the placement would "
+            "do nothing"
+        )
     if engine.prefill_cuda_graph_backend == "piecewise":
         raise NoTarget(
             "prefill_cuda_graph_backend='piecewise' makes the engine torch.compile the model, "
@@ -212,28 +216,9 @@ def _check_engine(
         )
 
 
-def _check_score_table(
-    max_num_tokens: int,
-    max_seq_len: Optional[int],
-    tokens_per_block: int,
-    compress_ratio: Optional[int],
+def _check_attention_dp(
+    member: str, spec_config: Optional[MTPDecodingConfig], engine: EngineChoices
 ) -> None:
-    """Decline a prefill step whose score table would pass 2^31 elements (see
-    `_SCORE_TABLE_ELEMENTS`); an unknown max_seq_len or compression is not checked."""
-    if max_seq_len is None or compress_ratio is None:
-        return
-    pages = -(-(max_seq_len + _GENERATION_LEAD_TOKENS) // tokens_per_block)
-    columns = -(-pages // 4) * 4 * tokens_per_block // compress_ratio
-    if max_num_tokens * columns >= _SCORE_TABLE_ELEMENTS:
-        raise NoTarget(
-            f"max_num_tokens={max_num_tokens} at max_seq_len={max_seq_len}: a prefill step's "
-            f"context rows score a {columns}-column table, and the target indexes it in int32 "
-            f"up to 2^31 elements; set max_num_tokens to at most "
-            f"{(_SCORE_TABLE_ELEMENTS - 1) // columns}"
-        )
-
-
-def _check_attention_dp(member: str, spec_config: Optional[Any], engine: EngineChoices) -> None:
     """Decline what the target does not run under attention DP (dep4, dep2), where
     each rank serves its own requests and only the routed experts cross ranks.
 
@@ -304,8 +289,8 @@ def route(
     # single MTP module, and no other draft path. A draft longer than seven needs
     # more verify rows per request than the GDN cached replay and thop_attention
     # are certified at. The draft must also be a linear chain over that one
-    # module; the target asserts each of these at construction, so declining here
-    # is what lets ``auto`` fall back instead of crashing.
+    # module. The target's constructor relies on each of these, so declining here
+    # is what lets ``auto`` fall back to the built-in model.
     mtp_eagle_or_none = spec_config is None or (
         isinstance(spec_config, MTPDecodingConfig)
         and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
@@ -325,12 +310,6 @@ def route(
         if mapping.enable_attention_dp:
             _check_attention_dp(member, spec_config, engine)
         _check_engine(spec_config, kv_cache_quant_algo, engine, member)
-        _check_score_table(
-            llm_args.max_num_tokens or model_config.max_num_tokens,
-            llm_args.max_seq_len or getattr(text, "max_position_embeddings", None),
-            llm_args.kv_cache_config.tokens_per_block,
-            getattr(text, "indexer_compress_ratio", None),
-        )
         # One line on purpose: the claims suite reads the routed target off the
         # `from .<target>.modeling import <Class>` line.
         # fmt: off

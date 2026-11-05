@@ -5,7 +5,8 @@
 Cells against the fp32 reference within the band `low_m_bf16_mm` uses (the
 same products, summed in another order). Beyond the cells: a PDL chain under
 CUDA-graph capture and replay, where each GEMV consumes the previous one's
-output and so would read a stale activation if it read before its wait.
+output and so would read a stale activation if it read before its wait; and
+the layout guard.
 """
 
 import zlib
@@ -100,3 +101,9 @@ def test_dependent_chain_under_graph_replay(rows, dims, last_n) -> None:
             # Each link against the reference of what the previous link actually stored.
             _compare(out, op.reference(h, w))
             h = out
+
+
+def test_guard_refuses_a_row_major_mat_b() -> None:
+    mat_a, mat_b = _build(1, 512, 2560, seed=3)
+    with validating(op), pytest.raises(AssertionError):
+        op(mat_a, mat_b.contiguous())

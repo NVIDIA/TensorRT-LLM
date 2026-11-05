@@ -9,6 +9,8 @@ outside those slots. The tp1 cells run over separate contiguous planes and over 
 side-plane page of an FP8 / NVFP4 pool; the default target's cells over core's coalesced bf16 pool at a
 tep4 rank's measured page count, with the requests' pages drawn across it and the pool's first
 and last page among them, so the last is addressed past 2^31 elements from a plane's base.
+Beyond the cells: graph capture and replay of both calls at 1024 rows, and the guards on a
+strided `old`, a `num_planes` past the table and a short `within`.
 """
 
 import zlib
@@ -210,6 +212,52 @@ def test_restore_cells(cell, layout, certifying):  # noqa: F811
     _assert_far_page(cell.spec, pool, pages[rejected.bool()])
 
 
+def test_cuda_graph_replay():
+    """The verify step is graph-captured: both calls at the envelope's 1024 rows, captured
+    once, then replayed over a new step's slots written into the captured inputs."""
+    (cell,) = [c for c in qsa_rollback_gather.CELLS if c.spec["rows"] == 1024]
+    spec = cell.spec
+    g, pool, pages, within = _setup(cell, spec["layout"])
+    ptrs, strides = plane_table(pool.planes)
+    count, rows = len(pool.planes), pages.shape[0]
+    rejected = _rejected(spec, g)
+    old = torch.empty(count, rows, ROW, dtype=torch.bfloat16, device=DEV)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):  # Triton compiles on the first launch, outside the capture
+        old.copy_(qsa_rollback_gather(ptrs, strides, pages, within, count))
+        qsa_rollback_restore(ptrs, strides, pages, within, rejected, old)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    gather_graph, restore_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gather_graph):
+        gathered = qsa_rollback_gather(ptrs, strides, pages, within, count)
+    with torch.cuda.graph(restore_graph, pool=gather_graph.pool()):
+        qsa_rollback_restore(ptrs, strides, pages, within, rejected, old)
+
+    new_pages, new_within = _verify_slots(spec, 991)
+    assert not torch.equal(new_pages, pages)
+    pages.copy_(new_pages)
+    within.copy_(new_within)
+    rejected.copy_(_rejected(spec, g))
+    _fill(pool.planes, pages, within, g)
+
+    want_old = qsa_rollback_gather.reference(pool.planes, pages, within, count)
+    gather_graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(gathered.view(torch.int16), want_old.view(torch.int16))
+
+    old.copy_(gathered)
+    _fill(pool.planes, pages, within, g)
+    want = qsa_rollback_restore.reference(pool.planes, pages, within, rejected, old)
+    restore_graph.replay()
+    torch.cuda.synchronize()
+    got = _slots_now(pool.planes, pages, within)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
 def _small():
     spec = dict(planes=12, rows=16)
     g = torch.Generator(device=DEV).manual_seed(5)
@@ -217,3 +265,42 @@ def _small():
     pages, within = _slots(spec, 5, g)
     _fill(pool.planes, pages, within, g)
     return g, pool, pages, within
+
+
+def test_guard_refuses_a_strided_old():
+    """The kernel reads `old` as dense `[L, R, 128]`: a strided view restores the wrong values,
+    with no error."""
+    g, pool, pages, within = _small()
+    ptrs, strides = plane_table(pool.planes)
+    count, rows = len(pool.planes), pages.shape[0]
+    wide = torch.randn(count, rows, 2 * ROW, generator=g, device=DEV).to(torch.bfloat16)
+    old = wide[..., :ROW]
+    assert not old.is_contiguous()
+    rejected = torch.ones(rows, dtype=torch.bool, device=DEV)
+
+    want = qsa_rollback_restore.reference(pool.planes, pages, within, rejected, old)
+    qsa_rollback_restore(ptrs, strides, pages, within, rejected, old)
+    got = _slots_now(pool.planes, pages, within)
+    assert not torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+        "the hazard this guard covers is gone"
+    )
+
+    with validating(qsa_rollback_restore), pytest.raises(AssertionError, match="contiguous"):
+        qsa_rollback_restore(ptrs, strides, pages, within, rejected, old)
+
+
+def test_guard_refuses_more_planes_than_the_table_holds():
+    """Not driven unguarded: the kernel would read addresses past the table's end."""
+    _, pool, pages, within = _small()
+    ptrs, strides = plane_table(pool.planes[:-1])
+    with validating(qsa_rollback_gather), pytest.raises(AssertionError, match="num_planes"):
+        qsa_rollback_gather(ptrs, strides, pages, within, len(pool.planes))
+
+
+def test_guard_refuses_a_short_within():
+    """Not driven unguarded: rows are counted off `pages`, so `within` would be read past its
+    end."""
+    _, pool, pages, within = _small()
+    ptrs, strides = plane_table(pool.planes)
+    with validating(qsa_rollback_gather), pytest.raises(AssertionError, match=r"one \[R\] pair"):
+        qsa_rollback_gather(ptrs, strides, pages, within[:-1], len(pool.planes))

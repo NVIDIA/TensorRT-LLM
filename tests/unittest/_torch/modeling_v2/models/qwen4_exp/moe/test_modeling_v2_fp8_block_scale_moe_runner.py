@@ -6,7 +6,9 @@
 The entry owns the contract: `CELLS`, `reference`, `is_valid`. This
 file turns a cell into operands and holds the claims no cell carries: a warm
 autotuned tactic is bitwise the cold fallback the cells run (whole stack and
-window), and the default target's four windows sum to the 512-expert layer.
+window), the default target's four windows sum to the 512-expert layer, a
+window call refuses the whole stack's tensors loudly, and the two guards
+(contiguity, a window outside the routing space).
 """
 
 import zlib
@@ -229,6 +231,41 @@ def test_windows_sum_to_the_whole_stack(tokens):
             _compare(short.to(torch.bfloat16), ref)
 
 
+@pytest.mark.parametrize(
+    "name", ["gemm1_weights", "gemm1_weights_scale", "gemm2_weights", "gemm2_weights_scale"]
+)
+def test_window_call_refuses_the_whole_stack_loudly(name):
+    """A window call handed the whole stack's tensor raises: unlike the NVFP4
+    runner, this op compares every weight and scale's expert dim with
+    `local_num_experts`, so `is_valid` need not."""
+    a = _args(16, **CKPT, local_expert_offset=128, local_num_experts=128, seed=5)
+    stack = dict(
+        zip(
+            ("gemm1_weights", "gemm1_weights_scale", "gemm2_weights", "gemm2_weights_scale"),
+            _weights(2560, 640, 512, seed=2560 + 640 + 512),
+        )
+    )
+    with pytest.raises(RuntimeError, match=f"{name} has incorrect"):
+        op(**dict(a, **{name: stack[name]}))
+
+
+def test_guard_refuses_a_window_outside_the_routing_space():
+    """`num_experts` passed as the window's own count: the raw op answers all
+    zeros with no error, and `is_valid` refuses it.
+
+    Probed at one token only. At 16 rows the same call reads out of bounds (an
+    illegal memory access that would end this process), recorded in the note.
+    """
+    a = _args(1, **CKPT, local_expert_offset=128, local_num_experts=128, seed=3)
+    assert _in_window(a).any(), "the probe needs a slot in the window"
+    wrong = dict(a, num_experts=128)
+    unguarded = op(**wrong)
+    assert torch.count_nonzero(unguarded) == 0, "the hazard this guard covers is gone"
+    assert torch.count_nonzero(op.reference(**a)) > 0
+    with validating(op), pytest.raises(AssertionError, match="outside the routing space"):
+        op(**wrong)
+
+
 # ── what a cell cannot carry ──────────────────────────────────────────────
 
 
@@ -255,3 +292,21 @@ def test_autotuned_tactic_matches_the_fallback_tactic(offset, local):
         _compare(warm, op.reference(**a))
     finally:
         AutoTuner.get().clear_cache()
+
+
+# ── the guards ────────────────────────────────────────────────────────────
+
+
+def _strided(t: torch.Tensor) -> torch.Tensor:
+    wide = torch.zeros(*t.shape[:-1], 2 * t.shape[-1], device=DEV, dtype=t.dtype)
+    wide[..., ::2] = t
+    view = wide[..., ::2]
+    assert not view.is_contiguous()
+    return view
+
+
+def test_guard_refuses_a_strided_hidden_states():
+    """What `is_valid` exists for: the raw op reads a strided operand as dense."""
+    a = _args(16, 256, 128, 8, 2, seed=11)
+    with validating(op), pytest.raises(AssertionError, match="must be contiguous"):
+        op(**dict(a, hidden_states=_strided(a["hidden_states"])))

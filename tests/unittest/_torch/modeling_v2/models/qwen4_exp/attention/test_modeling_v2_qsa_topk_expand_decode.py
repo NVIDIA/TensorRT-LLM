@@ -5,8 +5,9 @@
 Cells against the entry's reference (a stable descending sort, ties to the higher block,
 then the expansion entry's reference): the block list and the token selection exactly.
 Columns past each row's visible count carry garbage (huge values, NaN) that must never
-be read. Beyond the cells: the wide rows against the canonical composition, and a
-stale-read check under graph replay at each decode-path cell's shape.
+be read. Beyond the cells: the wide rows against the canonical composition, a
+stale-read check under graph replay at each decode-path cell's shape, and the
+`token_topk` guard.
 """
 
 import zlib
@@ -177,3 +178,21 @@ def test_reads_after_the_wait_under_graph_replay(spec) -> None:
         want_topk, want_sel = op.reference(src, *args[1:])
         assert torch.equal(got_topk, want_topk), f"replay {trial}: block list"
         assert torch.equal(graph_sel, want_sel), f"replay {trial}: token selection"
+
+
+def test_guard_refuses_a_token_budget_that_is_not_k_blocks() -> None:
+    """`token_topk` sizes the selection's rows while `k * compress_ratio` places the selected
+    tokens: a smaller budget writes past each row, into the next row and, for the last one,
+    past `out` -- here into the margin rows of a larger buffer, where it shows."""
+    spec = dict(rows=2, pos=(9215, 9211), relu_sparse=True, width=2304)
+    args = _build(spec, seed=5)
+    budget = TOKEN_TOPK // 2  # 256 blocks' worth, while 512 are selected
+    margin = 2
+    whole = torch.full((2 + 2 * margin, budget + CR - 1), -9, dtype=torch.int32, device=DEV)
+    args[6] = budget
+    op(*args, out=whole[margin : margin + 2])
+    torch.cuda.synchronize()
+    assert (whole[margin + 2 :] != -9).any(), "the hazard this guard covers is gone"
+
+    with validating(op), pytest.raises(AssertionError, match="token_topk = k \\* compress_ratio"):
+        op(*args, out=whole[margin : margin + 2])

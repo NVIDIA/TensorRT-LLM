@@ -23,6 +23,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
+    MoeConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
@@ -385,19 +386,22 @@ def test_the_piecewise_prefill_cuda_graph_declines():
     )
 
 
-@pytest.mark.parametrize("mapping_kwargs", [{}, _LAYOUTS["dep4"]], ids=["tp1", "dep4"])
-def test_a_prefill_step_past_the_int32_score_table_declines(mapping_kwargs):
-    """At the checkpoint's max_seq_len 262144 the score table is 65568 columns (8196 pages of
-    32 tokens at compression 4): 32752 context rows stay under 2^31 elements, 32768 do not."""
-    config = _model_config(
-        pretrained_config=_qwen4_exp_config(
-            {"max_position_embeddings": 262144, "indexer_compress_ratio": 4}
-        ),
-        **mapping_kwargs,
+@pytest.mark.parametrize("member", ["tep4", "dep4", "dep2"])
+def test_eplb_declines_at_the_expert_parallel_layouts(member):
+    """The engine builds an EPLB balancer only with expert parallelism; the target's windows
+    are fixed, so `auto` keeps the built-in model, which balances."""
+    mapping = _DEP2 if member == "dep2" else _LAYOUTS[member]
+    eplb = MoeConfig(load_balancer={"num_slots": 512})
+    _declined(_model_config(**mapping), match=r"load_balancer \(EPLB\)", moe_config=eplb)
+    _claimed(_model_config(**mapping))
+
+
+@pytest.mark.parametrize("mapping_kwargs", [{}, _LAYOUTS["tp4"]], ids=["tp1", "tp4"])
+def test_eplb_without_expert_parallelism_still_matches(mapping_kwargs):
+    """Without expert parallelism the engine builds no balancer, as for the built-in model."""
+    _claimed(
+        _model_config(**mapping_kwargs), moe_config=MoeConfig(load_balancer={"num_slots": 512})
     )
-    _claimed(config, max_num_tokens=32752)
-    _declined(config, match="max_num_tokens=32768 at max_seq_len=262144", max_num_tokens=32768)
-    _claimed(config, max_num_tokens=32768, max_seq_len=131072)
 
 
 @pytest.mark.parametrize("max_draft_len", [1, 3, 7])

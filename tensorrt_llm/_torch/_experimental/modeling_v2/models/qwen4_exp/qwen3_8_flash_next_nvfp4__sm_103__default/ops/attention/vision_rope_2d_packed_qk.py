@@ -31,11 +31,11 @@
 # `flash_attn/ops/triton/rotary.py`: `rotary_kernel` and `apply_rotary`.
 """Vision-tower 2-D rotary, in place on the q|k prefix of the packed qkv projection.
 
-The rotation half of the vision tower's 2-D axial rotary (`vision_rope_2d__r52` is the
-whole op, angle table included). The angle table depends only on the request's
-`grid_thw`, so the caller builds it once per tower forward -- spatial-merge `(row, col)`
-per token, fp64 angles rounded once to fp32, then `cos` / `sin` -- and every one of the 27
-blocks hands it here with that block's qkv projection output.
+The rotation half of the vision tower's 2-D axial rotary; the tower builds the angle
+table. The angle table depends only on the request's `grid_thw`, so the caller builds it
+once per tower forward -- spatial-merge `(row, col)` per token, fp64 angles rounded once
+to fp32, then `cos` / `sin` -- and every one of the 27 blocks hands it here with that
+block's qkv projection output.
 
 Tier 5: one Triton launch, flash-attn 2's `rotary_kernel` (BSD-3-Clause, header above)
 cut down to the path this call takes. flash-attn 2.x is not a pinned dependency
@@ -186,8 +186,8 @@ class VisionRope2dPackedQk(OpWrapper):
     itself, and the caller's qkv buffer holds the rotated q|k on return.
 
     Numerics: bitwise equal to `reference` (a complex multiply in fp32, rounded once) and
-    to `vision_rope_2d__r52.reference` (positions by nested loops, fp64 angles, `polar`)
-    at every cell, q and k alike: relative L2 0, cosine 1.
+    to the test's whole-op reference from the grid (positions by nested loops, fp64
+    angles, `polar`) at every cell, q and k alike: relative L2 0, cosine 1.
 
     Silent, refused by `is_valid` (each demonstrated unguarded in the test):
       - a bf16 (or any non-fp32) table: the kernel widens it and rotates by rounded

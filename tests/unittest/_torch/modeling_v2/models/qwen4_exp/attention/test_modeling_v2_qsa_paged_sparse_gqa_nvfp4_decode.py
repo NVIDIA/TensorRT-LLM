@@ -4,7 +4,8 @@
 `qsa_paged_sparse_gqa_nvfp4`
 and QSA's bf16 kernel over the dequantized pool, inside the NVFP4 op's band (4 ulp of each
 (row, head)'s max, 2 ulp relative RMS), over its cells with and without the output gate; plus
-an unaligned row slice of the selection.
+an unaligned row slice of the selection, determinism, and graph replay against eager at 1 and
+64 rows after every operand is rewritten in place.
 
 The tp4-heads cells run one tp4 / tep4 rank's 6 q heads over 1 KV head, q a view of the packed
 `[q | k | v]` rows as the target hands it. The dep4 cells run at one rank's pool as the engine
@@ -266,3 +267,36 @@ def test_unaligned_row_slice_of_the_selection() -> None:
         aligned[name] = args[name].clone()
     assert args["selected_tokens"].data_ptr() % 16
     assert torch.equal(op(**args), op(**aligned))
+
+
+def test_calls_are_bitwise_deterministic() -> None:
+    args = build(tuple((4000 + 37 * i, 2) for i in range(4)), seed=8800)
+    assert torch.equal(op(**args), op(**args))
+
+
+@pytest.mark.parametrize("rows", [1, 64])
+def test_replay_matches_eager(rows) -> None:
+    segments = (
+        ((4000, 1),) if rows == 1 else tuple((100 + (499 * g) % 8000, 1) for g in range(rows))
+    )
+    args = build(segments, seed=77)
+    fresh = build(segments, seed=127)
+    op(**args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(**args)
+    for name in (
+        "q",
+        "k_cache",
+        "v_cache",
+        "k_scale_cache",
+        "v_scale_cache",
+        "block_table",
+        "selected_tokens",
+        "request_indices",
+    ):
+        args[name].copy_(fresh[name])
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, op(**fresh))

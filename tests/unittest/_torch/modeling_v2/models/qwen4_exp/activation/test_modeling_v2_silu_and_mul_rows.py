@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the silu_and_mul_rows entry: the cells bitwise `flashinfer_silu_and_mul` on a
 contiguous copy of the gate|up columns (and so inside its reference band) with the fused
-output's extra columns present."""
+output's extra columns present, graph capture, the width guard."""
 
 import zlib
 
@@ -42,3 +42,27 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     torch.testing.assert_close(out, op.reference(x, INTER))
     if x.shape[0]:
         assert torch.equal(out, flashinfer_silu_and_mul(x[:, : 2 * INTER].contiguous()))
+
+
+@pytest.mark.parametrize("rows", [1, 32, 128])
+def test_cuda_graph_capture_and_replay(rows) -> None:
+    """The decode call sites run captured: one request, a dep4 rank's 32, a 128-request batch."""
+    x = _build(dict(rows=rows), 8)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        op(x, INTER)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(x, INTER)
+    x.copy_(_build(dict(rows=rows), 9))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, op(x, INTER))
+
+
+def test_guards() -> None:
+    x = _build(dict(rows=4), 5)
+    with validating(op), pytest.raises(AssertionError):
+        op(x[:, : 2 * INTER - 2], INTER)
