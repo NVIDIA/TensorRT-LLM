@@ -485,8 +485,8 @@ class PrimsTSFmha(PhasedFmha):
                 return False, "MLA context requires contiguous K and matching Q/K/V dtype/device."
             if v.stride(1) != 1 or v.stride(0) < attn.num_heads * attn.v_head_dim:
                 return False, "MLA context requires nonoverlapping V rows with unit feature stride."
-            if is_fp8_mla and v.stride(0) * v.element_size() % 16:
-                return False, "FP8 MLA context requires a 16-byte-aligned V token stride."
+            if v.stride(0) * v.element_size() % 16:
+                return False, "MLA context requires a 16-byte-aligned V token stride."
             if output.numel() != q.shape[0] * attn.num_heads * attn.v_head_dim:
                 return False, "MLA context output has an incompatible extent."
         elif is_mla:
@@ -1338,13 +1338,15 @@ class PrimsTSFmha(PhasedFmha):
             ("kv_indptr", (batch_size + 1,), torch.int32),
             ("bmm1_scale", (2,), torch.float32),
             ("bmm2_scale", (1,), torch.float32),
-            (
-                "v",
-                (k.shape[0], self.attn.num_heads * self.attn.v_head_dim),
-                torch.float8_e4m3fn if fp8 else q.dtype,
-            ),
         ]
         if fp8:
+            tensors.append(
+                (
+                    "v",
+                    (k.shape[0], self.attn.num_heads * self.attn.v_head_dim),
+                    torch.float8_e4m3fn,
+                )
+            )
             tensors.extend(
                 (name, tuple(tensor.shape), torch.float8_e4m3fn)
                 for name, tensor in (("q", q), ("k", k))
@@ -1380,7 +1382,7 @@ class PrimsTSFmha(PhasedFmha):
         attn._ensure_rope_table_size(meta.max_seq_len)
         fp8 = QuantMode(attn.quant_mode).has_fp8_kv_cache()
         q_processed, k_processed = (buffers["q"], buffers["k"]) if fp8 else (q, k)
-        v_processed = buffers["v"]
+        v_processed = buffers["v"] if fp8 else v
         sm_scale = self._get_bmm1_scale(attn)
         torch.ops.trtllm.mla_context_preprocess(
             q,

@@ -144,7 +144,7 @@ void mlaContextPreprocess(torch::Tensor q, torch::Tensor k, torch::Tensor const&
     TORCH_CHECK(!mode.hasInt8KvCache() && !mode.hasFp4KvCache());
     bool const fp8 = mode.hasFp8KvCache();
     auto const output_dtype = fp8 ? torch::kFloat8_e4m3fn : q.scalar_type();
-    for (auto const& tensor : {q_out, k_out, v_out})
+    for (auto const& tensor : {q_out, k_out})
     {
         CHECK_INPUT(tensor, output_dtype);
         TORCH_CHECK(tensor.device() == q.device());
@@ -154,17 +154,22 @@ void mlaContextPreprocess(torch::Tensor q, torch::Tensor k, torch::Tensor const&
     CHECK_INPUT(bmm2_scale, torch::kFloat32);
     TORCH_CHECK(bmm1_scale.numel() == 2 && bmm2_scale.numel() == 1);
     TORCH_CHECK(bmm1_scale.device() == q.device() && bmm2_scale.device() == q.device());
+    constexpr int64_t kVectorAlignmentBytes = 16;
+    TORCH_CHECK(v.stride(0) * v.element_size() % kVectorAlignmentBytes == 0,
+        "MLA context requires a 16-byte-aligned V token stride");
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(v.data_ptr()) % kVectorAlignmentBytes == 0,
+        "MLA context requires a 16-byte-aligned V pointer");
     if (fp8)
     {
-        constexpr int64_t kVectorAlignmentBytes = 16;
-        TORCH_CHECK(v.stride(0) * v.element_size() % kVectorAlignmentBytes == 0,
-            "FP8 MLA context requires a 16-byte-aligned V token stride");
-        TORCH_CHECK(reinterpret_cast<std::uintptr_t>(v.data_ptr()) % kVectorAlignmentBytes == 0,
-            "FP8 MLA context requires a 16-byte-aligned V pointer");
+        CHECK_INPUT(v_out, output_dtype);
+        TORCH_CHECK(v_out.device() == q.device());
     }
     else
     {
         TORCH_CHECK(q_out.data_ptr() == q.data_ptr() && k_out.data_ptr() == k.data_ptr());
+        TORCH_CHECK(v_out.device() == v.device() && v_out.scalar_type() == v.scalar_type()
+                && v_out.data_ptr() == v.data_ptr() && v_out.strides() == v.strides(),
+            "Non-FP8 MLA context must preserve the input V view");
     }
     for (auto const& scale : {kv_scale_orig_quant, kv_scale_quant_orig})
     {
@@ -233,11 +238,6 @@ void mlaContextPreprocess(torch::Tensor q, torch::Tensor k, torch::Tensor const&
     else
     {
         launch(half{});
-    }
-    if (!fp8)
-    {
-        // Q/K alias the caller's inputs; only V's split projection needs packing.
-        v_out.copy_(v);
     }
 }
 
