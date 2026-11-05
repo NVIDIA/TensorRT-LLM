@@ -21,6 +21,12 @@ Two questions decide what happens to it, and two different owners answer them:
     is flushed right after it, so that copy has landed before anything that runs next. Only the anchor's own write
     is guaranteed: a reader that needs other merged data anchors on those sites too.
 
+  - ``parallel_scatter`` and ``final_flush=InGraph(...)``: how a segment is issued. With ``parallel_scatter`` an
+    order-free segment (see ``_parallel_ok``) is scattered with one program per copy. With an ``InGraph`` final flush
+    every decode graph is captured with a prologue that issues a pinned window, and the final flush before a replay
+    only fills that window, so no operation is left between the decode graphs. Barrier segments stay eager: only the
+    last segment rides the window, and only when it fits and is order-free.
+
   Listing a site in ``merge`` asserts that between the call and its barrier no device work reads or writes the
   destination, nor, for a device-to-device copy, writes the source (which is read at the flush). A site in neither
   set, and every site of an engine whose model declares no plan, is ``dst.copy_(src, non_blocking=True)``.
@@ -57,9 +63,11 @@ import os
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator, Optional, Protocol
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 
@@ -115,11 +123,52 @@ class CopySite(CopySiteEnum):
     MAMBA_STATE_INDICES = ("mamba.state_indices", Direction.H2D)
     MAMBA_DUMMY_REQUEST_MASK = ("mamba.dummy_request_mask", Direction.H2D)
     MAMBA2_METADATA_STATE_INDICES = ("mamba2_metadata.state_indices", Direction.H2D)
-    # SpecMetadata: the one-model speculative sampler's per-step Philox seeds and offsets (the forward reads them first).
+    # SpecMetadata: the one-model speculative sampler's per-step Philox seeds and offsets (first read by the forward).
     SPEC_RNG_REQUEST_SEEDS = ("spec.rng_request_seeds", Direction.H2D)
     SPEC_RNG_REQUEST_OFFSETS = ("spec.rng_request_offsets", Direction.H2D)
     SPEC_RNG_SEEDS = ("spec.rng_seeds", Direction.H2D)
     SPEC_RNG_OFFSETS = ("spec.rng_offsets", Direction.H2D)
+
+
+class PrologueOp(Protocol):
+    """A model's one-launch in-graph prologue (``InGraph.prologue_op``).
+
+    Called inside the capture as ``op(window, epoch_or_None, max_desc)``: it writes the window's host copies, then its
+    device copies (at most ``max_desc`` of each), zeroes the window's header and, with an epoch, increments
+    ``epoch[0]`` once. It writes exactly what the default prologue (two scatter launches and a header fill) writes.
+    """
+
+    def __call__(
+        self, window: torch.Tensor, epoch: Optional[torch.Tensor], max_desc: int
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class InGraph:
+    """The step's final barrier issued by the replayed decode graph itself (``CopyPlan.final_flush``).
+
+    Every decode graph is captured with a prologue that scatters a fixed window, and the final flush before a replay
+    only fills that window on the host: no operation is left between the decode graphs. Only the step's last segment
+    rides the window, and only when it fits and is order-free (see ``_parallel_ok``); otherwise it is issued eagerly
+    and the window is left empty. A graph whose runner has pre-replay hooks is captured without a prologue, since the
+    hooks read the static inputs before the replay.
+
+    ``early_copy``: the window is uploaded on a side copy stream into a device buffer of the prologue's own while the
+    previous graph may still run; the prologue then waits for that upload and scatters device to device.
+    ``prologue_op``: the model's one-launch prologue (needs ``early_copy``). ``step_epoch``: the prologue increments
+    one int64 device counter once per replay (``step_epoch()``), never reset, so kernels later in the graph can tag
+    per-step device flags with it instead of clearing them between steps.
+    """
+
+    early_copy: bool = False
+    prologue_op: Optional[PrologueOp] = None
+    step_epoch: bool = False
+
+    def __post_init__(self) -> None:
+        if self.prologue_op is not None and not self.early_copy:
+            raise ValueError(
+                "InGraph.prologue_op scatters the early-copied window, so it needs early_copy=True"
+            )
 
 
 @dataclass(frozen=True)
@@ -129,16 +178,23 @@ class CopyPlan:
     ``merge``: sites whose copies are staged into the step's pack and land before the next barrier (see the module
     docstring). ``flush_after``: barrier sites, a subset of ``merge``. A call through one that stages its copy flushes
     the pack right after it; a call whose copy is unchanged, or runs eagerly, has nothing of its own to land and does
-    not flush.
+    not flush. ``changed_span`` (a subset of ``merge``): sites whose ``DeviceCopyBuffer.update(..., changed_span=True)``
+    uploads may stage only each row's changed span (see there). ``parallel_scatter``: a segment whose copies are
+    order-free is scattered with one program per copy instead of the serial one-CTA scatter. ``final_flush``: ``None``
+    issues the step's last segment eagerly before the replay; ``InGraph(...)`` lets the replayed graph issue it (needs
+    ``parallel_scatter``).
     """
 
     merge: frozenset[CopySiteEnum] = frozenset()
     flush_after: frozenset[CopySiteEnum] = frozenset()
+    changed_span: frozenset[CopySiteEnum] = frozenset()
+    parallel_scatter: bool = False
+    final_flush: Optional[InGraph] = None
 
     def __post_init__(self) -> None:
-        for name in ("merge", "flush_after"):
+        for name in ("merge", "flush_after", "changed_span"):
             object.__setattr__(self, name, frozenset(getattr(self, name)))
-        for site in self.merge | self.flush_after:
+        for site in self.merge | self.flush_after | self.changed_span:
             if not isinstance(site, CopySiteEnum):
                 raise TypeError(f"CopyPlan sites must be CopySiteEnum members, got {site!r}")
         fills = [site for site in self.merge if site.direction is Direction.FILL]
@@ -150,6 +206,25 @@ class CopyPlan:
                 "a flush_after barrier fires only when its own copy was merged, so it must be in merge: "
                 f"{sorted(unmerged, key=str)}"
             )
+        unmerged_spans = self.changed_span - self.merge
+        if unmerged_spans:
+            raise ValueError(
+                "a changed-span upload stages several copies into the pack, so its site must be in merge: "
+                f"{sorted(unmerged_spans, key=str)}"
+            )
+        if self.final_flush is not None:
+            if not isinstance(self.final_flush, InGraph):
+                raise TypeError(
+                    f"CopyPlan.final_flush must be None or InGraph, got {self.final_flush!r}"
+                )
+            if not self.parallel_scatter:
+                raise ValueError(
+                    "an InGraph final flush scatters in parallel, so it needs parallel_scatter=True"
+                )
+            if not self.merge:
+                raise ValueError(
+                    "an InGraph final flush issues merged copies, so the plan must merge some"
+                )
 
     def __bool__(self) -> bool:
         return bool(self.merge)
@@ -185,6 +260,87 @@ def _site_name(site: CopySiteEnum) -> str:
     return f"{type(site).__name__}.{site.name}"
 
 
+# One compiled variant for every descriptor offset: specializing ``first`` (== 1, divisible by 16) would compile a
+# new kernel when a step's segment first holds a new number of copies, after the warm-up.
+@triton.jit(do_not_specialize=["first"])
+def _parallel_scatter_kernel(
+    stage_u8, stage_i64, first, DEVICE_SRC: tl.constexpr, BLOCK: tl.constexpr
+):
+    """Program i writes copy ``first + i`` ([dst, src, bytes] descriptors after the 2-word header). ``src`` is an offset
+    into the staged segment for a host copy, a device address for a device copy (``DEVICE_SRC``)."""
+    d = 2 + 3 * (first + tl.program_id(0))
+    dst = tl.load(stage_i64 + d).to(tl.pointer_type(tl.uint8))
+    src_word = tl.load(stage_i64 + d + 1)
+    if DEVICE_SRC:
+        src = src_word.to(tl.pointer_type(tl.uint8))
+    else:
+        src = stage_u8 + src_word
+    nbytes = tl.load(stage_i64 + d + 2)
+    for start in range(0, nbytes, BLOCK):
+        o = start + tl.arange(0, BLOCK)
+        tl.store(dst + o, tl.load(src + o, mask=o < nbytes), mask=o < nbytes)
+
+
+@triton.jit
+def _graph_scatter_kernel(
+    stage_u8,
+    stage_i64,
+    epoch,
+    DEVICE_SRC: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BUMP_EPOCH: tl.constexpr,
+):
+    """Descriptor slot i of the host copies (``DEVICE_SRC`` False) or of the device copies, with the counts read from
+    the staged header; a slot past its count writes nothing. ``BUMP_EPOCH``: program 0 also increments ``epoch[0]``."""
+    i = tl.program_id(0)
+    if BUMP_EPOCH:
+        if i == 0:
+            tl.store(epoch, tl.load(epoch) + 1)
+    num_h2d = tl.load(stage_i64)
+    if DEVICE_SRC:
+        count = tl.load(stage_i64 + 1)
+        d = 2 + 3 * (num_h2d + i)
+    else:
+        count = num_h2d
+        d = 2 + 3 * i
+    if i < count:
+        dst = tl.load(stage_i64 + d).to(tl.pointer_type(tl.uint8))
+        src_word = tl.load(stage_i64 + d + 1)
+        if DEVICE_SRC:
+            src = src_word.to(tl.pointer_type(tl.uint8))
+        else:
+            src = stage_u8 + src_word
+        nbytes = tl.load(stage_i64 + d + 2)
+        for start in range(0, nbytes, BLOCK):
+            o = start + tl.arange(0, BLOCK)
+            tl.store(dst + o, tl.load(src + o, mask=o < nbytes), mask=o < nbytes)
+
+
+def _disjoint(ranges: list[tuple[int, int]]) -> bool:
+    """Whether the [start, start + bytes) ranges are pairwise disjoint."""
+    end = -1
+    for start, nbytes in sorted(ranges):
+        if start < end:
+            return False
+        end = start + nbytes
+    return True
+
+
+def _parallel_ok(h2d: list[tuple[int, int, int]], d2d: list[tuple[int, int, int]]) -> bool:
+    """Whether issuing the host copies in parallel and then the device copies in parallel writes what the serial
+    scatter (every host copy in order, then every device copy in order) writes: the host copies' destinations are
+    disjoint, and the device copies' destinations are disjoint and none of them is a device copy's source (a host copy
+    may still feed a device copy, as the launches run in order)."""
+    if not _disjoint([(dst, n) for dst, _, n in h2d]):
+        return False
+    if not d2d:
+        return True
+    dsts = [(dst, n) for dst, _, n in d2d]
+    if not _disjoint(dsts):
+        return False
+    return all(_disjoint(dsts + [(src, n)]) for _, src, n in d2d)
+
+
 class _Pack:
     """One engine's pack of merged copies (see the module docstring).
 
@@ -192,6 +348,12 @@ class _Pack:
     issues the copies staged since the previous one as a segment ([header | descriptors | data], aligned) appended
     after the previous segment in the same slot, with its own upload and scatter launch. The ring advances once per
     step, at ``begin``, which waits only for the upload that last used the slot RING steps ago.
+
+    With an ``InGraph`` final flush, the step's last segment is written instead into a pinned window (``ghost``) that
+    the prologue of every captured decode graph issues (``capture_prologue``): a host copy of the window into the
+    device staging buffer and the graph scatter, or, with ``early_copy``, a wait on the window's side-stream upload
+    into the prologue's own device buffer (``gdev``) and the scatter from there. A segment's descriptors address its
+    data relative to its own start, so the window is the segment's bytes as they are.
     """
 
     CAPACITY = 1 << 16
@@ -202,7 +364,16 @@ class _Pack:
     DESC_BYTES = 24
     ALIGN = 16
 
-    def __init__(self, device: torch.device, check: bool) -> None:
+    # The pinned window a graph's prologue issues (InGraph): the header, the descriptors and up to ~10 KB of data.
+    GRAPH_WINDOW = 1 << 14
+
+    def __init__(
+        self,
+        device: torch.device,
+        check: bool,
+        parallel_scatter: bool = False,
+        in_graph: Optional[InGraph] = None,
+    ) -> None:
         self.host = [
             torch.empty(self.CAPACITY, dtype=torch.uint8, pin_memory=prefer_pinned())
             for _ in range(self.RING)
@@ -225,12 +396,153 @@ class _Pack:
         self.dst_ranges: list[tuple[int, int]] = []
         # Every tensor a staged copy reads or writes, kept alive until its segment is issued.
         self.staged: list[torch.Tensor] = []
+        # The tensors of the segment in the graph window, kept alive until the replay that issues them is queued.
+        self.graph_staged: list[torch.Tensor] = []
         # The callers' on_drop callbacks of the segment's copies, called if the pack is discarded.
         self.drops: list[Callable[[], None]] = []
         # Check mode: (site, destination) of every staged copy, and (site, source, snapshot) of every device copy.
         self.poisoned: list[tuple[CopySiteEnum, torch.Tensor]] = []
         self.sources: list[tuple[CopySiteEnum, torch.Tensor, torch.Tensor]] = []
         self.used = self.seg + self.data_start
+        self.parallel_scatter = parallel_scatter
+        self.in_graph = in_graph
+        self.early_copy = in_graph is not None and in_graph.early_copy
+        self.prologue_op = in_graph.prologue_op if in_graph is not None else None
+        # The step epoch (InGraph.step_epoch); None without it.
+        self.epoch: Optional[torch.Tensor] = (
+            torch.zeros(1, dtype=torch.int64, device=device)
+            if in_graph is not None and in_graph.step_epoch
+            else None
+        )
+        if self.early_copy:
+            # The prologue's own device window: an eager segment (self.dev) can never leave a header in it.
+            self.gdev = torch.zeros(self.GRAPH_WINDOW, dtype=torch.uint8, device=device)
+            self.copy_stream = torch.cuda.Stream(device=device)
+            # Recorded by the side upload once it landed (the prologue waits on it) ...
+            self.staged_ready = torch.cuda.Event(external=True)
+            # ... and by every replayed prologue after its scatter (the next upload waits on it).
+            self.prologue_done = torch.cuda.Event(external=True)
+            # A CUDA event is created on its first record, and a wait on one never created is skipped: a capture
+            # would then leave the prologue's wait out of the graph. Create both now.
+            self.staged_ready.record(self.copy_stream)
+            self.prologue_done.record(self.copy_stream)
+        if in_graph is not None:
+            self.ghost = torch.zeros(
+                self.GRAPH_WINDOW, dtype=torch.uint8, pin_memory=prefer_pinned()
+            )
+            # Recorded by every replayed prologue right after it copied the window (an event node).
+            self.ghost_free = torch.cuda.Event(external=True)
+        if parallel_scatter:
+            self._warm_up(device)
+            if in_graph is not None:
+                self._warm_up_graph_kernel()
+
+    def _warm_up(self, device: torch.device) -> None:
+        """Compile the parallel scatter now, not on a serving step's flush."""
+        dst = torch.zeros(8, dtype=torch.int32, device=device)
+        check, self.check = self.check, False
+        try:
+            self.begin()
+            self.stage(None, dst[:4], torch.arange(4, dtype=torch.int32))
+            self.stage(None, dst[4:], dst[:4])
+            self.flush()
+        finally:
+            self.check = check
+        torch.cuda.synchronize(device)
+        # The next step starts in a fresh slot and segment.
+        self.seg = 0
+
+    def _warm_up_graph_kernel(self) -> None:
+        """Compile the prologue's scatter now (a zero-count header: it writes nothing)."""
+        self.dev[: self.HEADER_BYTES].zero_()
+        if self.prologue_op is not None:
+            # The window it is captured with; its header is zero until the first upload.
+            self.prologue_op(self.gdev, self.epoch, self.MAX_DESC)
+        else:
+            self._launch_graph_scatter(self.dev)
+        torch.cuda.synchronize(self.dev.device)
+
+    def _launch_graph_scatter(self, window: torch.Tensor) -> None:
+        stage_i64 = window.view(torch.int64)
+        for device_src in (False, True):
+            bump = self.epoch is not None and not device_src
+            _graph_scatter_kernel[(self.MAX_DESC,)](
+                window,
+                stage_i64,
+                self.epoch if bump else stage_i64,
+                DEVICE_SRC=device_src,
+                BLOCK=256,
+                BUMP_EPOCH=bump,
+                num_warps=1,
+            )
+
+    def capture_prologue(self) -> bool:
+        """Inside a graph capture: the prologue that issues the window ``flush(in_graph=True)`` fills. Returns whether
+        the graph has it."""
+        if self.in_graph is None:
+            return False
+        if self.early_copy:
+            torch.cuda.current_stream().wait_event(self.staged_ready)
+            if self.prologue_op is not None:
+                self.prologue_op(self.gdev, self.epoch, self.MAX_DESC)
+            else:
+                self._launch_graph_scatter(self.gdev)
+                # Consumed: a replay with no new upload scatters nothing.
+                self.gdev[: self.HEADER_BYTES].zero_()
+            self.prologue_done.record()
+            return True
+        self.dev[: self.GRAPH_WINDOW].copy_(self.ghost, non_blocking=True)
+        self.ghost_free.record()
+        self._launch_graph_scatter(self.dev)
+        return True
+
+    def _upload_window(self, nbytes: int) -> None:
+        """early_copy: upload the filled pinned window into gdev on the side stream, once the last replayed prologue
+        has consumed gdev; the window is fully written on the host before this is enqueued."""
+        stream = self.copy_stream
+        stream.wait_event(self.prologue_done)
+        with torch.cuda.stream(stream):
+            self.gdev[:nbytes].copy_(self.ghost[:nbytes], non_blocking=True)
+        self.ghost_free.record(stream)
+        self.staged_ready.record(stream)
+
+    def _ghost_writable(self) -> None:
+        # The last replayed prologue (or side upload) has copied the window (a no-op before the first replay).
+        self.ghost_free.synchronize()
+
+    def quiesce_graph_window(self) -> None:
+        """Before replaying a graph with the prologue without filling the window: a zero-count window, so it writes
+        nothing."""
+        if self.in_graph is not None and self.ghost[: self.HEADER_BYTES].any():
+            self._ghost_writable()
+            self.ghost[: self.HEADER_BYTES].zero_()
+            if self.early_copy:
+                # A window uploaded but never replayed would still sit in gdev: overwrite its header.
+                self._upload_window(self.HEADER_BYTES)
+
+    def _fill_graph_window(self) -> bool:
+        """Write the open segment into the pinned window the replay's prologue issues; False when it does not fit or
+        is not order-free (the caller issues it eagerly)."""
+        nbytes = self.used - self.seg
+        if nbytes > self.GRAPH_WINDOW or not _parallel_ok(self.h2d, self.d2d):
+            return False
+        desc = [len(self.h2d), len(self.d2d)] + [
+            value for copy in self.h2d + self.d2d for value in copy
+        ]
+        self._ghost_writable()
+        self.ghost[:nbytes].copy_(self.host[self.slot][self.seg : self.used])
+        self.ghost[: 8 * len(desc)].view(torch.int64).copy_(torch.tensor(desc, dtype=torch.int64))
+        if self.early_copy:
+            self._upload_window(nbytes)
+        return True
+
+    def on_graph_replay(self) -> None:
+        """Release the window's operands once the graph reading their addresses has been queued."""
+        if self.graph_staged:
+            stream = torch.cuda.current_stream(self.dev.device)
+            for tensor in self.graph_staged:
+                tensor.record_stream(stream)
+            self.graph_staged.clear()
 
     def begin(self) -> None:
         if self.open:
@@ -359,7 +671,19 @@ class _Pack:
         )
         # Descriptors and data in one upload; the gap between them is unused padding.
         self.dev[seg : self.used].copy_(host[seg : self.used], non_blocking=True)
-        torch.ops.trtllm.device_copy_scatter(self.dev[seg:])
+        if self.parallel_scatter and _parallel_ok(self.h2d, self.d2d):
+            stage = self.dev[seg:]
+            stage_i64 = stage.view(torch.int64)
+            if self.h2d:
+                _parallel_scatter_kernel[(len(self.h2d),)](
+                    stage, stage_i64, 0, DEVICE_SRC=False, BLOCK=256, num_warps=2
+                )
+            if self.d2d:
+                _parallel_scatter_kernel[(len(self.d2d),)](
+                    stage, stage_i64, len(self.h2d), DEVICE_SRC=True, BLOCK=256, num_warps=2
+                )
+        else:
+            torch.ops.trtllm.device_copy_scatter(self.dev[seg:])
         event = self.events[self.slot]
         if event is None:
             event = self.events[self.slot] = torch.cuda.Event()
@@ -373,11 +697,25 @@ class _Pack:
         if self.open:
             self._issue()
 
-    def flush(self) -> None:
-        """Issue what is staged and close the pack (the step's final barrier)."""
+    def flush(self, in_graph: bool = False) -> None:
+        """Issue what is staged and close the pack (the step's final barrier).
+
+        ``in_graph``: the next replay is of a graph captured with this pack's prologue, which issues the segment if it
+        rides the window; otherwise the segment is issued eagerly and the window left empty.
+        """
         if not self.open:
+            if in_graph:
+                self.quiesce_graph_window()
             return
         self.open = False
+        if in_graph and self.in_graph is not None:
+            if self.check:
+                self._verify()
+            if self._fill_graph_window():
+                self.graph_staged.extend(self.staged)
+                self._clear()
+                return
+            self.quiesce_graph_window()
         self._issue()
 
     def discard(self) -> None:
@@ -407,10 +745,15 @@ class DeviceCopier:
     def __init__(self, plan: CopyPlan, device: torch.device) -> None:
         self.plan = plan
         self.check = CHECK_MODE
-        self._pack = _Pack(device, self.check) if plan.merge else None
+        self._pack = (
+            _Pack(device, self.check, plan.parallel_scatter, plan.final_flush)
+            if plan.merge
+            else None
+        )
         # Site membership by identity: an Enum member hashes through a Python-level __hash__.
         self._merge_ids = frozenset(map(id, plan.merge))
         self._barrier_ids = frozenset(map(id, plan.flush_after))
+        self._changed_span_ids = frozenset(map(id, plan.changed_span))
 
     @property
     def merges(self) -> bool:
@@ -430,13 +773,50 @@ class DeviceCopier:
     def is_open(self) -> bool:
         return self._pack is not None and self._pack.open
 
+    def merges_now(self, site: CopySiteEnum) -> bool:
+        """Whether a copy through ``site`` would be staged into the open pack now."""
+        return (
+            self._pack is not None
+            and self._pack.open
+            and id(site) in self._merge_ids
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def stages_changed_span(self, site: CopySiteEnum) -> bool:
+        """Whether a changed-span upload through ``site`` may stage per-row spans now (``CopyPlan.changed_span``). Not
+        through a barrier site: each span would flush on its own, so the whole view is staged with one barrier."""
+        return (
+            id(site) in self._changed_span_ids
+            and id(site) not in self._barrier_ids
+            and self.merges_now(site)
+        )
+
     def begin(self) -> None:
         if self._pack is not None:
             self._pack.begin()
 
-    def flush(self) -> None:
+    def flush(self, in_graph: bool = False) -> None:
         if self._pack is not None:
-            self._pack.flush()
+            self._pack.flush(in_graph)
+
+    @property
+    def epoch(self) -> Optional[torch.Tensor]:
+        """The step epoch (``InGraph.step_epoch``), or None."""
+        return self._pack.epoch if self._pack is not None else None
+
+    def capture_prologue(self) -> bool:
+        """Inside a graph capture: add the in-graph final flush's prologue; whether the graph has it."""
+        return self._pack is not None and self._pack.capture_prologue()
+
+    def quiesce_graph_window(self) -> None:
+        """Before replaying a graph with this copier's prologue outside its context: an empty window."""
+        if self._pack is not None:
+            self._pack.quiesce_graph_window()
+
+    def on_graph_replay(self) -> None:
+        """After queueing the replay of a graph with this copier's prologue: release the window's operands."""
+        if self._pack is not None:
+            self._pack.on_graph_replay()
 
     def discard(self) -> None:
         """Drop the open pack: the step failed, so its staged copies never land (their on_drop callbacks run)."""
@@ -621,14 +1001,39 @@ def is_open() -> bool:
     return copier is not None and copier.is_open
 
 
-def flush() -> None:
+def stages_changed_span(site: CopySiteEnum) -> bool:
+    """Whether a changed-span upload through ``site`` may stage per-row spans now (see ``DeviceCopyBuffer.update``)."""
+    copier = _active.get()
+    return copier is not None and copier.stages_changed_span(site)
+
+
+def flush(in_graph: bool = False) -> None:
     """Issue the active open pack's last segment (one upload and one scatter launch on the current stream) and close it.
 
-    The step's final barrier, at the graph replay.
+    The step's final barrier, at the graph replay. ``in_graph``: the next replay is of a graph captured with the active
+    copier's prologue (``capture_prologue``), which issues the segment itself when it rides the window.
     """
     copier = _active.get()
     if copier is not None:
-        copier.flush()
+        copier.flush(in_graph)
+
+
+def is_active(copier: DeviceCopier) -> bool:
+    """Whether ``copier`` is the calling context's copier."""
+    return _active.get() is copier
+
+
+def capture_prologue() -> Optional[DeviceCopier]:
+    """Inside a graph capture: add the active copier's in-graph final flush prologue (``InGraph``); the copier whose
+    window the graph issues, or None when the graph has no prologue."""
+    copier = _active.get()
+    return copier if copier is not None and copier.capture_prologue() else None
+
+
+def step_epoch() -> Optional[torch.Tensor]:
+    """The active copier's step epoch (an int64 [1] device tensor, ``InGraph.step_epoch``), or None."""
+    copier = _active.get()
+    return copier.epoch if copier is not None else None
 
 
 def discard() -> None:
@@ -749,13 +1154,29 @@ class DeviceCopyBuffer:
         staging.copy_(src)
         return staging
 
+    # A changed-span upload is used only while it moves at most this fraction of the view's elements.
+    CHANGED_SPAN_MAX_FRACTION = 0.5
+
     def update(
-        self, host: torch.Tensor, force: bool = False, *, view: Optional[torch.Tensor] = None
+        self,
+        host: torch.Tensor,
+        force: bool = False,
+        *,
+        view: Optional[torch.Tensor] = None,
+        changed_span: bool = False,
     ) -> bool:
         """Upload ``host`` through the buffer's site unless the record says the buffer holds it; True if issued.
 
         ``force`` issues the copy whatever the record says. ``view``: the destination, a view of the buffer's storage
         (default: the buffer's leading ``host.numel()`` elements).
+
+        ``changed_span``: a changed upload into a 2-D ``view`` with contiguous rows, merged into the open pack through a
+        site in the plan's ``changed_span``, whose record covers the same rows (same first element, row count and row
+        stride) issues, per row, only the span from its first to its last changed column, plus any columns the record
+        does not cover, each through the buffer's site. A page table that gained one page then stages a few bytes
+        instead of every padded row. It falls back to the whole view when the spans would move more than
+        ``CHANGED_SPAN_MAX_FRACTION`` of it, or when the copy is not merged (per-row eager copies would cost more than
+        one).
         """
         site = self._site
         if site is None:
@@ -778,11 +1199,60 @@ class DeviceCopyBuffer:
         # Dropped while the copy is issued, then recorded on top of what the buffer held (a longer recorded run
         # keeps its tail).
         previous = (self._last_host_values, self._last_host_shape, self._copy_key)
+        old = (
+            (self._copy_key, self.host_values)
+            if changed_span and view is not None and self._last_host_values is not None
+            else None
+        )
         self._last_host_values = self._last_host_shape = self._copy_key = None
-        issued = copy(site, dst, src, on_drop=self.invalidate, snapshot=self._snapshot)
+        if old is not None and self._copy_changed_span(site, dst, src, *old):
+            issued = True
+        else:
+            issued = copy(site, dst, src, on_drop=self.invalidate, snapshot=self._snapshot)
         self._last_host_values, self._last_host_shape, self._copy_key = previous
         self.record(host, key=key)
         return issued
+
+    def _copy_changed_span(
+        self,
+        site: CopySiteEnum,
+        dst: torch.Tensor,
+        src: torch.Tensor,
+        old_key: object,
+        old: torch.Tensor,
+    ) -> bool:
+        """Stage only the changed span of each row of ``dst`` (see ``update``); False if not applicable."""
+        if not isinstance(old_key, tuple) or not stages_changed_span(site):
+            return False
+        offset, shape, stride, dtype = old_key
+        if (
+            dst.dim() != 2
+            or dst.stride(1) != 1
+            or offset != dst.storage_offset()
+            or len(shape) != 2
+            or shape[0] != dst.shape[0]
+            or stride != tuple(dst.stride())
+            or dtype != dst.dtype
+            or old.dtype != src.dtype
+            or tuple(src.shape) != tuple(dst.shape)
+        ):
+            return False
+        cols = dst.shape[1]
+        known = min(shape[1], cols)
+        changed = src[:, :known] != old[:, :known]
+        if cols > known:
+            # Columns the record does not cover hold unknown device values.
+            changed = torch.cat([changed, changed.new_ones(dst.shape[0], cols - known)], dim=1)
+        rows = changed.any(dim=1).nonzero().flatten().tolist()
+        spans = []
+        for row in rows:
+            columns = changed[row].nonzero().flatten()
+            spans.append((row, int(columns[0]), int(columns[-1]) + 1))
+        if sum(hi - lo for _, lo, hi in spans) > self.CHANGED_SPAN_MAX_FRACTION * dst.numel():
+            return False
+        for row, lo, hi in spans:
+            copy(site, dst[row, lo:hi], src[row, lo:hi], on_drop=self.invalidate)
+        return True
 
     def fill_tail(self, site: CopySiteEnum, start: int, value: int) -> None:
         """``fill_tail(site, tensor, start, value)``, passing unchanged=True when the last fill was the same."""

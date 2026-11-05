@@ -647,7 +647,7 @@ def test_identity_short_mode_keeps_every_attended_token_within_the_topk_span(max
 
 @pytest.mark.parametrize("same_pack", [False, True])
 @pytest.mark.parametrize("replay_fails", [False, True])
-def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, replay_fails):
+def test_replay_defers_copies_only_to_its_captured_copier(monkeypatch, same_pack, replay_fails):
     key = KeyType(batch_size=1, draft_len=0)
     captured = Mock()
     active = captured if same_pack else Mock()
@@ -664,7 +664,7 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
     runner.config = SimpleNamespace(use_mrope=False)
     runner._check_strict_buffer_stability = lambda meta: None
     runner._get_num_tokens_for_key = lambda key: 1
-    runner._step_input_prologue_keys = {key: captured}
+    runner._prologue_copiers = {key: captured}
     runner._pre_replay_hooks = []
 
     def replay():
@@ -676,10 +676,10 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
     runner.graph_outputs = {key: None}
     captured.on_graph_replay.side_effect = lambda: queued.append("release")
     monkeypatch.setattr(
-        cuda_graph_runner_module.step_inputs, "is_active", lambda pack: pack is active
+        cuda_graph_runner_module.device_copy, "is_active", lambda copier: copier is active
     )
     monkeypatch.setattr(
-        cuda_graph_runner_module.step_inputs, "flush", lambda *, in_graph: queued.append(in_graph)
+        cuda_graph_runner_module.device_copy, "flush", lambda *, in_graph: queued.append(in_graph)
     )
     if replay_fails:
         with pytest.raises(RuntimeError, match="replay failed"):

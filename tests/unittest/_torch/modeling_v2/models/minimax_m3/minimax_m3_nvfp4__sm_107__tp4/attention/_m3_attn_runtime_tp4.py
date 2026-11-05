@@ -36,7 +36,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.utils import create_attention
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -166,8 +165,7 @@ def make_msa_metadata(manager) -> MiniMaxM3MsaSparseAttentionMetadata:
         mapping=mapping(),
         sparse_metadata_params=sparse_attention_config().to_sparse_metadata_params(),
     )
-    # The target's MSA preparation choice that changes what prepare() stages (the identity tables of short steps).
-    metadata.msa_policy = MsaRuntimePolicy(short_sequence_identity=True)
+    # prepare() stages the identity tables of short steps: MSA's own default, so nothing to arm.
     return metadata
 
 
