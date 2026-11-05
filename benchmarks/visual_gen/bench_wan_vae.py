@@ -483,8 +483,8 @@ def _parse_winovae_opts(text: str) -> dict[str, Any]:
         key, _, value = item.partition("=")
         if not value:
             opts[key] = True
-        elif value.lower() in ("1", "true", "yes", "0", "false", "no"):
-            opts[key] = value.lower() in ("1", "true", "yes")
+        elif value.lower() in ("true", "yes", "false", "no"):
+            opts[key] = value.lower() in ("true", "yes")
         elif value.isdigit():
             opts[key] = int(value)
         else:

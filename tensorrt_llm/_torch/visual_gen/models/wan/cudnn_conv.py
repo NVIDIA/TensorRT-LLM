@@ -138,6 +138,9 @@ class _Conv:
         self.graph.validate()
         self.graph.build_operation_graph()
         self.graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+        # Every call of a shape must give the same bytes (graph replays are compared
+        # bitwise), so plans that may differ in the last bits between runs are excluded.
+        self.graph.deselect_numeric_notes([cudnn.numerical_note.NONDETERMINISTIC])
         self.graph.check_support()
         self.plan_count = self.graph.get_execution_plan_count()
         self.plan: int | None = None
