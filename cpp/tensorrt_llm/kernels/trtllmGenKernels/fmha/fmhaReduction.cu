@@ -254,7 +254,8 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         // Update the sums with the attention sink value.
         if (attentionSinksPtr != nullptr)
         {
-            float attentionSinkVal = exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+            float attentionSinkVal
+                = exp2f(attentionSinksPtr[localHeadIdxO] * static_cast<float>(M_LOG2E) - maxVal * softmaxScaleLog2);
             // Multiply the attention sink value by the quantization scale included in the sum value.
             sumVal += attentionSinkVal * softmaxPScale;
         }
@@ -264,7 +265,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         if (storesSoftmaxStats && isValidRow && headDimIdx == 0)
         {
             // The softmaxScale.
-            float softmaxScale = (softmaxScaleLog2 * (1.f / M_LOG2E));
+            float softmaxScale = (softmaxScaleLog2 * static_cast<float>(M_LN2));
             // The sumScale to unscale the softmaxPScale quantization scale from P.
             float sumScale = 1.f / softmaxPScale;
             // The final max and sum values.
