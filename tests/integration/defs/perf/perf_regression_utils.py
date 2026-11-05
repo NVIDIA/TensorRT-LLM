@@ -65,7 +65,7 @@ def get_job_info():
     raw_branch = global_vars.get("build_branch")
     branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
-    # The launcher publishes the test image; globalVars may describe a dispatcher.
+    # Original OCI/base reference, not the derived Enroot artifact or dispatcher.
     runtime_image = os.getenv("TRTLLM_CI_RUNTIME_IMAGE", "").strip()
     digest_match = re.fullmatch(r"[^@\s]+@(sha256:[0-9a-f]{64})", runtime_image)
     runtime_image_digest = digest_match.group(1) if digest_match else "unknown"

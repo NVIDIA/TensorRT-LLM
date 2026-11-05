@@ -830,7 +830,7 @@ def _checkpoint_startup_metadata(
         str(source_kind or "unknown"),
         "load_format":
         str(load_format_name).lower(),
-        # Explicitly unknown until a supported load session has finished.
+        # Explicitly unknown until a supported weight load has finished.
         "checkpoint_io_policy":
         None,
     }
@@ -842,7 +842,7 @@ def _checkpoint_io_policy_metadata(
     """Snapshot observed policy for loads using the built-in HF weight loader.
 
     Args:
-        checkpoint_loader: Loader whose completed weight session is observed.
+        checkpoint_loader: Loader whose completed weight load is observed.
 
     Returns:
         A detached policy snapshot, or None for unsupported or unobserved loads.
@@ -857,8 +857,8 @@ def _checkpoint_io_policy_metadata(
             or checkpoint_loader.is_weights_preloaded()):
         return None
     status = checkpoint_loader.weight_loader.last_checkpoint_io_status
-    if status.effective not in (_NATIVE_CHECKPOINT_IO_POLICY,
-                                _RANK_STRIPED_CHECKPOINT_IO_POLICY):
+    if status.effective not in (CheckpointIOPolicy.NATIVE,
+                                CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD):
         return None
     return {
         "requested": status.requested,
@@ -1535,6 +1535,9 @@ class ModelLoader:
                                     "did not preload the model. Refusing to "
                                     "commit an unpopulated model to the GMS "
                                     "pool.")
+
+                            self._startup_metadata["checkpoint_io_policy"] = \
+                                _checkpoint_io_policy_metadata(checkpoint_loader)
 
                             if loads_draft_weights:
                                 self._load_separate_draft_weights(
