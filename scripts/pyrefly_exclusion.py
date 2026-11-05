@@ -5,6 +5,7 @@
 import argparse
 import ast
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,21 @@ def is_excluded_path(source_path: str, project_root: Path, excluded_paths: set[P
         return False
     path = (project_root / relative_path).resolve()
     return path in excluded_paths or any(parent in excluded_paths for parent in path.parents)
+
+
+def filter_input_paths(
+    input_path: Path, output_path: Path, config_path: Path, project_root: Path
+) -> None:
+    """Keep supplied paths that are not excluded, preserving NUL separators."""
+    excluded_paths = load_excluded_paths(config_path)
+    paths = (os.fsdecode(path) for path in input_path.read_bytes().split(b"\0") if path)
+    output_path.write_bytes(
+        b"".join(
+            os.fsencode(path) + b"\0"
+            for path in paths
+            if not is_excluded_path(path, project_root, excluded_paths)
+        )
+    )
 
 
 class ImportScope:
@@ -263,6 +279,11 @@ def main() -> int:
     matches_parser.add_argument("source", type=str)
     matches_parser.add_argument("config", type=Path)
     matches_parser.add_argument("--project-root", type=Path, required=True)
+    paths_parser = subparsers.add_parser("filter-input-paths")
+    paths_parser.add_argument("input", type=Path)
+    paths_parser.add_argument("output", type=Path)
+    paths_parser.add_argument("config", type=Path)
+    paths_parser.add_argument("--project-root", type=Path, required=True)
     report_parser = subparsers.add_parser("filter-report")
     report_parser.add_argument("input", type=Path)
     report_parser.add_argument("output", type=Path)
@@ -275,6 +296,9 @@ def main() -> int:
         if args.command == "matches":
             excluded_paths = load_excluded_paths(args.config)
             return 0 if is_excluded_path(args.source, args.project_root, excluded_paths) else 1
+        if args.command == "filter-input-paths":
+            filter_input_paths(args.input, args.output, args.config, args.project_root)
+            return 0
         return filter_report(
             args.input,
             args.output,

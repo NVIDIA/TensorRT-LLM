@@ -752,14 +752,14 @@ def runLLMBuild(
         }
     }
 
-    // Check changed product lines after rebasing a temporary worktree onto upstream main.
-    // Record diagnostics after diff and configured exclusions without failing the build.
+    // Check the configured product sources and record diagnostics after exclusions.
+    // The advisory check does not fail the build.
     // Running directly avoids pre-commit hook downloads.
     if (typeCheck) {
-        echo "-- Running advisory Pyrefly type check with diff and exclusion filters..."
+        echo "-- Running advisory Pyrefly full-project type check with exclusions..."
         trtllm_utils.llmExecStepWithRetry(
             pipeline,
-            script: "cd ${LLM_ROOT} && bash scripts/run_pyrefly.sh --rebase-upstream",
+            script: "cd ${LLM_ROOT} && bash scripts/run_pyrefly.sh --full-project",
             shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
         )
     }
