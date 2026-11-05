@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -251,6 +251,10 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         _use_fp8_context_fmha=lambda _output, _input_type: False,
         _get_multi_ctas_kv_counter_buffer=lambda: None,
     )
+    fmha._run_generation_preprocess = MethodType(
+        FlashInferTrtllmGenFmha._run_generation_preprocess, fmha
+    )
+    fmha._run_generation_decode = MethodType(FlashInferTrtllmGenFmha._run_generation_decode, fmha)
 
     FlashInferTrtllmGenFmha.run_generation(fmha, params)
 

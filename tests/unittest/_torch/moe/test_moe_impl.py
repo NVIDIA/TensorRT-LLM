@@ -45,6 +45,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.identity import GROUPED_GEMM_FAMILY
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
@@ -422,6 +423,35 @@ def test_pinned_megamoe_cutedsl_identity_resolves_to_the_leaf():
     assert report.selected_by == "pinned"
     assert report.requested == _MEGAMOE_CUTEDSL_IMPL_ID
     assert not report.degraded
+
+
+def test_dynamic_eplb_is_a_declared_backend_capability():
+    assert TrtllmCutedslMegaMoeNvfp4Impl.capabilities.supports_per_layer_dynamic_eplb
+    assert not DeepgemmCudaW4a8Mxfp4Mxfp8Impl.capabilities.supports_per_layer_dynamic_eplb
+
+
+def test_per_layer_dynamic_eplb_filters_backends_by_declared_capability():
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(),
+        eplb_enabled=True,
+        eplb_mode="per_layer_dynamic",
+    )
+    accepted = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(),
+        deployment=deployment,
+        impl_id=_MEGAMOE_CUTEDSL_IMPL_ID,
+    )
+    assert impl_class_for(accepted) is TrtllmCutedslMegaMoeNvfp4Impl
+
+    rejected = resolve_moe_impl(
+        _deepgemm_model_config(QuantAlgo.W4A8_MXFP4_MXFP8),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        impl_id="deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8",
+    )
+    assert rejected.winner is None
+    assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
 
 
 def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
@@ -2074,6 +2104,7 @@ def test_build_gate_runs_after_the_leaf_gates(leaf, problem, deployment, reason)
 _CUTEDSL_GROUPED_GEMM_IDS = (
     "trtllm.cutedsl.grouped_gemm.nvfp4",
     "trtllm.cutedsl.grouped_gemm.none",
+    "trtllm.cutedsl.grouped_gemm.nvfp4_plus",
 )
 
 
@@ -2121,6 +2152,18 @@ _CUTEDSL_DECLARATIONS = (
         MoEStaticCapability(supports_eplb=True, supports_apply_router_weight_on_input=True),
         MoEActivationSupport(kinds=frozenset({ActivationType.Swiglu})),
         id="none",
+    ),
+    pytest.param(
+        TrtllmCutedslGroupedGemmNvfp4PlusImpl,
+        QuantAlgo.NVFP4_PLUS,
+        {107},
+        MoEStaticCapability(supports_eplb=True, supports_apply_router_weight_on_input=True),
+        MoEActivationSupport(
+            kinds=frozenset({ActivationType.Swiglu}),
+            limit=ActivationParamShape.UNIFORM_SCALAR,
+            limit_when_absent=float("inf"),
+        ),
+        id="nvfp4_plus",
     ),
 )
 
@@ -2171,6 +2214,9 @@ def test_cutedsl_leaf_declarations(leaf, quant_algo, sms, capabilities, activati
     [
         pytest.param(QuantAlgo.NVFP4, 100, _CUTEDSL_GROUPED_GEMM_IDS[0], id="nvfp4-sm100"),
         pytest.param(None, 107, _CUTEDSL_GROUPED_GEMM_IDS[1], id="none-sm107"),
+        pytest.param(
+            QuantAlgo.NVFP4_PLUS, 107, _CUTEDSL_GROUPED_GEMM_IDS[2], id="nvfp4_plus-sm107"
+        ),
     ],
 )
 def test_cutedsl_literal_picks_the_leaf_that_publishes_the_format(quant_algo, sm, impl_id):
@@ -2186,6 +2232,7 @@ def test_cutedsl_literal_picks_the_leaf_that_publishes_the_format(quant_algo, sm
     [
         pytest.param(QuantAlgo.NVFP4, _CUTEDSL_GROUPED_GEMM_IDS[0], id="nvfp4"),
         pytest.param(None, _CUTEDSL_GROUPED_GEMM_IDS[1], id="none"),
+        pytest.param(QuantAlgo.NVFP4_PLUS, _CUTEDSL_GROUPED_GEMM_IDS[2], id="nvfp4_plus"),
     ],
 )
 def test_pinned_cutedsl_grouped_gemm_identity_resolves_to_its_leaf(quant_algo, impl_id):

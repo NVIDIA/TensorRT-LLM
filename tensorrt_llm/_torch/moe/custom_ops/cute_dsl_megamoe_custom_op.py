@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import weakref
 from typing import Any, List, Optional, Tuple
 
@@ -58,6 +59,9 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div, pad_up
 
+# Default tactics validated once when the runtime becomes available.
+_PREVALIDATED_TACTICS: List[Tuple] = []
+
 _NVFP4_BLOCK_SIZE = 16
 _SF_PADDING_BLOCK = 128
 _SUPPORTED_MMA_TILE_M = (128, 256)
@@ -71,6 +75,7 @@ __all__ = [
     "enumerate_megamoe_candidate_tactics",
     "megamoe_activation_sf_bytes_per_row",
     "validate_megamoe_tactic",
+    "synthesize_profiling_topk",
 ]
 
 # Set to ``True`` if every symbol the op registration needs imports
@@ -134,7 +139,7 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 
 
 # ---------------------------------------------------------------------------
-# Tactic representation (v4: 10-tuple perf knobs)
+# Tactic representation (v5: 11-tuple perf knobs)
 # ---------------------------------------------------------------------------
 #
 # A tactic is a tuple of JSON-friendly primitives (lists / ints / bools /
@@ -151,7 +156,8 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 #    use_bulk_fc2_store,  # bool (epi -> peer UBLK; non-epi -> local TMA)
 #    fc2_tma_stages,      # optional staged-bulk depth
 #    flag_batch,          # int >= 1 (standalone_warps requires == 1)
-#    epi_flag_batch)      # (int, int) fc1/fc2 done-counter publish batch
+#    epi_flag_batch,      # (int, int) fc1/fc2 done-counter publish batch
+#    token_back_ready_granularity)  # "expert" | "token_tile"
 #
 # Derived / out-of-tuple:
 #   use_2cta_instrs      = (mma_tiler_mnk[0] == 256), derived in _build_kernel.
@@ -160,8 +166,11 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 # Tuple wrapping makes the tactic hashable, which AutoTuner needs for the
 # tactics cache.
 
-_TACTIC_LEN = 10
+_TACTIC_LEN = 11
+_TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
+_DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
+_TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
 # Kernel-side ceiling: ``flag_batch`` is hard-checked ``[1, 32]`` and
 # ``epi_flag_batch`` entries are SILENTLY clamped to ``[1, 32]``; reject > 32
@@ -169,14 +178,109 @@ _LEGACY_TACTIC_LEN = 8
 _FLAG_BATCH_MAX = 32
 
 
+_AUTOTUNE_PL_SEED = 0xA107
+
+
+def _autotune_pl_alpha(helper_expert_count: int = 0) -> float:
+    """Use the balanced-rank power-law workload only for load-balanced tuning."""
+    return 0.8 if helper_expert_count > 0 else 0.0
+
+
+def synthesize_profiling_topk(
+    *,
+    num_tokens: int,
+    num_topk: int,
+    num_experts_per_rank: int,
+    world_size: int,
+    alpha: float,
+    device: torch.device,
+    source_rank: int = 0,
+) -> torch.Tensor:
+    """Build physical routes with equal rank totals and ascending local load.
+
+    Every source rank has T tokens and T*K routes. Rotating the destination
+    round-robin by source_rank*T*K makes the aggregate receive count exactly
+    T*K on every destination, including small buckets where EP does not
+    divide T*K. A single source's destination totals differ by at most one.
+
+    Within each destination, sample with weights (E, ..., 1)**(-alpha).
+    Sampling is without replacement only within a token and destination;
+    equal local expert IDs on different ranks are distinct physical experts.
+    Relabel by each destination's realized counts so its expert load is
+    non-decreasing, including after summing all source ranks. Integer counts
+    fluctuate around the power-law weights; rank totals are exact.
+
+    alpha=0 retains the OFF uniform round-robin byte for byte. This helper
+    runs only during profiling setup, outside candidate timing.
+    """
+    tokens, topk = int(num_tokens), int(num_topk)
+    experts, ranks = int(num_experts_per_rank), int(world_size)
+    if tokens < 0 or experts <= 0 or ranks <= 0 or not 0 < topk <= experts * ranks:
+        raise ValueError("Invalid MegaMoE profiling route dimensions")
+    if not 0 <= source_rank < ranks or not math.isfinite(alpha) or alpha < 0:
+        raise ValueError("Invalid MegaMoE profiling source rank or exponent")
+    flat = torch.arange(tokens * topk, dtype=torch.long, device=device)
+    if alpha == 0:
+        return (flat % (experts * ranks)).view(tokens, topk)
+    destination = ((flat + source_rank * tokens * topk) % ranks).view(tokens, topk)
+    local_draws = (topk + ranks - 1) // ranks
+    log_weights = -alpha * torch.arange(experts, 0, -1, dtype=torch.float32, device=device).log()
+    generator = torch.Generator(device=device)
+    generator.manual_seed(_AUTOTUNE_PL_SEED)
+    noise = torch.rand((tokens, ranks, experts), generator=generator, device=device).clamp_(
+        min=torch.finfo(torch.float32).tiny
+    )
+    gumbel = -torch.log(-torch.log(noise))
+    candidates = torch.topk(log_weights + gumbel, local_draws, dim=-1).indices
+    local = candidates[
+        torch.arange(tokens, device=device).unsqueeze(1),
+        destination,
+        torch.arange(topk, device=device) // ranks,
+    ]
+    counts = torch.bincount(
+        (destination * experts + local).reshape(-1), minlength=ranks * experts
+    ).view(ranks, experts)
+    order = torch.argsort(counts, dim=1, stable=True)
+    relabel = torch.empty_like(order)
+    relabel.scatter_(1, order, torch.arange(experts, device=device).expand(ranks, experts))
+    return destination * experts + relabel[destination, local]
+
+
+def _token_back_ready_granularity_choices(*, load_balance: bool = False) -> tuple[str, ...]:
+    """Compare both readiness modes only for load-balanced tuning."""
+    return _TOKEN_BACK_READY_GRANULARITIES if load_balance else ("expert",)
+
+
+@functools.cache
+def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
+    """Separate timing caches without changing the registered op or kernel ABI.
+
+    Every launch that may tune asks for it, so each name is built once.
+    """
+    base = "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+    load_balance = helper_expert_count > 0
+    alpha = _autotune_pl_alpha(helper_expert_count)
+    granularities = _token_back_ready_granularity_choices(load_balance=load_balance)
+    if not load_balance and alpha == 0 and granularities == ("expert",):
+        return base
+    return (
+        f"{base}:profile_v2:load_balance={int(load_balance)}:alpha={alpha!r}"
+        f":ready={','.join(granularities)}"
+    )
+
+
 def _unpack_tactic(tactic: Tuple) -> Tuple:
-    """Return the canonical 10 fields, accepting the legacy 8-tuple.
+    """Return the canonical 11 fields, accepting the v4 10- and v3 8-tuples.
 
     Legacy tactics map ``static`` to grid-stride work IDs and preserve their
     grouped scheduling hint. Their single-stage bulk store is represented
     explicitly so old autotuner cache entries keep identical code generation.
+    Pre-v5 tactics take ``token_back_ready_granularity="expert"`` -- the only
+    value this op compiled before the field entered the tuple, so a cache
+    written by an older build keeps its exact meaning.
     Validation remains centralized in :func:`validate_megamoe_tactic`.
     """
+    token_back_ready_granularity = _DEFAULT_TOKEN_BACK_READY_GRANULARITY
     if len(tactic) == _LEGACY_TACTIC_LEN:
         (
             mma_tiler,
@@ -200,6 +304,19 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
                 f"'atomic_counter', got {load_balance_mode!r}."
             )
         fc2_tma_stages = 1 if use_bulk_fc2_store else None
+    elif len(tactic) == _TACTIC_LEN_V4:
+        (
+            mma_tiler,
+            cluster_shape,
+            fallback_cluster_shape,
+            schedule_policy,
+            work_id_mode,
+            token_back_mode,
+            use_bulk_fc2_store,
+            fc2_tma_stages,
+            flag_batch,
+            epi_flag_batch,
+        ) = tactic
     else:
         (
             mma_tiler,
@@ -212,6 +329,7 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
             fc2_tma_stages,
             flag_batch,
             epi_flag_batch,
+            token_back_ready_granularity,
         ) = tactic
 
     return (
@@ -225,14 +343,60 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
         fc2_tma_stages,
         flag_batch,
         epi_flag_batch,
+        token_back_ready_granularity,
     )
+
+
+# Reuse default tactic objects so validation can be memoized by identity.
+# These shared constants must not be mutated. Value-only memoization could
+# conflate bool with int and bypass tactic type checks.
+_DEFAULT_TACTIC_DECODE: Tuple = (
+    [256, 128, 256],
+    [2, 1, 1],
+    512,
+    "static",
+    "epi_warps",
+    True,
+    1,
+    (1, 1),
+)
+_DEFAULT_TACTIC_MID: Tuple = (
+    [256, 256, 256],
+    [2, 1, 1],
+    512,
+    "static",
+    "epi_warps",
+    True,
+    4,
+    (1, 1),
+)
+_DEFAULT_TACTIC_PREFILL_STATIC: Tuple = (
+    [256, 256, 256],
+    [2, 1, 1],
+    512,
+    "static",
+    "reuse_dispatch_warps",
+    False,
+    8,
+    (2, 4),
+)
+_DEFAULT_TACTIC_PREFILL_ATOMIC: Tuple = (
+    [256, 256, 256],
+    [2, 1, 1],
+    512,
+    "atomic_counter",
+    "reuse_dispatch_warps",
+    False,
+    8,
+    (2, 4),
+)
 
 
 def default_megamoe_tactic(num_tokens: int) -> Tuple:
     """Deterministic token-bucket fallback when no shape-tuned default
     exists; never profiled by the autotuner."""
     if num_tokens <= 1024:
-        # decode winner: N128 only helps epi_warps + bulk.
+        # Deterministic fallback for the smallest token bucket.
         return (
             [256, 128, 256],
             [2, 1, 1],
@@ -244,6 +408,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             1,
             1,
             (1, 1),
+            _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
         )
     if num_tokens <= 8192:
         return (
@@ -257,8 +422,9 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             1,
             4,
             (1, 1),
+            _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
         )
-    # prefill: atomic_counter only helps the very large tail (>=16384).
+    # Use the atomic work distributor for the upper token bucket.
     return (
         [256, 256, 256],
         [2, 1, 1],
@@ -270,13 +436,13 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
         None,
         8,
         (2, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
     )
 
 
-# Static defaults for the SM107 DSv4 Pro DEP4 and DEP8 shapes.
-# Routing distribution is not a
-# rank-identical runtime input, so each bucket uses one static tactic. The full
-# runner key prevents applying the table beyond the measured shape and codegen modes.
+# Static defaults for the explicitly keyed SM107 configurations. Routing is not
+# rank-identical, so each bucket uses one deterministic tactic. The complete
+# runner key prevents applying an entry to a different shape or codegen mode.
 _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
     (
         107,
@@ -296,6 +462,7 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         "bf16",
         None,
         None,
+        0,
     ): (
         list(mma_tiler),
         [4, 1, 1],
@@ -524,6 +691,7 @@ def _megamoe_problem_key(
     combine_format: str,
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
+    helper_expert_count: int = 0,
 ) -> Tuple:
     return (
         int(sm_version),
@@ -543,6 +711,8 @@ def _megamoe_problem_key(
         str(combine_format),
         None if swiglu_alpha is None else float(swiglu_alpha),
         None if swiglu_beta is None else float(swiglu_beta),
+        # The helper count changes generated code and must be part of its cache key.
+        int(helper_expert_count),
     )
 
 
@@ -557,19 +727,19 @@ def _default_megamoe_tactic_for_problem(
     shape_tuned_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
-        return _MEGAMOE_NONBULK_STANDALONE_TACTIC
+        return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
     bucket = _sm107_tactic_bucket(max_tokens_per_rank) if sm_version == 107 else None
     if bucket is not None:
         expected_in_kernel_fc2_reduce = _sm107_use_in_kernel_fc2_reduce(
             max_tokens_per_rank, apply_topk_in_fc1
         )
         if in_kernel_fc2_reduce != expected_in_kernel_fc2_reduce:
-            return _MEGAMOE_NONBULK_STANDALONE_TACTIC
-        return _SM107_GENPHASE_TACTICS[bucket]
+            return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+        return _unpack_tactic(_SM107_GENPHASE_TACTICS[bucket])
     if in_kernel_fc2_reduce:
-        return _MEGAMOE_NONBULK_STANDALONE_TACTIC
+        return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
     if shape_tuned_tactic is not None:
-        return shape_tuned_tactic
+        return _unpack_tactic(shape_tuned_tactic)
     return default_megamoe_tactic(num_tokens)
 
 
@@ -587,14 +757,16 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
 
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
     """Return the heuristic tactic followed by shape-safe fallbacks."""
+    tactic = _unpack_tactic(tactic)
     candidates = [tactic]
-    schedule_policy = _unpack_tactic(tactic)[3]
+    schedule_policy = tactic[3]
     if schedule_policy[0] == "phase_interleave" and schedule_policy[1] is not None:
         auto_hint_tactic = list(tactic)
         auto_hint_tactic[3] = ("phase_interleave", None)
         candidates.append(tuple(auto_hint_tactic))
-    if _MEGAMOE_NONBULK_STANDALONE_TACTIC not in candidates:
-        candidates.append(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    nonbulk_tactic = _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    if nonbulk_tactic not in candidates:
+        candidates.append(nonbulk_tactic)
     return tuple(candidates)
 
 
@@ -713,13 +885,13 @@ def _construct_megamoe_kernel(
     """Construct the active architecture kernel and report a narrow gen rejection."""
     from cutlass.cute.nvgpu import OperandMajorMode
 
-    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe import (
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import CombineFormat, QuantKind
+    from tensorrt_llm._torch.moe.kernels.megamoe_kernels import (
         BlackwellInferenceMegaMoE,
         RubinInferenceGenphaseMegaMoE,
         RubinInferenceMegaMoE,
     )
-    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
-    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import CombineFormat, QuantKind
 
     local_experts, intermediate_gateup_size, hidden_size = common["static_expert_shape"]
     problem_desc = ProblemDesc(
@@ -754,12 +926,15 @@ def _construct_megamoe_kernel(
         "work_id_mode": str(common["work_id_mode"]),
         "fc2_use_bulk": not bool(common["non_ubulk_fc2_store"]),
         "epi_flag_batches": tuple(common["epi_flag_batch"]),
+        # Kernel construction and READY arguments must use the same helper count.
+        "helper_expert_count": int(common.get("helper_expert_count", 0)),
         "launch_cluster_count": int(common["launch_cluster_count"]),
         "fallback_cluster_shape_mn": common["fallback_cluster_shape_mn"],
         "preferred_cluster_count": common["preferred_cluster_count"],
         "fallback_cluster_count": common["fallback_cluster_count"],
         "token_in_flag_batch": int(common["flag_batch"]),
         "token_back_mode": str(common["token_back_mode"]),
+        "token_back_ready_granularity": str(common.get("token_back_ready_granularity", "expert")),
         "reduce_topk_in_kernel": bool(common["in_kernel_fc2_reduce"]),
     }
     if sm_version == 107:
@@ -775,15 +950,25 @@ def _construct_megamoe_kernel(
         impl_values["fc2_tma_stages"] = int(common["fc2_tma_stages"])
     impl_desc = ImplDesc(impl_values)
 
+    def construct(kernel_cls):
+        # ProblemDesc.validate ignores undeclared keys, so a kernel without the SwiGLU
+        # constants would silently run plain SwiGLU.
+        if (
+            common["swiglu_alpha"] is not None
+            and "swiglu_alpha" not in kernel_cls.problem_desc_require()
+        ):
+            raise NotImplementedError(f"{kernel_cls.__name__} does not support swiglu_alpha.")
+        return kernel_cls(problem_desc, impl_desc)
+
     bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     rejection = None
     if bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS:
         try:
-            return RubinInferenceGenphaseMegaMoE(problem_desc, impl_desc), None
+            return construct(RubinInferenceGenphaseMegaMoE), None
         except (ValueError, TypeError, NotImplementedError) as exc:
             rejection = exc
     kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
-    return kernel_cls(problem_desc, impl_desc), rejection
+    return construct(kernel_cls), rejection
 
 
 def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
@@ -822,11 +1007,12 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
     """
     if (not isinstance(tactic, tuple)) or len(tactic) not in {
         _TACTIC_LEN,
+        _TACTIC_LEN_V4,
         _LEGACY_TACTIC_LEN,
     }:
         raise ValueError(
             f"MegaMoE tactic must be a {_TACTIC_LEN}-tuple (or legacy "
-            f"{_LEGACY_TACTIC_LEN}-tuple), got "
+            f"{_TACTIC_LEN_V4}- / {_LEGACY_TACTIC_LEN}-tuple), got "
             f"{type(tactic).__name__} len={len(tactic) if isinstance(tactic, tuple) else 'NA'}={tactic!r}"
         )
     is_legacy_tactic = len(tactic) == _LEGACY_TACTIC_LEN
@@ -841,6 +1027,7 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         fc2_tma_stages,
         flag_batch,
         epi_flag_batch,
+        token_back_ready_granularity,
     ) = _unpack_tactic(tactic)
 
     if (not isinstance(mma_tiler, (list, tuple))) or len(mma_tiler) != 3:
@@ -1001,10 +1188,89 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
                 f"(epilogue clamp range), got {epi_flag_batch!r}."
             )
 
+    if token_back_ready_granularity not in _TOKEN_BACK_READY_GRANULARITIES:
+        raise ValueError(
+            f"token_back_ready_granularity must be one of "
+            f"{_TOKEN_BACK_READY_GRANULARITIES}, got {token_back_ready_granularity!r}."
+        )
+    if token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
+        # Mirrors the kernel's own guard (kernel_src/*/inference/mega/
+        # block_scaled_swap_ab_mega_moe_kernel.py, _validate_geometry). Checking
+        # it HERE is the point of putting the granularity in the tuple: the
+        # kernel raises at build time, which is a crash, while enumeration wraps
+        # every candidate in this function and simply drops what fails. The
+        # kernel-side copy stays as the backstop for hand-supplied tactics.
+        #
+        # Two of the kernel's nine conditions are not tactic-local and are not
+        # re-checked here:
+        #   quant_kind == nvfp4     -- this op's ProblemDesc hardcodes nvfp4.
+        #   not reduce_topk_in_kernel -- implied transitively: token_tile
+        #     requires use_bulk_fc2_store, and get_valid_tactics already drops
+        #     every bulk candidate when in_kernel_fc2_reduce is set.
+        unmet = []
+        if work_id_mode != "atomic_counter":
+            unmet.append(f"work_id_mode={work_id_mode!r} (need 'atomic_counter')")
+        if token_back_mode not in ("standalone_warps", "reuse_dispatch_warps"):
+            unmet.append(
+                f"token_back_mode={token_back_mode!r} "
+                f"(need 'standalone_warps' or 'reuse_dispatch_warps')"
+            )
+        if mma_tiler[0] != 256:
+            unmet.append(f"mma_tiler_mnk[0]={mma_tiler[0]} (need 256, i.e. use_2cta_instrs)")
+        if not use_bulk_fc2_store:
+            unmet.append("use_bulk_fc2_store=False (need True, FC2 TMA stores)")
+        if unmet:
+            raise ValueError(
+                "token_back_ready_granularity='token_tile' is unmet by: " + "; ".join(unmet)
+            )
+
+
+def _expand_megamoe_ready_tactics(
+    candidates: list[Tuple], sm_version: int, *, load_balance: bool
+) -> list[Tuple]:
+    """Return canonical tactics for every legal token-back READY mode."""
+    choices = _token_back_ready_granularity_choices(load_balance=load_balance)
+    if sm_version == 107 and choices != ("expert",):
+        # At every token bucket include a legal local-TMA/atomic-counter
+        # base; the curated SM107 candidates otherwise exclude token_tile.
+        for cluster, fallback, policy, mode, flag, epi in (
+            ([2, 1, 1], None, ("grouped", 512), "reuse_dispatch_warps", 4, (1, 1)),
+            ([2, 1, 1], None, ("grouped", 512), "reuse_dispatch_warps", 4, (2, 4)),
+            ([2, 1, 1], None, ("grouped", 512), "standalone_warps", 1, (2, 4)),
+            ([4, 1, 1], [2, 1, 1], ("phase_interleave", None), "reuse_dispatch_warps", 4, (2, 4)),
+        ):
+            candidates.append(
+                (
+                    [256, 256, 256],
+                    cluster,
+                    fallback,
+                    policy,
+                    "atomic_counter",
+                    mode,
+                    True,
+                    2,
+                    flag,
+                    epi,
+                )
+            )
+    expanded = []
+    for base in candidates:
+        for granularity in choices:
+            tactic = (*_unpack_tactic(base)[:_TACTIC_LEN_V4], granularity)
+            try:
+                validate_megamoe_tactic(tactic, sm_version=sm_version)
+            except ValueError:
+                continue
+            if tactic not in expanded:
+                expanded.append(tactic)
+    return expanded
+
 
 def enumerate_megamoe_candidate_tactics(
     num_tokens: int,
     sm_version: int = 100,
+    *,
+    load_balance: bool = False,
 ) -> List[Tuple]:
     """Return the curated candidate tactic list for the current token bucket.
 
@@ -1093,7 +1359,7 @@ def enumerate_megamoe_candidate_tactics(
             )
             validate_megamoe_tactic(mixed, sm_version=sm_version)
             candidates.append(mixed)
-        return candidates
+        return _expand_megamoe_ready_tactics(candidates, sm_version, load_balance=load_balance)
     if sm_version not in (100, 103):
         raise ValueError(
             f"MegaMoE tactic enumeration supports SM100, SM103, or SM107; got SM{sm_version}."
@@ -1125,11 +1391,8 @@ def enumerate_megamoe_candidate_tactics(
                             continue
                         candidates.append(tactic)
 
-    # These additions are intentionally curated instead of crossed with every
-    # legacy axis: staged FC2 UBLK and mixed-CGA/phase scheduling are expensive
-    # to compile and autotuning is opt-in. These entries expose the upstream
-    # performance mechanisms while preserving the existing deterministic
-    # production defaults.
+    # Add a bounded set of valid staged and mixed-scheduling candidates rather
+    # than crossing every independent tactic axis.
     if num_tokens >= 2048:
         for fc2_tma_stages in (2, 4):
             tactic = (
@@ -1146,8 +1409,7 @@ def enumerate_megamoe_candidate_tactics(
             )
             validate_megamoe_tactic(tactic, sm_version=sm_version)
             candidates.append(tactic)
-        # Local TMA stage 2 was the only consistently useful depth in B200
-        # A/B tests: stage 1 tied it while stage 4 regressed from extra SMEM.
+        # Include the resource-balanced local TMA configuration.
         tactic = (
             [256, 256, 256],
             [2, 1, 1],
@@ -1177,7 +1439,7 @@ def enumerate_megamoe_candidate_tactics(
         )
         validate_megamoe_tactic(tactic, sm_version=sm_version)
         candidates.append(tactic)
-    return candidates
+    return _expand_megamoe_ready_tactics(candidates, sm_version, load_balance=load_balance)
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -1200,14 +1462,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         except ImportError:
             from cuda import cuda
 
-        from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe import (  # noqa: F401
+        from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain.symmetric_buffer import (
+            SymmetricBufferHost,  # noqa: F401
+        )
+        from tensorrt_llm._torch.moe.kernels.megamoe_kernels import (  # noqa: F401
             BlackwellInferenceMegaMoE,
             RubinInferenceGenphaseMegaMoE,
             RubinInferenceLocalMegaMoE,
             RubinInferenceMegaMoE,
-        )
-        from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain.symmetric_buffer import (
-            SymmetricBufferHost,  # noqa: F401
         )
 
         IS_MEGAMOE_OP_AVAILABLE = True
@@ -1227,6 +1489,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 if IS_MEGAMOE_OP_AVAILABLE:
+    # Validate default tactics before enabling identity-based validation bypass.
+    # If validation fails, retain normal per-call checks rather than failing import.
+    for _prevalidate_t in (
+        _DEFAULT_TACTIC_DECODE,
+        _DEFAULT_TACTIC_MID,
+        _DEFAULT_TACTIC_PREFILL_STATIC,
+        _DEFAULT_TACTIC_PREFILL_ATOMIC,
+        _MEGAMOE_NONBULK_STANDALONE_TACTIC,
+    ):
+        try:
+            validate_megamoe_tactic(_prevalidate_t)
+        except Exception as _prevalidate_err:  # pragma: no cover - partial installation
+            logger.debug(
+                "[MegaMoE] tactic prevalidation skipped (%s); falling back to "
+                "per-launch validation.",
+                _prevalidate_err,
+            )
+            _PREVALIDATED_TACTICS.clear()
+            break
+        _PREVALIDATED_TACTICS.append(_prevalidate_t)
+
     # ----- Local workspace cache --------------------------------------------
     #
     # ``local_workspace`` is per-rank CUDA-only and sized by
@@ -1242,6 +1525,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
     # workspace; persisting all would OOM, so each candidate's workspace is
     # freed when the next one allocates (only the winner is reused).
     _MEGAMOE_TUNING_WORKSPACE_KEYS: set = set()
+
+    # Cache runners by constructor inputs, except while the AutoTuner profiles
+    # an autotune opt-in. Reset profiling scratch on reuse and overwrite READY
+    # inputs for every call.
+    _MEGAMOE_RUNNER_CACHE: dict = {}
 
     @functools.lru_cache(maxsize=1)
     def _cute_launch_helpers():
@@ -1267,6 +1555,60 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
 
         return to_cute, to_cute_ptr, SymBufferHost, cute
+
+    def _cute_view_key(t: torch.Tensor, assumed_align: int) -> Tuple:
+        """Everything a cute view of ``t`` encodes."""
+        return (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype, t.device.index, assumed_align)
+
+    def _to_cute_cached(cache: dict, t: torch.Tensor, assumed_align: int = 16):
+        """Return the cute view of ``t`` from ``cache``, converting it on a miss.
+
+        The key holds everything the view encodes, so a hit equals a fresh
+        conversion even if the address was reused. Only for tensors whose
+        layout is fixed (module weights, launch buffers): one entry per tensor.
+        """
+        key = _cute_view_key(t, assumed_align)
+        cute_tensor = cache.get(key)
+        if cute_tensor is None:
+            cute_tensor = cache[key] = _cute_launch_helpers()[0](t, assumed_align)
+        return cute_tensor
+
+    def _to_cute_slot(cache: dict, slot: str, t: torch.Tensor, assumed_align: int = 16):
+        """Like ``_to_cute_cached`` but keep only the latest view under ``slot``.
+
+        For a buffer whose live row count changes between iterations but not
+        between the layers of one iteration.
+        """
+        key = _cute_view_key(t, assumed_align)
+        entry = cache.get(slot)
+        if entry is None or entry[0] != key:
+            entry = cache[slot] = (key, _cute_launch_helpers()[0](t, assumed_align))
+        return entry[1]
+
+    # cute pointers by (address, alignment): a pointer encodes nothing else, so
+    # a hit equals a fresh ``make_ptr``. Bounded because tuning visits many
+    # workspaces; a pointer holds no tensor reference.
+    _MEGAMOE_CUTE_PTR_CACHE: dict = {}
+    _MEGAMOE_CUTE_PTR_CACHE_MAX_ENTRIES = 256
+
+    def _to_cute_ptr_cached(t: torch.Tensor, assumed_align: int = 16):
+        key = (t.data_ptr(), assumed_align)
+        ptr = _MEGAMOE_CUTE_PTR_CACHE.get(key)
+        if ptr is None:
+            if len(_MEGAMOE_CUTE_PTR_CACHE) >= _MEGAMOE_CUTE_PTR_CACHE_MAX_ENTRIES:
+                _MEGAMOE_CUTE_PTR_CACHE.clear()
+            ptr = _MEGAMOE_CUTE_PTR_CACHE[key] = _cute_launch_helpers()[1](t, assumed_align)
+        return ptr
+
+    # cuda-python stream wrappers by raw handle.
+    _MEGAMOE_CU_STREAMS: dict = {}
+
+    def _current_cu_stream():
+        handle = torch._C._cuda_getCurrentRawStream(torch._C._cuda_getDevice())
+        stream = _MEGAMOE_CU_STREAMS.get(handle)
+        if stream is None:
+            stream = _MEGAMOE_CU_STREAMS[handle] = cuda.CUstream(handle)
+        return stream
 
     def _evict_latched_tuning_workspaces() -> None:
         """Pop every tuning-latched local workspace and prune its fence keys.
@@ -1358,7 +1700,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # (max_T, 1, hidden): both reduction forms collapse the top-k axis in-op.
         combine_output: torch.Tensor
         shared_workspace: torch.Tensor  # (shared_ws_bytes,) uint8
-        peer_offsets: List[int]  # symmetric peer-pointer deltas
+        peer_offsets: Tuple[int, ...]  # symmetric peer-pointer deltas
         rank: int
         world_size: int
 
@@ -1479,6 +1821,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 peer_ptr = int(self._handle.buffer_ptrs[r])
                 self.peer_offsets.append(peer_ptr - local_base)
 
+            # Built on first use per inference-mode state: a view made under
+            # inference mode cannot be updated in place outside it.
+            self._regions: dict = {}
+            # Cute views of these regions, shared by every layer launching on
+            # this provider (set as the op's buffer cache by the backend).
+            self.cute_views: dict = {}
+
             logger.debug(
                 "[MegaMoeSymmMemProvider] group=%s rank=%d/%d total_bytes=%d "
                 "(activation=%d sf=%d topk_weights=%d combine=%d shared=%d)",
@@ -1505,6 +1854,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             return byte_view.view(dtype).view(shape)
 
         def get_regions(self) -> MegaMoeSymmRegions:
+            inference_mode = torch.is_inference_mode_enabled()
+            regions = self._regions.get(inference_mode)
+            if regions is None:
+                regions = self._regions[inference_mode] = self._build_regions()
+            return regions
+
+        def _build_regions(self) -> MegaMoeSymmRegions:
             hidden = self.hidden_size
             max_t = self.max_tokens_per_rank
             top_k = self.num_topk
@@ -1529,7 +1885,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 shared_workspace=self._region_view(
                     "shared_workspace", (self._region_sizes["shared_workspace"],), torch.uint8
                 ),
-                peer_offsets=list(self.peer_offsets),
+                # A tuple: the regions object is shared across launches.
+                peer_offsets=tuple(self.peer_offsets),
                 rank=self.rank,
                 world_size=self.world_size,
             )
@@ -1647,6 +2004,27 @@ if IS_MEGAMOE_OP_AVAILABLE:
         _MEGAMOE_PROFILING_SCRATCH_CACHE[cache_key] = provider
         return provider
 
+    # Cute views of the calling module's weights, set by the backend around
+    # the op call like the profiling scratch. A cute view keeps its tensor
+    # alive, so the module owns the dict and the views never outlive it.
+    _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE: Optional[dict] = None
+
+    def set_active_megamoe_cute_weight_cache(cache: Optional[dict]) -> None:
+        """Set (``None`` clears) the calling module's cute weight-view cache."""
+        global _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE
+        _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE = cache
+
+    # Cute views of the symmetric launch buffers, set by the backend only
+    # when activation, activation_sf, topk_weights and the combine output are
+    # its provider's regions and topk_idx is its own staging buffer. The
+    # provider owns the dict; topk_idx views go to the module's weight cache.
+    _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE: Optional[dict] = None
+
+    def set_active_megamoe_cute_buffer_cache(cache: Optional[dict]) -> None:
+        """Set (``None`` clears) the active provider's cute launch-buffer cache."""
+        global _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE
+        _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE = cache
+
     def set_active_megamoe_profiling_scratch(regions) -> None:
         """Set (``None`` clears) the :class:`MegaMoeSymmRegions` used for
         AutoTuner profiling on the current call (set by the backend around
@@ -1752,6 +2130,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 fc2_tma_stages,
                 flag_batch,
                 epi_flag_batch,
+                token_back_ready_granularity,
             ) = _unpack_tactic(candidate)
             mma_tiler = tuple(mma_tiler)
             (
@@ -1796,6 +2175,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 fc2_output_dtype=cutlass.BFloat16,
                 in_kernel_fc2_reduce=bool(in_kernel_fc2_reduce),
                 token_back_mode=str(token_back_mode),
+                token_back_ready_granularity=str(token_back_ready_granularity),
                 non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
                 flag_batch=int(flag_batch),
                 epi_flag_batch=tuple(epi_flag_batch),
@@ -1877,6 +2257,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             in_kernel_fc2_reduce: bool = False,
             combine_format: str = "bf16",
             tactic_autotune: bool = False,
+            helper_expert_count: int = 0,
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
@@ -1929,12 +2310,28 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # generated kernel, so deliberately EXCLUDED from unique_id /
             # _tactic_cache_key: opted-in and opted-out runs share caches.
             self.tactic_autotune = bool(tactic_autotune)
+            # ``S``. CODEGEN-CHANGING: a helper-bearing build carries the READY
+            # gate and a static ``H`` boundary in the sched warp, so it MUST NOT
+            # share a compile-cache entry with the ungated baseline.  Hence it
+            # is in unique_id() (which _tactic_cache_key wraps).
+            self.helper_expert_count = int(helper_expert_count)
+            # Per-launch READY runtime bundle (device pointer + generation).
+            # Set by the op right after construction; never a codegen input.
+            self._helper_ready_flags = None
+            self._helper_ready_generation = 0
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
             # SAME tactic and MERGE merges timings by cache key across ranks,
             # so the key MUST be rank-identical. world_size stays so
-            # single-rank and multi-rank never share entries.
+            # single-rank and multi-rank never share entries. The key depends
+            # only on constructor inputs, so each runner builds it once.
+            key = self.__dict__.get("_unique_id")
+            if key is None:
+                key = self._unique_id = self._build_unique_id()
+            return key
+
+        def _build_unique_id(self):
             return _megamoe_problem_key(
                 sm_version=self.sm_version,
                 world_size=self.world_size,
@@ -1955,6 +2352,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 situ_linear_beta=self.situ_linear_beta,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
+                helper_expert_count=self.helper_expert_count,
             )
 
         def get_valid_tactics(
@@ -1965,7 +2363,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ) -> List[Tuple]:
             del profile, kwargs
             num_tokens = int(inputs[0].shape[0])
-            candidates = enumerate_megamoe_candidate_tactics(num_tokens, sm_version=self.sm_version)
+            candidates = enumerate_megamoe_candidate_tactics(
+                num_tokens,
+                sm_version=self.sm_version,
+                load_balance=self.helper_expert_count > 0,
+            )
             # Form-B remains non-bulk. FP4 only rejects peer UBLK; local TMA
             # supports its packed payload. Fields 5/6 are token-back mode and
             # use_bulk_fc2_store respectively.
@@ -1988,17 +2390,22 @@ if IS_MEGAMOE_OP_AVAILABLE:
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
             default_tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
-            if default_tactic is not None and default_tactic not in candidates:
-                candidates.append(default_tactic)
-            return candidates
+            if default_tactic is not None:
+                default_tactic = _unpack_tactic(default_tactic)
+                if default_tactic not in candidates:
+                    candidates.append(default_tactic)
+            choices = _token_back_ready_granularity_choices(
+                load_balance=self.helper_expert_count > 0
+            )
+            return [t for t in candidates if _unpack_tactic(t)[10] in choices]
 
         def _autotuner_inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
             """Sanitize ONLY the autotuner-regenerated fake inputs.
 
             AutoTuner rebuilds inputs 0-3 and 11; the static inputs (4-10) are
             the caller's REAL weights/scales, passed by reference -- filling
-            those would clobber them. topk_idx becomes a valid round-robin
-            (random ints index OOB); SF / weights are filled with 1.0, NOT 0
+            those would clobber them. ON topk_idx uses rank-balanced power-law
+            physical routes; OFF keeps round-robin. SF / weights use 1.0, NOT 0
             (SF==0 degenerates the GEMMs and skews tactic timing).
             """
             # Runs ONLY on a real profiling MISS (a tuning-mode cache HIT
@@ -2026,15 +2433,19 @@ if IS_MEGAMOE_OP_AVAILABLE:
             topk_idx = inputs[2]
             if isinstance(topk_idx, torch.Tensor) and topk_idx.dim() == 2:
                 T, K = topk_idx.shape
-                valid = (
-                    torch.arange(
-                        T * K,
-                        dtype=topk_idx.dtype,
-                        device=topk_idx.device,
-                    )
-                    % total_experts
-                ).view(T, K)
-                topk_idx.copy_(valid)
+                alpha = _autotune_pl_alpha(self.helper_expert_count)
+                valid = synthesize_profiling_topk(
+                    num_tokens=T,
+                    num_topk=K,
+                    num_experts_per_rank=self.num_experts_per_rank,
+                    world_size=self.world_size,
+                    source_rank=self.local_rank,
+                    alpha=alpha,
+                    device=topk_idx.device,
+                )
+                topk_idx.copy_(valid.to(topk_idx.dtype))
+                if self.local_rank == 0 and alpha > 0:
+                    logger.debug("[MegaMoE] helper-bearing autotune workload prepared")
 
             scratch = self._profiling_scratch
             if scratch is not None:
@@ -2082,13 +2493,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
             autotuner does not double-enumerate tile sizes for
             independent token axes.
 
-            Rebuilt on every call, NEVER cached across runners:
+            Built once per runner and NEVER shared across runners:
             ``inputs_pre_hook`` is bound to THIS runner's ``_profiling_scratch``;
-            a cached hook bound to a dead runner would mix non-symmetric
-            profiling tensors with the live runner's peer offsets (IMA + hang).
+            a hook bound to another runner would mix non-symmetric profiling
+            tensors with the live runner's peer offsets (IMA + hang).
             """
-
-            config = TuningConfig(
+            config = self.__dict__.get("_tuning_config")
+            if config is not None:
+                return config
+            config = self._tuning_config = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
@@ -2143,6 +2556,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 fc2_tma_stages,
                 flag_batch,
                 epi_flag_batch,
+                token_back_ready_granularity,
             ) = _unpack_tactic(tactic)
             (
                 launch_cluster_count,
@@ -2186,6 +2600,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 fc2_output_dtype=cutlass.BFloat16,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 token_back_mode=str(token_back_mode),
+                token_back_ready_granularity=str(token_back_ready_granularity),
                 non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
                 flag_batch=int(flag_batch),
                 epi_flag_batch=tuple(epi_flag_batch),
@@ -2195,6 +2610,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
+                helper_expert_count=self.helper_expert_count,
                 **_LOCKED_KERNEL_KWARGS,
             )
             kernel, rejection = _construct_megamoe_kernel(
@@ -2228,6 +2644,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 fc2_tma_stages,
                 flag_batch,
                 epi_flag_batch,
+                token_back_ready_granularity,
             ) = _unpack_tactic(tactic)
             launch_config = _launch_cluster_configuration(
                 cluster_shape,
@@ -2246,6 +2663,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 fc2_tma_stages,
                 int(flag_batch),
                 tuple(epi_flag_batch),
+                str(token_back_ready_granularity),
                 launch_config,
             )
 
@@ -2327,10 +2745,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # -- and a full zero wastes decode time). form-A overwrites.
 
             # Cached per FULL tactic: local workspace SIZE is tactic-dependent
-            # (see _tactic_cache_key).
+            # (see _tactic_cache_key). The key is computed HERE, not at the
+            # launch site further down: the local-workspace cache needs it
+            # first, and `tactic_t` is final from `_resolve_megamoe_kernel_tactic`
+            # above.
+            cache_key = self._tactic_cache_key(tactic_t)
             local_workspace = _get_or_alloc_local_workspace(
                 kernel,
-                cache_key=self._tactic_cache_key(tactic_t),
+                cache_key=cache_key,
                 device=activation.device,
                 latch_in_tuning_mode=self.tactic_autotune,
             )
@@ -2464,30 +2886,53 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # uint8 workspaces MUST be cute.Pointer, NOT cute.Tensor: the
             # 32-bit memref shape field overflows once shared_workspace passes
             # 2 GiB (the kernel addresses by raw base + Int64 byte offset).
-            _to_cute, _to_cute_ptr, SymBufferHost, cute = _cute_launch_helpers()
+            _to_cute, _, SymBufferHost, cute = _cute_launch_helpers()
+            # Weights reuse the calling module's cute views and the symmetric
+            # launch buffers the active provider's; tuning launches convert afresh.
+            tuning = AutoTuner.get().is_tuning_mode
+            weight_cache = None if tuning else _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE
+            buffer_cache = None if tuning else _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE
+            if weight_cache is None:
+                _to_cute_w = _to_cute
+            else:
+                _to_cute_w = functools.partial(_to_cute_cached, weight_cache)
 
             # combine_output (max_T, 1, hidden) reshapes freely to 2D. Weights
             # present K stride-1 via a transpose VIEW (DLPack carries the
             # strides); do NOT ``.contiguous()``.
             output_activation = combine_output.reshape(combine_output.shape[0], self.hidden_size)
+            if buffer_cache is None:
+                cute_activation = _to_cute(activation)
+                cute_activation_sf = _to_cute(activation_sf)
+                cute_topk_weights = _to_cute(topk_weights)
+                cute_output = _to_cute(output_activation)
+                cute_topk_idx = _to_cute(topk_idx)
+            else:
+                cute_activation = _to_cute_cached(buffer_cache, activation)
+                cute_activation_sf = _to_cute_cached(buffer_cache, activation_sf)
+                cute_topk_weights = _to_cute_cached(buffer_cache, topk_weights)
+                # Its live rows change per iteration, not between the layers of one.
+                cute_output = _to_cute_slot(buffer_cache, "output_activation", output_activation)
+                # topk_idx is the calling module's own staging buffer.
+                cute_topk_idx = _to_cute_w(topk_idx)
             runtime_kwargs = dict(
-                activation=_to_cute(activation),
-                activation_sf=_to_cute(activation_sf),
-                fc1_weight=_to_cute(fc1_weight.transpose(1, 2)),
-                fc1_weight_sf=_to_cute(fc1_weight_sf),
-                fc2_weight=_to_cute(fc2_weight.transpose(1, 2)),
-                fc2_weight_sf=_to_cute(fc2_weight_sf),
-                fc1_alpha=_to_cute(fc1_alpha, assumed_align=4),
-                fc2_alpha=_to_cute(fc2_alpha, assumed_align=4),
-                fc1_norm_const=_to_cute(fc1_norm_const, assumed_align=4),
-                output_activation=_to_cute(output_activation),
-                local_workspace=_to_cute_ptr(local_workspace),
-                shared_workspace=_to_cute_ptr(shared_workspace),
-                stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+                activation=cute_activation,
+                activation_sf=cute_activation_sf,
+                fc1_weight=_to_cute_w(fc1_weight.transpose(1, 2)),
+                fc1_weight_sf=_to_cute_w(fc1_weight_sf),
+                fc2_weight=_to_cute_w(fc2_weight.transpose(1, 2)),
+                fc2_weight_sf=_to_cute_w(fc2_weight_sf),
+                fc1_alpha=_to_cute_w(fc1_alpha, assumed_align=4),
+                fc2_alpha=_to_cute_w(fc2_alpha, assumed_align=4),
+                fc1_norm_const=_to_cute_w(fc1_norm_const, assumed_align=4),
+                output_activation=cute_output,
+                local_workspace=_to_cute_ptr_cached(local_workspace),
+                shared_workspace=_to_cute_ptr_cached(shared_workspace),
+                stream=_current_cu_stream(),
             )
             runtime_kwargs.update(
-                topk_indices=_to_cute(topk_idx),
-                topk_scores=_to_cute(topk_weights),
+                topk_indices=cute_topk_idx,
+                topk_scores=cute_topk_weights,
                 peer_rank_ptr_mapper_host=SymBufferHost(
                     base_address=int(activation.untyped_storage().data_ptr()),
                     offsets=tuple(int(off) for off in peer_offsets),
@@ -2495,7 +2940,35 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     max_ranks=int(self.world_size),
                 ),
             )
-            cache_key = self._tactic_cache_key(tactic_t)
+            # READY ABI tail: attached only when S > 0, i.e. rebalance is on.
+            # Contract: with S > 0 both values must be supplied. Fail loudly
+            # here rather than hand the kernel an unarmed gate.
+            if self.helper_expert_count > 0:
+                if self._helper_ready_flags is None:
+                    raise RuntimeError(
+                        "MegaMoE-CuteDSL: helper_expert_count > 0 requires "
+                        "hot_expert_weight_ready_flags (uint64[EP] terminal "
+                        "flags); got None."
+                    )
+                if not (1 <= int(self._helper_ready_generation) < (1 << 63)):
+                    raise RuntimeError(
+                        "MegaMoE-CuteDSL: hot_expert_weight_ready_generation "
+                        f"must be in [1, 2**63); got "
+                        f"{self._helper_ready_generation}."
+                    )
+                if self._helper_ready_flags.numel() < self.world_size:
+                    raise RuntimeError(
+                        "MegaMoE-CuteDSL: hot_expert_weight_ready_flags must "
+                        f"hold at least world_size={self.world_size} uint64 "
+                        f"cells; got numel={self._helper_ready_flags.numel()}."
+                    )
+                runtime_kwargs["hot_expert_weight_ready_flags"] = _to_cute_ptr_cached(
+                    self._helper_ready_flags
+                )
+                runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
+                    int(self._helper_ready_generation)
+                )
+            # unique_id() includes helper_expert_count, separating cached ABIs.
             cached = self.__class__.kernel_cache.get(cache_key)
             if cached is None:
                 compiled = cute.compile(kernel, **runtime_kwargs)
@@ -2505,14 +2978,94 @@ if IS_MEGAMOE_OP_AVAILABLE:
             compiled(**runtime_kwargs)
             return combine_output
 
+    def _megamoe_get_runner(
+        world_size,
+        local_rank,
+        num_topk,
+        num_experts_per_rank,
+        hidden_size,
+        intermediate_size_per_partition,
+        expand_intermediate_size_per_partition,
+        max_tokens_per_rank,
+        output_dtype,
+        apply_topk_in_fc1,
+        swiglu_alpha,
+        swiglu_beta,
+        gate_up_clamp,
+        situ_beta,
+        situ_linear_beta,
+        in_kernel_fc2_reduce,
+        combine_format,
+        tactic_autotune,
+        helper_expert_count,
+    ):
+        """Reuse a runner by its complete constructor key.
+
+        Reset profiling scratch on reuse; each op call supplies fresh READY inputs.
+        """
+        args = (
+            world_size,
+            local_rank,
+            num_topk,
+            num_experts_per_rank,
+            hidden_size,
+            intermediate_size_per_partition,
+            expand_intermediate_size_per_partition,
+            max_tokens_per_rank,
+            output_dtype,
+            apply_topk_in_fc1,
+            swiglu_alpha,
+            swiglu_beta,
+            gate_up_clamp,
+            situ_beta,
+            situ_linear_beta,
+            in_kernel_fc2_reduce,
+            combine_format,
+            tactic_autotune,
+            helper_expert_count,
+        )
+
+        def _make():
+            return Sm100MegaMoENvfp4Runner(
+                world_size=world_size,
+                local_rank=local_rank,
+                num_topk=num_topk,
+                num_experts_per_rank=num_experts_per_rank,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
+                max_tokens_per_rank=max_tokens_per_rank,
+                output_dtype=output_dtype,
+                apply_topk_in_fc1=apply_topk_in_fc1,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                gate_up_clamp=gate_up_clamp,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                combine_format=combine_format,
+                tactic_autotune=tactic_autotune,
+                helper_expert_count=helper_expert_count,
+            )
+
+        # A runner that may profile owns profiling scratch, so tuning-mode calls
+        # with the autotune opt-in get a fresh one. Outside tuning mode
+        # choose_one only looks up the tuned tactic, and the runner is reused.
+        if tactic_autotune and AutoTuner.get().is_tuning_mode:
+            return _make()
+        runner = _MEGAMOE_RUNNER_CACHE.get(args)
+        if runner is None:
+            runner = _make()
+            _MEGAMOE_RUNNER_CACHE[args] = runner
+        else:
+            # Reset profiling scratch on reuse; the caller supplies fresh READY fields.
+            runner._profiling_scratch = None
+            runner._profiling_scratch_factory = None
+        return runner
+
     # ----- torch op ---------------------------------------------------------
 
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
-        mutates_args=("combine_output", "shared_workspace"),
-        device_types="cuda",
-    )
-    def cute_dsl_megamoe_nvfp4_blackwell(
+    def run_cute_dsl_megamoe_nvfp4_blackwell(
         activation: torch.Tensor,
         activation_sf: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -2545,6 +3098,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
         num_tokens: int = -1,
+        # READY ABI tail. ``helper_expert_count`` (S) is codegen-time;
+        # ``hot_expert_weight_ready_flags`` is the local uint64[EP] terminal
+        # view published by the weight transport, ``..._generation`` the
+        # expected generation g in [1, 2**63). All three default to the
+        # S == 0 kernel without helper slots.
+        helper_expert_count: int = 0,
+        hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
+        hot_expert_weight_ready_generation: int = 0,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -2586,26 +3147,31 @@ if IS_MEGAMOE_OP_AVAILABLE:
         if num_tokens > 0:
             combine_output = combine_output[: min(num_tokens, combine_output.shape[0])]
 
-        runner = Sm100MegaMoENvfp4Runner(
-            world_size=world_size,
-            local_rank=local_rank,
-            num_topk=num_topk,
-            num_experts_per_rank=num_experts_per_rank,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=intermediate_size_per_partition,
-            expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
-            max_tokens_per_rank=max_tokens_per_rank,
-            output_dtype=combine_output.dtype,
-            apply_topk_in_fc1=apply_topk_in_fc1,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            gate_up_clamp=gate_up_clamp,
-            situ_beta=act_alpha,
-            situ_linear_beta=act_beta,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-            combine_format=combine_format,
-            tactic_autotune=tactic_autotune,
+        runner = _megamoe_get_runner(
+            world_size,
+            local_rank,
+            num_topk,
+            num_experts_per_rank,
+            hidden_size,
+            intermediate_size_per_partition,
+            expand_intermediate_size_per_partition,
+            max_tokens_per_rank,
+            combine_output.dtype,
+            apply_topk_in_fc1,
+            swiglu_alpha,
+            swiglu_beta,
+            gate_up_clamp,
+            act_alpha,
+            act_beta,
+            in_kernel_fc2_reduce,
+            combine_format,
+            tactic_autotune,
+            helper_expert_count,
         )
+        # READY inputs belong to this launch. Never regenerate them or retain stale
+        # values across calls, even when the runner itself is cached.
+        runner._helper_ready_flags = hot_expert_weight_ready_flags
+        runner._helper_ready_generation = int(hot_expert_weight_ready_generation)
         inputs = [
             activation,
             activation_sf,
@@ -2626,12 +3192,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # materializes the multi-GiB scratch and MERGE-sweeps every
             # candidates. tactic=-1 guarantees deterministic default selection
             # with no tuning collectives, even inside a global autotune().
-            runner(
-                inputs,
-                tactic=-1,
-                peer_offsets=peer_offsets,
-                shared_workspace=shared_workspace,
-            )
+            try:
+                runner(
+                    inputs,
+                    tactic=-1,
+                    peer_offsets=peer_offsets,
+                    shared_workspace=shared_workspace,
+                )
+            finally:
+                # Release the cached runner reference to this generation's terminal tensor.
+                # The next call supplies fresh READY inputs.
+                runner._helper_ready_flags = None
             return
         tuner = AutoTuner.get()
         # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
@@ -2670,7 +3241,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             prof_shared_workspace = shared_workspace
         try:
             _, best_tactic = tuner.choose_one(
-                "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
+                _megamoe_tuning_op_name(runner.helper_expert_count),
                 [runner],
                 runner.get_tuning_config(),
                 inputs,
@@ -2681,12 +3252,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
             runner._profiling_scratch = None
             runner._profiling_scratch_factory = None
         # Real run always uses the caller's staging buffer + peer_offsets.
-        runner(
-            inputs,
-            tactic=best_tactic,
-            peer_offsets=peer_offsets,
-            shared_workspace=shared_workspace,
-        )
+        try:
+            runner(
+                inputs,
+                tactic=best_tactic,
+                peer_offsets=peer_offsets,
+                shared_workspace=shared_workspace,
+            )
+        finally:
+            runner._helper_ready_flags = None
+
+    # Eager callers may call ``run_cute_dsl_megamoe_nvfp4_blackwell`` directly
+    # and skip the custom-op dispatch; traced code must use the registered op.
+    cute_dsl_megamoe_nvfp4_blackwell = torch.library.custom_op(
+        "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
+        mutates_args=("combine_output", "shared_workspace"),
+        device_types="cuda",
+    )(run_cute_dsl_megamoe_nvfp4_blackwell)
 
     @torch.library.register_fake("trtllm::cute_dsl_megamoe_nvfp4_blackwell")
     def _(
@@ -2722,5 +3304,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
         num_tokens: int = -1,
+        # READY ABI tail. ``helper_expert_count`` (S) is codegen-time;
+        # ``hot_expert_weight_ready_flags`` is the local uint64[EP] terminal
+        # view published by the weight transport, ``..._generation`` the
+        # expected generation g in [1, 2**63). All three default to the
+        # S == 0 kernel without helper slots.
+        helper_expert_count: int = 0,
+        hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
+        hot_expert_weight_ready_generation: int = 0,
     ) -> None:
         return None

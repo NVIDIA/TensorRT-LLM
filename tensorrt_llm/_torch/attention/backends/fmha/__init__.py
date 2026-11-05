@@ -19,6 +19,7 @@ from .fallback import FallbackFmha
 from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
+from .gqa_decode import GqaDecodeFmha
 from .interface import Fmha, FmhaPhase
 from .msa_decode import MsaDecodeFmha
 from .msa_prefill import MsaPrefillFmha
@@ -41,6 +42,7 @@ __all__ = [
     "FmhaCls",
     "FmhaParams",
     "FmhaPhase",
+    "GqaDecodeFmha",
     "MsaDecodeFmha",
     "MsaPrefillFmha",
     "PhasedFmha",
