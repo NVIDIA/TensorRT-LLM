@@ -180,6 +180,9 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     paged cache different shapes or page strides.
     """
 
+    # Its QSA side buffers and get_buffers override do not support mixed-precision KV.
+    _supports_mixed_precision_kv = False
+
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """PLE state and request-wide QSA positions are replicated across TP."""

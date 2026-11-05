@@ -186,23 +186,31 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     return content, ref.format, getattr(ref, "role", None)
 
 
-def _max_references(generator: Any, field: str) -> Optional[int]:
-    """How many entries the loaded pipeline accepts in ``field``.
+def _validate_video_reference_counts(request: VideoGenerationRequest, generator: VisualGen) -> None:
+    """Reject unsupported or oversized explicit slots before reading uploads.
 
-    ``None`` when a role of the slot is unbounded or the generator declares no
-    slots; a field the pipeline does not accept allows none.
+    The aggregate maximum is a necessary upper bound derived from pipeline
+    metadata. Role inference and per-role minima/maxima remain engine-owned.
     """
-    specs = getattr(generator, "ref_slot_specs", None)
+    specs = getattr(getattr(generator, "executor", None), "ref_slot_specs", None)
     if specs is None:
-        return None
-    spec = specs.get(field)
-    if spec is None:
-        return 0
-    maxes = [role.max for role in spec.roles]
-    return None if None in maxes else sum(maxes)
+        return
+    for field in ("image_reference", "video_reference", "audio_reference"):
+        value = getattr(request, field)
+        count = len(value) if isinstance(value, list) else int(value is not None)
+        if not count:
+            continue
+        spec = specs.get(field)
+        if spec is None:
+            raise ValueError(f"'{field}' is not accepted by the loaded pipeline.")
+        maxima = [role.max for role in spec.roles]
+        if all(maximum is not None for maximum in maxima):
+            limit = sum(maxima)
+            if count > limit:
+                raise ValueError(f"'{field}' accepts at most {limit} references, got {count}.")
 
 
-def _build_reference_lists(request: Any, generator: Any) -> Dict[str, list]:
+def _build_reference_lists(request: Any) -> Dict[str, list]:
     """Normalize the HTTP reference fields into lists of ``MediaRef`` objects.
 
     Each of ``image_reference`` / ``video_reference`` / ``audio_reference`` is
@@ -210,10 +218,10 @@ def _build_reference_lists(request: Any, generator: Any) -> Dict[str, list]:
     those. Each entry becomes a ``MediaRef`` carrying its transport content
     plus the declared (or, for an upload, implied) wire format. A ``path``
     reference is read here under the local media policy; ``url`` and
-    ``base64`` are resolved later, at the engine choke point. A field with
-    more entries than the loaded pipeline accepts is refused before any of
-    them is read, and the ``path`` references of one request read at most
-    ``PATH_REFERENCE_MAX_TOTAL_BYTES``. Only the fields that were set are
+    ``base64`` are resolved later, at the engine choke point. The ``path``
+    references of one request read at most ``PATH_REFERENCE_MAX_TOTAL_BYTES``;
+    the entry counts are checked before this by
+    `_validate_video_reference_counts`. Only the fields that were set are
     returned.
     """
     # Local import: the visual_gen tree is already loaded in a VisualGen serving
@@ -227,12 +235,6 @@ def _build_reference_lists(request: Any, generator: Any) -> Dict[str, list]:
         if value is None:
             continue
         raw_items = value if isinstance(value, list) else [value]
-        limit = _max_references(generator, field)
-        if limit is not None and len(raw_items) > limit:
-            raise ValueError(
-                f"{field}: the loaded pipeline accepts at most {limit} references, "
-                f"got {len(raw_items)}."
-            )
         refs = []
         for item in raw_items:
             content, content_format, role = _reference_transport(item)
@@ -527,6 +529,7 @@ def parse_visual_gen_params(
         params.image_reference = _build_image_edit_reference_list(request.image)
 
     elif isinstance(request, VideoGenerationRequest):
+        _validate_video_reference_counts(request, generator)
         if request.frame_rate is not None:
             params.frame_rate = request.frame_rate
         # num_frames wins; otherwise derive from seconds * frame_rate
@@ -554,7 +557,7 @@ def parse_visual_gen_params(
         # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
         # transport content (``bytes`` for an upload or an allowed local file,
         # the string otherwise). The engine resolves ``url`` and ``base64``.
-        for field, refs in _build_reference_lists(request, generator).items():
+        for field, refs in _build_reference_lists(request).items():
             if refs:
                 setattr(params, field, refs)
         _apply_deprecated_input_reference(request.input_reference, params)

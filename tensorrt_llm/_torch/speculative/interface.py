@@ -32,6 +32,7 @@ from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..pyexecutor import step_inputs
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
@@ -234,7 +235,8 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     Call restore_attn_metadata_after_draft_replay in a finally block.
     Returns saved state or None if no-op.
     """
-    if draft_kv_cache_manager is None:
+    if (draft_kv_cache_manager is None
+            or draft_kv_cache_manager is attn_metadata.kv_cache_manager):
         return None
     if not isinstance(attn_metadata, TrtllmAttentionMetadata):
         return None
@@ -643,6 +645,9 @@ class SpecMetadata:
     # from the model's RuntimeHooks). The argmax path never reads them, and the
     # next sampled batch rewrites every row it reads.
     skip_greedy_rng_upload: bool = False
+    # Stage the per-step Philox seed/offset uploads into the engine's step-input
+    # pack (RuntimeHooks.pack_spec_rng_uploads) instead of copying each one.
+    pack_rng_uploads: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -956,10 +961,15 @@ class SpecMetadata:
                                        device='cuda')
 
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            dst[:len(values)].copy_(torch.tensor(values,
-                                                 dtype=torch.int64,
-                                                 pin_memory=prefer_pinned()),
-                                    non_blocking=True)
+            src = torch.tensor(values,
+                               dtype=torch.int64,
+                               pin_memory=prefer_pinned())
+            if self.pack_rng_uploads:
+                # The forward is the first reader of these buffers, so the copy
+                # may move to the pack's flush (a plain copy when no pack is open).
+                step_inputs.copy_(dst[:len(values)], src)
+            else:
+                dst[:len(values)].copy_(src, non_blocking=True)
 
         # An all-greedy batch runs the argmax graph, which reads none of these
         # buffers. The offset windows above still advance, so skipping the
@@ -3419,8 +3429,10 @@ class SpecWorkerBase(nn.Module, ABC):
         Get the draft KV cache manager if using separate KV cache layouts.
         """
         if self.use_separate_draft_kv_cache and resource_manager is not None:
-            return resource_manager.get_resource_manager(
+            draft = resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            if draft is not None:
+                return draft
         if resource_manager is not None:
             target = resource_manager.get_resource_manager(
                 ResourceManagerType.KV_CACHE_MANAGER)
@@ -3441,7 +3453,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """
 
         # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if draft_kv_cache_manager is None:
+        if (draft_kv_cache_manager is None
+                or draft_kv_cache_manager is attn_metadata.kv_cache_manager):
             yield attn_metadata
             return
 

@@ -56,7 +56,7 @@ from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .inputs import DecoderInputPreparer
-from .metadata import DecoderMetadata, resolve_mamba_metadata_cls
+from .metadata import DecoderMetadata, resolve_mamba_metadata_cls, supports_advanced_draft_sampling
 from .warmup import WarmupAgreement
 
 # Context requests per warmup batch whose breakable prefill graph breaks get
@@ -924,7 +924,8 @@ class DecoderCudaGraphs:
             # Dummy warmup requests carry no sampling params, so the greedy pass
             # needs no override while the advanced one has to force the flag.
             _capture_variant("greedy")
-            _capture_variant("advanced sampling", force_non_greedy=True)
+            if supports_advanced_draft_sampling(self._config.spec_config):
+                _capture_variant("advanced sampling", force_non_greedy=True)
             if temperature_only_graphs:
                 # Temperature-only batches replay the vocabulary-sharded Gumbel-max
                 # target sampling (the advanced pass records the stock sampler: its
