@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, Dict, List, Optional, Tuple, Union)
 
-import msgspec
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -67,6 +66,9 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
+from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -81,6 +83,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -93,6 +96,7 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
@@ -106,15 +110,13 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
-    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse,
-    RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    ImageObject, MemoryUpdateRequest, PromptTokensDetails, ResponseFormat,
+    ResponsesRequest, ResponsesResponse, RuntimeMemoryUpdateRequest,
+    StartProfileRequest, TokenizeRequest, TokenizeResponse,
+    UpdateWeightsRequest, UsageInfo, ensure_request_chat_template_allowed,
+    to_llm_conversation_params, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
-                                             PerfMetricsMiddleware,
                                              build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -131,8 +133,7 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
-                                                ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ResponsesStreamingProcessor)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
@@ -155,9 +156,7 @@ from tensorrt_llm.version import __version__ as VERSION
 from .._utils import (AdjustedSteadyClock,
                       get_global_steady_clock_now_in_seconds, nvtx_mark,
                       set_prometheus_multiproc_dir)
-from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
-from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
@@ -178,33 +177,6 @@ def _is_visual_gen_instance(obj) -> bool:
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
-
-_msgpack_decoder = msgspec.msgpack.Decoder()
-
-
-class _MsgspecRequest(KvHintsRequest):
-    """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
-
-    async def json(self):
-        if not hasattr(self, "_json_body"):
-            body = await self.body()
-            if not body:
-                self._json_body = {}
-            elif self.headers.get("x-trtllm-msgpack") == "1":
-                try:
-                    self._json_body = _msgpack_decoder.decode(body)
-                except msgspec.DecodeError as e:
-                    raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
-            else:
-                self._json_body = json.loads(body)
-        return self.filter_kv_hints(self._json_body)
-
-
-class _MsgspecRoute(KvHintsRoute):
-    """Parse msgpack/JSON and apply hint trust policy before model validation."""
-
-    request_type = _MsgspecRequest
-
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -877,12 +849,6 @@ class OpenAIServer(_VideoRoutesMixin):
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
 
-        self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
-                                                  "0") == "1"
-        self.app.router.route_class = _MsgspecRoute
-
-        @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request, exc):
             if request.url.path.startswith("/v1/messages"):
                 # Anthropic clients expect a 400 with the Anthropic error
@@ -907,6 +873,35 @@ class OpenAIServer(_VideoRoutesMixin):
                     len(detail) - 4096)
             return JSONResponse(status_code=400, content={"error": detail})
 
+        self.app = build_http_app(
+            lifespan=lifespan,
+            route_class=_MsgspecRoute,
+            dialect_error_renderers=lambda app: app.add_exception_handler(
+                RequestValidationError, validation_exception_handler),
+            routers=(self._attach_role_routes, ),
+            middleware=lambda app: register_middlewares(
+                app,
+                collect_perf_metrics=self._collect_perf_metrics,
+                expose_perf_metrics=self._expose_perf_metrics,
+                perf_metrics_writer=self._perf_metrics_writer,
+                adjusted_clock=self._adjusted_steady_clock),
+        )
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
+                                                  "0") == "1"
+
+    def _attach_role_routes(self, app: FastAPI) -> None:
+        # The register_* methods below add their routes through self.app.
+        self.app = app
+        # /health, /version and /v1/models for every role. The health
+        # probe stays here, with its private accesses, until the public
+        # health API exists.
+        app.state.ops_serving_system = SystemServing(
+            model=self.model, health_probe=self._health_probe)
+        attach_routers(app, ServerCapabilities.for_role(self.server_role))
+        # Runs before the role dispatch for now. It moves after the dispatch
+        # once the serving objects attach_router checks for are built per
+        # role.
+
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
@@ -925,14 +920,6 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self._register_launcher_forwarding_routes()
             self.register_routes()
-
-        if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer,
-                                    adjusted_clock=self._adjusted_steady_clock)
-        self.app.add_middleware(ServerArrivalTimeMiddleware,
-                                adjusted_clock=self._adjusted_steady_clock)
 
     def _init_visual_gen(self):
         self.processor = None
@@ -1223,12 +1210,9 @@ class OpenAIServer(_VideoRoutesMixin):
         return True
 
     def register_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate",
                                self.health_generate,
                                methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/data_transceiver_state",
                                self.data_transceiver_state,
                                methods=["GET"])
@@ -1373,9 +1357,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.routes.append(metrics_route)
 
     def register_mm_encoder_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
@@ -1479,9 +1460,6 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def register_embedding_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/embeddings",
                                self.openai_embedding,
                                methods=["POST"])
@@ -1586,10 +1564,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""
-        # Health and info endpoints
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
@@ -1706,9 +1680,9 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
-    async def health(self) -> Response:
+    def _health_probe(self) -> bool:
         if self._check_health():
-            return Response(status_code=200)
+            return True
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
@@ -1726,11 +1700,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         f"server shutdown: {executor._fatal_error}")
                     _record_generator_termination(self.generator)
                     signal.raise_signal(signal.SIGINT)
-            return Response(
-                status_code=503,
-                content=
-                "LLM is unavailable. Please check the server logs for more details."
-            )
+            return False
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
@@ -1780,14 +1750,6 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(f"Health generate check encountered exception: {e}")
             return Response(status_code=500,
                             content=f"Generation health check failed: {str(e)}")
-
-    async def version(self) -> JSONResponse:
-        ver = {"version": VERSION}
-        return JSONResponse(content=ver)
-
-    async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
-        return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
         # Visual-gen deployments use a separate iteration-stats producer
@@ -4252,26 +4214,24 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        server = create_uvicorn_server(config)
+        await serve_uvicorn(self.app,
+                            host=host,
+                            port=port,
+                            sockets=sockets,
+                            log_level="info",
+                            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                            after_start=self._register_after_serving)
 
-        async def _register_after_serving():
-            with _StartupTimer("http_server_start"):
-                while not server.started:
-                    await asyncio.sleep(0.1)
-            if self.disagg_cluster_worker:
-                try:
-                    with _StartupTimer(
-                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
-                    ):
-                        await self.disagg_cluster_worker.register_worker()
-                except Exception as e:
-                    logger.error(f"Worker registration failed: {e}")
-                    server.should_exit = True
-
-        asyncio.create_task(_register_after_serving())
-        await server.serve(sockets=sockets)
+    async def _register_after_serving(self, server: uvicorn.Server) -> None:
+        with _StartupTimer("http_server_start"):
+            while not server.started:
+                await asyncio.sleep(0.1)
+        if self.disagg_cluster_worker:
+            try:
+                with _StartupTimer(
+                        f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                ):
+                    await self.disagg_cluster_worker.register_worker()
+            except Exception as e:
+                logger.error(f"Worker registration failed: {e}")
+                server.should_exit = True
