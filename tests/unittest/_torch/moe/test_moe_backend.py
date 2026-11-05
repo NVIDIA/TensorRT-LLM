@@ -7102,15 +7102,23 @@ def _mxfp8_fp32_oracle(
     [
         (60, 4, 2048, 1408, 128),  # Qwen1.5-MoE-A2.7B
         (128, 10, 4096, 1024, 128),  # Qwen3.5-397B experts as seen by one EP4 rank
-        # Decode-sized batch: quantize_input defers the MXFP8 quantization to
-        # the fused FC12 workspace reset (raw BF16 reaches the op).
-        (128, 10, 4096, 1024, 16),
+        (128, 10, 4096, 1024, 16),  # decode-sized batch
     ],
     ids=["e60_k4_h2048_i1408", "e128_k10_h4096_i1024", "e128_k10_h4096_i1024_decode"],
 )
+# Every shape above is under FUSED_INPUT_QUANT_MAX_ELEMENTS, so quantize_input
+# hands the op raw BF16 that it quantizes in its workspace reset; the
+# "prequantized" case lowers the threshold to 0 so the op gets E4M3 input.
+@pytest.mark.parametrize("fused_input_quant", [True, False], ids=["raw_input", "prequantized"])
 def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
-    num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, seq_len: int
-):
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    seq_len: int,
+    fused_input_quant: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A/B the fused MXFP8 FC12 CuTeDSL MoE against independent references on identical inputs.
 
     Three legs consume the SAME MXFP8 activations and e4m3/UE8M0 weights:
@@ -7176,10 +7184,13 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
         ref_fused_moe.cuda()
 
         token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+        if not fused_input_quant:
+            monkeypatch.setattr(type(backend), "FUSED_INPUT_QUANT_MAX_ELEMENTS", 0)
         x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
-        # Small batches come back as raw BF16 (quantized inside the fused op);
-        # the references always consume explicitly quantized activations,
-        # which are byte-identical to what the op produces.
+        assert (x_quantized.dtype == torch.float8_e4m3fn) is not fused_input_quant
+        # Raw BF16 is quantized inside the fused op; the references always
+        # consume explicitly quantized activations, which are byte-identical to
+        # what the op produces.
         if x_quantized.dtype == torch.float8_e4m3fn:
             x_q_ref, x_sf_ref = x_quantized, x_sf
         else:

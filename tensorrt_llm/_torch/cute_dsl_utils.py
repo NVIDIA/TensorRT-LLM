@@ -51,6 +51,24 @@ IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 # presence of both submodules as the capability marker for that kernel.
 IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE = False
 
+# The MXFP8 fused FC12 workspace reset indexes the output it zeroes and the raw
+# input it quantizes with Int32, so each holds at most this many elements.
+MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS = 2**31 - 1
+
+
+def mxfp8_fused_fc12_tuner_key_suffix(input_dtype) -> str:
+    """Tuner-key suffix that keeps raw-input timings apart from prequantized ones.
+
+    A raw BF16/FP16 input is quantized inside the op's workspace reset, so its
+    timings include that work; the leaf's outer key and the op's inner key both
+    append this suffix.
+    """
+    import torch
+    if input_dtype == torch.float8_e4m3fn:
+        return ""
+    return f"::input_quant::{input_dtype}"
+
+
 if platform.system() != "Windows":
     try:
         from cutlass import cute  # noqa

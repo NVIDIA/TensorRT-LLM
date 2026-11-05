@@ -5814,7 +5814,7 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
     reason="Sm107Mxfp8FusedFc12MoeRunner constructs on Rubin (SM107) only, with a CuTe DSL build "
     "that supports the fused FC12 kernel",
 )
-def test_mxfp8_fused_fc12_sparse_gather_selection():
+def test_mxfp8_fused_fc12_sparse_gather_selection() -> None:
     """The gather variant is chosen from static shapes, scaled by the rank's expert share.
 
     Qwen3.5-397B geometry: 512 experts, top-k 10. ``padded_routes`` is the
@@ -5828,8 +5828,8 @@ def test_mxfp8_fused_fc12_sparse_gather_selection():
     # EP16 decode: 32 tokens, ~20 local routes spread over ~20 tiles -> sparse.
     assert runner(32)._use_sparse_gather(num_rows=32, padded_routes=20 * 128)
     # EP16 mid range, 2048 tokens: ~1280 local routes but heavy per-expert
-    # padding (32 experts x 127 rows) -> still sparse; the old rank-agnostic
-    # rule (tokens * top_k * 2 = 40960) would have kept the static gather.
+    # padding (32 experts x 127 rows) -> still sparse, because the estimate
+    # counts only this rank's share of the routes.
     assert runner(32)._use_sparse_gather(num_rows=2048, padded_routes=1280 + 32 * 127)
     # EP4 prefill, 16384 tokens: routes dominate the padding -> static.
     assert not runner(128)._use_sparse_gather(
@@ -5842,11 +5842,8 @@ def test_mxfp8_fused_fc12_sparse_gather_selection():
     assert not runner(1)._use_sparse_gather(num_rows=100, padded_routes=128)
 
 
-@pytest.mark.skipif(
-    not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
-    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
-)
-def test_mxfp8_moe_tuning_buckets_cover_decode_shapes():
+@pytest.mark.cpu_only
+def test_mxfp8_moe_tuning_buckets_cover_decode_shapes() -> None:
     """The MXFP8 MoE tuning buckets must not depend on the warmup forward's token count.
 
     The engine's autotuner warmup runs one forward at whatever token count the
@@ -5888,9 +5885,10 @@ def test_mxfp8_moe_tuning_buckets_cover_decode_shapes():
     assert 4 not in unanchored and 8 not in unanchored, unanchored
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("hidden", [2048, 4096, 7168])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
+def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> None:
     """Only local computation may defer quantization; communication needs bytes.
 
     The cutoff is an element count, so the largest deferred row count follows
@@ -5939,8 +5937,9 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("over_limit", [False, True])
-def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit):
+def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -> None:
     """The Rubin workspace reset indexes the output with Int32, so an output
     past that extent is cleared by the memset rather than inside the op."""
     impl = TrtllmCutedslFusedFc12Mxfp8Impl
@@ -5991,7 +5990,8 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit):
     assert len(memsets) == (1 if over_limit else 0)
 
 
-def test_mxfp8_input_quantization_tuning_cache_isolation():
+@pytest.mark.cpu_only
+def test_mxfp8_input_quantization_tuning_cache_isolation() -> None:
     """Changing activation dtype must not reuse prequantized timing decisions."""
     keys = {
         TrtllmCutedslFusedFc12Mxfp8Impl._tuner_key(dtype)

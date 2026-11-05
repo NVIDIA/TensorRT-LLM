@@ -24,6 +24,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                              MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS,
+                              mxfp8_fused_fc12_tuner_key_suffix,
                               reserved_max_active_clusters, sm_reserve)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
 from ..locality_domain.runtime import LocalityDomainRuntime
@@ -18464,9 +18466,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 count and are re-materialized for the profiled bucket.
 
                 Input tensor layout:
-                    0: input                      - [orig_m, K] e4m3 activations
+                    0: input                      - [orig_m, K] e4m3 activations,
+                                                    or raw bf16/fp16 that the op
+                                                    quantizes in its reset launch
                     1: fc1_weight                 - [L, 2*I, K] e4m3
-                    2: input_scale                - [orig_m, K/32] uint8, linear
+                    2: input_scale                - [orig_m, K/32] uint8, linear;
+                                                    shape only for raw input
                     3: fc1_weight_scale           - [L, 2*I, K/32] uint8, swizzled
                     4: fc1_alpha                  - [L] float32
                     5: tile_idx_to_group_idx      - [num_tiles] int32
@@ -18516,9 +18521,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 the finalize scatter-adds ``route_scale * fc2`` into ``output``.
 
                 Contract:
-                - ``output`` must be zero on entry for the rows this rank owns
-                  (the backend runs ``moe_output_memset_inplace``); the kernel
-                  accumulates into it.
+                - The kernel accumulates into ``output``, so it must be zero on
+                  entry for the rows this rank owns: with ``zero_output`` the
+                  op's workspace reset clears it, otherwise the caller runs
+                  ``moe_output_memset_inplace`` first.
                 - Weight scales are in the 128x4 swizzled layout produced by
                   ``block_scale_interleave``; the activation scale is linear
                   ``[orig_m, K/32]``. FC1 weights and scales are gate/up
@@ -18613,14 +18619,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     Decode tiles carry a few valid rows per 128-row tile and win
                     from skipping the wholly padded 16-row groups; full tiles
-                    keep the statically unrolled gather. The DKG rule compares
-                    twice the valid local routes with the padded route count.
-                    The valid count is not known statically, so estimate it as
+                    keep the statically unrolled gather. Pick the sparse gather
+                    when the padded route count exceeds twice the valid local
+                    routes, i.e. when more than half of the gathered rows are
+                    padding. The valid count is not known statically, so
+                    estimate it as
                     ``num_rows * top_k`` scaled by this rank's share of the
                     experts (routes land on local experts in proportion), and
                     never below ``num_rows`` (with alltoall every arriving row
                     has at least one local route). Overestimating keeps the
-                    original gather, so the estimate errs that way.
+                    static gather, so the estimate errs that way.
                     """
                     local_routes = -(-num_rows * self.top_k *
                                      self.num_local_experts // self.num_experts)
@@ -18787,7 +18795,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                          != torch.float8_e4m3fn else None)
                     if input_unquantized is not None:
                         assert fc1_a.is_contiguous(
-                        ) and fc1_a.data_ptr() % 16 == 0
+                        ) and fc1_a.data_ptr() % 16 == 0, (
+                            "fused input quantization needs a contiguous, "
+                            "16-byte aligned input, got shape "
+                            f"{tuple(fc1_a.shape)}, stride {fc1_a.stride()}, "
+                            f"data_ptr {fc1_a.data_ptr():#x}")
                     assert fc1_b.dtype == torch.float8_e4m3fn and fc1_b.dim(
                     ) == 3
                     assert fc2_b.dtype == torch.float8_e4m3fn and fc2_b.dim(
@@ -18812,10 +18824,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             and output.data_ptr() % 16 == 0, (
                                 "zero_output needs a contiguous, 16-byte aligned "
                                 "BF16 output with a multiple of 8 elements")
-                        if output.numel() > _INT32_MAX:
+                        if output.numel() > MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS:
                             raise ValueError(
                                 "zero_output clears at most "
-                                f"{_INT32_MAX} output elements, got "
+                                f"{MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS} output "
+                                "elements, got "
                                 f"{output.numel()}; clear the output before "
                                 "the call instead")
                         reset_output_numel = output.numel()
@@ -18878,10 +18891,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # calls on different streams (chunk overlap) never share
                     # it, and nothing is retained per row count.
                     if input_unquantized is not None:
-                        if input_unquantized.numel() > _INT32_MAX:
+                        if (input_unquantized.numel()
+                                > MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS):
                             raise ValueError(
                                 "MXFP8 fused FC12 input quantization takes at most "
-                                f"{_INT32_MAX} elements, got "
+                                f"{MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS} elements, got "
                                 f"{input_unquantized.numel()}")
                         fc1_a = torch.empty(input_unquantized.shape,
                                             dtype=torch.float8_e4m3fn,
@@ -19308,8 +19322,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     fc1_norm_const, fc2_weight, fc2_weight_scale, fc2_alpha,
                     output, token_final_scales
                 ]
-                if input.dtype != torch.float8_e4m3fn:
-                    tuner_key += f"::input_quant::{input.dtype}"
+                tuner_key += mxfp8_fused_fc12_tuner_key_suffix(input.dtype)
                 if precomputed_tactic is None:
                     _, best_tactic = tuner.choose_one(
                         tuner_key,
@@ -19370,7 +19383,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 memset. BF16/FP16 input fuses MXFP8 input quantization into
                 that reset launch; ``input_scale`` then supplies only the
                 expected [orig_m, K/32] shape and is never read or modified.
-                E4M3 input requires populated linear UE8M0 scales as before.
+                E4M3 input requires populated linear UE8M0 scales.
                 A negative ``swiglu_limit`` disables the SwiGLU clamp.
                 """
                 _run_mxfp8_fused_fc12_moe_rubin(
