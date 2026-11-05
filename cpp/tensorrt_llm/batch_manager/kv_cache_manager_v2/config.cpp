@@ -63,8 +63,16 @@ void SparseCacheConfig::validate(int tokensPerBlock) const
     TLLM_CHECK_WITH_INFO(maxCachedUnits > numSelectedBlocks,
         "SparseCacheConfig: maxCachedUnits must exceed numSelectedBlocks, to leave room for units in "
         "flight");
-    TLLM_CHECK_WITH_INFO(unitTokens > 0 && tokensPerBlock % unitTokens == 0,
-        "SparseCacheConfig: unitTokens must be a divisor of tokensPerBlock");
+    TLLM_CHECK_WITH_INFO(unitTokens > 0 && tokensPerBlock > 0 && tokensPerBlock % unitTokens == 0,
+        "SparseCacheConfig: unitTokens must be a divisor of positive tokensPerBlock");
+    // The arena rounds capacity up to whole pages. Bound it by the largest whole-page
+    // capacity the probe supports, without rounding an arbitrarily large input upward.
+    int const units = unitsPerPage(tokensPerBlock);
+    int const maxSupportedUnits = (kMaxCacheEntries / units) * units;
+    TLLM_CHECK_WITH_INFO(maxCachedUnits <= maxSupportedUnits,
+        "SparseCacheConfig: maxCachedUnits=%d exceeds the supported capacity of %d units for %d units per page "
+        "(sparse probe limit %d); reduce gpu_cache_factor or max_cached_units",
+        maxCachedUnits, maxSupportedUnits, units, kMaxCacheEntries);
 }
 
 void AttentionLayerConfig::validate() const

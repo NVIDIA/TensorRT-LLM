@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,66 @@ TEST(KvCacheManagerV2ConfigTest, ExistingBufferConfigurationDefaultsToDense)
     EXPECT_FALSE(buffer.isSparse);
     EXPECT_EQ(buffer.tokensPerBlockOverride, 2);
     EXPECT_NO_THROW(makeConfig().validate());
+}
+
+TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityRespectsProbeLimitAfterPageRounding)
+{
+    constexpr int kTokensPerBlock = 128;
+
+    struct Boundary
+    {
+        int unitTokens;
+        int maxCachedUnits;
+    };
+
+    constexpr Boundary kBoundaries[] = {{128, 16'382}, {1, 16'256}, {4, 16'352}};
+    for (auto const& boundary : kBoundaries)
+    {
+        SCOPED_TRACE(boundary.unitTokens);
+        SparseCacheConfig cache{
+            .numSelectedBlocks = 2, .maxCachedUnits = boundary.maxCachedUnits, .unitTokens = boundary.unitTokens};
+        EXPECT_NO_THROW(cache.validate(kTokensPerBlock));
+        ++cache.maxCachedUnits;
+        EXPECT_THROW(cache.validate(kTokensPerBlock), std::runtime_error);
+    }
+}
+
+TEST(KvCacheManagerV2ConfigTest, OversizedSparseCacheFailsManagerConfigValidation)
+{
+    auto config = makeConfig();
+    config.tokensPerBlock = 128;
+    auto layer = makeAttentionLayer(0, true);
+    layer.buffers.push_back(BufferConfig{.role = "index", .size = 256});
+    // Eight selections of 2048 tokens plus one in-flight token round to 16,512 entries.
+    layer.sparseCache = SparseCacheConfig{.numSelectedBlocks = 2048, .maxCachedUnits = 16'512, .unitTokens = 1};
+    config.layers = {layer};
+    try
+    {
+        config.validate();
+        FAIL() << "An oversized sparse cache must fail before manager construction";
+    }
+    catch (std::runtime_error const& error)
+    {
+        std::string const message = error.what();
+        EXPECT_NE(message.find("maxCachedUnits=16512"), std::string::npos);
+        EXPECT_NE(message.find("supported capacity of 16256"), std::string::npos);
+        EXPECT_NE(message.find("reduce gpu_cache_factor"), std::string::npos);
+    }
+}
+
+TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityValidationHandlesLargeInputs)
+{
+    constexpr int kTokensPerBlock = 128;
+    SparseCacheConfig const cache{
+        .numSelectedBlocks = 2, .maxCachedUnits = std::numeric_limits<int>::max(), .unitTokens = 1};
+    EXPECT_THROW(cache.validate(kTokensPerBlock), std::runtime_error);
+}
+
+TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityValidationRejectsNonPositivePageSize)
+{
+    SparseCacheConfig const cache{.numSelectedBlocks = 2, .maxCachedUnits = 4, .unitTokens = 1};
+    EXPECT_THROW(cache.validate(0), std::runtime_error);
+    EXPECT_THROW(cache.validate(-1), std::runtime_error);
 }
 
 TEST(KvCacheManagerV2ConfigTest, OneLayerMayMixSparseAndDenseBuffers)

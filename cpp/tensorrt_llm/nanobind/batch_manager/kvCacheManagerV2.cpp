@@ -1761,6 +1761,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
         .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens)
+        .def_prop_ro(
+            "max_unit_ordinal", [](kv::SparseCacheConfig const&) { return kv::SparseCacheConfig::kMaxUnitOrdinal; },
+            "Largest zero-based unit ordinal supported by the sparse probe index.")
         .def_rw("selection_id", &kv::SparseCacheConfig::selectionId,
             "Layers whose selection is one selection share this id, and with it one resident "
             "set and one resolve. None means the layer selects for itself: it is read as the "
@@ -2540,6 +2543,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::make_tuple(std::move(r.first), std::move(r.second));
         },
         nb::arg("batch"));
+    mIntrospection.def("batch_sparse_clock", &kv::KvCacheIntrospection::batchSparseClock, nb::arg("batch"),
+        "The sparse eviction clock as (host counter, staged copy). Both are host reads, so this "
+        "neither synchronises nor waits on a publish in flight.");
     mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& entryAge, int numLayers,

@@ -223,6 +223,11 @@ std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batc
     return {std::move(history), std::move(capacity)};
 }
 
+std::pair<uint32_t, int32_t> KvCacheIntrospection::batchSparseClock(Batch const& batch)
+{
+    return {batch.mSparseStepAge, batch._buf<int32_t>(Batch::BufName::kSparseClock).front()};
+}
+
 std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};
@@ -558,7 +563,8 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.work.ordinal = reinterpret_cast<int32_t*>(missOrd.get());
     args.work.slot = reinterpret_cast<int32_t*>(missSlotBuf.get());
     args.work.total = reinterpret_cast<int32_t*>(totalBuf.get());
-    args.work.capacity = static_cast<int32_t>(flatOrdinal.size());
+    // One list's length: the kernel finds list k at k * capacity.
+    args.work.capacity = static_cast<int32_t>(perList);
     args.work.numLists = numLists;
     args.gridCtas = gridCtas;
 

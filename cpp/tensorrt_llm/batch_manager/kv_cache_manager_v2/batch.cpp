@@ -1477,16 +1477,6 @@ void Batch::publish()
     }
     mFlushCountersDirty = false;
 
-    // The sparse eviction clock, which the resolves of this step then read. It wraps into
-    // SparseEntry's timestamp field, and a rebase every kRebaseStep steps is what keeps a
-    // timestamp from falling far enough behind the wrap to read as a recent one.
-    //
-    // Staged rather than passed by value, with the watermarks and for the same reason: a
-    // captured resolve replays against whatever the device holds, not against what the host
-    // held when the graph was recorded.
-    mSparseStepAge = (mSparseStepAge + 1) & SparseEntry::kTimestampMask;
-    _buf<int32_t>(BufName::kSparseClock).front() = static_cast<int32_t>(mSparseStepAge);
-
     // Refusing rather than waiting, because by this point a wait would be too late to help.
     // Everything that writes the staged rows has to be separated from the copy reading them:
     // the members' own mutations, which happened before this call, and the watermarks and
@@ -1520,6 +1510,20 @@ void Batch::publish()
                 "one converted index table");
         }
     }
+
+    // The sparse eviction clock, which the resolves of this step then read. It wraps into
+    // SparseEntry's timestamp field, and a rebase every kRebaseStep steps is what keeps a
+    // timestamp from falling far enough behind the wrap to read as a recent one.
+    //
+    // Staged rather than passed by value, with the watermarks and for the same reason: a
+    // captured resolve replays against whatever the device holds, not against what the host
+    // held when the graph was recorded.
+    //
+    // Only after both checks above: a refused publish must leave the counter and its staged
+    // copy as they were. The previous upload may still be reading that copy, and a step
+    // counted here but never run on the device can be the one a rebase was due on.
+    mSparseStepAge = (mSparseStepAge + 1) & SparseEntry::kTimestampMask;
+    _buf<int32_t>(BufName::kSparseClock).front() = static_cast<int32_t>(mSparseStepAge);
 
     // The members write their own page indices, but not their watermarks; collect those
     // now so the single transfer below carries a matched pair.

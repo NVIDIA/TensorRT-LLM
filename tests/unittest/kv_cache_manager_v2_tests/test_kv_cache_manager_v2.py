@@ -693,6 +693,106 @@ class TestSparseBufferConfig(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_each_arena_pool_has_a_zeroed_tile_tail(self):
+        import ctypes
+
+        import cuda.bindings.runtime as cudart
+
+        def aligned(size: int) -> int:
+            return (size + 255) // 256 * 256
+
+        init_cuda_once()
+        # Exercise 32, 64, 128 and 256 stored rows per page, multiple layers and
+        # multiple leases. The guard is always 128 rows for each whole pool.
+        for tokens_per_block, unit_tokens, num_layers, max_leases in (
+            (128, 4, 1, 1),
+            (128, 2, 2, 3),
+            (128, 1, 2, 3),
+            (256, 1, 2, 3),
+        ):
+            with self.subTest(
+                tokens_per_block=tokens_per_block,
+                unit_tokens=unit_tokens,
+                num_layers=num_layers,
+                max_leases=max_leases,
+            ):
+                units_per_page = tokens_per_block // unit_tokens
+                units_per_buffer = 3 * units_per_page
+                row_bytes = {"key": 576, "key_scale": 36}
+                manager = KVCacheManager(
+                    KVCacheManagerConfig(
+                        tokens_per_block=tokens_per_block,
+                        cache_tiers=[GpuCacheTierConfig(64 << 20)],
+                        constraints=[
+                            BatchDesc(
+                                kv_caches=[KVCacheDesc(capacity=1024, history_length=0)]
+                                * max_leases
+                            )
+                        ],
+                        layers=[
+                            AttentionLayerConfig(
+                                layer,
+                                [
+                                    BufferConfig(role, units_per_page * size, is_sparse=True)
+                                    for role, size in row_bytes.items()
+                                ]
+                                + [BufferConfig("index", 256)],
+                                sparse_cache=SparseCacheConfig(
+                                    num_selected_blocks=2,
+                                    max_cached_units=units_per_buffer,
+                                    unit_tokens=unit_tokens,
+                                ),
+                            )
+                            for layer in range(num_layers)
+                        ],
+                    )
+                )
+                try:
+                    with TemporaryCudaStream([]) as stream:
+                        batch = Batch(
+                            manager,
+                            cast(CudaStream, stream.handle),
+                            max_batch_size=max_leases,
+                            max_blocks_per_seq=8,
+                            index_tables=manager.sparse_index_table_specs(),
+                        )
+                        usable_rows = max_leases * num_layers * units_per_buffer
+                        regions = sorted(
+                            (
+                                int(batch.get_sparse_cache_base_address(LayerId(0), role)),
+                                usable_rows * size,
+                                128 * size,
+                            )
+                            for role, size in row_bytes.items()
+                        )
+                        # Each region pads its payload and tail to 256 bytes, which the
+                        # one-lease key_scale region needs. No guard is allocated for the
+                        # dense indexer's empty arena region.
+                        first_base, first_payload, first_tail = regions[0]
+                        self.assertEqual(
+                            regions[1][0] - first_base, aligned(first_payload + first_tail)
+                        )
+                        metadata_bytes = aligned(num_layers * units_per_buffer * 4)
+                        self.assertEqual(
+                            batch.sparse_arena_bytes,
+                            sum(aligned(payload + tail) for _, payload, tail in regions)
+                            + 3 * 256
+                            + max_leases * metadata_bytes,
+                        )
+                        self.assertEqual(manager.get_sparse_cache_max_units(0), units_per_buffer)
+                        for base, payload, tail in regions:
+                            sink = (ctypes.c_ubyte * tail)()
+                            (err,) = cudart.cudaMemcpy(
+                                ctypes.addressof(sink),
+                                base + payload,
+                                tail,
+                                cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                            )
+                            self.assertEqual(int(err), 0)
+                            self.assertEqual(bytes(sink), bytes(tail))
+                finally:
+                    manager.shutdown()
+
     def test_sparse_sizing_defaults_and_roundtrip(self):
         plain = BufferConfig("key", 4096)
         self.assertFalse(plain.is_sparse)
@@ -1049,26 +1149,32 @@ class TestSparseCacheReservation(unittest.TestCase):
         return sum(stats.free for stats in manager.get_storage_statistics())
 
     def test_batch_rejects_resolve_shared_memory_overflow_before_fetch(self) -> None:
-        for max_cached_units, selection_width in ((1 << 20, 2), (1 << 16, (1 << 16) - 1)):
-            with self.subTest(max_cached_units=max_cached_units, selection_width=selection_width):
-                # Token-sized units keep the arena small while either residency metadata
-                # or the selection's probe table exceeds a device's per-block limit.
-                manager = self._manager(
-                    max_cached_units,
-                    num_selected_blocks=selection_width,
-                    unit_tokens=1,
+        # Token-sized units keep the arena small. The widest cache the probe index can name,
+        # 16256 units at 128 per page, needs about 80 KiB for its residency metadata, so the
+        # selection's probe table and miss lists are what exceed a device's per-block limit.
+        manager = self._manager(16256, num_selected_blocks=16255, unit_tokens=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+                Batch(
+                    manager,
+                    NULL_STREAM,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_specs(),
                 )
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
-                        Batch(
-                            manager,
-                            NULL_STREAM,
-                            max_batch_size=1,
-                            max_blocks_per_seq=4,
-                            index_tables=manager.sparse_index_table_specs(),
-                        )
-                finally:
-                    manager.shutdown()
+        finally:
+            manager.shutdown()
+
+    def test_a_cache_wider_than_the_probe_index_fails_with_the_config(self) -> None:
+        # The probe index names at most 16382 entries, which round down to 16256 token-sized
+        # units at 128 per page. A wider cache fails when the config is built, before a
+        # Batch sizes any resolve.
+        for max_cached_units in (16257, 1 << 20):
+            with self.subTest(max_cached_units=max_cached_units):
+                with self.assertRaisesRegex(
+                    RuntimeError, "exceeds the supported capacity of 16256 units"
+                ):
+                    self._manager(max_cached_units, unit_tokens=1)
 
     def test_batch_accepts_resolve_shared_memory_that_fits(self) -> None:
         # Three token-sized units round up to a full 128-unit cell.
@@ -2037,7 +2143,7 @@ class TestSparseUnitCopy(unittest.TestCase):
 
     def test_layers_land_in_their_own_sub_slot(self):
         # A cold page concatenates two layers' buffers; the cache cell is derived.
-        unit, layers = 16, 2
+        unit, layers, cells = 16, 2, 2
         host = self._pattern(unit * layers)
         result = _introspection.sparse_unit_copy(
             host_pool=host,
@@ -2047,10 +2153,10 @@ class TestSparseUnitCopy(unittest.TestCase):
             # offset array: slot 0 of a pool coalescing two buffers converts to index 0 or
             # 1, and layer 0 is given the second.
             page_table=[1, 0],
-            device_arena=[0] * (unit * layers),
+            device_arena=[0] * (unit * layers * cells),
             base_cell=0,
             num_blocks=1,
-            cells_per_buffer=1,
+            cells_per_buffer=cells,
             buffer_bytes=unit,
             num_chunks=1,
             chunk_bytes=unit,
@@ -2058,15 +2164,18 @@ class TestSparseUnitCopy(unittest.TestCase):
             unit_stride=unit,
             expansion=1,
             miss_ordinal=[0, 0],
-            miss_slot=[0, 0],
+            # Each layer reads its own work list, so the layers name different entries.
+            miss_slot=[0, 1],
             miss_count=[1, 1],
             selection_width=1,
             buffer_layer=list(range(layers)),
         )
         # The cold page comes from the entry and the hot cell is arithmetic on the sub-slot,
-        # so layer 0 reads the second cold buffer into cell 0, and layer 1 the reverse.
+        # so layer 0 reads the second cold buffer into its first cell, and layer 1 the first
+        # cold buffer into its second.
         self.assertEqual(result[:unit], host[unit:])
-        self.assertEqual(result[unit:], host[:unit])
+        self.assertEqual(result[unit : 3 * unit], [0] * (2 * unit))
+        self.assertEqual(result[3 * unit :], host[:unit])
 
     def test_a_layer_without_misses_copies_nothing(self):
         unit = 16
@@ -3626,16 +3735,25 @@ class TestBatchPageTable(unittest.TestCase):
         them: the members' own mutations, and the watermarks and views publish() stages
         itself. Waiting inside publish() would cover only the second, and would do it while
         hiding that a member mutated before the call had already raced.
+
+        The refusal comes before publish() stages anything, the eviction clock included: the
+        copy in flight may still be reading the staged clock, and a refused step must not
+        count, so the next accepted publish advances the clock by exactly one.
         """
         with self._fixture() as (torch, manager, batch, handle):
             with self._member(manager, batch, 0, handle):
+                step_age, staged = _introspection.batch_sparse_clock(batch)
                 # _member's resize() published and nobody has waited on it.
                 with self.assertRaises(Exception) as caught:
                     batch.publish()
                 self.assertIn("still reading the staged rows", str(caught.exception))
+                self.assertEqual(_introspection.batch_sparse_clock(batch), (step_age, staged))
 
                 batch.wait_published()
                 batch.publish()
+                self.assertEqual(
+                    _introspection.batch_sparse_clock(batch), (step_age + 1, staged + 1)
+                )
 
     def test_a_member_refuses_a_second_page_index_buffer(self):
         """Its indices live in the Batch's row, so a second buffer is refused.

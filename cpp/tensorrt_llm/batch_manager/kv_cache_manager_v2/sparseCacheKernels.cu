@@ -169,11 +169,11 @@ __device__ inline uint32_t slotOf(int32_t key, uint32_t mask) noexcept
 //! rest for the ordinal itself. An ordinal of every one bit would be indistinguishable from
 //! an empty position, and a slot of every one bit is what "keyed, but not resident" is, so
 //! neither field reaches its own maximum.
-constexpr uint32_t kTableSlotBits = 14;
+constexpr uint32_t kTableSlotBits = SparseCacheConfig::kProbeSlotBits;
 constexpr uint32_t kTableSlotMask = (1U << kTableSlotBits) - 1U;
 constexpr uint32_t kTableEmpty = 0xFFFFFFFFU;
-constexpr int32_t kMaxTableOrdinal = static_cast<int32_t>((1U << (32 - kTableSlotBits)) - 2U);
-constexpr int32_t kMaxTableSlot = static_cast<int32_t>(kTableSlotMask) - 1;
+constexpr int32_t kMaxTableOrdinal = SparseCacheConfig::kMaxUnitOrdinal;
+constexpr int32_t kMaxTableSlot = SparseCacheConfig::kMaxCacheEntries;
 
 //! The resolve's open-addressed probe index, one word per position.
 //!

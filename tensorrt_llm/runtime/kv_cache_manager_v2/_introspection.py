@@ -343,6 +343,15 @@ def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:
     return list(history), list(capacity)
 
 
+def batch_sparse_clock(batch: Any) -> tuple[int, int]:
+    """A Batch's sparse eviction clock as (host counter, staged copy).
+
+    The staged copy sits in the pinned block publish() uploads, so both are host reads: this
+    neither synchronises nor waits on a publish in flight.
+    """
+    return tuple(_cpp().batch_sparse_clock(batch))
+
+
 class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 

@@ -944,10 +944,14 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         "rejected. It is separate from kv_cache_config.host_cache_size, the "
         "host tier that evicted KV cache pages move to, and the two together "
         "must fit this rank's share of available host memory and the "
-        "pinned-memory limit. When unset, it holds max_batch_size requests at "
-        "kv_cache_config.avg_seq_len, or max_seq_len when that is unset, "
-        "capped by the host memory automatic sizing may pin, and at least what "
-        "those batches need.")
+        "pinned-memory limit. When unset, the history pools come first: they "
+        "may take the host memory automatic sizing may pin, beside the staging "
+        "buffers and, unless kv_cache_config.host_cache_size or a disk tier is "
+        "set, room in the host tier for one max_seq_len request. Either way it "
+        "is an upper bound: the history pools share their slot count with the "
+        "GPU KV cache pools, so they pin only what the GPU quota's slots pair "
+        "with. When unset, the automatic host tier takes the host memory they "
+        "leave, up to the GPU KV cache quota.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):

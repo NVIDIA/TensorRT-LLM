@@ -27,6 +27,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm_100f(),
@@ -73,6 +74,8 @@ def _manager(
     num_layers: int = NUM_LAYERS,
     dtype: DataType = DataType.FP8,
     pretrained_config: SimpleNamespace | None = None,
+    kv_cache_config: KvCacheConfig | None = None,
+    max_batch_size: int = MAX_BATCH_SIZE,
 ) -> DSACacheManagerV2:
     sparse_config = DeepSeekSparseAttentionConfig(
         index_head_dim=128,
@@ -83,17 +86,19 @@ def _manager(
             {"gpu_cache_factor": 2.0, "host_history_size": 1 << 30} if offload else {}
         ),
     )
-    return DSACacheManagerV2(
-        kv_cache_config=KvCacheConfig(
+    if kv_cache_config is None:
+        kv_cache_config = KvCacheConfig(
             enable_block_reuse=False, max_tokens=16384, host_cache_size=0
-        ),
+        )
+    return DSACacheManagerV2(
+        kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELFKONLY,
         num_layers=num_layers,
         num_kv_heads=1,
         head_dim=HEAD_DIM,
         tokens_per_block=TOKENS_PER_BLOCK,
         max_seq_len=1024,
-        max_batch_size=MAX_BATCH_SIZE,
+        max_batch_size=max_batch_size,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=dtype,
         sparse_attention_config=sparse_config,
@@ -435,6 +440,129 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
         assert permuted == (num_requests > 1)
         for request in active:
             manager.free_resources(request)
+    finally:
+        manager.shutdown()
+
+
+def test_suspended_request_keeps_its_history_through_demotion():
+    """With a host tier, history is not reserved at admission; suspension frees it instead.
+
+    A request decodes and tags every token row it writes, then is suspended. Filler
+    requests then take every history slot that is free or held by the suspended
+    request, so they are admitted only by demoting all of its pages to the host tier.
+    Once they leave, the request resumes, and the oldest rows it wrote must read back
+    from the restored pages.
+    """
+    # The suspended request and its fillers are resident at once.
+    max_batch_size = 24
+    manager = _manager(
+        num_layers=1,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=1280,
+            host_cache_size=256 << 20,
+            # A new request's first resume is refused above this utilization, and the
+            # fillers take every slot.
+            max_util_for_resume=1.0,
+        ),
+        max_batch_size=max_batch_size,
+    )
+    try:
+        assert manager._host_history_reservations is None
+        (history_group,) = manager.get_host_backed_pool_groups()
+        # Through both decode phases, the request stays within max_seq_len.
+        prompt_len = 1024 - 3 * TOKENS_PER_BLOCK
+        decode_steps = TOKENS_PER_BLOCK + 1
+        # A filler's prompt and max_new_tokens stay within max_seq_len.
+        filler_blocks = 15
+
+        descriptors = manager.get_sparse_offload_descriptors()
+        descriptor = descriptors[0]
+        arena = _arena_rows(descriptor, descriptor.data_buffer_index, HEAD_DIM)
+        state = allocate_sparse_offload_state(
+            lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
+            descriptors,
+            max_batch_size=max_batch_size,
+            topk=TOPK,
+        )
+        first = _request(1, prompt_len)
+        rid = first.py_request_id
+        written: list[int] = []
+
+        def decode(num_steps: int, oldest: bool) -> None:
+            for _ in range(num_steps):
+                assert manager.try_allocate_generation(first)
+                scheduled = SimpleNamespace(context_requests=[], generation_requests=[first])
+                manager.prepare_resources(scheduled)
+                manager.prepare_sparse_offload(state, [rid], beam_width=1)
+                history = manager.kv_cache_map[rid].history_length
+                row = state.batch_rows[0].item()
+                writes = manager.prepare_sparse_write_indices(state, 0)
+                data = state.out_slots[0][descriptor.data_buffer_index]
+                write_row = writes[row, data].item()
+                assert write_row >= 0
+                arena[write_row, :3] = torch.tensor(
+                    [history, 0, rid], dtype=torch.int32, device="cuda"
+                )
+                # The oldest or newest rows this request wrote, then this step's.
+                units = (written[: TOPK - 1] if oldest else written[-(TOPK - 1) :]) + [history]
+                topk = torch.full((1, TOPK), -1, dtype=torch.int32, device="cuda")
+                topk[0, : len(units)] = torch.tensor(units, dtype=torch.int32)
+                request_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+                kv_lengths = torch.tensor([history + 1], dtype=torch.int32, device="cuda")
+                fetched = manager.fetch_sparse_indices(state, 0, topk, request_indices, kv_lengths)
+                out = torch.empty((1, TOPK), dtype=torch.int32, device="cuda")
+                merge_sparse_arena_indices(
+                    topk,
+                    request_indices,
+                    state.batch_rows,
+                    state.active_request_count,
+                    kv_lengths,
+                    state.history_lengths,
+                    fetched[:, data, :],
+                    writes[:, data],
+                    out,
+                    unit_tokens=1,
+                )
+                got = arena[out[0, : len(units)].long(), :3].tolist()
+                assert got == [[unit, 0, rid] for unit in units], (history, units, got)
+                manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
+                written.append(history)
+
+        assert manager.prepare_disagg_gen_init(first)
+        decode(decode_steps, oldest=False)
+        first_cache = manager.kv_cache_map[rid]
+        manager.suspend_request(first)
+        torch.cuda.synchronize()
+        # Rows read back after the resume must come from the restored pages, not from
+        # what the arena still holds.
+        arena.fill_(-1)
+        held_blocks, demoted_blocks = _introspection.active_page_stats(first_cache)[0]
+        assert demoted_blocks == 0
+
+        # The fillers fit only once every page the suspended request holds, the rows it
+        # wrote included, has moved to the host tier.
+        stats = manager.impl.get_storage_statistics()[history_group.pool_group_index]
+        remaining = stats.free + held_blocks
+        fillers: list[LlmRequest] = []
+        while remaining > 0:
+            num_blocks = min(remaining, filler_blocks)
+            filler = _request(2 + len(fillers), num_blocks * TOKENS_PER_BLOCK)
+            assert manager.prepare_disagg_gen_init(filler), (len(fillers), remaining)
+            fillers.append(filler)
+            remaining -= num_blocks
+        torch.cuda.synchronize()
+        assert _introspection.active_page_stats(first_cache)[0] == [0, held_blocks]
+
+        for filler in fillers:
+            manager.free_resources(filler)
+        assert manager.resume_request(first)
+        torch.cuda.synchronize()
+        assert _introspection.active_page_stats(first_cache)[0] == [held_blocks, 0]
+        # The rows from before the suspension, read back from restored pages.
+        decode(decode_steps, oldest=True)
+        assert len(written) == 2 * decode_steps
+        manager.free_resources(first)
     finally:
         manager.shutdown()
 
