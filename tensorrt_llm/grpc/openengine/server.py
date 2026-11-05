@@ -326,7 +326,7 @@ def _disable_gc_if_requested() -> None:
     """
     if get_env_flag("TRTLLM_SERVER_DISABLE_GC", False):
         gc.disable()
-        logger.info("Python cyclic GC disabled (TRTLLM_SERVER_DISABLE_GC=1)")
+        logger.info("Python cyclic GC disabled by TRTLLM_SERVER_DISABLE_GC")
 
 
 def launch_server(

@@ -466,10 +466,10 @@ def select_mamba2_state(
         )
         use_replay = False
     if not get_env_flag("TRTLLM_USE_MAMBA_REPLAY", True):
-        logger.info("Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
+        logger.info("Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY")
         use_replay = False
     else:
-        logger.info("Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
+        logger.info("Replay kernel is not disabled by TRTLLM_USE_MAMBA_REPLAY")
     return create_mamba2_state(
         spec_config=spec_config, use_replay=use_replay, stochastic_rounding=stochastic_rounding
     )

@@ -656,6 +656,20 @@ else:
 
 Except in exceptional circumstances, use the built-in exception types.  For which type to use when, see [https://docs.python.org/3/library/exceptions.html](https://docs.python.org/3/library/exceptions.html). Use exceptions for error handling, not return values.  And despite the example above, prefer isinstance() to duck typing where possible.
 
+#### Environment Switches
+Read an on/off environment variable with `get_env_flag(name, default)` from `tensorrt_llm._utils`. It accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case, returns `default` when the variable is unset or blank, and raises `ValueError` on any other value.
+
+- Read the switch where a bad value stops the launch: at import, in a constructor or during warmup. Do not read it for the first time while serving a request.
+- Do not read it inside a `try` block that falls back to another path on error. The fallback would hide the `ValueError`.
+- If C++ code, a shell script or another library also reads the variable, every reader must accept the same values.
+
+```python
+from tensorrt_llm._utils import get_env_flag
+
+# Read once at import; the group remap is on unless the switch disables it.
+_GROUP_REMAP = not get_env_flag("TRTLLM_DISABLE_DSA_GROUP_REMAP", False)
+```
+
 #### Static Typing
 
 1. Static type checking at pre-commit time is opt-in by submodule PICs. This is highly recommended because static type checking eliminates an entire class of bugs and makes your code more readable and maintainable overall.

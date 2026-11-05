@@ -105,7 +105,8 @@ def _local_capability(
     major, _ = torch.cuda.get_device_capability()
     if major < 9:
         return False, f"SM {major}x < 90"
-    if "aarch64" not in platform.machine().lower() and not get_env_flag("TLLM_TEST_MNNVL", False):
+    test_mnnvl = get_env_flag("TLLM_TEST_MNNVL", False)
+    if "aarch64" not in platform.machine().lower() and not test_mnnvl:
         return False, "MNNVL multicast workspace requires an aarch64 NVLink domain"
     try:
         import triton  # noqa: F401
@@ -113,7 +114,7 @@ def _local_capability(
         from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
     except ImportError as exc:
         return False, f"import failed: {exc}"
-    if not MnnvlMemory.supports_mnnvl() and not get_env_flag("TLLM_TEST_MNNVL", False):
+    if not MnnvlMemory.supports_mnnvl() and not test_mnnvl:
         return False, "MNNVL not supported on this device"
     return True, ""
 
