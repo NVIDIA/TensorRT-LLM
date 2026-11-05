@@ -104,6 +104,9 @@ ROUTERS: tuple[RouterSpec, ...] = (
         roles=frozenset({RoleGroup.LLM}),
         when=_anthropic_routes_enabled,
     ),
+    RouterSpec(
+        "tensorrt_llm.serve.api.visual_gen.api_router", roles=frozenset({RoleGroup.VISUAL_GEN})
+    ),
 )
 
 

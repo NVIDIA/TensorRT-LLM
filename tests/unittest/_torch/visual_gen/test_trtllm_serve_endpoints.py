@@ -3,8 +3,8 @@
 
 """trtllm-serve visual_gen endpoints tests.
 
-Tests all endpoints registered for the VISUAL_GEN server role
-in OpenAIServer.register_visual_gen_routes():
+Tests all endpoints of the VISUAL_GEN server role, served by ``ImageServing``
+and ``VideoServing`` in ``tensorrt_llm/serve/api/visual_gen/``:
 
     POST /v1/images/generations
     POST /v1/images/edits
@@ -37,10 +37,10 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.serve.api.visual_gen.metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.api.visual_gen.protocol import VideoJob
-from tensorrt_llm.serve.openai_server import _normalize_image_output
-from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
+from tensorrt_llm.serve.api.visual_gen.serving_images import _normalize_image_output
+from tensorrt_llm.serve.api.visual_gen.utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 from tensorrt_llm.visual_gen.params import prepare_reference_slots, validate_visual_gen_params
 
@@ -749,9 +749,9 @@ def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, m
 def test_servers_starting_in_the_same_second_get_separate_directories(tmp_path):
     """The stamp has one-second resolution, so two servers that start together
     would otherwise share a directory and interleave their media."""
-    from tensorrt_llm.serve.openai_server import _new_media_dir
+    from tensorrt_llm.serve.api.visual_gen.media import _new_media_dir
 
-    with patch("tensorrt_llm.serve.openai_server.datetime") as clock:
+    with patch("tensorrt_llm.serve.api.visual_gen.media.datetime") as clock:
         clock.now.return_value = datetime(2026, 9, 15, 7, 12, 38)
         first = _new_media_dir(tmp_path)
         second = _new_media_dir(tmp_path)
@@ -1080,7 +1080,7 @@ class TestImageGeneration:
             client = _create_server(gen)
             with (
                 patch(
-                    "tensorrt_llm.serve.openai_server.image_to_bytes",
+                    "tensorrt_llm.serve.api.visual_gen.serving_images.image_to_bytes",
                     wraps=image_to_bytes,
                 ) as mock_cvt,
                 patch("tensorrt_llm.media.encoding.save_image") as mock_save,
@@ -1503,7 +1503,7 @@ class TestImageEdit:
 
     def test_image_edit_rejects_oversized_base64_image_before_decode(self, tmp_path, monkeypatch):
         """Base64 image size is capped before allocating decoded bytes."""
-        from tensorrt_llm.serve import visual_gen_utils
+        from tensorrt_llm.serve.api.visual_gen import utils as visual_gen_utils
 
         client, gen = self._client(tmp_path, monkeypatch)
         monkeypatch.setattr(visual_gen_utils, "IMAGE_EDIT_MAX_IMAGE_BYTES", 8)
@@ -2636,6 +2636,176 @@ class TestRouteEngineValidationError:
 
 
 # =========================================================================
+# The visual-gen validation-error envelope (both entry points)
+# =========================================================================
+
+
+class TestVisualGenValidationErrorRendering:
+    """Characterize the visual-gen 422 envelope at both entry points.
+
+    Routes with a declared request model fail with FastAPI's
+    ``RequestValidationError``; handlers that build their own request
+    model (video sync/async, image edit, multipart) fail with pydantic's
+    ``ValidationError``. Every path must render byte-identical bodies.
+    These tests pin the full body, so they must pass unchanged before
+    and after any refactor of the rendering code.
+    """
+
+    # The exact envelope every unknown-field request below must produce.
+    _UNKNOWN_FIELD_BODY = {
+        "object": "error",
+        "message": "Unknown request field 'not_a_field'. Pass model-specific "
+        "parameters via 'extra_params' instead.",
+        "type": "BadRequestError",
+        "param": None,
+        "code": 422,
+    }
+
+    def test_route_level_unknown_field_body_is_exact(self, image_client):
+        """``POST /v1/images/generations`` declares its request model, so an
+        unknown field arrives as a ``RequestValidationError``; the body is
+        pinned in full."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={"prompt": "a cat", "not_a_field": 1},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    def test_route_level_type_error_names_the_field(self, image_client):
+        """A type error reads ``<field>: <pydantic msg>``. The expected
+        message is computed from the model in the test, so the assertion
+        does not hard-code pydantic's wording."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest
+
+        payload = {"prompt": "a cat", "seed": "abc"}
+        with pytest.raises(ValidationError) as exc_info:
+            ImageGenerationRequest.model_validate(payload)
+        expected_msg = exc_info.value.errors()[0]["msg"]
+
+        resp = image_client.post("/v1/images/generations", json=payload)
+        assert resp.status_code == 422
+        body = resp.json()
+        _assert_llm_envelope(body, code=422)
+        assert body["message"] == f"seed: {expected_msg}"
+
+    def test_handler_level_bodies_match_route_level(self, tmp_path, monkeypatch):
+        """Handlers that build their own request model (video sync JSON,
+        video async JSON, image edit JSON) return the same 422 body as the
+        route-level path."""
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+
+        video_client = _create_server(MockVisualGen(video_output=_make_dummy_video_tensor()))
+        for url in ("/v1/videos/sync", "/v1/videos"):
+            resp = video_client.post(url, json={"prompt": "a cat", "not_a_field": 1})
+            assert resp.status_code == 422, (url, resp.text)
+            assert resp.json() == self._UNKNOWN_FIELD_BODY, url
+
+        edit_client = _create_server(
+            MockVisualGen(
+                image_output=_make_dummy_image_tensor(),
+                supports_image_edit=True,
+            )
+        )
+        resp = edit_client.post(
+            "/v1/images/edits",
+            json={"prompt": "a cat", "image": _b64_white_png_1x1(), "not_a_field": 1},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    def test_multipart_handler_level_body_is_exact(self, video_client):
+        """The multipart path funnels through the same pydantic model and
+        renders the same envelope. The unknown field is sent as a plain
+        multipart text part (no filename) so it is the only validation
+        error and the body matches the route-level one byte for byte."""
+        resp = video_client.post(
+            "/v1/videos/sync",
+            data={"prompt": "a cat"},
+            files={"not_a_field": (None, "1")},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    @staticmethod
+    def _pydantic_unknown_field_error():
+        """Return the pydantic ValidationError for an unknown field."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest
+
+        with pytest.raises(ValidationError) as exc_info:
+            ImageGenerationRequest.model_validate({"prompt": "x", "not_a_field": 1})
+        return exc_info.value
+
+    def test_renderer_accepts_both_exception_types(self):
+        """The shared renderer produces the same status and bytes for a
+        pydantic ``ValidationError`` and for a ``RequestValidationError``
+        whose ``loc`` entries carry FastAPI's leading ``body`` segment."""
+        from fastapi.exceptions import RequestValidationError
+
+        from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        pydantic_exc = self._pydantic_unknown_field_error()
+        fastapi_exc = RequestValidationError(
+            errors=[{**err, "loc": ("body", *err["loc"])} for err in pydantic_exc.errors()]
+        )
+
+        responses = [
+            render_visual_gen_validation_error(exc, OpenAIServer.create_error_response)
+            for exc in (pydantic_exc, fastapi_exc)
+        ]
+        assert [r.status_code for r in responses] == [422, 422]
+        assert responses[0].body == responses[1].body
+        assert json.loads(responses[0].body) == self._UNKNOWN_FIELD_BODY
+
+    def test_renderer_falls_back_to_str_without_errors(self):
+        """With no error entries the message falls back to ``str(exc)``."""
+        from fastapi.exceptions import RequestValidationError
+
+        from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        exc = RequestValidationError([])
+        resp = render_visual_gen_validation_error(exc, OpenAIServer.create_error_response)
+        assert resp.status_code == 422
+        assert json.loads(resp.body)["message"] == str(exc)
+
+    def test_renderer_delegates_to_the_factory(self):
+        """The renderer builds no response itself: it calls the factory it
+        is given exactly once, with the rendered message and the fixed
+        error type and status, and returns the factory's result. The
+        factory owns the envelope and the context-length code rule."""
+        from http import HTTPStatus
+
+        from fastapi.responses import Response
+
+        from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
+
+        calls = []
+        sentinel = Response(status_code=422)
+
+        def spy_factory(*, message, err_type, status_code):
+            calls.append((message, err_type, status_code))
+            return sentinel
+
+        result = render_visual_gen_validation_error(
+            self._pydantic_unknown_field_error(), spy_factory
+        )
+        assert result is sentinel
+        assert calls == [
+            (
+                self._UNKNOWN_FIELD_BODY["message"],
+                "BadRequestError",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+        ]
+
+
+# =========================================================================
 # Non-visual-gen routes keep FastAPI's default validation response
 # =========================================================================
 
@@ -2676,7 +2846,7 @@ class TestNonVisualGenValidationResponse:
                 return _llm_envelope_branch(exc)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
-        # Mirror :meth:`OpenAIServer._create_visual_gen_validation_error_response`
+        # Mirror :func:`tensorrt_llm.serve.api.visual_gen.errors.render_visual_gen_validation_error`
         # inline so the test does not depend on instance state.
         def _llm_envelope_branch(exc):
             from http import HTTPStatus
@@ -3149,7 +3319,7 @@ class TestVideoEncoderFailsFast:
         ids=["unsupported_format", "missing_ffmpeg"],
     )
     def test_sync_route_fails_before_generate(self, video_client, monkeypatch, raiser):
-        from tensorrt_llm.serve import openai_video_routes as routes
+        from tensorrt_llm.serve.api.visual_gen import serving_videos as routes
 
         monkeypatch.setattr(routes, "resolve_video_format", raiser)
         # Record whether the generator was called so the assertion
@@ -3177,7 +3347,7 @@ class TestVideoEncoderFailsFast:
         ids=["unsupported_format", "missing_ffmpeg"],
     )
     def test_async_route_fails_before_queue(self, video_client, monkeypatch, raiser):
-        from tensorrt_llm.serve import openai_video_routes as routes
+        from tensorrt_llm.serve.api.visual_gen import serving_videos as routes
 
         monkeypatch.setattr(routes, "resolve_video_format", raiser)
         video_client.mock_gen.last_inputs = None
@@ -3198,7 +3368,7 @@ class TestVideoEncoderFailsFast:
     def test_sync_route_tensor_format_unaffected(self, video_client, monkeypatch):
         """Tensor formats have no encoder dependency; a broken
         ``resolve_video_format`` must not affect them."""
-        from tensorrt_llm.serve import openai_video_routes as routes
+        from tensorrt_llm.serve.api.visual_gen import serving_videos as routes
 
         monkeypatch.setattr(routes, "resolve_video_format", _raise_value_error)
         resp = video_client.post(
@@ -3424,13 +3594,13 @@ class TestTensorOnlyFormatRule:
         }
 
     def test_no_specs_is_a_noop(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         assert _resolve_tensor_only_format("auto", {"action_mode": "policy"}, None) == "auto"
         assert _resolve_tensor_only_format("auto", None, self._specs(a=True)) == "auto"
 
     def test_only_a_declared_param_triggers(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         specs = self._specs(action_mode=True, stg_scale=False)
         # a non-declaring param must not force a tensor payload
@@ -3440,14 +3610,354 @@ class TestTensorOnlyFormatRule:
         )
 
     def test_null_value_does_not_trigger(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         specs = self._specs(action_mode=True)
         assert _resolve_tensor_only_format("auto", {"action_mode": None}, specs) == "auto"
 
     def test_encoder_format_raises_naming_the_parameter(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         specs = self._specs(action_mode=True)
         with pytest.raises(ValueError, match="action_mode"):
             _resolve_tensor_only_format("mp4", {"action_mode": "policy"}, specs)
+
+
+# =========================================================================
+# Serving classes, router and composition root
+# =========================================================================
+
+
+def _build_visual_gen_server(generator: MockVisualGen, model_name: str = "test-model"):
+    """The VISUAL_GEN ``OpenAIServer`` itself (``_create_server`` returns a client)."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
+        return OpenAIServer(
+            generator=generator,
+            model=model_name,
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+
+
+def _sync_video_json(prompt: str) -> dict:
+    return {
+        "prompt": prompt,
+        "size": "32x32",
+        "seconds": 1.0,
+        "fps": 8,
+        "format": "safetensors",
+    }
+
+
+# Handlers that used to be methods of OpenAIServer (or inherited from its
+# video-routes mixin) and now live on ImageServing / VideoServing.
+_REMOVED_FROM_OPENAI_SERVER = (
+    "_supports_image_edit",
+    "_create_not_supported_error",
+    "openai_image_generation",
+    "get_image_content",
+    "_build_image_content_url",
+    "_reject_disabled_path",
+    "_image_object",
+    "_parse_image_edit_request",
+    "openai_image_edit",
+    "openai_video_generation_sync",
+    "_parse_video_generation_request",
+    "openai_video_generation_async",
+    "_generate_video_background",
+    "list_videos",
+    "get_video_metadata",
+    "get_video_content",
+    "delete_video",
+    "_on_video_task_done",
+)
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVisualGenMediaDirectory:
+    def test_images_and_videos_share_one_media_directory(self, tmp_path, monkeypatch):
+        """The composition root resolves the media directory once per server and
+        hands the same ``Path`` to the image and the video serving object, so
+        images and videos keep landing in one directory."""
+        monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+        server = _build_visual_gen_server(
+            MockVisualGen(
+                image_output=_make_dummy_image_tensor(),
+                video_output=_make_dummy_video_tensor(),
+            )
+        )
+        root = tmp_path / "trtllm_generated"
+        assert [p.name for p in root.iterdir()] == [server.media_storage_path.name]
+        images = server.app.state.visual_gen_serving_images
+        videos = server.app.state.visual_gen_serving_videos
+        assert images.media_storage_path is videos.media_storage_path
+        assert videos.media_storage_path is server.media_storage_path
+
+        client = _ThreadSettlingTestClient(server.app)
+        image = client.post(
+            "/v1/images/generations",
+            json={"prompt": "cat", "response_format": "url", "size": "64x64"},
+        )
+        assert image.status_code == 200, image.text
+        video = client.post(
+            "/v1/videos/sync",
+            json=_sync_video_json("cat"),
+            headers={"content-type": "application/json"},
+        )
+        assert video.status_code == 200, video.text
+
+        written = sorted(p.name for p in server.media_storage_path.iterdir())
+        assert len(written) == 2, written
+        assert written[0].startswith("image_") and written[0].endswith(".png")
+        assert written[1].startswith("video_") and written[1].endswith(".safetensors")
+        # Still the one directory under the working directory.
+        assert [p.name for p in root.iterdir()] == [server.media_storage_path.name]
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVisualGenServingClasses:
+    def test_construction_needs_no_server_and_no_filesystem(self, tmp_path):
+        """The serving classes take their dependencies as constructor arguments
+        and never touch the filesystem: the media directory is injected."""
+        from tensorrt_llm.serve.api.visual_gen.serving_images import ImageServing
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import VideoServing
+
+        generator = MockVisualGen(image_output=_make_dummy_image_tensor())
+        clock = AdjustedSteadyClock()
+        missing = tmp_path / "never-created"
+        images = ImageServing(
+            generator=generator,
+            model="test-model",
+            media_storage_path=missing,
+            adjusted_clock=clock,
+        )
+        videos = VideoServing(
+            generator=generator,
+            model="test-model",
+            media_storage_path=missing,
+            adjusted_clock=clock,
+        )
+        for serving in (images, videos):
+            assert serving.generator is generator
+            assert serving.model == "test-model"
+            assert serving.media_storage_path is missing
+            assert serving._adjusted_steady_clock is clock
+        assert not missing.exists()
+
+        other = VideoServing(
+            generator=generator,
+            model="test-model",
+            media_storage_path=missing,
+            adjusted_clock=clock,
+        )
+        assert videos.video_gen_tasks == {} and other.video_gen_tasks == {}
+        assert videos.video_gen_tasks is not other.video_gen_tasks
+
+    def test_router_serves_requests_without_openai_server(self, tmp_path, monkeypatch):
+        """A bare app with the arrival-time middleware, ``init_serving_state`` and
+        ``attach_router`` serves image and video requests, every route on the
+        msgpack route class."""
+        from fastapi import FastAPI
+        from test_common.serve.routes import effective_routes
+
+        from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
+        from tensorrt_llm.serve.api.visual_gen import api_router
+        from tensorrt_llm.serve.middleware.arrival_time import ServerArrivalTimeMiddleware
+
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
+        app = FastAPI()
+        clock = AdjustedSteadyClock()
+        app.add_middleware(ServerArrivalTimeMiddleware, adjusted_clock=clock)
+        media = api_router.init_serving_state(
+            app.state,
+            generator=MockVisualGen(
+                image_output=_make_dummy_image_tensor(),
+                video_output=_make_dummy_video_tensor(),
+            ),
+            model="test-model",
+            adjusted_clock=clock,
+        )
+        assert media == tmp_path / "media"
+        api_router.attach_router(app)
+
+        client = _ThreadSettlingTestClient(app)
+        image = client.post(
+            "/v1/images/generations",
+            json={"prompt": "cat", "response_format": "b64_json", "size": "64x64"},
+        )
+        assert image.status_code == 200, image.text
+        assert image.json()["data"][0]["b64_json"]
+        video = client.post(
+            "/v1/videos/sync",
+            json=_sync_video_json("cat"),
+            headers={"content-type": "application/json"},
+        )
+        assert video.status_code == 200, video.text
+
+        api_routes = [
+            (path, route) for path, route in effective_routes(app) if path.startswith("/v1/")
+        ]
+        assert len(api_routes) == 10, [path for path, _ in api_routes]
+        assert all(isinstance(route, _MsgspecRoute) for _, route in api_routes), [
+            (path, type(route).__name__) for path, route in api_routes
+        ]
+
+    def test_attach_router_requires_serving_state(self, tmp_path, monkeypatch):
+        """``attach_router`` refuses an app whose serving objects are missing and
+        names what to call; this is why the composition root attaches routers
+        after its role switch."""
+        from fastapi import FastAPI
+
+        from tensorrt_llm.serve.api.visual_gen import api_router
+
+        with pytest.raises(RuntimeError) as excinfo:
+            api_router.attach_router(FastAPI())
+        assert "visual_gen_serving_images" in str(excinfo.value)
+        assert "init_serving_state" in str(excinfo.value)
+
+        app = FastAPI()
+        app.state.visual_gen_serving_images = object()
+        with pytest.raises(RuntimeError) as excinfo:
+            api_router.attach_router(app)
+        assert "visual_gen_serving_videos" in str(excinfo.value)
+
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
+        app = FastAPI()
+        api_router.init_serving_state(
+            app.state,
+            generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+            model="test-model",
+            adjusted_clock=AdjustedSteadyClock(),
+        )
+        api_router.attach_router(app)
+        # The route is attached now: an invalid body is a 422, not a 404.
+        assert TestClient(app).post("/v1/images/generations", json={}).status_code == 422
+
+    def test_openai_server_no_longer_hosts_visual_gen_handlers(self, tmp_path, monkeypatch):
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        hosted = [name for name in _REMOVED_FROM_OPENAI_SERVER if hasattr(OpenAIServer, name)]
+        assert hosted == [], (
+            "VisualGen handlers belong in tensorrt_llm/serve/api/visual_gen/ (ImageServing, "
+            f"VideoServing); do not add them back to OpenAIServer: {hosted}"
+        )
+        assert "_VideoRoutesMixin" not in [cls.__name__ for cls in OpenAIServer.__mro__]
+
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        server = _build_visual_gen_server(MockVisualGen(image_output=_make_dummy_image_tensor()))
+        assert not hasattr(server, "video_gen_tasks")
+        assert server.app.state.visual_gen_serving_videos.video_gen_tasks == {}
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVisualGenGenerateEntryPoint:
+    def test_generation_points_go_through_generate(self, tmp_path, monkeypatch):
+        """Image generation, synchronous video and asynchronous video submit
+        through ``VisualGenBaseServing._generate``. The image edit still calls
+        the generator's synchronous ``generate()``: taking it off the event loop
+        is a behavior change that is not part of the move."""
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+        from tensorrt_llm.serve.api.visual_gen.serving_base import VisualGenBaseServing
+
+        submitted = []
+        original = VisualGenBaseServing._generate
+
+        async def spy(self, prompt, params):
+            submitted.append(prompt)
+            return await original(self, prompt, params)
+
+        monkeypatch.setattr(VisualGenBaseServing, "_generate", spy)
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+
+        client = _create_server(
+            MockVisualGen(
+                image_output=_make_dummy_image_tensor(),
+                video_output=_make_dummy_video_tensor(),
+            )
+        )
+        resp = client.post(
+            "/v1/images/generations",
+            json={"prompt": "image", "response_format": "b64_json", "size": "64x64"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert submitted == ["image"]
+        resp = client.post(
+            "/v1/videos/sync",
+            json=_sync_video_json("sync video"),
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert submitted == ["image", "sync video"]
+        resp = client.post(
+            "/v1/videos",
+            json=_sync_video_json("async video"),
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202, resp.text
+        assert submitted == ["image", "sync video", "async video"]
+
+        # The image edit: an edit-capable mock (the edit slot takes joint
+        # conditioning images), its synchronous generate() recorded.
+        edit_gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(4, 4),
+            model="Qwen/Qwen-Image-Layered",
+            supports_image_edit=True,
+            ref_slot_specs={
+                "image_reference": RefSlotSpec(
+                    modality="image", roles=[RoleSpec(role="reference", min=1, max=None)]
+                ),
+            },
+        )
+        edited = []
+        original_generate = edit_gen.generate
+
+        def recording_generate(*args, **kwargs):
+            edited.append(kwargs.get("inputs"))
+            return original_generate(*args, **kwargs)
+
+        edit_gen.generate = recording_generate
+        edit_client = _create_server(edit_gen, model_name="Qwen/Qwen-Image-Layered")
+        resp = edit_client.post(
+            "/v1/images/edits",
+            json={"prompt": "edit", "image": _b64_white_png_1x1(), "response_format": "b64_json"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert edited == ["edit"]
+        assert submitted == ["image", "sync video", "async video"]
+
+    def test_generate_submits_off_the_event_loop(self, tmp_path):
+        """``_generate`` runs ``generate_async`` in a worker thread, because it
+        resolves and enqueues synchronously."""
+        from tensorrt_llm.serve.api.visual_gen.serving_images import ImageServing
+
+        gen = MockVisualGen(image_output=_make_dummy_image_tensor())
+        seen = {}
+        original = gen.generate_async
+
+        def recording_generate_async(*args, **kwargs):
+            seen["thread"] = threading.current_thread()
+            return original(*args, **kwargs)
+
+        gen.generate_async = recording_generate_async
+        serving = ImageServing(
+            generator=gen,
+            model="test-model",
+            media_storage_path=tmp_path,
+            adjusted_clock=AdjustedSteadyClock(),
+        )
+
+        async def submit():
+            handle = await serving._generate("prompt", gen.default_params)
+            return threading.current_thread(), await handle.aresult()
+
+        loop_thread, output = _run_async(submit())
+        assert output.image is not None
+        assert seen["thread"] is not loop_thread
