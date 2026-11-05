@@ -815,6 +815,11 @@ class GenerationResultBase:
             })
         processed_metrics_stat = _process_req_perf_metrics(
             stats, len(output.token_ids))
+        # The transfer is shared by all output candidates of this request.
+        if sequence_index != 0:
+            processed_metrics_stat.pop(MetricNames.KV_CACHE_TRANSFER_TIME, None)
+            processed_metrics_stat.pop(MetricNames.KV_CACHE_TRANSFER_BYTES,
+                                       None)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
         # Record prompt tokens only for the first candidate to avoid

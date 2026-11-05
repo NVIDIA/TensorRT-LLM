@@ -211,6 +211,103 @@ class TestIterationLogTimingMetrics:
         assert _get_gauge_value(collector, "iteration_latency_seconds") == 0.008
 
 
+class TestExistingRankAndTransferMetrics:
+    def test_existing_rank_snapshots_and_optional_kv_details(self, collector):
+        for rank, total, new in [(0, 5, 3), (1, 7, 2), (0, 8, 4)]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "kvCacheStats": {"allocTotalBlocks": total, "allocNewBlocks": new},
+                    "inflightBatchingStats": {
+                        "numCtxKvTokens": 100 + rank,
+                        "numGenKvTokens": 200 + rank,
+                        "numPausedKvTokens": 10 + rank,
+                    },
+                }
+            )
+        for rank, total, new in [(0, 8, 4), (1, 7, 2)]:
+            assert _get_counter_value(collector, "kv_cache_allocated_blocks", rank) == total
+            assert _get_counter_value(collector, "kv_cache_new_blocks", rank) == new
+            assert _get_gauge_value(collector, "context_kv_tokens", rank) == 100 + rank
+            assert _get_gauge_value(collector, "generation_kv_tokens", rank) == 200 + rank
+            assert _get_gauge_value(collector, "paused_kv_tokens", rank) == 10 + rank
+        collector.log_iteration_stats(
+            {
+                "attentionDpRank": 0,
+                "iterSuspendedRequests": 2,
+                "iterResumedRequests": 1,
+                "kvCacheIterationStatsByPoolGroup": {
+                    "0": {
+                        "primaryEvictableNumBlocks": 3,
+                        "primaryPeakUsedNumBlocks": 8,
+                        "iterHostDroppedBytes": 1024,
+                    },
+                    "1": {
+                        "primaryEvictableNumBlocks": 4,
+                        "primaryPeakUsedNumBlocks": 9,
+                        "iterHostDroppedBytes": 2048,
+                    },
+                },
+            }
+        )
+        assert _get_gauge_value(collector, "kv_cache_evictable_blocks", 0) == 7
+        assert _get_gauge_value(collector, "kv_cache_peak_used_blocks", 0) == 17
+        assert _get_counter_value(collector, "kv_cache_host_dropped_bytes", 0) == 3072
+        assert _get_counter_value(collector, "kv_cache_requests_suspended", 0) == 2
+        assert _get_counter_value(collector, "kv_cache_requests_resumed", 0) == 1
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_kv_cache_evictable_blocks", {**collector.labels, "dp_rank": "1"}
+            )
+            is None
+        )
+
+    def test_transfer_perf_metrics_count_once_across_candidates(self, collector):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.executor.result import RequestOutput
+
+        result = SimpleNamespace(
+            candidate_metrics=[],
+            metrics_dict={},
+            cached_tokens=0,
+            prompt_token_ids=[1, 2],
+            per_pos_drafted=None,
+            per_pos_accepted=None,
+        )
+        output = SimpleNamespace(
+            finish_reason="end_id",
+            token_ids=[3, 4],
+            request_perf_metrics=None,
+            prompt_logprobs=None,
+            length=2,
+            cumulative_logprob=None,
+            logprobs=None,
+        )
+        stats = {
+            RequestEventTiming.KV_CACHE_TRANSFER_START: 10.0,
+            RequestEventTiming.KV_CACHE_TRANSFER_END: 12.0,
+            RequestEventTiming.KV_CACHE_SIZE: 1024,
+        }
+        for sequence_index in [0, 1]:
+            RequestOutput._record_completion_stats(result, output, stats, sequence_index)
+        for candidate in result.candidate_metrics:
+            collector.log_request_metrics_dict(candidate)
+        assert _get_counter_value(collector, "kv_cache_transfer_bytes") == 1024
+        assert _get_histogram_count(collector, "histogram_kv_cache_transfer_duration") == 1
+        assert _get_histogram_sum(collector, "histogram_kv_cache_transfer_duration") == 2.0
+        assert MetricNames.KV_CACHE_TRANSFER_BYTES not in result.candidate_metrics[1]
+        assert MetricNames.KV_CACHE_TRANSFER_TIME not in result.candidate_metrics[1]
+        invalid = process_req_perf_metrics(
+            {
+                RequestEventTiming.KV_CACHE_TRANSFER_START: 2.0,
+                RequestEventTiming.KV_CACHE_TRANSFER_END: 1.0,
+            },
+            2,
+        )
+        assert MetricNames.KV_CACHE_TRANSFER_TIME not in invalid
+
+
 class TestAttentionDpIterationMetrics:
     """Keep independent rank histories and shared measurement ownership."""
 

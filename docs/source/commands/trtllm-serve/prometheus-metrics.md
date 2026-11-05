@@ -18,6 +18,7 @@ Save the following configuration as `metrics.yaml`:
 ```yaml
 return_perf_metrics: true
 enable_iter_perf_stats: true
+enable_iter_req_stats: false
 iter_perf_stats_interval: 1
 ```
 
@@ -45,6 +46,7 @@ for its deployment and multiprocess settings.
 | Setting | Effect |
 | --- | --- |
 | `return_perf_metrics: true` | Enables request performance collection and the Prometheus endpoint. Defaults to `false`. |
+| `enable_iter_req_stats: false` | Keeps per-request iteration records disabled. Aggregated Prometheus metrics and completed-request KV-transfer metrics do not require them. |
 | `enable_iter_perf_stats: true` | Adds engine iteration statistics to collection. Defaults to `false`; it does not enable the Prometheus endpoint by itself. |
 | `iter_perf_stats_interval` | Builds an engine statistics record every N iterations; defaults to 1. Larger values reduce collection work and change the meaning of sampled metrics, as described below. |
 | `kv_cache_config.iteration_stats_interval` | Controls how often KV iteration statistics are fetched. Larger values delay KV updates; align this interval with the iteration-performance interval. |
@@ -161,12 +163,25 @@ no latency observation.
 | `request_inference_time_seconds` | Histogram | First scheduling to last output token. |
 | `request_success_total` | Counter | Completed output candidates by `finished_reason`; multiple outputs can contribute more than one completion per request. |
 | `request_error_total` | Counter | HTTP request errors by `http_code`; use OpenEngine RPC outcomes for gRPC failures. |
+| `kv_cache_transfer_duration_seconds` | Histogram | Completed-request KV-transfer duration from existing transfer start/end timestamps; measured in seconds. |
+| `kv_cache_transfer_bytes_total` | Counter | Positive KV-transfer bytes reported by completed-request performance metrics. |
 | `prompt_tokens_total` | Counter | Input tokens recorded by request performance collection. |
 | `generation_tokens_total` | Counter | Output tokens recorded by request performance collection. |
 | `prompt_cached_tokens_total` | Counter | Prompt tokens served from KV cache, recorded at request completion. |
 | `prompt_cached_tokens_per_request` | Histogram | Cached prompt tokens per recorded request sample, including zero. |
 | `prefill_perplexity` | Histogram | Finite prefill perplexity values, when supplied. |
 | `generation_perplexity` | Histogram | Finite generation perplexity values, when supplied. |
+
+KV-transfer timing and size come from `RequestPerfMetrics`, also used by
+JSONL and Server-Timing. Transfer observations are request-scoped and recorded
+only for the first output candidate, so multiple outputs do not multiply the
+same transfer. These families use model labels, not a fabricated rank label:
+the request's reported transfer size can already aggregate across ranks.
+For disaggregated serving, retain the worker role in scrape target labels to
+separate observations from the prefill and decode sides. Duration requires
+valid increasing timestamps; byte totals require a positive reported size.
+This path needs `return_perf_metrics`, not `enable_iter_req_stats`, and is
+independent of iteration sampling.
 
 Prompt-cache counters are process-lifetime totals, not current cache contents;
 eviction or a cache flush does not clear them. Perplexity families only gain
@@ -187,6 +202,9 @@ observations when the engine supplies the corresponding measurements.
 | `num_generation_requests` | Gauge | Generation/decode requests in the local batch, by `dp_rank`. |
 | `num_paused_requests` | Gauge | Paused requests, by `dp_rank`. |
 | `num_scheduled_requests` | Gauge | Scheduled requests, by `dp_rank`. |
+| `context_kv_tokens` | Gauge | Existing KV-context tokens read by scheduled prefill requests, by rank. |
+| `generation_kv_tokens` | Gauge | Summed KV-context length of scheduled generation requests, by rank. |
+| `paused_kv_tokens` | Gauge | Summed KV-context length of paused requests, by rank. |
 | `total_context_tokens` | Gauge | Context tokens in the latest local batch; despite its name, this is not a counter. |
 | `avg_decoded_tokens_per_iter` | Gauge | Engine-reported average decoded tokens per iteration. |
 | `prefill_batch_occupancy` | Gauge | Local context-request count divided by reported maximum active-request capacity. |
@@ -204,6 +222,13 @@ not be combined in a single rate calculation.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
+| `kv_cache_allocated_blocks_total` | Counter | Positive deltas of the rank's cumulative total-allocation snapshot. |
+| `kv_cache_new_blocks_total` | Counter | Positive deltas of the rank's cumulative new-allocation snapshot. |
+| `kv_cache_evictable_blocks` | Gauge | Reclaimable primary blocks summed across reported pool groups. |
+| `kv_cache_peak_used_blocks` | Gauge | Sum of reported pool-group peak-used counts; an upper bound on simultaneous rank-wide usage. |
+| `kv_cache_host_dropped_bytes_total` | Counter | Host-cache bytes discarded in reported iteration deltas. |
+| `kv_cache_requests_suspended_total` | Counter | KV-manager suspension events in reported iteration deltas. |
+| `kv_cache_requests_resumed_total` | Counter | Recovery of previously suspended requests; excludes initial admission. |
 | `kv_cache_utilization` | Gauge | Used primary/GPU blocks divided by maximum blocks. |
 | `kv_cache_host_utilization` | Gauge | Used secondary-pool blocks divided by its capacity, when reported. |
 | `kv_cache_max_blocks` | Gauge | Maximum primary KV blocks. |
@@ -225,6 +250,17 @@ not be combined in a single rate calculation.
 | `kv_cache_disk_prefetch_blocks_total` | Counter | V2 blocks prefetched from disk to host. |
 | `kv_cache_intra_device_copy_bytes_total` | Counter | Bytes copied within the GPU for block copies. |
 | `prompt_cache_hit_tokens_total` | Counter | Prompt cache-hit tokens by `dp_rank`, `cache_level`, and `cache_tier`, accumulated from engine iteration records. |
+
+The basic allocation snapshots and context-length summaries use fields
+already transported in rank-local records. Rich KV iteration details such as
+reclaimable blocks, pool peaks, suspensions, and host-cache drops are exported
+only where the source record supplies them. The current attention-DP fanout
+provides those detailed records on rank 0; absent ranks are not emitted as
+measured zeros. This exporter does not expand rank collectives to obtain them.
+
+Pool-group peak values can occur at different times. Their sum is a pressure
+indicator and upper bound, not a measured simultaneous peak. Block counts
+also do not directly measure bytes when pool groups have different block sizes.
 
 The cumulative-snapshot counters and iteration-delta counters are separate
 views of reuse and misses; do not add the two views. A decrease in a rank's
@@ -381,6 +417,14 @@ histogram_quantile(
 ```
 
 ## Sampling and availability
+
+The exporter reuses existing engine/request statistics. It adds no CUDA
+events, GPU synchronizations, expert histograms, request-ID labels, or rank
+collectives. Its iteration updates run only for delivered sampled records;
+`enable_iter_req_stats` can remain false. The existing engine instrumentation
+still has a cost: `iter_perf_stats_interval` controls structured record
+construction, while `print_iter_log` independently logs executor loops.
+Keep iteration logging off when only Prometheus summaries are needed.
 
 Collection and scraping have separate cadences. The servers drain available
 iteration records in the background, and OpenEngine polls approximately once
