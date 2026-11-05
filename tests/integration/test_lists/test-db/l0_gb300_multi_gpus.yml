@@ -20,6 +20,7 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/comm
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[modeling_v2-dep4]
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[stock-dep4]

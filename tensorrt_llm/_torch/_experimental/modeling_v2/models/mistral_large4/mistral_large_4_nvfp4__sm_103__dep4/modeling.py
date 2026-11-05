@@ -77,70 +77,6 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_con
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
     flashinfer_silu_and_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_erf import gelu_erf
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.tanh_softcap import (
-    tanh_softcap,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.convert_req_index_to_global import (
-    convert_req_index_to_global,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_fp8_paged_mqa_logits import (
-    cute_dsl_fp8_paged_mqa_logits,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_gvr_topk_prefill import (
-    cute_dsl_gvr_topk_prefill,
-    gvr_warmup,
-    gvr_workspace,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_indexer_k_cache_update import (
-    build as build_ix_k_cache,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_indexer_k_cache_update import (
-    cute_dsl_indexer_k_cache_update,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_indexer_q_side_fused import (
-    build as build_ix_q_side,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_indexer_q_side_fused import (
-    cute_dsl_indexer_q_side_fused,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    build as build_ix_topk_decode,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    cute_dsl_radix_topk_decode,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather import (
-    ds_mla_dequant_gather,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_rope_append import (
-    ds_mla_rope_append,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flash_mla_sparse_decode import (
-    flash_mla_sparse_decode,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flash_mla_sparse_prefill import (
-    flash_mla_sparse_prefill,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fp8_mqa_logits import (
-    fp8_mqa_logits,
-    mqa_logits_schedule,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.indexer_k_cache_gather_op import (
-    indexer_k_cache_gather_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.indexer_topk_decode import (
-    indexer_topk_decode,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ssmax_indexer_q_side_fused import (
-    ssmax_indexer_q_side_fused,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ssmax_scaling import (
-    ssmax_scaling,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ssmax_scaling_fused_q import (
-    ssmax_scaling_fused_q,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -148,14 +84,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.fp8_prequantized_swap_ab_gemm import (
-    fp8_prequantized_swap_ab_gemm,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.renorm_moe_routing_op import (
-    renorm_moe_routing_op,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
     flashinfer_fused_add_rmsnorm,
@@ -163,14 +93,88 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm import layer_norm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128_packed_ue8m0 import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.activation.gelu_erf import (
+    gelu_erf,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.activation.tanh_softcap import (
+    tanh_softcap,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.convert_req_index_to_global import (  # noqa: E501
+    convert_req_index_to_global,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_fp8_paged_mqa_logits import (  # noqa: E501
+    cute_dsl_fp8_paged_mqa_logits,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_gvr_topk_prefill import (  # noqa: E501
+    cute_dsl_gvr_topk_prefill,
+    gvr_warmup,
+    gvr_workspace,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_indexer_k_cache_update import (  # noqa: E501
+    build as build_ix_k_cache,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_indexer_k_cache_update import (  # noqa: E501
+    cute_dsl_indexer_k_cache_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_indexer_q_side_fused import (  # noqa: E501
+    build as build_ix_q_side,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_indexer_q_side_fused import (  # noqa: E501
+    cute_dsl_indexer_q_side_fused,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_radix_topk_decode import (  # noqa: E501
+    build as build_ix_topk_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_radix_topk_decode import (  # noqa: E501
+    cute_dsl_radix_topk_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.ds_mla_dequant_gather import (
+    ds_mla_dequant_gather,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.ds_mla_rope_append import (
+    ds_mla_rope_append,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.flash_mla_sparse_decode import (
+    flash_mla_sparse_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.flash_mla_sparse_prefill import (
+    flash_mla_sparse_prefill,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.fp8_mqa_logits import (
+    fp8_mqa_logits,
+    mqa_logits_schedule,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.indexer_k_cache_gather_op import (  # noqa: E501
+    indexer_k_cache_gather_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.indexer_topk_decode import (
+    indexer_topk_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.ssmax_indexer_q_side_fused import (  # noqa: E501
+    ssmax_indexer_q_side_fused,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.ssmax_scaling import (
+    ssmax_scaling,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.ssmax_scaling_fused_q import (
+    ssmax_scaling_fused_q,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.gemm.fp8_prequantized_swap_ab_gemm import (
+    fp8_prequantized_swap_ab_gemm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.norm.layer_norm import (
+    layer_norm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.quantization.fp8_quantize_1x128_packed_ue8m0 import (  # noqa: E501
     fp8_quantize_1x128_packed_ue8m0,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.vision.pixtral_rope_2d import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.vision.pixtral_rope_2d import (
     pixtral_rope_2d,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata

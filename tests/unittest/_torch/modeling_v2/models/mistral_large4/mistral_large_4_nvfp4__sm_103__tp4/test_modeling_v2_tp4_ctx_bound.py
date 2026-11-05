@@ -58,14 +58,14 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.convert_req_index_to_global import (  # noqa: E501
-    convert_req_index_to_global,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flash_mla_sparse_prefill import (  # noqa: E501
-    flash_mla_sparse_prefill,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp4 import (  # noqa: E501
     modeling as M,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.convert_req_index_to_global import (  # noqa: E501
+    convert_req_index_to_global,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.flash_mla_sparse_prefill import (  # noqa: E501
+    flash_mla_sparse_prefill,
 )
 from tensorrt_llm.flash_mla import get_mla_metadata
 
