@@ -1104,7 +1104,8 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     try {
         echo "[SLURM-FINALIZER] ${entry.id}: reconciling orphaned SLURM resources off-pod " +
              "(job=${entry.slurmJobId ?: entry.jobUID}, node=${entry.nodeName ?: 'n/a'})."
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, {
+        def stageName = entry.id.toString().replaceFirst(/\/slurm$/, "")
+        launchKubernetesStagePod(pipeline, podSpec, containerName, stageName, [reportFailure: false], {
             if (entry.usedSbatch) {
                 cleanUpSlurmResources(pipeline, cluster, entry.clusterName, entry.jobUID)
             } else {
@@ -3966,7 +3967,9 @@ boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error,
     }
     Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
     int attempt = parsedAttempt != null ? parsedAttempt as int : 1
-    int effectiveMax = retryMaxForFailure(scope, classified, retryContext.infraRetryMax as Integer)
+    int effectiveMax = retryContext.launchOnly ?
+        resolveInfraRetryMax(scope, retryContext.infraRetryMax as Integer) :
+        retryMaxForFailure(scope, classified, retryContext.infraRetryMax as Integer)
     Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
     long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
     return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
@@ -4191,7 +4194,7 @@ def getHostNodeName() {
     ''', returnStdout: true).trim()
 }
 
-def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null)
+def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean collectTimeoutResult=true)
 {
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
@@ -4243,7 +4246,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else if (!fileExists("${stageName}/results-timeout.xml")) {
+                } else if (collectTimeoutResult && !fileExists("${stageName}/results-timeout.xml")) {
                     // Generate timeout test result xml if there are terminated unexpectedly tests
                     generateTimeoutTestResultXml(pipeline, stageName)
                 }
@@ -4668,7 +4671,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """.stripIndent(),
     ]
 
-    return ciNodePolicy.apply(podConfig, [pipeline: "L0_Test"])
+    return podConfig
 }
 
 def echoNodeAndGpuInfo(pipeline, stageName)
@@ -6726,12 +6729,40 @@ def runInEnrootOnNode(label, partitionTimeout)
     }
 }
 
+def launchKubernetesStagePod(pipeline, podSpec, containerName, String stageName, Map opts = [:], Closure runner)
+{
+    def stagePodSpec
+    try {
+        stagePodSpec = ciNodePolicy.apply(podSpec, [pipeline: "L0_Test", stage: stageName])
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "[NODE-EXCLUSION] ${stageName}: failed to apply node policy: ${e.toString()}"
+        if (opts.reportFailure != false) {
+            // Report before launch from an isolated parent-agent directory; no test tracker exists yet.
+            def resultStage = stageName.replaceAll(/[^-+\w\[\]]/, "_")
+            def postTag = opts.postTag ?: ""
+            preservePrimaryFailure(e) {
+                try {
+                    dir("node-policy-${resultStage}${postTag}") {
+                        cacheErrorAndUploadResult(pipeline, resultStage, { throw e }, {}, true,
+                            postTag, opts.isFinalAttempt != false, opts.retryContext, false)
+                    }
+                } catch (Exception reportError) {
+                    if (!reportError.is(e)) throw reportError
+                }
+            }
+        }
+        throw e
+    }
+    trtllm_utils.launchKubernetesPodWithPlacement(pipeline, stagePodSpec, containerName, opts.placementContext, runner)
+}
+
 def runInKubernetes(pipeline, podSpec, containerName)
 {
     return {
         stageName, runner -> stage(stageName) {
-            def stagePodSpec = ciNodePolicy.apply(podSpec, [pipeline: "L0_Test", stage: stageName])
-            trtllm_utils.launchKubernetesPod(pipeline, stagePodSpec, containerName) {
+            launchKubernetesStagePod(pipeline, podSpec, containerName, stageName) {
                 echoNodeAndGpuInfo(pipeline, stageName)
                 runner()
             }
@@ -6764,7 +6795,6 @@ def runInKubernetes(pipeline, podSpec, containerName)
 //                                       the worst-case attempt budget.
 def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerName, String stageName, Closure runner)
 {
-    podSpec = ciNodePolicy.apply(podSpec, [pipeline: "L0_Test", stage: stageName])
     boolean singleAttempt = opts.singleAttempt ?: false
     // SLURM dispatcher pods opt in to off-pod resource reconciliation: on a
     // mid-run pod death their SLURM job / Jenkins node would otherwise leak.
@@ -6779,7 +6809,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
     if (testFilter[(DEBUG_MODE)]) {
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
+        launchKubernetesStagePod(pipeline, podSpec, containerName, stageName, { runner("", true, null) })
         return
     }
 
@@ -6812,7 +6842,11 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                     // launch a fresh cleanup pod if this pod dies mid-run.
                     registerSlurmResource(stageName, [podSpec: attemptPodSpec, containerName: containerName])
                 }
-                trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
+                launchKubernetesStagePod(pipeline, attemptPodSpec, containerName, stageName,
+                    [placementContext: attemptPlacementContext, postTag: "-node-policy-launch-${launchAttempt}",
+                     isFinalAttempt: launchAttempt > K8S_INFRA_RETRY_MAX,
+                     retryContext: [scope: InfraFailure.K8S, stageName: stageName, attempt: launchAttempt,
+                         backoffMs: 60L * 1000L, infraRetryMax: K8S_INFRA_RETRY_MAX, launchOnly: true]], {
                     attemptPlacementContext.runnerStarted = true
                     runner("", true, null)
                 })
@@ -6912,7 +6946,10 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
             def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
-            trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, { runner(attemptTag, isFinalAttempt, retryContext) })
+            launchKubernetesStagePod(pipeline, attemptPodSpec, containerName, stageName,
+                [placementContext: attemptPlacementContext, postTag: attemptTag,
+                 isFinalAttempt: isFinalAttempt, retryContext: retryContext],
+                { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
             }
@@ -7605,7 +7642,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
             if (checkPipStage) {
                 stage("[${toStageName(values[1], key)}] Run LLMAPI Test") {
-                    pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
+                    def pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
@@ -7974,7 +8011,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
         } else if (values.wheelInstalled) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
-                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                def imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
@@ -7983,9 +8020,8 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             }
         } else {
             stage(values.name) {
-                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
-                imageSanitySpec = ciNodePolicy.apply(imageSanitySpec, [pipeline: "L0_Test", stage: values.name])
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                def imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                launchKubernetesStagePod(pipeline, imageSanitySpec, "trt-llm", values.name, {
                     sh "env | sort"
                     def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
                     runLLMBuild(pipeline, cpuArch, false, "imageTest/")
@@ -8000,7 +8036,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
 
 pipeline {
     agent {
-        kubernetes createKubernetesPodConfig("", "agent")
+        kubernetes ciNodePolicy.apply(createKubernetesPodConfig("", "agent"), [pipeline: "L0_Test"])
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/
