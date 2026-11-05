@@ -217,10 +217,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
 
         # A greedy request cannot carry a watermark, so it is served normally.
-        if self._watermark_unsupported_reason is not None and request_carries_watermark(
-            self._watermark_config, request
-        ):
-            raise ValueError(self._watermark_unsupported_reason)
+        reason = getattr(self, "_watermark_unsupported_reason", None)
+        if reason is not None and request_carries_watermark(self._watermark_config, request):
+            raise ValueError(reason)
 
         sampling_config = request.sampling_config
         if sampling_config is None:

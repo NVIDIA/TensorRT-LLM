@@ -190,7 +190,7 @@ def test_skip_drafting_routes_through_the_guided_helper():
             hidden_states=None,
             logits=logits,
             attn_metadata=attn_metadata,
-            spec_metadata=MagicMock(name="spec_metadata", watermark_ready=False),
+            spec_metadata=MagicMock(name="spec_metadata"),
             draft_model=None,
         )
 
