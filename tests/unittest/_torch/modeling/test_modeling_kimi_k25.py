@@ -67,7 +67,11 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.inputs import create_input_processor
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # ---------------------------------------------------------------------------
@@ -478,7 +482,7 @@ class TestKimiK25Structure(unittest.TestCase):
         self.assertIn("image.image_grid_thw", paths)
         # Video paths (MoonViT3d supports spatial-temporal attention)
         self.assertIn("video.pixel_values_videos", paths)
-        self.assertIn("video.video_grid_thw", paths)
+        self.assertIn("video.video_chunk_grid_thw", paths)
 
     @unittest.skipUnless(
         os.path.isdir(_KIMI_K25_MODEL_DIR), f"Model dir not found: {_KIMI_K25_MODEL_DIR}"
@@ -665,16 +669,14 @@ class TestKimiK25Structure(unittest.TestCase):
             self.assertIsInstance(token_ids, list)
             self.assertGreater(len(token_ids), 0)
 
-            # Verify multimodal_data contains pixel data under "image" key.
-            # MoonViT3d processes images and video chunks identically, so
-            # all media (including video) goes under the "image" key.
+            # Video chunks retain their original video item in the payload.
             mm_data = extra.get("multimodal_data", {})
             self.assertIn(
-                "image",
+                "video",
                 mm_data,
-                "Expected 'image' key in multimodal_data for video input (MoonViT3d unified path)",
+                "Expected video payload for video input",
             )
-            self.assertIn("pixel_values", mm_data["image"])
+            self.assertIn("pixel_values_videos", mm_data["video"])
 
             # The expanded token_ids should contain placeholder tokens
             placeholder_count = sum(1 for t in token_ids if t == 163605)
@@ -725,10 +727,10 @@ class TestKimiK25Structure(unittest.TestCase):
             self.assertGreater(len(token_ids), 0)
 
             mm_data = extra.get("multimodal_data", {})
-            # All media (images + video chunks) are unified under "image"
-            # key because MoonViT3d processes them identically.
+            # Images and videos retain separate payloads for grouped assembly.
             self.assertIn("image", mm_data, "Expected 'image' key for mixed input")
             self.assertIn("pixel_values", mm_data["image"])
+            self.assertIn("pixel_values_videos", mm_data["video"])
 
             # Placeholder tokens should be expanded for both modalities
             placeholder_count = sum(1 for t in token_ids if t == 163605)
@@ -1044,3 +1046,293 @@ class TestKimiK25E2ESmoke(unittest.TestCase):
         finally:
             if video_tmp and os.path.isfile(video_tmp):
                 os.unlink(video_tmp)
+
+
+def _main_kimi_vision_forward(self, multimodal_params):
+    """Encode images/video from multimodal params into LLM-space embeddings."""
+    all_pixel_values = []
+    all_grid_thws = []
+
+    for param in multimodal_params:
+        mm_data = param.multimodal_data
+        if mm_data is None:
+            continue
+        for modality in ("image", "video"):
+            if modality not in mm_data:
+                continue
+            mod_data = mm_data[modality]
+            pv_key = (
+                "pixel_values_videos"
+                if modality == "video" and "pixel_values_videos" in mod_data
+                else "pixel_values"
+            )
+            if pv_key not in mod_data:
+                continue
+            all_pixel_values.append(mod_data[pv_key])
+            thw_key = (
+                "video_grid_thw"
+                if modality == "video" and "video_grid_thw" in mod_data
+                else "image_grid_thw"
+            )
+            if thw_key in mod_data:
+                all_grid_thws.append(mod_data[thw_key])
+
+    if not all_pixel_values:
+        return []
+
+    pixel_values = torch.cat(all_pixel_values, dim=0)
+    grid_thws = torch.cat(all_grid_thws, dim=0) if all_grid_thws else None
+    embeds = self._extract_features(pixel_values, grid_thws)
+    if embeds.dim() == 3:
+        embeds = embeds.reshape(-1, embeds.shape[-1])
+    return [embeds]
+
+
+class _KimiCpuEncoder:
+    mm_encoder_groups = KimiK25VisionModel.mm_encoder_groups
+    encode_batched = KimiK25VisionModel.encode_batched
+    forward = KimiK25VisionModel.forward
+    _extract_features = KimiK25VisionModel._extract_features
+
+    def __init__(self):
+        self.calls = []
+        self.model_dtype = torch.float32
+        self.merge_type = "sd2_tpool"
+        self.merge_kernel_size = (2, 2)
+        self.encoder = lambda hidden, grids: hidden
+        self.mm_projector = lambda items: [item.sum(dim=1) for item in items]
+
+    def patch_embed(self, pixel_values, grid_thws):
+        self.calls.append((pixel_values.clone(), grid_thws.clone()))
+        return pixel_values.flatten(1)
+
+
+def _kimi_group_param(spec, item_refs=None, video_chunks=None):
+    payload = {}
+    lengths = {}
+    offset = 1
+    for modality, grids in spec.items():
+        grid = torch.tensor(grids, dtype=torch.int64)
+        pixels = torch.arange(
+            offset, offset + int(grid.prod(dim=-1).sum()) * 3, dtype=torch.float32
+        ).reshape(-1, 3, 1, 1)
+        offset += pixels.numel()
+        pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+        grid_key = "image_grid_thw" if modality == "image" else "video_chunk_grid_thw"
+        payload[modality] = {pixel_key: pixels, grid_key: grid}
+        values = [(h // 2) * (w // 2) for _, h, w in grids]
+        if modality == "video" and video_chunks is not None:
+            payload[modality]["video_num_chunks"] = torch.tensor(video_chunks, dtype=torch.int64)
+            cursor = 0
+            lengths[modality] = []
+            for count in video_chunks:
+                lengths[modality].append(sum(values[cursor : cursor + count]))
+                cursor += count
+        else:
+            lengths[modality] = values
+    refs = item_refs or [
+        (modality, index) for modality, values in lengths.items() for index in range(len(values))
+    ]
+    payload[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        refs, output_embedding_lengths=[lengths[modality][index] for modality, index in refs]
+    )
+    return MultimodalParams(multimodal_data=payload)
+
+
+def _main_kimi_payload(modality, data):
+    """The payload under the field names main's forward reads."""
+    if modality == "video":
+        return {
+            "pixel_values_videos": data["pixel_values_videos"],
+            "video_grid_thw": data["video_chunk_grid_thw"],
+        }
+    return data
+
+
+def _kimi_prompt_order_main(params):
+    output = []
+    for param in params:
+        per_modality = {}
+        for modality in ("image", "video"):
+            data = param.multimodal_data.get(modality)
+            if data is not None:
+                main_data = {modality: _main_kimi_payload(modality, data)}
+                rows = _main_kimi_vision_forward(
+                    _KimiCpuEncoder(), [MultimodalParams(multimodal_data=main_data)]
+                )[0]
+                lengths = {
+                    index: length
+                    for (kind, index), length in zip(
+                        param.item_metadata.item_refs, param.item_metadata.output_embedding_lengths
+                    )
+                    if kind == modality
+                }
+                per_modality[modality] = rows.split([lengths[index] for index in sorted(lengths)])
+        output.extend(
+            per_modality[modality][index] for modality, index in param.item_metadata.item_refs
+        )
+    return torch.cat(output)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_name", ["k25", "k3"])
+@pytest.mark.parametrize("case", ["one", "several", "mixed", "prompt_order", "video_chunks"])
+def test_kimi_groups_match_main(model_name, case):
+    from tensorrt_llm._torch.models.modeling_kimi_k3_vl import KimiK3VisionModel
+
+    first = _kimi_group_param({"image": [(1, 2, 2), (1, 2, 4)]})
+    if case == "one":
+        params = [first]
+    elif case == "several":
+        params = [first, _kimi_group_param({"image": [(1, 4, 2)]})]
+    elif case == "mixed":
+        params = [
+            first,
+            _kimi_group_param({"image": [(1, 2, 2)], "video": [(2, 2, 4)]}),
+            _kimi_group_param({"video": [(3, 4, 2)]}),
+        ]
+    elif case == "prompt_order":
+        params = [
+            _kimi_group_param(
+                {"image": [(1, 2, 2), (1, 2, 4)], "video": [(2, 4, 2)]},
+                [("video", 0), ("image", 1), ("image", 0)],
+            ),
+            first,
+        ]
+    else:
+        params = [
+            _kimi_group_param({"video": [(4, 2, 2), (2, 2, 4), (3, 4, 2)]}, video_chunks=[2, 1]),
+            first,
+        ]
+    model_cls = KimiK25VisionModel if model_name == "k25" else KimiK3VisionModel
+    encoder = _KimiCpuEncoder()
+    encoder.encode_batched = model_cls.encode_batched.__get__(encoder)
+    groups = model_cls.mm_encoder_groups.fget(encoder)
+    assert groups[0].build_batched_input is None
+    output = model_cls.forward(encoder, params)
+    assert len(output) == 1
+    assert len(encoder.calls) == 1
+    assert torch.equal(output[0], _kimi_prompt_order_main(params))
+    # The tower receives the same main-packed values, in modality layout.
+    oracle = _KimiCpuEncoder()
+    ordered_params = [
+        MultimodalParams(
+            multimodal_data={
+                modality: _main_kimi_payload(modality, param.multimodal_data[modality])
+            }
+        )
+        for modality in ("image", "video")
+        for param in params
+        if modality in param.multimodal_data
+    ]
+    _main_kimi_vision_forward(oracle, ordered_params)
+    for actual, expected in zip(encoder.calls[0], oracle.calls[0]):
+        assert torch.equal(actual, expected)
+        assert actual.dtype == expected.dtype
+        assert actual.device == expected.device
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("processor_name", ["k25", "k3"])
+def test_kimi_metadata_without_hashing(processor_name):
+    from tensorrt_llm._torch.models.modeling_kimi_k3_vl import KimiK3InputProcessor
+
+    processor_cls = KimiK25InputProcessor if processor_name == "k25" else KimiK3InputProcessor
+    processor = object.__new__(processor_cls)
+    processor._config = _build_hf_config()
+    processor._multimodal_hashing_supported = False
+    param = _kimi_group_param(
+        {"image": [(1, 2, 4)], "video": [(4, 2, 2), (2, 4, 2), (1, 4, 4)]},
+        [("video", 1), ("image", 0), ("video", 0)],
+        video_chunks=[2, 1],
+    )
+    original = param.multimodal_data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+    default_metadata = processor.get_mm_item_metadata([], param.multimodal_data)
+    assert default_metadata.item_refs == (("image", 0), ("video", 0), ("video", 1))
+    assert default_metadata.output_embedding_lengths == (2, 3, 4)
+    order = [{"modality": modality, "index": index} for modality, index in original.item_refs]
+    metadata = processor.get_mm_item_metadata([], param.multimodal_data, order)
+    assert metadata.item_refs == original.item_refs
+    assert metadata.output_embedding_lengths == original.output_embedding_lengths
+    param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    assert processor.get_mm_item_metadata([], param.multimodal_data, order) is metadata
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("grid_key", ["image_grid_thw", "video_grid_thw"])
+def test_kimi_video_aliases_are_normalized_by_processor(grid_key):
+    processor = object.__new__(KimiK25InputProcessor)
+    processor._config = _build_hf_config()
+    data = {
+        "video": {
+            "pixel_values": torch.zeros(8, 3, 1, 1),
+            grid_key: torch.tensor([[2, 2, 2]]),
+        }
+    }
+    metadata = processor.get_mm_item_metadata([], data)
+    assert metadata.item_refs == (("video", 0),)
+    assert metadata.output_embedding_lengths == (1,)
+    assert data["video"]["pixel_values_videos"] is data["video"]["pixel_values"]
+    assert data["video"]["video_chunk_grid_thw"] is data["video"][grid_key]
+
+
+@pytest.mark.cpu_only
+def test_kimi_processor_keeps_original_video_items():
+    from PIL import Image
+
+    processor = object.__new__(KimiK25InputProcessor)
+    processor._config = _build_hf_config()
+    processor._media_placeholder_token_id = 163605
+    grids = torch.tensor([[1, 2, 2], [2, 2, 2], [1, 2, 4], [1, 4, 2]])
+    pixels = torch.arange(28 * 3, dtype=torch.float32).reshape(28, 3, 1, 1)
+    image_processor = SimpleNamespace(
+        media_proc_cfg={"temporal_merge_kernel_size": 2},
+        preprocess=lambda medias, return_tensors: {"pixel_values": pixels, "grid_thws": grids},
+    )
+    processor._processor = SimpleNamespace(
+        image_processor=image_processor, media_processor=image_processor
+    )
+    processor._tokenizer = lambda prompt, return_tensors: {
+        "input_ids": torch.tensor([[163605] * 4])
+    }
+    image = Image.new("RGB", (4, 4))
+    token_ids, extra = processor.call_with_text_prompt(
+        {
+            "prompt": "<|media_pad|><|kimi_k25_video_placeholder|><|kimi_k25_video_placeholder|>",
+            "multi_modal_data": {"image": [image], "video": [[image] * 3, [image]]},
+        },
+        sampling_params=None,
+    )
+    data = extra["multimodal_data"]
+    assert torch.equal(data["image"]["pixel_values"], pixels[:4])
+    assert torch.equal(data["video"]["pixel_values_videos"], pixels[4:])
+    assert torch.equal(data["video"]["video_chunk_grid_thw"], grids[1:])
+    assert "video_grid_thw" not in data["video"]
+    assert data["video"]["video_num_chunks"].tolist() == [2, 1]
+    order = [
+        {"modality": "image", "index": 0},
+        {"modality": "video", "index": 0},
+        {"modality": "video", "index": 1},
+    ]
+    metadata = processor.get_mm_item_metadata(token_ids, data, order)
+    assert metadata.item_refs == (("image", 0), ("video", 0), ("video", 1))
+    assert metadata.output_embedding_lengths == (1, 3, 2)
+    assert token_ids == [163605] * 6
+    # Concatenating the new modality payloads reproduces main's unified tensors.
+    assert torch.equal(
+        torch.cat([data["image"]["pixel_values"], data["video"]["pixel_values_videos"]]), pixels
+    )
+    assert torch.equal(
+        torch.cat([data["image"]["image_grid_thw"], data["video"]["video_chunk_grid_thw"]]), grids
+    )
+    # The shared token counter reads video_grid_thw as one row per video, so
+    # the per-chunk grids must not reach it under that name.
+    from tensorrt_llm.inputs import multimodal as multimodal_inputs
+
+    counter = SimpleNamespace(get_num_tokens_per_video=lambda *, video, **kwargs: len(video))
+    with mock.patch.object(multimodal_inputs.logger, "warning") as warning:
+        lengths = multimodal_inputs.find_mm_token_lengths(
+            {"video": [[image] * 3, [image]]}, counter, multimodal_data=data
+        )
+    warning.assert_not_called()
+    assert lengths == {"video": [3, 1]}

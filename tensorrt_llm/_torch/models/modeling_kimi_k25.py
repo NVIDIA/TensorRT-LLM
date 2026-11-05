@@ -74,6 +74,7 @@ from ..modules.mlp import MLP
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -980,45 +981,37 @@ class KimiK25VisionModel(nn.Module):
         projected = self.mm_projector(merged)
         return torch.cat(projected, dim=0)
 
-    @torch.inference_mode()
-    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        """Encode images/video from multimodal params into LLM-space embeddings."""
-        all_pixel_values = []
-        all_grid_thws = []
-
-        for param in multimodal_params:
-            mm_data = param.multimodal_data
-            if mm_data is None:
-                continue
-            for modality in ("image", "video"):
-                if modality not in mm_data:
-                    continue
-                mod_data = mm_data[modality]
-                pv_key = (
-                    "pixel_values_videos"
-                    if modality == "video" and "pixel_values_videos" in mod_data
-                    else "pixel_values"
-                )
-                if pv_key not in mod_data:
-                    continue
-                all_pixel_values.append(mod_data[pv_key])
-                thw_key = (
-                    "video_grid_thw"
-                    if modality == "video" and "video_grid_thw" in mod_data
-                    else "image_grid_thw"
-                )
-                if thw_key in mod_data:
-                    all_grid_thws.append(mod_data[thw_key])
-
-        if not all_pixel_values:
-            return []
-
-        pixel_values = torch.cat(all_pixel_values, dim=0)
-        grid_thws = torch.cat(all_grid_thws, dim=0) if all_grid_thws else None
+    def encode_batched(
+        self, pixel_values: torch.Tensor, grid_thws: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         embeds = self._extract_features(pixel_values, grid_thws)
         if embeds.dim() == 3:
             embeds = embeds.reshape(-1, embeds.shape[-1])
-        return [embeds]
+        return embeds
+
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self.encode_batched,
+                input_fields={
+                    "pixel_values": {
+                        "image": "pixel_values",
+                        "video": "pixel_values_videos",
+                    },
+                    "grid_thws": {
+                        "image": "image_grid_thw",
+                        "video": "video_chunk_grid_thw",
+                    },
+                },
+            ),
+        )
+
+    @torch.inference_mode()
+    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        """Encode images/video from multimodal params into LLM-space embeddings."""
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
 # ---------------------------------------------------------------------------
@@ -1125,6 +1118,70 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        video = multimodal_data.get("video")
+        if isinstance(video, dict):
+            if "pixel_values_videos" not in video and "pixel_values" in video:
+                video["pixel_values_videos"] = video["pixel_values"]
+            if "video_chunk_grid_thw" not in video:
+                for legacy_key in ("video_grid_thw", "image_grid_thw"):
+                    if legacy_key in video:
+                        video["video_chunk_grid_thw"] = video[legacy_key]
+                        break
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        if metadata is not None and metadata.output_embedding_lengths is not None:
+            return metadata
+        vision_cfg = getattr(self._config, "vision_config", self._config)
+        merge_kernel_size = (
+            vision_cfg.get("merge_kernel_size", (2, 2))
+            if isinstance(vision_cfg, dict)
+            else getattr(vision_cfg, "merge_kernel_size", (2, 2))
+        )
+        merge_kh, merge_kw = merge_kernel_size
+        rows = {}
+        for modality, grid_key in (("image", "image_grid_thw"), ("video", "video_chunk_grid_thw")):
+            payload = multimodal_data.get(modality)
+            if not isinstance(payload, dict) or grid_key not in payload:
+                continue
+            chunk_rows = [
+                (h // merge_kh) * (w // merge_kw) for _, h, w in payload[grid_key].tolist()
+            ]
+            chunk_counts = payload.get("video_num_chunks")
+            if chunk_counts is None:
+                rows[modality] = chunk_rows
+            else:
+                offset = 0
+                rows[modality] = []
+                for count in chunk_counts.tolist():
+                    rows[modality].append(sum(chunk_rows[offset : offset + count]))
+                    offset += count
+        if not rows:
+            return metadata
+        # Images and videos share one placeholder token, so without an item
+        # order the prompt cannot tell them apart: fall back to images first.
+        item_refs = (
+            metadata.item_refs
+            if metadata is not None
+            else [(entry["modality"], entry["index"]) for entry in mm_item_order]
+            if mm_item_order
+            else [
+                (modality, index)
+                for modality, values in rows.items()
+                for index in range(len(values))
+            ]
+        )
+        return MultimodalItemMetadata(
+            item_refs,
+            encoder_token_lengths=metadata.encoder_token_lengths if metadata is not None else None,
+            output_embedding_lengths=[rows[modality][index] for modality, index in item_refs],
+            input_partitions=metadata.input_partitions if metadata is not None else None,
+        )
 
     def get_vocab_size(self) -> int:
         """Return the K2.5 vocabulary size (163840)."""
@@ -1275,6 +1332,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             medias.append({"type": "image", "image": img})
 
         video_prompt_parts: List[str] = []
+        video_num_chunks: List[int] = []
         if videos:
             # Read video processing config from the HF image processor
             image_processor = getattr(self._processor, "image_processor", None)
@@ -1323,6 +1381,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                         timestamp_mode=ts_mode,
                     )
                 medias.extend(chunks)
+                video_num_chunks.append(len(chunks))
                 video_prompt_parts.append(vid_prompt)
 
         # Replace the video placeholder(s) in the prompt with actual
@@ -1437,29 +1496,30 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                     new_ids.append(tok)
             input_ids = torch.tensor(new_ids, dtype=torch.int32)
 
-        # Build multimodal_data dict with pixel values and grid_thws.
-        # MoonViT3d requires image_grid_thw for 3D patch embedding.
-        #
-        # When videos are pre-decoded into video_chunks, the HF processor
-        # merges ALL media (images + video_chunks) into unified
-        # ``pixel_values`` and ``grid_thws`` tensors.  We put everything
-        # under the "image" key because:
-        # 1. MoonViT3d processes images and video chunks identically
-        #    (temporal dim is encoded in grid_thws).
-        # 2. The framework's multimodal_data_device_paths moves
-        #    "image.pixel_values" and "image.image_grid_thw" to GPU.
-        # 3. The VLM forward() extracts data from the "image" modality.
-        #
-        # Do NOT duplicate under "video" — that would cause forward()
-        # to process the same tensors twice and trigger device mismatches.
+        # Keep each original video as one item, with its temporal chunks
+        # adjacent in the packed tensors. The chunk grids have one row per
+        # chunk, so they do not use the per-video video_grid_thw name.
         multimodal_data: Dict[str, Any] = {}
         pv = processed.get("pixel_values")
         gt = processed.get("grid_thws", processed.get("image_grid_thw"))
         if pv is not None:
-            mm_entry: Dict[str, Any] = {"pixel_values": pv}
-            if gt is not None:
-                mm_entry["image_grid_thw"] = gt
-            multimodal_data["image"] = mm_entry
+            if videos and gt is not None:
+                image_patches = int(gt[: len(images)].prod(dim=-1).sum())
+                if images:
+                    multimodal_data["image"] = {
+                        "pixel_values": pv[:image_patches],
+                        "image_grid_thw": gt[: len(images)],
+                    }
+                multimodal_data["video"] = {
+                    "pixel_values_videos": pv[image_patches:],
+                    "video_chunk_grid_thw": gt[len(images) :],
+                    "video_num_chunks": torch.tensor(video_num_chunks, dtype=torch.int64),
+                }
+            else:
+                mm_entry: Dict[str, Any] = {"pixel_values": pv}
+                if gt is not None:
+                    mm_entry["image_grid_thw"] = gt
+                multimodal_data["image"] = mm_entry
 
         return input_ids.to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
@@ -1715,7 +1775,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             "image.pixel_values",
             "image.image_grid_thw",
             "video.pixel_values_videos",
-            "video.video_grid_thw",
+            "video.video_chunk_grid_thw",
             "multimodal_embedding",
         ]
 
