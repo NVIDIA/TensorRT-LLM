@@ -393,7 +393,12 @@ def test_nvfp4_input_scale_only_where_the_forward_takes_the_input_as_is(blocker)
     scale = torch.tensor(1.0)
     moe = SimpleNamespace(
         comm=object() if blocker == "comm" else None,
-        _using_load_balancer=lambda: blocker == "eplb",
+        # The stub lists ``routed_ids_unchanged`` independently so the property
+        # under test reads it (a comm strategy, EPLB or the router-weight fold
+        # makes the ids reach the backend changed) without needing a full
+        # ConfigurableMoE. The "chunked" blocker leaves it True on purpose: the
+        # property must decline on the chunk test alone.
+        routed_ids_unchanged=blocker not in ("comm", "eplb", "router_weight_on_input"),
         apply_router_weight_on_input=blocker == "router_weight_on_input",
         moe_max_num_tokens=4 if blocker == "chunked" else 64,
         backend=SimpleNamespace(prequantized_nvfp4_input_scale=lambda: scale),
