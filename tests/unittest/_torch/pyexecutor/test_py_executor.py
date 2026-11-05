@@ -326,7 +326,6 @@ def _make_remote_tail_executor_and_request(
     )
     executor = types.SimpleNamespace(
         model_engine=types.SimpleNamespace(model=types.SimpleNamespace(model=model)),
-        _decode_only=False,
         kv_cache_transceiver=types.SimpleNamespace(pipeline_transfer_enabled=False),
         scheduler=types.SimpleNamespace(max_context_length=8192),
         max_num_tokens=8192,
@@ -657,7 +656,6 @@ def _make_admission_executor(model, requests):
     real ones, over a model engine holding `model`; everything else they touch is a stub."""
     executor = types.SimpleNamespace(
         model_engine=types.SimpleNamespace(model=model),
-        _decode_only=False,
         _is_kv_manager_v2=False,
         kv_cache_manager=None,
         kv_cache_transceiver=None,

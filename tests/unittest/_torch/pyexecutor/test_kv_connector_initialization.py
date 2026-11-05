@@ -85,7 +85,6 @@ def test_connector_retention_request_validation(
     rejected: bool,
 ) -> None:
     executor = object.__new__(PyExecutor)
-    executor._decode_only = False
     executor._is_kv_manager_v2 = use_v2
     executor.kv_connector_manager = (
         None if connector_mode is None else Mock(capacity_only=connector_mode == "capacity")
