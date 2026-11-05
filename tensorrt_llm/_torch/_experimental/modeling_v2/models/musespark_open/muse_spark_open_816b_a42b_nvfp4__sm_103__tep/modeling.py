@@ -215,19 +215,25 @@ Hops and boundaries:
   ``DecodeTarget`` pass ``capture_fold``: on the DFlash capture layers the fused
   post-FFN boundary also writes the layer's BF16 capture into the DFlash
   buffer, and the built-in capture copies of that layer are not launched.
-* ``wide_projection_gathers`` (tep4 on sm_103 only) widens ``projection_gathers`` to
+* ``wide_projection_gathers`` (sm_103, tep4 and tep8) widens ``projection_gathers`` to
   decode steps of 9..32 rows (two to four requests at K = 7), which ``DecodeTarget``
   arms (``WideProjections.armed``): the pool and unpool projections return the rank's
   slice, the post-FFN boundary and the pre-expert quantization gather it on the path's
-  32-row inboxes, and the dense GEMM plan runs its 9..32-row table, so the next QKV is
-  flashinfer's split-K, which the boundary's early release lets stream its weight.
-  Decode steps of 1..8 rows keep the 8-row inboxes and kernels.
-* ``projection_publish`` (tep4 on sm_103 only) takes the deferred pool and unpool
-  projections of decode steps of 33..512 rows (5 to 64 requests at K = 7), which
-  ``DecodeTarget`` arms (``PublishedProjections.armed``): each rank multiplies its column
-  slice with the slot of the site's multicast transport as the GEMM's output, and the
-  pre-expert NVFP4 quantization and the post-FFN join poll the published rows (the built-in
-  kernels' arithmetic on the gathered rows).
+  32-row inboxes, and the dense GEMM plan runs its 9..32-row table for the slices (and at
+  tep4 for QKV; at tep8 ``wide_dense_gemms`` has the QKV cells), so the next QKV is
+  flashinfer's split-K, which the boundary's early release lets stream its weight. At tep8
+  each boundary CTA of those rows covers two ranks' slices, and the unpooler's
+  ``dense_gemm_prefetch`` fork of the next QKV weight is dropped at those rows on the
+  converted edges (``boundary_early_release``). Decode steps of 1..8 rows keep the 8-row
+  inboxes and kernels.
+* ``projection_publish`` (tep4 and tep8 on sm_103) takes the deferred
+  pool and unpool projections of multi-request decode steps -- 33..448 rows at tep4 (5 to 56
+  requests at K = 7), the producer census's row counts of 40..512 at tep8 (5 to 64
+  requests; ``kernels/projection_publish``'s ``MAX_ROWS_BY_TP``) -- which ``DecodeTarget``
+  arms (``PublishedProjections.armed``): each rank multiplies its column slice with the slot
+  of the site's multicast transport as the GEMM's output (at tep8 over the two trays'
+  fabric), and the pre-expert NVFP4 quantization and the post-FFN join poll the published
+  rows (the built-in kernels' arithmetic on the gathered rows).
 
 MoE:
 
@@ -696,9 +702,11 @@ class DecodeTarget:
     With ``wide_projection_gathers``, a forward of 9..32 rows (two to four requests) is
     armed (``WideProjections.armed``): the layers' pool and unpool projections return the
     rank's slice, their consumers gather it on the path's 32-row inboxes, and the dense
-    GEMM plan runs its 9..32-row table (the QKV projection on split-K).
+    GEMM plan runs its 9..32-row table (the slices on split-K; the QKV projection on split-K
+    from this table at tep4, from ``wide_dense_gemms``' at tep8).
 
-    With ``projection_publish``, a forward of 33..448 rows (5 to 56 requests) is armed
+    With ``projection_publish``, a forward of 33..448 rows (5 to 56 requests) at tep4, or of
+    one of the producer census's row counts of 40..512 (5 to 64 requests) at tep8, is armed
     (``PublishedProjections.armed``): the layers' pool and unpool slice GEMMs write into the
     sites' multicast transports and their consumers poll the published rows.
 
@@ -927,7 +935,22 @@ _TEP8_PATHS = _dispatch.BASE_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PA
 #: shard from 16 rows, the split verify sampler on 129..1024-row steps and the unfused MoE
 #: output all-reduce of 129..1024-row steps (above the fabric finalize's 128 rows; NCCL in
 #: the built-in). The windowed drafter arena's compaction keeps the context-K/V fork and
-#: the verify fold in the plan over the windowed arena (``dispatch.compose``).
+#: the verify fold in the plan over the windowed arena (``dispatch.compose``). And
+#: ``projection_publish``, whose transports and consumers take the TP size from the mapping
+#: (``projection_publish.WORLDS``; the pool consumer reads one vector of each of the eight
+#: ranks' slots per thread, the unpool join's ``WORLD_SIZE`` is a constant of its build):
+#: the pool and unpool projections of the decode steps at the producer census's row counts
+#: of 40..512 (``CENSUS_ROWS_BY_TP[8]``, capped by ``MAX_ROWS_BY_TP[8]``) multiply the
+#: rank's 512 / 1024 columns and publish them from the GEMM, where the built-in multiplies
+#: the replicated weights on every rank above 8 rows. Its cuBLAS producer is certified per
+#: TP size and slice shape (``projection_publish.CERTIFIED_PRODUCERS``), so a TP4 census does
+#: not arm it; on another torch, cuBLASLt or device its build refuses and the built-in serves.
+#: And ``wide_projection_gathers`` on its TP8 table
+#: (``wide_projection_gathers.TP8_WIDE_KERNELS``, the slices only): the pool / unpool
+#: projections of 9..32-row decode steps as the rank's 512 / 1024 columns on split-K 4, in
+#: place of the replicated cuBLAS calls over the whole weights, their gathers fused into the
+#: pre-expert quantization and the post-FFN boundary on 32-row inboxes (each boundary CTA
+#: polling two peers), the boundary releasing the next QKV at entry.
 #: Left out: ``decode_kv_splits`` (its split acts only on the decode FMHA calls
 #: ``multi_request_split_kv`` declines and on mixed steps) and the paths written for one
 #: tray.
@@ -941,6 +964,8 @@ _SM103_TEP8_MULTI_REQUEST_PATHS = frozenset(
         "wide_split_sampler",
         "drafter_window_compact",
         "wide_moe_allreduce",
+        "wide_projection_gathers",
+        "projection_publish",
     }
 )
 #: The fast paths written for any rank count whose output is bitwise the built-in

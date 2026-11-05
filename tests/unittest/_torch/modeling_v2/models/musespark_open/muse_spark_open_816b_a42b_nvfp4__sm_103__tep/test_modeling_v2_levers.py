@@ -200,7 +200,7 @@ SERVED_AT = {
     "multi_request_post_attention_hop": ({(103, 4), (103, 8)}, "composition", "upstream"),
     "wide_drafter_hops": ({(103, 4)}, "composition", "upstream"),
     "router_gemm": ({(103, 4), (103, 8)}, "composition", "upstream"),
-    "projection_publish": ({(103, 4)}, "composition", "upstream"),
+    "projection_publish": ({(103, 4), (103, 8)}, "composition", "upstream"),
 }
 
 
@@ -217,7 +217,7 @@ def test_the_compositions_and_the_fast_paths():
     assert sorted(TARGET_PATHS) == [(103, 4), (103, 8)]
     served = TARGET_PATHS[(103, 4)].served | TARGET_PATHS[(103, 8)].served
     assert DISPATCH.FAST_PATH_NAMES == served
-    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (53, 55)
+    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (55, 55)
     with pytest.raises(KeyError):
         table((107, 4), 4, "agg", "windowed")
 
@@ -254,6 +254,7 @@ TEP8_MULTI_REQUEST = {
     "multi_request_split_kv",
     "multi_request_post_attention_hop",
     "router_gemm",
+    "projection_publish",
 }
 
 REGIONS = [
@@ -455,10 +456,12 @@ SM103_TEP8_ADDED = frozenset(
         "multi_request_post_attention_hop",
         "multi_request_prep_append",
         "multi_request_split_kv",
+        "projection_publish",
         "router_gemm",
         "vocab_parallel_head",
         "wide_dense_gemms",
         "wide_moe_allreduce",
+        "wide_projection_gathers",
         "wide_split_sampler",
     }
 )

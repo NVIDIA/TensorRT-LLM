@@ -1184,8 +1184,14 @@ def adopt_model(
             model, pdl_triggers.capture_layers(model) - capture_folded
         )
         _refuse_unconverted_edges(converted, kept, len(model.layers))
+        # With wide_projection_gathers the unpool slice of a 9..32-row step runs on the unpooler's
+        # dispatcher too: its next-QKV prefetch is dropped at those rows on the converted edges
+        # (the path's check refuses a plan that still forks it there).
         dropped = pdl_triggers.drop_converted_prefetches(
-            model, dense_gemm_plan, qkv=bool(converted)
+            model,
+            dense_gemm_plan,
+            qkv=bool(converted),
+            wide=plan.enabled("wide_projection_gathers"),
         )
         pdl_triggers.log_installed(
             len(model.layers),
