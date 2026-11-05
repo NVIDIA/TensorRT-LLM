@@ -35,6 +35,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
+from .kv_cache.mamba_cache_manager import use_py_mamba_cache_manager
+
 if TYPE_CHECKING:
     from tensorrt_llm.executor.ipc import IpcQueue
 
@@ -1226,7 +1228,7 @@ def _create_py_executor(
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
             # no effect in disagg. The disagg manager choice is driven by
             # get_kv_cache_manager_cls and cache_transceiver_config.
-            if get_env_flag("TRTLLM_USE_PY_MAMBA", False):
+            if use_py_mamba_cache_manager():
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
                     "configure transceiver_runtime='PYTHON' with backend='NIXL' "
