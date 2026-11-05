@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.dsa.module import DSAHooks, _forward_dsa_attn
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import (
-    forward_dsa_proj as main_forward_dsa_proj,
+    DSAHooks,
+    _forward_dsa_attn,
+    should_use_short_mha,
 )
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
@@ -132,6 +133,41 @@ def _q_b_with_norm(mla, raw_q: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _forward_dsa_proj_fallback(
+    mla, position_ids, hidden_states, attn_metadata, *, allow_k_cache_write: bool
+) -> list[torch.Tensor]:
+    q, compressed_kv, k_pe = mla.kv_a_proj_with_mqa(hidden_states).split(
+        [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim], dim=-1
+    )
+    q_pair, compressed_kv = maybe_execute_in_parallel(
+        lambda: mla._q_a_layernorm_maybe_fused(q, return_norm_out=True),
+        lambda: mla.kv_a_layernorm(compressed_kv),
+        mla.ln_events[0],
+        mla.ln_events[1],
+        mla.aux_stream,
+    )
+    q, qr = q_pair
+    latent_cache = torch.cat((compressed_kv, k_pe), dim=-1)
+    q = mla.q_b_proj(q)
+    outputs = [q, compressed_kv, k_pe, latent_cache]
+    if (
+        should_use_short_mha(mla, attn_metadata, position_ids)
+        and attn_metadata.num_generations == 0
+    ):
+        return outputs
+    indexer = mla.mqa.indexer
+    if indexer is not None:
+        outputs.extend(
+            indexer.pre_indexer_proj(
+                qr,
+                hidden_states,
+                position_ids,
+                k_cache_metadata=attn_metadata if allow_k_cache_write else None,
+            )
+        )
+    return outputs
+
+
 def forward_dsa_proj(
     mla, position_ids, hidden_states, attn_metadata, *, allow_k_cache_write: bool = False
 ) -> list[torch.Tensor]:
@@ -141,7 +177,13 @@ def forward_dsa_proj(
         or isinstance(hidden_states, Fp4QuantizedTensor)
         or hidden_states.dtype != torch.bfloat16
     ):
-        return main_forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata)
+        return _forward_dsa_proj_fallback(
+            mla,
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            allow_k_cache_write=allow_k_cache_write,
+        )
 
     rows = hidden_states.shape[0]
     indexer = mla.mqa.indexer
@@ -240,8 +282,9 @@ class RubinDSAHooks(DSAHooks):
             maybe_bcg_mla_dsa_attn_inplace,
         )
 
-        from .projection_op import mla_dsa_proj
+        from .projection_op import indexer_cache_for_projection, mla_dsa_proj
 
+        indexer_k_cache = indexer_cache_for_projection(mla.layer_idx_str)
         if isinstance(hidden_states, Fp4QuantizedTensor):
             outputs = mla_dsa_proj(
                 hidden_states.unquantized_hidden_states,
@@ -249,9 +292,12 @@ class RubinDSAHooks(DSAHooks):
                 mla.layer_idx_str,
                 hidden_states.fp4_tensor,
                 hidden_states.scaling_factor,
+                indexer_k_cache,
             )
         else:
-            outputs = mla_dsa_proj(hidden_states, position_ids, mla.layer_idx_str)
+            outputs = mla_dsa_proj(
+                hidden_states, position_ids, mla.layer_idx_str, indexer_k_cache=indexer_k_cache
+            )
         maybe_bcg_mla_dsa_attn_inplace(
             *outputs[:4], outputs[4:], position_ids, mla.layer_idx_str, attn_output[0]
         )
