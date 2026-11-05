@@ -53,6 +53,9 @@ from pathlib import Path
 # The markers in our test lists, need to be preprocess before checking
 MARKER_LIST_IN_TEST = [" TIMEOUT"]
 
+# The only test-db file format version the Jenkins test-db scheduler accepts.
+TEST_DB_VERSION = "0.0.1"
+
 # AST validation defaults
 _DEFAULT_TEST_LISTS_DIR = "tests/integration/test_lists"
 _DEFAULT_TEST_BASE_DIR = "tests/integration/defs"
@@ -925,20 +928,66 @@ def list_test_db_names(test_db_path: str) -> list[str]:
 
     Perf lists other than perf_sanity are skipped: their tests are generated
     dynamically.
+
+    Raises ValueError on input the test-db scheduler rejects: duplicate mapping
+    keys, a missing or unsupported version, a context defined in more than one
+    file, a context or block of the wrong type, or a block without a
+    'condition' or a 'tests' list.
     """
     # Imported here so --validate runs without PyYAML (pre-commit uses system python).
     import yaml
 
+    class _UniqueKeyLoader(yaml.SafeLoader):
+
+        def construct_mapping(self, node, deep=False):
+            seen = set()
+            for key_node, _ in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise ValueError(
+                        f"duplicate key {key!r} at line {key_node.start_mark.line + 1}"
+                    )
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
     names = set()
-    for path in glob.glob(os.path.join(test_db_path, "*.yml")):
+    context_files = {}
+    for path in sorted(glob.glob(os.path.join(test_db_path, "*.yml"))):
         base = os.path.basename(path)
         if "perf" in base and "perf_sanity" not in base:
             continue
         with open(path) as f:
-            for blocks in (yaml.safe_load(f) or {}).values():
-                if isinstance(blocks, list):
-                    for block in blocks:
-                        names.update(str(t) for t in block.get("tests") or [])
+            try:
+                data = yaml.load(f, Loader=_UniqueKeyLoader)
+            except ValueError as e:
+                raise ValueError(f"{path}: {e}") from None
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: expected a mapping at the top level")
+        version = data.pop("version", None)
+        if version != TEST_DB_VERSION:
+            raise ValueError(
+                f"{path}: version must be {TEST_DB_VERSION!r}, got {version!r}")
+        for context, blocks in data.items():
+            if context in context_files:
+                raise ValueError(f"{path}: context {context!r} is already "
+                                 f"defined in {context_files[context]}")
+            context_files[context] = path
+            if not isinstance(blocks, list):
+                raise ValueError(
+                    f"{path}: context {context!r} must be a list of blocks")
+            for block in blocks:
+                if not isinstance(block, dict):
+                    raise ValueError(
+                        f"{path}: context {context!r} has a non-mapping block")
+                if "condition" not in block:
+                    raise ValueError(
+                        f"{path}: context {context!r} has a block without 'condition'"
+                    )
+                if not isinstance(block.get("tests"), list):
+                    raise ValueError(
+                        f"{path}: context {context!r} has a block whose 'tests' is not a list"
+                    )
+                names.update(str(t) for t in block["tests"])
     return sorted(names)
 
 
