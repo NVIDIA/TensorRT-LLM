@@ -59,14 +59,14 @@ from safetensors import safe_open
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.renorm_moe_routing_op import (
-    renorm_moe_routing_op,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp4 import (  # noqa: E501
     modeling as M,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp4 import (  # noqa: E501
     weights as W,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader

@@ -355,7 +355,7 @@ def _check(s: _Step, run: SimpleNamespace, other: SimpleNamespace) -> dict:
     """Every row finite; the sharer equal to its source; each layer's context rows bitwise the
     other path's on every row neither run split over its keys, a split row within the band;
     the generation rows bitwise; the gated rows against the fp32 reference."""
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flash_mla_sparse_decode import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.ops.attention.flash_mla_sparse_decode import (  # noqa: E501
         flash_mla_sparse_decode,
     )
 
