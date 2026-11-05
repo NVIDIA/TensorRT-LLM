@@ -158,8 +158,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::Tes
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugs/6451323)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/6451323)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
-llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_native_fp8_lora_matches_bf16_reference[cudagraph] SKIP (https://nvbugs/7028059)
-llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_native_fp8_lora_matches_bf16_reference[eager] SKIP (https://nvbugs/7028059)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tp4_8k1k] SKIP (https://nvbugs/7028057)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_8_flash_next_fp4_blackwell-qwen3_8_flash_next_fp4_tp1_mtp3_8k1k] SKIP (https://nvbugs/7028057)
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] SKIP (https://nvbugs/6759009)
