@@ -289,6 +289,11 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert [buffer.size for buffer in config.layers[1].buffers] == [
         buffer.size for buffer in config.layers[0].buffers
     ]
+    # The high layer's K and V blocks follow the layer's in every slot of the shared pool, so a
+    # held block's high rows are its rows two blocks further: the per-pool delta dense attention
+    # applies to its block offsets.
+    assert manager.mixed_precision_high_layer_offsets == {0: 2}
+    assert manager.mixed_precision_high_block_deltas == {0: 2}
 
 
 def test_cold_page_window_skips_the_codec_while_estimating(make_manager):

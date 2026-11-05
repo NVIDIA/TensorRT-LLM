@@ -5,8 +5,8 @@
 Each new token is also written to the mixed-precision high pool. With an NVFP4 history pool,
 rows the mixed-precision high pool still holds overwrite the dequantized rows in the FP8
 scratch after the top-k gather. A plain FP8/BF16 pool (cold-page first/last-N) shares its
-memory with the mixed-precision high pool, so the selected positions it holds are pointed at
-its rows and attention reads them in place.
+memory with the mixed-precision high pool, so the positions it holds are read from its rows in
+place: the sparse backends redirect the selected rows, dense attention the block offsets.
 Mixed-precision high page table: a page index if the token is held there, else -1.
 """
 
@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 
 if TYPE_CHECKING:
-    from ..trtllm import TrtllmAttention
+    from ..trtllm import TrtllmAttention, TrtllmAttentionMetadata
     from .deepseek_v4.compressor import Compressor
     from .dsa.metadata import DSAtrtllmAttentionMetadata
 
@@ -550,3 +550,92 @@ def mixed_precision_high_row_indices(
         requests, block_table, topk_indices, rows_per_page, topk, rows_per_page, layer_offset
     )
     return torch.where(high_rows >= 0, high_rows, topk_indices_global, out=topk_indices_global)
+
+
+@triton.jit
+def _store_mixed_precision_low_rows_kernel(
+    rows_ptr,
+    high_table_ptr,
+    high_table_stride,
+    src_ptr,
+    dst_ptr,
+    offsets_request_stride,
+    offsets_kv_stride,
+    kv_lens_ptr,
+    new_lens_ptr,
+    tokens_per_block,
+    max_blocks,
+    ROW_WIDTH: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Per (request, BLOCK_T new tokens, K or V): copy a held block's rows from the high layer's
+    block (`src`, the redirected block offsets) to the layer's own block (`dst`)."""
+    request = tl.program_id(0).to(tl.int64)
+    kv = tl.program_id(2)
+    j = tl.program_id(1) * BLOCK_T + tl.arange(0, BLOCK_T)
+    new = tl.load(new_lens_ptr + request)
+    position = tl.load(kv_lens_ptr + request) - new + j
+    block = position // tokens_per_block
+    valid = (j < new) & (block < max_blocks)
+    page = tl.load(high_table_ptr + request * high_table_stride + block, mask=valid, other=-1)
+    valid = valid & (page >= 0)
+    entry = request * offsets_request_stride + kv * offsets_kv_stride + block
+    src_block = tl.load(src_ptr + entry, mask=valid, other=0).to(tl.int64)
+    dst_block = tl.load(dst_ptr + entry, mask=valid, other=0).to(tl.int64)
+    token = position % tokens_per_block
+    _copy_rows(
+        rows_ptr,
+        src_block * tokens_per_block + token,
+        rows_ptr,
+        dst_block * tokens_per_block + token,
+        valid,
+        rows_ptr,
+        False,
+        ROW_WIDTH,
+        BLOCK_W,
+    )
+
+
+def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> None:
+    """Copy this step's rows of the held blocks from the mixed-precision high layer to the layer.
+
+    Dense attention wrote them into the high layer's blocks, where the redirected block offsets
+    point; the layer's own blocks keep the history complete for the blocks the window releases.
+
+    Args:
+        metadata: Attention metadata of the batch, after the attention op of ``layer_idx``.
+        layer_idx: Model layer whose rows the attention op wrote.
+    """
+    manager = metadata.kv_cache_manager
+    local = manager.layer_offsets[layer_idx]
+    num_seqs = metadata.num_seqs
+    if local not in manager.mixed_precision_high_layers or num_seqs == 0:
+        return
+    pool_id = int(manager.impl.get_layer_group_id(local))
+    src = metadata.kv_cache_block_offsets[pool_id]
+    dst = metadata.mixed_precision_low_block_offsets[pool_id]
+    high_table = metadata.mixed_precision_high_block_table
+    # [pages, kv_factor, tokens, heads, bytes]: block offsets count K/V blocks from this base.
+    pool = manager._get_mixed_precision_buffers(local, "NHD", "low")
+    rows = pool.view(-1, pool.shape[3] * pool.shape[4])
+    max_new = int(metadata.seq_lens_kv[:num_seqs].max())
+    block_t = 16
+    _store_mixed_precision_low_rows_kernel[
+        (num_seqs, triton.cdiv(max_new, block_t), pool.shape[1])
+    ](
+        rows,
+        high_table,
+        high_table.stride(0),
+        src,
+        dst,
+        src.stride(0),
+        src.stride(1),
+        metadata.kv_lens_cuda_runtime,
+        metadata.seq_lens_kv_cuda[:num_seqs],
+        pool.shape[2],
+        high_table.shape[1],
+        ROW_WIDTH=rows.shape[1],
+        BLOCK_T=block_t,
+        BLOCK_W=128,
+    )

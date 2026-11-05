@@ -389,52 +389,6 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype, layout", ((torch.float8_e4m3fn, "NHD"), (torch.bfloat16, "HND")))
-def test_native_history_pool_paged_conversion(dtype, layout):
-    """Cold-page mixed precision keeps the history pool at the runtime dtype: both directions copy
-    (one- and two-byte elements, both layouts)."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("Mixed-precision KV conversion requires Blackwell")
-    from tensorrt_llm._torch.attention.kernels.blackwell import mixed_precision_kv as kernels
-
-    low_dtype = {torch.bfloat16: DataType.BF16, torch.float8_e4m3fn: DataType.FP8}[dtype]
-    width = 64
-    row_bytes = width * dtype.itemsize
-    assert kernels.get_mixed_precision_kv_row_bytes(low_dtype, width) == row_bytes
-    values = torch.linspace(-6, 6, 192 * 4 * width, device="cuda").view(192, 2, 2, width).to(dtype)
-    pool = values.view(3, 64, 2, 2, width).transpose(1, 2).contiguous()
-    low = torch.full((3, 2, 128, 2, row_bytes), 23, dtype=torch.uint8, device="cuda")
-    high = torch.zeros((3, 2, 128, 2, width), dtype=dtype, device="cuda")
-    tables = torch.tensor([[[2, 0]], [[1, -1]]], dtype=torch.int32, device="cuda")
-    lengths = torch.tensor([[0], [130]], dtype=torch.int32, device="cuda")
-    rows = values.view(torch.uint8).view(192, 2, 2, row_bytes)
-    expected_low, expected_high = low.clone(), high.clone()
-    for page, count in enumerate((128, 2)):
-        expected_low[(2, 0)[page], :, :count] = rows[128 * page : 128 * page + count].transpose(
-            0, 1
-        )
-    expected_high[1] = values[:128].transpose(0, 1)
-    pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, high))
-    kernels.convert_mixed_precision_kv(
-        True, 130, *pools, tables, lengths, layout, low_dtype=low_dtype
-    )
-    # Complete records: the history pool holds the native bytes, padding keeps its sentinel.
-    for actual, expected in ((low, expected_low), (high, expected_high)):
-        torch.testing.assert_close(
-            actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
-        )
-    # Reading back restores every written token bit for bit; positions past the length stay zero.
-    pool.copy_(torch.zeros_like(pool))
-    lengths[0].fill_(130)
-    kernels.convert_mixed_precision_kv(
-        False, 192, *pools, tables, lengths, layout, low_dtype=low_dtype
-    )
-    expected = values.clone()
-    expected[130:] = 0
-    actual = pool.transpose(1, 2).reshape_as(values)
-    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
-
-
 @pytest.mark.cpu_only
 def test_conversion_kernel_imports_pinned_flashinfer_symbols():
     """The kernel relies on internal FlashInfer modules; a bump that drops them fails here."""
@@ -604,7 +558,7 @@ def test_dsa_draft_forward_uses_draft_mixed_precision_high_table():
         DSAtrtllmAttentionMetadata,
     )
 
-    metadata = Mock()
+    metadata = Mock(spec=DSAtrtllmAttentionMetadata)
     metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
     metadata.draft_replay_swapped_attrs = {}
     metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
@@ -873,15 +827,34 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
         draft.shutdown()
 
 
+class _ColdPageProvider:
+    """Cold-page codec provider stand-in: the manager reads only its first/last-N window."""
+
+    config = SimpleNamespace(algorithm="quantization_for_cold_page")
+
+    def __init__(self, first_n: int, last_n: int):
+        self.mixed_precision_high_window = (first_n, last_n)
+
+    def create_cold_page_codec(self, cache_config, **kwargs):
+        return None
+
+
 def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloat16"):
-    """A one-layer BF16 cache; mixed precision keeps one page at each end in the high pool."""
+    """A one-layer BF16 cache; mixed precision ("mixed_*", or "cold" for the cold-page window)
+    keeps one page at each end in the high pool."""
     mixed = (
         dict(mixed_precision_first_n=block, mixed_precision_last_n=block, pool_ratio=[0.75, 0.25])
         if dtype.startswith("mixed_")
         else {}
     )
+    cold = dtype == "cold"
     return KVCacheManagerV2(
-        KvCacheConfig(max_tokens=65536, enable_block_reuse=True, dtype=dtype, **mixed),
+        KvCacheConfig(
+            max_tokens=65536,
+            enable_block_reuse=True,
+            dtype="auto" if cold else dtype,
+            **(dict(pool_ratio=[0.75, 0.25]) if cold else mixed),
+        ),
         CacheType.SELF,
         num_layers=1,
         num_kv_heads=2,
@@ -891,6 +864,7 @@ def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloa
         max_batch_size=2,
         mapping=mapping,
         dtype=DataType.BF16,
+        cold_page_codec_provider=_ColdPageProvider(block, block) if cold else None,
     )
 
 
@@ -961,7 +935,7 @@ def test_draft_forward_hides_mixed_precision_high_rows(backend):
     cls = {"dsa": DSAtrtllmAttentionMetadata, "deepseek_v4": DeepseekV4TrtllmAttentionMetadata}[
         backend
     ]
-    metadata = Mock()
+    metadata = Mock(spec=cls)
     metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
     metadata.draft_sliding_block_tables = None
     metadata.draft_mixed_precision_high_block_table = None
@@ -1109,7 +1083,7 @@ def test_staging_covers_allocated_capacity(backend):
         manager.shutdown()
 
 
-@pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16"])
+@pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16", "cold"])
 def test_steady_decode_step_skips_mixed_precision(dtype):
     """The steady MTP decode shortcut stands in for prepare() only without mixed precision."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
@@ -1122,5 +1096,61 @@ def test_steady_decode_step_skips_mixed_precision(dtype):
         metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached)
         metadata.prepare()
         assert metadata.supports_steady_decode_step == (dtype == "auto")
+    finally:
+        manager.shutdown()
+
+
+def test_cold_page_window_redirects_dense_block_offsets():
+    """TRTLLM block offsets of the held blocks point at the high layer's blocks of the same pages;
+    after attention the step's rows come back to the layer's own blocks."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision KV requires Blackwell")
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        store_mixed_precision_low_rows,
+    )
+
+    block, cached = 32, 4 * 32
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = _small_manager(block, mapping, "cold")
+    try:
+        # A context request appends one block: the high pool holds the first block (first_n) and
+        # the last two (last_n + 1 tokens).
+        manager.add_dummy_requests([0], [cached + block], is_gen=False)
+        metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached)
+        metadata.prepare()
+        blocks = (cached + block) // block
+        pages = torch.full((2, 1, blocks), -1, dtype=torch.int32)
+        manager.fill_mixed_precision_page_tables([0], 0, pages.numpy())
+        low, high = pages[0, 0].tolist(), pages[1, 0].tolist()
+        assert metadata.mixed_precision_high_block_table[0, :blocks].tolist() == high
+        held = [i for i, page in enumerate(high) if page >= 0]
+        assert held == [0, 3, 4]
+        delta, kv_offset = manager.mixed_precision_high_block_deltas[0], int(manager.kv_offset[0])
+        offsets = metadata.kv_cache_block_offsets[0, 0, :, :blocks].tolist()
+        kept = metadata.mixed_precision_low_block_offsets[0, 0, :, :blocks].tolist()
+        for kv in range(2):
+            assert kept[kv] == [page * 2 + kv * kv_offset for page in low]
+            assert offsets[kv] == [
+                (high[i] * 2 + delta if i in held else low[i] * 2) + kv * kv_offset
+                for i in range(blocks)
+            ]
+        # The redirected offsets address the high layer's rows of those pages.
+        low_pool = manager.get_buffers(0, "NHD", mixed_precision_pool="low")
+        high_pool = manager.get_buffers(0, "NHD", mixed_precision_pool="high")
+        rows = low_pool.view(-1, low_pool.shape[3] * low_pool.shape[4])
+        for i in held:
+            for kv in range(2):
+                assert rows[offsets[kv][i] * block].data_ptr() == high_pool[high[i], kv].data_ptr()
+        # Attention wrote this step's rows (block 4) into the high layer; the copy back fills the
+        # layer's block and leaves the earlier held block alone.
+        torch.manual_seed(0)
+        written = torch.randn(2, block, 2, 64, device="cuda").to(torch.bfloat16)
+        high_pool[high[4]].copy_(written)
+        high_pool[high[3]].fill_(1.0)
+        low_pool.fill_(7)
+        store_mixed_precision_low_rows(metadata, 0)
+        torch.cuda.synchronize()
+        assert torch.equal(low_pool[low[4]].view(torch.bfloat16), written)
+        assert (low_pool[low[3]] == 7).all() and (low_pool[low[0]] == 7).all()
     finally:
         manager.shutdown()

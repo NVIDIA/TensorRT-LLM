@@ -276,16 +276,15 @@ kv_cache_compression_config:
 The cost is one extra GPU copy of the first/last tokens per attention layer,
 sized by `mixed_precision_first_n + mixed_precision_last_n`, and the full-size
 storage of those tokens in the cold tiers. Attention kernels are unchanged: the
-first/last tokens are served from that copy, as in the mixed-precision KV cache,
-including its per-step staging cost on dense attention backends.
+page tables point the first/last tokens at that copy, and each step's new tokens
+are copied into the history pages as well.
 
 The option is a prototype and has the limits of the mixed-precision KV cache:
-the TRTLLM or FlashInfer attention backend, the standard KV cache manager, the
-hybrid Mamba manager and the DSA and DeepSeek-V4 sparse backends, single-beam
-decoding, speculative decoding except dynamic-tree drafting, no KV connector,
-and not the `fp8_ds_mla` cache layout. MTP drafter layers keep their first/last
-tokens like the target layers; a drafter with its own architecture keeps a
-plain cache.
+the TRTLLM attention backend, the standard KV cache manager, the hybrid Mamba
+manager and the DSA and DeepSeek-V4 sparse backends, single-beam decoding,
+speculative decoding except dynamic-tree drafting, no KV connector, and not the
+`fp8_ds_mla` cache layout. MTP drafter layers keep their first/last tokens like
+the target layers; a drafter with its own architecture keeps a plain cache.
 
 ### TriAttention
 

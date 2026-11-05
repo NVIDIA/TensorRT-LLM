@@ -7451,11 +7451,15 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 f"{feature} requires kv_cache_config.use_kv_cache_manager_v2=True."
             )
-        # get_attention_backend matches the name case-insensitively.
-        if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
+        # get_attention_backend matches the name case-insensitively. The cold-page
+        # window reads the high rows through TRTLLM's block offsets; FlashInfer
+        # indexes whole pages.
+        backends = "TRTLLM" if cold else "TRTLLM and FLASHINFER"
+        if self.attn_backend.upper() not in backends.split(" and "):
             raise ValueError(
-                f"{feature} supports the TRTLLM and FLASHINFER attention "
-                f"backends; got attn_backend={self.attn_backend!r}.")
+                f"{feature} supports the {backends} attention backend"
+                f"{'' if cold else 's'}; got attn_backend={self.attn_backend!r}."
+            )
         # The connector layout maps every cache layer to one model layer; the
         # mixed-precision high layers break that mapping.
         if self.kv_connector_config is not None:
