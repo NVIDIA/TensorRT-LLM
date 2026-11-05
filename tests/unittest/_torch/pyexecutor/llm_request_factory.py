@@ -8,7 +8,7 @@ class exposes read-only properties (``is_generation_only_request``,
 ``prepopulated_prompt_len``) that a ``SimpleNamespace`` cannot pin down.
 """
 
-from typing import Sequence
+from typing import Any, Sequence
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, executor_request_to_llm_request
 from tensorrt_llm.bindings import executor as trtllm
@@ -20,11 +20,14 @@ def make_llm_request(
     *,
     input_token_ids: Sequence[int] = (1, 2, 3, 4),
     max_tokens: int = 8,
+    **request_options: Any,
 ) -> LlmRequest:
     """Build a real ``LlmRequest`` of ``request_type`` via ``executor_request_to_llm_request``.
 
     A generation-only request always arrives from a context server, so it
-    carries the first generated token in its context phase params.
+    carries the first generated token (100) in its context phase params.
+    ``request_options`` are further ``trtllm.Request`` arguments, such as
+    ``stop_words`` or ``output_config``.
     """
     context_phase_params = (
         trtllm.ContextPhaseParams([100], request_id, None, None, None, None)
@@ -36,6 +39,7 @@ def make_llm_request(
         max_tokens=max_tokens,
         type=request_type,
         context_phase_params=context_phase_params,
+        **request_options,
     )
     return executor_request_to_llm_request(
         request_id,
