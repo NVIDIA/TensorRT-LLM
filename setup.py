@@ -206,7 +206,8 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
-    # CUDA sources compiled at first use with torch.utils.cpp_extension.
+    # CUDA sources compiled at first use with torch.utils.cpp_extension: the
+    # musespark_open sm103 (GB300) target, then the sm107 (Vera Rubin) target.
     '_torch/_experimental/modeling_v2/models/musespark_open/'
     'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/_head_sampler/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
@@ -214,23 +215,29 @@ package_data += [
     '_torch/_experimental/modeling_v2/models/musespark_open/'
     'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/_head_sampler/*.h',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/megakernel/*.cu',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/ops/spec/_head_sampler/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/megakernel/stages/*.cuh',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/ops/spec/_head_sampler/*.cuh',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/dr_draft_tail/*.cu',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/ops/spec/_head_sampler/*.h',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/drafter_attn_pdl/_qk_norm_rope_pdl/*.cu',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/megakernel/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/pf_pre/*.cu',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/megakernel/stages/*.cuh',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/pv_logits/*.cu',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/dr_draft_tail/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/s2_sampler/*.cu',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/drafter_attn_pdl/_qk_norm_rope_pdl/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/rs_sampler/*.cu',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/pf_pre/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
-    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/rs_sampler/*.cuh',
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/pv_logits/*.cu',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/s2_sampler/*.cu',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/rs_sampler/*.cu',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/rs_sampler/*.cuh',
 ]
 
 
