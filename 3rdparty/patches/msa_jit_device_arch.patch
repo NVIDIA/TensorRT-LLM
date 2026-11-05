@@ -134,72 +134,96 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
              cwd=str(cache_dir),
              capture_output=True,
              text=True,
-@@ -420,7 +500,7 @@
+@@ -418,9 +498,11 @@
+ _plan_lock = threading.Lock()
  
- def _do_compile_plan():
-     """Generate and compile plan kernel. No TVM loading."""
+ 
+-def _do_compile_plan():
+-    """Generate and compile plan kernel. No TVM loading."""
 -    cache_dir = CACHE_BASE / "plan"
-+    cache_dir = _built_dir("plan", "fmha_sm100_plan.so")
++def _do_compile_plan(cache_dir=None):
++    """Generate and compile plan kernel. No TVM loading. ``cache_dir``: where
++    to build; by default _built_dir() chooses."""
++    if cache_dir is None:
++        cache_dir = _built_dir("plan", "fmha_sm100_plan.so")
      so_path = cache_dir / "fmha_sm100_plan.so"
  
      if so_path.exists():
-@@ -478,11 +558,11 @@
+@@ -478,11 +560,14 @@
  
  def _compile_plan_module():
      """Compile and load plan kernel."""
 -    lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
-+    lock_fd = _acquire_file_lock(_jit_base() / "plan.lock")
++    # Build and load in one directory, under the lock every process building
++    # there takes.
++    cache_dir = _built_dir("plan", "fmha_sm100_plan.so")
++    lock_fd = _acquire_file_lock(cache_dir.parent / "plan.lock")
      try:
-         _do_compile_plan()
+-        _do_compile_plan()
++        _do_compile_plan(cache_dir)
          import tvm_ffi
 -        so_path = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
-+        so_path = _built_dir("plan", "fmha_sm100_plan.so") / "fmha_sm100_plan.so"
++        so_path = cache_dir / "fmha_sm100_plan.so"
          return tvm_ffi.load_module(str(so_path))
      finally:
          _release_file_lock(lock_fd)
-@@ -510,7 +590,7 @@
+@@ -509,8 +594,9 @@
+ _sparse_topk_lock = threading.Lock()
  
  
- def _do_compile_sparse_topk():
+-def _do_compile_sparse_topk():
 -    cache_dir = CACHE_BASE / "sparse_topk"
-+    cache_dir = _built_dir("sparse_topk", "sparse_topk_select.so")
++def _do_compile_sparse_topk(cache_dir=None):
++    if cache_dir is None:
++        cache_dir = _built_dir("sparse_topk", "sparse_topk_select.so")
      so_path = cache_dir / "sparse_topk_select.so"
  
      if so_path.exists():
-@@ -576,11 +656,11 @@
+@@ -576,11 +662,14 @@
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
              return _sparse_topk_module
 -        lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
-+        lock_fd = _acquire_file_lock(_jit_base() / "sparse_topk.lock")
++        # Build and load in one directory, under the lock every process
++        # building there takes.
++        cache_dir = _built_dir("sparse_topk", "sparse_topk_select.so")
++        lock_fd = _acquire_file_lock(cache_dir.parent / "sparse_topk.lock")
          try:
-             _do_compile_sparse_topk()
+-            _do_compile_sparse_topk()
++            _do_compile_sparse_topk(cache_dir)
              import tvm_ffi
 -            so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
-+            so_path = _built_dir("sparse_topk", "sparse_topk_select.so") / "sparse_topk_select.so"
++            so_path = cache_dir / "sparse_topk_select.so"
              _sparse_topk_module = tvm_ffi.load_module(str(so_path))
          finally:
              _release_file_lock(lock_fd)
-@@ -596,7 +676,7 @@
+@@ -595,8 +684,9 @@
+ _reduction_lock = threading.Lock()
  
  
- def _do_compile_reduction():
+-def _do_compile_reduction():
 -    cache_dir = CACHE_BASE / "reduction"
-+    cache_dir = _built_dir("reduction", "fmha_sm100_reduction.so")
++def _do_compile_reduction(cache_dir=None):
++    if cache_dir is None:
++        cache_dir = _built_dir("reduction", "fmha_sm100_reduction.so")
      so_path = cache_dir / "fmha_sm100_reduction.so"
  
      if so_path.exists():
-@@ -661,11 +741,11 @@
+@@ -661,11 +751,14 @@
      with _reduction_lock:
          if _reduction_module is not None:
              return _reduction_module
 -        lock_fd = _acquire_file_lock(CACHE_BASE / "reduction.lock")
-+        lock_fd = _acquire_file_lock(_jit_base() / "reduction.lock")
++        # Build and load in one directory, under the lock every process
++        # building there takes.
++        cache_dir = _built_dir("reduction", "fmha_sm100_reduction.so")
++        lock_fd = _acquire_file_lock(cache_dir.parent / "reduction.lock")
          try:
-             _do_compile_reduction()
+-            _do_compile_reduction()
++            _do_compile_reduction(cache_dir)
              import tvm_ffi
 -            so_path = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
-+            so_path = _built_dir("reduction", "fmha_sm100_reduction.so") / "fmha_sm100_reduction.so"
++            so_path = cache_dir / "fmha_sm100_reduction.so"
              _reduction_module = tvm_ffi.load_module(str(so_path))
          finally:
              _release_file_lock(lock_fd)
