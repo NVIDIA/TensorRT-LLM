@@ -284,6 +284,8 @@ class CUDAGraphRunner:
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        # Graphs captured with a step-input pack's prologue, and that pack (step_inputs.capture_prologue).
+        self._step_input_prologue_keys: Dict[KeyType, Any] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
@@ -911,6 +913,11 @@ class CUDAGraphRunner:
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
             with nccl_window_graph_capture(graph, graph_pool):
+                # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
+                prologue_pack = (None if self._pre_replay_hooks else
+                                 step_inputs.capture_prologue())
+                if prologue_pack is not None:
+                    self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
             # The addresses the graph baked in, for the strict buffer check.
             self._record_strict_buffer_snapshot(key)
@@ -1039,8 +1046,15 @@ class CUDAGraphRunner:
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
         # Issue the step's packed input copies (no-op without an open pack) before
-        # anything below reads the static inputs on the device.
-        step_inputs.flush()
+        # anything below reads the static inputs on the device; a graph captured
+        # with the pack's prologue issues them itself at the start of the replay.
+        prologue_pack = self._step_input_prologue_keys.get(key)
+        captured_pack_active = (prologue_pack is not None
+                                and step_inputs.is_active(prologue_pack))
+        step_inputs.flush(in_graph=captured_pack_active)
+        if prologue_pack is not None and not captured_pack_active:
+            # Replayed outside the pack's context: nothing filled its window.
+            prologue_pack.quiesce_graph_window()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if position_id_offsets is not None:
@@ -1059,7 +1073,11 @@ class CUDAGraphRunner:
             for hook in self._pre_replay_hooks:
                 hook(key, seqlen, hook_tensors, current_inputs)
 
-        self.graphs[key].replay()
+        try:
+            self.graphs[key].replay()
+        finally:
+            if prologue_pack is not None:
+                prologue_pack.on_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref
@@ -1579,6 +1597,7 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self._pre_replay_position_ids = None
+        self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()
         del self.memory_pool
         self.memory_pool = None
