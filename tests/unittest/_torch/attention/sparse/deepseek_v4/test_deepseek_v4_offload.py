@@ -554,6 +554,7 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
         compress_block_tables={4: None},
         compressed_kv_lens_cuda={4: torch.tensor([2], dtype=torch.int32)},
         max_compressed_indices={4: 8},
+        has_mixed_precision_high_rows=False,
     )
     backend = SimpleNamespace(
         layer_idx=2,

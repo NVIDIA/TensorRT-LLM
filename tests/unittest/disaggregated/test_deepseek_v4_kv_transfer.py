@@ -533,6 +533,7 @@ def _native_transfer_manager(
     adapter._sparse_offload_topk = 8
     adapter._sparse_kv_offload = SparseKvCacheOffloadConfig() if offload else None
     adapter.pp_layers = [0, 1, 2, 3]
+    adapter.layer_offsets = {layer: offset for offset, layer in enumerate(adapter.pp_layers)}
     adapter._compress_ratios = [1, 4, 128, 4]
     adapter.compressed_block_sizes = [tokens_per_block // r for r in adapter._compress_ratios]
     adapter.tokens_per_block = tokens_per_block

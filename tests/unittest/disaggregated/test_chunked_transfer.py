@@ -461,6 +461,7 @@ def _make_respond_transceiver(session, chunk, *, pipelined=True):
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
+    session._enforce_physical_ownership = False
     # A send session appends one task per chunk and the caller reads the new one back by
     # position, so a double whose send() leaves the list empty has nothing at that position.
     session.kv_tasks = []
@@ -622,6 +623,7 @@ def test_pipelined_transfer_requires_gen_first_flow():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
@@ -672,6 +674,7 @@ def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
     executor.dist.pp_size = 2
@@ -706,6 +709,7 @@ def test_pipelined_transfer_requires_single_beam_for_context_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
 
@@ -726,6 +730,7 @@ def test_pipelined_transfer_allows_non_disaggregated_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 1
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
@@ -749,6 +754,7 @@ def test_pipelined_transfer_allows_generation_only_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 2
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True

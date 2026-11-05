@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .inputs import DecoderInputBuffers
 
@@ -143,6 +144,7 @@ class DecoderMetadata:
         kv_cache_manager.configure_decode_shortcuts(
             skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
+            block_ids_from_views=msa.block_ids_from_views,
         )
 
     def setup_speculative(
@@ -154,6 +156,13 @@ class DecoderMetadata:
             self._config, self.model.config, spec_resource_manager, self.mapping
         )
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
+        self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        if self.runtime_hooks.pack_spec_rng_uploads:
+            logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
+        if self.runtime_hooks.spec_small_h2d:
+            logger.info(
+                "[M3 host] spec step small uploads off the boundary (accepted counts packed, static slot ids)"
+            )
         return self.spec_metadata
 
     @property
@@ -372,7 +381,11 @@ def update_spec_metadata(
 
 
 def sync_group_all_greedy_sample(
-    spec_metadata: SpecMetadata, mapping: Mapping, dist: Distributed | None
+    spec_metadata: SpecMetadata,
+    mapping: Mapping,
+    dist: Distributed | None,
+    *,
+    confidence_enabled: bool = False,
 ) -> None:
     """All-gather the per-rank greedy flags and store the group AND.
 
@@ -387,18 +400,45 @@ def sync_group_all_greedy_sample(
     ``all_rank_num_tokens`` exchange, which runs in ``prepare_inputs`` --
     after the graph key, too late for the key to see the synced value.
     """
-    # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
-    # Mapping.__init__), so ADP needs no separate check here.
-    if not (mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
+    # Confidence needs the same group-uniform rejection decision even without
+    # LM-head TP. Feature-off execution retains the existing gate.
+    if not (
+        spec_metadata.use_rejection_sampling
+        and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+    ):
         return
     local_flag = bool(spec_metadata.is_all_greedy_sample)
-    all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
-    spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    if mapping.tp_size > 1:
+        all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
+        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    else:
+        spec_metadata.group_all_greedy_sample = local_flag
     # Also overwrite the live flag directly: this iteration's scan already
     # ran (update_is_all_greedy_sample just returned) and the CUDA graph
     # key reads the flag next -- the stored override only takes effect on
     # the NEXT rescan (populate), which is after key selection.
     spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
+
+def supports_advanced_draft_sampling(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether the engine may capture an advanced draft-sampling variant."""
+    return not (
+        getattr(spec_config, "enable_confidence_scheduling", False)
+        and spec_config.use_rejection_sampling
+    )
+
+
+def validate_dspark_draft_sampling(
+    spec_metadata: SpecMetadata,
+    *,
+    confidence_enabled: bool,
+) -> None:
+    """Reject unsupported group-uniform sampling before graph lookup."""
+    if confidence_enabled and spec_metadata.wants_advanced_draft_sampling:
+        raise ValueError(
+            "DSpark confidence scheduling does not support advanced rejection "
+            "draft sampling: confidence is conditioned on the greedy proposal prefix"
+        )
 
 
 def set_spec_metadata_all_rank_num_tokens(

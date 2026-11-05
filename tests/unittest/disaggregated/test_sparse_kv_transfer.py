@@ -217,12 +217,15 @@ def test_receiver_dispatches_host_and_device_pool_requests(
     )
     receiver._enforce_physical_ownership = False
     receiver._get_sender_info = Mock(return_value=src)
-    receiver._get_session = Mock(return_value=Mock(_sender_endpoints=set()))
+    receiver._get_session = Mock(
+        return_value=Mock(_sender_endpoints=set(), _enforce_physical_ownership=False)
+    )
     receiver._request_sender_data = Mock()
     task = SimpleNamespace(
         _params=DisaggregatedParams(ctx_dp_rank=0),
         _unique_rid=401,
         _perf_timer=None,
+        _enforce_physical_ownership=False,
         slice_id=0,
     )
     req_info = transfer_mod.RecvReqInfo(1, "gen", 0, [np.array([0])], 401)

@@ -239,8 +239,12 @@ def test_sender_late_done_reports_physical_failure_only(
         task.expected_transfers = 1
     status = Mock(wait=Mock(return_value=False), is_completed=Mock(return_value=False))
     status.last_status_str.return_value = "ERROR"
-    sender._agent = SimpleNamespace(name="nixl", submit_transfer_requests=lambda request: status)
-    request = SimpleNamespace(op="WRITE", remote_name="gen")
+    sender._agent = SimpleNamespace(
+        name="nixl",
+        submit_transfer_requests=lambda request: status,
+        check_remote_descs=lambda _name, _descs: True,
+    )
+    request = SimpleNamespace(op="WRITE", remote_name="gen", dst_descs=None)
     monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
@@ -449,7 +453,7 @@ def test_listener_failure_uses_worker_stream_in_ownership_bridge() -> None:
     sender = _sender()
     sender._send_task_queues = [queue.Queue()]
     sender._get_or_connect_dealer = Mock()
-    info = SimpleNamespace(unique_rid=401, instance_rank=7)
+    info = SimpleNamespace(unique_rid=401, instance_rank=7, context_first=False)
     message = [transfer_mod.MessageType.KV_AGENT_RESULT, b"failed"]
     sender._route_result_messages_to_receiver(info, "receiver", [message], defer_to_worker=False)
     sender._get_or_connect_dealer.assert_not_called()

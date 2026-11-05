@@ -233,6 +233,11 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block, excluding padding in a partial final block. The kernel
+weights each proxy by its represented token count; do not pass V sums or
+pre-weight the summaries.
+
 The contiguous block-sparse path also consumes the SageAttention recipe in
 `AttentionForwardArgs`. Prediction sees the original Q/K/V. The attention core
 then quantizes the Q/K/V of a block-sparse call before FMHA selection, with
