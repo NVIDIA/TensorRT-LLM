@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import overview_plots
 from matplotlib.patches import Rectangle
 
 ROOT = Path(__file__).resolve().parent
@@ -494,6 +495,7 @@ def main() -> None:
     halo_latency(data)
     motivation(data)
     bars(data)
+    overview_plots.main()
 
 
 if __name__ == "__main__":
