@@ -257,8 +257,11 @@ does not recurse into archives.
 
 On post-merge runs, `L0_MergeRequest.groovy` uploads SQLite-only x86 and SBSA tarballs once their
 single-GPU stages finish; the coverage selector requires both and merges their compact databases.
-Those early architecture checkpoints contain single-GPU coverage only. The later Test Coverage
-stage merges all collected single-GPU and multi-GPU files through `pystart_report.py` and uploads
+Those early architecture checkpoints contain single-GPU coverage only. After each multi-GPU job,
+its architecture's coverage is merged separately into `cbts_pystart_report_x86_64_multi_gpu.tar.gz`
+or `cbts_pystart_report_SBSA_multi_gpu.tar.gz`. Missing data skips that artifact; a test failure
+can leave a partial artifact. The selector continues to use the single-GPU checkpoints. The later
+Test Coverage stage merges all collected single-GPU and multi-GPU files through `pystart_report.py` and uploads
 `cbts_pystart_report.tar.gz`, holding `cbts_touchmap.sqlite` (the indexed selector artifact, with a
 `meta` table carrying the coverage rate) and `cbts_report/` (the split HTML report; open
 `cbts_report/index.html` after extracting).
