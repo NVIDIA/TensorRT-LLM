@@ -37,11 +37,12 @@ REPLAY_WORK_ITEM_WIDTH = 5
 _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
 
 
-# Neither the decode count nor the alignment of the decode slice (it starts
-# after the step's context requests) is specialized: a mixed step would
-# otherwise reach a new variant, and compile it, while serving.
+# Neither the decode count nor the alignment of the decode slices of the state
+# and replay slots (they start after the step's context requests) is
+# specialized: a mixed step would otherwise reach a new variant, and compile
+# it, while serving.
 @triton.jit(do_not_specialize=["num_decodes"],
-            do_not_specialize_on_alignment=["state_indices"])
+            do_not_specialize_on_alignment=["state_indices", "replay_indices"])
 def _prepare_gdn_replay_work_items_kernel(
     state_indices,
     replay_indices,
@@ -533,9 +534,10 @@ class Mamba2Metadata:
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
 
-        if (num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
-                and prev_num_accepted_tokens.is_contiguous()
-                and cache_buf_idx.is_contiguous()):
+        # The kernel reads the accepted counts and active buffers through their
+        # strides: a manager that keeps them in its KV cache pool hands out
+        # strided views of the per-slot replay metadata rows.
+        if num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE:
             build_work_items = _build_replay_work_items_triton
         else:
             build_work_items = _build_replay_work_items_torch
