@@ -437,3 +437,9 @@ l0_cpu:
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
+  # TRTLLM-15161 CPU migration: files outside the directory entries above.
+  - unittest/llmapi/test_rlhf_utils.py
+  - unittest/llmapi/test_embedding_arch_routing.py
+  - unittest/llmapi/test_deepseek_v4_tokenizer.py
+  - unittest/executor/test_postprocessor_hook.py
+  - unittest/executor/test_spec_decode_serialization.py
