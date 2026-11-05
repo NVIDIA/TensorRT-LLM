@@ -946,12 +946,16 @@ def test_pinned_fc12_identity_fails_hard_where_the_backend_literal_degrades():
 # TrtllmCutedslFusedFc12Mxfp8Impl implementation identity
 # =====================================================================
 # The MXFP8 fused FC12 leaf is what ``moe_backend: CUTEDSL`` resolves to for an
-# MXFP8 checkpoint. Its gates read SM, two CuTe DSL dependencies, EPLB, the
-# hidden size's alignment to the FC1 scale gather and the per-rank
-# intermediate size's alignment to the 128-row scale atoms.
+# MXFP8 checkpoint. Its gates read SM, the CuTe DSL dependencies of that SM's
+# kernel copy, EPLB, the hidden size's alignment to the FC1 scale gather and
+# the per-rank intermediate size's alignment to the 128-row scale atoms.
 
 _FC12_MXFP8_IMPL_ID = "trtllm.cutedsl.fused_fc12.mxfp8"
-_FC12_MXFP8_DEPS = (MoEDep.CUTEDSL_RUBIN.value, MoEDep.CUTEDSL_MXFP8_FUSED_FC12.value)
+_FC12_MXFP8_DEPS = (
+    MoEDep.CUTEDSL_RUBIN.value,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12.value,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12_BLACKWELL.value,
+)
 
 
 def _fc12_mxfp8_problem(hidden_size: int = 4096, intermediate_size: int = 1024) -> MoEProblem:
@@ -993,7 +997,7 @@ def test_fc12_mxfp8_identity_round_trips_through_registry():
     assert backend_family_of(impl) == "CUTEDSL"
 
 
-def test_fc12_mxfp8_is_admitted_on_rubin_only():
+def test_fc12_mxfp8_is_admitted_on_rubin_and_blackwell():
     problem = _fc12_mxfp8_problem()
     admitted = {
         sm
@@ -1002,7 +1006,7 @@ def test_fc12_mxfp8_is_admitted_on_rubin_only():
             problem, _single_rank_deployment(_fc12_mxfp8_environment(sm))
         ).eligible
     }
-    assert admitted == {107}
+    assert admitted == {100, 103, 107}
 
 
 @pytest.mark.parametrize(
@@ -1013,6 +1017,17 @@ def test_fc12_mxfp8_is_admitted_on_rubin_only():
             _single_rank_deployment(_fc12_mxfp8_environment(deps=(MoEDep.CUTEDSL_RUBIN.value,))),
             MoERejectReason.DEP_MISSING,
             id="dsl-too-old",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            _single_rank_deployment(
+                _fc12_mxfp8_environment(
+                    sm=100,
+                    deps=(MoEDep.CUTEDSL_RUBIN.value, MoEDep.CUTEDSL_MXFP8_FUSED_FC12.value),
+                )
+            ),
+            MoERejectReason.DEP_MISSING,
+            id="sm100-without-blackwell-port",
         ),
         pytest.param(
             _fc12_mxfp8_problem(hidden_size=2304),
@@ -1063,8 +1078,9 @@ def test_fc12_mxfp8_gate_rejections(problem, deployment, reason):
     assert verdict.reject_reason is reason
 
 
-def test_cutedsl_literal_serves_mxfp8_with_the_fused_fc12_leaf():
-    with override_moe_environment(_fc12_mxfp8_environment()):
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_cutedsl_literal_serves_mxfp8_with_the_fused_fc12_leaf_on_every_sm(sm):
+    with override_moe_environment(_fc12_mxfp8_environment(sm)):
         report = resolve_moe_impl(_cutedsl_model_config(QuantAlgo.MXFP8))
     assert impl_class_for(report) is TrtllmCutedslFusedFc12Mxfp8Impl
     assert not report.degraded

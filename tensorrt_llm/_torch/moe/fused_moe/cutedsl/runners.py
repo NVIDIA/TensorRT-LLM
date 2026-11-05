@@ -37,6 +37,7 @@ from ....custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from ....cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
     IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from ....locality_domain.autotune import (
@@ -509,7 +510,7 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
 
 
 class CuteDslFusedMoEMxfp8Runner(TunableRunner):
-    """Autotuner runner for the MXFP8 fused FC1+FC2 MoE on Rubin (SM107).
+    """Autotuner runner for the MXFP8 fused FC1+FC2 MoE on Rubin and Blackwell.
 
     Selects the routing tile size from {128, 256} and delegates to
     ``forward_impl`` (the full-GPU fused FC1+FC2 kernel, or its inner-channel
@@ -632,6 +633,10 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             from ....custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
 
             checked_runner_types.append(Sm107Mxfp8FusedFc12MoeRunner)
+        if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE:
+            from ....custom_ops.cute_dsl_custom_ops import Sm100Mxfp8FusedFc12MoeRunner
+
+            checked_runner_types.append(Sm100Mxfp8FusedFc12MoeRunner)
 
         return _runner_tactics_match_tile_size(
             comb,
