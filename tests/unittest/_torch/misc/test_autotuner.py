@@ -2166,6 +2166,63 @@ def test_parallel_split_deals_pairs_across_runners(monkeypatch):
     assert warnings == [], warnings
 
 
+def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(monkeypatch):
+    """choose_one on a PARALLEL rank that profiles nothing returns the winner
+    the group found: with one (runner, tactic) pair on two ranks, the rank the
+    deal skips gets it from the merge."""
+
+    class SingleTacticRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return [7]
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            return inputs[0]
+
+    profiled = []
+
+    def record_pair(self, runner, inputs, tactic, **kwargs):
+        profiled.append((self._tuning_group()[1], tactic))
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    gathered = {}
+
+    class _AllgatherDist:
+        """tp_cp_allgather of the ranks run so far, in rank order."""
+
+        def __init__(self, rank):
+            self.rank = rank
+
+        def tp_cp_allgather(self, obj):
+            gathered[self.rank] = obj
+            return [gathered[r] for r in sorted(gathered)]
+
+    op = "autotuner_test::parallel_rank_without_pairs"
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    runner = SingleTacticRunner()
+    inputs = [torch.zeros(8, 64), torch.zeros(64, 32)]
+
+    def tuner_for(rank):
+        tuner = autotuner.AutoTuner()
+        tuner.setup_distributed_state(Mapping(world_size=2,
+                                              rank=rank,
+                                              tp_size=2),
+                                      dist=_AllgatherDist(rank))
+        tuner.is_tuning_mode = True
+        return tuner
+
+    profile = tuner_for(0)._optimization_profiles(config, inputs)[0]
+    profiling_rank = tuner_for(0)._parallel_deal_start(
+        op, profile, DistributedTuningStrategy.PARALLEL)
+    results = {}
+    for rank in (profiling_rank, 1 - profiling_rank):
+        results[rank] = tuner_for(rank).choose_one(op, [runner], config, inputs)
+    assert profiled == [(profiling_rank, 7)], profiled
+    assert results[0] == results[1] == (runner, 7), results
+
+
 def test_parallel_search_cache_picks_fastest_runner():
     """After a PARALLEL merge a shape can hold one entry per runner.
 
