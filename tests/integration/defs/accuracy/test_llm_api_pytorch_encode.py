@@ -320,6 +320,43 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             # Embeddings must be unit-norm.
             assert abs(tllm_emb.norm().item() - 1.0) < 1e-2
 
+    @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
+    def test_qwen3_text_embedding_cuda_graph_matches_eager(self, model_name, model_path):
+        """Graph replay must pool each prompt's own last token.
+
+        The prompts have different lengths and are packed into one batch; the
+        reversed three-prompt call replays a padded bucket with other lengths.
+        """
+        _, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        batches = [PROMPTS, PROMPTS[:0:-1]]
+        model_kwargs = {"architectures": ["Qwen3ForTextEmbedding"]}
+
+        with LLM(
+            model_path, encode_only=True, dtype=llm_dtype, model_kwargs=model_kwargs
+        ) as llm_eager:
+            eager = [
+                torch.stack([o.logits.cpu() for o in llm_eager.encode(batch)]) for batch in batches
+            ]
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+        )
+        with LLM(
+            model_path,
+            encode_only=True,
+            dtype=llm_dtype,
+            model_kwargs=model_kwargs,
+            cuda_graph_config=cgc,
+        ) as llm_graph:
+            graph = [
+                torch.stack([o.logits.cpu() for o in llm_graph.encode(batch)]) for batch in batches
+            ]
+
+        for graph_out, eager_out in zip(graph, eager):
+            torch.testing.assert_close(graph_out, eager_out, rtol=1e-3, atol=1e-3)
+
 
 # --------------------------------------------------------------------------- #
 # Decoder models used in single-prefill mode
