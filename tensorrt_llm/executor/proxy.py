@@ -598,6 +598,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         if self._engine_dead or self._fatal_error is not None:
             return
+        if request_id not in self._results:
+            return
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
@@ -606,11 +608,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         except EngineDeadError:
             # Worker death can win after the fast-path check above.
             return
-        except EngineUnavailableError as error:
-            if self.doing_shutdown:
-                return
-            self._handle_worker_death(
-                RuntimeError(f"Cancellation could not be queued: {error}"))
+        except EngineUnavailableError:
+            # close() retains attached-frontends' remaining cancellations.
+            if not self.doing_shutdown:
+                raise
 
     # Per-call timeouts for the synchronous worker round-trip. The stop
     # path can take up to 30s because PyExecutor.stop_profile itself
@@ -787,6 +788,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             result = self._results.get(client_id)
             if result is None:
                 return
+            if isinstance(res, PostprocWorker.Output) and res.should_abort:
+                # Retain the worker abort before a local final response can
+                # retire the admitted request and wake its consumer.
+                self.abort_request(client_id)
             queue = result.queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
@@ -1109,6 +1114,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError("Executor command sender is not initialized")
         self._request_sender.send(
             pickle.dumps(request),
+            cancellation_id=request.id
+            if isinstance(request, CancellingRequest) else None,
             control=isinstance(
                 request,
                 (CancellingRequest, StartProfileRequest, StopProfileRequest)))

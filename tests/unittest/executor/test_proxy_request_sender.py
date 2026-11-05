@@ -88,9 +88,13 @@ def _pre_shutdown(proxy):
     return shutdown
 
 
-@pytest.mark.parametrize("batching", [False, True])
-def test_batching_is_opt_in(monkeypatch, batching):
-    monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", "1" if batching else "0")
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+def test_batching_is_opt_in(monkeypatch, setting):
+    if setting is None:
+        monkeypatch.delenv("TRTLLM_PROXY_BATCH_REQUESTS", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", setting)
+    batching = setting == "1"
     q = _RecordingQueue(block_first_put=batching)
     sender = _create_request_sender(q, queue.Queue())
     sender.send(pickle.dumps("a"))
@@ -414,6 +418,51 @@ def test_control_capacity_is_reserved_when_admission_is_full():
         q.release_first_put.set()
         sender.close(timeout=3, send_sentinel=True)
     assert q.messages == [_payloads("in-flight"), _payloads("queued"), _payloads("cancel"), None]
+
+
+@pytest.mark.timeout(12, method="thread")
+@pytest.mark.parametrize("local_final", [False, True])
+def test_proxy_retains_cancellations_when_control_queue_is_full(local_final):
+    q = _RecordingQueue(block_first_put=True)
+    proxy = _bare_proxy()
+    proxy._engine_dead = False
+    proxy._fatal_error = None
+    proxy.doing_shutdown = False
+    proxy._error_queue = queue.Queue()
+    unrelated = SimpleNamespace(queue=queue.Queue())
+    proxy._results = {
+        42: SimpleNamespace(queue=queue.Queue()),
+        43: SimpleNamespace(queue=queue.Queue()),
+        44: unrelated,
+    }
+    sender = _RequestSender(q, proxy._error_queue)
+    sender.MAX_PENDING_CONTROLS = 1
+    sender.MAX_BATCH_SIZE = 1
+    proxy._request_sender = sender
+    try:
+        sender.send(pickle.dumps("in-flight"))
+        assert q.first_put_started.wait(3)
+        sender.send(pickle.dumps("queued-control"), control=True)
+        if local_final:
+            from tensorrt_llm.executor.postproc_worker import PostprocWorker
+
+            response = PostprocWorker.Output(42, None, True, should_abort=True)
+            proxy.result_queue = SimpleNamespace(get=lambda: response)
+            assert proxy.dispatch_result_task()
+            assert 42 not in proxy._results
+        else:
+            proxy.abort_request(42)
+        proxy.abort_request(42)
+        proxy.abort_request(43)
+        assert not proxy._engine_dead
+        assert unrelated.queue.empty()
+        assert proxy._error_queue.empty()
+    finally:
+        q.release_first_put.set()
+        sender.close(timeout=3)
+    delivered = [pickle.loads(message[0]) for message in q.messages[2:]]
+    assert [request.id for request in delivered] == [42, 43]
+    assert all(isinstance(request, CancellingRequest) for request in delivered)
 
 
 @pytest.mark.timeout(12, method="thread")
