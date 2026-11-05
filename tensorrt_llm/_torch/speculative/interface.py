@@ -62,7 +62,7 @@ def _watermark_active(spec_metadata) -> bool:
     Metadata objects that predate the feature have no ``watermark_ready``; they are not
     watermarked.
     """
-    return getattr(spec_metadata, "watermark_ready", False)
+    return getattr(spec_metadata, "watermark_ready", False) is True
 
 
 def supports_sharded_target_sampling(spec_config, mapping) -> bool:
