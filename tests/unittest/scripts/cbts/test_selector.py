@@ -1326,3 +1326,170 @@ def test_unresolved_or_aliased_fixture_decorator_declines(tmp_path: Path, declar
     assert not result.ok
     assert "shared test infrastructure" in result.reason
     assert not result.skippable
+
+
+@pytest.mark.parametrize(
+    "receiver, declaration",
+    [
+        ("cls", "@classmethod\n    "),
+        ("self", ""),
+        ("FixtureMixin", "@staticmethod\n    "),
+        ("alias", "@classmethod\n    "),
+    ],
+)
+def test_shared_class_fixture_method_dependency_keeps_both_consumers(
+    tmp_path: Path, receiver: str, declaration: str
+) -> None:
+    """A shared fixture's later consumer has no execution row for its method."""
+    parameter = "self" if receiver == "self" else "cls"
+    build_parameter = "" if "staticmethod" in declaration else parameter
+    source = (
+        "import pytest\nclass FixtureMixin:\n"
+        f"    {declaration}def build({build_parameter}):\n        return 2\n"
+        '    @pytest.fixture(scope="class")\n'
+        f"    def shared({parameter}):\n        alias = {parameter}\n"
+        f"        return {receiver}.build()\n"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "FixtureMixin.build", "shared fixture")
+
+
+def _assert_shared_dependency_declines(
+    tmp_path: Path, source: str, changed: str, reason: str
+) -> None:
+    path = "tests/test_common/helper.py"
+    helper = tmp_path / path
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_text(source)
+    before = source.replace("return 2", "return 1")
+    assert before != source
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    class FirstConsumerDB(_FakeDB):
+        def __init__(self) -> None:
+            self.rows = {changed: {"A10-PyTorch-1/test_first"}}
+
+        def tests_touching_file(self, _path: str) -> set[str]:
+            return {"A10-PyTorch-1/test_first"}
+
+        def known_by_family(self) -> dict[str, set[str]]:
+            return {"A10-PyTorch": {"test_first", "test_second"}}
+
+    result = CoverageSelector(FirstConsumerDB(), tmp_path).decide([path], {path: diff})
+
+    assert not result.ok
+    assert reason in result.reason
+    assert not result.skippable
+    pr = PRInputs(changed_files=[path], diffs={path: diff})
+    tier, note = apply_coverage_tier(pr, [], set(), {}, YAMLIndex(), tmp_path, FirstConsumerDB())
+    assert tier is None
+    assert reason in note
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "VALUE = caller()",
+        "VALUE: int = caller()",
+        "VALUE = OTHER = caller()",
+        "VALUE, OTHER = (caller(), 0)",
+        "if True:\n    VALUE = caller()",
+        "class Values:\n    VALUE = caller()",
+        "VALUE = [caller() for _ in range(2)]",
+        "VALUE = caller()\nALIAS = VALUE",
+    ],
+)
+def test_initialized_helper_result_keeps_both_consumers(tmp_path: Path, assignment: str) -> None:
+    """Module/class initialization is reused even when imports occur inside tests."""
+    source = f"def caller():\n    return 2\n{assignment}\n"
+    reason = (
+        "class initialization result"
+        if assignment.startswith("class")
+        else "module initialization result"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "caller", reason)
+
+
+def test_imported_helper_initialization_keeps_both_consumers(tmp_path: Path) -> None:
+    path = "tests/test_common/helper.py"
+    helper = tmp_path / path
+    helper.parent.mkdir(parents=True)
+    helper.write_text("def caller():\n    return 2\n")
+    consumer = helper.with_name("values.py")
+    consumer.write_text("from test_common.helper import caller as make\nVALUE = make()\n")
+    source = helper.read_text()
+    # The changed function has rows only for the first test importing values.
+    _assert_shared_dependency_declines(tmp_path, source, "caller", "module initialization result")
+
+
+@pytest.mark.parametrize(
+    "source, changed",
+    [
+        (
+            "def caller():\n    return 2\ndef use():\n    value = caller()\n    return value\n",
+            "caller",
+        ),
+        (
+            "def caller():\n    return 2\ndef other():\n    return 10\nVALUE = other()\n",
+            "caller",
+        ),
+        (
+            "import pytest\nclass Helpers:\n"
+            "    def caller(self):\n        return 2\n"
+            '    @pytest.fixture(scope="function")\n'
+            "    def per_test(self):\n        return self.caller()\n"
+            '    @pytest.fixture(scope="class")\n'
+            "    def shared(self):\n        return 10\n",
+            "Helpers.caller",
+        ),
+    ],
+)
+def test_unrelated_initialization_and_per_test_method_calls_remain_eligible(
+    tmp_path: Path, source: str, changed: str
+) -> None:
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    db = _FakeDB()
+    db.rows[changed] = {"A10-PyTorch-1/test_caller"}
+    result = CoverageSelector(db, tmp_path, read_source=lambda _path: source).decide(
+        ["tests/test_common/helper.py"], {"tests/test_common/helper.py": diff}
+    )
+    assert result.ok, result.reason
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+
+
+@pytest.mark.parametrize("receiver", ["self", "type(self)", "super()"])
+def test_inherited_shared_fixture_method_keeps_both_consumers(
+    tmp_path: Path, receiver: str
+) -> None:
+    source = (
+        "import pytest\nclass Base:\n"
+        "    @classmethod\n    def build(cls):\n        return 2\n"
+        "class FixtureMixin(Base):\n"
+        '    @pytest.fixture(scope="class")\n'
+        f"    def shared(self):\n        return {receiver}.build()\n"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "Base.build", "shared fixture")
+
+
+def test_shared_base_fixture_dispatches_to_changed_override(tmp_path: Path) -> None:
+    source = (
+        "import pytest\nclass Base:\n"
+        "    def build(self):\n        return 0\n"
+        '    @pytest.fixture(scope="class")\n'
+        "    def shared(self):\n        return self.build()\n"
+        "class Derived(Base):\n    def build(self):\n        return 2\n"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "Derived.build", "shared fixture")
+
+
+def test_shared_fixture_using_imported_base_keeps_both_consumers(tmp_path: Path) -> None:
+    consumer = tmp_path / "tests/conftest.py"
+    consumer.parent.mkdir(parents=True)
+    consumer.write_text(
+        "import pytest\nfrom test_common.helper import Base as Parent\n"
+        "class FixtureMixin(Parent):\n"
+        '    @pytest.fixture(scope="class")\n'
+        "    def shared(self):\n        return self.build()\n"
+    )
+    source = "class Base:\n    def build(self):\n        return 2\n"
+    _assert_shared_dependency_declines(tmp_path, source, "Base.build", "shared fixture")

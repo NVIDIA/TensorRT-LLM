@@ -68,6 +68,11 @@ shared fixtures, session/collection hooks, or cached/stateful helpers. Only the 
 because execution rows omit cached consumers (COLLECTION.md §5.4). Fixture scope is resolved
 from its decorator; nonliteral/unknown scopes and unrecognized decorators decline. Local dependencies,
 fixture parameters, and repository-visible imported helpers propagate this restriction.
+Class method references include qualified dependencies; aliases, inherited methods, and
+unresolved attribute dispatch conservatively include same-named local methods.
+Module/class initialization assignments are shared bindings: a helper body change reaching
+one declines even if the imports occur inside individual tests. Function-local assignments
+remain per-call. Both source images are checked, including removed shared dependencies.
 Unrelated shared fixtures in the same file do not block ordinary helper edits.
 Coverage explicitly requests diffs for all Python files, as DocsRule already does.
 Repository-relative DB keys retain their full path, so

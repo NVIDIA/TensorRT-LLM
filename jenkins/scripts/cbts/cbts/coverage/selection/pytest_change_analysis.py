@@ -42,13 +42,36 @@ def _leaf(node: ast.expr) -> str:
     return ""
 
 
-def _references(node: ast.AST) -> set[str]:
+def _references(
+    node: ast.AST, class_prefix: str = "", methods: dict[str, set[str]] | None = None
+) -> set[str]:
     """Include fixture injection, attribute access, and ordinary Python references."""
-    return {
+    refs = {
         child.id if isinstance(child, ast.Name) else child.attr
         for child in ast.walk(node)
         if isinstance(child, (ast.Name, ast.Attribute))
     } | {child.arg for child in ast.walk(node) if isinstance(child, ast.arg)}
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Attribute):
+            continue
+        parts = [child.attr]
+        base = child.value
+        while isinstance(base, ast.Attribute):
+            parts.append(base.attr)
+            base = base.value
+        if isinstance(base, ast.Name):
+            parts.append(base.id)
+            dotted = ".".join(reversed(parts))
+            if base.id in {"self", "cls"} and class_prefix:
+                refs.add(class_prefix + "." + ".".join(reversed(parts[:-1])))
+            else:
+                refs.add(dotted)
+        # Aliases, super(), inherited fixtures and dynamic self/cls dispatch can
+        # target another class's implementation. Keep all same-named methods as
+        # possible dependencies rather than assuming an unresolved edge is absent.
+        if methods:
+            refs.update(methods.get(child.attr, set()))
+    return refs
 
 
 def _shared_reason(node: ast.FunctionDef | ast.AsyncFunctionDef, aliases: dict[str, str]) -> str:
@@ -121,28 +144,60 @@ def _facts(source: str) -> tuple[dict[str, set[str]], dict[str, str]]:
                         aliases[target.id] = aliases.get(target_name, target_name)
         if previous == aliases:
             break
-    graph: dict[str, set[str]] = {}
+    nodes: dict[str, tuple[ast.AST, str]] = {}
+    methods: dict[str, set[str]] = {}
+    bases: dict[str, set[str]] = {}
     shared: dict[str, str] = {}
 
-    def walk(node: ast.AST, prefix: str = "") -> None:
+    def walk(
+        node: ast.AST, prefix: str = "", class_prefix: str = "", in_function: bool = False
+    ) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 name = prefix + child.name
-                graph[name] = _references(child)
+                nodes[name] = (child, class_prefix)
+                if class_prefix and isinstance(node, ast.ClassDef):
+                    methods.setdefault(child.name, set()).add(name)
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     reason = _shared_reason(child, aliases)
                     if reason:
                         shared[name] = reason
-                walk(child, name + ("." if isinstance(child, ast.ClassDef) else ".<locals>."))
+                is_class = isinstance(child, ast.ClassDef)
+                if is_class:
+                    bases[name] = {ref for base in child.bases for ref in _references(base)}
+                walk(
+                    child,
+                    name + ("." if is_class else ".<locals>."),
+                    name if is_class else class_prefix,
+                    in_function or not is_class,
+                )
             elif isinstance(child, (ast.Assign, ast.AnnAssign)):
                 targets = child.targets if isinstance(child, ast.Assign) else [child.target]
                 for target in targets:
-                    if isinstance(target, ast.Name):
-                        graph[prefix + target.id] = _references(child)
+                    for binding in ast.walk(target):
+                        if isinstance(binding, ast.Name) and isinstance(binding.ctx, ast.Store):
+                            name = prefix + binding.id
+                            nodes[name] = (child, class_prefix)
+                            if (
+                                not in_function
+                                and child.value is not None
+                                and _references(child.value)
+                            ):
+                                shared[name] = (
+                                    "class initialization result"
+                                    if class_prefix
+                                    else "module initialization result"
+                                )
             else:
-                walk(child, prefix)
+                walk(child, prefix, class_prefix, in_function)
 
     walk(tree)
+    # An imported/aliased base may provide the implementation called through
+    # self/cls; its body is not necessarily present in this module's graph.
+    graph = {
+        name: _references(node, owner, methods) | bases.get(owner, set())
+        for name, (node, owner) in nodes.items()
+    }
     return graph, shared
 
 
