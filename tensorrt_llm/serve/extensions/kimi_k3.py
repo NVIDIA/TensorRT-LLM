@@ -38,6 +38,17 @@ _DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
 _RESPONSE_CHANNEL_OPEN = "<|open|>response<|sep|>"
 _RESPONSE_CHANNEL_CLOSE = "<|close|>response<|sep|>"
 
+# Request ``reasoning_effort`` -> K3 ``thinking_effort``. K3 has three efforts
+# (low, high, max); OpenAI's "minimal" and "xhigh" take the lowest and the
+# highest of them.
+_K3_THINKING_EFFORTS = {
+    "minimal": "low",
+    "low": "low",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
 
 def enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
     """Enforce Kimi's pinned sampling-parameter policy when opted in.
@@ -77,17 +88,18 @@ def _derive_from_reasoning_effort(kwargs: dict[str, Any], effort: object) -> Non
     """Derive the K3 ``thinking`` / ``thinking_effort`` kwargs from a reasoning effort.
 
     A no-op when ``kwargs`` turns thinking off. Otherwise ``"none"`` turns
-    thinking off unless ``kwargs`` sets it, ``"low"``, ``"high"`` and ``"max"``
-    set the effort unless ``kwargs`` sets one, and other values (e.g. harmony's
-    ``"medium"``) have no K3 equivalent and leave the template default.
+    thinking off unless ``kwargs`` sets it, an effort in ``_K3_THINKING_EFFORTS``
+    sets the K3 effort it maps to unless ``kwargs`` sets one, and other values
+    (e.g. harmony's ``"medium"``) have no K3 equivalent and leave the template
+    default.
     """
     if not isinstance(effort, str) or kwargs.get("thinking") is False:
         return
     effort = effort.lower()
     if effort == "none":
         kwargs.setdefault("thinking", False)
-    elif effort in ("low", "high", "max"):
-        kwargs.setdefault("thinking_effort", effort)
+    elif effort in _K3_THINKING_EFFORTS:
+        kwargs.setdefault("thinking_effort", _K3_THINKING_EFFORTS[effort])
 
 
 def dynamic_tool_dicts(messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
@@ -265,9 +277,7 @@ class KimiK3ServingExtension(ServingExtension):
         generic_effort = chat_template_kwargs.get("reasoning_effort")
         if isinstance(generic_effort, str) and generic_effort.lower() in (
             "none",
-            "low",
-            "high",
-            "max",
+            *_K3_THINKING_EFFORTS,
         ):
             # The extension consumes this control even if a higher-precedence
             # K3 setting wins. Keep it available to custom templates as well.
