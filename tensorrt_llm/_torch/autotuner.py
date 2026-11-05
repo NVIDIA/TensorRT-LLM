@@ -39,7 +39,8 @@ from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
-from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm._utils import (confidential_compute_enabled, local_mpi_size,
+                                 mpi_disabled, nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
@@ -152,9 +153,10 @@ class TuningConfig:
             kernel and releases the GIL while compiling (DeepGEMM), those compiles then
             overlap, and the profiling loop that follows finds them built. Opted-in
             runners must be thread-safe and must not use NCCL windows. 0 disables; -1 uses
-            this rank's share of the host's cores (up to 32): neighbouring sweep points
-            often select the same kernel and compile it twice, so more threads keep
-            paying off. TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
+            the CPUs this rank may run on, divided by the ranks on the node unless the
+            rank is pinned to a subset, up to 32: neighbouring sweep points often select
+            the same kernel and compile it twice, so more threads keep paying off.
+            TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -929,6 +931,28 @@ def _spec_in_bounds(spec, shapes_list) -> bool:
     return True
 
 
+def _default_parallel_jit_warmup_threads() -> int:
+    """Threads for ``parallel_jit_warmup=-1``: this rank's CPUs, up to 32.
+
+    The compilers the warmup starts inherit this process's CPU affinity. A rank
+    pinned to a subset of the host's CPUs has that subset to itself; unpinned
+    ranks share all of them, so each takes its share by the ranks on the node.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # no affinity API (non-Linux)
+        cpus = os.cpu_count() or 1
+    if cpus >= (os.cpu_count() or cpus):
+        local_ranks = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        if not mpi_disabled():
+            try:
+                local_ranks = local_mpi_size()
+            except Exception:  # noqa: BLE001 - MPI cannot split by node here
+                pass
+        cpus //= max(1, local_ranks)
+    return min(32, cpus)
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT LLM operations.
 
@@ -1580,8 +1604,7 @@ class AutoTuner:
             os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
                            tuning_config.parallel_jit_warmup))
         if num_threads < 0:
-            num_threads = min(32, (os.cpu_count() or 1) //
-                              max(1, torch.cuda.device_count()))
+            num_threads = _default_parallel_jit_warmup_threads()
         if num_threads < 2:
             return
         pending = [

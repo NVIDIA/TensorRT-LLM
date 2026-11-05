@@ -2187,3 +2187,68 @@ def test_parallel_jit_warmup_runs_pending_profiles_on_a_thread_pool(
     assert on_caller == set(buckets)
     assert on_pool == (sorted(buckets) if expect_pool else [])
     tuner.clear_cache()
+
+
+def test_parallel_jit_warmup_worker_failure_is_left_to_profiling(monkeypatch):
+    """A profile that fails on the warmup pool does not fail choose_one: the
+    profiling loop still runs every profile on the calling thread."""
+    monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
+    caller = threading.get_ident()
+
+    class WorkerFailingRunner(ThreadRecordingRunner):
+        calls: list[tuple[int, int]] = []
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            if threading.get_ident() != caller:
+                raise RuntimeError("fails on warmup threads only")
+            return super().forward(inputs, tactic=tactic, **kwargs)
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    buckets = (4, 8, 16, 32, 64, 128)
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, buckets), ),
+                          parallel_jit_warmup=4)
+    x = torch.randn(128, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    with autotune():
+        tuner.choose_one("autotuner_test::parallel_jit_warmup_worker_failure",
+                         [WorkerFailingRunner()], config, [x, w])
+
+    assert {m for m, _ in WorkerFailingRunner.calls} == set(buckets)
+    assert all(t == caller for _, t in WorkerFailingRunner.calls)
+    assert not tuner.stats.failed_profiling_count.get(
+        "autotuner_test::parallel_jit_warmup_worker_failure")
+    tuner.clear_cache()
+
+
+@pytest.mark.parametrize(
+    "host_cpus, affinity, local_ranks, env_local, mpi_off, expected", [
+        (144, 144, 4, None, False, 32),
+        (64, 64, 8, None, False, 8),
+        (64, 8, 8, None, False, 8),
+        (64, 64, 1, "16", True, 4),
+        (64, 64, RuntimeError("no node split"), None, False, 32),
+    ])
+def test_default_parallel_jit_warmup_threads(monkeypatch, host_cpus, affinity,
+                                             local_ranks, env_local, mpi_off,
+                                             expected):
+    """parallel_jit_warmup=-1 uses the CPUs this rank may run on: unpinned ranks
+    share the host's CPUs with the other ranks on the node, a rank pinned to a
+    subset has it to itself, and the result is capped at 32."""
+
+    def node_ranks():
+        if isinstance(local_ranks, Exception):
+            raise local_ranks
+        return local_ranks
+
+    monkeypatch.setattr(os, "cpu_count", lambda: host_cpus)
+    monkeypatch.setattr(os, "sched_getaffinity",
+                        lambda pid: set(range(affinity)))
+    monkeypatch.setattr(autotuner, "local_mpi_size", node_ranks)
+    monkeypatch.setattr(autotuner, "mpi_disabled", lambda: mpi_off)
+    if env_local is None:
+        monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", env_local)
+    assert autotuner._default_parallel_jit_warmup_threads() == expected
