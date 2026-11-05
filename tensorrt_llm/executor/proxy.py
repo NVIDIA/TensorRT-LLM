@@ -110,13 +110,16 @@ def _check_collective_rpc_guard(
 def _create_request_sender(
         request_queue: IpcQueue,
         error_queue: Queue,
-        on_failure: Optional[weakref.WeakMethod] = None) -> _RequestSender:
+        on_failure: Optional[weakref.WeakMethod] = None,
+        *,
+        stop_workers_on_failure: bool = True) -> _RequestSender:
     """Create the command owner; the environment selects burst coalescing only."""
     return _RequestSender(request_queue,
                           error_queue,
                           batching=os.getenv("TRTLLM_PROXY_BATCH_REQUESTS",
                                              "0") == "1",
-                          on_failure=on_failure)
+                          on_failure=on_failure,
+                          stop_workers_on_failure=stop_workers_on_failure)
 
 
 class GenerationExecutorProxy(GenerationExecutor):
@@ -1624,8 +1627,10 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             name=f"frontend_{frontend_id}_request_queue",
             send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
         self._request_sender = _create_request_sender(
-            self.request_queue, self._error_queue,
-            weakref.WeakMethod(self._handle_worker_death))
+            self.request_queue,
+            self._error_queue,
+            weakref.WeakMethod(self._handle_worker_death),
+            stop_workers_on_failure=False)
         self.result_queue = FusedIpcQueue(
             (attach_info["result_addrs"][frontend_id], hmac_key),
             is_server=True,
