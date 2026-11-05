@@ -1,0 +1,8 @@
+Attention-DP KV Cache Connector
+===============================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/9e334fbaae504cc836cddea8a20cc1bdab543e55/examples/llm-api/llm_kv_cache_connector_adp.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_kv_cache_connector_adp.py
+    :lines: 1-2,6-60
+    :language: python
+    :linenos:

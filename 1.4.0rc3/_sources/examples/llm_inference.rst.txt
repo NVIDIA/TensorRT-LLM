@@ -1,0 +1,8 @@
+Generate text
+=============
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/9e334fbaae504cc836cddea8a20cc1bdab543e55/examples/llm-api/llm_inference.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_inference.py
+    :lines: 4-35
+    :language: python
+    :linenos:

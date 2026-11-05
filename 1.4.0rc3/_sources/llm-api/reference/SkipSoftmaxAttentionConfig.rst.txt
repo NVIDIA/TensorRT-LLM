@@ -1,0 +1,11 @@
+SkipSoftmaxAttentionConfig
+==========================
+
+.. autoclass:: tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: model_construct,model_validate_json,model_dump,validate,parse_file,model_validate_strings,model_computed_fields,Config,model_rebuild,model_fields,from_orm,model_json_schema,schema,model_parametrized_name,dict,model_post_init,model_validate,update_forward_refs,parse_obj,schema_json,model_copy,model_config,model_extra,json,model_fields_set,parse_raw,model_dump_json,construct,copy
