@@ -95,9 +95,10 @@ def test_import_tensorrt_llm_is_gpu_free():
         deep_gemm.set_pdl = configured.append
         os.environ["TRTLLM_ENABLE_PDL"] = "1"
         from tensorrt_llm._torch.pyexecutor import model_engine
+        from tensorrt_llm._torch.pyexecutor.engine import model_setup
         assert configured == [], "Engine-module import called the native PDL setter"
         os.environ["TRTLLM_ENABLE_PDL"] = "0"
-        model_engine._configure_deep_gemm_pdl()
+        model_setup._configure_deep_gemm_pdl()
         assert configured == [False], (
             "Engine-module import configured DeepGEMM before startup settings were applied"
         )
