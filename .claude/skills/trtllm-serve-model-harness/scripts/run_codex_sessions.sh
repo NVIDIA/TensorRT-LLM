@@ -56,6 +56,8 @@
 # Otherwise the exit status is 0 when every session exited 0, and 1 when one did not.
 # Judge the run from the trace of the recorder BASE_URL points at (references/smoke.md section 1).
 # <out_dir> must be new or empty, or the runner exits 2 before it starts a session.
+# A session whose task source cannot be copied whole is not started: its row records
+# exit code 1, and its stderr.log says why.
 set -u
 TASKS=${1:?tasks.tsv}
 OUT=${2:?out_dir}
@@ -90,7 +92,12 @@ run_one() {
   local dir
   dir=$(printf '%s/s%04d' "$OUT" "$index")
   mkdir -p "$dir/home" "$dir/workspace" "$dir/tmp"
-  if [ "$src" != "-" ]; then cp -a "$src/." "$dir/workspace/"; fi
+  if [ "$src" != "-" ] && ! cp -a "$src/." "$dir/workspace/" 2> "$dir/stderr.log"; then
+    # A session on a partial copy would work on another task than its own.
+    echo "cannot copy the task source $src: the session was not started" >> "$dir/stderr.log"
+    printf '%d\t%d\t%d\t%d\n' "$index" 1 0 0 >> "$OUT/sessions.tsv"
+    return
+  fi
   local extra=()
   [ -n "${CONTEXT_WINDOW:-}" ] && extra+=(-c "model_context_window=${CONTEXT_WINDOW}")
   [ -n "${EFFORT:-}" ] && extra+=(-c "model_reasoning_effort=\"${EFFORT}\"")

@@ -51,6 +51,8 @@
 # (index, exit code, seconds). Judge the run from the trace of the recorder BASE_URL points at
 # (record_requests.py) with scripts/validate/verdict.py --population smoke.
 # <out_dir> must be new or empty, or the runner exits 2 before it starts a session.
+# A session whose task source cannot be copied whole is not started: its row records
+# exit code 1, and its stderr.log says why.
 # Exit status: 0 when every session exited 0, 1 otherwise.
 set -u
 TASKS=${1:?tasks.tsv}
@@ -87,7 +89,12 @@ run_one() {
   local dir
   dir=$(printf '%s/s%04d' "$OUT" "$index")
   mkdir -p "$dir/home/.claude" "$dir/workspace" "$dir/tmp"
-  if [ "$src" != "-" ]; then cp -a "$src/." "$dir/workspace/"; fi
+  if [ "$src" != "-" ] && ! cp -a "$src/." "$dir/workspace/" 2> "$dir/stderr.log"; then
+    # A session on a partial copy would work on another task than its own.
+    echo "cannot copy the task source $src: the session was not started" >> "$dir/stderr.log"
+    printf '%d\t%d\t%d\n' "$index" 1 0 >> "$OUT/sessions.tsv"
+    return
+  fi
   local env_extra=()
   [ -n "${ATTRIBUTION:-}" ] && env_extra+=("CLAUDE_CODE_ATTRIBUTION_HEADER=${ATTRIBUTION}")
   local start=$SECONDS

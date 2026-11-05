@@ -63,6 +63,8 @@
 # <out_dir>/sessions.tsv (index, exit code, seconds). Judge the run from the trace of the recorder
 # BASE_URL points at (record_requests.py) with scripts/validate/verdict.py --population smoke.
 # <out_dir> must be new or empty, or the runner exits 2 before it starts a session.
+# A session whose task source cannot be copied whole is not started: its row records
+# exit code 1, and its stderr.log says why.
 # Exit status: 0 when every session exited 0, 1 otherwise. pi -p exits 0 even when a run ends
 # on an error, so read its events too.
 set -u
@@ -111,7 +113,12 @@ run_one() {
   local ws="$dir/workspace"
   if [ -n "${WORKSPACE:-}" ]; then ws=$(printf '%s/s%04d' "$WORKSPACE" "$index"); rm -rf "$ws"; fi
   mkdir -p "$dir/home" "$dir/agent" "$dir/sessions" "$dir/tmp" "$ws"
-  if [ "$src" != "-" ]; then cp -a "$src/." "$ws/"; fi
+  if [ "$src" != "-" ] && ! cp -a "$src/." "$ws/" 2> "$dir/stderr.log"; then
+    # A session on a partial copy would work on another task than its own.
+    echo "cannot copy the task source $src: the session was not started" >> "$dir/stderr.log"
+    printf '%d\t%d\t%d\n' "$index" 1 0 >> "$OUT/sessions.tsv"
+    return
+  fi
   cat > "$dir/agent/models.json" <<JSON
 {"providers": {"trtllm": {"baseUrl": "$BASE_URL", "api": "$API", "apiKey": "dummy-local-key",
   "models": [{"id": "$MODEL", "name": "trtllm-$MODEL", "reasoning": $REASONING, "input": ["text"],

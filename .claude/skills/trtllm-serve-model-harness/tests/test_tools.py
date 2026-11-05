@@ -594,6 +594,17 @@ def _prompt(runner, argv):
 
 @needs_proc
 @pytest.mark.parametrize("runner", sorted(RUNNERS))
+def test_a_session_whose_source_cannot_be_copied_is_not_started(tmp_path, runner):
+    """A task source that cannot be copied fails its session, before the harness starts."""
+    result, records = _run_sessions(tmp_path, runner, tasks="no-such-dir\tsay hi\n")
+
+    row = (tmp_path / "out" / "sessions.tsv").read_text().split("\t")
+    assert records == [] and row[:2] == ["1", "1"], result.stdout + result.stderr
+    assert "cannot copy the task source" in (tmp_path / "out" / "s0001" / "stderr.log").read_text()
+
+
+@needs_proc
+@pytest.mark.parametrize("runner", sorted(RUNNERS))
 def test_a_runner_refuses_an_output_directory_in_use(tmp_path, runner):
     """A rerun into an earlier run's directory would carry its sessions' files over: exit 2."""
     stale = tmp_path / "out" / "s0001" / "workspace" / "left.txt"
