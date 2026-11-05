@@ -144,7 +144,7 @@ class VerifyHeadSampleState:
     def __init__(self, device, max_rows: int = MAX_ROWS, vocab: int = VOCAB_SIZE):
         device = torch.device(device)
         if device.type != "cuda" or not 1 <= max_rows <= MAX_ROWS or vocab != VOCAB_SIZE:
-            raise ValueError("GLM verify sampling requires CUDA, rows1..24 and vocabulary154880")
+            raise ValueError("GLM verify sampling requires CUDA, rows 1..24 and vocabulary 154880")
         if device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if torch.cuda.get_device_capability(device) != (10, 7):
