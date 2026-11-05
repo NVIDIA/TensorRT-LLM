@@ -71,9 +71,9 @@ from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
-    _init_multi_frontend_mode, _signal_frontend_ready,
-    _spawn_attached_frontends, _terminate_attached_frontends,
-    _watch_attached_frontends)
+    _frontend_affinity_sockets, _init_multi_frontend_mode,
+    _signal_frontend_ready, _spawn_attached_frontends,
+    _terminate_attached_frontends, _watch_attached_frontends)
 from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
                                                LAUNCHER_UDS_NAME,
                                                MultiFrontendServing)
@@ -205,8 +205,6 @@ def is_non_default_or_required(param_name, value, explicit_cli_keys):
     # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
     cli_derived_fields = {
         **SERVE_CLI_CONFIG_FIELDS,
-        "build_config":
-        ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
@@ -724,8 +722,16 @@ def launch_server(
         # until uvicorn takes it over, so no one can steal the port in between.
         _publish_bound_address(report_addr, host, port)
 
-        with _provision_kv_cache_pool(
-                llm_args, owns_engine=not multi_frontend.is_attached_frontend):
+        # The affinity ports are bound before the LLM is created, so the
+        # executor's outgoing connections cannot take one of them.
+        with (_frontend_affinity_sockets(
+                host, port, address_family, multi_frontend,
+                llm_args.get("serve_frontend_affinity_port_stride"),
+                _diagnose_port_in_use) as
+              (affinity_socket, attached_affinity_sockets),
+              _provision_kv_cache_pool(
+                  llm_args,
+                  owns_engine=not multi_frontend.is_attached_frontend)):
             if backend == 'pytorch':
                 llm_args.pop("build_config", None)
                 llm = PyTorchLLM(**llm_args)
@@ -741,6 +747,8 @@ def launch_server(
             frontend_children = []
             stop_watching_frontends = None
             sockets = [s]
+            if affinity_socket is not None:
+                sockets.append(affinity_socket)
             launcher_uds_sock = None
             try:
                 if multi_frontend.is_launcher:
@@ -752,7 +760,8 @@ def launch_server(
                         llm,
                         multi_frontend.num_frontends,
                         extra_env={LAUNCHER_UDS_ENV: launcher_uds_path},
-                        report_failure=_report_observed_child_failure)
+                        report_failure=_report_observed_child_failure,
+                        affinity_sockets=attached_affinity_sockets)
                     stop_watching_frontends = _watch_attached_frontends(
                         frontend_children)
                     multi_frontend_serving = MultiFrontendServing(
@@ -2506,7 +2515,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
             role,
             request_timeout,
             max_retries,
-            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key)
+            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key,
+            frontend_affinity=disagg_cfg.ctx_frontend_affinity)
 
     coordinator = DisaggCoordinatorService(
         disagg_cfg,
@@ -2710,6 +2720,16 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         config_file,
         telemetry=telemetry,
     )
+    disagg_cfg = parse_disagg_config_file(config_file)
+    # The servers launched here run a single frontend each, so they bind no
+    # affinity ports for the disaggregated server to send conversations to.
+    if disagg_cfg.ctx_frontend_affinity is not None:
+        raise ValueError(
+            "disaggregated_mpi_worker runs one serving frontend per server; "
+            "remove num_serve_frontends and serve_frontend_affinity_port_stride "
+            "from context_servers, or launch the context servers with trtllm-serve."
+        )
+
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2720,7 +2740,37 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
-    disagg_cfg = parse_disagg_config_file(config_file)
+    with_spec = {
+        cfg.type
+        for cfg in disagg_cfg.server_configs
+        if cfg.other_args.get("speculative_config")
+    }
+    attention_parallel_configs = {(cfg.other_args.get("tensor_parallel_size",
+                                                      1),
+                                   cfg.other_args.get("enable_attention_dp",
+                                                      False))
+                                  for cfg in disagg_cfg.server_configs}
+    shared_draft_kv_supported = True
+    for cfg in disagg_cfg.server_configs:
+        spec = cfg.other_args.get("speculative_config") or {}
+        kv_cache = cfg.other_args.get("kv_cache_config") or {}
+        if (spec.get("decoding_type") != "DFlash"
+                or spec.get("attention_backend") != "TRTLLM"
+                or spec.get("draft_len_schedule") is not None
+                or spec.get("max_concurrency") is not None
+                or cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM"
+                or cfg.other_args.get("pipeline_parallel_size", 1) != 1
+                or cfg.other_args.get("context_parallel_size", 1) != 1
+                or cfg.other_args.get("kv_cache_compression_config") is not None
+                or str(kv_cache.get("dtype",
+                                    "auto")).lower().startswith("mixed_")
+                or kv_cache.get("tokens_per_block", 32) not in (16, 32, 64)):
+            shared_draft_kv_supported = False
+            break
+    os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = (
+        "1"
+        if with_spec == {"ctx", "gen"} and len(attention_parallel_configs) == 1
+        and shared_draft_kv_supported else "0")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

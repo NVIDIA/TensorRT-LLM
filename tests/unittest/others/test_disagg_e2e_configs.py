@@ -54,6 +54,7 @@ def test_e2e_recipe_avoids_legacy_transceiver_options(path: Path) -> None:
     assert configs, f"No transceiver configuration found in {path}"
     for worker, config in configs:
         assert config.get("backend") not in {"UCX", "MPI", "MOONCAKE"}, (path, config)
+        assert "agent_bounce_buffer_enable" not in config, (path, config)
         # Omitted runtime means auto; an explicit null still selects C++ today.
         assert config.get("transceiver_runtime", "auto") not in {"CPP", None}, (path, config)
         if config.get("transceiver_runtime") == "PYTHON":

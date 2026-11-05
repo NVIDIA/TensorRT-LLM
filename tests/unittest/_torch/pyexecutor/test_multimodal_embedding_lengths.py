@@ -232,7 +232,7 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
 def test_mm_encoder_sampler_exports_results_only_on_response_ranks(mapping, exports_results):
     """Ranks whose responses never reach the frontend must not export MM results."""
     sampler = _util.instantiate_sampler(
-        SimpleNamespace(max_seq_len=16, spec_config=None),
+        SimpleNamespace(max_seq_len=16, max_num_tokens=16, spec_config=None),
         SimpleNamespace(
             sampler_force_async_worker=False,
             disable_overlap_scheduler=True,
@@ -245,6 +245,8 @@ def test_mm_encoder_sampler_exports_results_only_on_response_ranks(mapping, expo
         speculative_config=None,
         max_num_sequences=1,
     )
+    with pytest.raises(ValueError, match="maximum context length is 16 tokens"):
+        sampler.validate_request(SimpleNamespace(prompt_len=17))
     request = _FakeRequest(multimodal_lengths=[4])
     state = sampler.SampleState(
         requests=[request],

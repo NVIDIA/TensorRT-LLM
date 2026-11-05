@@ -31,6 +31,12 @@ CUDA graph replay. The full GSM8K evaluation then runs without profiling.
 
 ``TestModelingV2Glm52Nvfp4Sm103Tep4``: identity and MTP1 GSM8K, paired in one
 session, and MTP1 acceptance for the SM103 tep4 target.
+
+``TestModelingV2Glm52Nvfp4Sm103Tp8``: GSM8K end to end for the SM103 tp8
+low-latency target, at the deployment its ``route()`` admits: the GLM-5.2
+modelopt NVFP4 checkpoint (bf16 MTP layer), attention and experts
+tensor-parallel over 8 ranks, one-model MTP-Eagle as a linear chain of five
+draft tokens.
 """
 
 import json
@@ -61,6 +67,7 @@ from ..accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from ._env import scoped_env_overrides
 
 _TP_SIZE = 16
 _NUM_SAMPLES = 1319
@@ -197,10 +204,7 @@ class TestModelingV2Glm52Nvfp4Sm107Tp16(LlmapiAccuracyTestHarness):
         assert os.environ.get("INTEGRATION_TEST") != "1", "This guard requires all 1319 samples"
         monkeypatch.setenv("TLLM_EVAL_MAX_IN_FLIGHT", "1")
         monkeypatch.setenv("TLLM_EVAL_PARTIAL_SCORES_EVERY", "100")
-        for key, value in _RANK_ENV.items():
-            monkeypatch.setenv(key, value)
-
-        with LLM(_MODEL_PATH, **_engine_kwargs()) as llm:
+        with scoped_env_overrides(_RANK_ENV), LLM(_MODEL_PATH, **_engine_kwargs()) as llm:
             _assert_optimized_paths(llm, tmp_path / "optimized-path-traces")
             _request_stats(llm, 1)  # Exclude the coverage probe from corpus AL.
             evaluator = GSM8KInferenceX(
@@ -265,6 +269,53 @@ class TestModelingV2Glm52Nvfp4Sm107Tp16(LlmapiAccuracyTestHarness):
 skip_not_sm103 = pytest.mark.skipif(
     get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
 )
+
+
+# On every rank: check the target's step contract on the first forward, and run the
+# indexer key projection in BF16, the form the target's fused indexer paths take.
+_SM103_RANK_ENV = {MODELING_V2_VALIDATE_ENV: "1", "TRTLLM_DSA_INDEXER_BF16": "1"}
+
+
+class TestModelingV2Glm52Nvfp4Sm103Tp8(LlmapiAccuracyTestHarness):
+    """glm-5.2-nvfp4 / sm_103 / tp8, at the deployment it was validated at."""
+
+    MODEL_NAME = "zai-org/GLM-5.2"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
+
+    @staticmethod
+    def _llm_kwargs(*, draft_len: int, kv_dtype: str, moe_backend: str, batch: int) -> dict:
+        return dict(
+            modeling_v2="require",
+            env_overrides=dict(_SM103_RANK_ENV),
+            speculative_config=MTPDecodingConfig(max_draft_len=draft_len),
+            kv_cache_config=KvCacheConfig(
+                dtype=kv_dtype, enable_block_reuse=False, free_gpu_memory_fraction=0.75
+            ),
+            moe_config=MoeConfig(backend=moe_backend),
+            sparse_attention_config=DeepSeekSparseAttentionConfig(
+                enable_heuristic_topk=True,
+                use_cute_dsl_paged_mqa_logits=True,
+                use_cute_dsl_topk=True,
+            ),
+            cuda_graph_config=CudaGraphConfig(max_batch_size=batch, enable_padding=True),
+            max_batch_size=batch,
+            max_seq_len=8192,
+            enable_chunked_prefill=True,
+        )
+
+    def _evaluate(self, **llm_kwargs) -> None:
+        with LLM(self.MODEL_PATH, **llm_kwargs) as llm:
+            GSM8K(self.MODEL_NAME).evaluate(llm)
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_tp8(self):
+        """tp8, the layout the fast paths are tuned for: attention and experts TP over 8 ranks."""
+        self._evaluate(
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=1,
+            **self._llm_kwargs(draft_len=5, kv_dtype="fp8", moe_backend="TRTLLM", batch=1),
+        )
 
 
 class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
@@ -359,24 +410,30 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
         # would be checking the synthesizer.
         modeling_v2 = dict(modeling_v2="require", env_overrides={MODELING_V2_VALIDATE_ENV: "1"})
 
-        with LLM(
-            self.MODEL_PATH,
-            kv_cache_config=self.IDENTITY_KV,
-            **modeling_v2,
-            **self.TEP4,
-            **self.BOUNDS,
-        ) as llm:
+        with (
+            scoped_env_overrides(modeling_v2["env_overrides"]),
+            LLM(
+                self.MODEL_PATH,
+                kv_cache_config=self.IDENTITY_KV,
+                **modeling_v2,
+                **self.TEP4,
+                **self.BOUNDS,
+            ) as llm,
+        ):
             identity = task.evaluate(llm)
 
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=self.MTP1,
-            kv_cache_config=self.MTP1_KV,
-            enable_iter_perf_stats=True,
-            **modeling_v2,
-            **self.TEP4,
-            **self.BOUNDS,
-        ) as llm:
+        with (
+            scoped_env_overrides(modeling_v2["env_overrides"]),
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP1,
+                kv_cache_config=self.MTP1_KV,
+                enable_iter_perf_stats=True,
+                **modeling_v2,
+                **self.TEP4,
+                **self.BOUNDS,
+            ) as llm,
+        ):
             mtp1 = task.evaluate(llm)
             acceptance_length = compute_acceptance_length(llm)
 

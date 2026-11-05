@@ -222,6 +222,9 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
+        # Declared by the model: the FP4 block-scale op tunes for its decode steps
+        # (FP4BlockScaleMoERunner.get_tuning_config).
+        self.decode_tuning = bool(model_config.extra_attrs.get("moe_decode_tuning", False))
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 

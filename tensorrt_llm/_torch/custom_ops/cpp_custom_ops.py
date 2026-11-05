@@ -191,7 +191,8 @@ def _register_fake():
           buffer_flags,
           rmsnorm_fusion,
           scale=None,
-          fusion_op: int = 0):
+          fusion_op: int = 0,
+          fp8_payload: bool = False):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
@@ -283,10 +284,13 @@ def _register_fake():
     @torch.library.register_fake("trtllm::attn_res_add_rmsnorm_persistent_fwd")
     def _(layer_residual: torch.Tensor,
           layer_residual_add: Optional[torch.Tensor],
-          block_residual: torch.Tensor, res_weight: torch.Tensor,
-          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
+          block_residual: torch.Tensor,
+          res_weight: torch.Tensor,
+          rms_weight: torch.Tensor,
+          output_rms_weight: torch.Tensor,
           rms_eps: float,
-          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+          output_rms_eps: float,
+          sm_reserve: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         # Returns (updated_layer_residual, output), both [T, B, H]. The eager
         # implementation returns layer_residual itself as the first result when
         # layer_residual_add is None; that conditional aliasing cannot be
@@ -1189,6 +1193,29 @@ def _register_fake():
         out: Optional[torch.Tensor] = None,
     ) -> None:
         pass
+
+    @torch.library.register_fake("trtllm::gdn_verify")
+    def _(
+        qkv: torch.Tensor,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        fp8_scale: Optional[torch.Tensor],
+        norm_eps: float,
+        ssm_states: torch.Tensor,
+        state_indices: torch.Tensor,
+        old_u: torch.Tensor,
+        old_k: torch.Tensor,
+        old_g: torch.Tensor,
+        cache_buf_idx: torch.Tensor,
+        prev_num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
+        return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),
+                             dtype=dtype)
 
     @torch.library.register_fake("trtllm::causal_conv1d_update")
     def _(
