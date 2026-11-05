@@ -3847,6 +3847,17 @@
           "title": "Enable Branch Snapshot",
           "type": "boolean"
         },
+        "low_priority_snapshot_prompt_len": {
+          "default": 0,
+          "description": "Context requests whose prompt is shorter than this many tokens create their recurrent-state pages (live state and snapshots) at the lowest eviction priority; attention pages keep the default priority. 0 disables. Requires KV cache manager V2 and block reuse.",
+          "minimum": 0,
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Low Priority Snapshot Prompt Len",
+          "type": "integer"
+        },
         "periodic_snapshot_interval": {
           "default": 0,
           "description": "The number of tokens between periodic snapshots in the Mamba prefix cache. Periodic snapshots are disabled by default; set this to a positive value to enable them.",
