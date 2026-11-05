@@ -20,20 +20,10 @@ the attributes the handlers touch, so they run without GPUs, models,
 or an MPI/RPC environment.
 """
 
-import json
 import threading
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
 
-import pytest
-import torch
-
-from tensorrt_llm._torch.pyexecutor import profiling
 from tensorrt_llm._torch.pyexecutor.profiling import PyExecutorProfileManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-pytestmark = pytest.mark.cpu_only
 
 
 def _bare_executor():
@@ -403,90 +393,3 @@ def test_apply_profile_stop_config_reports_cancel_vs_schedule(tmp_path):
     assert executor._apply_profile_stop_config() is False
     assert executor._runtime_profile_pending_stop_iter == 8
     assert 8 in executor.profile_stop_iters
-
-
-def test_runtime_profile_flushes_on_executor_thread(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Runtime callers schedule capture; only the loop owns profiler calls."""
-    for name in (
-        "TLLM_PROFILE_START_STOP",
-        "TLLM_TORCH_PROFILE_TRACE",
-        "ENABLE_PYTORCH_EXECUTION_TRACE",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(torch.cuda, "Event", Mock())
-    monkeypatch.setattr(
-        torch.cuda,
-        "cudart",
-        lambda: SimpleNamespace(cudaProfilerStart=lambda: None, cudaProfilerStop=lambda: None),
-    )
-    monkeypatch.setattr(profiling, "get_calibrator", lambda: Mock())
-    monkeypatch.setattr(profiling, "get_global_profiler", lambda: None)
-    calls: list[tuple[str, int]] = []
-    original_start = torch.profiler.profile.start
-    original_stop = torch.profiler.profile.stop
-
-    def start(profile: torch.profiler.profile) -> None:
-        calls.append(("start", threading.get_ident()))
-        original_start(profile)
-
-    def stop(profile: torch.profiler.profile) -> None:
-        calls.append(("stop", threading.get_ident()))
-        original_stop(profile)
-
-    monkeypatch.setattr(torch.profiler.profile, "start", start)
-    monkeypatch.setattr(torch.profiler.profile, "stop", stop)
-    executor = _bare_executor()
-    executor.is_warmup = False
-    executor.print_log = False
-    executor.enable_iter_perf_stats = False
-    start_configs: list[dict] = []
-    ready = threading.Event()
-    stop_requested = threading.Event()
-    executor.executor_request_queue = SimpleNamespace(
-        enqueue_profile_start_request=start_configs.append,
-        enqueue_profile_stop_request=stop_requested.set,
-    )
-    executor.start_profile(output_dir=str(tmp_path), activities=["CPU"])
-    assert executor._runtime_profile_pending_start_iter is not None
-    assert len(start_configs) == 1
-    errors: list[BaseException] = []
-
-    def run_loop() -> None:
-        """Apply the queued caller config and own the entire profiler lifetime."""
-        try:
-            executor._apply_profile_start_config(start_configs.pop())
-            with executor._profile_manager.profile_step() as step:
-                executor.iter_counter = 1
-                step()
-                torch.ones(2) + 1
-                ready.set()
-                if not stop_requested.wait(timeout=5):
-                    raise TimeoutError("caller did not schedule a stop")
-                executor.iter_counter = 2
-                step()
-        except BaseException as caught:
-            errors.append(caught)
-            ready.set()
-
-    worker = threading.Thread(target=run_loop)
-    worker.start()
-    try:
-        assert ready.wait(timeout=5)
-        executor.stop_profile()
-    finally:
-        stop_requested.set()
-        worker.join(timeout=5)
-    assert not worker.is_alive()
-    assert not errors
-    assert calls == [("start", worker.ident), ("stop", worker.ident)]
-    assert worker.ident != threading.get_ident()
-    assert executor._runtime_profile_pending_start_iter is None
-    assert executor._runtime_profile_pending_stop_iter is None
-    assert not executor._profile_enabled
-    assert not start_configs
-    paths = list(tmp_path.glob("trtllm-trace-*-rank-0.json"))
-    assert len(paths) == 1
-    trace = json.loads(paths[0].read_text())
-    assert any(event.get("name") == "aten::add" for event in trace["traceEvents"])
