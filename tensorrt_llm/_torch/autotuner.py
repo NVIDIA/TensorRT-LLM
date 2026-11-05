@@ -1179,9 +1179,9 @@ class AutoTuner:
                  s.map_to_tuning_buckets)
                 for s in tuning_config.dynamic_tensor_specs)
             excluded_key = (custom_op,
-                            tuple(str(r.unique_id()) for r in runners),
-                            input_shapes, dynamic_specs,
-                            tuning_config.constraint_specs,
+                            tuple(str(r.unique_id())
+                                  for r in runners), input_shapes,
+                            dynamic_specs, tuning_config.constraint_specs,
                             tuning_config.tune_max_num_tokens)
         if (excluded_key is not None and self.is_tuning_mode
                 and excluded_key not in self._tuned_excluded_ops):
