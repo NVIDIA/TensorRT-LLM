@@ -3752,6 +3752,10 @@ def _cache_kernels():
             self.jobs = tuple(jobs)
             self.pdl = pdl
             self.threads = max(job.threads for job in self.jobs)
+            # A norm row wider than a warp reduces through ``partial`` and a CTA barrier, so it
+            # cannot share its CTA with other rows.
+            if any(job.norm and 32 < job.threads < self.threads for job in self.jobs):
+                raise ValueError("A CSA2 quantize launch cannot pack norm rows wider than a warp")
             self.rows_per_cta = tuple(
                 self.threads // self.jobs[i].threads if i < len(self.jobs) else 1
                 for i in range(_MAX_QUANTIZE_JOBS)

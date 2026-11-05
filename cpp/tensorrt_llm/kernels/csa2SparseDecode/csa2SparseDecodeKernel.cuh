@@ -338,6 +338,8 @@ struct WorkSplit
 //! must not run concurrently.
 constexpr int kMaxSplitTokens = 2048;
 constexpr int kCombineHeadsPerCta = 8;
+// Generous bound on the combine kernel's wait for a split token's parts: seconds of polling, then a trap.
+constexpr int kMaxArrivalPolls = 1 << 25; // 32M
 __device__ int csa2SplitArrivals[kMaxSplitTokens][2];
 
 struct Csa2Kernel
@@ -1810,12 +1812,17 @@ __global__ void __launch_bounds__(256, 4) csa2SparseDecodeCombineKernel(__grid_c
         // the attention kernel has completed before this kernel starts.
         int* const arrived = &csa2SplitArrivals[r][0];
         int v;
-        while (true)
+        for (int polls = 0;; ++polls)
         {
             asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(arrived) : "memory");
             if (v >= nsplit)
             {
                 break;
+            }
+            if (polls == kMaxArrivalPolls)
+            {
+                // A part missing for seconds: concurrent launches on the device or an invalid schedule.
+                __trap();
             }
             __nanosleep(64);
         }

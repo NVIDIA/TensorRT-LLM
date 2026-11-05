@@ -958,7 +958,15 @@ def _(routing_logits,
         top_k,
         routing_bias,
     )
-    return outputs[:1] if prerouted_tables is not None else outputs
+    if prerouted_tables is not None:
+        return outputs[:1]
+    if routing_tables is not None and routing_tiles:
+        # The tactic picked at run time decides: [num_tokens, top_k], or an
+        # empty [0, tile] when its tile ran on a routing table.
+        ctx = torch.library.get_ctx()
+        outputs[2] = outputs[2].new_empty(
+            (ctx.new_dynamic_size(), ctx.new_dynamic_size()))
+    return outputs
 
 
 @dataclass(frozen=True)

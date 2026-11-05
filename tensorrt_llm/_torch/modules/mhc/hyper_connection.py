@@ -221,7 +221,9 @@ class mHC(nn.Module):
         super().__init__()
         self.mult = mult
         self.hidden_size = hidden_size
-        self.sinkhorn_iters = sinkhorn_iters
+        # Zero iterations give the same comb as one; the boundary kernel reserves 0 for its
+        # deferred Sinkhorn.
+        self.sinkhorn_iters = max(sinkhorn_iters, 1)
         self.dtype = dtype
         self.eps = eps
         self.norm_eps = norm_eps

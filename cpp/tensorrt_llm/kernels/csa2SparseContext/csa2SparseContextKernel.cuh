@@ -988,312 +988,316 @@ __global__ void __launch_bounds__(detail::kNumThreads, 1)
         }
         __syncwarp();
     }
-    else if (warp == 8)
-    {
-        // ======================================================================================== QK issue
-        setMaxRegistersDec<56>();
-        if (electOne())
-        {
-            constexpr uint32_t kQkDesc = mmaDescriptorF8(64, 128, 0, 0);
-            // An E4M3 chunk of Q sits at chunk c of its slot, or at BF16 box 2c once quantized in place.
-            constexpr int kQChunkStride = kBf16Q ? 2 * kQChunkBytes : kQChunkBytes;
-            int it = 0; // ring item
-            int g = 0;  // global block
-            for (int token = blockIdx.x; token < p.numTokens; token += gridDim.x)
-            {
-                int const blocks = blockCount(keyCount(p, token));
-                {
-                    // Q item: shared memory -> TMEM, duplicated into both lane halves; in order after this thread's
-                    // last QK, so the previous query's S no longer reads TMEM Q.
-                    int const slot = it % kNumSlots;
-                    uint32_t const qAddress = smemAddress(sm.slot[slot]);
-#pragma unroll
-                    for (int c = 0; c < 4; ++c)
-                    {
-                        mbarWait(&sm.slotFull[slot][c], (it / kNumSlots) & 1);
-                        tcFenceAfter();
-#pragma unroll
-                        for (int s = 0; s < 8; ++s)
-                        {
-                            tmemCopy64x128Dup(tmemBase + kTmemQ + 32 * c + 4 * s,
-                                smemDescriptor(qAddress + c * kQChunkStride + s * 16, 16, 1024));
-                        }
-                    }
-                    tcCommit(&sm.slotEmpty[slot]);
-                    ++it;
-                }
-                for (int k = 0; k < blocks; ++k, ++g)
-                {
-                    int const slot = it % kNumSlots;
-                    int const sb = g & 1;
-                    mbarWait(&sm.sEmpty[sb], ((g >> 1) & 1) ^ 1);
-                    uint32_t const kAddress = smemAddress(sm.slot[slot]);
-#pragma unroll
-                    for (int c = 0; c < 4; ++c)
-                    {
-                        mbarWait(&sm.slotFull[slot][c], (it / kNumSlots) & 1);
-                        tcFenceAfter();
-#pragma unroll
-                        for (int j = 0; j < 4; ++j)
-                        {
-                            mmaWsTmemA(tmemBase + kTmemS + 64 * sb, tmemBase + kTmemQ + 32 * c + 8 * j,
-                                smemDescriptor(kAddress + c * kKvChunkBytes + j * 32, 16, 1024), kQkDesc,
-                                (c | j) ? 1U : 0U);
-                        }
-                    }
-                    tcCommit(&sm.sFull[sb]);
-                    ++it;
-                }
-            }
-        }
-    }
-    else if (warp == 12)
-    {
-        // ======================================================================================== PV issue
-        // A second issuing thread lets QK of later blocks fill the tensor core while PV waits for the softmax and
-        // the O rescale.
-        setMaxRegistersDec<56>();
-        if (electOne())
-        {
-            constexpr uint32_t kPvDesc = mmaDescriptorF8(64, 256, 0, 1);
-            int it = 0;
-            int g = 0;
-            int r = 0;
-            int item = 0;
-            for (int token = blockIdx.x; token < p.numTokens; token += gridDim.x, ++item)
-            {
-                int const blocks = blockCount(keyCount(p, token));
-                ++it; // Q item
-                for (int k = 0; k < blocks; ++k, ++g)
-                {
-                    int const slot = it % kNumSlots;
-                    int const sb = g & 1;
-                    bool const first = k == 0;
-                    mbarWait(&sm.pFull[sb], (g >> 1) & 1);
-                    if (first && item > 0)
-                    {
-                        mbarWait(&sm.oEmpty, (item - 1) & 1);
-                    }
-                    uint32_t const pAddress = smemAddress(sm.p[sb]);
-                    uint32_t const vAddress = smemAddress(sm.slot[slot]);
-#pragma unroll
-                    for (int h = 0; h < 2; ++h)
-                    {
-                        // A query's first PV overwrites O, which the previous epilogue has read (oEmpty above); later
-                        // ones wait for the O rescale. So the first PV does not wait for the previous epilogue's
-                        // stores, which run on the rescale warps.
-                        if (!first)
-                        {
-                            mbarWait(&sm.oReady[r & 1][h], (r >> 1) & 1);
-                        }
-                        tcFenceAfter();
-#pragma unroll
-                        for (int j = 0; j < 4; ++j)
-                        {
-                            uint64_t const aDesc = smemDescriptor(pAddress + j * 32, 16, 1024);
-                            uint64_t const bDesc
-                                = smemDescriptor(vAddress + (2 * h) * kKvChunkBytes + j * 4096, kKvChunkBytes, 1024);
-                            mmaWsSmemA(tmemBase + kTmemO + 128 * h, aDesc, bDesc, kPvDesc, (first && j == 0) ? 0U : 1U);
-                        }
-                        tcCommit(&sm.pvDone[sb][h]);
-                    }
-                    r += first ? 0 : 1;
-                    // The slot is free once PV(g) completed (QK(g) completed before P(g) existed).
-                    tcCommit(&sm.slotEmpty[slot]);
-                    tcCommit(&sm.pEmpty[sb]);
-                    ++it;
-                }
-            }
-        }
-    }
     else
     {
-        // ======================================================================================== producers
+        // Warpgroups 2 and 3 mix MMA-issue and producer warps; setmaxnreg must be one instruction per warpgroup.
         setMaxRegistersDec<56>();
-        int const pw = warp < 12 ? warp - 9 : warp - 10;
-        int const producerThread = pw * 32 + lane;
-        // Gather instruction i = lane * kNumProducerWarps + pw covers row group i % 32 (4 keys) and channel chunk
-        // i / 32.
-        int const gatherIndex = lane * kNumProducerWarps + pw;
-        bool const gathers = gatherIndex < 128;
-        int const rowGroup = gatherIndex & 31;
-        int const chunk = gatherIndex >> 5;
-        float const qScale = kBf16Q ? __ldg(p.qScale) : 1.F;
-        // Indices are prefetched one block ahead, so their load latency overlaps the previous block.
-        auto loadRows = [&](int token, int k, int keys) -> int4
+        if (warp == 8)
         {
-            int32_t const* const rowIndices = p.indices + static_cast<int64_t>(token) * p.indexStride;
-            int const pos = k * kBlockKeys + lane * 4;
-            int4 r;
-            if (pos + 3 < keys)
+            // ======================================================================================== QK issue
+            if (electOne())
             {
-                r = __ldg(reinterpret_cast<int4 const*>(rowIndices + pos));
-            }
-            else
-            {
-                r.x = (pos + 0 < keys) ? __ldg(rowIndices + pos + 0) : 0;
-                r.y = (pos + 1 < keys) ? __ldg(rowIndices + pos + 1) : 0;
-                r.z = (pos + 2 < keys) ? __ldg(rowIndices + pos + 2) : 0;
-                r.w = (pos + 3 < keys) ? __ldg(rowIndices + pos + 3) : 0;
-            }
-            return r;
-        };
-        int it = 0;
-        // Every producer warp observes every phase of its slots' slotEmpty barriers (a skipped phase would alias the
-        // parity). Warp 9 arms the item's chunk barriers with its bytes; every other producer warp arrives on the last
-        // chunk's barrier once all of its lanes have waited (the wait ends in a warp sync, so lane 0 cannot arrive or
-        // issue for lanes still waiting). QK reads that chunk last, so even an item that warp 9 loads alone (E4M3 Q, a
-        // contiguous block) cannot be consumed and its slot released before every producer lane has waited on the
-        // slot; otherwise a lagging lane's parity wait would match the following phase.
-        auto waitSlotEmpty = [&](int slot)
-        {
-            mbarWait(&sm.slotEmpty[slot], ((it / kNumSlots) & 1) ^ 1);
-            __syncwarp();
-        };
-        auto arriveOtherWarp = [&](int slot)
-        {
-            if (pw != 0 && lane == 0)
-            {
-                mbarArrive(&sm.slotFull[slot][3]);
-            }
-        };
-        [[maybe_unused]] int qItem = 0; // BF16 Q items converted (parity of the qRaw barriers)
-        // Current block (token, k) with `keys` keys; the next block is prefetched into nextRows.
-        int token = blockIdx.x;
-        int k = 0;
-        int keys = token < p.numTokens ? keyCount(p, token) : 1;
-        int4 rows = token < p.numTokens ? loadRows(token, 0, keys) : make_int4(0, 0, 0, 0);
-        while (token < p.numTokens)
-        {
-            int const blocks = blockCount(keys);
-            int nextToken = token;
-            int nextK = k + 1;
-            int nextKeys = keys;
-            if (nextK >= blocks)
-            {
-                nextToken = token + gridDim.x;
-                nextK = 0;
-                nextKeys = nextToken < p.numTokens ? keyCount(p, nextToken) : 1;
-            }
-            int4 const nextRows
-                = nextToken < p.numTokens ? loadRows(nextToken, nextK, nextKeys) : make_int4(0, 0, 0, 0);
-            if (k == 0)
-            {
-                // Q item.
-                int const slot = it % kNumSlots;
-                waitSlotEmpty(slot);
-                int const prefetchToken = token + kQPrefetchItems * gridDim.x;
-                if constexpr (kBf16Q)
+                constexpr uint32_t kQkDesc = mmaDescriptorF8(64, 128, 0, 0);
+                // An E4M3 chunk of Q sits at chunk c of its slot, or at BF16 box 2c once quantized in place.
+                constexpr int kQChunkStride = kBf16Q ? 2 * kQChunkBytes : kQChunkBytes;
+                int it = 0; // ring item
+                int g = 0;  // global block
+                for (int token = blockIdx.x; token < p.numTokens; token += gridDim.x)
                 {
-                    if (producerThread == 0)
+                    int const blocks = blockCount(keyCount(p, token));
                     {
+                        // Q item: shared memory -> TMEM, duplicated into both lane halves; in order after this thread's
+                        // last QK, so the previous query's S no longer reads TMEM Q.
+                        int const slot = it % kNumSlots;
+                        uint32_t const qAddress = smemAddress(sm.slot[slot]);
 #pragma unroll
                         for (int c = 0; c < 4; ++c)
                         {
-                            mbarArriveExpectTx(&sm.qRaw[c], 2 * kQChunkBytes);
-                            tmaLoad3d(&tmapQ, &sm.qRaw[c], sm.slot[slot] + (2 * c) * kQChunkBytes, 128 * c, 0, token);
-                            tmaLoad3d(&tmapQ, &sm.qRaw[c], sm.slot[slot] + (2 * c + 1) * kQChunkBytes, 128 * c + 64, 0,
-                                token);
-                        }
-                        if (prefetchToken < p.numTokens)
-                        {
+                            mbarWait(&sm.slotFull[slot][c], (it / kNumSlots) & 1);
+                            tcFenceAfter();
 #pragma unroll
-                            for (int c = 0; c < 8; ++c)
+                            for (int s = 0; s < 8; ++s)
                             {
-                                tmaPrefetch3d(&tmapQ, 64 * c, 0, prefetchToken);
+                                tmemCopy64x128Dup(tmemBase + kTmemQ + 32 * c + 4 * s,
+                                    smemDescriptor(qAddress + c * kQChunkStride + s * 16, 16, 1024));
                             }
                         }
+                        tcCommit(&sm.slotEmpty[slot]);
+                        ++it;
                     }
-                    // 256 (chunk, row) items over the producer threads; each converts one row of one chunk in
-                    // place. Converting here, before the first KV block is issued, uses the time the producers
-                    // would otherwise wait for that block's slot.
-                    for (int i = producerThread; i < 4 * kHeads; i += kNumProducerThreads)
+                    for (int k = 0; k < blocks; ++k, ++g)
                     {
-                        int const c = i / kHeads;
-                        mbarWait(&sm.qRaw[c], qItem & 1);
-                        quantizeQRow(sm.slot[slot], c, i % kHeads, qScale);
-                    }
-                    fenceProxyAsyncSmem();
-                    namedBarrierSync(kProducerBarrier, kNumProducerThreads);
-                    if (producerThread == 0)
-                    {
+                        int const slot = it % kNumSlots;
+                        int const sb = g & 1;
+                        mbarWait(&sm.sEmpty[sb], ((g >> 1) & 1) ^ 1);
+                        uint32_t const kAddress = smemAddress(sm.slot[slot]);
 #pragma unroll
                         for (int c = 0; c < 4; ++c)
                         {
-                            mbarArrive(&sm.slotFull[slot][c]);
+                            mbarWait(&sm.slotFull[slot][c], (it / kNumSlots) & 1);
+                            tcFenceAfter();
+#pragma unroll
+                            for (int j = 0; j < 4; ++j)
+                            {
+                                mmaWsTmemA(tmemBase + kTmemS + 64 * sb, tmemBase + kTmemQ + 32 * c + 8 * j,
+                                    smemDescriptor(kAddress + c * kKvChunkBytes + j * 32, 16, 1024), kQkDesc,
+                                    (c | j) ? 1U : 0U);
+                            }
                         }
+                        tcCommit(&sm.sFull[sb]);
+                        ++it;
                     }
-                    arriveOtherWarp(slot);
-                    ++qItem;
+                }
+            }
+        }
+        else if (warp == 12)
+        {
+            // ======================================================================================== PV issue
+            // A second issuing thread lets QK of later blocks fill the tensor core while PV waits for the softmax and
+            // the O rescale.
+            if (electOne())
+            {
+                constexpr uint32_t kPvDesc = mmaDescriptorF8(64, 256, 0, 1);
+                int it = 0;
+                int g = 0;
+                int r = 0;
+                int item = 0;
+                for (int token = blockIdx.x; token < p.numTokens; token += gridDim.x, ++item)
+                {
+                    int const blocks = blockCount(keyCount(p, token));
+                    ++it; // Q item
+                    for (int k = 0; k < blocks; ++k, ++g)
+                    {
+                        int const slot = it % kNumSlots;
+                        int const sb = g & 1;
+                        bool const first = k == 0;
+                        mbarWait(&sm.pFull[sb], (g >> 1) & 1);
+                        if (first && item > 0)
+                        {
+                            mbarWait(&sm.oEmpty, (item - 1) & 1);
+                        }
+                        uint32_t const pAddress = smemAddress(sm.p[sb]);
+                        uint32_t const vAddress = smemAddress(sm.slot[slot]);
+#pragma unroll
+                        for (int h = 0; h < 2; ++h)
+                        {
+                            // A query's first PV overwrites O, which the previous epilogue has read (oEmpty above);
+                            // later ones wait for the O rescale. So the first PV does not wait for the previous
+                            // epilogue's stores, which run on the rescale warps.
+                            if (!first)
+                            {
+                                mbarWait(&sm.oReady[r & 1][h], (r >> 1) & 1);
+                            }
+                            tcFenceAfter();
+#pragma unroll
+                            for (int j = 0; j < 4; ++j)
+                            {
+                                uint64_t const aDesc = smemDescriptor(pAddress + j * 32, 16, 1024);
+                                uint64_t const bDesc = smemDescriptor(
+                                    vAddress + (2 * h) * kKvChunkBytes + j * 4096, kKvChunkBytes, 1024);
+                                mmaWsSmemA(
+                                    tmemBase + kTmemO + 128 * h, aDesc, bDesc, kPvDesc, (first && j == 0) ? 0U : 1U);
+                            }
+                            tcCommit(&sm.pvDone[sb][h]);
+                        }
+                        r += first ? 0 : 1;
+                        // The slot is free once PV(g) completed (QK(g) completed before P(g) existed).
+                        tcCommit(&sm.slotEmpty[slot]);
+                        tcCommit(&sm.pEmpty[sb]);
+                        ++it;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // ======================================================================================== producers
+            int const pw = warp < 12 ? warp - 9 : warp - 10;
+            int const producerThread = pw * 32 + lane;
+            // Gather instruction i = lane * kNumProducerWarps + pw covers row group i % 32 (4 keys) and channel chunk
+            // i / 32.
+            int const gatherIndex = lane * kNumProducerWarps + pw;
+            bool const gathers = gatherIndex < 128;
+            int const rowGroup = gatherIndex & 31;
+            int const chunk = gatherIndex >> 5;
+            float const qScale = kBf16Q ? __ldg(p.qScale) : 1.F;
+            // Indices are prefetched one block ahead, so their load latency overlaps the previous block.
+            auto loadRows = [&](int token, int k, int keys) -> int4
+            {
+                int32_t const* const rowIndices = p.indices + static_cast<int64_t>(token) * p.indexStride;
+                int const pos = k * kBlockKeys + lane * 4;
+                int4 r;
+                if (pos + 3 < keys)
+                {
+                    r = __ldg(reinterpret_cast<int4 const*>(rowIndices + pos));
                 }
                 else
                 {
-                    arriveOtherWarp(slot);
-                    if (producerThread == 0)
+                    r.x = (pos + 0 < keys) ? __ldg(rowIndices + pos + 0) : 0;
+                    r.y = (pos + 1 < keys) ? __ldg(rowIndices + pos + 1) : 0;
+                    r.z = (pos + 2 < keys) ? __ldg(rowIndices + pos + 2) : 0;
+                    r.w = (pos + 3 < keys) ? __ldg(rowIndices + pos + 3) : 0;
+                }
+                return r;
+            };
+            int it = 0;
+            // Every producer warp observes every phase of its slots' slotEmpty barriers (a skipped phase would alias
+            // the parity). Warp 9 arms the item's chunk barriers with its bytes; every other producer warp arrives on
+            // the last chunk's barrier once all of its lanes have waited (the wait ends in a warp sync, so lane 0
+            // cannot arrive or issue for lanes still waiting). QK reads that chunk last, so even an item that warp 9
+            // loads alone (E4M3 Q, a contiguous block) cannot be consumed and its slot released before every producer
+            // lane has waited on the slot; otherwise a lagging lane's parity wait would match the following phase.
+            auto waitSlotEmpty = [&](int slot)
+            {
+                mbarWait(&sm.slotEmpty[slot], ((it / kNumSlots) & 1) ^ 1);
+                __syncwarp();
+            };
+            auto arriveOtherWarp = [&](int slot)
+            {
+                if (pw != 0 && lane == 0)
+                {
+                    mbarArrive(&sm.slotFull[slot][3]);
+                }
+            };
+            [[maybe_unused]] int qItem = 0; // BF16 Q items converted (parity of the qRaw barriers)
+            // Current block (token, k) with `keys` keys; the next block is prefetched into nextRows.
+            int token = blockIdx.x;
+            int k = 0;
+            int keys = token < p.numTokens ? keyCount(p, token) : 1;
+            int4 rows = token < p.numTokens ? loadRows(token, 0, keys) : make_int4(0, 0, 0, 0);
+            while (token < p.numTokens)
+            {
+                int const blocks = blockCount(keys);
+                int nextToken = token;
+                int nextK = k + 1;
+                int nextKeys = keys;
+                if (nextK >= blocks)
+                {
+                    nextToken = token + gridDim.x;
+                    nextK = 0;
+                    nextKeys = nextToken < p.numTokens ? keyCount(p, nextToken) : 1;
+                }
+                int4 const nextRows
+                    = nextToken < p.numTokens ? loadRows(nextToken, nextK, nextKeys) : make_int4(0, 0, 0, 0);
+                if (k == 0)
+                {
+                    // Q item.
+                    int const slot = it % kNumSlots;
+                    waitSlotEmpty(slot);
+                    int const prefetchToken = token + kQPrefetchItems * gridDim.x;
+                    if constexpr (kBf16Q)
                     {
-#pragma unroll
-                        for (int c = 0; c < 4; ++c)
-                        {
-                            mbarArriveExpectTx(&sm.slotFull[slot][c], kQChunkBytes);
-                            tmaLoad3d(
-                                &tmapQ, &sm.slotFull[slot][c], sm.slot[slot] + c * kQChunkBytes, 128 * c, 0, token);
-                        }
-                        if (prefetchToken < p.numTokens)
+                        if (producerThread == 0)
                         {
 #pragma unroll
                             for (int c = 0; c < 4; ++c)
                             {
-                                tmaPrefetch3d(&tmapQ, 128 * c, 0, prefetchToken);
+                                mbarArriveExpectTx(&sm.qRaw[c], 2 * kQChunkBytes);
+                                tmaLoad3d(
+                                    &tmapQ, &sm.qRaw[c], sm.slot[slot] + (2 * c) * kQChunkBytes, 128 * c, 0, token);
+                                tmaLoad3d(&tmapQ, &sm.qRaw[c], sm.slot[slot] + (2 * c + 1) * kQChunkBytes, 128 * c + 64,
+                                    0, token);
+                            }
+                            if (prefetchToken < p.numTokens)
+                            {
+#pragma unroll
+                                for (int c = 0; c < 8; ++c)
+                                {
+                                    tmaPrefetch3d(&tmapQ, 64 * c, 0, prefetchToken);
+                                }
+                            }
+                        }
+                        // 256 (chunk, row) items over the producer threads; each converts one row of one chunk in
+                        // place. Converting here, before the first KV block is issued, uses the time the producers
+                        // would otherwise wait for that block's slot.
+                        for (int i = producerThread; i < 4 * kHeads; i += kNumProducerThreads)
+                        {
+                            int const c = i / kHeads;
+                            mbarWait(&sm.qRaw[c], qItem & 1);
+                            quantizeQRow(sm.slot[slot], c, i % kHeads, qScale);
+                        }
+                        fenceProxyAsyncSmem();
+                        namedBarrierSync(kProducerBarrier, kNumProducerThreads);
+                        if (producerThread == 0)
+                        {
+#pragma unroll
+                            for (int c = 0; c < 4; ++c)
+                            {
+                                mbarArrive(&sm.slotFull[slot][c]);
+                            }
+                        }
+                        arriveOtherWarp(slot);
+                        ++qItem;
+                    }
+                    else
+                    {
+                        arriveOtherWarp(slot);
+                        if (producerThread == 0)
+                        {
+#pragma unroll
+                            for (int c = 0; c < 4; ++c)
+                            {
+                                mbarArriveExpectTx(&sm.slotFull[slot][c], kQChunkBytes);
+                                tmaLoad3d(
+                                    &tmapQ, &sm.slotFull[slot][c], sm.slot[slot] + c * kQChunkBytes, 128 * c, 0, token);
+                            }
+                            if (prefetchToken < p.numTokens)
+                            {
+#pragma unroll
+                                for (int c = 0; c < 4; ++c)
+                                {
+                                    tmaPrefetch3d(&tmapQ, 128 * c, 0, prefetchToken);
+                                }
                             }
                         }
                     }
+                    ++it;
                 }
-                ++it;
-            }
-            {
-                int const slot = it % kNumSlots;
-                int4 r = rows;
-                r.x = (r.x < 0 || r.x >= p.bankRows) ? 0 : r.x;
-                r.y = (r.y < 0 || r.y >= p.bankRows) ? 0 : r.y;
-                r.z = (r.z < 0 || r.z >= p.bankRows) ? 0 : r.z;
-                r.w = (r.w < 0 || r.w >= p.bankRows) ? 0 : r.w;
-                // A block of 128 consecutive bank rows (an SWA window) loads as four dense tiles.
-                int const base = __shfl_sync(0xFFFFFFFFU, r.x, 0);
-                bool const mine = (r.x == base + 4 * lane) && (r.y == r.x + 1) && (r.z == r.x + 2) && (r.w == r.x + 3)
-                    && (base + kBlockKeys - 1 < p.bankRows);
-                bool const contiguous = __all_sync(0xFFFFFFFFU, mine);
-                int4 const gatherRows
-                    = make_int4(__shfl_sync(0xFFFFFFFFU, r.x, rowGroup), __shfl_sync(0xFFFFFFFFU, r.y, rowGroup),
-                        __shfl_sync(0xFFFFFFFFU, r.z, rowGroup), __shfl_sync(0xFFFFFFFFU, r.w, rowGroup));
-                waitSlotEmpty(slot);
-                if (producerThread == 0)
                 {
+                    int const slot = it % kNumSlots;
+                    int4 r = rows;
+                    r.x = (r.x < 0 || r.x >= p.bankRows) ? 0 : r.x;
+                    r.y = (r.y < 0 || r.y >= p.bankRows) ? 0 : r.y;
+                    r.z = (r.z < 0 || r.z >= p.bankRows) ? 0 : r.z;
+                    r.w = (r.w < 0 || r.w >= p.bankRows) ? 0 : r.w;
+                    // A block of 128 consecutive bank rows (an SWA window) loads as four dense tiles.
+                    int const base = __shfl_sync(0xFFFFFFFFU, r.x, 0);
+                    bool const mine = (r.x == base + 4 * lane) && (r.y == r.x + 1) && (r.z == r.x + 2)
+                        && (r.w == r.x + 3) && (base + kBlockKeys - 1 < p.bankRows);
+                    bool const contiguous = __all_sync(0xFFFFFFFFU, mine);
+                    int4 const gatherRows
+                        = make_int4(__shfl_sync(0xFFFFFFFFU, r.x, rowGroup), __shfl_sync(0xFFFFFFFFU, r.y, rowGroup),
+                            __shfl_sync(0xFFFFFFFFU, r.z, rowGroup), __shfl_sync(0xFFFFFFFFU, r.w, rowGroup));
+                    waitSlotEmpty(slot);
+                    if (producerThread == 0)
+                    {
 #pragma unroll
-                    for (int c = 0; c < 4; ++c)
-                    {
-                        mbarArriveExpectTx(&sm.slotFull[slot][c], kKvChunkBytes);
+                        for (int c = 0; c < 4; ++c)
+                        {
+                            mbarArriveExpectTx(&sm.slotFull[slot][c], kKvChunkBytes);
+                        }
                     }
-                }
-                arriveOtherWarp(slot);
-                if (contiguous)
-                {
-                    if (pw == 0 && lane < 4)
+                    arriveOtherWarp(slot);
+                    if (contiguous)
                     {
-                        tmaLoad2d(&tmapTile, &sm.slotFull[slot][lane], sm.slot[slot] + lane * kKvChunkBytes, lane * 128,
-                            base);
+                        if (pw == 0 && lane < 4)
+                        {
+                            tmaLoad2d(&tmapTile, &sm.slotFull[slot][lane], sm.slot[slot] + lane * kKvChunkBytes,
+                                lane * 128, base);
+                        }
                     }
+                    else if (gathers)
+                    {
+                        tmaGather4(&tmapBank, &sm.slotFull[slot][chunk],
+                            sm.slot[slot] + chunk * kKvChunkBytes + rowGroup * 512, chunk * 128, gatherRows);
+                    }
+                    ++it;
                 }
-                else if (gathers)
-                {
-                    tmaGather4(&tmapBank, &sm.slotFull[slot][chunk],
-                        sm.slot[slot] + chunk * kKvChunkBytes + rowGroup * 512, chunk * 128, gatherRows);
-                }
-                ++it;
+                token = nextToken;
+                k = nextK;
+                keys = nextKeys;
+                rows = nextRows;
             }
-            token = nextToken;
-            k = nextK;
-            keys = nextKeys;
-            rows = nextRows;
         }
     }
 

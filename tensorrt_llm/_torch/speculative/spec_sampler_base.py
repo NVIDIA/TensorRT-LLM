@@ -596,8 +596,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
 
-        slots_device = (self._device_slot_ids(slots)
-                        if self.static_slot_ids else self._slot_index(slots))
+        slots_device = (
+            self._device_slot_ids(slots) if self.static_slot_ids else self._slot_index(slots)
+        )
         step_fold = self.spec_step_fold
         if step_fold is not None and step_fold.scatter(
             slots_device, o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
@@ -628,6 +629,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
+
+        # The scatter reads one output row and writes one store slot per request, unchecked.
+        num_slots = self.store.new_tokens_lens.shape[0]
+        if any(
+            rows.shape[0] != num_sampling_requests
+            for rows in (o_new_tokens, o_new_tokens_lens, o_next_draft_tokens, o_next_new_tokens)
+        ) or (slots and not (min(slots) >= 0 and max(slots) < num_slots)):
+            raise ValueError("speculative outputs need one row and an in-range slot per request")
 
         spec_store_scatter(
             slots_device,

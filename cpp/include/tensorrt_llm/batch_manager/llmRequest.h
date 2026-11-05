@@ -1477,7 +1477,7 @@ public:
 
     //! Capacity of a beam's token vector: room for the generated tokens, up to what the first one would allocate
     //! anyway, keeps that token from copying the prompt.
-    [[nodiscard]] static std::size_t promptTokensCapacity(std::size_t promptLen, SizeType32 maxNewTokens)
+    [[nodiscard]] static std::size_t beamTokensCapacity(std::size_t promptLen, SizeType32 maxNewTokens)
     {
         return promptLen + std::min(promptLen, static_cast<std::size_t>(std::max<SizeType32>(maxNewTokens, 0)));
     }
@@ -1612,7 +1612,8 @@ protected:
 
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
-    // Without block reuse nothing reads mUniqueTokens, so a request can skip building it.
+    // False only when no reader needs mUniqueTokens: block reuse, V1 cache managers and a transceiver that keys
+    // transfers on them all do (see PyExecutor.track_unique_tokens).
     bool mTrackUniqueTokens{true};
 
 private:
@@ -1663,7 +1664,7 @@ private:
         mTokens = BeamTokens(mSamplingConfig.getBeamWidth());
         for (auto& beamTokens : mTokens)
         {
-            beamTokens.reserve(promptTokensCapacity(inputTokens.size(), mMaxNewTokens));
+            beamTokens.reserve(beamTokensCapacity(inputTokens.size(), mMaxNewTokens));
             beamTokens.assign(inputTokens.cbegin(), inputTokens.cend());
         }
         initializeFromTokens(arrivalTime);
@@ -1679,7 +1680,7 @@ private:
         }
         mTokens = BeamTokens(1);
         mTokens.front() = std::move(inputTokens);
-        mTokens.front().reserve(promptTokensCapacity(mTokens.front().size(), mMaxNewTokens));
+        mTokens.front().reserve(beamTokensCapacity(mTokens.front().size(), mMaxNewTokens));
         initializeFromTokens(arrivalTime);
     }
 

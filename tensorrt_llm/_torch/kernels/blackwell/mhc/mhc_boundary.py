@@ -1557,11 +1557,8 @@ def compiled(
         )
     if tokens <= MAX_TOKENS:
         return (hidden, with_post, sinkhorn_iters, mxfp8, boundary_tile(tokens)) in _COMPILED
-    return ("stream", hidden, with_post) in _COMPILED and (
-        "finalize",
-        hidden,
-        sinkhorn_iters,
-    ) in _COMPILED
+    stream = ("stream", hidden, with_post, _stream_ctas(torch.cuda.current_device()))
+    return stream in _COMPILED and ("finalize", hidden, sinkhorn_iters) in _COMPILED
 
 
 def _mat(dtype, *shape):
@@ -1612,10 +1609,15 @@ def _compile_tile(hidden: int, with_post: bool, sinkhorn_iters: int, mxfp8: bool
 
 
 @functools.cache
-def _compile_stream(hidden: int, with_post: bool):
+def _stream_ctas(device_index: int) -> int:
+    """Persistent CTAs per hidden slice of ``MhcStreamKernel``: one wave on the device."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count // CLUSTER
+
+
+@functools.cache
+def _compile_stream(hidden: int, with_post: bool, ctas: int):
     tokens = cute.sym_int()
     bf16 = cutlass.BFloat16
-    ctas = torch.cuda.get_device_properties().multi_processor_count // CLUSTER
     fn = cute.compile(
         MhcStreamKernel(hidden, with_post, ctas),
         _mat(bf16, tokens, hidden),
@@ -1630,7 +1632,7 @@ def _compile_stream(hidden: int, with_post: bool):
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
-    _COMPILED.add(("stream", hidden, with_post))
+    _COMPILED.add(("stream", hidden, with_post, ctas))
     return fn
 
 
@@ -1732,7 +1734,8 @@ def mhc_boundary(
     [B, 4]``, ``comb_prev [B, 16]``, ``pre_lag [B, 4]`` (FP32), ``weight =
     prepare_boundary_weight(fn)`` and the BF16 ``norm_weight`` folded into ``layer_input``.
     Up to ``MAX_TOKENS`` tokens run the single-pass kernel, more the stream and finalize kernels.
-    With ``sinkhorn_iters = 0``, ``comb_cur`` holds the row softmax for ``mhc_sinkhorn``.
+    With ``sinkhorn_iters = 0``, ``comb_cur`` holds the row softmax for ``mhc_sinkhorn``; a model
+    with zero iterations passes 1, which gives its comb (the column normalization always runs).
     Returns ``(residual_cur, pre_cur, post_cur, comb_cur, layer_input, layer_input_mxfp8)``; with
     ``mxfp8`` the single-pass kernel also returns ``torch.ops.trtllm.mxfp8_quantize(layer_input,
     True)`` as ``layer_input_mxfp8`` (E4M3 values, swizzled UE8M0 scales), which is None otherwise.
@@ -1779,7 +1782,9 @@ def mhc_boundary(
         )
     else:
         partials = torch.empty(tokens, CLUSTER, PART, dtype=torch.float32, device=dev)
-        _compile_stream(hidden, with_post)(*activations, residual_cur, layer_input, partials)
+        _compile_stream(hidden, with_post, _stream_ctas(dev.index))(
+            *activations, residual_cur, layer_input, partials
+        )
         _compile_finalize(hidden, sinkhorn_iters)(
             partials,
             scale,

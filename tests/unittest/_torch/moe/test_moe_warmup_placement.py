@@ -13,7 +13,6 @@ every per-slot tensor moves. After every round the eager outputs and those of CU
 bitwise the one-copy identity placement's; after the last one the counters stop.
 """
 
-import dataclasses
 import functools
 import pickle
 import sys
@@ -38,7 +37,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
 from tensorrt_llm._utils import get_sm_version, mpi_allgather, mpi_rank, mpi_world_size
-from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoeWarmupPlacementConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -260,7 +259,7 @@ def _run_placement(gens: int, draft_len: int) -> None:
             hidden_size=_HIDDEN_SIZE,
             quant_config=quant_config,
         ).create_weights(x_sf_global=torch.tensor(448.0 * 6.0))
-        settings = mwp.WarmupPlacementSettings(
+        settings = MoeWarmupPlacementConfig(
             start_step=0,
             interval_steps=1,
             max_migrations=_PHASES,
@@ -305,7 +304,7 @@ def _run_placement(gens: int, draft_len: int) -> None:
         moved = [0] * len(layers)
         # Step 1 plans under a min_round_gain no plan meets: it moves nothing but halves the
         # counters as a round that moves does; step 2 then places phase 0 from both of its forwards.
-        skip = dataclasses.replace(settings, min_round_gain=1e9)
+        skip = settings.model_copy(update={"min_round_gain": 1e9})
         for step in range(_PHASES + 2):
             torch.cuda.synchronize()
             before = {

@@ -227,6 +227,7 @@ class SharedPromptStore:
                     entries = sorted(self._scan())
                     total = sum(cost for _, cost, _ in entries)
                     target = int(_EVICT_TO * self._max_bytes)
+                    freed = 0
                     for _, cost, name in entries:
                         if total <= target:
                             break
@@ -235,11 +236,14 @@ class SharedPromptStore:
                         except OSError:
                             continue
                         total -= cost
+                        freed += cost
                     with self._mutex, self._locked("lock"):
-                        # Entries written since ``start`` are in the running total, not the scan.
-                        self._store_total(total + self._load_total() - start)
-                    if total > target:
-                        return  # the remaining entries cannot be removed
+                        current = self._load_total()
+                        # An entry written since ``start`` can be in both the scan and the running
+                        # total, so the scan replaces that total only if no write changed it.
+                        self._store_total(total if current == start else current - freed)
+                    if not freed or total > target:
+                        return  # the scan was under the target, or nothing more can be removed
         except BlockingIOError:
             return
         except OSError as error:

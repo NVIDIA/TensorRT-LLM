@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host entry of the GB300 (512 TMEM columns) sparse MLA attention (``kernel_gb300.py``)."""
+"""Host entry of the sm_103 sparse MLA attention (``kernel_gb300.py``)."""
 
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ def sparse_mla_attention_gb300(
     """Attention of ``q`` ``[T, 64, 512]`` E4M3 over each token's bank rows ``indices[t, :lengths[t]]``.
 
     ``bank_ptr`` is the base address of the ``[R, 512]`` E4M3 bank rows; ``indices`` is ``[T, W]`` int32 with
-    W <= 640 and W % 4 == 0 (row stride W; entries past the length are ignored), ``lengths`` ``[T]`` int32;
-    ``sinks`` ``[64]`` FP32 logits; ``scale`` FP32 q_dequant * kv_dequant * softmax_scale * log2(e) and ``vscale``
-    FP32 kv_dequant. ``epi="stm"`` writes ``out`` ``[T, 64, 512]`` BF16.
+    W <= 640 and a row stride that is a multiple of 64 (entries past the length are ignored), ``lengths``
+    ``[T]`` int32; ``sinks`` ``[64]`` FP32 logits; ``scale`` FP32 q_dequant * kv_dequant * softmax_scale *
+    log2(e) and ``vscale`` FP32 kv_dequant. ``epi="stm"`` writes ``out`` ``[T, 64, 512]`` BF16.
 
     ``epi="rope_mxfp8"`` writes ``grouped_output_mxfp8``'s input instead, bit for bit what
     ``inverse_rope_mxfp8(out, positions, rope_table, 8)`` gives on the BF16 O: ``out_fp8`` E4M3 ``[8, T, 4096]`` and
@@ -57,9 +57,11 @@ def sparse_mla_attention_gb300(
     if indices.dtype != torch.int32 or indices.dim() != 2 or indices.shape[0] < tokens:
         raise ValueError("indices must be an int32 [T, W] tensor")
     width = indices.stride(0)
-    if indices.stride(1) != 1 or width % 4 or indices.shape[1] > _k.LIST_COLS:
+    # The kernel copies each list in whole tiles of KEYS entries.
+    if indices.stride(1) != 1 or width % _k.KEYS or indices.shape[1] > _k.LIST_COLS:
         raise ValueError(
-            f"indices rows must be contiguous, 16-byte aligned and at most {_k.LIST_COLS} wide"
+            f"indices rows must be contiguous with a row stride that is a multiple of {_k.KEYS}, "
+            f"and at most {_k.LIST_COLS} wide"
         )
     if lengths.dtype != torch.int32 or lengths.shape[0] < tokens:
         raise ValueError("lengths must be an int32 [T] tensor")
@@ -126,7 +128,7 @@ def sparse_mla_attention_gb300(
     fn = _COMPILED.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Compile the GB300 sparse MLA kernel before CUDA graph capture")
+            raise RuntimeError("Compile the sm_103 sparse MLA kernel before CUDA graph capture")
         fn = _COMPILED[key] = cute.compile(
             _k.SparseMlaAttentionGB300(arch, epi=epi, pdl=bool(pdl)), *args
         )

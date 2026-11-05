@@ -67,6 +67,7 @@ std::tuple<torch::Tensor, torch::Tensor> fusedInvRopeFp8Quant( //
     TORCH_CHECK(o.is_contiguous(), "o must be contiguous");
     TORCH_CHECK(o.dim() == 3, "o must be 3D [num_tokens, num_heads, head_dim]");
     TORCH_CHECK(positions.is_cuda(), "positions must be on CUDA");
+    TORCH_CHECK(positions.device() == o.device(), "positions must be on the same device as o");
     TORCH_CHECK(positions.scalar_type() == torch::kInt64 || positions.scalar_type() == torch::kInt32,
         "positions must be int32 or int64");
     TORCH_CHECK(
@@ -75,6 +76,9 @@ std::tuple<torch::Tensor, torch::Tensor> fusedInvRopeFp8Quant( //
     int64_t const num_tokens = o.size(0);
     int64_t const num_heads = o.size(1);
     int64_t const head_dim = o.size(2);
+    // The kernel reads positions[0, num_tokens) with unit stride.
+    TORCH_CHECK(positions.dim() == 1 && positions.size(0) >= num_tokens && positions.is_contiguous(),
+        "positions must be a contiguous 1D tensor of at least num_tokens (", num_tokens, ") entries");
 
     TORCH_CHECK(quant_group_size == kQuantGroupSize, "Only quant_group_size=", kQuantGroupSize, " supported, got ",
         quant_group_size);

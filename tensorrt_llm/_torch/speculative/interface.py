@@ -813,7 +813,7 @@ class SpecMetadata:
     group_all_greedy_sample: Optional[bool] = None
     # This rank's batch has only greedy and temperature-only rows (the scan's local value), and
     # its group-synchronized AND when attention-DP ranks sample from shards of a shared head
-    # (``_sync_group_all_greedy_sample``; None = no group sync).
+    # (``sync_group_all_greedy_sample``; None = no group sync).
     local_all_temperature_only: bool = False
     group_all_temperature_only: Optional[bool] = None
     # Deploy-time: the worker samples greedy and temperature-only target rows from this

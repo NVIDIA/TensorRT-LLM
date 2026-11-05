@@ -168,6 +168,18 @@ void checkParams(Csa2SparseDecodeParams const& p, Csa2SparseDecodeSchedule const
                 "CSA2 sparse decode page mapping is invalid");
         }
     }
+    int64_t const remTokens = p.numTokens - int64_t{s.fullPerCta} * s.numCtas;
+    if (remTokens > 0)
+    {
+        // Every remainder chunk must hold a block and run on a launched CTA, every remainder token needs an arrival
+        // counter, and no token may be cut into more parts than the combine kernel merges.
+        int64_t const remBlocks = remTokens * blocksPerToken(p.swaTopk, p.mainTopk);
+        bool const mergeable
+            = s.remCtas <= remTokens || (s.remCtas % remTokens == 0 && s.remCtas / remTokens <= kMaxCombineSplits);
+        TLLM_CHECK_WITH_INFO(s.remCtas > 0 && s.remCtas <= s.numCtas && s.remCtas <= remBlocks
+                && remTokens <= kMaxSplitTokens && mergeable,
+            "CSA2 sparse decode schedule does not match the token count and top-k widths");
+    }
     TLLM_CHECK_WITH_INFO(p.attnSinks != nullptr, "CSA2 sparse decode needs the attention sinks");
     TLLM_CHECK_WITH_INFO(p.workspace != nullptr && isAligned(p.workspace, kWorkspaceAlignment),
         "CSA2 sparse decode workspace must be 256-B aligned");
@@ -324,6 +336,11 @@ bool isSupported()
         {
             static_cast<void>(cudaGetLastError());
             supported = false;
+        }
+        else
+        {
+            supported = attributes.sharedSizeBytes + Csa2Kernel::SMEM_SIZE
+                <= static_cast<size_t>(common::getMaxSharedMemoryPerBlockOptin());
         }
     }
     if (device < kMaxDevices)

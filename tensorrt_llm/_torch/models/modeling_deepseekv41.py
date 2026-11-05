@@ -1271,7 +1271,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             )
         # The next layer's split entry prefetches like the FFN boundary above, or all-reduces
         # the MoE output itself.
-        self._moe_ar_trigger_at_end = not (split and self._v41_defer_post_mapping)
+        trigger_allreduce_at_end = not (split and self._v41_defer_post_mapping)
         moe_allreduce = getattr(self.mlp, "allreduce", None)
         moe_partial = (
             lamport is not None and self._v41_defer_post_mapping and moe_allreduce is not None
@@ -1285,8 +1285,6 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             and not spec_metadata.spec_dec_mode.is_dspark()
         )
         moe_unfinalized = moe_partial and self._moe_supports_unfinalized() and not materializes_next
-        self._moe_ar_skip = moe_partial
-        self._moe_unfinalized = moe_unfinalized
         x_ffn = self.forward_MoE(
             hidden_states=layer_input,
             attn_metadata=attn_metadata,
@@ -1294,9 +1292,11 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             input_ids=input_ids,
             hidden_states_normalized=True,
             unrouted_rows=unrouted_rows,
+            skip_allreduce=moe_partial,
+            trigger_allreduce_at_end=trigger_allreduce_at_end,
+            unfinalized=moe_unfinalized,
             **({"image_mask": image_mask} if image_mask is not None else {}),
         )
-        self._moe_unfinalized = False
         if moe_unfinalized:
             shared_out, fc2_out, expert_scales, permuted_idx = x_ffn
             x_ffn = MoeUnfinalized(
@@ -1387,7 +1387,7 @@ class DeepseekV41Model(DeepseekV4Model):
         # The CSA2 cache manager and its estimator follow this decision.
         model_config.extra_attrs["csa2_encoder_replay"] = self.encoder_replay_enabled
         mapping = model_config.mapping
-        # GB300 measurements cover TP4 head-sharded host tables at T=1.
+        # Measured on GB300 with head-sharded host tables (TP4 and TP8, up to 64 rows).
         self._engram_projection_schedule = (
             {0: 1, 2: 14}
             if torch.cuda.is_available()
@@ -1520,10 +1520,9 @@ class DeepseekV41Model(DeepseekV4Model):
             kwargs.pop("context_requests", None)
             requests = None
         engram_streams = []
-        # FIXME: Investigate intermittent startup failures with eager Engram side-stream
-        # execution when BCG is enabled and remote-tail and attention DP are disabled.
+        # Engram's side stream intermittently broke startup inside breakable CUDA graphs, so a BCG
+        # forward runs Engram on the model stream; eager prefill and decode-only batches keep it.
         if self.use_engram and is_in_breakable_cuda_graph():
-            # BCG uses the model stream; eager prefill and decode-only batches retain Engram's stream.
             for layer_id in self.engram_layer_ids:
                 engram = self.layers[layer_id].engram
                 if engram is not None and engram.stream is not None:
@@ -1589,15 +1588,22 @@ class DeepseekV41Model(DeepseekV4Model):
 
     def _supports_engram_context_overlap(self, model_config: ModelConfig[PretrainedConfig]) -> bool:
         """Whether context batches can overlap the Engram layers' work with the model stream."""
+
+        def packs_rows(engram) -> bool:
+            # Packed rows feed the MXFP8 projection: 32-lane scale blocks, 128-lane K tiles per rank.
+            table = engram.multi_head_embedding
+            return (
+                engram.exchanges_token_rows
+                and engram.kv_proj.supports_packed_input()
+                and getattr(table, "block_size", None) == 32
+                and table.num_local_heads * table.embedding_dim % 128 == 0
+            )
+
         return (
             model_config.mapping.tp_size == 2
             and self.use_engram
             and self.engram_layer_ids == list(_ENGRAM_CONTEXT_SCHEDULE)
-            and all(
-                self.layers[layer_id].engram.exchanges_token_rows
-                and self.layers[layer_id].engram.kv_proj.supports_packed_input()
-                for layer_id in self.engram_layer_ids
-            )
+            and all(packs_rows(self.layers[layer_id].engram) for layer_id in self.engram_layer_ids)
         )
 
     def _use_engram_context_overlap(self, attn_metadata: CSA2TrtllmMetadata) -> bool:
@@ -3416,10 +3422,15 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         defer_ok = defer_ok and not self.model_config.mapping.has_pp()
         layers = self._post_load_decoder_layers()
         # The NVFP4 MoEs consume their input as fp4_quantize(x, fc31_input_scale) writes it,
-        # which the FFN boundary can produce alongside the BF16 router input.
+        # which the FFN boundary can produce alongside the BF16 router input. An AWQ/ARC
+        # pre-quant scale must apply before that quantization, so those MoEs take BF16.
         nvfp4_moe = self.model_config.moe_backend in ("CUTEDSL", "TRTLLM")
         for idx, layer in enumerate(layers):
-            layer._moe_nvfp4_input = nvfp4_moe and layer.mlp.experts.has_nvfp4
+            layer._moe_nvfp4_input = (
+                nvfp4_moe
+                and layer.mlp.experts.has_nvfp4
+                and getattr(layer.mlp.experts.backend, "fc31_act_scale", None) is None
+            )
             layer._shared_fp8_1x128 = layer._moe_nvfp4_input and _shared_expert_takes_fp8_1x128(
                 layer.mlp
             )

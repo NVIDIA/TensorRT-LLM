@@ -63,8 +63,9 @@ class RequestQueueItem:
     admit_orig_arrival: Optional[float] = None
     # Waiting-queue passes that left this request queued because its rank was full.
     admission_wait_iters: int = 0
-    # Prompt length, kept when ``request`` travels without its prompt, and the prompt
-    # itself on the rank that owns such a request (see RequestBroadcaster).
+    # The number of input token ids ``request`` carries (without the prefix a prompt-tail
+    # transport left out), kept when it travels without them, and those ids on the rank
+    # that owns such a request (see RequestBroadcaster).
     num_input_tokens: Optional[int] = None
     prompt_token_ids: Optional[np.ndarray] = None
 

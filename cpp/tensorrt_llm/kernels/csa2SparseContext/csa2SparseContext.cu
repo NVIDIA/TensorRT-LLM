@@ -195,7 +195,8 @@ bool isSupported()
         static_cast<void>(cudaGetLastError());
         return false;
     }
-    return true;
+    return attributes.sharedSizeBytes + detail::kSmemBytes
+        <= static_cast<size_t>(common::getMaxSharedMemoryPerBlockOptin());
 #endif
 }
 

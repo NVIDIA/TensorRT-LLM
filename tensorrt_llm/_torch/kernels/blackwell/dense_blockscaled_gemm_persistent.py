@@ -1883,13 +1883,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """Scale this thread's 32 BF16 row values to E4M3 range and store their UE8M0 byte.
 
         The scaled values are exact in BF16; the FP8 store converts them. Rows past M
-        up to the next multiple of 128 store a zero scale; rows beyond store none.
+        up to the next multiple of 128 store a zero scale; rows beyond, and columns past
+        the group's N, store none.
         """
         thread = cute.arch.thread_idx()[0]
         row = tile_m * self.cta_tile_shape_mnk[0] + thread
         width = mC.shape[1]
-        block = (tile_l * width + tile_n * self.cta_tile_shape_mnk[1] +
-                 subtile * self.epi_tile_n) // 32
+        first = tile_n * self.cta_tile_shape_mnk[1] + subtile * self.epi_tile_n
+        block = (tile_l * width + first) // 32
         values = cute.make_tensor(rC.iterator, cute.make_layout(32))
         amax = cutlass.Float32(0.0)
         for column in cutlass.range_constexpr(32):
@@ -1916,7 +1917,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         blocks = width * mC.shape[2] // 32
         offset = ((row // 128) * blocks * 128 + (block // 4) * 512 +
                   (row % 32) * 16 + ((row % 128) // 32) * 4 + block % 4)
-        if row < (mC.shape[0] + 127) // 128 * 128:
+        # A tile may run past the group's columns; their scales stay unwritten.
+        if (row < (mC.shape[0] + 127) // 128 * 128) & (first < width):
             scales[offset] = cutlass.Uint8(exponent)
 
     @cute.jit

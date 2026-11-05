@@ -1217,10 +1217,8 @@ def _create_warmup_placement(
         ep_size: int) -> Optional["WarmupPlacementController"]:
     """The controller of ``moe_load_balancer.warmup_placement``, or None when unset."""
     from .moe_warmup_placement import (WarmupPlacementController,
-                                       WarmupPlacementSettings,
                                        register_controller)
-    settings = WarmupPlacementSettings.from_config(
-        model_config.moe_load_balancer.warmup_placement)
+    settings = model_config.moe_load_balancer.warmup_placement
     if settings is None:
         return None
     # MoE layers past the target's decoder layers are draft (MTP) layers.

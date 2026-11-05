@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -789,9 +790,14 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
         input_ids: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # gate_forward supports target geometries (256/384 experts, top-6),
-        # not V4.1's smaller draft bank, which routes through a CuTe DSL kernel.
+        # not V4.1's smaller draft bank, which routes through a CuTe DSL kernel
+        # on SM100-family GPUs and through the PyTorch reference elsewhere.
         if self._top_k == 3 and logits.shape[-1] == 128:
-            return self._apply_draft(logits, input_ids)
+            from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+            if logits.is_cuda and IS_CUTLASS_DSL_AVAILABLE and is_sm_100f():
+                return self._apply_draft(logits, input_ids)
+            return self._apply_pytorch(logits, input_ids)
         # gate_forward kernel requires float32 input scores
         return self._apply_native(logits.to(torch.float32), input_ids)
 
