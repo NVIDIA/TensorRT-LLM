@@ -3617,6 +3617,13 @@ async def test_video_omni_invalid_reference_part(value, status, repeat, omni_ref
     assert generator.last_inputs is None
 
 
+async def _wait_for(condition, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert condition()
+
+
 @pytest.mark.asyncio
 async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
     tmp_path, monkeypatch
@@ -3626,9 +3633,16 @@ async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
     request was cancelled holds its worker until it returns."""
     from tensorrt_llm.serve import openai_video_routes
 
+    routes = openai_video_routes._VideoRoutesMixin
+    submit = routes._parse_visual_gen_params
     parse = openai_video_routes.parse_visual_gen_params
     release = threading.Event()
-    started = []
+    submitted, started = [], []
+
+    async def counting_submit(self, request):
+        # Hands the parse to the pool before its first await.
+        submitted.append(request)
+        return await submit(self, request)
 
     def blocking_parse(request, generator):
         started.append(threading.current_thread().name)
@@ -3636,6 +3650,7 @@ async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
             release.wait(10)
         return parse(request, generator)
 
+    monkeypatch.setattr(routes, "_parse_visual_gen_params", counting_submit)
     monkeypatch.setattr(openai_video_routes, "parse_visual_gen_params", blocking_parse)
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
     generator = MockVisualGen(image_output=_make_dummy_image_tensor())
@@ -3643,16 +3658,13 @@ async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
     try:
         async with _create_async_client(generator, media_load_workers=1) as client:
             first = asyncio.create_task(client.post("/v1/images/generations", json=body))
-            deadline = time.monotonic() + 10
-            while not started and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
-            assert started
+            await _wait_for(lambda: started)
             first.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await first
 
             second = asyncio.create_task(client.post("/v1/images/generations", json=body))
-            await asyncio.sleep(0.2)
+            await _wait_for(lambda: len(submitted) == 2)
             assert len(started) == 1
             release.set()
             resp = await second
@@ -3660,3 +3672,22 @@ async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
         release.set()
     assert resp.status_code == 200, resp.text
     assert all(name.startswith("trtllm_media_load") for name in started)
+
+
+def test_server_shutdown_stops_the_media_load_pool(tmp_path, monkeypatch):
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    with patch("tensorrt_llm.serve.openai_server._is_visual_gen_instance", return_value=True):
+        server = OpenAIServer(
+            generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+            model="test-model",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+    with TestClient(server.app):
+        pass
+    with pytest.raises(RuntimeError):
+        server._media_load_executor.submit(int)

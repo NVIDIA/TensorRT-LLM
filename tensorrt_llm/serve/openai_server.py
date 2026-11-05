@@ -877,6 +877,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # down; the /metrics handler already treats that as no stats.
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
+            self._media_load_executor.shutdown(wait=False, cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
