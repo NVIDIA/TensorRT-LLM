@@ -24,7 +24,7 @@ def store_context_logits(
     """Consume context rows from either projection path using one result contract.
 
     Prompt logprobs are reduced on the logits' device; only the reduced rows and
-    the final prompt row reach host memory.
+    the final prompt row's log probabilities reach host memory.
 
     Args:
         request: Context request whose current chunk produced ``logits``.
@@ -52,7 +52,25 @@ def store_context_logits(
         reduce_prompt_logprobs(logits[: len(targets)], targets, request.py_prompt_logprobs)
     )
     if offset + logits.shape[0] == request.context_chunk_size and request.is_last_context_chunk:
-        request.py_result.set_prompt_last_logits(logits[-1:].to("cpu", copy=True))
+        request.py_result.set_prompt_last_logprobs(_normalized_host_row(logits[-1:]))
+
+
+def _normalized_host_row(row: torch.Tensor) -> torch.Tensor:
+    """Log-softmax ``row`` on its own device, like the other prompt rows, and copy it to host.
+
+    Args:
+        row: ``[1, vocab]`` logits of any floating dtype.
+
+    Returns:
+        ``[1, vocab]`` FP32 host tensor of log probabilities.
+    """
+    try:
+        logprobs = torch.log_softmax(row.to(dtype=torch.float32), dim=-1)
+    except torch.OutOfMemoryError:
+        if not row.is_cuda:
+            raise
+        logprobs = torch.log_softmax(row.to("cpu", dtype=torch.float32), dim=-1)
+    return logprobs.to("cpu", copy=True)
 
 
 def _keeps_context_logits(request: LlmRequest) -> bool:

@@ -1382,9 +1382,11 @@ class IterationResult:
 
 
 def _reduce_prompt_logprobs_chunk(logits: torch.Tensor,
-                                  token_ids: Optional[list[int]],
-                                  top_k: int) -> torch.Tensor:
-    logprobs = F.log_softmax(logits.to(dtype=torch.float32), dim=-1)
+                                  token_ids: Optional[list[int]], top_k: int,
+                                  normalized: bool) -> torch.Tensor:
+    logprobs = logits.to(dtype=torch.float32)
+    if not normalized:
+        logprobs = F.log_softmax(logprobs, dim=-1)
     columns = []
     if token_ids is not None:
         targets = torch.tensor(token_ids,
@@ -1403,8 +1405,11 @@ def _reduce_prompt_logprobs_chunk(logits: torch.Tensor,
                      dim=1).cpu()
 
 
-def reduce_prompt_logprobs(logits: torch.Tensor, token_ids: Optional[list[int]],
-                           top_k: int) -> torch.Tensor:
+def reduce_prompt_logprobs(logits: torch.Tensor,
+                           token_ids: Optional[list[int]],
+                           top_k: int,
+                           *,
+                           normalized: bool = False) -> torch.Tensor:
     """Reduce context logits to the values reported as prompt logprobs.
 
     The reduction runs on the logits' device and copies one small host tensor
@@ -1416,6 +1421,8 @@ def reduce_prompt_logprobs(logits: torch.Tensor, token_ids: Optional[list[int]],
         token_ids: Target token ids, one per used row, or None to report only
             the top-k tokens.
         top_k: Number of most likely tokens to report per row.
+        normalized: ``logits`` already hold log probabilities, so they are
+            reported as is instead of being log-softmaxed again.
 
     Returns:
         ``[rows, columns]`` FP64 host tensor. With ``token_ids``, the columns
@@ -1435,13 +1442,15 @@ def reduce_prompt_logprobs(logits: torch.Tensor, token_ids: Optional[list[int]],
         tokens = None if token_ids is None else token_ids[start:start +
                                                           chunk.shape[0]]
         try:
-            reduced = _reduce_prompt_logprobs_chunk(chunk, tokens, top_k)
+            reduced = _reduce_prompt_logprobs_chunk(chunk, tokens, top_k,
+                                                    normalized)
         except torch.OutOfMemoryError:
             if not chunk.is_cuda:
                 raise
             reduced = None
         if reduced is None:
-            reduced = _reduce_prompt_logprobs_chunk(chunk.cpu(), tokens, top_k)
+            reduced = _reduce_prompt_logprobs_chunk(chunk.cpu(), tokens, top_k,
+                                                    normalized)
         chunks.append(reduced)
     if not chunks:
         columns = (0 if token_ids is None else 2) + 2 * top_k

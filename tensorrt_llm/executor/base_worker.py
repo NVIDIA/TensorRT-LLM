@@ -24,7 +24,8 @@ import weakref
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import (TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple,
+                    Union)
 
 import torch
 
@@ -54,7 +55,7 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
 from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict,
-                     prompt_logprobs_from_reduced)
+                     prompt_logprobs_from_reduced, reduce_prompt_logprobs)
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
@@ -1689,16 +1690,18 @@ def _compute_pytorch_prompt_logprobs(
         if cached is not None:
             return LogProbsResult(prompt=cached)
     context_logits = response.result.context_logits
+    compact_rows = response.result.context_prompt_logprob_rows
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
-    if (context_logits is None and result.is_sequence_final
-            and result.finish_reasons
+    if (context_logits is None and compact_rows is None
+            and result.is_sequence_final and result.finish_reasons
             and all(reason == tllm.FinishReason.CANCELLED
                     for reason in result.finish_reasons)):
         # Cancellation before execution has no prompt logits to report. Keep
         # cached streaming logprobs above, but do not invent them for queued work.
         return None
-    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    assert context_logits is not None or compact_rows is not None, \
+        "context_logits must not be None when prompt_logprobs is requested."
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
     assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."
@@ -1706,7 +1709,6 @@ def _compute_pytorch_prompt_logprobs(
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
 
-    compact_rows = response.result.context_prompt_logprob_rows
     if compact_rows is not None:
         rows = torch.cat(compact_rows)
         if rows.shape[0] + 1 != len(prompt_token_ids):
@@ -1716,23 +1718,24 @@ def _compute_pytorch_prompt_logprobs(
                 f"prompt logprobs need context logits for all "
                 f"{len(prompt_token_ids)} prompt tokens, got {rows.shape[0] + 1} "
                 "(a reused KV cache prefix is not rescored)")
-        tail = response.result.context_prompt_last_logits
+        tail = response.result.context_prompt_last_logprobs
         assert tail is not None, "Completed prompt must retain its last prediction row"
-        compact = prompt_logprobs_from_reduced(
-            rows, prompt_token_ids[:-1], logprob_params.prompt_logprobs,
-            logprob_params.prompt_logprobs_simple_format)
-        tail_result = compute_prompt_logprobs(
-            logprob_params.prompt_logprobs,
-            tail,
-            first_generation_token,
-            simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format)
-        logprobs_result = LogProbsResult(
-            prompt=[*compact, *(tail_result.prompt or [])])
+        # The executor already normalized the last row on the logits' device,
+        # matching the other rows; normalizing it again on the host would not.
+        rows = torch.cat([
+            rows,
+            reduce_prompt_logprobs(tail,
+                                   first_generation_token,
+                                   logprob_params.prompt_logprobs,
+                                   normalized=True)
+        ])
+        logprobs_result = LogProbsResult(prompt=prompt_logprobs_from_reduced(
+            rows, prompt_token_ids, logprob_params.prompt_logprobs,
+            logprob_params.prompt_logprobs_simple_format))
         if generation_result._streaming:
             generation_result._cached_prompt_logprobs = logprobs_result.prompt
         return logprobs_result
 
-    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     logprobs_result = compute_prompt_logprobs(
         logprob_params.prompt_logprobs,
         context_logits,

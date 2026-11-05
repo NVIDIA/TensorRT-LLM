@@ -340,7 +340,7 @@ class PyResult:
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
         context_logits_on_cpu: bool = False
         prompt_logprob_rows: list[torch.Tensor] = field(default_factory=list)
-        prompt_last_logits: torch.Tensor | None = None
+        prompt_last_logprobs: torch.Tensor | None = None
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
@@ -379,7 +379,7 @@ class PyResult:
         # Prompt logprobs reduced on the executor (``reduce_prompt_logprobs``
         # rows); the worker builds the user-facing values from them.
         self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
-        self.context_prompt_last_logits: torch.Tensor | None = None
+        self.context_prompt_last_logprobs: torch.Tensor | None = None
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
             use_device_memory=use_device_memory,
@@ -427,8 +427,8 @@ class PyResult:
             if self.context_prompt_logprob_rows is None:
                 self.context_prompt_logprob_rows = []
             self.context_prompt_logprob_rows.extend(diff.prompt_logprob_rows)
-        if diff.prompt_last_logits is not None:
-            self.context_prompt_last_logits = diff.prompt_last_logits
+        if diff.prompt_last_logprobs is not None:
+            self.context_prompt_last_logprobs = diff.prompt_last_logprobs
         if diff.exclude_last_generation_logits is not None:
             self._exclude_last_generation_logits = diff.exclude_last_generation_logits
         if len(diff.context_logits_list) > 0:
@@ -504,17 +504,18 @@ class PyResult:
         self.context_prompt_logprob_rows.append(rows)
         self.diff.prompt_logprob_rows.append(rows)
 
-    def set_prompt_last_logits(self, logits: torch.Tensor) -> None:
-        """Retain the last prompt position's logits.
+    def set_prompt_last_logprobs(self, logprobs: torch.Tensor) -> None:
+        """Retain the last prompt position's normalized log probabilities.
 
         The worker scores the first generated token with this row once it is
-        known.
+        known, without normalizing it again.
 
         Args:
-            logits: ``[1, vocab]`` FP32 host tensor.
+            logprobs: ``[1, vocab]`` FP32 host tensor of log-softmax values,
+                normalized on the device that produced the logits.
         """
-        self.context_prompt_last_logits = logits
-        self.diff.prompt_last_logits = logits
+        self.context_prompt_last_logprobs = logprobs
+        self.diff.prompt_last_logprobs = logprobs
 
     def append_context_logits(self,
                               context_logits: torch.Tensor,
@@ -727,7 +728,7 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'context_prompt_logprob_rows',
-         'context_prompt_last_logits', 'generation_logits', 'log_probs',
+         'context_prompt_last_logprobs', 'generation_logits', 'log_probs',
          'cum_log_probs', 'first_gen_log_probs', 'mm_embedding_handles',
          'additional_context_outputs', 'additional_generation_outputs',
          'encoder_output', 'mrope_position_ids_handle',
