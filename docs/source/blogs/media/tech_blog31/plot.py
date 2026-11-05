@@ -373,21 +373,66 @@ def halo_latency(data: dict) -> None:
     save(fig, "halo_latency")
 
 
-def bars(data: dict) -> None:
-    fig, ax = plt.subplots(figsize=(6.4, 3.2), layout="constrained")
+def motivation(data: dict) -> None:
+    fig, ax = plt.subplots(figsize=(6.4, 5.0))
+    fig.subplots_adjust(left=0.08, right=0.92, top=0.98, bottom=0.23)
     values = data["motivation"]["seconds"]
-    ax.barh(
-        ["VAE decode", "Transformer", "Prompt +\nVAE encode"],
+    total = sum(values)
+    labels = ["VAE decode", "Transformer rollout", "Prompt + VAE encode"]
+    wedges, _ = ax.pie(
         values,
-        color=[GREEN, BLUE, ORANGE],
-        height=0.6,
+        colors=["#76B900", "#4C5B6B", "#9AA7B3"],
+        startangle=90,
+        counterclock=False,
+        wedgeprops={"width": 0.38, "edgecolor": "white", "linewidth": 3},
+        explode=[0.04, 0, 0],
     )
-    for i, value in enumerate(values):
-        ax.text(value + 0.2, i, f"{value:.1f} s", va="center")
-    ax.invert_yaxis()
-    ax.set(xlim=(0, 15), xticks=[0, 5, 10, 15], xlabel="Time per rollout (seconds)")
-    clean(ax)
+    ax.legend(
+        wedges,
+        [
+            f"{label}: {value:.1f} s ({100 * value / total:.0f}%)"
+            for label, value in zip(labels, values)
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.02),
+        frameon=False,
+        fontsize=15,
+        handlelength=1.2,
+    )
+    angle = np.deg2rad(90 - 180 * values[0] / total)
+    ax.text(
+        0.85 * np.cos(angle),
+        0.85 * np.sin(angle),
+        f"{100 * values[0] / total:.0f}%",
+        ha="center",
+        va="center",
+        fontsize=15,
+        weight="bold",
+        color="white",
+    )
+    ax.text(
+        0,
+        0.07,
+        f"{total:.1f} s",
+        ha="center",
+        va="center",
+        fontsize=29,
+        weight="bold",
+        color="#1F2933",
+    )
+    ax.text(
+        0,
+        -0.17,
+        f"per {data['motivation']['frames']}-frame clip",
+        ha="center",
+        va="center",
+        fontsize=13,
+        color="#5F6B76",
+    )
     save(fig, "motivation")
+
+
+def bars(data: dict) -> None:
     fig, ax = plt.subplots(figsize=(6.4, 2.5), layout="constrained")
     values = np.array(data["latency"]["median_ms"]) / 1000
     ax.barh(["BF16\nWan VAE", "WinoVAE"], values, color=[BLUE, GREEN], height=0.5)
@@ -446,6 +491,7 @@ def main() -> None:
     costs(data)
     sweep(data)
     halo_latency(data)
+    motivation(data)
     bars(data)
 
 
