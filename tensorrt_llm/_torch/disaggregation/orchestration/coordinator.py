@@ -242,6 +242,39 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
+        else:
+            self._retire_legacy_timed_out_gen_transfers()
+
+    def _retire_legacy_timed_out_gen_transfers(self) -> None:
+        """Progress expired receives without requiring a runnable model batch.
+
+        A successful legacy cancel authorizes memory release; a refused or
+        failed cancel must be retried with the request and its KV still held.
+        Multi-rank ADP publishes failures at the existing loop-head error vote.
+        """
+        timeout_ms = self._transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
+        canceled_ids = set(self._registry.canceled_request_ids())
+        retired = False
+        for request in list(self._registry.active_requests()):
+            if not request.is_generation_only_request or self._vote_id(request) in canceled_ids:
+                continue
+            if request.is_disagg_generation_transmission_in_progress:
+                self._flag_transfer_timeout(request, "generation", timeout_ms)
+            if (
+                not request.py_kv_transfer_timed_out
+                or request.state == LlmRequestState.DISAGG_TRANS_ERROR
+            ):
+                continue
+            if self.request_cancellation(request):
+                # The cancel contract proves no transfer still owns these KV
+                # pages. Clear the in-progress state before the error handler
+                # checks ownership, so it can terminate instead of parking.
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                retired = True
+        if retired:
+            self._check_transfer_errors("generation requests")
 
     def _describe_transfer_timeout(self, request: LlmRequest) -> str:
         """Get optional native progress only when an existing deadline expires.
@@ -809,8 +842,8 @@ class DisaggTransferCoordinator:
         request; ``AsyncTransferManager`` counts them. A request that is still
         active gets its response created here (the transfer completed before
         the response pass could run) and staged for the rank-synchronized
-        flush; a failed transfer only releases its claim so the synchronized
-        error path can respond once every owner is done.
+        flush. An active failed request stays on the synchronized error path;
+        a departed request is reclaimed when its final owner releases it.
         """
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
         if self._registry.contains(request):
@@ -834,12 +867,10 @@ class DisaggTransferCoordinator:
                 self._effects.terminate_request(request)
             return
         if self._transfers.end_transfer(request):
-            if transfer_failed:
-                return
-            # Skip if the PP=1 early path already terminated this request;
-            # under PP>1 that path is off, so terminate here on completion.
-            if not self._force_terminate_ctx_for_partial_reuse:
-                self._effects.terminate_request(request)
+            # The response pass removed this request, but termination was
+            # deferred while a transfer owned its KV blocks. No active-request
+            # error pass can reclaim it now, so the last owner must do so.
+            self._effects.terminate_request(request)
 
     # -- timeouts and cancellation -------------------------------------------
 
