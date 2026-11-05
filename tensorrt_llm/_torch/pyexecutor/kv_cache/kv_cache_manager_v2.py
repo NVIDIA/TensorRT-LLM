@@ -1874,6 +1874,12 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         **kwargs,
     ) -> None:
+        """Initialize cache pools and per-request page-index buffers.
+
+        The configured max_seq_len bounds page-index capacity, including
+        generation headroom. Physical pool capacity may reduce the manager's
+        allocatable sequence length without reducing those buffers.
+        """
         self.mapping = mapping
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
