@@ -3675,9 +3675,11 @@ async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
 
 
 def test_server_shutdown_stops_the_media_load_pool(tmp_path, monkeypatch):
+    from tensorrt_llm.inputs.media_io import BaseMediaIO
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
+    monkeypatch.setattr(BaseMediaIO, "_executor", None)
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
     with patch("tensorrt_llm.serve.openai_server._is_visual_gen_instance", return_value=True):
         server = OpenAIServer(
@@ -3688,6 +3690,7 @@ def test_server_shutdown_stops_the_media_load_pool(tmp_path, monkeypatch):
             metadata_server_cfg=None,
         )
     with TestClient(server.app):
-        pass
+        assert BaseMediaIO._executor is server._media_load_executor
     with pytest.raises(RuntimeError):
         server._media_load_executor.submit(int)
+    assert BaseMediaIO._executor is None

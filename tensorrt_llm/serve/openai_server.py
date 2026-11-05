@@ -877,6 +877,9 @@ class OpenAIServer(_VideoRoutesMixin):
             # down; the /metrics handler already treats that as no stats.
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
+            # Later media loads in this process use the default executor.
+            if BaseMediaIO._executor is self._media_load_executor:
+                BaseMediaIO.set_executor(None)
             self._media_load_executor.shutdown(wait=False, cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
