@@ -688,13 +688,74 @@ Combining NVFP4 with Winograd is a separate numerical problem. If $Q_4$ is NVFP4
 
 These results concern the tested quantization recipes, not every possible NVFP4 Winograd implementation. Reconstruction-aware calibration remains untested. The [measurement notes](../media/tech_blog31/measurement_notes.md#channel-sorting-and-scale-search) describe the channel-grouping experiments and their arithmetic assumptions.
 
-### Fourier68: fewer products without the same error amplification
+### Fourier-domain convolution
 
-A Fourier-transform convolution offers another way to reduce products. For background on FFT convolution, see [Mathieu et al., *Fast Training of Convolutional Networks through FFTs*](https://arxiv.org/abs/1312.5851). The specific 68-product configuration and NVFP4 quantization results below are our experiments.
+Fourier-domain convolution replaces spatial filtering with products of frequency coefficients. Its reconstruction uses orthogonal basis functions, which gives a different error-propagation behavior from the real-point Winograd transforms. For public background on FFT convolution, see [Mathieu et al., *Fast Training of Convolutional Networks through FFTs*](https://arxiv.org/abs/1312.5851). The particular tile construction and NVFP4 quantization results below are our experiments.
 
-We call the tested decomposition **Fourier68** because it computes a 4 × 4 output tile using 68 real channel dot products, compared with 144 for direct convolution and 36 for spatial F4. On a 6 × 6 Fourier grid, real inputs give four real coordinates and sixteen complex-conjugate pairs. Each pair uses four real products, giving $4+16\times4=68$ in total.
+#### Transform, multiply, and reconstruct
 
-Figure 19 compares these decompositions on matched synthetic spatial 3 × 3 convolutions. This experiment measures error in one convolution, separately from the whole-decoder results in Table 5. Both operands are quantized to NVFP4, while transforms, accumulation, and reconstruction use FP64.
+Consider a 6 × 6 input tile $d_c[u,v]$ and a 3 × 3 filter $g_{oc}[r,s]$, where $c$ and $o$ index input and output channels. The valid output is 4 × 4. For each frequency $k,l=0,\ldots,5$, compute
+
+<a id="eq-fourier-forward"></a>
+
+$$
+\begin{aligned}
+D_c[k,l] &= \sum_{u,v=0}^{5} d_c[u,v]e^{-2\pi\mathrm{i}(ku+lv)/6},\\
+W_{oc}[k,l] &= \sum_{r,s=0}^{2} g_{oc}[r,s]e^{+2\pi\mathrm{i}(kr+ls)/6},\\
+S_o[k,l] &= \sum_c D_c[k,l]W_{oc}[k,l].
+\end{aligned}
+\qquad (15)
+$$
+
+Here $\mathrm{i}^2=-1$. The filter transform is equivalent to zero-padding the filter to 6 × 6 and conjugating its Fourier transform. The opposite signs in <a href="#eq-fourier-forward">Eq. 15</a> implement the sliding-filter convention used by neural-network convolutions; no additional conjugation of $W$ is needed. As with Winograd, transformed filters can be prepared once, and each frequency's channel contraction can be batched across tiles as a GEMM.
+
+The inverse transform reconstructs the pixels:
+
+<a id="eq-fourier-inverse"></a>
+
+$$
+y_o[p,q]=\frac{1}{36}\sum_{k,l=0}^{5}S_o[k,l]e^{+2\pi\mathrm{i}(kp+lq)/6},
+\qquad (16)
+$$
+
+Retain only $p,q=0,1,2,3$. Substituting <a href="#eq-fourier-forward">Eq. 15</a> into <a href="#eq-fourier-inverse">Eq. 16</a> selects the input positions $(p+r,q+s)$ modulo 6. These indices never wrap in the retained region, so the result is exactly the valid 3 × 3 convolution. Neighboring input tiles overlap by two pixels; their retained output tiles do not overlap.
+
+#### Real GEMMs and the product count
+
+Real inputs and filters have conjugate-symmetric spectra: the coefficient at $(-k\bmod6,-l\bmod6)$ is the complex conjugate of the coefficient at $(k,l)$. Four frequencies, with both indices in $\{0,3\}$, are self-conjugate and therefore real. The remaining 32 frequencies form 16 pairs. Only one member of each pair needs to be computed.
+
+At one frequency, arrange the transformed inputs and filters into matrices $V$ and $U$ as in <a href="#eq-coordinate-gemm">Eq. 10</a>. Writing their real and imaginary parts with subscripts R and I gives four real GEMMs:
+
+<a id="eq-fourier-real-gemms"></a>
+
+$$
+\begin{aligned}
+M_{\mathrm{R}} &= V_{\mathrm{R}}U_{\mathrm{R}}-V_{\mathrm{I}}U_{\mathrm{I}},\\
+M_{\mathrm{I}} &= V_{\mathrm{R}}U_{\mathrm{I}}+V_{\mathrm{I}}U_{\mathrm{R}}.
+\end{aligned}
+\qquad (17)
+$$
+
+Thus this construction needs $4+16\times4=68$ real channel dot products per 4 × 4 output tile, compared with 144 for direct convolution and 36 for spatial F4. **Fourier68** in Figure 19 and Table 8 labels this particular configuration, rather than Fourier convolution in general. The count excludes transforms and the additions in <a href="#eq-fourier-real-gemms">Eq. 17</a>.
+
+#### Why reconstruction behaves differently
+
+The Fourier basis is orthogonal. Let $\Delta S$ contain errors in all 36 combined frequency products, including both members of every conjugate pair, and let $\Delta z$ be the error after the full 6 × 6 inverse transform. With the normalization in <a href="#eq-fourier-inverse">Eq. 16</a>, Parseval's identity gives
+
+<a id="eq-fourier-error"></a>
+
+$$
+\lVert\Delta z\rVert_2^2=\frac{1}{36}\lVert\Delta S\rVert_2^2,
+\qquad
+\lVert\Delta y\rVert_2^2\leq\lVert\Delta z\rVert_2^2.
+\qquad (18)
+$$
+
+The squared norms in <a href="#eq-fourier-error">Eq. 18</a> sum squared magnitudes over the tile. Cropping to the valid output cannot increase that sum. The factor $1/36$ reflects the transform normalization: with a unitary normalization, the full inverse transform preserves squared error. Unlike reconstruction through a poorly conditioned transform, it does not amplify some frequency-error directions more than others.
+
+This bound starts from the combined product error $\Delta S$ and assumes exact reconstruction. Quantizing the operands still changes those products, channel sums can still cancel, and a small true output can still have a large relative error. Finite-precision transforms and reconstruction introduce additional rounding. The bound explains why Fourier coordinates are worth testing; it does not establish NVFP4 model quality.
+
+Figure 19 compares these decompositions on matched synthetic spatial 3 × 3 convolutions. This experiment measures error in one convolution, separately from the whole-decoder results in Table 5. Both operands are quantized to NVFP4, while transforms, accumulation, and reconstruction use FP64. For the Fourier construction, the quantized operands are the real matrices in <a href="#eq-fourier-real-gemms">Eq. 17</a>.
 
 <a id="figure-19"></a>
 
