@@ -2234,7 +2234,7 @@ class Fp8QuantKernelRunner(TunableRunner):
 
 # DeepGemm compiles each layout with nvcc and releases the GIL meanwhile, so
 # the autotuner drives the JIT of a sweep's distinct layouts on a thread pool
-# (TuningConfig.parallel_jit_warmup; -1 sizes it from the host's cores).
+# (TuningConfig.parallel_jit_warmup; -1 sizes it from this rank's CPUs).
 _DEEP_GEMM_JIT_WARMUP_THREADS = -1
 
 
