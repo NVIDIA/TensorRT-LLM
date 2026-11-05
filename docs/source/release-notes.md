@@ -35,6 +35,7 @@ All published functionality in the Release Notes has been fully tested and verif
   Grouped encoders must also include item metadata with exact output row counts
   in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
+- **Removed `TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER`.** The opt-in that moved quantized TRTLLM-Gen MoE (`moe_config.backend="TRTLLM"` with NVFP4, FP8 block scales, W4A16_MXFP4 or W4A8_MXFP4_MXFP8) onto FlashInfer's TRTLLM-Gen wrappers has been removed together with those wrappers and the FlashInfer two-sided NVLink all-to-all. Quantized formats always run the native TRT-LLM kernels, which accept every configuration the FlashInfer path did; the unquantized BF16 path still runs on FlashInfer and now uses the native `NVLinkTwoSided` all-to-all. Setting the variable has no effect and logs a one-time warning; deployments should drop it.
 
 ### Fixed Issues
 

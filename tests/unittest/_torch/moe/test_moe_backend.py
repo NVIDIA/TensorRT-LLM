@@ -57,6 +57,7 @@ from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
+    DefaultMoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
@@ -154,7 +155,6 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
-    FlashinferTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
@@ -1334,15 +1334,9 @@ def create_test_backend(
     activation_type: ActivationType = ActivationType.Swiglu,
     locality_domain_policy: Optional[LocalityDomainPolicy] = None,
     n_shared_experts: int = 0,
-    moe_cls: Optional[type] = None,
 ) -> MoE:
-    """Create a MoE backend for testing.
-
-    ``moe_cls`` pins the leaf class directly, for the providers the default
-    lookup never selects (resolution prefers the native TRTLLM-Gen leaf
-    whenever one exists for the format).
-    """
-    backend_cls = moe_cls or get_backend_class(
+    """Create a MoE backend for testing."""
+    backend_cls = get_backend_class(
         backend_type, None if quant_config is None else quant_config.quant_algo
     )
     if locality_domain_policy is None:
@@ -1395,109 +1389,6 @@ def create_test_backend(
     if n_shared_experts > 0:
         backend.create_weights()
     return backend
-
-
-# The quantized FlashInfer provider is otherwise never run: resolution prefers
-# the native TRTLLM-Gen leaf whenever one exists for the format (only the bf16
-# leaf is FlashInfer-exclusive), so without pinning the class the FlashInfer
-# NVFP4 kernels have zero coverage. The real provider is exercised here, which
-# needs Blackwell: FlashInfer's FP4 path has no pre-Blackwell backend.
-@skip_pre_blackwell
-def test_flashinfer_provider_nvfp4_matches_reference(tmp_path: Path):
-    pytest.importorskip("flashinfer")
-
-    model_config = MoeModelConfig(8, 2, 512, 512)
-    seq_len = 8
-    dtype = torch.bfloat16
-    mapping = Mapping()
-    mapping.rank = mpi_rank()
-
-    with torch.device(f"cuda:{mapping.rank}"):
-        torch.manual_seed(0)
-        torch.cuda.manual_seed(0)
-        AutoTuner.get().setup_distributed_state(mapping)
-
-        routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
-        x = torch.randn((seq_len, model_config.hidden_size), dtype=dtype, device="cuda")
-        router_logits = torch.randn((seq_len, model_config.num_experts), dtype=dtype, device="cuda")
-
-        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-            QuantAlgo.NVFP4, x, MoeBackendType.TRTLLM
-        )
-        quantize_util = quantize_util_cls(
-            num_experts=model_config.num_experts,
-            dtype=dtype,
-            intermediate_size=model_config.intermediate_size,
-            hidden_size=model_config.hidden_size,
-            quant_config=quant_config,
-            bias=False,
-            swiglu_gptoss_style=False,
-            swiglu_alpha=None,
-            swiglu_beta=None,
-            swiglu_limit=None,
-            activation_type=ActivationType.Swiglu,
-        )
-        NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
-
-        backend = create_test_backend(
-            backend_type=MoeBackendType.TRTLLM,
-            routing_method=routing_method,
-            num_experts=model_config.num_experts,
-            hidden_size=model_config.hidden_size,
-            intermediate_size=model_config.intermediate_size,
-            dtype=dtype,
-            quant_config=quant_config,
-            mapping=mapping,
-            weight_loading_mode=getattr(
-                quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
-            ),
-            moe_cls=FlashinferTrtllmGenNvfp4Impl,
-        )
-        assert backend.use_flashinfer
-
-        ref_cls = quant_kwargs.pop("ref_cls", None)
-        weights = quantize_util.create_weights(**quant_kwargs)
-        backend.load_weights([weights])
-        backend.post_load_weights()
-        backend.cuda()
-
-        if ref_cls is not None:
-            ref_fused_moe = quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
-        else:
-            ref_fused_moe = quantize_util.create_ref_module(routing_method)
-        ref_fused_moe.load_weights([weights])
-        ref_fused_moe.cuda()
-
-        with torch.inference_mode():
-            ref_output = ref_fused_moe.forward(x, router_logits)
-
-        def run_moe():
-            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
-            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
-            return run_backend_moe(
-                backend,
-                MoeBackendType.TRTLLM,
-                x_quantized,
-                x_sf,
-                token_selected_experts,
-                token_final_scales,
-                dtype,
-                router_logits,
-            )
-
-        autotuner = AutoTuner.get()
-        autotuner.warmup = 0
-        autotuner.repeat = 1
-        autotuner.stream_delay_micro_secs = 10
-        autotuner.clear_cache()
-        with (
-            torch.inference_mode(),
-            autotune(cache_path=str(tmp_path / "moe_autotuner_cache.json")),
-        ):
-            _ = run_moe()
-        with torch.inference_mode():
-            output = run_moe()
-        ref_fused_moe.check_accuracy(output, ref_output)
 
 
 # =====================================================================
@@ -5582,11 +5473,8 @@ def test_moe_backend(
                 assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
                 assert not autotuner.stats.failed_profiling_count.get(op_name, set())
 
-        # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
-        use_flashinfer = getattr(backend, "use_flashinfer", False)
-
         # Check if this backend+quant_algo combination supports autotuner capture/replay
-        if supports_autotuner_capture(backend_type, quant_algo, use_flashinfer):
+        if supports_autotuner_capture(backend_type, quant_algo):
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
@@ -5661,6 +5549,8 @@ _BF16_UNQUANT_INTERMEDIATE = 512
 def _make_bf16_routing_method(routing_kind: str, top_k: int, num_experts: int, device: str):
     if routing_kind == "renormalize":
         return RenormalizeMoeRoutingMethod(top_k=top_k)
+    if routing_kind == "default":
+        return DefaultMoeRoutingMethod(top_k=top_k)
     # DeepSeekV3 (noaux_tc): sigmoid scores + correction bias, single group.
     bias = torch.randn(num_experts, dtype=torch.float32, device=device)
     return DeepSeekV3MoeRoutingMethod(
@@ -5685,15 +5575,46 @@ def test_trtllm_bf16_unquantized_moe(
     activation_type,
     seq_len,
     trtllm_use_router_logits,
-    num_experts=_BF16_UNQUANT_NUM_EXPERTS,
-    top_k=_BF16_UNQUANT_TOP_K,
 ):
     """TRTLLM-Gen BF16 (unquantized) MoE accuracy vs the reference impl."""
+    _run_trtllm_bf16_unquantized_moe(
+        routing_kind,
+        activation_type,
+        seq_len,
+        trtllm_use_router_logits,
+        num_experts=_BF16_UNQUANT_NUM_EXPERTS,
+        top_k=_BF16_UNQUANT_TOP_K,
+    )
+
+
+def test_trtllm_bf16_in_kernel_routing_256_experts():
+    """Default routing inside the kernel past 128 experts.
+
+    The routing kernels are compiled per (experts, topK) tier for each routing
+    policy, so this checks that Default has a tier beyond the smallest one.
+    """
+    _run_trtllm_bf16_unquantized_moe(
+        "default",
+        ActivationType.Swiglu,
+        seq_len=8,
+        trtllm_use_router_logits=True,
+        num_experts=256,
+        top_k=6,
+    )
+
+
+def _run_trtllm_bf16_unquantized_moe(
+    routing_kind: str,
+    activation_type: ActivationType,
+    seq_len: int,
+    trtllm_use_router_logits: bool,
+    *,
+    num_experts: int,
+    top_k: int,
+) -> None:
     backend_type = MoeBackendType.TRTLLM
     dtype = torch.bfloat16
 
-    num_experts = _BF16_UNQUANT_NUM_EXPERTS
-    top_k = _BF16_UNQUANT_TOP_K
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
 
@@ -5811,10 +5732,10 @@ def test_trtllm_bf16_dsv3_routing_kimi_k3_shape(seq_len):
     kernels, including the cooperative small-batch kernel at num_tokens 1,
     via the fused-routing path (router logits consumed in-kernel).
     """
-    test_trtllm_bf16_unquantized_moe(
-        routing_kind="deepseekv3",
-        activation_type=ActivationType.Swiglu,
-        seq_len=seq_len,
+    _run_trtllm_bf16_unquantized_moe(
+        "deepseekv3",
+        ActivationType.Swiglu,
+        seq_len,
         trtllm_use_router_logits=True,
         num_experts=896,
         top_k=16,
