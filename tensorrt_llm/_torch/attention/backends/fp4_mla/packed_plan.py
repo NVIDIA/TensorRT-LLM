@@ -87,6 +87,9 @@ class _PackedPlanGeometry(NamedTuple):
     # Whether the decode stages each task's page table in shared memory (the page-plan
     # profile) where the task fits it, rather than reading page ids per tile.
     use_smem_page_plan: bool = True
+    # 2-CTA clusters per task and per wave: the schedule the wave plan simulates.
+    m_tiles: int = 1
+    wave_clusters: int = 0
 
 
 def _fp4_mla_packed_plan_geometry(
@@ -145,6 +148,7 @@ def _fp4_mla_packed_plan_geometry(
     # Only Helix ranks stage the page table in shared memory; the others read page ids per tile
     # (the next bucketed profile). The plan keeps the page-plan profile's task-length cap.
     use_smem_page_plan = helix_kv_bounds is not None
+    wave_clusters = max(1, _get_sm_count(device) // 2)
     if splits == 1:
         return _PackedPlanGeometry(
             num_requests,
@@ -158,6 +162,8 @@ def _fp4_mla_packed_plan_geometry(
             None,
             None,
             use_smem_page_plan,
+            m_tiles,
+            wave_clusters,
         )
     from .fp4_mla_packed_reduce import packed_plan_length
 
@@ -182,6 +188,8 @@ def _fp4_mla_packed_plan_geometry(
         kv_lens.data_ptr() if isinstance(kv_lens, torch.Tensor) else 0,
         helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else 0,
         plan.data_ptr(),
+        m_tiles,
+        wave_clusters,
     )
     return _PackedPlanGeometry(
         num_requests,
@@ -195,6 +203,8 @@ def _fp4_mla_packed_plan_geometry(
         plan,
         key,
         use_smem_page_plan,
+        m_tiles,
+        wave_clusters,
     )
 
 
@@ -237,5 +247,7 @@ def _launch_fp4_mla_packed_plan(
         helix_kv_bounds=geometry.helix_kv_bounds,
         generation_lengths=generation_lengths,
         wave_plan=_fp4_mla_packed_wave_plan_enabled(),
+        m_tiles=geometry.m_tiles,
+        wave_clusters=geometry.wave_clusters,
     )
     metadata.fp4_mla_state.packed_plan_key = geometry.key

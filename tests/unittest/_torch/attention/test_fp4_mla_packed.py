@@ -80,13 +80,13 @@ def _plan_mod():
         ([128] * 15 + [200], 48, 17, 136, list(range(16)) + [17]),
         # Full machine, longest within 1.5x of the wave share: no split at all.
         ([128] * 15 + [130], 48, 17, 130, list(range(17))),
-        # Strong skew in a full machine: eleven 96-tile tasks for the long request, short tails behind.
-        ([128] * 15 + [1024], 48, 17, 96, list(range(0, 32, 2)) + [41]),
-        # Strong skew in a small batch: 94-tile tasks, 11 for the long request, fill one wave.
-        ([128, 128, 128, 1024], 24, 17, 94, [0, 2, 4, 6, 17]),
-        # A single request fills one wave with 16 tasks; a short one is not worth splitting.
+        # Strong skew in a full machine: twelve 92-tile tasks for the long request, short tails behind.
+        ([128] * 15 + [1024], 48, 17, 92, list(range(0, 32, 2)) + [42]),
+        # Strong skew in a small batch: 89-tile tasks, 12 for the long request, fill one wave.
+        ([128, 128, 128, 1024], 24, 17, 89, [0, 2, 4, 6, 18]),
+        # A single request fills one wave with 16 tasks; a short one takes four 2-tile tasks.
         ([128], 16, 17, 8, [0, 16]),
-        ([8], 16, 17, 8, [0, 1]),
+        ([8], 16, 17, 2, [0, 4]),
         # No spare slots: one task per request, however long.
         ([5, 900], 2, 17, 900, list(range(3))),
     ],
@@ -112,13 +112,12 @@ def test_plan_packed_tasks_balances_by_kv_length(
 def test_plan_packed_tasks_simulates_helix_ranks() -> None:
     plan = functools.partial(_plan_mod().plan_packed_tasks, wave_plan=True)
     # helix16 bs16 (6 m-tiles, 17 wave tasks), per-rank KV skewed 3.5x: the Helix rule targets one
-    # wave of 28-tile tasks (21 tasks, a second wave); the simulation keeps the 16 requests whole.
+    # wave of 28-tile tasks (21 tasks, a second wave); no candidate beats it by the margin.
     tiles = [16] * 12 + [40, 48, 56, 56]
-    assert plan(tiles, 48, 17, one_wave=True, wave_plan=False) == (
-        28,
-        list(range(13)) + [14, 16, 18, 20],
-    )
-    assert plan(tiles, 48, 17, one_wave=True) == (56, list(range(17)))
+    rule = (28, list(range(13)) + [14, 16, 18, 20])
+    assert plan(tiles, 48, 17, one_wave=True, wave_plan=False) == rule
+    assert plan(tiles, 48, 17, one_wave=True) == rule
+    assert plan(tiles, 48, 17, one_wave=True, m_tiles=6, wave_clusters=106) == rule
     # Even Helix batches are unchanged.
     assert plan([128] * 4, 24, 17, one_wave=True) == plan([128] * 4, 24, 17)
 
@@ -128,20 +127,23 @@ def test_plan_packed_tasks_simulates_the_waves() -> None:
     plan = functools.partial(reduce_mod.plan_packed_tasks, wave_plan=True)
     # Skewed request lengths exercise the task-rounding overhead across waves.
     tiles = [1848, 1250, 977, 743, 586, 430, 313, 196, 106]
-    assert plan(tiles, 9 * 9, 35) == (195, [0, 10, 17, 23, 27, 31, 34, 36, 38, 39])
+    assert plan(tiles, 9 * 9, 35) == (188, [0, 10, 17, 23, 27, 31, 34, 36, 38, 39])
     # Nine equal requests: three 239-tile pieces fit one wave, but four 206-tile pieces finish
     # first: eight of the nine 97-tile tails share the first wave, the ninth follows one of them.
     assert plan([715] * 9, 9 * 9, 35) == (206, list(range(0, 37, 4)))
     simulate = reduce_mod.plan_simulated_makespan
-    cost = reduce_mod.PLAN_TASK_COST_TILES + reduce_mod.PLAN_SPLIT_COST_TILES
+    cost = reduce_mod.PLAN_TASK_COST_TILES
     # 36 equal 179-tile tasks on 35 slots: the last one waits for a whole task.
     assert simulate([716] * 9, 179, 35) == 2 * (179 + cost)
     # The 36th task (a 178-tile tail) starts when the first tail frees its slot.
     assert simulate([715] * 9, 179, 35) == (178 + cost) + (178 + cost)
     # 2-tile tails free their slots early, so a spilled tail does not extend the makespan.
     assert simulate([181] * 18, 179, 35) == 179 + cost
-    # Requests that keep one task pay no split cost.
-    assert simulate([100, 300], 300, 35) == 300 + reduce_mod.PLAN_TASK_COST_TILES
+    assert simulate([100, 300], 300, 35) == 300 + cost
+    # dep16 16 x 1094 tiles, 5 clusters per task on 106 cluster slots: 16 full 883-tile tasks
+    # (80 clusters) leave 26 slots to the 211-tile tails; 438-tile tasks take three rounds.
+    assert simulate([1094] * 16, 883, 21, m_tiles=5, wave_clusters=106) == 883 + cost
+    assert simulate([1094] * 16, 438, 21, m_tiles=5, wave_clusters=106) == 910
 
 
 @functools.cache
@@ -167,13 +169,21 @@ def _device_plan_candidates():
         total_tiles: cutlass.Int32,
         longest: cutlass.Int32,
         num_requests: cutlass.Int32,
-        wave_tasks: cutlass.Int32,
+        m_tiles: cutlass.Int32,
+        slots: cutlass.Int32,
         max_tiles_per_task: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         if tidx < cutlass.Int32(count):
             out[tidx] = reduce_mod._plan_candidate_tiles(
-                tidx, rule_tiles, total_tiles, longest, num_requests, wave_tasks, max_tiles_per_task
+                tidx,
+                rule_tiles,
+                total_tiles,
+                longest,
+                num_requests,
+                m_tiles,
+                slots,
+                max_tiles_per_task,
             )
 
     @cute.jit
@@ -184,17 +194,18 @@ def _device_plan_candidates():
         total_tiles: cutlass.Int32,
         longest: cutlass.Int32,
         num_requests: cutlass.Int32,
-        wave_tasks: cutlass.Int32,
+        m_tiles: cutlass.Int32,
+        slots: cutlass.Int32,
         max_tiles_per_task: cutlass.Int32,
     ):
         out = cute.make_tensor(out_ptr, cute.make_layout((count,), stride=(1,)))
         candidates_kernel(
-            out, rule_tiles, total_tiles, longest, num_requests, wave_tasks, max_tiles_per_task
+            out, rule_tiles, total_tiles, longest, num_requests, m_tiles, slots, max_tiles_per_task
         ).launch(grid=(1, 1, 1), block=((count + 31) // 32 * 32, 1, 1), stream=stream)
 
     compiled = None
 
-    def run(request_tiles, rule_tiles, wave_tasks, max_tiles_per_task):
+    def run(request_tiles, rule_tiles, m_tiles, slots, max_tiles_per_task):
         nonlocal compiled
         out = torch.full((count,), -1, dtype=torch.int32, device="cuda")
         ptr = make_ptr(cutlass.Int32, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
@@ -205,7 +216,8 @@ def _device_plan_candidates():
                 sum(request_tiles),
                 max(request_tiles),
                 len(request_tiles),
-                wave_tasks,
+                m_tiles,
+                slots,
                 max_tiles_per_task,
             )
         ]
@@ -230,14 +242,21 @@ def test_plan_candidates_device_match_the_host_mirror() -> None:
     for _ in range(64):
         num_requests = draw(1, reduce_mod.PLAN_SIM_MAX_REQUESTS)
         request_tiles = [draw(1, 4096) for _ in range(num_requests)]
-        wave_tasks = draw(num_requests + 1, reduce_mod.PLAN_SIM_MAX_SLOTS)
+        m_tiles = draw(1, 8)
+        slots = draw(1, reduce_mod.PLAN_SIM_MAX_SLOTS)
+        wave_tasks = max(1, slots // m_tiles)
         rule_tiles = draw(1, max(request_tiles))
         max_tiles_per_task = draw(1, 1024)
         expected = reduce_mod.plan_candidate_lengths(
-            request_tiles, rule_tiles, wave_tasks, max_tiles_per_task
+            request_tiles,
+            rule_tiles,
+            wave_tasks,
+            max_tiles_per_task,
+            m_tiles=m_tiles,
+            wave_clusters=slots,
         )
-        got = run(request_tiles, rule_tiles, wave_tasks, max_tiles_per_task)
-        assert got == expected, (request_tiles, rule_tiles, wave_tasks, max_tiles_per_task)
+        got = run(request_tiles, rule_tiles, m_tiles, slots, max_tiles_per_task)
+        assert got == expected, (request_tiles, rule_tiles, m_tiles, slots, max_tiles_per_task)
 
 
 def test_plan_load_candidates_follow_the_balanced_slot_load() -> None:
@@ -249,34 +268,93 @@ def test_plan_load_candidates_follow_the_balanced_slot_load() -> None:
     # Clamped to the minimum task length, the longest request and the runtime profile.
     assert reduce_mod.plan_load_candidates([3, 5], 106) == [2] * reduce_mod.PLAN_LOAD_CANDIDATES
     assert max(reduce_mod.plan_load_candidates([684] * 16, 21, max_tiles_per_task=300)) == 300
+    # dep16 B16 MTP5 at 280K: 16 requests x 5 cluster streams on 106 cluster slots.
+    assert reduce_mod.plan_load_candidates([1094] * 16, 21, m_tiles=5, wave_clusters=106) == [
+        835,
+        868,
+        417,
+        434,
+        278,
+        289,
+        208,
+        217,
+        883,
+    ]
     candidates = reduce_mod.plan_candidate_lengths(tiles, 100, 17)
     assert len(candidates) == reduce_mod.PLAN_CANDIDATES
     assert candidates[0] == 100 and candidates[1:3] == [200, 100]
 
 
 def test_plan_packed_tasks_takes_the_shortest_simulated_candidate() -> None:
+    """The rule's length unless a candidate beats it by the margin, then the shortest one."""
     import random
 
     rng = random.Random(4321)
     reduce_mod = _plan_mod()
-    simulate = reduce_mod.plan_simulated_makespan
     for _ in range(500):
         requests = rng.randint(1, 40)
         tiles = [rng.choice([1, 3, 25, 64, 128, 300, 704, 1024, 4096]) for _ in range(requests)]
         capacity = requests * rng.choice([2, 4, 8, 16])
-        wave_tasks = rng.choice([17, 21, 35, 53])
-        tiles_per_task, begins = reduce_mod.plan_packed_tasks(tiles, capacity, wave_tasks)
+        m_tiles = rng.choice([1, 3, 5, 6])
+        wave_tasks = 106 // m_tiles
+        geometry = dict(m_tiles=m_tiles, wave_clusters=106)
+        tiles_per_task, begins = reduce_mod.plan_packed_tasks(
+            tiles, capacity, wave_tasks, wave_plan=True, **geometry
+        )
         rule, _ = reduce_mod.plan_packed_tasks(tiles, capacity, wave_tasks, wave_plan=False)
         feasible = [
             candidate
-            for candidate in reduce_mod.plan_candidate_lengths(tiles, rule, wave_tasks)
+            for candidate in reduce_mod.plan_candidate_lengths(tiles, rule, wave_tasks, **geometry)
             if sum(math.ceil(t / candidate) for t in tiles)
             <= min(capacity, reduce_mod.PLAN_SIM_MAX_TASKS)
         ]
-        assert tiles_per_task in feasible
-        best = min(simulate(tiles, candidate, wave_tasks) for candidate in feasible)
-        assert simulate(tiles, tiles_per_task, wave_tasks) == best
         assert begins[-1] <= capacity
+        if requests >= capacity or not feasible:
+            assert tiles_per_task == rule
+            continue
+
+        def simulate(length: int) -> int:
+            return reduce_mod.plan_simulated_makespan(tiles, length, wave_tasks, **geometry)
+
+        baseline = simulate(feasible[0])
+        best = min(simulate(candidate) for candidate in feasible)
+        limit = baseline - max(
+            baseline // reduce_mod.PLAN_MIN_GAIN_DIVISOR, reduce_mod.PLAN_MIN_GAIN_TILES
+        )
+        if best <= limit:
+            assert simulate(tiles_per_task) == best
+        else:
+            assert tiles_per_task == feasible[0]
+
+
+@pytest.mark.parametrize(
+    "tiles,m_tiles,one_wave,expected",
+    [
+        # dep16 B16 MTP5 (5 m-tiles) at 280K: 883-tile tasks, 2 per request (makespan 895 tiles
+        # against 910 for the 438-tile tasks a per-task slot model picks).
+        ([1094] * 16, 5, False, 883),
+        ([1094] * 16, 6, False, 1005),
+        ([1094] * 8, 6, False, 502),
+        # helix8 B8 / B20 and helix16 B4 per-rank KV (35K / 17.5K).
+        ([137] * 8, 5, True, 58),
+        ([137] * 20, 6, True, 58),
+        ([69] * 4, 5, True, 14),
+    ],
+)
+def test_plan_packed_tasks_simulates_cluster_slots(
+    tiles: list[int], m_tiles: int, one_wave: bool, expected: int
+) -> None:
+    """Each task runs m_tiles clusters on the wave's 2-CTA cluster slots (106 on Rubin)."""
+    tiles_per_task, _ = _plan_mod().plan_packed_tasks(
+        tiles,
+        8 * len(tiles),
+        106 // m_tiles,
+        one_wave=one_wave,
+        wave_plan=True,
+        m_tiles=m_tiles,
+        wave_clusters=106,
+    )
+    assert tiles_per_task == expected
 
 
 def test_plan_task_order_runs_full_tasks_then_longest_tails() -> None:
@@ -303,9 +381,9 @@ def test_plan_without_wave_plan_keeps_the_rule_and_request_order() -> None:
 
 
 def test_plan_packed_tasks_honours_the_runtime_profile_cap() -> None:
-    plan = _plan_mod().plan_packed_tasks
+    plan = functools.partial(_plan_mod().plan_packed_tasks, wave_plan=True)
     # An even full machine would not split, but the profile only covers 512 tiles.
-    assert plan([1024] * 16, 48, 17, max_tiles_per_task=512) == (507, list(range(0, 49, 3)))
+    assert plan([1024] * 16, 48, 17, max_tiles_per_task=512) == (488, list(range(0, 49, 3)))
     # The cap never pushes a batch past its slots when it is ceil(longest / (splits - 1)).
     assert plan([1024, 3, 1024, 700], 4 * 6, 17, max_tiles_per_task=205)[1][-1] <= 24
 
@@ -352,6 +430,9 @@ _DEP16_RANK_KV_LENS = [473000, 320000, 250000, 190000, 150000, 110000, 80000, 50
         # Balanced per-slot load candidates: dep16 B8 MTP7 at 180K, dep16 B16 MTP5 at 175K.
         ([180000] * 8, 8, 17, 8, False, True),
         ([175000] * 16, 8, 21, 6, False, True),
+        # dep16 B16 MTP5 at 280K, helix8 B20 MTP7 at 35K per rank.
+        ([280000] * 16, 8, 21, 6, False, True),
+        ([35000] * 20, 8, 17, 8, True, True),
         # Two cached requests per lane; larger batches take the existing fallback.
         ([32768] * 31 + [262144], 2, 35, 4, False, True),
         ([32768] * 32 + [262144], 2, 35, 4, False, True),
@@ -381,8 +462,10 @@ def test_packed_plan_kernel_matches_host_mirror(
         bounds = torch.tensor(bounds_list, dtype=torch.int32, device="cuda")
     tiles = reduce_mod.request_kv_tiles(kv_lens, query_len, bounds_list)
     cap = max(tiles)
+    # Rubin: 106 2-CTA cluster slots, wave_tasks of them per m_tiles-cluster task.
+    geometry = dict(m_tiles=106 // wave_tasks, wave_clusters=106)
     expected_tiles, expected_begins = reduce_mod.plan_packed_tasks(
-        tiles, tasks, wave_tasks, cap, one_wave=helix, wave_plan=wave_plan
+        tiles, tasks, wave_tasks, cap, one_wave=helix, wave_plan=wave_plan, **geometry
     )
     plan = torch.full(
         (reduce_mod.packed_plan_length(requests, tasks),), -7, dtype=torch.int32, device="cuda"
@@ -397,6 +480,7 @@ def test_packed_plan_kernel_matches_host_mirror(
         query_len=query_len,
         helix_kv_bounds=bounds,
         wave_plan=wave_plan,
+        **geometry,
     )
     torch.cuda.synchronize()
     plan = plan.tolist()
@@ -578,6 +662,8 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
     )
     # helix16 B4 MTP7: 6 m-tiles, 17 tasks per wave, 10 slots per request.
     assert (geometry.splits, geometry.wave_tasks, geometry.task_capacity) == (10, 17, 40)
+    # The wave plan simulates the 6 clusters of each task on 106 2-CTA cluster slots.
+    assert (geometry.m_tiles, geometry.wave_clusters) == (6, 106)
     # The plan lives in the metadata workspace (a view of the stored buffer).
     assert (
         geometry.plan.data_ptr()
