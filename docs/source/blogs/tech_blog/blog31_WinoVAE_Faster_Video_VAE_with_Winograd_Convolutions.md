@@ -71,7 +71,7 @@ Early convolutions have many channels and small spatial maps. Later convolutions
 
 WinoVAE addresses the two parts of the profile together. First, it fuses the operations around convolution and removes repeated work in upsampling, causal initialization, and encoder downsampling. Second, it replaces suitable convolutions with spatial and temporal Winograd transforms followed by batched GEMMs. Finally, it partitions the feature maps across GPUs and fuses border communication into the kernels that already produce those maps.
 
-The implementation keeps BF16 model inputs and outputs. Its Winograd operands and products use FP16 storage, with optimized spatial interpolation points. The following results use these implementation choices. The [Discussion](#discussion) explains their numerical motivation and limits.
+The implementation keeps BF16 model inputs and outputs. Its Winograd operands and products use FP16 storage, with optimized spatial interpolation points. The coefficient construction and precision choices are described below. The [Results](#coefficient-and-precision-comparisons) compare their errors, and the [Error analysis](#error-analysis) explains how rounding propagates through the transforms.
 
 ### Remove memory passes around convolution
 
@@ -266,6 +266,66 @@ For a 360 × 640 feature frame with 256 input and output channels, spatial F2 pr
 *Figure 9. The 16 coordinate GEMMs for F(2 × 2, 3 × 3). The input transform maps 4 × 4 input tiles to the Vᵢ matrices; the filter transform maps 3 × 3 filters to the Uᵢ matrices once at weight loading. Each coordinate has its own transformed input matrix Vᵢ, transformed filter matrix Uᵢ, and product matrix Mᵢ. Green and orange rows identify tiles A and B. Additional tiles continue down each matrix. The green connectors collect tile A’s row from every Mᵢ. The output transform combines those 16 rows into a 2 × 2 tile for each output channel. Tile B and the remaining tiles are reconstructed in the same way.*
 
 The same idea applies along time. Temporal F4 combines four current frames and two history frames into six spatial-convolution problems, replacing twelve direct temporal contributions. Combined with spatial F4, the product count is $6\times36/(4\times16)=3.375$ per output and input/output-channel pair, compared with 27 for direct 3D convolution. This eightfold arithmetic reduction applies to that convolution. A complete decoder still includes transforms and other layers, and some levels have too few frames available to use temporal F4.
+
+### Interpolation and transform coefficients
+
+The transform coefficients come from polynomial arithmetic. To see the construction, take an auxiliary two-element sequence $a=[a_0,a_1]$ and the three filter coefficients $g=[g_0,g_1,g_2]$, and write
+
+<a id="eq-polynomials"></a>
+
+$$
+\begin{aligned}
+a(z)&=a_0+a_1z,\\
+g(z)&=g_0+g_1z+g_2z^2.
+\end{aligned}
+\qquad (11)
+$$
+
+The product of the polynomials in <a href="#eq-polynomials">Eq. 11</a>, $c(z)=a(z)g(z)$, has four coefficients. Those coefficients are the full convolution of the two sequences: for example, the coefficient of $z$ is $c_1=a_0g_1+a_1g_0$. The variable $z$ records coefficient positions. It is not a pixel coordinate.
+
+Instead of forming all six pairwise products, evaluate the polynomials at $0$, $1$, and $-1$, multiply their values, and also multiply their leading coefficients:
+
+<a id="eq-polynomial-products"></a>
+
+$$
+\begin{aligned}
+q_0 &= a_0g_0,\\
+q_+ &= (a_0+a_1)(g_0+g_1+g_2),\\
+q_- &= (a_0-a_1)(g_0-g_1+g_2),\\
+q_\infty &= a_1g_2.
+\end{aligned}
+\qquad (12)
+$$
+
+The notation $\infty$ means selecting the leading coefficient, not evaluating floating-point arithmetic at infinity. The four products in <a href="#eq-polynomial-products">Eq. 12</a> determine all four coefficients of $c(z)$:
+
+<a id="eq-interpolation"></a>
+
+$$
+\begin{aligned}
+c_0 &= q_0,\\
+c_1 &= (q_+-q_-)/2-q_\infty,\\
+c_2 &= (q_++q_-)/2-q_0,\\
+c_3 &= q_\infty.
+\end{aligned}
+\qquad (13)
+$$
+
+Recovering polynomial coefficients with <a href="#eq-interpolation">Eq. 13</a> from the values in <a href="#eq-polynomial-products">Eq. 12</a> is **interpolation**. Evaluation at $0$ and $\pm1$ requires only sums and differences because their powers are zeros, ones, or signs. The interpolation step supplies the fixed factors such as $1/2$.
+
+This example maps two sequence elements to four full-convolution coefficients. To obtain the sliding filter in <a href="#eq-direct-f23">Eq. 8</a>, hold $g$ fixed and transpose that $4\times2$ linear map: its transpose maps the four inputs $d_0,\ldots,d_3$ to $y_0,y_1$. Transposing the evaluation and interpolation steps produces the Winograd input and output transforms. For example, $q_0$ contributes $+q_0$ to $c_0$ and $-q_0$ to $c_2$. The transposed step combines inputs as $d_0-d_2$. This is the first input combination in <a href="#eq-winograd-f23">Eq. 9</a>. The [Cook–Toom construction described by Lavin and Gray](https://arxiv.org/abs/1509.09308) generalizes this approach to larger tiles. <!-- codespell:ignore toom -->
+
+For one-dimensional $F(m,r)$, the polynomial product has $m+r-1$ coefficients, so the construction needs that many independent values: four for $F(2,3)$, six for $F(4,3)$. Applying the six-point construction along both spatial axes gives the 36 coordinates of spatial F4. Other valid point sets give the same convolution in exact arithmetic, but change the transform coefficients, intermediate magnitudes, and cancellation during reconstruction. That changes how much rounding error reaches the output. [Barabasz et al.](https://arxiv.org/abs/1803.10986) analyze this floating-point behavior.
+
+### Choosing coefficients and intermediate precision
+
+Model precision and intermediate precision are separate choices. WinoVAE keeps BF16 model inputs and outputs but stores transformed intermediates in FP16. Both formats occupy 16 bits. FP16 spends three more bits on the fraction, giving roughly eightfold finer spacing in its normal range, in exchange for a narrower exponent range.
+
+We searched for points that reduce rounding sensitivity across the input, filter, and output transforms together. A continuous numerical search found a low-error set. A separate fraction grid found the nearby set $0,\pm3/2,\pm5/8,\infty$, which WinoVAE uses for spatial F4. The search does not prove global optimality. The [measurement notes](../media/tech_blog31/measurement_notes.md#precision-study) give the sensitivity objective and search procedure. The [coefficient and precision comparisons](#coefficient-and-precision-comparisons) report the measured errors.
+
+The temporal $F(4,3)$ transform uses a different set: $0,1,-1,2,-1/2,\infty$. Its transformed inputs, weights, and products also use FP16 storage. The point search and isolated error measurements in Table 7 apply only to spatial F4.
+
+We also evaluated larger spatial tiles with balanced transform ranges. That balancing rescales input and filter coordinates by powers of two and compensates in the output transform. It prevents some underflow and subnormal precision loss, but cannot add fraction bits.
 
 ### Account for transforms and workspace
 
@@ -499,80 +559,9 @@ A separate B300 experiment measures strong scaling with NCCL halo exchange. With
 
 Eight GPUs give a 3.63× decode speedup and a 5.32× encode speedup. Communication and synchronization remain as each GPU receives less convolution work, limiting scaling efficiency. Fused GPUDirect P2P addresses one recurring part of that overhead, as the fixed-GPU-count comparison above shows.
 
-## Discussion
+### Coefficient and precision comparisons
 
-The complete-model measurements put the chosen FP16 Winograd paths near the BF16 reference error scale for the tested inputs. Numerical experiments explain why other tile sizes and storage formats can behave differently, and what limits further reductions in arithmetic.
-
-### Where rounding error enters and how it propagates
-
-The four-product construction in <a href="#eq-winograd-f23">Eq. 9</a> is exact, but its terms can be much larger than the final output. Large intermediate values may cancel during reconstruction while their rounding errors remain. FP32 accumulation cannot recover bits already lost when the GEMM operands were stored.
-
-For a spatial tile, the input transform $V=B^TdB$ and filter transform $U=GgG^T$ create the GEMM operands. Their coefficients can increase magnitudes before storage rounding occurs. The coordinate products accumulate over input channels to form $M$. The output transform then reconstructs $Y=A^TMA$. If the accumulated error in those coordinates is $\Delta M$, its contribution to the output is
-
-<a id="eq-reconstruction-error"></a>
-
-$$
-\Delta Y \approx A^T(\Delta M)A + \Delta Y_{\mathrm{out}},
-\qquad (11)
-$$
-
-In <a href="#eq-reconstruction-error">Eq. 11</a>, $\Delta Y_{\mathrm{out}}$ represents rounding in reconstruction itself. Errors introduced in V, U, or stored M pass through the output transform. Cancellation can make the exact output small without making the independently rounded errors small. Point optimization must account for the input, filter, and output transforms together. The size of the GEMM operands alone does not determine output error.
-
-This makes intermediate precision a separate choice from model precision. WinoVAE keeps BF16 model inputs and outputs but stores transformed intermediates in FP16. Both formats occupy 16 bits. FP16 spends three more bits on the fraction, giving roughly eightfold finer spacing in its normal range, in exchange for a narrower exponent range.
-
-#### Interpolation and transform coefficients
-
-The transform coefficients come from polynomial arithmetic. To see the construction, take an auxiliary two-element sequence $a=[a_0,a_1]$ and the three filter coefficients $g=[g_0,g_1,g_2]$, and write
-
-<a id="eq-polynomials"></a>
-
-$$
-\begin{aligned}
-a(z)&=a_0+a_1z,\\
-g(z)&=g_0+g_1z+g_2z^2.
-\end{aligned}
-\qquad (12)
-$$
-
-The product of the polynomials in <a href="#eq-polynomials">Eq. 12</a>, $c(z)=a(z)g(z)$, has four coefficients. Those coefficients are the full convolution of the two sequences: for example, the coefficient of $z$ is $c_1=a_0g_1+a_1g_0$. The variable $z$ records coefficient positions. It is not a pixel coordinate.
-
-Instead of forming all six pairwise products, evaluate the polynomials at $0$, $1$, and $-1$, multiply their values, and also multiply their leading coefficients:
-
-<a id="eq-polynomial-products"></a>
-
-$$
-\begin{aligned}
-q_0 &= a_0g_0,\\
-q_+ &= (a_0+a_1)(g_0+g_1+g_2),\\
-q_- &= (a_0-a_1)(g_0-g_1+g_2),\\
-q_\infty &= a_1g_2.
-\end{aligned}
-\qquad (13)
-$$
-
-The notation $\infty$ means selecting the leading coefficient, not evaluating floating-point arithmetic at infinity. The four products in <a href="#eq-polynomial-products">Eq. 13</a> determine all four coefficients of $c(z)$:
-
-<a id="eq-interpolation"></a>
-
-$$
-\begin{aligned}
-c_0 &= q_0,\\
-c_1 &= (q_+-q_-)/2-q_\infty,\\
-c_2 &= (q_++q_-)/2-q_0,\\
-c_3 &= q_\infty.
-\end{aligned}
-\qquad (14)
-$$
-
-Recovering polynomial coefficients with <a href="#eq-interpolation">Eq. 14</a> from the values in <a href="#eq-polynomial-products">Eq. 13</a> is **interpolation**. Evaluation at $0$ and $\pm1$ requires only sums and differences because their powers are zeros, ones, or signs. The interpolation step supplies the fixed factors such as $1/2$.
-
-This example maps two sequence elements to four full-convolution coefficients. To obtain the sliding filter in <a href="#eq-direct-f23">Eq. 8</a>, hold $g$ fixed and transpose that $4\times2$ linear map: its transpose maps the four inputs $d_0,\ldots,d_3$ to $y_0,y_1$. Transposing the evaluation and interpolation steps produces the Winograd input and output transforms. For example, $q_0$ contributes $+q_0$ to $c_0$ and $-q_0$ to $c_2$. The transposed step combines inputs as $d_0-d_2$. This is the first input combination in <a href="#eq-winograd-f23">Eq. 9</a>. The [Cook–Toom construction described by Lavin and Gray](https://arxiv.org/abs/1509.09308) generalizes this approach to larger tiles. <!-- codespell:ignore toom -->
-
-For one-dimensional $F(m,r)$, the polynomial product has $m+r-1$ coefficients, so the construction needs that many independent values: four for $F(2,3)$, six for $F(4,3)$. Applying the six-point construction along both spatial axes gives the 36 coordinates of spatial F4. Other valid point sets give the same convolution in exact arithmetic, but change the transform coefficients, intermediate magnitudes, and cancellation during reconstruction. That changes how much rounding error reaches the output. [Barabasz et al.](https://arxiv.org/abs/1803.10986) analyze this floating-point behavior.
-
-#### Choosing coefficients and intermediate precision
-
-We searched for points that reduce rounding sensitivity across the input, filter, and output transforms together. A continuous numerical search found a low-error set. A separate fraction grid found the nearby set $0,\pm3/2,\pm5/8,\infty$, which WinoVAE uses for spatial F4. Table 7 shows why: the simple fractions retain nearly all the accuracy benefit of the continuous search.
+Table 7 compares the spatial-F4 point sets and intermediate storage formats described in [Methodology](#choosing-coefficients-and-intermediate-precision). These simulations measure rounding error in a single convolution, separately from the trained-model accuracy measurements above.
 
 <a id="table-7"></a>
 
@@ -584,11 +573,28 @@ We searched for points that reduce rounding sensitivity across the input, filter
 | Best-found continuous set | 0.1657 to 0.1674% | 1.331 to 1.335% |
 | Implemented: 0, ±3/2, ±5/8, ∞ | 0.1699 to 0.1716% | 1.362 to 1.365% |
 
-The implemented fractions reduce simulated rounding error, although the search does not prove global optimality. Their effect on runtime would require a separate timing comparison. The [measurement notes](../media/tech_blog31/measurement_notes.md#precision-study) give the sensitivity objective and search procedure.
+The implemented fractions retain nearly all the accuracy benefit of the continuous search and reduce simulated rounding error compared with the standard point set. Their effect on runtime would require a separate timing comparison.
 
-The temporal $F(4,3)$ transform uses a different set: $0,1,-1,2,-1/2,\infty$. Its transformed inputs, weights, and products also use FP16 storage. The point search and isolated error measurements in Table 7 apply only to spatial F4.
+Larger tiles increase the numerical difficulty. In separate simulations, F6 reached about 0.73% FP16 storage error and optimized F8 about 4.0%, even after balancing the transform ranges. F4 provided a more useful combination of arithmetic reduction and accuracy for this implementation.
 
-Larger tiles increase the numerical difficulty. In separate simulations, F6 reached about 0.73% FP16 storage error and optimized F8 about 4.0%, even after balancing the transform ranges. That balancing rescales input and filter coordinates by powers of two and compensates in the output transform. It prevents some underflow and subnormal precision loss, but cannot add fraction bits. F4 provided a more useful combination of arithmetic reduction and accuracy for this implementation.
+## Discussion
+
+The complete-model measurements put the chosen FP16 Winograd paths near the BF16 reference error scale for the tested inputs. Numerical experiments explain why other tile sizes and storage formats can behave differently, and what limits further reductions in arithmetic.
+
+### Error analysis
+
+The four-product construction in <a href="#eq-winograd-f23">Eq. 9</a> is exact, but its terms can be much larger than the final output. Large intermediate values may cancel during reconstruction while their rounding errors remain. FP32 accumulation cannot recover bits already lost when the GEMM operands were stored.
+
+For a spatial tile, the input transform $V=B^TdB$ and filter transform $U=GgG^T$ create the GEMM operands. Their coefficients can increase magnitudes before storage rounding occurs. The coordinate products accumulate over input channels to form $M$. The output transform then reconstructs $Y=A^TMA$. If the accumulated error in those coordinates is $\Delta M$, its contribution to the output is
+
+<a id="eq-reconstruction-error"></a>
+
+$$
+\Delta Y \approx A^T(\Delta M)A + \Delta Y_{\mathrm{out}},
+\qquad (14)
+$$
+
+In <a href="#eq-reconstruction-error">Eq. 14</a>, $\Delta Y_{\mathrm{out}}$ represents rounding in reconstruction itself. Errors introduced in V, U, or stored M pass through the output transform. Cancellation can make the exact output small without making the independently rounded errors small. Point optimization must account for the input, filter, and output transforms together. The size of the GEMM operands alone does not determine output error.
 
 ### Quantizing the Winograd products
 
