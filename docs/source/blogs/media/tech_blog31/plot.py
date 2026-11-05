@@ -117,14 +117,14 @@ def tiles() -> None:
 
 
 def gemm() -> None:
-    fig, ax = plt.subplots(figsize=(10.5, 6.3))
+    fig, ax = plt.subplots(figsize=(9.4, 6.3))
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    ax.set(xlim=(0, 10.5), ylim=(0, 6.3))
+    ax.set(xlim=(0, 9.4), ylim=(0, 6.3))
     ax.axis("off")
-    text(ax, 5.25, 6.05, r"$F(2\times2,\;3\times3)$: 16 GEMMs, $M_i=V_iU_i$", weight="bold")
+    text(ax, 4.70, 6.05, r"$F(2\times2,\;3\times3)$: 16 GEMMs", weight="bold")
     for x, size, label, color in [
         (0.50, 4, "Input tiles", PALE_GREEN),
-        (5.70, 3, "Filters", PALE_BLUE),
+        (5.15, 3, "Filters", PALE_BLUE),
     ]:
         text(ax, x + 0.36, 5.58, label)
         for row in range(size):
@@ -141,10 +141,11 @@ def gemm() -> None:
     arrow(ax, (1.38, 5.08), (3.60, 5.08))
     text(ax, 2.49, 5.41, "Input transform")
     text(ax, 4.22, 5.08, r"$V_0,\ldots,V_{15}$")
-    arrow(ax, (6.58, 5.08), (8.80, 5.08))
-    text(ax, 7.69, 5.41, "Filter transform")
-    ax.text(7.69, 4.72, "Once at weight loading", ha="center", va="center", color=GREY, fontsize=13)
-    text(ax, 9.48, 5.08, r"$U_0,\ldots,U_{15}$")
+    arrow(ax, (6.03, 5.08), (7.38, 5.08))
+    text(ax, 6.705, 5.51, "Filter\ntransform")
+    ax.text(7.15, 4.72, "Once at weight loading", ha="center", va="center", color=GREY, fontsize=13)
+    text(ax, 8.06, 5.08, r"$U_0,\ldots,U_{15}$")
+    text(ax, 2.45, 4.58, r"$M_i=V_iU_i$")
     specs = [(0.15, 1.35, "V"), (1.88, 1.10, "U"), (3.40, 1.35, "M")]
     for x, label in [
         (0.825, r"$N_{\mathrm{tiles}}\times C_{\mathrm{in}}$"),
@@ -175,13 +176,13 @@ def gemm() -> None:
         )
         ax.text(5.70, y + 0.085, str(coordinate), ha="left", va="center", color=GREEN, fontsize=10)
     text(ax, 6.23, 0.62, r"$16\times C_{\mathrm{out}}$")
-    arrow(ax, (6.87, 2.30), (9.24, 2.30), GREEN)
-    text(ax, 8.05, 2.65, "Output transform")
+    arrow(ax, (6.87, 2.30), (8.18, 2.30), GREEN)
+    text(ax, 7.525, 2.74, "Output\ntransform")
     for row in range(2):
         for column in range(2):
-            box(ax, 9.29 + column * 0.36, 1.94 + row * 0.36, 0.36, 0.36, "", PALE_GREEN)
-    text(ax, 9.65, 3.10, "Output\ntile A")
-    text(ax, 9.65, 1.43, "2 × 2 per\noutput channel")
+            box(ax, 8.23 + column * 0.36, 1.94 + row * 0.36, 0.36, 0.36, "", PALE_GREEN)
+    text(ax, 8.59, 3.10, "Output\ntile A")
+    text(ax, 8.59, 1.43, "2 × 2 per\noutput channel")
     save(fig, "coordinate_gemm")
 
 
