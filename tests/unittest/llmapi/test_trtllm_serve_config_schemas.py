@@ -281,6 +281,26 @@ def test_branch_snapshot_field_types(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
+def test_dspark_device_reranking_field(
+    schemas: dict[str, dict], filename: str, value: bool | str, valid: bool
+) -> None:
+    field = schemas[filename]["$defs"]["DSparkDecodingConfig"]["properties"][
+        "enable_fused_confidence_scheduler"
+    ]
+    assert field["default"] is True
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 5,
+            "enable_fused_confidence_scheduler": value,
+        }
+    }
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
 @pytest.mark.parametrize(
     ("load_balancer", "valid"),
     [

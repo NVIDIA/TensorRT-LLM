@@ -486,3 +486,33 @@ def test_cost_profiler_schedule_replaces_the_policy(monkeypatch):
     select.assert_not_called()
     fit_kwargs = executor.model_engine.fit_ragged_verify_lens.call_args.kwargs
     assert fit_kwargs["exact_shape"] == (4, 12, 1)
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_tp_ranks_fit_rank_zero_verify_lens(monkeypatch, enable_attention_dp):
+    from tensorrt_llm._torch.speculative import dspark_planner
+
+    executor, batch, _worker = _policy_executor()
+    monkeypatch.setattr(dspark_planner, "select_exact_sps_candidate", lambda **_kwargs: 12)
+    broadcasts = []
+
+    def broadcast(values, root=0):
+        broadcasts.append((list(values), root))
+        return [2, 3, 3]
+
+    executor.dist = SimpleNamespace(
+        tp_size=2,
+        mapping=SimpleNamespace(enable_attention_dp=enable_attention_dp),
+        tp_allgather_int64=lambda payload: SimpleNamespace(tolist=lambda: [payload, list(payload)]),
+        tp_cp_broadcast_int64=broadcast,
+    )
+
+    executor._dspark_confidence_draft_len(batch)
+
+    fitted_lens = executor.model_engine.fit_ragged_verify_lens.call_args.args[1]
+    if enable_attention_dp:
+        assert broadcasts == []
+        assert fitted_lens == [3, 2, 3]
+    else:
+        assert broadcasts == [([3, 2, 3], 0)]
+        assert fitted_lens == [2, 3, 3]

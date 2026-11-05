@@ -3898,7 +3898,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "step's host copy. The verifier budget is still chosen on the host. "
         "On by default; set False to rank on the host only, which drops a "
         "device pass and a full input rebuild on compact steps. Only used when "
-        "enable_confidence_scheduling=True.",
+        "enable_confidence_scheduling=True and the overlap scheduler is on; "
+        "with disable_overlap_scheduler=True, ranking stays on the host.",
         status="prototype")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")

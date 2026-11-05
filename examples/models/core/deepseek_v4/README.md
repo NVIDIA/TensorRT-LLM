@@ -544,7 +544,8 @@ every `K`. Without it the raw sigmoid confidence is used.
 The host chooses the verifier budget from a copy of the previous step's confidence, so it never
 waits for the GPU. The GPU then re-ranks which drafted positions to verify, using the confidence of
 the block being verified. This is on by default with confidence scheduling; it costs compact steps
-a full input rebuild and a small extra GPU pass. To rank on the host only:
+a full input rebuild and a small extra GPU pass. It needs the overlap scheduler, so with
+`disable_overlap_scheduler: true` ranking stays on the host. To rank on the host only:
 
 ```yaml
 speculative_config:
