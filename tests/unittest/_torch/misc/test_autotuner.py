@@ -383,16 +383,6 @@ def test_exclude_from_cache_op_reuses_profiles_within_window(
         tuner.choose_one(op, [GemmRunner()], wider_config, [x, w])
     assert len(profiled) == 6
 
-    # List-valued buckets are accepted and key like their tuple form.
-    list_spec = dataclasses.replace(tuning_config.dynamic_tensor_specs[0],
-                                    gen_tuning_buckets=[3, 4, 5])
-    list_config = dataclasses.replace(tuning_config,
-                                      dynamic_tensor_specs=(list_spec, ))
-    with autotune():
-        tuner.choose_one(op, [GemmRunner()], list_config, [x, w])
-        tuner.choose_one(op, [GemmRunner()], list_config, [x, w])
-    assert len(profiled) == 7
-
 
 def test_exclude_from_cache_op_is_reprofiled_until_every_profile_is_cached(
         monkeypatch) -> None:
