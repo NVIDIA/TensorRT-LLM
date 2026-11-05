@@ -164,6 +164,7 @@ def _zero_kv_rank(
                     NUM_HEADS,
                     VALUE_DIM,
                     zero_kv_mask=zero_kv_mask,
+                    is_cuda_graph=True,
                 )
         torch.cuda.current_stream().wait_stream(side_stream)
         torch.cuda.synchronize()
@@ -177,6 +178,7 @@ def _zero_kv_rank(
                 NUM_HEADS,
                 VALUE_DIM,
                 zero_kv_mask=zero_kv_mask,
+                is_cuda_graph=True,
             )
         torch.cuda.synchronize()
         _bounded_barrier(comm, "after capture")
@@ -231,9 +233,10 @@ def test_zero_kv_rows_are_neutral(comms_medium: str, num_tokens: int) -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @skip_pre_blackwell
-def test_zero_kv_rows_are_neutral_under_cuda_graph() -> None:
-    """The fifo-v2 sender must preserve the contract under graph replay."""
-    _assert_neutral(_launch(96, "fifo_v2", use_cuda_graph=True))
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v2"])
+def test_zero_kv_rows_are_neutral_under_cuda_graph(comms_medium: str) -> None:
+    """The compiled NCCL reformat and the fifo-v2 sender must hold under graph replay."""
+    _assert_neutral(_launch(96, comms_medium, use_cuda_graph=True))
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
