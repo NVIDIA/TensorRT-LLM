@@ -49,12 +49,12 @@ top-level directories when the configured include patterns name literal top-leve
 ## When it runs
 
 `jenkins/L0_MergeRequest.groovy` decides pipeline-level eligibility and propagates it through
-`testFilter[cbts_coverage]`: the `ENABLE_CBTS_COVERAGE` kill switch.
+`testFilter[cbts_coverage]`: `ENABLE_CBTS_COVERAGE` and the official post-merge pipeline gate.
 
 `isCbtsStage()` in `jenkins/L0_Test.groovy` gates each stage on that flag plus:
 
 - not a perf stage, a Ray stage (`-Ray-` in the name), or a TensorRT / CPP stage
-- post-merge: single-GPU stages only; pre-merge: single-node multi-GPU stages only
+- official post-merge: single-GPU and single-node multi-GPU stages; pre-merge collection is disabled
 - multi-node stages remain excluded
 - not listed in `CBTS_EXCLUDE_STAGES`
 
@@ -257,7 +257,8 @@ does not recurse into archives.
 
 On post-merge runs, `L0_MergeRequest.groovy` uploads SQLite-only x86 and SBSA tarballs once their
 single-GPU stages finish; the coverage selector requires both and merges their compact databases.
-The later Test Coverage stage merges every stage's files through `pystart_report.py` and uploads
+Those early architecture checkpoints contain single-GPU coverage only. The later Test Coverage
+stage merges all collected single-GPU and multi-GPU files through `pystart_report.py` and uploads
 `cbts_pystart_report.tar.gz`, holding `cbts_touchmap.sqlite` (the indexed selector artifact, with a
 `meta` table carrying the coverage rate) and `cbts_report/` (the split HTML report; open
 `cbts_report/index.html` after extracting).

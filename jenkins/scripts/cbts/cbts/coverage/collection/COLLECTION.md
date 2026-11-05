@@ -195,14 +195,14 @@ whether or not the record is sound.
 
 `L0_MergeRequest.groovy` decides pipeline-level eligibility and `isCbtsStage()` decides each stage:
 
-- `ENABLE_CBTS_COVERAGE` kill switch
+- `ENABLE_CBTS_COVERAGE` and the official post-merge pipeline gate
 - not a perf stage, a Ray stage (`-Ray-` in the name), or a TensorRT / CPP stage
-- post-merge: single-GPU stages only; pre-merge: single-node multi-GPU stages only
+- official post-merge: single-GPU and single-node multi-GPU stages; pre-merge collection is disabled
 - multi-node stages excluded
 - not listed in `CBTS_EXCLUDE_STAGES`
 
 The per-process files ride back inside `results-<stage>.tar.gz`. Post-merge architecture
-checkpoints first upload `cbts_pystart_report_x86_64.tar.gz` and
+checkpoints first upload single-GPU `cbts_pystart_report_x86_64.tar.gz` and
 `cbts_pystart_report_SBSA.tar.gz`, which the selector requires and hierarchically merges. The
 later `Test Coverage` stage merges all files and uploads
 `${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz` for the full report.
