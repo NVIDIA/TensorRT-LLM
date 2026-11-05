@@ -38,6 +38,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 struct GpuCacheTierConfig
 {
     size_t quota = 0; // bytes
+    // Place KV pages in per-locality-domain physical memory when the device exposes locality domains.
+    bool enableLocalityDomains = false;
 
     [[nodiscard]] CacheTier tier() const noexcept
     {

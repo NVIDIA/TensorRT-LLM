@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -245,13 +246,14 @@ TEST(KvCacheManagerV2TypedIndexTest, AllocationRequestsUsePlainSlotCount)
     static_assert(!std::is_invocable<decltype(&SlotAllocator::allocateMultiple), SlotAllocator&, SlotId>::value,
         "SlotAllocator::allocateMultiple must not take a slot id");
 
-    using StorageManagerNewGpuSlots = TypedVec<LifeCycleId, std::vector<Slot>> (StorageManager::*)(
-        TypedVec<LifeCycleId, SlotCount> const&, MigrationRecorder const&, DropRecorder const&);
+    using StorageManagerNewGpuSlots
+        = TypedVec<LifeCycleId, std::vector<Slot>> (StorageManager::*)(TypedVec<LifeCycleId, SlotCount> const&,
+            MigrationRecorder const&, DropRecorder const&, std::optional<LocalityDomainId>);
     static_assert(std::is_same<decltype(&StorageManager::newGpuSlots), StorageManagerNewGpuSlots>::value,
         "StorageManager::newGpuSlots must take plain slot counts");
 
-    using StorageManagerNewSlotsForPoolGroup = std::vector<Slot> (StorageManager::*)(
-        CacheLevel, PoolGroupIndex, SlotCount, MigrationRecorder const&, DropRecorder const&);
+    using StorageManagerNewSlotsForPoolGroup = std::vector<Slot> (StorageManager::*)(CacheLevel, PoolGroupIndex,
+        SlotCount, MigrationRecorder const&, DropRecorder const&, std::optional<LocalityDomainId>);
     static_assert(
         std::is_same<decltype(&StorageManager::newSlotsForPoolGroup), StorageManagerNewSlotsForPoolGroup>::value,
         "StorageManager::newSlotsForPoolGroup must take a plain slot count");

@@ -33,6 +33,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -3643,7 +3644,11 @@ int MLA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
 
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
+        // A locality-domain stream runs only on its Green Context's SMs, so size the KV split for those.
+        // GQA decode stays on the device count: at small batch its kernels run faster over-split.
+        auto const streamSmCount = static_cast<int>(tensorrt_llm::locality_domain::getLocalizedStreamSmCount(stream));
+        tllmRunnerParams.mMultiProcessorCount
+            = streamSmCount > 0 ? std::min(streamSmCount, mMultiProcessorCount) : mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = p.token_offset;
 
@@ -4013,6 +4018,7 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.sage_attn_num_elts_per_blk_k = fwd.sage_attn_num_elts_per_blk_k;
     c.sage_attn_num_elts_per_blk_v = fwd.sage_attn_num_elts_per_blk_v;
     c.sage_attn_qk_int8 = fwd.sage_attn_qk_int8;
+    c.locality_domain_id = fwd.locality_domain_id;
     c.sage_attn_smooth_k = fwd.sage_attn_smooth_k;
     c.skip_correction_threshold = attn.skip_correction_threshold;
     return c;
@@ -4059,6 +4065,7 @@ std::string AttentionBase::toString() const
     TRTLLM_DUMP_FIELD(sage_attn_num_elts_per_blk_k)
     TRTLLM_DUMP_FIELD(sage_attn_num_elts_per_blk_v)
     TRTLLM_DUMP_FIELD(sage_attn_qk_int8)
+    TRTLLM_DUMP_FIELD(locality_domain_id)
     TRTLLM_DUMP_FIELD(sage_attn_smooth_k)
     TRTLLM_DUMP_FIELD(skip_correction_threshold)
 #undef TRTLLM_DUMP_FIELD
@@ -4312,7 +4319,8 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
              std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
              c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
              std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
-             c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
+             c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k},
+             c.locality_domain_id})
     {
         h = hashCombine(h, v);
     }
