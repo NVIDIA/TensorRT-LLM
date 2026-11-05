@@ -54,7 +54,7 @@ top-level directories when the configured include patterns name literal top-leve
 `isCbtsStage()` in `jenkins/L0_Test.groovy` gates each stage on that flag plus:
 
 - not a perf stage, a Ray stage (`-Ray-` in the name), or a TensorRT / CPP stage
-- post-merge: single-GPU stages only; pre-merge: single-node multi-GPU stages only (collection experiment)
+- post-merge: single-GPU stages only; pre-merge: single-node multi-GPU stages only
 - multi-node stages remain excluded
 - not listed in `CBTS_EXCLUDE_STAGES`
 
