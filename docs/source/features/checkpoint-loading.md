@@ -228,6 +228,8 @@ separate draft checkpoint can reuse the loader. It preserves activation even
 when a subsequent advisory read failure makes the effective policy native.
 HF-derived formats such as Mistral and MX also report observed native disk
 loads; this does not enable rank-striped read-ahead for those formats.
+GMS writers using the built-in HF disk path capture the native policy after
+target materialization, before draft loading; GMS readers remain unknown.
 Unsupported, preloaded, or unobserved paths report an explicit unknown (`null`),
 not an inferred native policy. The collector prefers this structured primary
 status; only older runtimes without the field use `legacy_logs` fallback.
@@ -244,15 +246,24 @@ prefixes for disaggregated server roles):
   times. The existing collection-complete flag only checks successful fetches
   and server counts; it does not imply these fields were present.
 
-Image provenance is recorded from the actual test-container launch reference,
-not the Jenkins dispatcher image: `s_runtime_image`, `s_runtime_image_source`,
-`s_runtime_image_digest`, and `s_runtime_image_identity_strength`. A valid
-digest-pinned launch reference reports `digest_pinned`; a tagged reference
-reports `reference_only` with an unknown digest. Missing provenance remains
-`unknown`. A tag, its hash, or an Enroot cache filename is not evidence of the
-resolved runtime digest. Group comparisons by image identity as well as
-model/configuration, GPU and parallelism; tagged-image comparisons still lack
-immutable-image verification.
+CI records include image provenance so startup comparisons can account for
+runtime-environment differences instead of attributing them to the loader.
+This describes the benchmark environment, not which images customers deploy.
+
+The existing `s_runtime_image`, `s_runtime_image_source`,
+`s_runtime_image_digest`, and `s_runtime_image_identity_strength` fields
+describe the original OCI/base-image reference selected for the test
+container, not the Jenkins dispatcher image. A valid digest-pinned reference
+reports `digest_pinned` for that OCI reference only; a tagged reference reports
+`reference_only` with an unknown digest. Missing provenance remains `unknown`.
+
+Enroot may launch a derived fat `.sqsh` with dependencies and TRT-LLM already
+installed. These fields do not identify or verify that derived artifact or
+the environment after package installation. A tag hash or `.sqsh` cache
+filename is not a content digest. Group comparisons by the recorded base
+reference as well as model/configuration, GPU and parallelism, but do not
+treat matching base references as proof of identical runtime environments.
+Final launch-artifact provenance remains a separate follow-up.
 
 These additions do not change loader policy or add startup collectives. Timing
 remains rank-0-based per server, and failed launches are not comprehensively

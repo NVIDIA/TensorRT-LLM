@@ -73,7 +73,7 @@ def get_job_info():
     commit = os.getenv("gitlabCommit", "")
     primary = global_vars.get("llm_artifacts_primary") or "aws"
     artifact_base = _ARTIFACT_BASES.get(primary, _ARTIFACT_BASES["aws"])
-    # The launcher publishes the test image; globalVars may describe a dispatcher.
+    # Original OCI/base reference, not the derived Enroot artifact or dispatcher.
     runtime_image = os.getenv("TRTLLM_CI_RUNTIME_IMAGE", "").strip()
     digest_match = re.fullmatch(r"[^@\s]+@(sha256:[0-9a-f]{64})", runtime_image)
     runtime_image_digest = digest_match.group(1) if digest_match else "unknown"

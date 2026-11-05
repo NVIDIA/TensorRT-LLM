@@ -2010,7 +2010,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            // The dispatcher may use an x86 image while the test runs on SBSA.
             withEnv(["TRTLLM_CI_RUNTIME_IMAGE=${LLM_DOCKER_IMAGE}"]) {
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
             }

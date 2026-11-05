@@ -60,7 +60,7 @@ def test_model_loader_snapshots_final_policy_before_draft_reset(
     outcome: str,
 ) -> None:
     requested = "native" if outcome == "native" else "auto"
-    checkpoint_loader = _construct_checkpoint_loader(None, "HF", checkpoint_io_policy=requested)
+    checkpoint_loader = construct_checkpoint_loader(None, "HF", checkpoint_io_policy=requested)
     weight_loader = checkpoint_loader.weight_loader
     weights = {"model.weight": object()}
     monkeypatch.setattr(weight_loader, "_load_weights_native", MagicMock(return_value=weights))
@@ -129,7 +129,7 @@ def test_model_loader_snapshots_final_policy_before_draft_reset(
 def test_hf_subclass_disk_loads_report_final_native_policy(
     monkeypatch: pytest.MonkeyPatch, checkpoint_format: str, requested: str
 ) -> None:
-    checkpoint_loader = _construct_checkpoint_loader(
+    checkpoint_loader = construct_checkpoint_loader(
         None, checkpoint_format, checkpoint_io_policy=requested
     )
     weight_loader = checkpoint_loader.weight_loader
