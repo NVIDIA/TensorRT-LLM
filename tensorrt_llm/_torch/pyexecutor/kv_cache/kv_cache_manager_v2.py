@@ -3033,7 +3033,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # stay int.
             self.max_seq_len = int(max_num_tokens)
 
-        self.max_blocks_per_seq = self._get_max_blocks_per_seq(self.max_seq_len)
+        self.max_blocks_per_seq = self._get_max_blocks_per_seq(max_seq_len)
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
