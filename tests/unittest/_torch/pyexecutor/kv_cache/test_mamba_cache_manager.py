@@ -4472,6 +4472,7 @@ def test_v2_hybrid_low_priority_snapshot_prompt_len(
     demoted: bool,
 ) -> None:
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.mapping = SimpleNamespace(rank=0)
     mgr.local_num_mamba_layers = num_mamba_layers
     mgr._low_priority_snapshot_prompt_len = threshold
     req = SimpleNamespace(is_dummy=is_dummy, prompt_len=prompt_len)
