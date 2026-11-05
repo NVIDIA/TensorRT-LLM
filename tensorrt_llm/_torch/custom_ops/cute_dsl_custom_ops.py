@@ -18599,7 +18599,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              local_expert_offset: int,
                              tile_size: int,
                              swiglu_limit: float = float("inf"),
-                             zero_output: bool = False):
+                             zero_output: bool = False,
+                             skip_reset: bool = False):
                     super().__init__()
                     self.num_experts = num_experts
                     self.top_k = top_k
@@ -18610,6 +18611,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # instead of a separate memset (dense case only; the caller
                     # keeps its sparse row memset for alltoall with ep > top_k).
                     self.zero_output = zero_output
+                    # Locality-domain shards: the composite op clears both
+                    # partitions' workspaces (and quantizes raw input) in one
+                    # parent launch before the fork, so the shard launches
+                    # skip their own reset and receive E4M3 input.
+                    self.skip_reset = skip_reset
+                    if skip_reset and zero_output:
+                        raise ValueError(
+                            "skip_reset leaves the output to the parent reset; "
+                            "zero_output must be False")
                     # The kernel treats a negative limit as "no clamp".
                     swiglu_limit = float(swiglu_limit)
                     self.swiglu_limit = swiglu_limit if swiglu_limit >= 0 else float(
@@ -18635,7 +18645,155 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.tile_size,
                         self.swiglu_limit,
                         self.zero_output,
+                        self.skip_reset,
                     )
+
+                @staticmethod
+                def new_sync_workspace(
+                        device: torch.device,
+                        num_padded_rows: int) -> Tuple[torch.Tensor, ...]:
+                    """One call's FC1->FC2 readiness counters (one per 128-row M
+                    tile is an upper bound for every tile geometry) and the two
+                    L2-atomic work-ID counters on their own 128 B lines, as one
+                    uninitialized allocation the reset launch clears.
+
+                    Allocated per call: the caching allocator is stream-ordered,
+                    so calls in flight on different streams (chunk overlap,
+                    locality-domain partitions) never share a workspace, and
+                    CUDA graphs capture fixed addresses from their pool.
+                    """
+                    num_ready = num_padded_rows // 128
+                    ready_words = (num_ready + 31) // 32 * 32
+                    workspace = torch.empty(ready_words + 64,
+                                            dtype=torch.int32,
+                                            device=device)
+                    return (workspace[:num_ready],
+                            workspace[ready_words:ready_words + 1],
+                            workspace[ready_words + 32:ready_words + 33])
+
+                @staticmethod
+                def new_input_quant_scratch(
+                        input_raw: torch.Tensor,
+                        scale_shape) -> Tuple[torch.Tensor, torch.Tensor]:
+                    """One call's E4M3 values and linear UE8M0 scales, written by
+                    the fused input quantization in the reset launch and read by
+                    the GEMM; allocated per call like the workspace."""
+                    if input_raw.numel() > _INT32_MAX:
+                        raise ValueError(
+                            "MXFP8 fused FC12 input quantization takes at most "
+                            f"{_INT32_MAX} elements, got {input_raw.numel()}")
+                    return (
+                        torch.empty(input_raw.shape,
+                                    dtype=torch.float8_e4m3fn,
+                                    device=input_raw.device),
+                        torch.empty(scale_shape,
+                                    dtype=torch.uint8,
+                                    device=input_raw.device),
+                    )
+
+                @classmethod
+                def launch_locality_domain_parent_reset(
+                    cls, inputs: List[torch.Tensor], zero_output: bool
+                ) -> Tuple[List[Tuple[torch.Tensor, ...]], Optional[Tuple[
+                        torch.Tensor, torch.Tensor]]]:
+                    """One reset launch for both locality-domain shards.
+
+                    Runs on the current (parent) stream before the fork: clears
+                    the sync workspaces of partitions 0 and 1, optionally the
+                    whole BF16 output both shards scatter-add into, and
+                    quantizes raw BF16/FP16 input into the scratch the shards
+                    then consume. ``inputs`` follows the fused FC12 op order
+                    (input, ..., permuted_idx_to_expanded_idx at 7, output at
+                    13). Returns this call's two workspaces and the E4M3 input
+                    scratch (``None`` for E4M3 input); the caller hands them to
+                    the shard launches. They are allocated on the parent stream
+                    and released after the join, so the shards' streams never
+                    see them reused while in flight.
+                    """
+                    input_raw = inputs[0]
+                    scale_holder = inputs[2]
+                    output = inputs[13]
+                    m = inputs[7].size(0)
+                    device = input_raw.device
+                    assert m % 128 == 0
+                    workspaces = [
+                        cls.new_sync_workspace(device, m) for _ in (0, 1)
+                    ]
+                    scratch = None
+                    quant_args = {}
+                    input_dtype = None
+                    if input_raw.dtype != torch.float8_e4m3fn:
+                        assert input_raw.dtype in (torch.bfloat16,
+                                                   torch.float16)
+                        assert input_raw.is_contiguous() and \
+                            input_raw.data_ptr() % 16 == 0
+                        scratch = cls.new_input_quant_scratch(
+                            input_raw, scale_holder.shape)
+                        quant, scale = scratch
+                        input_dtype = input_raw.dtype
+                        raw_dtype = (cutlass.BFloat16 if input_dtype
+                                     == torch.bfloat16 else cutlass.Float16)
+                        quant_args = dict(
+                            input_raw_ptr=make_ptr(raw_dtype,
+                                                   input_raw.data_ptr(),
+                                                   cute.AddressSpace.gmem,
+                                                   assumed_align=16),
+                            input_quant_ptr=make_ptr(cutlass.Float8E4M3FN,
+                                                     quant.data_ptr(),
+                                                     cute.AddressSpace.gmem,
+                                                     assumed_align=16),
+                            input_scale_ptr=make_ptr(cutlass.Float8E8M0FNU,
+                                                     scale.data_ptr(),
+                                                     cute.AddressSpace.gmem,
+                                                     assumed_align=16),
+                            input_numel=cutlass.Int32(input_raw.numel()))
+                    # The reset kernel indexes the output with Int32 and reads
+                    # its extent only with zero_output.
+                    reset_output_numel = 0
+                    if zero_output:
+                        assert output.is_contiguous() and output.numel() % 8 == 0 \
+                            and output.data_ptr() % 16 == 0, (
+                                "zero_output needs a contiguous, 16-byte aligned "
+                                "BF16 output with a multiple of 8 elements")
+                        if output.numel() > _INT32_MAX:
+                            raise ValueError(
+                                "zero_output clears at most "
+                                f"{_INT32_MAX} output elements, got "
+                                f"{output.numel()}; clear the output before "
+                                "the call instead")
+                        reset_output_numel = output.numel()
+
+                    def _i32_ptr(t):
+                        return make_ptr(cutlass.Int32, t.data_ptr(),
+                                        cute.AddressSpace.gmem)
+
+                    output_ptr = make_ptr(cutlass.BFloat16,
+                                          output.data_ptr(),
+                                          cute.AddressSpace.gmem,
+                                          assumed_align=16)
+                    stream = cuda.CUstream(
+                        torch.cuda.current_stream().cuda_stream)
+                    args = (_i32_ptr(workspaces[0][0]), cutlass.Int32(m // 128),
+                            _i32_ptr(workspaces[0][1]),
+                            _i32_ptr(workspaces[0][2]), output_ptr,
+                            cutlass.Int32(reset_output_numel), stream)
+                    second = dict(ready_1_ptr=_i32_ptr(workspaces[1][0]),
+                                  fc1_counter_1_ptr=_i32_ptr(workspaces[1][1]),
+                                  fc2_counter_1_ptr=_i32_ptr(workspaces[1][2]))
+                    # PDL against the caller's preceding kernel (routing
+                    # metadata or the previous forward); the shards are
+                    # ordered behind this launch by the fork events.
+                    reset_key = ("locality_domain_parent", TRTLLM_ENABLE_PDL,
+                                 zero_output, input_dtype)
+                    compiled_reset = cls.reset_kernel_cache.get(reset_key)
+                    if compiled_reset is None:
+                        compiled_reset = cute.compile(reset_fc12_sync_workspace,
+                                                      *args, TRTLLM_ENABLE_PDL,
+                                                      zero_output, **quant_args,
+                                                      **second)
+                        cls.reset_kernel_cache[reset_key] = compiled_reset
+                    compiled_reset(*args, **quant_args, **second)
+                    return workspaces, scratch
 
                 @property
                 def cta_group(self) -> int:
@@ -18916,21 +19074,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # read-only, including the scale-shape placeholder. Like
                     # the workspace below, the scratch is allocated per call:
                     # the caching allocator is stream-ordered, so concurrent
-                    # calls on different streams (chunk overlap) never share
-                    # it, and nothing is retained per row count.
+                    # calls on different streams (chunk overlap, locality
+                    # domain partitions) never share it, and nothing is
+                    # retained per row count.
                     if input_unquantized is not None:
-                        if (input_unquantized.numel()
-                                > MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS):
-                            raise ValueError(
-                                "MXFP8 fused FC12 input quantization takes at most "
-                                f"{MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS} elements, got "
-                                f"{input_unquantized.numel()}")
-                        fc1_a = torch.empty(input_unquantized.shape,
-                                            dtype=torch.float8_e4m3fn,
-                                            device=input_unquantized.device)
-                        fc1_sfa = torch.empty(fc1_sfa.shape,
-                                              dtype=fc1_sfa.dtype,
-                                              device=input_unquantized.device)
+                        assert not self.skip_reset, (
+                            "skip_reset shards receive E4M3 input quantized by "
+                            "the parent reset")
+                        fc1_a, fc1_sfa = self.__class__.new_input_quant_scratch(
+                            input_unquantized, fc1_sfa.shape)
 
                     # FC1 intermediate (FC2 A operand) and its swizzled block
                     # scales: written and re-read by the kernel, so plain scratch.
@@ -18941,25 +19093,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     fc1_sfc = torch.empty(m * interm_size // sf_vec,
                                           dtype=fc1_sfa.dtype,
                                           device=fc1_sfa.device)
-                    # Per-launch zeroed workspace: FC1->FC2 readiness counters
-                    # (one per 128-row M tile is an upper bound for every tile
-                    # geometry) and the two L2-atomic work-ID counters on their
-                    # own 128 B lines. One uninitialized allocation per call,
-                    # cleared by the reset launch below (no fill kernels). The
-                    # caching allocator is stream-ordered, so calls in flight
-                    # on different streams (chunk overlap) get distinct
-                    # buffers, and CUDA graphs capture fixed addresses from
-                    # their private pool.
-                    num_ready = m // 128
-                    ready_words = (num_ready + 31) // 32 * 32
-                    workspace = torch.empty(ready_words + 64,
-                                            dtype=torch.int32,
-                                            device=fc1_a.device)
-                    fc1_ready = workspace[:num_ready]
-                    fc1_scheduler_counter = workspace[ready_words:ready_words +
-                                                      1]
-                    fc2_scheduler_counter = workspace[ready_words +
-                                                      32:ready_words + 33]
+                    # Per-launch zeroed workspace, cleared by one reset launch
+                    # below (no fill kernels). Allocated per call, see
+                    # new_sync_workspace. Locality-domain shards skip their own
+                    # reset and receive the workspace the composite op's parent
+                    # reset cleared before the fork.
+                    if self.skip_reset:
+                        workspace = kwargs.get("sync_workspace")
+                        assert workspace is not None, (
+                            "skip_reset shards need the sync_workspace the "
+                            "parent reset cleared")
+                    else:
+                        workspace = self.__class__.new_sync_workspace(
+                            fc1_a.device, m)
+                    fc1_ready, fc1_scheduler_counter, fc2_scheduler_counter = \
+                        workspace
 
                     def _e4m3_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Float8E4M3FN,
@@ -19220,35 +19368,53 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     else:
                         compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-                    # Clear the readiness flags and work-ID counters (and, with
-                    # zero_output, the output itself) with one launch. PDL lets
-                    # it overlap the previous kernel's tail and the fused GEMM's
-                    # prologue; the GEMM's griddepcontrol_wait precedes its
-                    # first workspace access. Cluster launches keep the plain
-                    # ordering.
-                    use_reset_pdl = TRTLLM_ENABLE_PDL and (
-                        cluster_shape_mn[0] * cluster_shape_mn[1] == 1)
-                    quant_args = {}
-                    input_dtype = None
-                    if input_unquantized is not None:
-                        input_dtype = input_unquantized.dtype
-                        raw_dtype = (cutlass.BFloat16 if input_dtype
-                                     == torch.bfloat16 else cutlass.Float16)
-                        quant_args = dict(input_raw_ptr=make_ptr(
-                            raw_dtype,
-                            input_unquantized.data_ptr(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=16),
-                                          input_quant_ptr=fc1_a_ptr,
-                                          input_scale_ptr=fc1_sfa_ptr,
-                                          input_numel=cutlass.Int32(
-                                              input_unquantized.numel()))
-                    reset_key = (use_reset_pdl, self.zero_output, input_dtype)
-                    compiled_reset = self.__class__.reset_kernel_cache.get(
-                        reset_key)
-                    if compiled_reset is None:
-                        compiled_reset = cute.compile(
-                            reset_fc12_sync_workspace,
+                    if not self.skip_reset:
+                        # Clear the readiness flags and work-ID counters (and, with
+                        # zero_output, the output itself) with one launch. Locality
+                        # domain shards skip this: the composite op's parent reset
+                        # cleared both workspaces before the fork. PDL lets
+                        # it overlap the previous kernel's tail and the fused GEMM's
+                        # prologue; the GEMM's griddepcontrol_wait precedes its
+                        # first workspace access. Cluster launches keep the plain
+                        # ordering.
+                        use_reset_pdl = TRTLLM_ENABLE_PDL and (
+                            cluster_shape_mn[0] * cluster_shape_mn[1] == 1)
+                        quant_args = {}
+                        input_dtype = None
+                        if input_unquantized is not None:
+                            input_dtype = input_unquantized.dtype
+                            raw_dtype = (cutlass.BFloat16 if input_dtype
+                                         == torch.bfloat16 else cutlass.Float16)
+                            quant_args = dict(input_raw_ptr=make_ptr(
+                                raw_dtype,
+                                input_unquantized.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16),
+                                              input_quant_ptr=fc1_a_ptr,
+                                              input_scale_ptr=fc1_sfa_ptr,
+                                              input_numel=cutlass.Int32(
+                                                  input_unquantized.numel()))
+                        reset_key = (use_reset_pdl, self.zero_output,
+                                     input_dtype)
+                        compiled_reset = self.__class__.reset_kernel_cache.get(
+                            reset_key)
+                        if compiled_reset is None:
+                            compiled_reset = cute.compile(
+                                reset_fc12_sync_workspace,
+                                fc1_ready_ptr,
+                                cutlass.Int32(m // 128),
+                                fc1_scheduler_counter_ptr,
+                                fc2_scheduler_counter_ptr,
+                                output_ptr,
+                                cutlass.Int32(reset_output_numel),
+                                stream,
+                                use_reset_pdl,
+                                self.zero_output,
+                                **quant_args,
+                            )
+                            self.__class__.reset_kernel_cache[
+                                reset_key] = compiled_reset
+                        compiled_reset(
                             fc1_ready_ptr,
                             cutlass.Int32(m // 128),
                             fc1_scheduler_counter_ptr,
@@ -19256,22 +19422,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             output_ptr,
                             cutlass.Int32(reset_output_numel),
                             stream,
-                            use_reset_pdl,
-                            self.zero_output,
                             **quant_args,
                         )
-                        self.__class__.reset_kernel_cache[
-                            reset_key] = compiled_reset
-                    compiled_reset(
-                        fc1_ready_ptr,
-                        cutlass.Int32(m // 128),
-                        fc1_scheduler_counter_ptr,
-                        fc2_scheduler_counter_ptr,
-                        output_ptr,
-                        cutlass.Int32(reset_output_numel),
-                        stream,
-                        **quant_args,
-                    )
 
                     compiled_gemm(
                         fc1_a_ptr,
@@ -19483,6 +19635,216 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size: int,
                 swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
                 precomputed_tactic: Optional[str] = None,
+                zero_output: bool = False,
+            ) -> None:
+                return None
+
+            # Shares the runner above, so it exists only where that does.
+            _MXFP8_FUSED_FC12_LOCALITY_ARGS = (
+                "(Tensor input, Tensor fc1_weight_0, Tensor fc1_weight_1, "
+                "Tensor input_scale, Tensor fc1_weight_scale_0, Tensor fc1_weight_scale_1, "
+                "Tensor fc1_alpha, Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
+                "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, "
+                "Tensor fc1_norm_const, Tensor fc2_weight_0, Tensor fc2_weight_1, "
+                "Tensor fc2_weight_scale_0, Tensor fc2_weight_scale_1, Tensor fc2_alpha, "
+                "Tensor(a17!) output, Tensor token_final_scales, "
+                "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+                "SymInt local_expert_offset, SymInt tile_size, "
+                f"float swiglu_limit={SWIGLU_LIMIT_SCALAR_DISABLED}, "
+                "bool zero_output=False) -> ()")
+
+            def _check_locality_shards(name: str, shard_0: torch.Tensor,
+                                       shard_1: torch.Tensor) -> None:
+                if shard_0.shape != shard_1.shape or shard_0.dtype != shard_1.dtype:
+                    raise ValueError(
+                        f"locality domain MXFP8 fused FC12 MoE {name} shards must have "
+                        f"identical shapes and dtypes, got {tuple(shard_0.shape)} "
+                        f"{shard_0.dtype} and {tuple(shard_1.shape)} {shard_1.dtype}."
+                    )
+
+            @torch.library.custom_op(
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin",
+                mutates_args=("output", ),
+                schema=_MXFP8_FUSED_FC12_LOCALITY_ARGS,
+                device_types="cuda")
+            def cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
+                input: torch.Tensor,
+                fc1_weight_0: torch.Tensor,
+                fc1_weight_1: torch.Tensor,
+                input_scale: torch.Tensor,
+                fc1_weight_scale_0: torch.Tensor,
+                fc1_weight_scale_1: torch.Tensor,
+                fc1_alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                fc1_norm_const: torch.Tensor,
+                fc2_weight_0: torch.Tensor,
+                fc2_weight_1: torch.Tensor,
+                fc2_weight_scale_0: torch.Tensor,
+                fc2_weight_scale_1: torch.Tensor,
+                fc2_alpha: torch.Tensor,
+                output: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+                zero_output: bool = False,
+            ) -> None:
+                """Tune and launch both locality-domain shards of the MXFP8 fused FC12 MoE.
+
+                Each shard holds half of every expert's inner channels: FC1 weights
+                and scales sliced along N (whole gate/up pairs), FC2 weights and
+                scales sliced along K. Both shards see all local experts and routes,
+                so the routing metadata is shared, and both scatter-add their partial
+                FC2 result into ``output`` through the fused finalize. ``output`` must
+                therefore be zero on entry for the rows this rank produces unless
+                ``zero_output`` is set, in which case one parent reset launch on the
+                caller's stream clears the whole output before the fork (dense case;
+                the alignment rules of the full-GPU op apply). That same launch
+                clears both partitions' synchronization workspaces and, for BF16 /
+                FP16 ``input``, performs the MXFP8 input quantization once for both
+                shards (``input_scale`` then only supplies the [orig_m, K/32]
+                shape), so the split pays one reset like the full-GPU op instead of
+                one per shard plus a separate quantize and memset.
+                Splitting FC2 changes the BF16 accumulation order, so results agree
+                with the full-GPU kernel within the MoE tolerances, not bitwise.
+
+                The MoE outer runner invokes this op during preparation so locality
+                domain resources, tactics and kernels are ready before CUDA graph
+                capture. Direct callers must likewise invoke it once before capture.
+                """
+                _check_locality_shards("FC1 weight", fc1_weight_0, fc1_weight_1)
+                _check_locality_shards("FC1 weight-scale", fc1_weight_scale_0,
+                                       fc1_weight_scale_1)
+                _check_locality_shards("FC2 weight", fc2_weight_0, fc2_weight_1)
+                _check_locality_shards("FC2 weight-scale", fc2_weight_scale_0,
+                                       fc2_weight_scale_1)
+                if fc2_weight_0.size(2) * 2 != fc1_weight_0.size(1):
+                    raise ValueError(
+                        "locality domain MXFP8 fused FC12 MoE shards must split the "
+                        f"inner channels: FC2 K {fc2_weight_0.size(2)} vs FC1 N "
+                        f"{fc1_weight_0.size(1)}.")
+
+                runtime = LocalityDomainRuntime(num_partitions=2)
+                tuner_key = (
+                    "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin::locality_domain"
+                )
+                if input.dtype != torch.float8_e4m3fn:
+                    tuner_key += f"::input_quant::{input.dtype}"
+                # One runner owns the tactic space and launches both shards. The
+                # shards skip their own workspace reset: the parent reset (the
+                # prologue below) clears both partitions' workspaces, the output
+                # and quantizes raw input in one launch before the fork. The FC2
+                # cache policy follows stream_weights like the full-GPU op's: the
+                # cached-FC2 tactic only wins when the profiler replays one layer
+                # on L2-resident weights (concurrent partition tuning cannot use
+                # the cold-L2 mode), and measured cold it lost 0.3-0.8 us.
+                op_runner = Sm107Mxfp8FusedFc12MoeRunner(
+                    num_experts,
+                    top_k,
+                    num_local_experts,
+                    local_expert_offset,
+                    tile_size,
+                    swiglu_limit=swiglu_limit,
+                    zero_output=False,
+                    skip_reset=True,
+                )
+                # Input order matches Sm107Mxfp8FusedFc12InputsHelper (shard 0).
+                inputs = [
+                    input, fc1_weight_0, input_scale, fc1_weight_scale_0,
+                    fc1_alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                    fc1_norm_const, fc2_weight_0, fc2_weight_scale_0, fc2_alpha,
+                    output, token_final_scales
+                ]
+
+                shard_weights = (
+                    (fc1_weight_0, fc1_weight_scale_0, fc2_weight_0,
+                     fc2_weight_scale_0),
+                    (fc1_weight_1, fc1_weight_scale_1, fc2_weight_1,
+                     fc2_weight_scale_1),
+                )
+
+                # This call's workspaces and input scratch, set by the parent
+                # reset and read by the shard launches that follow it.
+                call_buffers = {}
+
+                def parent_reset(partition_inputs: List[torch.Tensor],
+                                 tactic) -> None:
+                    # Derived from the call's own inputs so autotuner profiles at
+                    # other row counts reset (and quantize into) matching buffers.
+                    (
+                        call_buffers["workspaces"], call_buffers["scratch"]
+                    ) = Sm107Mxfp8FusedFc12MoeRunner.launch_locality_domain_parent_reset(
+                        partition_inputs, zero_output)
+
+                def launch_partition(
+                    partition_id: int,
+                    partition_inputs: List[torch.Tensor],
+                    tactic,
+                ) -> None:
+                    (fc1_weight, fc1_weight_scale, fc2_weight,
+                     fc2_weight_scale) = shard_weights[partition_id]
+                    shard_inputs = list(partition_inputs)
+                    if shard_inputs[0].dtype != torch.float8_e4m3fn:
+                        # Quantized by the parent reset into this call's scratch.
+                        shard_inputs[0], shard_inputs[2] = call_buffers[
+                            "scratch"]
+                    shard_inputs[1] = fc1_weight
+                    shard_inputs[3] = fc1_weight_scale
+                    shard_inputs[10] = fc2_weight
+                    shard_inputs[11] = fc2_weight_scale
+                    op_runner(
+                        shard_inputs,
+                        tactic=tactic,
+                        sync_workspace=call_buffers["workspaces"][partition_id])
+
+                runner, best_tactic = tune_locality_domain_concurrent(
+                    tuner_key,
+                    op_runner,
+                    runtime,
+                    2,
+                    launch_partition,
+                    inputs,
+                    op_runner.get_tuning_config(),
+                    prologue_fn=parent_reset,
+                )
+                runner(inputs, tactic=best_tactic)
+
+            @torch.library.register_fake(
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin"
+            )
+            def _(
+                input: torch.Tensor,
+                fc1_weight_0: torch.Tensor,
+                fc1_weight_1: torch.Tensor,
+                input_scale: torch.Tensor,
+                fc1_weight_scale_0: torch.Tensor,
+                fc1_weight_scale_1: torch.Tensor,
+                fc1_alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                fc1_norm_const: torch.Tensor,
+                fc2_weight_0: torch.Tensor,
+                fc2_weight_1: torch.Tensor,
+                fc2_weight_scale_0: torch.Tensor,
+                fc2_weight_scale_1: torch.Tensor,
+                fc2_alpha: torch.Tensor,
+                output: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
                 zero_output: bool = False,
             ) -> None:
                 return None

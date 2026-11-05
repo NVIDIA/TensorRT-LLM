@@ -55,9 +55,10 @@ l0_gr100:
   # CuteDSL MoE locality-domain split (NVFP4/BF16 grouped GEMM): module lifecycle and forward.
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_locality_domain_correctness_rubin
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_locality_domain_lifecycle_and_forward_rubin
-  # MXFP8 fused FC12 MoE: the SM107 kernel, the input quantization fused into
-  # its workspace reset, the leaf end to end against the Cutlass MXFP8 leaf, and
-  # its gate/up interleave across partial refits.
+  # MXFP8 fused FC12 MoE: the SM107 kernel, its locality-domain split, the
+  # input quantization fused into its workspace reset, the leaf end to end
+  # against the Cutlass MXFP8 leaf, and its gate/up interleave across partial
+  # refits.
   - unittest/_torch/moe/kernels/parallel/test_mxfp8_input_quant.py
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_moe_rubin
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_mxfp8_chunked_forward_with_aux_stream
@@ -65,6 +66,8 @@ l0_gr100:
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_sparse_gather_selection
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_mxfp8_fused_fc12_accuracy_ab
   - unittest/_torch/moe/test_mxfp8_moe_partial_refit.py
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_mxfp8_locality_domain_static_split_rubin
   - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py::test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay
   - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
