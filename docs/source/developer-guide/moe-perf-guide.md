@@ -3,7 +3,7 @@
 # MoE Performance Guide
 
 ## MoE Architecture
-
+Test
 An MoE module contains `num_experts` experts and a router that selects `top_k` of them for each token. To accelerate LLM execution, a multi-GPU deployment usually partitions these experts across ranks, which makes each rank hold only part of them. The module therefore additionally pays for a **dispatch** (send each token to the rank that owns its target expert) and a **combine** (bring the results back).
 
 The consequence is that MoE execution time is usually *not* decided by the expert GEMM alone, but by the combination of **how the experts are partitioned**, **how the tokens are exchanged**, and **which kernel implementation runs the GEMM**:
