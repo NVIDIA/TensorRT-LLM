@@ -26,9 +26,17 @@ The VAE decoder converts the transformer's compressed output tensors, called lat
 
 <a id="figure-1"></a>
 
+<div align="center">
+
 ![Generation time split between VAE decoding, the transformer, and prompt processing plus encoding](../media/tech_blog31/motivation.svg)
 
+</div>
+
+<div align="center">
+
 ![Decoder time split across convolutions, normalization, elementwise work, and upsampling](../media/tech_blog31/decoder_breakdown.svg)
+
+</div>
 
 *Figure 1. Generation profile with trained Cosmos3-Nano-Sim-Bimanual weights: 901 frames at 832 × 480 on one B200, with two denoising steps per chunk. A chunk is a group of frames processed together. The second panel reconstructs a 10.1-second decoder-only breakdown from a kernel profile and the measured 2.7-second normalization-fusion saving. It is separate from the 10.5-second decode measured inside the generation run.*
 
@@ -44,7 +52,11 @@ WinoVAE retains the trained weights and preserves these convolutions in exact ar
 
 <a id="figure-2"></a>
 
+<div align="center">
+
 ![Decoder graph showing the mid block, four up blocks, channel counts, and frame dimensions](../media/tech_blog31/decoder_graph.svg)
+
+</div>
 
 *Figure 2. Decoder structure for a steady-state chunk containing one latent frame at 720p. Operations within each box run from top to bottom. Dimensions at the right are the outputs of each stage. The first chunk has separate causal-start behavior. The green stages have larger spatial maps and fewer channels. Unpatchify rearranges 12 feature channels into RGB pixels at twice the height and width.*
 
@@ -79,7 +91,11 @@ Memory traffic also arises between convolutions. Bias addition, residual additio
 
 <a id="figure-3"></a>
 
+<div align="center">
+
 ![Separate kernels write and reread two intermediate tensors; a fused kernel keeps those values on chip](../media/tech_blog31/fusion.svg)
+
+</div>
 
 *Figure 3. A representative normalization and activation path. Both versions read the operands and write the convolution input. Fusion removes the two intermediate tensor write/read passes shown on the left.*
 
@@ -91,7 +107,11 @@ Nearest-neighbor 2× upsampling repeats each source pixel in a 2 × 2 block. A s
 
 <a id="figure-4"></a>
 
+<div align="center">
+
 ![The same low-resolution input follows two paths: upsample then convolve with a 3 by 3 filter, or convolve with a folded 2 by 2 filter. The highlighted window contains four distinct pixel values.](../media/tech_blog31/upsample_fold.svg)
+
+</div>
 
 *Figure 4. Equivalent computations of one output for one input/output-channel pair. The upper path repeats each input pixel into a 2 × 2 block, then applies the 3 × 3 filter to the dashed window. The lower path applies a folded 2 × 2 filter to the original input. In the highlighted window, four weights multiply A, two multiply B, two multiply C, and one multiplies D. Summing each group gives the lower filter and the same output $y$ in exact arithmetic. This example shows the odd-row, odd-column output phase (zero-based). The symbol $\ast$ denotes convolution.*
 
@@ -167,7 +187,11 @@ where $\ast$ denotes spatial convolution with summation over input channels. The
 
 <a id="figure-5"></a>
 
+<div align="center">
+
 ![Three spatial convolutions contribute with temporal history; at the first frame, two zero inputs leave only the current-frame convolution](../media/tech_blog31/causal_first_frame.svg)
+
+</div>
 
 *Figure 5. Splitting a causal 3D convolution along time. Each highlighted patch represents a 3 × 3 spatial neighborhood, with the same operation across all input channels. At sequence start, the two earlier feature frames are zero padding. Their convolution terms vanish. Bias is added once in either case.*
 
@@ -220,7 +244,11 @@ In $F(m,r)$, $m$ is the number of outputs and $r$ the filter length. The constru
 
 <a id="figure-6"></a>
 
+<div align="center">
+
 ![Winograd input and filter transforms feed products, then an output transform reconstructs the tile](../media/tech_blog31/transform_stages.svg)
+
+</div>
 
 *Figure 6. The four stages of the one-dimensional construction. The fixed matrices B, G, and A implement input transformation, filter transformation, and reconstruction. Filter preparation runs once at weight loading. SIMT denotes ordinary GPU instruction execution. The channel contractions can use Tensor Cores. Each product index identifies one transform coordinate.*
 
@@ -243,7 +271,11 @@ Figure 7 follows coordinate zero from <a href="#eq-winograd-f23">Eq. 9</a> into 
 
 <a id="figure-7"></a>
 
+<div align="center">
+
 ![Coordinate-zero input combinations from two overlapping windows become two rows of a GEMM](../media/tech_blog31/channel_flow.svg)
+
+</div>
 
 *Figure 7. Building the GEMM input for F(2,3) from input stream x. The first subscript identifies the sample position and the second identifies the input channel. Each window contributes one row, and all windows share the transformed filters.*
 
@@ -251,7 +283,11 @@ The important reuse is across outputs within a tile. Overlapping tiles still rea
 
 <a id="figure-8"></a>
 
+<div align="center">
+
 ![Two-dimensional Winograd notation: an input tile of size (h+hf−1) by (w+wf−1), a filter of size hf by wf, and an output tile of size h by w](../media/tech_blog31/spatial_tiles.svg)
+
+</div>
 
 *Figure 8. The notation F(h × w, h_f × w_f) specifies the output tile and filter dimensions. The input tile is larger because the filter must cover every output position. The dimensions assume stride 1 and no dilation.*
 
@@ -261,7 +297,11 @@ For a 360 × 640 feature frame with 256 input and output channels, spatial F2 pr
 
 <a id="figure-9"></a>
 
+<div align="center">
+
 ![Input and filter transforms produce 16 pairs of coordinate matrices for GEMMs; tile A rows from every product feed an output transform that reconstructs the output tile](../media/tech_blog31/coordinate_gemm.svg)
+
+</div>
 
 *Figure 9. The 16 coordinate GEMMs for F(2 × 2, 3 × 3). The input transform maps 4 × 4 input tiles to the Vᵢ matrices; the filter transform maps 3 × 3 filters to the Uᵢ matrices once at weight loading. Each coordinate has its own transformed input matrix Vᵢ, transformed filter matrix Uᵢ, and product matrix Mᵢ. Green and orange rows identify tiles A and B. Additional tiles continue down each matrix. The green connectors collect tile A’s row from every Mᵢ. The output transform combines those 16 rows into a 2 × 2 tile for each output channel. Tile B and the remaining tiles are reconstructed in the same way.*
 
@@ -335,9 +375,17 @@ Figure 10 compares these costs for 1024 input and output channels. The arithmeti
 
 <a id="figure-10"></a>
 
+<div align="center">
+
 ![GEMM arithmetic falls with tile size while transform work grows](../media/tech_blog31/cost_flops.svg)
 
+</div>
+
+<div align="center">
+
 ![Extra transformed-input and product workspace per output pixel](../media/tech_blog31/cost_workspace.svg)
+
+</div>
 
 *Figure 10.* Analytical costs per output pixel across all 1024 channels, with FP16 V and M. The axis labels $F(m\times m)$ denote $F(m\times m,3\times3)$ spatial convolutions. Transform counts use illustrative interpolation points. The lower panel measures extra high-bandwidth memory (HBM) capacity, not bytes transferred.
 
@@ -359,11 +407,19 @@ A spatial 3 × 3 convolution also needs one column from either neighboring strip
 
 <a id="figure-11"></a>
 
+<div align="center">
+
 ![GPU 0 owns the blue columns and GPU 1 owns the green columns. Arrows show each GPU writing its border column into the other GPU's halo. Outer boundaries contain zero padding.](../media/tech_blog31/halo2.png)
+
+</div>
 
 *Figure 11(a). Halo exchange for a width split across two GPUs. Blue and green identify the GPU that computes each column. Each buffer contains its own strip plus a halo column on either side. The arrows show Fused GPUDirect P2P writes into the neighbor's halo. The outer image boundaries use zero padding. Interior GPUs in a larger partition exchange borders with both neighbors.*
 
+<div align="center">
+
 ![Before all-gather, GPU 0 holds the blue strip and GPU 1 holds the green strip. After all-gather, both GPUs hold the whole frame, containing both strips.](../media/tech_blog31/allgather2.png)
+
+</div>
 
 *Figure 11(b). All-gather combines the strips on every GPU. Attention gathers keys and values across the full spatial extent while queries remain local. At the end of decoding, a separate all-gather assembles complete video frames from the decoded strips. These operations transfer all strips, whereas halo exchange transfers only border columns.*
 
@@ -383,7 +439,11 @@ We first compare individual convolution paths with cuDNN, then measure complete 
 
 <a id="figure-12"></a>
 
+<div align="center">
+
 ![Speedup over cuDNN for two-dimensional Winograd and fused width-only Winograd with direct height filtering](../media/tech_blog31/cudnn_sweep.svg)
+
+</div>
 
 *Figure 12. Different implementations of the same spatial 3 × 3 convolution on one GB200, using random FP16 operands and four input frames. Blue and orange apply two-dimensional Winograd. Green applies one-dimensional Winograd along width and direct filtering along height in a fused kernel. Each timing includes transforms and reconstruction. Values above the horizontal dashed line beat direct cuDNN. The green series was measured only at 256 channels and the shown sizes.*
 
@@ -408,7 +468,11 @@ The single-convolution sweep tests the arithmetic and data-movement choices in i
 
 <a id="figure-13"></a>
 
+<div align="center">
+
 ![Encoder and decoder latency on B300 for image, video, and streaming workloads](../media/tech_blog31/hardware_b300.svg)
+
+</div>
 
 *Figure 13. One B300, BF16 source tensors, random weights at Cosmos3 VAE dimensions, CUDA-graph replay, median of ten CUPTI measurements after two warmups. Video workloads use 189 frames at 1280 × 720 and 121 frames at 832 × 480. The streaming encode takes one conditioning image. Its decode column times a steady-state two-latent-frame step producing eight frames. These measurements were recorded on November 1, 2026.*
 
@@ -416,7 +480,11 @@ For the 189-frame 720p workload, B300 decode falls from 4618.1 to 1268.5 ms (**3
 
 <a id="figure-14"></a>
 
+<div align="center">
+
 ![Encoder and decoder latency on H200 for the same workload families](../media/tech_blog31/hardware_h200.svg)
+
+</div>
 
 *Figure 14. One H200, BF16 source tensors, random Cosmos3-sized weights, CUDA graphs, median of ten CUPTI measurements after two warmups. These October 22, 2026 measurements use CUDA transforms and cuBLAS batched GEMMs, before the transform port to CuTe DSL. The plotted values come from the same unthrottled single-GPU measurement set as the H200 720p numbers below.*
 
@@ -428,7 +496,11 @@ The arithmetic reduction, precision choices, and kernel routing are parts of one
 
 <a id="figure-15"></a>
 
+<div align="center">
+
 ![BF16 Wan VAE takes 5.96 seconds and WinoVAE 1.61 seconds for the measured decode](../media/tech_blog31/latency.svg)
+
+</div>
 
 *Figure 15. Decoder benchmark on one GB200, using BF16 tensors and random weights with Cosmos3 VAE dimensions. The output is 189 frames at 1280 × 720. Median of ten CUDA-graph replays, measured from the first GPU kernel's start to the last kernel's completion with L2 flushed before replay. Model loading and video-file encoding are excluded.*
 
@@ -522,7 +594,11 @@ The same integration also tested two execution arrangements. Overlapping decode 
 
 <a id="figure-16"></a>
 
+<div align="center">
+
 ![Four-GB200 encode and decode times with NCCL and Fused GPUDirect P2P halo exchange](../media/tech_blog31/halo_latency.svg)
+
+</div>
 
 *Figure 16. Halo comparison on four GB200 GPUs in one tray, using width sharding and CUDA graphs. The 720p workload has 189 frames at 1280 × 720. The 480p workload has 121 frames at 832 × 480. Bars show median latency over ten calls and compare communication methods at a fixed GPU count.*
 
@@ -532,13 +608,21 @@ Fused GPUDirect P2P reduces 720p decode from 460.3 to 420.6 ms (8.6%) and 480p d
 
 <a id="figure-17"></a>
 
+<div align="center">
+
 ![B200 encoder latency versus GPU count on logarithmic axes](../media/tech_blog31/scaling_encode.svg)
+
+</div>
 
 *Figure 17. Strong scaling of encoding within one eight-B200 node on October 24, 2026. Both axes are logarithmic. Random Cosmos3-sized weights, BF16, width partitioning, CUDA graphs, median of ten CUPTI measurements. WinoVAE uses Fused GPUDirect P2P. Each curve holds the workload fixed while changing GPU count.*
 
 <a id="figure-18"></a>
 
+<div align="center">
+
 ![B200 decoder latency versus GPU count on logarithmic axes](../media/tech_blog31/scaling_decode.svg)
+
+</div>
 
 *Figure 18. Decode measurements from the same B200 scaling experiment. The streaming panel measures an eight-frame steady-state step. Missing eight-GPU baseline points at 832 × 480 reflect the equal-shard restriction of those tested implementations, not zero latency or an extrapolated result.*
 
@@ -614,7 +698,11 @@ Figure 19 compares these decompositions on matched synthetic spatial 3 × 3 conv
 
 <a id="figure-19"></a>
 
+<div align="center">
+
 ![Direct NVFP4 and Fourier68 have about 13 percent relative-L2 convolution error; optimized Winograd has about 64 percent](../media/tech_blog31/nvfp4_error.svg)
+
+</div>
 
 *Figure 19. CPU simulations of isolated spatial convolutions with matched BF16-rounded Gaussian source tensors. Bars show mean relative-L2 error across three seeds, and whiskers show the range. Product storage and final output rounding are excluded.*
 
@@ -642,7 +730,11 @@ Choosing one of [cuDNN's Winograd convolution algorithms](https://docs.nvidia.co
 
 <a id="figure-20"></a>
 
+<div align="center">
+
 ![Before-and-after B300 decoder profiles, with convolution paths in green and surrounding operations in blue](../media/tech_blog31/final_profile.svg)
+
+</div>
 
 *Figure 20. One B300, 189-frame 720p decode, one latent frame per chunk, CUDA-graph replay, November 1, 2026. Ring fractions use the sum of categorized CUPTI kernel durations. Central values show median first-to-last kernel time. Green includes direct convolution, Winograd GEMMs, input/output transforms, and fused spatial convolution. The two totals are from this same profiling run.*
 
