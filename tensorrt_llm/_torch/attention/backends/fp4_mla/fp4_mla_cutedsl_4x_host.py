@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Torch host entry for the four-CTA-cluster (4x) FP4 MLA decode kernel (``fp4_mla_cutedsl_4x.py``).
 
 Scope: validate the envelope, build the 30 wrapper arguments of
