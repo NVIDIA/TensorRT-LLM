@@ -55,7 +55,10 @@ This directory contains various test configuration files:
 ### Multi-node Launch Parameters
 
 `llm_function_multinode.yml` contains a `tests` sequence. Each entry has an exact
-pytest node ID in `case` and a `launch` mapping:
+pytest node ID in `case` and an optional `launch` mapping. Entries without
+`launch` use `defaults.launch`, which specifies `mode: mpi` and `world_size: 16`.
+An explicit per-case `launch` replaces the entire default launch mapping; it is
+not merged with it, so per-node cases do not inherit an MPI `world_size`.
 
 - `mode: mpi` uses `world_size` for the total MPI rank count. The pipeline derives
   node count and tasks per node from the selected platform's GPU capacity.
