@@ -43,6 +43,8 @@ import pytest
 __extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
 import run_precheck as rp
 
+pytestmark = pytest.mark.cpu_only
+
 KEY = b"k" * 32
 
 _DEEPSEEK_V4_CONFIGS = [

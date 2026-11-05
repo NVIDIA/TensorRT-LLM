@@ -22,6 +22,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_server(*, max_batch_size=None, kv_cache_config=None):
     server = object.__new__(OpenAIServer)

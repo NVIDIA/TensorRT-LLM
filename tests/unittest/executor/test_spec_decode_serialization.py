@@ -44,6 +44,8 @@ from tensorrt_llm.serve.openai_protocol import (
     SpeculativeDecodingStats,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 STATS = SpeculativeDecodingStats(
     acceptance_rate=0.5,
     total_accepted_draft_tokens=30,

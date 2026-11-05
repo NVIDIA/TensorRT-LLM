@@ -25,6 +25,8 @@ from tensorrt_llm.inputs.prefix_token_cache import (
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.sampling_params import SamplingParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _tok_id(token: str) -> int:
     """Stable across processes, unlike hash() on str."""

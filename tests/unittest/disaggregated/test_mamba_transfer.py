@@ -390,6 +390,7 @@ def _make_side_state_page_table(*, include_side: bool = True):
     )
 
 
+@pytest.mark.cpu_only
 def test_mamba_policy_rejects_incompatible_replicated_side_state():
     rank_info = _make_rank_info(tp_size=1)
     pt_with_side = _make_side_state_page_table()

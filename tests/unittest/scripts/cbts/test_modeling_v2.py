@@ -25,6 +25,8 @@ from cbts.blocks import Block, YAMLIndex
 from cbts.rules.base import PRInputs
 from cbts.rules.modeling_v2 import ModelingV2Rule
 
+pytestmark = pytest.mark.cpu_only
+
 _SRC = "tensorrt_llm/_torch/_experimental/modeling_v2"
 _UNIT = "unittest/_torch/modeling_v2"
 _GATE_A = "accuracy/modeling_v2/test_fam.py::TestModelingV2A"

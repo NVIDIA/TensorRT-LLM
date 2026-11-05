@@ -13,9 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tensorrt_llm.inputs.utils import apply_chat_template
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _DummyTokenizer:
