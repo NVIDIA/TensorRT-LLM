@@ -459,10 +459,17 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
     resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
     config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
 
-    # the default (4x off) resolves nothing and never looks at the KV cache
+    # a KV cache without the FP4 MLA page table (every other model) resolves nothing and never
+    # probes the FP4 MLA switches, even when they are set
+    resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
+    with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True) as enabled:
+        assert runner._kv_regime_resolver(resource_manager) is None
+    enabled.assert_not_called()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+
+    # the default (4x off) resolves nothing
     with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=False):
         assert runner._kv_regime_resolver(resource_manager) is None
-    resource_manager.get_resource_manager.assert_not_called()
 
     with (
         patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),

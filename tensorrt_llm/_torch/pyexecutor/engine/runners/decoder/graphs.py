@@ -794,6 +794,14 @@ class DecoderCudaGraphs:
         regimes of a shape are those its 2x | 4x | two-stream decision can tell
         apart (``kv_regimes_for_batch``), one for most shapes.
         """
+        # Only an FP4 MLA KV cache gets regimes (the predicate under which the
+        # attention metadata carries an fp4_mla_state); every other model returns
+        # here, before any FP4 MLA module is imported or probed.
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
+            return None
         from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
         from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
             FP4_MLA_TOKENS_PER_BLOCK,
@@ -802,18 +810,12 @@ class DecoderCudaGraphs:
             _fp4_mla_packed_rows_per_seq,
         )
 
-        # Environment gates first: the default (4x off) touches nothing else. The
+        # Environment gates next: the default (4x off) resolves nothing. The
         # dispatcher runs only for the packed-Q cutedsl decode and keeps Helix on
         # the 2x kernel, so regimes would only multiply those graphs.
         if not (_fp4_mla_cutedsl_4x_enabled() and _fp4_mla_packed_q_enabled()):
             return None
         if self.mapping.has_cp_helix():
-            return None
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
-        # The predicate under which the attention metadata carries an fp4_mla_state.
-        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
             return None
         num_heads = self._fp4_mla_decode_heads()
         if num_heads is None:
