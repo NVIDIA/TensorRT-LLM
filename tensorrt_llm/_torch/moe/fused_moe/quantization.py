@@ -7172,7 +7172,7 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
     # Gate/up interleave granularity expected by the fused SwiGLU epilogue.
     INTERLEAVE_GROUP_SIZE = 64
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module) -> None:
         if module.hidden_size % self.FC1_K_ALIGNMENT != 0:
             raise ValueError(
                 f"hidden_size={module.hidden_size} must be a multiple of "
@@ -7206,7 +7206,7 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor,
                                  allow_partial_loading: bool = False,
-                                 expert_idx: int = -1):
+                                 expert_idx: int = -1) -> None:
         # Stage the plain [w3, w1] concat; the interleave is deferred (see the
         # class docstring). Arm the slot only when FC1 bytes actually arrive so
         # a down_proj-only bucket cannot re-interleave a finalized slot.
@@ -7231,7 +7231,7 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
             self._get_scale_key(weights, expert_id, leaf) is not None
             for leaf in ("w1", "w3"))
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         interleaved = module._cute_dsl_mxfp8_w3_w1_scale_interleaved
         if interleaved:
             scale_data = module.w3_w1_weight_scale.data
@@ -7271,9 +7271,9 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         w3_w1_u8 = dst_w3_w1_weight.view(torch.uint8)
         w3_w1_u8.copy_(cls._deinterleave_w3_w1_rows(w3_w1_u8))
 
-    def _permute_w3_w1_weight_scale_rows(self, module: torch.nn.Module,
-                                         dst_w3_w1_weight_scale: torch.Tensor,
-                                         permute) -> None:
+    def _permute_w3_w1_weight_scale_rows(
+            self, module: torch.nn.Module, dst_w3_w1_weight_scale: torch.Tensor,
+            permute: Callable[[torch.Tensor], torch.Tensor]) -> None:
         """Reorder the rows of one slot's swizzled [2N, K/32] UE8M0 scales.
 
         The slot is stored int32-packed and swizzled, so unswizzle -> permute
@@ -7303,7 +7303,7 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         self._permute_w3_w1_weight_scale_rows(module, dst_w3_w1_weight_scale,
                                               self._deinterleave_w3_w1_rows)
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
+    def process_weights_after_loading(self, module: torch.nn.Module) -> None:
         # Snapshot the scale slots the parent is about to swizzle: those are
         # exactly the slots whose FC1 scales were (re)staged and therefore owe
         # the interleave once the swizzle has been applied.
@@ -7328,7 +7328,7 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
                                                     scale_data[local_slot_id])
             module._cute_dsl_mxfp8_w3_w1_scale_interleaved.update(scale_slots)
 
-    def pre_reload_weights(self, module: torch.nn.Module):
+    def pre_reload_weights(self, module: torch.nn.Module) -> None:
         rebuilt = set(module.rebuild_tensor_metadata)
         super().pre_reload_weights(module)
         # A recreated parameter holds no slot in either layout; one left in

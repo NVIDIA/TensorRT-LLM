@@ -18575,7 +18575,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             f"tile_size 128 and 256 only, but got {self.tile_size}"
                         )
 
-                def unique_id(self):
+                def unique_id(self) -> Tuple:
                     return (
                         self.num_experts,
                         self.top_k,
@@ -18598,7 +18598,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     )
 
                 @staticmethod
-                def _normalize_tactic(tactic) -> Tuple:
+                def _normalize_tactic(tactic: Tuple) -> Tuple:
                     mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = tactic
                     return (tuple(int(v) for v in mma_tiler),
                             tuple(int(v) for v in mma_inst_shape),
@@ -18823,23 +18823,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                         dtype=torch.int32,
                                                         device=fc1_a.device)
 
-                    def _e4m3_ptr(t):
+                    def _e4m3_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Float8E4M3FN,
                                         t.data_ptr(),
                                         cute.AddressSpace.gmem,
                                         assumed_align=16)
 
-                    def _ue8m0_ptr(t):
+                    def _ue8m0_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Float8E8M0FNU,
                                         t.data_ptr(),
                                         cute.AddressSpace.gmem,
                                         assumed_align=16)
 
-                    def _f32_ptr(t):
+                    def _f32_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Float32, t.data_ptr(),
                                         cute.AddressSpace.gmem)
 
-                    def _i32_ptr(t):
+                    def _i32_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Int32, t.data_ptr(),
                                         cute.AddressSpace.gmem)
 
@@ -18929,7 +18929,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             num_tokens: cutlass.Int64,
                             max_active_clusters: cutlass.Constexpr,
                             stream: cuda.CUstream,
-                        ):
+                        ) -> None:
                             interm_size = fc1_n // 2
                             scale_k = k // sf_vec_cx
                             fc2_scale_k = fc2_k // sf_vec_cx
