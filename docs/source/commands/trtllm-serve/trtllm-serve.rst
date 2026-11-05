@@ -364,8 +364,18 @@ You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ m
 
 See `the source code <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch>`_ of ``trtllm-llmapi-launch`` for more details.
 
-Metrics Endpoint
-----------------
+.. _serving-metrics:
+
+Metrics
+-------
+
+Use ``/metrics`` for individual runtime-iteration snapshots and
+``/prometheus/metrics`` for monitoring request latency, throughput, cache use,
+and load over time. Scheduler logs provide additional policy diagnostics on
+workers that enable those policies.
+
+Runtime iteration statistics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. note::
 
@@ -379,7 +389,7 @@ For the default PyTorch backend, iteration statistics logging is enabled by sett
 
 .. code-block:: yaml
 
-   # extra_llm_config.yaml
+   # config.yaml
    enable_iter_perf_stats: true
 
 Start the server and specify the ``--config`` argument with the path to the YAML file:
@@ -420,6 +430,90 @@ Example output:
             ...
         }
     ]
+
+Prometheus metrics
+~~~~~~~~~~~~~~~~~~
+
+For the OpenAI HTTP server, enable request performance metrics and iteration
+statistics in the serving configuration:
+
+.. code-block:: yaml
+
+   return_perf_metrics: true
+   enable_iter_perf_stats: true
+
+Start the server with ``--config config.yaml``, send inference traffic, and
+scrape the Prometheus endpoint:
+
+.. code-block:: bash
+
+   curl -sS http://localhost:8000/prometheus/metrics
+
+``return_perf_metrics`` enables the OpenAI server's Prometheus endpoint and
+request measurements. ``enable_iter_perf_stats`` supplies iteration-level
+measurements, such as cache utilization and scheduled work. Available
+measurements depend on the backend, enabled features, and inference traffic.
+
+The following metric families are useful starting points for dashboards:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 45 30
+
+   * - Measurement
+     - Metric families
+     - Interpretation
+   * - Request volume and tokens
+     - ``trtllm_request_success_total``, ``trtllm_prompt_tokens_total``,
+       ``trtllm_generation_tokens_total``
+     - Cumulative counters; use rates over a time window for throughput.
+   * - Request latency
+     - ``trtllm_e2e_request_latency_seconds``,
+       ``trtllm_time_to_first_token_seconds``,
+       ``trtllm_time_per_output_token_seconds``
+     - Histograms in seconds for end-to-end latency, TTFT, and TPOT.
+   * - Time by phase
+     - ``trtllm_request_queue_time_seconds``,
+       ``trtllm_request_prefill_time_seconds``,
+       ``trtllm_request_decode_time_seconds``
+     - Histograms separating queueing, prefill, and decode time.
+   * - Load and memory
+     - ``trtllm_num_requests_running``, ``trtllm_num_requests_waiting``,
+       ``trtllm_gpu_memory_usage_bytes``
+     - Gauges describing the latest reported load and GPU memory use.
+   * - KV cache
+     - ``trtllm_kv_cache_utilization``, ``trtllm_kv_cache_hit_rate``,
+       ``trtllm_kv_cache_reused_blocks_total``,
+       ``trtllm_kv_cache_missed_blocks_total``
+     - Occupancy and reuse measurements; retain rank labels when comparing workers.
+   * - Speculative decoding
+     - ``trtllm_spec_decode_drafted_tokens_total``,
+       ``trtllm_spec_decode_accepted_tokens_total``
+     - Per-request drafted and accepted token counters when speculation is enabled.
+
+Histograms expose ``_bucket``, ``_sum``, and ``_count`` series. For example, this
+PromQL expression calculates TTFT p90 over five minutes, grouped by model:
+
+.. code-block:: text
+
+   histogram_quantile(0.90,
+     sum by (le, model_name) (
+       rate(trtllm_time_to_first_token_seconds_bucket[5m])
+     )
+   )
+
+Customize histogram boundaries with ``prometheus_metrics_config`` in the same
+YAML file; latency bucket values are in seconds. For example:
+
+.. code-block:: yaml
+
+   prometheus_metrics_config:
+     time_to_first_token_buckets: [0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0]
+
+The :download:`Prometheus client example <../../../../examples/serve/prometheus_metrics.py>`
+fetches and displays selected metrics. With multiple HTTP frontends, scrape the
+shared serving endpoint. In a disaggregated deployment, scrape the public server
+and each context/generation worker separately to retain their distinct views.
 
 Attention-DP statistics
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -462,6 +556,28 @@ When updating dashboards, retain ``dp_rank`` to inspect individual ranks or
 aggregate it explicitly. Used/free block counts can be summed across ranks;
 the maximum utilization identifies the fullest rank. Do not sum utilization or
 cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.
+
+Scheduler diagnostics
+~~~~~~~~~~~~~~~~~~~~~
+
+Generation workers with TTFT-percentile admission enabled emit
+``[gen_admission]`` logs. These report the policy, queue length (``qlen``),
+oldest waiting-request ages, and admissions by tier since the previous report.
+The adaptive policy also reports its TTFT target ``X``, age guard ``G``, and
+admission-to-first-token estimate ``s2f``; times are in seconds.
+
+Workers with GEN slot preemption enabled emit ``[gen_preempt]`` INFO logs at
+most once every 30 seconds when there is activity or a request remains paused.
+``paused``, ``resumed``, and ``forced`` count events since the previous report;
+``paused_now`` gives the current paused count and cap. ``g`` is the TPOT-budget
+controller gain, ``slack`` is the admission-risk window in seconds, and
+``decode`` is the running mean decode time excluding pauses. ``tpot_infl`` is
+the mean scored pause-induced TPOT inflation relative to the running unpaused
+TPOT estimate; it is ``na`` before any scored completion. Output-rate mode also
+reports ``below_target`` as below-target/scored completions and the sacrifice
+``credit`` balance. These policy diagnostics are log fields; they are not
+exported as dedicated Prometheus metric families. See
+:doc:`Disaggregated Serving <../../features/disagg-serving>` for policy configuration.
 
 .. _runtime-profiling-endpoints:
 
