@@ -1931,10 +1931,13 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         }
         # MTP layers use mixed-precision KV like the model's own layers; the layers that another
-        # drafter (Eagle3, ...) adds to this manager keep a plain cache.
+        # drafter (Eagle3, ...) adds to this manager keep a plain cache. With the cold-page window
+        # they keep their first/last tokens too: the high layers must share the pool of the group
+        # they copy, which a group with an extra plain layer would not have.
         self._plain_draft_layers = set()
         if (
             self.mixed_precision_low_dtype is not None
+            and self.mixed_precision_low_dtype != self.mixed_precision_high_dtype
             and spec_config is not None
             and not is_draft
             and not spec_config.spec_dec_mode.is_mtp_one_model()

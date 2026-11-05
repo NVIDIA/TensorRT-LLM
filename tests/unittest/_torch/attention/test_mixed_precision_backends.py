@@ -1109,16 +1109,29 @@ def test_cold_page_window_redirects_dense_block_offsets():
         store_mixed_precision_low_rows,
     )
 
-    block, cached = 32, 4 * 32
+    block, cached = 32, 4 * 32 + 5
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
     manager = _small_manager(block, mapping, "cold")
     try:
-        # A context request appends one block: the high pool holds the first block (first_n) and
-        # the last two (last_n + 1 tokens).
-        manager.add_dummy_requests([0], [cached + block], is_gen=False)
-        metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached)
+        # A decode request with 133 cached tokens writes one: the high pool holds the first block
+        # (first_n) and the last two (last_n + 1 tokens); the window released blocks 1 and 2.
+        manager.add_dummy_requests([0], [cached + 1], is_gen=True)
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=2,
+            max_num_sequences=2,
+            kv_cache_manager=manager,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            num_contexts=0,
+            request_ids=[0],
+            prompt_lens=[cached],
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+            kv_layout="NHD",
+            mapping=mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+        )
         metadata.prepare()
-        blocks = (cached + block) // block
+        blocks = -(-(cached + 1) // block)
         pages = torch.full((2, 1, blocks), -1, dtype=torch.int32)
         manager.fill_mixed_precision_page_tables([0], 0, pages.numpy())
         low, high = pages[0, 0].tolist(), pages[1, 0].tolist()
@@ -1141,16 +1154,17 @@ def test_cold_page_window_redirects_dense_block_offsets():
         for i in held:
             for kv in range(2):
                 assert rows[offsets[kv][i] * block].data_ptr() == high_pool[high[i], kv].data_ptr()
-        # Attention wrote this step's rows (block 4) into the high layer; the copy back fills the
-        # layer's block and leaves the earlier held block alone.
+        # Attention wrote this step's row (position 133: block 4, token 5) into the high layer;
+        # the copy back fills that row of the layer's block and nothing else.
         torch.manual_seed(0)
-        written = torch.randn(2, block, 2, 64, device="cuda").to(torch.bfloat16)
-        high_pool[high[4]].copy_(written)
-        high_pool[high[3]].fill_(1.0)
+        written = torch.randn(2, 2, 64, device="cuda").to(torch.bfloat16)
+        high_pool[high[4], :, 5].copy_(written)
+        high_pool[high[4], :, 4].fill_(1.0)
         low_pool.fill_(7)
         store_mixed_precision_low_rows(metadata, 0)
         torch.cuda.synchronize()
-        assert torch.equal(low_pool[low[4]].view(torch.bfloat16), written)
-        assert (low_pool[low[3]] == 7).all() and (low_pool[low[0]] == 7).all()
+        assert torch.equal(low_pool[low[4], :, 5].view(torch.bfloat16), written)
+        assert (low_pool[low[4], :, 4] == 7).all() and (low_pool[low[3]] == 7).all()
+        assert (low_pool[low[0]] == 7).all()
     finally:
         manager.shutdown()
