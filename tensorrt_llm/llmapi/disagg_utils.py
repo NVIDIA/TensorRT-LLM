@@ -20,6 +20,7 @@ from .._utils import global_mpi_rank, global_mpi_size
 from .utils import StrictBaseModel
 
 __all__ = [
+    'DisaggRequestDeadlineConfig',
     'InternalRequestAuthKey',
     'ServerConfig',
     'parse_disagg_config_file',
@@ -246,6 +247,18 @@ class OutputLengthPredictionConfig(StrictBaseModel):
             "(checked at startup)."))
 
 
+class DisaggRequestDeadlineConfig(StrictBaseModel):
+    """Optional total request budget enforced by the serving pair owner."""
+
+    total_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        strict=True,
+        description="Total request budget in seconds, including routing, "
+        "context, generation, and streaming. This does not change worker "
+        "HTTP or KV-transfer deadlines.")
+
+
 @dataclass
 class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
@@ -300,6 +313,7 @@ class DisaggServerConfig():
     ctx_frontend_affinity: Optional[Tuple[int, int]] = None
     # Generation priority from the predicted output length; None: off.
     output_length_prediction: Optional[OutputLengthPredictionConfig] = None
+    request_deadline: Optional[DisaggRequestDeadlineConfig] = None
 
 
 class MetadataServerConfig(StrictBaseModel):
@@ -439,11 +453,16 @@ def extract_disagg_cfg(
         conversation_affinity_header_for_subagents: Optional[str] = None,
         subagent_affinity_scope: Literal['context', 'both'] = 'context',
         output_length_prediction: Optional[OutputLengthPredictionConfig] = None,
+        request_deadline: Optional[DisaggRequestDeadlineConfig
+                                   | dict[str, float]] = None,
         **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
     internal_request_auth_key = _extract_internal_request_auth_key(
         internal_request_auth_key, context_servers, generation_servers)
+    if request_deadline is not None:
+        request_deadline = DisaggRequestDeadlineConfig.model_validate(
+            request_deadline)
 
     bounded_replay_on_generation = validate_config_bool(
         bounded_replay_on_generation, "bounded_replay_on_generation")
@@ -513,6 +532,7 @@ def extract_disagg_cfg(
         ctx_router_config=ctx_router_config,
         gen_router_config=gen_router_config,
         conditional_disagg_config=conditional_disagg_config,
+        request_deadline=request_deadline,
         bounded_replay_on_generation=bounded_replay_on_generation,
         otlp_config=otlp_config,
         max_retries=max_retries,
