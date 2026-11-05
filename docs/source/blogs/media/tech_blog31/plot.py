@@ -117,40 +117,43 @@ def tiles() -> None:
 
 
 def gemm() -> None:
-    fig, ax = canvas(7.25)
-    text(ax, 3.2, 7.0, "16 coordinate GEMMs", weight="bold")
-    text(ax, 3.2, 6.61, r"$F(2\times2,\;3\times3):\quad M_i=V_iU_i$")
-    specs = [(0.2, 1.7, "V"), (2.45, 1.3, "U"), (4.3, 1.7, "M")]
+    fig, ax = plt.subplots(figsize=(10.5, 5.0))
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    ax.set(xlim=(0, 10.5), ylim=(0, 5.0))
+    ax.axis("off")
+    text(ax, 5.25, 4.75, r"$F(2\times2,\;3\times3)$: 16 GEMMs, $M_i=V_iU_i$", weight="bold")
+    specs = [(0.15, 1.35, "V"), (1.88, 1.10, "U"), (3.40, 1.35, "M")]
     for x, label in [
-        (1.05, r"$N_{\mathrm{tiles}}\times C_{\mathrm{in}}$"),
-        (3.1, r"$C_{\mathrm{in}}\times C_{\mathrm{out}}$"),
-        (5.15, r"$N_{\mathrm{tiles}}\times C_{\mathrm{out}}$"),
+        (0.825, r"$N_{\mathrm{tiles}}\times C_{\mathrm{in}}$"),
+        (2.43, r"$C_{\mathrm{in}}\times C_{\mathrm{out}}$"),
+        (4.075, r"$N_{\mathrm{tiles}}\times C_{\mathrm{out}}$"),
     ]:
-        ax.text(x, 6.2, label, ha="center", va="center", color=DARK, fontsize=14)
-    for coordinate, y in [(0, 5.0), (1, 3.7), (15, 2.0)]:
+        ax.text(x, 4.25, label, ha="center", va="center", color=DARK, fontsize=14)
+    for coordinate, y in [(0, 2.95), (1, 1.60), (15, 0.05)]:
         for x, width, name in specs:
-            text(ax, x + width / 2, y + 1.0, rf"${name}_{{{coordinate}}}$")
+            text(ax, x + width / 2, y + 1.03, rf"${name}_{{{coordinate}}}$")
             if name == "U":
                 box(ax, x, y, width, 0.84, "filters", PALE_BLUE)
             else:
                 box(ax, x, y + 0.56, width, 0.28, "tile A", PALE_GREEN)
                 box(ax, x, y + 0.28, width, 0.28, "tile B", PALE_ORANGE)
                 box(ax, x, y, width, 0.28, "…", PALE_GREY)
-        text(ax, 4.02, y + 0.42, "=")
-        ax.plot([6.0, 6.18], [y + 0.7, y + 0.7], color=GREEN, lw=2)
-    for x in [1.05, 3.1, 5.15]:
-        text(ax, x, 3.25, "⋮")
-    ax.plot([6.18, 6.18, 1.05], [5.7, 1.55, 1.55], color=GREEN, lw=2)
-    arrow(ax, (1.05, 1.55), (1.05, 1.03), GREEN)
-    box(ax, 0.2, 0.3, 1.7, 0.7, "tile A\nall 16 rows", PALE_GREEN)
-    arrow(ax, (1.96, 0.65), (2.35, 0.65), GREEN)
-    box(ax, 2.4, 0.3, 1.65, 0.7, "Output\ntransform", PALE_GREY)
-    arrow(ax, (4.12, 0.65), (4.7, 0.65), GREEN)
+        text(ax, 3.19, y + 0.42, "=")
+        ax.plot([4.75, 5.12], [y + 0.70, y + 0.70], color=GREEN, lw=2)
+    for x in [0.825, 2.43, 4.075]:
+        text(ax, x, 1.33, "⋮")
+    ax.plot([5.12, 5.12], [0.75, 3.65], color=GREEN, lw=2)
+    arrow(ax, (5.12, 2.30), (5.57, 2.30), GREEN)
+    box(ax, 5.62, 1.88, 1.22, 0.84, "tile A\n16 rows", PALE_GREEN)
+    text(ax, 6.23, 1.53, r"$16\times C_{\mathrm{out}}$")
+    arrow(ax, (6.87, 2.30), (7.24, 2.30), GREEN)
+    box(ax, 7.29, 1.88, 1.45, 0.84, "Output\ntransform", PALE_GREY)
+    arrow(ax, (8.79, 2.30), (9.24, 2.30), GREEN)
     for row in range(2):
         for column in range(2):
-            box(ax, 4.8 + column * 0.35, 0.3 + row * 0.35, 0.35, 0.35, "", PALE_GREEN)
-    text(ax, 5.15, 1.18, "tile A")
-    ax.text(5.15, 0.08, "2 × 2 per channel", ha="center", va="center", color=DARK, fontsize=14)
+            box(ax, 9.29 + column * 0.36, 1.94 + row * 0.36, 0.36, 0.36, "", PALE_GREEN)
+    text(ax, 9.65, 2.98, "tile A")
+    text(ax, 9.65, 1.43, "2 × 2 per\noutput channel")
     save(fig, "coordinate_gemm")
 
 
