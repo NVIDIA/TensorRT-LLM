@@ -258,11 +258,13 @@ class _ImportGraph:
                 self.complete = False
                 continue
             # Tests are not a package of the subtree: only absolute names and
-            # bare helper names count, and a computed name reaches no helper.
+            # helper names count, a helper by any part of a dotted name, and a
+            # computed name reaches no helper.
             names, _ = imported_names(tree, "")
             deps = package_names(names)
             for name in names:
-                deps |= helpers.get(name.split(".")[0], set())
+                for part in name.split("."):
+                    deps |= helpers.get(part, set())
             for dep in deps - {key}:
                 self._importers[dep].add(key)
 
