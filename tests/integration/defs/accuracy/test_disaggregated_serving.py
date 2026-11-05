@@ -54,9 +54,9 @@ from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
                         skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
-                            LlmapiAccuracyTestHarness, LongBenchV2,
-                            acceptance_length_from_iteration_stats,
+from .accuracy_core import (GSM8K, MMLU, QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS,
+                            GSM8KInferenceX, LlmapiAccuracyTestHarness,
+                            LongBenchV2, acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
 from .sparse_offload_accuracy import (LONGBENCH_CASES, assert_host_fetches,
                                       assert_token_parity, read_fetch_events,
@@ -211,7 +211,7 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 def run_accuracy_test(llm: "DuckLLM",
                       model_name: str,
                       test_sets: List[Union[str, type]] = ["MMLU", "GSM8K"],
-                      extra_evaluator_kwargs: Optional[Dict[Union[str, type],
+                      extra_evaluator_kwargs: Optional[Dict[type,
                                                             Dict[str,
                                                                  Any]]] = None,
                       extra_acc_spec: Optional[str] = None,
@@ -1057,7 +1057,7 @@ def run_parallel_test(model_name: str,
                       quant_algo: str = None,
                       kv_cache_quant_algo: str = None,
                       max_batch_size: int = None,
-                      extra_evaluator_kwargs: Optional[Dict[Union[str, type],
+                      extra_evaluator_kwargs: Optional[Dict[type,
                                                             Dict[str,
                                                                  Any]]] = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
@@ -2146,16 +2146,10 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     # fallback (_util.py's _validate_or_fallback_kv_cache_manager_v2).
     MODEL_NAME = "Qwen/Qwen3.5-4B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3.5-4B-FP8"
-    # Match the aggregate accuracy run that the gsm8k.yaml reference comes
-    # from (test_llm_api_pytorch.py::TestQwen3_5_4B). With raw completion
-    # prompts the model often opens its answer with an empty think block and
-    # long markdown that runs past the output budget, scoring well below the
-    # reference.
-    GSM8K_EVALUATOR_KWARGS = dict(
-        apply_chat_template=True,
-        fewshot_as_multiturn=True,
-        chat_template_kwargs=dict(enable_thinking=False),
-    )
+    # Evaluate GSM8K like the aggregate runs that set the gsm8k.yaml
+    # reference; on raw completion prompts this checkpoint scores several
+    # points lower.
+    GSM8K_EVALUATOR_KWARGS = QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS
 
     @pytest.mark.skip_less_device(2)
     def test_mismatched_block_reuse(self, mocker):
