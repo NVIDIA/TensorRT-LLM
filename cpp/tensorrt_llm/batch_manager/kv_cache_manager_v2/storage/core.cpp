@@ -385,7 +385,9 @@ HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, H
     // waitForFill = false: the owning pool group blocks per allocation on only the range
     // it hands out, so serving can start before the whole tier is committed.
     , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots),
-          HostMemBackingOptions{.registerUnit = slotSize, .allowRemoteNumaFallback = options.allowRemoteNumaFallback},
+          HostMemBackingOptions{.registerUnit = slotSize,
+              .allowRemoteNumaFallback = options.allowRemoteNumaFallback,
+              .useThp = options.useThp},
           /*waitForFill=*/false)
 {
 }
@@ -668,7 +670,11 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
             // a resize past it. maxSlots alone would keep it unreachable, but scaled by a
             // sparse slot it can exceed the address space, so `sparseReservation` caps it
             // and growth past the cap is refused.
-            mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, vmSize, hostOptions));
+            // Huge pages are requested only here: these pools hold the offloaded sparse history,
+            // which is large, long-lived and read in bulk.
+            HostMemBackingOptions sparseOptions = hostOptions;
+            sparseOptions.useThp = true;
+            mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, vmSize, sparseOptions));
             continue;
         }
         mPools.push_back(std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots));

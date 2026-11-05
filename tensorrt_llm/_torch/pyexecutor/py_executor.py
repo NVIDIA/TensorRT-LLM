@@ -918,7 +918,7 @@ class PyExecutor:
                                   if model_engine.is_spec_decode else 0)
         self.llm_args = self.model_engine.llm_args
         self._decode_only = is_decode_only(
-            self.llm_args.sparse_attention_config)
+            getattr(self.llm_args, "sparse_attention_config", None))
         self._kv_connector_config = self.llm_args.kv_connector_config
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens

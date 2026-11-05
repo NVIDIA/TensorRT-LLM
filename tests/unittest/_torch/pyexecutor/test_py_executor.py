@@ -994,7 +994,7 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
         return logits
 
     caller_stream = Mock()
-    caller_stream.wait_stream.side_effect = lambda stream: events.append("join")
+    caller_stream.wait_event.side_effect = lambda event: events.append("join")
     kv_cache_manager = Mock()
 
     def update_forward_resources(

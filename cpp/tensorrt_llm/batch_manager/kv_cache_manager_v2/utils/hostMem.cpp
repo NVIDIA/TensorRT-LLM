@@ -93,11 +93,24 @@ void resizeFile(int fd, size_t newSize)
     }
 }
 
-bool hostUseThp()
+bool hostUseThp(bool requested)
 {
-    // Enable transparent huge pages by default. Set TLLM_KV_CACHE_MANAGER_V2_THP=0 to opt out.
+    // TLLM_KV_CACHE_MANAGER_V2_THP: unset leaves the choice to the range, "1" enables huge pages for
+    // every range, anything else disables them for every range.
     char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_THP");
-    return value == nullptr || std::string_view(value) == "1";
+    if (value == nullptr)
+    {
+        return requested;
+    }
+    bool const enabled = std::string_view(value) == "1";
+    if (requested && !enabled)
+    {
+        TLLM_LOG_WARNING(
+            "KVCM2 host tier: TLLM_KV_CACHE_MANAGER_V2_THP=%s disables transparent huge pages for a range that asked "
+            "for them",
+            value);
+    }
+    return enabled;
 }
 
 size_t hostTotalMemory()
