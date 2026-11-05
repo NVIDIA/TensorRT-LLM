@@ -262,20 +262,14 @@ class RubinDSATrtllmAttention(TrtllmAttention):
             if scratch is None or compact_indices is None:
                 raise RuntimeError("NVFP4 MLA scratch buffers were not allocated")
             num_rows = topk_indices_global.shape[0]
-            # These verified decode shapes benefit from splitting V rather
-            # than KV, which avoids the separate partial-output reduction.
+            # Medium decode batches split V rather than KV, avoiding a
+            # separate partial-output reduction.
             if (
                 is_generation
                 and self.num_heads == 64
                 and self.head_dim == 576
                 and topk_indices_global.shape[1] == 2048
-                and (
-                    (num_rows, metadata.gen_token_stride) == (56, 8)
-                    or (
-                        metadata.gen_token_stride == 6
-                        and num_rows in (60, 66, 72, 78, 84, 90, 96, 102)
-                    )
-                )
+                and 49 <= num_rows <= 106
             ):
                 forward_args.sparse_runtime_params.max_num_ctas_per_seq_kv = 1
             if num_rows > scratch.shape[0] or num_rows > compact_indices.shape[0]:

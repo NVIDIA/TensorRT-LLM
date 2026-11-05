@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import DSAHooks, _forward_dsa_attn
@@ -17,6 +19,10 @@ from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
 from ..gemm.low_m import _device_limits, low_m_gemm
 from .kv_norm_pack import is_kv_norm_pack_supported, kv_norm_pack
+from .q_a_norm import is_q_a_norm_early_supported, q_a_norm_early
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.mla import MLA
 
 
 def build_projection_weights(mla) -> None:
@@ -42,12 +48,11 @@ def build_projection_weights(mla) -> None:
     mla.fused_a_indexer_weight = old
 
 
-def _fold_q_b(mla, raw_q: torch.Tensor) -> bool:
+def _q_b_norm_fold_ready(mla: MLA) -> bool:
     norm = mla.q_a_layernorm
     linear = mla.q_b_proj
     return (
-        33 <= raw_q.shape[0] <= 64
-        and type(norm) is RMSNorm
+        type(norm) is RMSNorm
         and not norm.use_gemma
         and not norm.use_cuda_tile
         and not norm.return_hp_output
@@ -55,13 +60,49 @@ def _fold_q_b(mla, raw_q: torch.Tensor) -> bool:
         and mla._resolve_qa_fused_scale() is None
         and linear.bias is None
         and not linear.has_any_quant
-        and linear.weight.dtype == norm.weight.dtype == raw_q.dtype == torch.bfloat16
+        and linear.lora is None
+        and linear._locality_domain_weight_shards is None
+        and linear.weight.dtype == norm.weight.dtype == torch.bfloat16
+        and linear.weight.ndim == 2
+        and linear.weight.shape[1] == mla.q_lora_rank
+        and mla.q_lora_rank % 128 == 0
         and linear.weight.is_contiguous()
         and norm.weight.is_contiguous()
+        and linear.weight.data_ptr() % 32 == 0
+        and norm.weight.data_ptr() % 16 == 0
+    )
+
+
+def _fold_q_b(mla: MLA, raw_q: torch.Tensor) -> bool:
+    return (
+        33 <= raw_q.shape[0] <= 64
+        and _q_b_norm_fold_ready(mla)
+        and raw_q.dtype == torch.bfloat16
+        and raw_q.is_cuda
         and raw_q.stride(1) == 1
         and raw_q.stride(0) % 8 == 0
-        and raw_q.data_ptr() % 32 == linear.weight.data_ptr() % 32 == 0
-        and norm.weight.data_ptr() % 16 == 0
+        and raw_q.data_ptr() % 32 == 0
+        and not torch.is_grad_enabled()
+    )
+
+
+def _fused_a_supported(mla: MLA, inputs: torch.Tensor, weight: torch.Tensor) -> bool:
+    linear = mla.kv_a_proj_with_mqa
+    return (
+        not linear.has_any_quant
+        and linear.bias is None
+        and linear.lora is None
+        and linear._locality_domain_weight_shards is None
+        and not linear.use_cute_dsl_bf16_gemm
+        and inputs.ndim == weight.ndim == 2
+        and inputs.is_cuda
+        and inputs.device == weight.device
+        and inputs.dtype == weight.dtype == torch.bfloat16
+        and inputs.is_contiguous()
+        and weight.is_contiguous()
+        and inputs.shape[1] == weight.shape[1] == 6144
+        and weight.shape[0] % 8 == 0
+        and inputs.data_ptr() % 32 == weight.data_ptr() % 32 == 0
         and not torch.is_grad_enabled()
     )
 
@@ -91,7 +132,9 @@ def _q_b_with_norm(mla, raw_q: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata) -> list[torch.Tensor]:
+def forward_dsa_proj(
+    mla, position_ids, hidden_states, attn_metadata, *, allow_k_cache_write: bool = False
+) -> list[torch.Tensor]:
     if (
         attn_metadata.num_contexts != 0
         or attn_metadata.num_generations == 0
@@ -102,12 +145,27 @@ def forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata) -> list[to
 
     rows = hidden_states.shape[0]
     indexer = mla.mqa.indexer
-    extended = mla.fused_a_indexer_weight
+    skip_indexer = indexer is not None and indexer.can_skip_projection(attn_metadata, rows)
+    extended = mla.fused_a_indexer_weight if not skip_indexer else None
     indexer_wk_wp = None
-    if extended is not None and 1 <= rows <= 64 and hidden_states.is_contiguous():
-        projected = low_m_gemm(hidden_states, extended, None)
-        kv_a = projected[:, : mla.q_lora_rank + mla.kv_lora_rank + mla.qk_rope_head_dim]
-        indexer_wk_wp = projected[:, kv_a.shape[1] :]
+    fused_a_weight = extended if extended is not None else mla.kv_a_proj_with_mqa.weight
+    if 1 <= rows <= 64 and _fused_a_supported(mla, hidden_states, fused_a_weight):
+        if rows <= 16:
+            projected = torch.ops.trtllm.dsv3_fused_a_gemm_op(
+                hidden_states, fused_a_weight.t(), None, None
+            )
+        else:
+            projected = low_m_gemm(
+                hidden_states,
+                fused_a_weight,
+                None,
+                release_early=rows > 32 and _q_b_norm_fold_ready(mla),
+            )
+        if extended is not None:
+            kv_a = projected[:, : mla.q_lora_rank + mla.kv_lora_rank + mla.qk_rope_head_dim]
+            indexer_wk_wp = projected[:, kv_a.shape[1] :]
+        else:
+            kv_a = projected
     else:
         kv_a = mla.kv_a_proj_with_mqa(hidden_states)
     raw_q, kv, k_pe = kv_a.split([mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim], dim=-1)
@@ -117,7 +175,15 @@ def forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata) -> list[to
     def q_path():
         if folded:
             return _q_b_with_norm(mla, raw_q), None
-        q_norm, qr = mla._q_a_layernorm_maybe_fused(raw_q, return_norm_out=True)
+        if mla._resolve_qa_fused_scale() is None and is_q_a_norm_early_supported(
+            raw_q, mla.q_a_layernorm
+        ):
+            q_norm = q_a_norm_early(
+                raw_q, mla.q_a_layernorm.weight, mla.q_a_layernorm.variance_epsilon
+            )
+            qr = q_norm
+        else:
+            q_norm, qr = mla._q_a_layernorm_maybe_fused(raw_q, return_norm_out=True)
         return mla.q_b_proj(q_norm), qr
 
     def kv_path():
@@ -128,7 +194,7 @@ def forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata) -> list[to
         else:
             normalized = mla.kv_a_layernorm(kv)
             result = normalized, torch.cat((normalized, k_pe), dim=-1)
-        if folded and indexer is not None:
+        if folded and indexer is not None and not skip_indexer:
             qr = mla._q_a_layernorm_maybe_fused(raw_q, return_norm_out=True)[1]
             aux_projection.extend((qr, indexer.wq_b(qr)))
         return result
@@ -139,12 +205,20 @@ def forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata) -> list[to
     outputs = [q, compressed_kv, k_pe, latent_cache]
     if indexer is None:
         return outputs
+    if skip_indexer:
+        outputs.extend(indexer.reused_projection_outputs(attn_metadata, rows))
+        return outputs
     q_in = None
     if aux_projection:
         qr, q_in = aux_projection
     outputs.extend(
         indexer.pre_indexer_proj(
-            qr, hidden_states, position_ids, q_in=q_in, wk_wp_out=indexer_wk_wp
+            qr,
+            hidden_states,
+            position_ids,
+            q_in=q_in,
+            wk_wp_out=indexer_wk_wp,
+            k_cache_metadata=attn_metadata if allow_k_cache_write else None,
         )
     )
     return outputs
@@ -152,7 +226,9 @@ def forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata) -> list[to
 
 class RubinDSAHooks(DSAHooks):
     def forward(self, mla, position_ids, hidden_states, attn_metadata, attn_output) -> None:
-        outputs = forward_dsa_proj(mla, position_ids, hidden_states, attn_metadata)
+        outputs = forward_dsa_proj(
+            mla, position_ids, hidden_states, attn_metadata, allow_k_cache_write=True
+        )
         _forward_dsa_attn(
             mla, *outputs[:4], outputs[4:], position_ids, attn_metadata, attn_output[0]
         )

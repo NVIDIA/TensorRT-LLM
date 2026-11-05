@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Rubin decode launch policy for the shared hint-free GVR device kernel."""
+"""Rubin decode policy for balanced and static hint-free GVR kernels."""
 
 from functools import lru_cache
 
@@ -12,15 +12,8 @@ _SPLITS = {
     (40, 8): 4,
     (48, 8): 4,
     (48, 6): 4,
-    (56, 8): 3,
-    (60, 6): 3,
-    (72, 6): 2,
-    (78, 6): 2,
-    (84, 6): 2,
-    (90, 6): 2,
-    (96, 6): 2,
-    (102, 6): 2,
 }
+_BALANCED_SHAPES = {(rows, 6) for rows in range(54, 108, 6)} | {(56, 8)}
 _ENVELOPE = 1048576
 _WORKSPACE_ELEMENTS = (2048 + 160 * 16384 * 8) // 4
 _workspaces: dict[tuple[int, int], torch.Tensor] = {}
@@ -44,7 +37,7 @@ def supports(
         scores.is_cuda
         and _supported_device(scores.get_device())
         and scores.ndim == 2
-        and (scores.shape[0], next_n) in _SPLITS
+        and ((scores.shape[0], next_n) in _SPLITS or (scores.shape[0], next_n) in _BALANCED_SHAPES)
         and scores.dtype == torch.float32
         and max_seq_len is not None
         and _ENVELOPE <= max_seq_len <= _ENVELOPE + 256
@@ -87,33 +80,43 @@ def run(
     if launcher is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm Rubin GVR TopK before CUDA graph capture")
-        from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling import (
-            get_compiled,
-        )
-
         rows = scores.shape[0]
-        split = _SPLITS[(rows, next_n)]
-        assert rows * split <= 212 and split * 2048 <= 16384
-        fn = get_compiled(
-            (1024, 8, 1, 256, 2, True, False, next_n, 0, split),
-            hint_free=True,
-            fused_k=2048,
-        )
-        # Match the shared varlen launcher's tail parameters for this grid.
-        big = rows * split <= 148
-        pre = (0, stride, 2048, 8192, 4096, split, 0, 0, 0, 0, 0)
-        tail = (
-            4096 if big else 2816,
-            32 if split == 2 else 48,
-            6144 if split == 2 else 7168,
-            0 if big else 1,
-            0,
-        )
+        if (rows, next_n) in _BALANCED_SHAPES:
+            from .gvr_balanced import get_compiled
+
+            fn = get_compiled(
+                (1024, 8, 1, 256, 2, True, False, next_n, 0, 3, (rows + 31) // 32),
+                hf=True,
+            )
+            pre = (0, stride, 2048, 8192, 4096, 212, 0, 0, 0, 0, 0)
+            tail = (4096, 48, 7168, 0, 0)
+            policy = "balanced, CTAs=212"
+        else:
+            from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling import (
+                get_compiled,
+            )
+
+            split = _SPLITS[(rows, next_n)]
+            assert rows * split <= 212 and split * 2048 <= 16384
+            fn = get_compiled(
+                (1024, 8, 1, 256, 2, True, False, next_n, 0, split),
+                hint_free=True,
+                fused_k=2048,
+            )
+            # Match the shared varlen launcher's tail parameters for this grid.
+            big = rows * split <= 148
+            pre = (0, stride, 2048, 8192, 4096, split, 0, 0, 0, 0, 0)
+            tail = (
+                4096 if big else 2816,
+                32 if split == 2 else 48,
+                6144 if split == 2 else 7168,
+                0 if big else 1,
+                0,
+            )
+            policy = f"R={split}, CTAs={rows * split}"
         launcher = (fn, pre, tail)
         _launchers[key] = launcher
-        logger.info(
-            f"Rubin GVR TopK: rows={rows}, next_n={next_n}, R={split}, CTAs={rows * split}, stride={stride}"
-        )
+        logger.info(f"Rubin GVR TopK: rows={rows}, next_n={next_n}, {policy}, stride={stride}")
     fn, pre, tail = launcher
     logits = scores.as_strided((scores.shape[0], stride), (stride, 1))
     # The hint-free engine does not read the legacy pre_idx ABI slot.
