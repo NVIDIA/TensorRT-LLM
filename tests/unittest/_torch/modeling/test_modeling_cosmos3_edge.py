@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +24,13 @@ from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
     Cosmos3EdgeImageProcessor,
     Cosmos3EdgeInputProcessor,
     Cosmos3EdgeModel,
+    Cosmos3EdgeVisionEncoder,
+    _cpu_int_rows,
     _edge_positional_embedding_params,
     merge_spatial_patches,
     resize_positional_embeddings_packed,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionPatchMerger
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.inputs.multimodal import (
@@ -497,3 +501,50 @@ def test_cosmos3_edge_init_preserves_caller_quant_config():
     assert model.mm_encoder.model_config.quant_config is not quant_config
     assert model.mm_encoder.model_config.quant_config.kv_cache_quant_algo is None
     assert model.mm_encoder.model_config.quant_config.quant_algo is None
+
+
+def _legacy_cosmos3_edge_encode_batched(
+    self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+) -> torch.Tensor:
+    """Copy of the `Cosmos3EdgeVisionEncoder.encode_batched` body this change replaced."""
+    grid_cpu = _cpu_int_rows(grid_thw)
+    hidden = self.visual(pixel_values, grid_thw, grid_cpu=grid_cpu)
+    merged = merge_spatial_patches(hidden, grid_cpu, merge_size=self.spatial_merge_size)
+    merged = merged.view(-1, self.spatial_merge_size**2, hidden.shape[-1])
+    return self.projector(merged)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("raw", [False, True], ids=["normalized", "raw_uint8"])
+def test_cosmos3_edge_vision_group_matches_legacy_packing(raw: bool) -> None:
+    params = [
+        _qwen3vl._qwen_vision_request(items, raw=raw)
+        for items in _qwen3vl._QWEN_VISION_BATCHES["mixed"]
+    ]
+
+    def encoder() -> SimpleNamespace:
+        # SigLIP stand-in returns its patch rows; the projector sums each 2x2 block.
+        vision = SimpleNamespace(spatial_merge_size=2, inputs=[])
+        vision.visual = lambda pixel_values, grid_thw, grid_cpu: (
+            vision.inputs.append((pixel_values, grid_thw)) or pixel_values
+        )
+        vision.projector = lambda merged: merged.sum(dim=1)
+        return vision
+
+    new, legacy = encoder(), encoder()
+    new.encode_batched = partial(Cosmos3EdgeVisionEncoder.encode_batched, new)
+    new.mm_encoder_groups = Cosmos3EdgeVisionEncoder.mm_encoder_groups.fget(new)
+    legacy.mm_encoder_groups = (
+        EncoderGroup(
+            ("image", "video"),
+            partial(_legacy_cosmos3_edge_encode_batched, legacy),
+            _qwen3vl._legacy_qwen3vl_build_batched_input,
+        ),
+    )
+    with torch.inference_mode():
+        (batched,) = Cosmos3EdgeVisionEncoder.forward(new, params)
+        (expected,) = Cosmos3EdgeVisionEncoder.forward(legacy, params)
+
+    assert len(new.inputs) == len(legacy.inputs) == 1
+    _qwen3vl._assert_same_tensors(new.inputs[0], legacy.inputs[0])
+    assert torch.equal(batched, expected)
