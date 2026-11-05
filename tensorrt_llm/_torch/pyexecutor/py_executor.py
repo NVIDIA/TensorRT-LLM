@@ -8184,7 +8184,8 @@ class PyExecutor:
                 active_requests, self.request_broadcaster.rank0_now,
                 self._get_request_admission_capacity(),
                 total_num_active_requests, waiting_queue)
-            self.scheduler.set_gen_paused_ids(preemption.paused_ids)
+            self.scheduler.set_gen_paused_ids(preemption.paused_ids,
+                                              preemption.resumed_ids)
             if self.dist.rank == 0:
                 preemption.maybe_log()
 

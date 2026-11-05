@@ -147,6 +147,10 @@ class GenPreemption:
         return frozenset(self._paused)
 
     @property
+    def resumed_ids(self) -> frozenset[int]:
+        return frozenset(self._resumed_ids)
+
+    @property
     def gain(self) -> float:
         return math.exp(self.theta)
 

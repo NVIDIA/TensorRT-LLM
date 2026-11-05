@@ -346,6 +346,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Generation requests paused in place (GEN slot preemption).
         self._gen_paused_ids: frozenset[int] = frozenset()
+        self._gen_resumed_ids: frozenset[int] = frozenset()
         self._gen_preemption_enabled = False
 
         # `is True`: a manager without the flag reads as off.
@@ -449,10 +450,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._remote_tail_context_ids = context_request_ids
         self._remote_tail_generation_ids = generation_request_ids
 
-    def set_gen_paused_ids(self, request_ids: frozenset[int]) -> None:
-        """Generation requests to leave out of the batch but keep resident."""
+    def set_gen_paused_ids(
+        self, request_ids: frozenset[int], resumed_ids: frozenset[int] = frozenset()
+    ) -> None:
+        """Leave paused requests resident and give resumes priority this pass."""
         self._gen_preemption_enabled = True
         self._gen_paused_ids = request_ids
+        self._gen_resumed_ids = resumed_ids
 
     def _filter_paused_requests(self, requests: RequestList) -> RequestList:
         paused = [req for req in requests if req.py_request_id in self._gen_paused_ids]
@@ -543,6 +547,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                     0 if (req.is_generation_only_request and req.py_decoding_iter == 0) else 1
                 )
             )
+
+        # Resume deadlines take precedence over the first-token preference.
+        if self._gen_resumed_ids:
+            requests_list.sort(key=lambda req: req.py_request_id not in self._gen_resumed_ids)
 
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)

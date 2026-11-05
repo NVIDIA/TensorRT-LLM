@@ -1908,6 +1908,44 @@ class TestGenSlotPreemption:
         sched.set_gen_paused_ids(frozenset())
         assert ids(sched.schedule_request(reqs, set()).generation_requests) == [0, 1]
 
+    @pytest.mark.parametrize("first_token_first", [False, True])
+    def test_forced_resume_precedes_first_token(self, first_token_first, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import (
+            GenPreemption,
+            GenPreemptionSettings,
+        )
+
+        monkeypatch.setenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", str(int(first_token_first)))
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=1)
+        resident, waiter = [make_gen_request(i) for i in range(2)]
+        for req, decoding_iter in [(resident, 100), (waiter, 0)]:
+            req.py_decoding_iter = decoding_iter
+            req.is_generation_only_request = True
+            req.state = LlmRequestState.GENERATION_IN_PROGRESS
+            req.prompt_len = 10
+            req.get_num_tokens.return_value = 110
+        waiter.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        waiter.state_value = waiter.state.value
+        waiter.is_generation_in_progress_state = False
+        p = GenPreemption(GenPreemptionSettings(tpot_budget=0.1), 1)
+        p.observe([resident], 0.0)
+        p._pause(resident)
+        assert p.step([waiter, resident], 11.0, 1, 2, None) == 2
+        assert p.resumed_ids == {0} and p.stats["forced"] == 1
+        sched.set_gen_paused_ids(p.paused_ids, p.resumed_ids)
+        assert ids(sched.schedule_request([waiter, resident], set()).generation_requests) == [0]
+        assert p._reqs[0].paused_t is None and p._reqs[0].paused_total == 11.0
+
+        # On the next pass the ordinary first-token preference applies again.
+        resident.py_decoding_iter += 1
+        p.step([resident, waiter], 11.1, 1, 2, None)
+        assert not p.resumed_ids
+        sched.set_gen_paused_ids(p.paused_ids, p.resumed_ids)
+        expected = [1] if first_token_first else [0]
+        assert (
+            ids(sched.schedule_request([resident, waiter], set()).generation_requests) == expected
+        )
+
     @pytest.mark.parametrize("paused_ids", [frozenset({0}), frozenset()])
     def test_paused_and_displaced_requests_keep_peft_claims(self, paused_ids):
         peft = make_peft_cache_manager(max_device_pages=1)
