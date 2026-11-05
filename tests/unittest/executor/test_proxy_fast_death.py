@@ -107,6 +107,7 @@ def test_cancellation_preserves_live_worker_shutdown(state: str) -> None:
     proxy._engine_dead = state == "dead"
     proxy.doing_shutdown = state == "graceful"
     proxy._error_queue = _queue.Queue()
+    proxy._results = {42: _FakeResult()}
     proxy.request_queue = IpcQueue(is_server=True)
     proxy._request_sender = proxy_module._RequestSender(
         proxy.request_queue, proxy._error_queue, batching=False
@@ -1177,6 +1178,7 @@ def test_non_ready_status_during_init_does_not_abort_borrowed_session():
 
 def test_cancellation_tolerates_concurrent_terminal_failure():
     proxy = _bare_proxy()
+    proxy._results = {42: _FakeResult()}
     proxy._fatal_error = None
     proxy.doing_shutdown = True
     proxy._request_sender = _Mock()
