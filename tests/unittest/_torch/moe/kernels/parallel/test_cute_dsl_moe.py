@@ -6475,10 +6475,14 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> 
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("locality_domain", [False, True], ids=["full_gpu", "locality_domain"])
 @pytest.mark.parametrize("over_limit", [False, True])
-def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -> None:
+def test_mxfp8_output_past_int32_falls_back_to_memset(
+    monkeypatch, over_limit, locality_domain
+) -> None:
     """The Rubin workspace reset indexes the output with Int32, so an output
-    past that extent is cleared by the memset rather than inside the op."""
+    past that extent is cleared by the memset rather than inside the op, on
+    both the full-GPU and the locality-domain path."""
     impl = TrtllmCutedslFusedFc12Mxfp8Impl
     leaf = impl.__new__(impl)
     torch.nn.Module.__init__(leaf)
@@ -6488,6 +6492,15 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -
     leaf.mapping = SimpleNamespace(moe_ep_size=1)
     leaf._sm_version = 107
     leaf.act_clamp = float("inf")
+    leaf._locality_domain_weight_shards = [
+        {
+            "w3_w1_weight": torch.empty(0),
+            "fc31_weight_block_scale": torch.empty(0, dtype=torch.int32),
+            "w2_weight": torch.empty(0),
+            "fc2_weight_block_scale": torch.empty(0, dtype=torch.int32),
+        }
+        for _ in range(2)
+    ]
     leaf.w3_w1_weight = torch.empty(0)
     leaf.w2_weight = torch.empty(0)
     leaf.quant_scales = SimpleNamespace(
@@ -6503,18 +6516,23 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -
         lambda **kwargs: tuple(torch.empty(1, dtype=torch.int32) for _ in range(6)),
         raising=False,
     )
-    monkeypatch.setattr(
-        torch.ops.trtllm,
+    for op_name in (
         "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
-        lambda **kwargs: op_calls.append(kwargs),
-        raising=False,
-    )
+        "cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin",
+    ):
+        monkeypatch.setattr(
+            torch.ops.trtllm,
+            op_name,
+            lambda op_name=op_name, **kwargs: op_calls.append((op_name, kwargs)),
+            raising=False,
+        )
     num_tokens, hidden = 8, 64
     moe_output = torch.empty((num_tokens, hidden), dtype=torch.bfloat16)
     limit = moe_output.numel() - 1 if over_limit else moe_output.numel()
     monkeypatch.setattr(impl, "_ZERO_OUTPUT_MAX_ELEMENTS", limit)
 
-    impl.run_moe_mxfp8_impl(
+    run = impl._run_moe_mxfp8_locality_domain if locality_domain else impl.run_moe_mxfp8_impl
+    run(
         leaf,
         x=torch.empty((num_tokens, hidden), dtype=torch.float8_e4m3fn),
         token_selected_experts=torch.zeros((num_tokens, 2), dtype=torch.int32),
@@ -6524,7 +6542,9 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -
     )
 
     assert len(op_calls) == 1
-    assert op_calls[0]["zero_output"] is (not over_limit)
+    op_name, kwargs = op_calls[0]
+    assert ("locality_domain" in op_name) is locality_domain
+    assert kwargs["zero_output"] is (not over_limit)
     assert len(memsets) == (1 if over_limit else 0)
 
 
