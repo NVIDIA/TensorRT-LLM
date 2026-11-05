@@ -918,6 +918,7 @@ def test_worker_enqueues_serializable_python_input_envelope(
     worker._lora_manager = None
     worker.max_seq_len = 20
     worker.engine = SimpleNamespace(
+        is_generation_model=True,
         enqueue_request=lambda request: captured.append(request) or 42)
     request = GenerationRequest(
         prompt_token_ids=[1, 2, 3],
