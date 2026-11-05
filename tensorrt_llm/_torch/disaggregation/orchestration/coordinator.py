@@ -813,8 +813,10 @@ class DisaggTransferCoordinator:
         request; ``AsyncTransferManager`` counts them. A request that is still
         active gets its response created here (the transfer completed before
         the response pass could run) and staged for the rank-synchronized
-        flush; a failed transfer only releases its claim so the synchronized
-        error path can respond once every owner is done.
+        flush; an active failed request only releases its claim so the
+        synchronized error path can respond once every owner is done. A
+        protected CTX request whose result already left the registry terminates
+        on final retirement without another response.
         """
         if request.py_request_id in self._context_cancellation_drains:
             # The logical response is owned by the executor, or was already
@@ -847,8 +849,10 @@ class DisaggTransferCoordinator:
                 self._effects.terminate_request(request)
             return
         if self._transfers.end_transfer(request):
-            if transfer_failed:
+            if transfer_failed and not self.supports_logical_context_cancellation(request):
                 return
+            # A protected CTX result may already have left the active registry.
+            # No later error-response pass can terminate its retired request.
             # Skip if the PP=1 early path already terminated this request;
             # under PP>1 that path is off, so terminate here on completion.
             if not self._force_terminate_ctx_for_partial_reuse:

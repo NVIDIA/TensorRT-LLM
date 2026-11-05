@@ -415,10 +415,11 @@ def test_preserved_failure_is_flushed_before_idle_fetch(
     for target in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
         monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
 
-    def stop_before_blocking(timeout: timedelta | None) -> None:
+    def stop_before_blocking(timeout: timedelta | None, *, wait_for_batch: bool) -> None:
         """Check publication and cleanup before the real fetch would wait forever."""
         events.append("fetch")
         assert timeout is None
+        assert wait_for_batch
         assert executor.active_requests == []
         if failure_rank == 0 and not should_flush:
             # TP consensus cannot authorize a world-wide collective. Keep the

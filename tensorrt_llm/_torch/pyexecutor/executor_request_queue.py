@@ -275,6 +275,8 @@ class ExecutorRequestQueue:
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
@@ -285,6 +287,8 @@ class ExecutorRequestQueue:
             client_id: Original frontend identity, not an executor request ID.
         """
         with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
             self.request_queue.put(
                 RequestQueueItem(client_id,
                                  is_canceled_request=True,
@@ -338,13 +342,27 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             return self.active and self.dist.rank == 0
 
+    def _can_enqueue_cancellation(self) -> bool:
+        # The caller holds enqueue_lock, including the enqueue-time recheck.
+        return (self.active and self.dist.rank == 0
+                and self.admission_state in (RequestAdmissionState.RUNNING,
+                                             RequestAdmissionState.PARKING))
+
+    def can_enqueue_cancellation(self) -> bool:
+        """Allow cancellation of existing work while admission drains for sleep."""
+        with self.enqueue_lock:
+            return self._can_enqueue_cancellation()
+
     def get_from_request_queue(
             self,
-            timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
+            timeout: Optional[datetime.timedelta],
+            *,
+            wait_for_batch: bool = True) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
 
         Args:
             timeout: Optional timeout for waiting on queue.
+            wait_for_batch: Whether to wait for additional items to fill a batch.
 
         Returns:
             List of RequestQueueItem fetched from the queue.
@@ -365,7 +383,7 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
 
-        if self.batch_wait_timeout_ms == 0:
+        if not wait_for_batch or self.batch_wait_timeout_ms == 0:
             return items
 
         if len(items) >= self.max_batch_size:
