@@ -242,7 +242,9 @@ def test_pre_shutdown_sends_the_sentinel_itself_if_nothing_else_wrote(batching):
 
 
 @pytest.mark.timeout(20, method="thread")
-def test_transport_error_reaches_error_queue():
+@pytest.mark.parametrize("late_close", [False, True])
+def test_transport_error_reaches_error_queue(monkeypatch, late_close):
+    monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", "1")
     published = threading.Event()
     finish_failure = threading.Event()
 
@@ -250,7 +252,8 @@ def test_transport_error_reaches_error_queue():
         def put_nowait(self, error):
             super().put_nowait(error)
             published.set()
-            assert finish_failure.wait(timeout=10)
+            if not late_close:
+                assert finish_failure.wait(timeout=10)
 
     class _FailingQueue(_RecordingQueue):
         attempts = 0
@@ -266,7 +269,7 @@ def test_transport_error_reaches_error_queue():
 
     request_queue = _FailingQueue(block_first_put=True)
     error_queue = _ErrorQueue()
-    sender = _RequestSender(request_queue, error_queue)
+    sender = _create_request_sender(request_queue, error_queue)
     closer = None
     try:
         sender.send(pickle.dumps("a"))
@@ -274,13 +277,19 @@ def test_transport_error_reaches_error_queue():
         sender.send(pickle.dumps("queued"))
         request_queue.release_first_put.set()
         assert published.wait(timeout=10)
+        if late_close:
+            # The failure owner must already know how to stop its workers;
+            # cleanup can arrive after that owner has closed its socket.
+            sender._thread.join(timeout=3)
+            assert not sender._thread.is_alive()
         responsibility = []
         closer = threading.Thread(
             target=lambda: responsibility.append(sender.close(timeout=10, send_sentinel=True))
         )
         closer.start()
-        with sender._cond:
-            assert sender._cond.wait_for(lambda: sender._send_sentinel, timeout=10)
+        if not late_close:
+            with sender._cond:
+                assert sender._cond.wait_for(lambda: sender._send_sentinel, timeout=10)
         finish_failure.set()
         closer.join(timeout=10)
         assert not closer.is_alive()
@@ -340,7 +349,9 @@ def test_connection_recovery_requires_worker_receipt(tmp_path, push, acknowledge
         commands = IpcQueue(is_server=True)
         address = commands.address
     errors = queue.Queue()
-    sender = _RequestSender(commands, errors, batching=False, recovery_timeout=2)
+    sender = _RequestSender(
+        commands, errors, batching=False, recovery_timeout=2, stop_workers_on_failure=True
+    )
     received = []
     worker_errors = []
 

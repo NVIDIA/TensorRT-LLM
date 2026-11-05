@@ -43,6 +43,8 @@ A temporary executor command-connection failure pauses admission and makes `infe
 
 Cancellations retain one pending intent per admitted request, including requests that postprocessing finishes before the worker stops. Repeated aborts for the same pending cancellation are coalesced. A full profiling-control queue does not drop cancellations or fail unrelated requests. Retained cancellations keep their position after earlier generation commands and remain subject to the existing transport recovery deadline.
 
+On terminal failure, the launcher's command sender attempts to stop surviving workers before closing its socket. This decision does not depend on how quickly monitor cleanup runs. An attached frontend never sends the shared worker-stop message.
+
 Remote MPI sessions also supervise each running worker through a separate process watch. The helper does not depend on MPI, CUDA or the worker's Python thread making progress. A worker exit, helper exit, or five seconds without a heartbeat makes the engine failure terminal. This detects process loss; it does not detect a live worker stuck in a collective. Supervision starts when the worker function begins, after the MPI launch barrier.
 
 If a recovery acknowledgement is lost, the sender retries only the idempotent barrier within the same recovery deadline. It does not replay generation requests or extend the deadline.
