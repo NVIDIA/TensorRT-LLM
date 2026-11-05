@@ -144,8 +144,14 @@ def gemm() -> None:
         text(ax, x, 1.33, "⋮")
     ax.plot([5.12, 5.12], [0.75, 3.65], color=GREEN, lw=2)
     arrow(ax, (5.12, 2.30), (5.57, 2.30), GREEN)
-    box(ax, 5.62, 1.88, 1.22, 0.84, "tile A\n16 rows", PALE_GREEN)
-    text(ax, 6.23, 1.53, r"$16\times C_{\mathrm{out}}$")
+    text(ax, 6.23, 3.95, "tile A")
+    for coordinate in range(16):
+        y = 3.66 - (coordinate + 1) * 0.17
+        ax.add_patch(
+            Rectangle((5.62, y), 1.22, 0.17, facecolor=PALE_GREEN, edgecolor=GREEN, linewidth=0.5)
+        )
+        ax.text(5.70, y + 0.085, str(coordinate), ha="left", va="center", color=GREEN, fontsize=10)
+    text(ax, 6.23, 0.62, r"$16\times C_{\mathrm{out}}$")
     arrow(ax, (6.87, 2.30), (7.24, 2.30), GREEN)
     box(ax, 7.29, 1.88, 1.45, 0.84, "Output\ntransform", PALE_GREY)
     arrow(ax, (8.79, 2.30), (9.24, 2.30), GREEN)
