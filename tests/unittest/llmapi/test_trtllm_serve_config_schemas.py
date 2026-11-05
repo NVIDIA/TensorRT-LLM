@@ -79,6 +79,21 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             {"disagg_cluster": {"cluster_uri": "etcd://localhost:2379", "cluster_nmae": "bad"}},
             False,
         ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "disagg_cluster": {
+                    "cluster_uri": "etcd://localhost:2379",
+                    "user": "u",
+                    "password": "p",
+                    "ca_cert": "/ca.pem",
+                    "cert_key": "/key.pem",
+                    "cert_cert": "/cert.pem",
+                    "record_auth_key": "secret",
+                }
+            },
+            True,
+        ),
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
