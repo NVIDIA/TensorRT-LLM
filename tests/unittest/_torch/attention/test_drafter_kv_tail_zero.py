@@ -24,7 +24,6 @@ PAGE, HEADS, D = 128, 4, 128
 def test_mark_drafter_last_row_preserves_manager_lifecycle(initialized: bool) -> None:
     """A deferred backend can be marked before its FMHA manager is constructed."""
     backend = TrtllmAttention.__new__(TrtllmAttention)
-    torch.nn.Module.__init__(backend)
     manager = None
     if initialized:
         manager = FmhaManager.__new__(FmhaManager)

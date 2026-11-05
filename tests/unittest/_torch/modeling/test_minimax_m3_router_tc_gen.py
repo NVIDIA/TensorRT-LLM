@@ -108,8 +108,10 @@ def test_gate_dispatch(monkeypatch):
 
     def stock_path(
         x,
-    ):  # the gate's own stock router under the process's TF32 setting (same ops, same bits)
-        return torch.nn.functional.linear(mm.minimax_m3_router_input_fp32(x), w)
+    ):  # Match the unloaded gate's actual stock operator, including its compute policy.
+        return torch.ops.trtllm.cublas_mm(
+            x.to(torch.float32).contiguous(), w.t(), bias=None, out_dtype=torch.float32
+        )
 
     x4 = x16[:4].contiguous()
     assert torch.equal(gate(x4, generation_only=True), stock_path(x4))  # 4 rows: the stock router

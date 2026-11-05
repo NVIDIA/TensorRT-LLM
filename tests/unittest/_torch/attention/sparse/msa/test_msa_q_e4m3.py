@@ -56,7 +56,7 @@ def test_query_cast_finite_bits_and_explicit_saturation(monkeypatch, rows, strid
     backing = torch.empty(
         (rows, width * (3 if strided else 1)), dtype=pattern.dtype, device=pattern.device
     )
-    q = backing[:, :width].view(rows, heads, dim)
+    q = backing.view(rows, 3 if strided else 1, heads, dim)[:, 0]
     q.copy_(
         pattern.repeat((q.numel() + pattern.numel() - 1) // pattern.numel())[: q.numel()].view_as(q)
     )
@@ -68,10 +68,8 @@ def test_query_cast_finite_bits_and_explicit_saturation(monkeypatch, rows, strid
     finite = torch.isfinite(reference.float())
     assert torch.equal(actual.view(torch.uint8)[finite], reference.view(torch.uint8)[finite])
     source_nan = torch.isnan(q.float())
-    overflow = ~finite & ~source_nan
-    assert (
-        overflow.any()
-    )  # Saturation distinguishes the optimized path from an accidental ATen fallback.
+    overflow = q.float().abs() > 448
+    assert overflow.any()
     torch.testing.assert_close(
         actual.float()[overflow], q.float().sign()[overflow] * 448, rtol=0, atol=0
     )

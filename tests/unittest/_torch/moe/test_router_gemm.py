@@ -93,7 +93,9 @@ def test_weight_terms_preserve_sampled_fp32_weights(data: RouterData) -> None:
 def test_m_invariant_and_deterministic(data) -> None:
     x, _, wr, _ = data
     full = router_gemm(x, wr)
+    torch.cuda.synchronize()  # Attribute asynchronous faults to the single-pass launch.
     capped = router_gemm(x[: rgt.SPLITK_MAX_M].contiguous(), wr)
+    torch.cuda.synchronize()  # Attribute partial/reduction faults before subsequent launches.
     for _ in range(3):
         assert torch.equal(router_gemm(x, wr).view(torch.int32), full.view(torch.int32))
     for m in (

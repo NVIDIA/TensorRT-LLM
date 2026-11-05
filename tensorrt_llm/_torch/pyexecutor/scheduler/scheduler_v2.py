@@ -1667,6 +1667,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             # A replay that exhausts the reduced budget takes the same optional
             # reserve-release retry as an indivisible context chunk below.
             remaining_budget = max(0, remaining_budget - replay_tokens)
+        if (
+            full_token_budget is not None
+            and remaining_budget is not None
+            and context_remaining <= remaining_budget
+            and context_remaining + get_draft_token_length(req) > remaining_budget
+        ):
+            # A final chunk also charges its drafts. Keep this chunk non-final
+            # so it cannot consume the optional reserve through those drafts.
+            remaining_budget = max(0, context_remaining - 1)
         if force_chunk:
             # Snapshot boundaries can be shorter than chunk_unit_size.
             assert isinstance(req.expect_snapshot_points, list)

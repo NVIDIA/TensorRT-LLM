@@ -411,7 +411,7 @@ def test_drafter_last_row_matches_stock_forward(
         stock = _attention(kv_dtype)
         optimized = _attention(kv_dtype)
         draft = torch.nn.Module()
-        draft.add_module("attn", optimized)
+        draft.attn = optimized
         assert drafter_last_row.mark_drafter_last_row_attention(draft) == 1
         rids = sorted(lengths)
         manager.add_dummy_requests(

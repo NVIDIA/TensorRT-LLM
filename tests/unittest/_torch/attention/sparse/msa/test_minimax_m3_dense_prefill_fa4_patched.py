@@ -31,6 +31,9 @@ def test_dense_prefill_fa4_patched_accuracy_suite() -> None:
     spec = importlib.util.find_spec("flash_attn.cute")
     assert spec is not None and spec.submodule_search_locations, "pinned flash-attn-4 is required"
     installed = Path(next(iter(spec.submodule_search_locations))) / "flash_fwd_sm100.py"
+    runtime = importlib.util.find_spec("tensorrt_llm")
+    assert runtime is not None and runtime.origin is not None
+    runtime_root = Path(runtime.origin).resolve().parents[1]
     already_patched = hashlib.sha256(installed.read_bytes()).hexdigest() == pin[1]
     with tempfile.TemporaryDirectory(prefix="trtllm-fa4-validation-", dir="/tmp") as temporary:
         scratch = Path(temporary)
@@ -79,8 +82,12 @@ def test_dense_prefill_fa4_patched_accuracy_suite() -> None:
             entry
             for entry in (
                 str(overlay) if not already_patched else "",
-                str(root),
-                env.get("PYTHONPATH", ""),
+                str(runtime_root),
+                *(
+                    entry
+                    for entry in env.get("PYTHONPATH", "").split(os.pathsep)
+                    if entry and (runtime_root == root or Path(entry).resolve() != root)
+                ),
             )
             if entry
         )
@@ -101,7 +108,7 @@ def test_dense_prefill_fa4_patched_accuracy_suite() -> None:
                 "-o",
                 f"cache_dir={scratch / 'pytest-cache'}",
             ],
-            cwd=root,
+            cwd=scratch,
             env=env,
             capture_output=True,
             text=True,

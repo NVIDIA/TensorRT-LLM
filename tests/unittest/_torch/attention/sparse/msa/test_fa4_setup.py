@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -59,7 +60,10 @@ def test_fa4_setup_supports_package_layouts(tmp_path: Path, namespace: bool) -> 
     setup.write_text(source)
     binaries = tmp_path / "bin"
     binaries.mkdir()
-    (binaries / "python3").symlink_to(sys.executable)
+    interpreter = binaries / "python3"
+    # An installed regular flash_attn package otherwise overrides the namespace fixture.
+    interpreter.write_text(f'#!/usr/bin/env bash\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+    interpreter.chmod(0o755)
     env = {
         **os.environ,
         "PATH": str(binaries) + os.pathsep + os.environ["PATH"],

@@ -5362,7 +5362,39 @@ class TestAppendReserveShortestFirst:
         short = make_ctx_request(2, context_remaining_length=1000)
         out = scheduler.schedule_request([generation, skipped, head, short], set())
         assert sorted(ids(out.context_requests)) == [1, 2]
-        assert head.context_chunk_size == 6080 and short.context_chunk_size == 1000
+        # SJF admits the short request first; the head is the second admitted context.
+        assert head.context_chunk_size == 7104 and short.context_chunk_size == 1000
+
+    def test_skipped_candidate_keeps_reserve_for_first_admitted_long_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        original = scheduler._try_schedule_context
+
+        def skip_candidate(request: Mock, *args, **kwargs) -> tuple[ScheduleAction, int, bool]:
+            if request.py_request_id == 0:
+                return ScheduleAction.SKIP, 0, False
+            return original(request, *args, **kwargs)
+
+        monkeypatch.setattr(scheduler, "_try_schedule_context", skip_candidate)
+        requests = [make_ctx_request(i, context_remaining_length=20000) for i in range(3)]
+        out = scheduler.schedule_request(requests, set())
+        assert ids(out.context_requests) == [1, 2]
+        assert requests[1].context_chunk_size == 6144
+        assert requests[2].context_chunk_size == 2048
+
+    def test_last_chunk_drafts_do_not_spend_append_reserve(self) -> None:
+        head = make_ctx_request(0, context_remaining_length=6144, num_draft_tokens=31)
+        next_request = make_ctx_request(1, context_remaining_length=2048)
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, next_request])
+        assert ids(out.context_requests) == [0, 1]
+        assert head.context_chunk_size == 6080
+        assert next_request.context_chunk_size == 2048
+        head.discard_draft_tokens.assert_not_called()
 
     def test_kill_switch_keeps_arrival_order(self, monkeypatch):
         monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF", "0")

@@ -14,7 +14,6 @@ l0_gr100:
       backend: pytorch
   tests:
   # MiniMax-M3 context kernels and router validation; all run on one Rubin GPU.
-  - unittest/_torch/attention/sparse/msa/test_fmha_sm107_gates.py::test_deferred_plan_retries_after_resolution_failure
   - unittest/_torch/attention/sparse/msa/test_msa_backend.py::test_segmented_proxy_reads_current_page_table_before_pack_flush
   - unittest/_torch/kernels/serial/test_m3_ctx_clc_gemm.py
   - unittest/_torch/kernels/serial/test_m3_ctx_fused_quant.py

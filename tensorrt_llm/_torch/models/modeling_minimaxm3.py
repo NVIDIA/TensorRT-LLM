@@ -592,6 +592,7 @@ class _SwigluOaiMLP(GatedMLP):
             and x.dtype == torch.bfloat16
             and x.shape[-1] % 256 == 0
             and ctx_eager_only()
+            and not linear_module._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
             and isinstance(method, MXFP8LinearMethod)
             and getattr(method, "use_cutlass", False)
         )

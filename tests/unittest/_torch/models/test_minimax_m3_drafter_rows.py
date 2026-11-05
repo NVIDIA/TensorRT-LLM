@@ -2,13 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU coverage of the drafter's live-row selection and unused-row output contract."""
 
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.models.modeling_minimaxm3 import _drafter_live_rows, _rows_only
+from tensorrt_llm._torch.models.modeling_minimaxm3 import (
+    Eagle3DecoderLayer,
+    _drafter_live_rows,
+    _rows_only,
+    mark_drafter_dead_rows,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -61,3 +66,59 @@ def test_rows_only_computes_live_rows_and_restores_output_positions(monkeypatch)
     live[0] = torch.empty(0, dtype=torch.long)
     assert torch.count_nonzero(module(x)) == 0
     assert call.call_args.args[0].shape == (0, 4)
+
+
+@pytest.mark.parametrize("layers", [0, 1, 2])
+def test_mark_drafter_dead_rows_restores_full_rows_after_exception(layers: int) -> None:
+    draft = torch.nn.Module()
+    decoders = torch.nn.ModuleList()
+    for _ in range(layers):
+        layer = Eagle3DecoderLayer.__new__(Eagle3DecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.o_proj = torch.nn.Identity()
+        layer.mlp = torch.nn.Identity()
+        decoders.append(layer)
+    draft.layers = decoders
+    hidden = torch.arange(20, dtype=torch.float32).view(5, 4)
+    metadata = AttentionMetadata(
+        max_num_requests=2, max_num_tokens=5, seq_lens=None, num_contexts=0
+    )
+    metadata._num_contexts = 1
+    metadata._num_ctx_tokens = 4
+    metadata._seq_lens_cuda = torch.tensor([4, 1], dtype=torch.int32)
+    if layers != 1:
+        originals = [layer.forward for layer in decoders]
+        assert mark_drafter_dead_rows(draft) == 0
+        assert [layer.forward for layer in decoders] == originals
+        return
+    layer = decoders[0]
+
+    def run(
+        position_ids: None,
+        embeds: None,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return layer.mlp(layer.self_attn.o_proj(hidden_states)), hidden_states
+
+    call = create_autospec(layer.forward, side_effect=run, spec_set=True)
+    layer.forward = call
+    assert mark_drafter_dead_rows(draft) == 1
+    result, residual = layer(None, None, hidden, metadata, None)
+    assert residual is hidden
+    torch.testing.assert_close(result[3:], hidden[3:], rtol=0, atol=0)
+    assert torch.count_nonzero(result[:3]) == 0
+    call.side_effect = RuntimeError("controlled drafter failure")
+    with pytest.raises(RuntimeError, match="controlled drafter failure"):
+        layer(None, None, hidden, metadata, None)
+    # The wrapper must clear shared row state even when the layer raises.
+    torch.testing.assert_close(layer.mlp(hidden), hidden, rtol=0, atol=0)
+    torch.testing.assert_close(layer.self_attn.o_proj(hidden), hidden, rtol=0, atol=0)
+    call.side_effect = run
+    metadata._num_contexts = 0
+    metadata._num_ctx_tokens = 0
+    result, residual = layer(None, None, hidden, metadata, None)
+    assert residual is hidden
+    torch.testing.assert_close(result, hidden, rtol=0, atol=0)

@@ -1,8 +1,7 @@
 diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
-index b02f747..47dea78 100644
 --- a/python/fmha_sm100/api.py
 +++ b/python/fmha_sm100/api.py
-@@ -17,6 +17,8 @@ __all__ = [
+@@ -17,6 +17,8 @@
  ]
  
  import numpy as np
@@ -11,7 +10,7 @@ index b02f747..47dea78 100644
  import torch
  
  from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module
-@@ -91,6 +93,8 @@ def _get_workspace_buf(tag, device):
+@@ -91,6 +93,8 @@
      return _workspace_cache[device_id][tag]
  
  def _alloc_perplan_buf(tag, size, device, dtype):
@@ -20,7 +19,7 @@ index b02f747..47dea78 100644
      # global _workspace_cache
      # device_id = torch.device(device).index
      # buf = _workspace_cache[-1][device_id][tag]
-@@ -482,6 +486,73 @@ def _make_plan_info(
+@@ -482,6 +486,73 @@
      })
  
  
@@ -94,7 +93,7 @@ index b02f747..47dea78 100644
  def _call_plan(qo_segment_offsets, qo_segment_lens, kv_segment_lens,
                 packed_work_range, packed_work_info,
                 qo_tile_size, kv_tile_size, num_qo_heads, num_ctas, causal,
-@@ -507,7 +578,7 @@ def _call_plan(qo_segment_offsets, qo_segment_lens, kv_segment_lens,
+@@ -507,7 +578,7 @@
          pack_factor,
      )
  
@@ -103,7 +102,7 @@ index b02f747..47dea78 100644
      qo_segment_lens: torch.Tensor,
      kv_segment_lens: torch.Tensor,
      num_qo_heads: int,
-@@ -532,9 +603,8 @@ def _fmha_sm100_plan(
+@@ -532,9 +603,8 @@
  
      if kv_block_num > 0 and (sparse_kernel_mode == 'prefill' or (sparse_kernel_mode == 'auto' and max_qo_len_orig > _prefill_qlen_threshold(True))):
          # print("Nv-Prefill")
@@ -115,7 +114,7 @@ index b02f747..47dea78 100644
          return sparse_fmha_plan(qo_segment_lens=qo_segment_lens, kv_segment_lens=kv_segment_lens,
                  num_qo_heads=num_qo_heads, causal=causal, qo_offset=qo_offset,
                  num_kv_splits=num_kv_splits, page_size=page_size, output_maxscore=output_maxscore,
-@@ -652,7 +722,10 @@ def _fmha_sm100_plan(
+@@ -652,7 +722,10 @@
              kv_tile_end_indices = _alloc_perplan_buf(_BuffTag.kv_tile_end_indices, max_work_items, device, torch.int32)
              kv_split_indices = _alloc_perplan_buf(_BuffTag.kv_split_indices, max_work_items, device, torch.int32)
              num_kv_splits_per_row = _alloc_perplan_buf(_BuffTag.num_kv_splits_per_row, total_qo_len, device, torch.int32)
@@ -127,7 +126,7 @@ index b02f747..47dea78 100644
  
              lse_total_size = max_kv_splits * total_qo_len * num_qo_heads
              workspace_lse = _alloc_perplan_buf(_BuffTag.workspace_lse, lse_total_size, device, torch.float32)
-@@ -669,7 +742,32 @@ def _fmha_sm100_plan(
+@@ -669,7 +742,32 @@
                  chunk_size, plan_cost, num_kv_splits_per_row, workspace_lse, lse_total_size,
                  pack_factor, cuda_stream)
  
@@ -160,10 +159,11 @@ index b02f747..47dea78 100644
              do_split = _cost[0] > 0
              predicted_speedup = _cost[1]
  
-@@ -747,6 +845,164 @@ def _fmha_sm100_plan(
+@@ -746,6 +844,164 @@
+         qo_len_uniform=qo_len_uniform, cute_workspace_buffer=cute_workspace_buffer)
  
  
- 
++
 +
 +# ---- TTFT/CTX: side-stream plan (exact). The adaptive plan reads plan_cost back to the host (.tolist()); on the current
 +# stream that read waits for every kernel queued before it (the previous prefill chunk), so the host can no longer run
@@ -293,7 +293,7 @@ index b02f747..47dea78 100644
 +        return _fmha_sm100_plan_impl(*args, **kwargs)
 +    dev = b.arguments.get("device")
 +    caller = b.arguments.get("stream")
-+    consumer = torch.cuda.ExternalStream(caller) if isinstance(caller, int) and caller else torch.cuda.current_stream()
++    consumer = torch.cuda.ExternalStream(caller, device=dev) if isinstance(caller, int) and caller else torch.cuda.current_stream(dev)
 +    side = _ss_stream(dev)
 +    b.arguments["stream"] = side.cuda_stream
 +    t0 = _ss_time.perf_counter()
@@ -321,11 +321,10 @@ index b02f747..47dea78 100644
 +        _ss_sys.stderr.write(f"[fmha_sm100] side-stream plan: last {len(w)} calls, plan wall ms (upper bound of the plan_cost read wait) p50 {w[len(w)//2]:.3f} "
 +                             f"p99 {w[min(len(w)-1, int(0.99*len(w)))]:.3f} max {w[-1]:.3f}\n")
 +    return out
-+
+ 
  def _fmha_sm100(
      q: torch.Tensor,
-     k: torch.Tensor,
-@@ -941,6 +1197,62 @@ def _fmha_sm100(
+@@ -941,6 +1197,62 @@
      return out, max_score
  
  
@@ -379,16 +378,16 @@ index b02f747..47dea78 100644
 +    offsets = sub_lo.get("qo_segment_offsets")
 +    if offsets is not None:
 +        sub_lo["_split_nnz"] = int(offsets[-1].item()) // sub_lo.get("pack_factor", 1)
-+    if "kv_page_indptr" in sub_lo:
++    if sub_lo.get("kv_page_indptr") is not None:
 +        sub_lo["_split_kv_pages"] = int(sub_lo["kv_page_indptr"][-1].item())
-+    elif "total_rows" in sub_lo:
++    elif "kv_page_indptr" not in sub_lo and "total_rows" in sub_lo:
 +        sub_lo["_split_kv_pages"] = int(sub_lo["total_rows"])
 +
 +
  def fmha_sm100_plan(
      qo_segment_lens: torch.Tensor,
      kv_segment_lens: torch.Tensor,
-@@ -973,9 +1285,11 @@ def fmha_sm100_plan(
+@@ -973,9 +1285,11 @@
          ``kv_segment_lens - qo_segment_lens`` for bottom-right causal masking.
          A tensor must have shape ``[batch_size]``.
      split_prefill_decode : bool, optional
@@ -403,7 +402,7 @@ index b02f747..47dea78 100644
      **kwargs
          Planner options forwarded to ``_fmha_sm100_plan``.  Common options are
          ``num_kv_heads``, ``num_kv_splits``, ``page_size``,
-@@ -985,8 +1299,13 @@ def fmha_sm100_plan(
+@@ -985,8 +1299,13 @@
      Returns
      -------
      tuple
@@ -419,7 +418,7 @@ index b02f747..47dea78 100644
      """
  
      # assert qo_segment_lens.device.type == 'cpu' \
-@@ -997,31 +1316,23 @@ def fmha_sm100_plan(
+@@ -997,31 +1316,23 @@
          qo_offset = kv_segment_lens - qo_segment_lens
      elif isinstance(qo_offset, int):
          qo_offset = torch.full_like(qo_segment_lens, qo_offset)
@@ -464,7 +463,7 @@ index b02f747..47dea78 100644
                                      qo_offset=qo_offset, **kwargs)
          return (False, 0, batch_size, plan, None)
  
-@@ -1081,16 +1392,23 @@ def fmha_sm100(
+@@ -1081,16 +1392,23 @@
      -------
      tuple[torch.Tensor | None, torch.Tensor | None]
          ``(out, max_score)``.  Either item may be ``None`` if the corresponding
@@ -493,7 +492,7 @@ index b02f747..47dea78 100644
          is_paged = kv_indices is not None
          nnz_qo = q.shape[0]
          num_qo_heads = q.shape[1]
-@@ -1101,10 +1419,12 @@ def fmha_sm100(
+@@ -1101,10 +1419,12 @@
          if is_paged:
              k_decode, v_decode = k, v
              k_prefill, v_prefill = k, v
@@ -510,7 +509,7 @@ index b02f747..47dea78 100644
              decode_kv_indices = kv_indices[:kv_page_split]
              prefill_kv_indices = kv_indices[kv_page_split:]
          else:
-@@ -1129,27 +1449,35 @@ def fmha_sm100(
+@@ -1129,27 +1449,38 @@
              decode_qo_offset = None
              prefill_qo_offset = None
  
@@ -518,7 +517,10 @@ index b02f747..47dea78 100644
 +        # Row views of a contiguous [nnz, H, D] output are themselves
 +        # contiguous, which is what the kernels require, so this removes a
 +        # full-size concatenate plus copy from every call.
-+        write_in_place = out is not None and out.is_contiguous()
++        write_in_place = (
++            out is not None and out.is_contiguous()
++            and out.dtype == torch.bfloat16 and out.device == q.device
++        )
 +
          # ---- Run kernels ----
          decode_out, decode_ms = _fmha_sm100(

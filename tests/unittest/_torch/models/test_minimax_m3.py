@@ -59,6 +59,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -3188,6 +3189,33 @@ def test_swiglu_mxfp8_engages_on_sm107_only(monkeypatch, sm: int, expected: bool
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("tuning", [False, True])
+@pytest.mark.parametrize("rows", [8191, 8192, 16384])
+def test_swiglu_mxfp8_avoids_non_consuming_decode_graph(
+    monkeypatch: pytest.MonkeyPatch, capturing: bool, tuning: bool, rows: int
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    method.tune_decode_graph_backends = tuning
+    mlp = Mock(spec_set=["activation", "down_proj"])
+    mlp.activation = torch.nn.functional.silu
+    mlp.down_proj = Mock(spec_set=["quant_method"])
+    mlp.down_proj.quant_method = method
+    x = torch.empty((rows, 3072), dtype=torch.bfloat16, device="meta")
+    active = linear_module._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE
+    token = active.set(capturing)
+    try:
+        expected = rows >= modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS and not capturing
+        assert modeling_minimaxm3._SwigluOaiMLP._swiglu_mxfp8_eligible(mlp, x, False) is expected
+    finally:
+        active.reset(token)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm, expected", [(107, True), (100, False), (103, False), (90, False)])
 def test_shared_fold_into_trtllm_gen_finalize_is_sm107_only(
     monkeypatch, sm: int, expected: bool
@@ -3278,14 +3306,13 @@ def test_cutedsl_shared_fold_only_without_token_dispatch(monkeypatch, use_dp, co
 def test_ctx_qkv_fused_skips_autotune_pass(monkeypatch, tuning: bool) -> None:
     # The fused QKV producer stays out of the AutoTuner warmup pass, so the stock MXFP8 QKV GEMM profiles its shape
     # for the steps the producer does not take.
-    from tensorrt_llm._torch.autotuner import AutoTuner
-    from tensorrt_llm._torch.models import modeling_minimaxm3 as m3
-
-    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", tuning)
-    monkeypatch.setattr(m3, "_CTX_QKV_FUSED_YIELD_LOGGED", False)
-    assert m3._autotuner_tuning() is tuning
+    tuner = Mock(spec_set=["is_tuning_mode"])
+    tuner.is_tuning_mode = tuning
+    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_YIELD_LOGGED", False)
+    assert modeling_minimaxm3._autotuner_tuning() is tuning
     # The yield is logged once per process, and only when it happens.
-    assert m3._CTX_QKV_FUSED_YIELD_LOGGED is tuning
+    assert modeling_minimaxm3._CTX_QKV_FUSED_YIELD_LOGGED is tuning
 
 
 @pytest.mark.cpu_only

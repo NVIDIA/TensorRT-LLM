@@ -23,6 +23,7 @@ stand-in torch, and the k2q cell reads the installed source, so they run without
 """
 
 import ast
+import contextlib
 import importlib.util
 import inspect
 import os
@@ -275,3 +276,92 @@ def test_deferred_plan_retries_after_resolution_failure(monkeypatch, failure: st
     calls = event.synchronize.call_count
     assert plan.get("num_kv_splits") == 3
     assert event.synchronize.call_count == calls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("caller", [None, 0, 123])
+def test_plan_consumer_uses_requested_device(
+    api: types.ModuleType, monkeypatch: pytest.MonkeyPatch, caller: int | None
+) -> None:
+    side = Mock(spec_set=["cuda_stream"])
+    side.cuda_stream = 456
+    consumer = Mock(spec_set=["wait_stream"])
+    result = object()
+
+    def plan_impl(device: int, stream: int | None = None) -> object:
+        assert device == 1 and stream == side.cuda_stream
+        return result
+
+    external = Mock(return_value=consumer)
+    current = Mock(return_value=consumer)
+    side_for_device = Mock(return_value=side)
+    monkeypatch.setattr(api, "_SS_ON", True)
+    monkeypatch.setattr(api, "_SS_VERIFY", False)
+    monkeypatch.setattr(api, "_SS_SIG", inspect.signature(plan_impl))
+    monkeypatch.setattr(api, "_SS_STATS", {"n": 0, "waits": [], "logged": True})
+    monkeypatch.setattr(api, "_ss_eligible", lambda bound: True)
+    monkeypatch.setattr(api, "_ss_stream", side_for_device)
+    monkeypatch.setattr(api, "_ss_tensors", lambda output: ())
+    monkeypatch.setattr(api, "_fmha_sm100_plan_impl", plan_impl)
+    monkeypatch.setattr(torch.cuda, "ExternalStream", external)
+    monkeypatch.setattr(torch.cuda, "current_stream", current)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    assert api._fmha_sm100_plan(device=1, stream=caller) is result
+    side_for_device.assert_called_once_with(1)
+    consumer.wait_stream.assert_called_once_with(side)
+    if caller:
+        external.assert_called_once_with(caller, device=1)
+        current.assert_not_called()
+    else:
+        current.assert_called_once_with(1)
+        external.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("kind", ["paged", "nonpaged", "legacy"])
+def test_split_boundaries_handle_nonpaged_metadata(api: types.ModuleType, kind: str) -> None:
+    plan = {"qo_segment_offsets": torch.tensor([0, 12]), "pack_factor": 2, "total_rows": 9}
+    if kind != "legacy":
+        plan["kv_page_indptr"] = torch.tensor([0, 9]) if kind == "paged" else None
+    api._cache_split_boundaries(plan)
+    assert plan["_split_nnz"] == 6
+    if kind == "nonpaged":
+        assert "_split_kv_pages" not in plan
+    else:
+        assert plan["_split_kv_pages"] == 9
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_mixed_split_output_preserves_copy_conversion(
+    api: types.ModuleType, monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, contiguous: bool
+) -> None:
+    q = torch.arange(24, dtype=torch.bfloat16).view(4, 1, 6)
+    destination = torch.empty((4, 1, 6 if contiguous else 12), dtype=dtype)
+    out = destination if contiguous else destination[..., ::2]
+    calls = []
+
+    def run(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        plan: dict,
+        *,
+        out: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, None]:
+        calls.append(out)
+        expected = q + 1
+        if out is not None:
+            assert out.dtype == torch.bfloat16 and out.device == q.device
+            out.copy_(expected)
+            return out, None
+        return expected, None
+
+    monkeypatch.setattr(api, "_fmha_sm100", run)
+    decode = {"_split_nnz": 2, "kv_segment_offsets": torch.tensor([0, 2])}
+    result, scores = api.fmha_sm100(q, q, q, (True, 1, 2, decode, {}), out=out)
+    assert result is out and scores is None
+    torch.testing.assert_close(out, (q + 1).to(dtype), rtol=0, atol=0)
+    assert all(value is not None for value in calls) is (dtype == torch.bfloat16 and contiguous)

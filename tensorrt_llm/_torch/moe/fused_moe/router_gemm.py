@@ -3,6 +3,8 @@
 """Fixed-tile context router over the loaded stock gate's three BF16 weight terms.
 
 The BF16 activation is read once per K tile and multiplied by every weight term with FP32 accumulation.
+BF16 operands are promoted exactly to FP32 for TF32 MMA; their seven mantissa bits fit within TF32,
+so this does not round a full FP32 checkpoint weight or discard any of its three BF16 terms.
 No term is discarded and no repeated activation tensor is materialized. Each row has the same tile and
 K/term order for every M within a split-K regime. Up to SPLITK_MAX_M rows, eight fixed K slices produce
 FP32 partials, reduced in slice order; larger calls use the single-pass kernel. Reduction order can differ
@@ -50,7 +52,13 @@ def _router_gemm_kernel(
         )
         for term in tl.static_range(TERMS):
             b = tl.load(w_ptr + rn[None, :] * (TERMS * K) + term * K + (k0 + rk)[:, None])
-            acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+            acc = tl.dot(
+                a.to(tl.float32),
+                b.to(tl.float32),
+                acc,
+                input_precision="tf32",
+                out_dtype=tl.float32,
+            )
     tl.store(out_ptr + rm[:, None].to(tl.int64) * N + rn[None, :], acc, mask=mask[:, None])
 
 
@@ -81,7 +89,13 @@ def _router_gemm_partial_kernel(
         )
         for term in tl.static_range(TERMS):
             b = tl.load(w_ptr + rn[None, :] * (TERMS * K) + term * K + (k0 + rk)[:, None])
-            acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+            acc = tl.dot(
+                a.to(tl.float32),
+                b.to(tl.float32),
+                acc,
+                input_precision="tf32",
+                out_dtype=tl.float32,
+            )
     tl.store(p_ptr + (s * M + rm[:, None]).to(tl.int64) * N + rn[None, :], acc, mask=mask[:, None])
 
 
