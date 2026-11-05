@@ -5,8 +5,8 @@
 Chunked prefill changes the token count and the sequence count on nearly every step. A CuTe
 compilation that depends on either costs about a second on every rank of a lock-stepped
 deployment, so after the first call of each path nothing in the chain may compile again:
-the fused convolution, the BT16 chunk kernel (engine and decomposition routes) and the
-Small-BH kernels.
+the fused convolution and the BT16 chunk kernel (engine and decomposition routes). The
+``auto`` mode never selects the Small-BH kernels, so this chain does not reach them.
 """
 
 import random
@@ -90,9 +90,9 @@ class _Pools:
 def test_prefill_chain_does_not_compile_after_warmup(heads: int, cute_compiles) -> None:
     pools = _Pools(heads)
     rng = random.Random(20261020 + heads)
-    # One launch per kernel family: the conv and Small-BH (one sequence of several tokens), BT16
-    # (a single token cannot use Small-BH) and, whichever route the architecture picks for them,
-    # a few and many sequences. BT16's one compilation serves its engine and decomposition routes.
+    # One launch per batch kind: one sequence of several tokens, a single token, and a few and
+    # many sequences, whichever BT16 route the architecture picks for them. BT16's one
+    # compilation serves its engine and decomposition routes.
     for warm_up in ([64], [1], [40, 24], [3] * 9, [1] * MAX_SEQS):
         pools.run(warm_up)
     warmed = len(cute_compiles)
