@@ -54,6 +54,7 @@
 # with "bwrap: " in them, i.e. commands Codex's sandbox could not start). A session that exited 101
 # or has sandbox failures ran none of its commands: the runner then warns and exits 3.
 # Judge the run from the trace of the recorder BASE_URL points at (references/smoke.md section 1).
+# <out_dir> must be new or empty, or the runner exits 2 before it starts a session.
 set -u
 TASKS=${1:?tasks.tsv}
 OUT=${2:?out_dir}
@@ -74,6 +75,12 @@ PASS_ENV=()
 for name in TERM HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
   [ -n "${!name+set}" ] && PASS_ENV+=("$name=${!name}")
 done
+# A run starts from nothing: an earlier run's session directories would carry their workspaces
+# and homes into this one.
+if [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+  echo "$OUT is not empty: give each run a new output directory" >&2
+  exit 2
+fi
 mkdir -p "$OUT"
 : > "$OUT/sessions.tsv"
 

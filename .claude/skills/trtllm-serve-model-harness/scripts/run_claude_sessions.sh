@@ -50,6 +50,7 @@
 # Output: <out_dir>/sNNNN/{events.jsonl,stderr.log,workspace/,tmp/} and <out_dir>/sessions.tsv
 # (index, exit code, seconds). Judge the run from the trace of the recorder BASE_URL points at
 # (record_requests.py) with scripts/validate/verdict.py --population smoke.
+# <out_dir> must be new or empty, or the runner exits 2 before it starts a session.
 set -u
 TASKS=${1:?tasks.tsv}
 OUT=${2:?out_dir}
@@ -71,6 +72,12 @@ PROXY_ENV=()
 for name in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
   [ -n "${!name+set}" ] && PROXY_ENV+=("$name=${!name}")
 done
+# A run starts from nothing: an earlier run's session directories would carry their workspaces
+# and homes into this one.
+if [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+  echo "$OUT is not empty: give each run a new output directory" >&2
+  exit 2
+fi
 mkdir -p "$OUT"
 : > "$OUT/sessions.tsv"
 

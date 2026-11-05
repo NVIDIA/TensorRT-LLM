@@ -569,6 +569,20 @@ def _prompt(runner, argv):
 
 @needs_proc
 @pytest.mark.parametrize("runner", sorted(RUNNERS))
+def test_a_runner_refuses_an_output_directory_in_use(tmp_path, runner):
+    """A rerun into an earlier run's directory would carry its sessions' files over: exit 2."""
+    stale = tmp_path / "out" / "s0001" / "workspace" / "left.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("from the earlier run\n")
+    result, records = _run_sessions(tmp_path, runner)
+
+    assert result.returncode == 2 and "out is not empty" in result.stderr, result.stderr
+    assert records == [] and stale.read_text() == "from the earlier run\n"
+    assert not (tmp_path / "out" / "sessions.tsv").exists()
+
+
+@needs_proc
+@pytest.mark.parametrize("runner", sorted(RUNNERS))
 def test_a_runner_takes_relative_paths_from_where_it_started(tmp_path, runner):
     """Relative paths: the outputs land in <out_dir>, and the harness is given absolute paths."""
     result, records = _run_sessions(tmp_path, runner, relative=True)
