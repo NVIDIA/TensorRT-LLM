@@ -17,6 +17,7 @@
 import asyncio
 import io
 import os
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
@@ -702,6 +703,32 @@ class TestGenerateValidation:
         )
         details = self._assert_invalid_argument(request)
         assert "Missing tokenized input" in details
+
+    def test_omitted_max_tokens_reaches_request_manager_as_none(self) -> None:
+        """Generate hands an omitted max_tokens to the request manager as None."""
+        captured: dict = {}
+
+        class _RecordingRequestManager:
+            def get_model_config(self) -> dict:
+                return {}
+
+            async def generate(self, **kwargs) -> AsyncIterator[None]:
+                captured.update(kwargs)
+                return
+                yield  # unreachable; makes generate() an async generator
+
+        servicer = TrtllmServiceServicer(request_manager=_RecordingRequestManager())
+        request = pb2.GenerateRequest(
+            request_id="test-no-max-tokens",
+            tokenized=pb2.TokenizedInput(input_token_ids=[1, 2, 3]),
+        )
+
+        async def run() -> None:
+            async for _ in servicer.Generate(request, _MockContext()):
+                pass
+
+        _run_async(run())
+        assert captured["sampling_params"].max_tokens is None
 
 
 # ============================================================================
