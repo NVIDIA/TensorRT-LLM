@@ -49,7 +49,10 @@ text decoder differs.
 import json
 import os
 import unittest
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Tuple
 
+import pytest
 import torch
 from parameterized import parameterized
 from PIL import Image
@@ -57,6 +60,7 @@ from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 # The PerceptionEncoder head_dim is not in the FMHA cubin set, so the vision
@@ -207,6 +211,238 @@ def _init_finite_weights(module, std: float = 0.02):
     Value-comparing tests seed deterministic finite weights instead."""
     for p in module.parameters():
         p.normal_(0.0, std)
+
+
+def _step3p7_processed_params(pixel_values, patch_pixel_values=None, num_patches=None):
+    """Exercise the real producer with a deterministic processor result."""
+    from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VLInputProcessor
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    processed = {"pixel_values": pixel_values, "input_ids": torch.tensor([[1, 10, 2]])}
+    if patch_pixel_values is not None:
+        processed["patch_pixel_values"] = patch_pixel_values
+    if num_patches is not None:
+        processed["num_patches"] = num_patches
+    proc = object.__new__(Step3p7VLInputProcessor)
+    proc._processor = lambda **kwargs: processed
+    proc._dtype = pixel_values.dtype
+    proc._image_token_id = 10
+    proc._tllm_multimodal_token_id = 101
+    proc._config = SimpleNamespace(vision_config=SimpleNamespace(patch_size=8))
+    _, extra = proc.call_with_text_prompt(
+        {"prompt": "<im_patch>", "multi_modal_data": {"image": [object()]}}, SamplingParams()
+    )
+    data = extra["multimodal_data"]
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = proc.get_mm_item_metadata([], data)
+    return MultimodalParams(multimodal_data=data)
+
+
+class _Step3p7CpuTower:
+    def __init__(self):
+        from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
+
+        self.vision_model = SimpleNamespace(conv1=SimpleNamespace(weight=torch.empty(0)))
+        self.calls = []
+        self._encode_images = Step3p7VisionTower._encode_images.__get__(self)
+        self.mm_encoder_groups = Step3p7VisionTower.mm_encoder_groups.fget(self)
+        self.forward = Step3p7VisionTower.forward.__get__(self)
+
+    def _encode(self, pixels):
+        self.calls.append(pixels.clone())
+        # The real tower needs GPU attention. Keep spatially distinct tokens
+        # and the same row geometry, without floating-point reductions.
+        return pixels[:, :, ::32, ::32].flatten(2).transpose(1, 2)
+
+
+def _main_step3p7_forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+    """Encode all images (and their patches) in the batch.
+
+    For each request we mirror the HF reference's per-image layout:
+    ``[patches_for_image_i ... | full_image_i]`` flattened into a single
+    ``(num_tokens, hidden)`` tensor.  The caller (``fuse_input_embeds``)
+    concatenates per-request embeddings and writes them into the
+    positions where the placeholder token id appears in ``input_ids``.
+
+    Token ordering must therefore match the input processor's text
+    placeholder expansion, which follows HF
+    ``Step3VLProcessor._get_image_repl_features``: patch features come
+    first (``num_patches`` blocks of ``num_patch_feature_size`` tokens),
+    then the full image feature block (``num_image_feature_size`` tokens).
+
+    All images and patches across the whole batch are gathered, grouped by
+    pixel-tensor shape, and encoded in as few batched vision passes as
+    possible (one ``_encode`` per distinct shape), then scattered back and
+    reassembled per request according to ``num_patches``.
+    """
+    device = self.vision_model.conv1.weight.device
+
+    # ---- Pass 1: gather every image / patch across all requests. ----
+    # ``order`` keeps request order; per request we hold its full images,
+    # its patch images, and the per-full-image patch counts.
+    order: List[int] = []
+    full_imgs: Dict[int, List[torch.Tensor]] = {}
+    patch_imgs: Dict[int, List[torch.Tensor]] = {}
+    num_patches: Dict[int, List[int]] = {}
+
+    def _flatten_to_images(t: torch.Tensor) -> List[torch.Tensor]:
+        if t.dim() >= 5:
+            t = t.view(-1, *t.shape[-3:])
+        elif t.dim() == 3:
+            t = t.unsqueeze(0)
+        return list(t.to(device))
+
+    for req_idx, mm in enumerate(multimodal_params):
+        image_data = mm.multimodal_data.get("image") if mm.multimodal_data else None
+        if image_data is None:
+            continue
+        pixel_values = image_data.get("pixel_values")
+        if pixel_values is None:
+            continue
+        fulls = _flatten_to_images(pixel_values)
+
+        patches: List[torch.Tensor] = []
+        patch_pixel_values = image_data.get("patch_pixel_values")
+        if patch_pixel_values is not None and patch_pixel_values.numel() > 0:
+            patches = _flatten_to_images(patch_pixel_values)
+
+        npl = image_data.get("num_patches")
+        if npl is None:
+            npl = [0] * len(fulls)
+        elif isinstance(npl, torch.Tensor):
+            npl = npl.flatten().tolist()
+        else:
+            npl = list(npl)
+
+        order.append(req_idx)
+        full_imgs[req_idx] = fulls
+        patch_imgs[req_idx] = patches
+        num_patches[req_idx] = npl
+
+    if not order:
+        return []
+
+    # ---- Pass 2: group every image by pixel-tensor shape and encode each
+    # group in a single batched vision pass; scatter features back. ----
+    to_encode: List[Tuple[torch.Tensor, Tuple[int, str, int]]] = []
+    for req_idx in order:
+        for i, img in enumerate(full_imgs[req_idx]):
+            to_encode.append((img, (req_idx, "full", i)))
+        for i, img in enumerate(patch_imgs[req_idx]):
+            to_encode.append((img, (req_idx, "patch", i)))
+
+    shape_groups: Dict[Tuple[int, ...], List[int]] = {}
+    for gi, (img, _ref) in enumerate(to_encode):
+        shape_groups.setdefault(tuple(img.shape), []).append(gi)
+
+    feats: List[Optional[torch.Tensor]] = [None] * len(to_encode)
+    for idxs in shape_groups.values():
+        batch = torch.stack([to_encode[gi][0] for gi in idxs], dim=0)
+        encoded = self._encode(batch)  # (G, P, text_hidden)
+        for j, gi in enumerate(idxs):
+            feats[gi] = encoded[j]
+
+    full_feats: Dict[int, List[torch.Tensor]] = {r: [None] * len(full_imgs[r]) for r in order}
+    patch_feats: Dict[int, List[torch.Tensor]] = {r: [None] * len(patch_imgs[r]) for r in order}
+    for gi, (_img, (req_idx, role, i)) in enumerate(to_encode):
+        (full_feats if role == "full" else patch_feats)[req_idx][i] = feats[gi]
+
+    # ---- Pass 3: reassemble each request as [patches... | full image]. ----
+    per_request_embeds: List[torch.Tensor] = []
+    for req_idx in order:
+        ff = full_feats[req_idx]
+        pf = patch_feats[req_idx]
+        cur_patch_idx = 0
+        flat_blocks: List[torch.Tensor] = []
+        for img_idx, n_p in enumerate(num_patches[req_idx]):
+            for j in range(cur_patch_idx, cur_patch_idx + n_p):
+                blk = pf[j]
+                flat_blocks.append(blk.reshape(-1, blk.shape[-1]))
+            cur_patch_idx += n_p
+            full_blk = ff[img_idx]
+            flat_blocks.append(full_blk.reshape(-1, full_blk.shape[-1]))
+        if flat_blocks:
+            per_request_embeds.append(torch.cat(flat_blocks, dim=0))
+
+    if not per_request_embeds:
+        return []
+    return [torch.cat(per_request_embeds, dim=0)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("case", ["one", "several", "crops", "ragged", "mixed_dtype"])
+def test_step3p7_groups_match_main(case):
+    generator = torch.Generator().manual_seed(123)
+
+    def pixels(n, h=64, w=64, dtype=torch.float32):
+        return torch.randn(n, 3, h, w, generator=generator).to(dtype)
+
+    params = [_step3p7_processed_params(pixels(1))]
+    if case == "several":
+        params += [_step3p7_processed_params(pixels(2))]
+    elif case == "crops":
+        params = [
+            _step3p7_processed_params(pixels(2), pixels(3), [2, 1]),
+            _step3p7_processed_params(pixels(1), pixels(1), torch.tensor([1])),
+        ]
+    elif case == "ragged":
+        params = [
+            _step3p7_processed_params(pixels(2), pixels(2, 32, 64), [2, 0]),
+            _step3p7_processed_params(pixels(1, 96, 32)),
+            _step3p7_processed_params(pixels(1, 64, 96), pixels(1, 64, 32), [1]),
+        ]
+    elif case == "mixed_dtype":
+        params += [_step3p7_processed_params(pixels(1, dtype=torch.float16))]
+
+    tower = _Step3p7CpuTower()
+    actual = tower.forward(params)
+    oracle = _Step3p7CpuTower()
+    expected = torch.cat([_main_step3p7_forward(oracle, [param])[0] for param in params])
+    assert len(actual) == 1
+    assert torch.equal(actual[0], expected)
+    assert actual[0].dtype == expected.dtype
+    assert actual[0].device == expected.device
+    full_batch_oracle = _Step3p7CpuTower()
+    assert torch.equal(actual[0], _main_step3p7_forward(full_batch_oracle, params)[0])
+    expected_calls = 2 if case == "mixed_dtype" else len(full_batch_oracle.calls)
+    assert len(tower.calls) == expected_calls
+    # Shape grouping receives precisely the unpadded original pixels.
+    for batch in tower.calls:
+        reference = [
+            image
+            for original in full_batch_oracle.calls
+            for image in original
+            if original.shape[1:] == batch.shape[1:]
+        ]
+        for image in batch:
+            assert any(torch.equal(image, candidate) for candidate in reference)
+
+
+@pytest.mark.cpu_only
+def test_step3p7_producer_keeps_host_geometry_and_empty_crops():
+    from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VLInputProcessor
+
+    params = _step3p7_processed_params(torch.zeros(1, 2, 3, 64, 64))
+    image = params.multimodal_data["image"]
+    assert image["pixel_values"].shape == (2, 3, 64, 64)
+    assert image["patch_pixel_values"].shape == (0, 3, 64, 64)
+    assert image["num_patches"].dtype == torch.int64
+    assert image["num_patches"].device.type == "cpu"
+    assert image["image_sizes"].tolist() == [[64, 64], [64, 64]]
+    assert image["patch_sizes"].shape == (0, 2)
+    assert params.item_metadata.output_embedding_lengths == (4, 4)
+
+    proc = object.__new__(Step3p7VLInputProcessor)
+    proc._config = SimpleNamespace(vision_config=SimpleNamespace(patch_size=8))
+    assert proc.get_mm_item_metadata([], params.multimodal_data) is params.item_metadata
+    data = {"image": image}
+    metadata = proc.get_mm_item_metadata(
+        [], data, [{"modality": "image", "index": 1}, {"modality": "image", "index": 0}]
+    )
+    assert metadata.item_refs == (("image", 1), ("image", 0))
+    assert metadata.output_embedding_lengths == (4, 4)
+    proc._config.vision_config = {"patch_size": 8}
+    assert proc.get_mm_item_metadata([], data).output_embedding_lengths == (4, 4)
+    assert _Step3p7CpuTower().forward([MultimodalParams(multimodal_data={})]) == []
 
 
 class TestStep3p7VisionTower(unittest.TestCase):
@@ -538,23 +774,13 @@ class TestStep3p7VisionTower(unittest.TestCase):
             return torch.randn(*shape, device="cuda", dtype=_GPU_DTYPE)
 
         # One full image, no patches → just the full-image block.
-        mm_image_only = MultimodalParams(
-            multimodal_data={"image": {"pixel_values": _img(1, 3, 64, 64)}}
-        )
+        mm_image_only = _step3p7_processed_params(_img(1, 3, 64, 64))
         out = tower.forward([mm_image_only])
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].shape, (tokens_per_tile, 32))
 
         # One image with 2 patches → 2 patch blocks then the full-image block.
-        mm_with_patches = MultimodalParams(
-            multimodal_data={
-                "image": {
-                    "pixel_values": _img(1, 3, 64, 64),
-                    "patch_pixel_values": _img(2, 3, 64, 64),
-                    "num_patches": [2],
-                }
-            }
-        )
+        mm_with_patches = _step3p7_processed_params(_img(1, 3, 64, 64), _img(2, 3, 64, 64), [2])
         out = tower.forward([mm_with_patches])
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].shape, (3 * tokens_per_tile, 32))
@@ -567,7 +793,6 @@ class TestStep3p7VisionTower(unittest.TestCase):
         """Batching images across requests yields the same per-request features
         as encoding each request alone (TODO #2 correctness)."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
-        from tensorrt_llm.inputs.multimodal import MultimodalParams
 
         tower = _setup_encoder_attn_metadata(
             Step3p7VisionTower(
@@ -581,8 +806,8 @@ class TestStep3p7VisionTower(unittest.TestCase):
         _init_finite_weights(tower)
         img_a = torch.randn(1, 3, 64, 64, device="cuda", dtype=_GPU_DTYPE)
         img_b = torch.randn(1, 3, 64, 64, device="cuda", dtype=_GPU_DTYPE)
-        mm_a = MultimodalParams(multimodal_data={"image": {"pixel_values": img_a}})
-        mm_b = MultimodalParams(multimodal_data={"image": {"pixel_values": img_b}})
+        mm_a = _step3p7_processed_params(img_a)
+        mm_b = _step3p7_processed_params(img_b)
 
         with torch.inference_mode():
             batched = tower.forward([mm_a, mm_b])[0]

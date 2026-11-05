@@ -33,7 +33,7 @@ from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range, prefer_pinned
@@ -58,6 +58,7 @@ from ..modules.mlp import MLP
 from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
     find_input_mm_embeds,
@@ -866,120 +867,69 @@ class Step3p7VisionTower(nn.Module):
         feats = self.vision_model(pixel_values)
         return self._process_image_features(feats)
 
-    @nvtx_range("Step3p7VisionTower forward()")
-    @torch.inference_mode()
-    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        """Encode all images (and their patches) in the batch.
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (
+            EncoderGroup(
+                modalities=("image",),
+                encoder_fn=self._encode_images,
+                input_fields={
+                    "pixel_values": {"image": "pixel_values"},
+                    "patch_pixel_values": {"image": "patch_pixel_values"},
+                    "num_patches": {"image": "num_patches"},
+                    "image_sizes": {"image": "image_sizes"},
+                    "patch_sizes": {"image": "patch_sizes"},
+                },
+            ),
+        )
 
-        For each request we mirror the HF reference's per-image layout:
-        ``[patches_for_image_i ... | full_image_i]`` flattened into a single
-        ``(num_tokens, hidden)`` tensor.  The caller (``fuse_input_embeds``)
-        concatenates per-request embeddings and writes them into the
-        positions where the placeholder token id appears in ``input_ids``.
+    def _encode_images(
+        self,
+        pixel_values: torch.Tensor,
+        patch_pixel_values: torch.Tensor,
+        num_patches: torch.Tensor,
+        image_sizes: torch.Tensor,
+        patch_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode each pixel shape, then emit crops before their full image.
 
-        Token ordering must therefore match the input processor's text
-        placeholder expansion, which follows HF
-        ``Step3VLProcessor._get_image_repl_features``: patch features come
-        first (``num_patches`` blocks of ``num_patch_feature_size`` tokens),
-        then the full image feature block (``num_image_feature_size`` tokens).
-
-        All images and patches across the whole batch are gathered, grouped by
-        pixel-tensor shape, and encoded in as few batched vision passes as
-        possible (one ``_encode`` per distinct shape), then scattered back and
-        reassembled per request according to ``num_patches``.
+        Spatial sizes stay on the host and trim the common batcher's padding
+        before images enter the vision tower.
         """
         device = self.vision_model.conv1.weight.device
-
-        # ---- Pass 1: gather every image / patch across all requests. ----
-        # ``order`` keeps request order; per request we hold its full images,
-        # its patch images, and the per-full-image patch counts.
-        order: List[int] = []
-        full_imgs: Dict[int, List[torch.Tensor]] = {}
-        patch_imgs: Dict[int, List[torch.Tensor]] = {}
-        num_patches: Dict[int, List[int]] = {}
-
-        def _flatten_to_images(t: torch.Tensor) -> List[torch.Tensor]:
-            if t.dim() >= 5:
-                t = t.view(-1, *t.shape[-3:])
-            elif t.dim() == 3:
-                t = t.unsqueeze(0)
-            return list(t.to(device))
-
-        for req_idx, mm in enumerate(multimodal_params):
-            image_data = mm.multimodal_data.get("image") if mm.multimodal_data else None
-            if image_data is None:
-                continue
-            pixel_values = image_data.get("pixel_values")
-            if pixel_values is None:
-                continue
-            fulls = _flatten_to_images(pixel_values)
-
-            patches: List[torch.Tensor] = []
-            patch_pixel_values = image_data.get("patch_pixel_values")
-            if patch_pixel_values is not None and patch_pixel_values.numel() > 0:
-                patches = _flatten_to_images(patch_pixel_values)
-
-            npl = image_data.get("num_patches")
-            if npl is None:
-                npl = [0] * len(fulls)
-            elif isinstance(npl, torch.Tensor):
-                npl = npl.flatten().tolist()
-            else:
-                npl = list(npl)
-
-            order.append(req_idx)
-            full_imgs[req_idx] = fulls
-            patch_imgs[req_idx] = patches
-            num_patches[req_idx] = npl
-
-        if not order:
-            return []
-
-        # ---- Pass 2: group every image by pixel-tensor shape and encode each
-        # group in a single batched vision pass; scatter features back. ----
-        to_encode: List[Tuple[torch.Tensor, Tuple[int, str, int]]] = []
-        for req_idx in order:
-            for i, img in enumerate(full_imgs[req_idx]):
-                to_encode.append((img, (req_idx, "full", i)))
-            for i, img in enumerate(patch_imgs[req_idx]):
-                to_encode.append((img, (req_idx, "patch", i)))
-
+        fulls = [
+            img[:, :h, :w] for img, (h, w) in zip(pixel_values.to(device), image_sizes.tolist())
+        ]
+        patches = [
+            img[:, :h, :w]
+            for img, (h, w) in zip(patch_pixel_values.to(device), patch_sizes.tolist())
+        ]
+        to_encode = fulls + patches
         shape_groups: Dict[Tuple[int, ...], List[int]] = {}
-        for gi, (img, _ref) in enumerate(to_encode):
-            shape_groups.setdefault(tuple(img.shape), []).append(gi)
+        for i, img in enumerate(to_encode):
+            shape_groups.setdefault(tuple(img.shape), []).append(i)
 
         feats: List[Optional[torch.Tensor]] = [None] * len(to_encode)
         for idxs in shape_groups.values():
-            batch = torch.stack([to_encode[gi][0] for gi in idxs], dim=0)
-            encoded = self._encode(batch)  # (G, P, text_hidden)
-            for j, gi in enumerate(idxs):
-                feats[gi] = encoded[j]
+            batch = torch.stack([to_encode[i] for i in idxs], dim=0)
+            encoded = self._encode(batch)
+            for j, i in enumerate(idxs):
+                feats[i] = encoded[j]
 
-        full_feats: Dict[int, List[torch.Tensor]] = {r: [None] * len(full_imgs[r]) for r in order}
-        patch_feats: Dict[int, List[torch.Tensor]] = {r: [None] * len(patch_imgs[r]) for r in order}
-        for gi, (_img, (req_idx, role, i)) in enumerate(to_encode):
-            (full_feats if role == "full" else patch_feats)[req_idx][i] = feats[gi]
+        blocks: List[torch.Tensor] = []
+        patch_index = len(fulls)
+        for image_index, count in enumerate(num_patches.tolist()):
+            blocks.extend(feats[patch_index : patch_index + count])
+            patch_index += count
+            blocks.append(feats[image_index])
+        return torch.cat([block.reshape(-1, block.shape[-1]) for block in blocks], dim=0)
 
-        # ---- Pass 3: reassemble each request as [patches... | full image]. ----
-        per_request_embeds: List[torch.Tensor] = []
-        for req_idx in order:
-            ff = full_feats[req_idx]
-            pf = patch_feats[req_idx]
-            cur_patch_idx = 0
-            flat_blocks: List[torch.Tensor] = []
-            for img_idx, n_p in enumerate(num_patches[req_idx]):
-                for j in range(cur_patch_idx, cur_patch_idx + n_p):
-                    blk = pf[j]
-                    flat_blocks.append(blk.reshape(-1, blk.shape[-1]))
-                cur_patch_idx += n_p
-                full_blk = ff[img_idx]
-                flat_blocks.append(full_blk.reshape(-1, full_blk.shape[-1]))
-            if flat_blocks:
-                per_request_embeds.append(torch.cat(flat_blocks, dim=0))
-
-        if not per_request_embeds:
+    @nvtx_range("Step3p7VisionTower forward()")
+    @torch.inference_mode()
+    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        if not any(mm.multimodal_data.get("image") is not None for mm in multimodal_params):
             return []
-        return [torch.cat(per_request_embeds, dim=0)]
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1103,44 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
             return None
         return torch.tensor(self._mm_special_token_ids)
 
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        image_data = multimodal_data.get("image")
+        if metadata is not None or image_data is None:
+            return metadata
+        vision_config = self.config.vision_config
+        patch_size = int(
+            vision_config["patch_size"]
+            if isinstance(vision_config, dict)
+            else vision_config.patch_size
+        )
+
+        def output_rows(sizes: torch.Tensor) -> List[int]:
+            return [
+                ((h // patch_size + 3) // 4) * ((w // patch_size + 3) // 4)
+                for h, w in sizes.tolist()
+            ]
+
+        rows = output_rows(image_data["image_sizes"])
+        patch_rows = output_rows(image_data["patch_sizes"])
+        patch_index = 0
+        for i, count in enumerate(image_data["num_patches"].tolist()):
+            rows[i] += sum(patch_rows[patch_index : patch_index + count])
+            patch_index += count
+        item_refs = (
+            [(entry["modality"], entry["index"]) for entry in mm_item_order]
+            if mm_item_order
+            else [("image", i) for i in range(len(rows))]
+        )
+        return MultimodalItemMetadata(
+            item_refs, output_embedding_lengths=[rows[i] for _, i in item_refs]
+        )
+
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -1180,14 +1168,29 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
 
         multimodal_data: Dict[str, Any] = {"image": {}}
         image_dict = multimodal_data["image"]
-        image_dict["pixel_values"] = processed["pixel_values"].to(self._dtype)
-        if "patch_pixel_values" in processed:
-            image_dict["patch_pixel_values"] = processed["patch_pixel_values"].to(self._dtype)
-        if "num_patches" in processed:
-            np_val = processed["num_patches"]
-            image_dict["num_patches"] = (
-                np_val.tolist() if isinstance(np_val, torch.Tensor) else list(np_val)
-            )
+        pixel_values = processed["pixel_values"].to(self._dtype)
+        if pixel_values.dim() >= 5:
+            pixel_values = pixel_values.view(-1, *pixel_values.shape[-3:])
+        elif pixel_values.dim() == 3:
+            pixel_values = pixel_values.unsqueeze(0)
+        image_dict["pixel_values"] = pixel_values
+        patches = processed.get("patch_pixel_values")
+        if patches is None or patches.numel() == 0:
+            patches = pixel_values.new_empty((0, *pixel_values.shape[-3:]))
+        else:
+            patches = patches.to(self._dtype).view(-1, *patches.shape[-3:])
+        image_dict["patch_pixel_values"] = patches
+        image_dict["num_patches"] = torch.as_tensor(
+            processed.get("num_patches", [0] * pixel_values.shape[0]),
+            dtype=torch.int64,
+            device="cpu",
+        ).flatten()
+        image_dict["image_sizes"] = torch.tensor(
+            [pixel_values.shape[-2:]] * pixel_values.shape[0], dtype=torch.int64, device="cpu"
+        )
+        image_dict["patch_sizes"] = torch.tensor(
+            [patches.shape[-2:]] * patches.shape[0], dtype=torch.int64, device="cpu"
+        ).reshape(-1, 2)
         if "patch_newline_mask" in processed:
             image_dict["patch_newline_mask"] = processed["patch_newline_mask"]
 
