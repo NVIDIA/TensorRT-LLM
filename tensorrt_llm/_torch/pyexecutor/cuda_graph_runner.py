@@ -18,7 +18,6 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention.backends.fp4_mla import fp4_mla_dispatch
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
@@ -733,6 +732,8 @@ class CUDAGraphRunner:
         ceilings = resolver(batch.batch_size, draft_len)
         # One-engine speculation reads max_draft_len - 1 KV tokens beyond the
         # row's sequence length (the sparse short/long split counts them too).
+        # Imported here: only an FP4 MLA decode registers a resolver.
+        from ..attention.backends.fp4_mla import fp4_mla_dispatch
         from ..speculative import get_num_extra_kv_tokens
         max_kv_len = self._max_total_seq_len(
             batch, new_tensors_device,
