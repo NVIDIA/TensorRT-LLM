@@ -8,6 +8,7 @@ cpu_only; the model-level tests require a GPU.
 
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import torch
@@ -149,7 +150,7 @@ class TestSparkOutputGate:
         with pytest.raises(ValueError, match="gate_attn_act_mode"):
             _apply_output_gate(torch.ones(1, 8), torch.ones(1, 2), 2, 4, act_mode="softplus")
 
-    def test_gate_zero_weights_zero_output(self):
+    def test_gate_zero_logits_half_scale(self):
         # A zero g_proj produces sigmoid(0)=0.5 scaling, not a zero output;
         # pin the exact semantics so the model-level test can rely on it.
         num_tokens, num_heads, head_dim = 2, 2, 4
@@ -453,8 +454,8 @@ class TestSparkModel(unittest.TestCase):
         torch.manual_seed(42)
         hidden = torch.randn(seq_len, config.hidden_size, dtype=dtype, device=device)
         hidden_perturbed = hidden.clone()
-        hidden_perturbed[0] += 1.0  # position 0 is outside the window for the
-        # last query position (16 - 1 - 8 = 7 tokens away)
+        hidden_perturbed[0] += 1.0  # position 0 sits 15 tokens behind the last
+        # query (position 15), far outside the 8-token window
 
         kv_cache_manager = _get_kv_cache_manager(dtype, config, 64, 1024, 1, 16)
         self.addCleanup(kv_cache_manager.shutdown)
@@ -559,6 +560,24 @@ class TestSparkModel(unittest.TestCase):
         # sigmoid(-60) ~ 0 -> attention output suppressed -> different logits.
         self.assertFalse(torch.allclose(logits_gate_closed, logits_bypass, atol=1e-3, rtol=1e-3))
         self.assertTrue(torch.isfinite(logits_gate_closed.float()).all())
+
+    def test_gate_disables_quantized_attention_output(self):
+        """The headwise gate needs a plain tensor: _use_quantize_output must
+        opt out the same way the base class does for attn_output_gate, or an
+        FP8/NVFP4 o_proj would make the kernel emit a pre-quantized output
+        (fp8 dtype or Fp4QuantizedTensor) that the gate math cannot consume."""
+        device = torch.device("cuda")
+        model, _, _ = _build_tiny_model("TRTLLM", device)
+        attn = model.model.layers[0].self_attn
+        self.assertTrue(attn.use_headwise_gate)
+
+        # Simulate a quantized checkpoint: the base opt-in condition becomes true.
+        attn.has_quant_scale = True
+        self.assertFalse(attn._use_quantize_output())
+
+        # Without the headwise gate the same setup keeps the base behavior.
+        attn.use_headwise_gate = False
+        self.assertTrue(attn._use_quantize_output())
 
     @torch.no_grad()
     def test_spark_partial_rope_numerics(self):
@@ -917,4 +936,132 @@ class TestSparkHfAlignment(unittest.TestCase):
             atol=scenario.atol,
             rtol=scenario.rtol,
             max_failed_fraction=scenario.max_failed_fraction,
+        )
+
+
+GOLDEN_PATH = Path(__file__).parent / "spark_golden" / "spark2_5_golden.pt"
+
+
+@dataclass(repr=False)
+class GoldenScenario:
+    backend: str
+    dtype: torch.dtype
+    kv_dtype: "tensorrt_llm.bindings.DataType"
+    atol: float
+    rtol: float
+    max_failed_fraction: float
+
+    def __repr__(self) -> str:
+        return f"backend:{self.backend.lower()}_dtype:{str(self.dtype).split('.')[-1]}"
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "TestSparkGoldenParity requires CUDA")
+class TestSparkGoldenParity(unittest.TestCase):
+    """CI-enforced parity against the HF reference implementation via a
+    committed golden artifact (spark_golden/generate_spark2_5_golden.py).
+
+    The golden weights use HF checkpoint naming (fused q_k_v_proj, model.embedding,
+    out_proj), so loading them also validates SparkHfWeightMapper's renames and
+    the q|k|v split order: a wrong split order cannot reproduce the reference
+    logits. VANILLA runs fp32 against the fp32 golden with a tight tolerance;
+    TRTLLM runs bf16 (its fused RoPE path included) with a loose tolerance.
+    """
+
+    @parameterized.expand(
+        [
+            GoldenScenario(
+                backend="VANILLA",
+                dtype=torch.float32,
+                kv_dtype=tensorrt_llm.bindings.DataType.FLOAT,
+                atol=1e-3,
+                rtol=1e-3,
+                max_failed_fraction=0.01,
+            ),
+            GoldenScenario(
+                backend="TRTLLM",
+                dtype=torch.bfloat16,
+                kv_dtype=tensorrt_llm.bindings.DataType.BF16,
+                atol=0.2,
+                rtol=0.2,
+                max_failed_fraction=0.01,
+            ),
+        ],
+        lambda func, num, param: f"{func.__name__}[{param.args[0]}]",
+    )
+    @torch.no_grad()
+    def test_spark_golden_parity(self, scenario: GoldenScenario):
+        golden = torch.load(GOLDEN_PATH, map_location="cpu", weights_only=True)
+        device = torch.device("cuda")
+        dtype_str = "float32" if scenario.dtype == torch.float32 else "bfloat16"
+
+        config_dict = dict(golden["config"])
+        config_dict["dtype"] = dtype_str
+        config_dict["torch_dtype"] = dtype_str
+        config = Spark2_5Config(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend=scenario.backend)
+        model = Spark2_5ForCausalLM(model_config).to(scenario.dtype).to(device)
+        model.load_weights(
+            {k: v.to(scenario.dtype).to(device) for k, v in golden["state_dict"].items()}
+        )
+
+        input_ids = torch.tensor(golden["input_ids"], dtype=torch.int, device=device)
+        seq_len = input_ids.numel()
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfig(
+                enable_block_reuse=False,
+                enable_partial_reuse=False,
+                copy_on_partial_reuse=False,
+                max_tokens=64,
+            ),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            tokens_per_block=16,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=mapping,
+            dtype=scenario.kv_dtype,
+        )
+        self.addCleanup(kv_cache_manager.shutdown)
+        kv_cache_manager.add_dummy_requests([0], [seq_len])
+
+        metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[0],
+            prompt_lens=[seq_len],
+            max_num_requests=1,
+            max_num_tokens=8192,
+        )
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = model.forward(
+                input_ids=input_ids,
+                position_ids=torch.arange(seq_len, device=device).unsqueeze(0),
+                attn_metadata=attn_metadata,
+                return_context_logits=True,
+            )
+
+        ref_logits = golden["logits"]
+        matches = torch.isclose(
+            logits.float().cpu(),
+            ref_logits.float(),
+            atol=scenario.atol,
+            rtol=scenario.rtol,
+        )
+        failed_fraction = (~matches).float().mean().item()
+        assert failed_fraction <= scenario.max_failed_fraction, (
+            f"Exceeded tolerance vs HF-reference golden: "
+            f"{failed_fraction * 100:.2f}% of logits differ more than allowed "
+            f"(max {scenario.max_failed_fraction * 100:.2f}%)"
         )

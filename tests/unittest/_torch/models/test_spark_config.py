@@ -116,6 +116,32 @@ def test_spark2_5_config_rejects_bad_inputs():
         Spark2_5Config(num_hidden_layers=4, layer_types=["full_attention"] * 3)
 
 
+def test_spark2_5_config_rejects_sliding_without_window():
+    # Sliding layers with no (or a non-positive) window would silently run as
+    # full attention; the config must reject them instead.
+    with pytest.raises(ValueError, match="sliding_window"):
+        Spark2_5Config(
+            num_hidden_layers=4,
+            layer_types=["sliding_attention"] * 4,
+            sliding_window=None,
+        )
+    with pytest.raises(ValueError, match="sliding_window"):
+        Spark2_5Config(
+            num_hidden_layers=4,
+            layer_types=["sliding_attention"] * 4,
+            sliding_window=0,
+        )
+    # bool is not a valid window size either.
+    with pytest.raises(ValueError, match="sliding_window"):
+        Spark2_5Config(
+            num_hidden_layers=4,
+            layer_types=["sliding_attention"] * 4,
+            sliding_window=True,
+        )
+    # Full-attention-only configs legitimately omit sliding_window.
+    Spark2_5Config(num_hidden_layers=4, sliding_window=None)
+
+
 def test_spark2_5_layer_windows():
     config = _make_config()
     windows = [get_layer_attention_window(config, i) for i in range(config.num_hidden_layers)]
