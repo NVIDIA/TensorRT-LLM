@@ -1957,8 +1957,11 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/api/ops/",
         "tensorrt_llm/serve/cluster_storage.py",
         "tensorrt_llm/serve/disagg_auto_scaling.py",
+        // The error renderers both apps install; the disaggregated frontend runs them.
+        "tensorrt_llm/serve/exception_handling/",
         "tensorrt_llm/serve/extensions/",
         "tensorrt_llm/serve/metadata_server.py",
+        "tensorrt_llm/serve/middleware/",
         "tensorrt_llm/serve/openai_client.py",
         "tensorrt_llm/serve/openai_disagg_server.py",
         "tensorrt_llm/serve/openai_disagg_service.py",

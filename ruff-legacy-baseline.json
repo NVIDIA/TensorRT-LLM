@@ -542,6 +542,9 @@
     "D212": 19,
     "D415": 1
   },
+  "tensorrt_llm/serve/middleware/arrival_time.py": {
+    "D212": 1
+  },
   "tensorrt_llm/serve/openai_disagg_server.py": {
     "D210": 1,
     "F811": 1

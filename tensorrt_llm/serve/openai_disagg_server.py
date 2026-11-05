@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import functools
 import json
 import os
 import signal
@@ -25,7 +26,6 @@ from contextlib import asynccontextmanager
 from typing import Callable, Optional, Union
 
 import aiohttp
-import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -40,9 +40,9 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
 from tensorrt_llm.serve._base.errors import EngineFatalError, ServingError
 from tensorrt_llm.serve._base.request_context import RequestContext
-from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.api.anthropic.adapter import anthropic_error_response
 from tensorrt_llm.serve.api.anthropic.protocol import (
     AnthropicCountTokensRequest, AnthropicMessagesRequest)
@@ -54,7 +54,11 @@ from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
+from tensorrt_llm.serve.exception_handling.register import (
+    ANTHROPIC, OPENAI, default_error_renderers, install_exception_handlers,
+    route_dialect)
 from tensorrt_llm.serve.kv_hints import KvHintsRoute
+from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
@@ -64,10 +68,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
-                                             PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                UCompletionResponseOrGenerator,
+from tensorrt_llm.serve.responses_utils import (UCompletionResponseOrGenerator,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
                                                 stream_error_event)
@@ -359,46 +361,63 @@ class OpenAIDisaggServer:
             await self._service.teardown()
             await self._perf_metrics_writer.close()
 
-        self.app = FastAPI(lifespan=lifespan)
+        # Validation errors are rendered per wire dialect (the marked Anthropic
+        # routes answer with the Anthropic envelope, every other route with the
+        # OpenAI shape) after _observe_validation_error has counted and logged
+        # them.
+        self._val_err_n = 0
+        self._error_renderers = default_error_renderers()
+
+        # KvHintsRoute: the frontend's public port strips kv_hints from request
+        # bodies unless this process trusts its ingress (TRTLLM_TRUST_KV_HINTS=1);
+        # it does not decode msgpack bodies. The middleware takes no clock.
+        self.app = build_http_app(
+            lifespan=lifespan,
+            route_class=KvHintsRoute,
+            dialect_error_renderers=functools.partial(
+                install_exception_handlers,
+                renderers=self._error_renderers,
+                default_dialect=OPENAI,
+                on_validation_error=self._observe_validation_error),
+            routers=(self._attach_routes,),
+            middleware=lambda app: register_middlewares(
+                app,
+                collect_perf_metrics=self._collect_perf_metrics,
+                expose_perf_metrics=self._expose_perf_metrics,
+                perf_metrics_writer=self._perf_metrics_writer),
+        )
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
-        self.app.router.route_class = KvHintsRoute
 
-        if self._collect_perf_metrics:
-            self.app.add_middleware(
-                PerfMetricsMiddleware,
-                expose_headers=self._expose_perf_metrics,
-                writer=self._perf_metrics_writer)
-        self.app.add_middleware(ServerArrivalTimeMiddleware)
+    def _attach_routes(self, app: FastAPI) -> None:
+        # register_routes adds its routes through self.app.
+        self.app = app
+        self.register_routes()
 
+    def _observe_validation_error(self, request: Request,
+                                  exc: RequestValidationError,
+                                  dialect: str) -> None:
+        self._perf_metrics_collector.validation_exceptions.inc()
+        # Anthropic clients parse the error envelope; only the OpenAI-shaped
+        # rejections are logged.
+        if dialect == ANTHROPIC:
+            return
         # Log request-body validation failures so a client/server schema mismatch
         # shows up server-side. Throttled (first, then every 1000th) to avoid
         # flooding the event loop when every request fails identically.
-        self._val_err_n = 0
-        @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(request: Request, exc):
-            self._perf_metrics_collector.validation_exceptions.inc()
-            # Anthropic clients parse the error envelope, so every /v1/messages
-            # route must fail in that shape rather than the generic one below.
-            if request.url.path.startswith("/v1/messages"):
-                return anthropic_error_response(str(exc),
-                                                "invalid_request_error", 400)
-            self._val_err_n += 1
-            if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
-                try:
-                    errs = exc.errors()
-                    # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
-                    brief = [{"loc": e.get("loc"), "type": e.get("type"),
-                              "msg": e.get("msg")} for e in errs][:8]
-                except Exception:  # noqa: BLE001
-                    brief = str(exc)[:500]
-                method = request.method.translate(_LOG_CONTROL_CHARACTERS)
-                path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
-                logger.warning(
-                    f"[validation] {method} {path} 400 "
-                    f"(n={self._val_err_n}): {brief}")
-            return JSONResponse(status_code=400, content={"error": str(exc)})
-
-        self.register_routes()
+        self._val_err_n += 1
+        if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
+            try:
+                errs = exc.errors()
+                # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
+                brief = [{"loc": e.get("loc"), "type": e.get("type"),
+                          "msg": e.get("msg")} for e in errs][:8]
+            except Exception:  # noqa: BLE001
+                brief = str(exc)[:500]
+            method = request.method.translate(_LOG_CONTROL_CHARACTERS)
+            path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
+            logger.warning(
+                f"[validation] {method} {path} 400 "
+                f"(n={self._val_err_n}): {brief}")
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():
@@ -598,6 +617,7 @@ class OpenAIDisaggServer:
         return JSONResponse(
             content=response_or_generator.model_dump(by_alias=True))
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve Anthropic Messages through the disaggregated chat pipeline."""
@@ -624,6 +644,7 @@ class OpenAIDisaggServer:
                 code=status,
             ).model_dump())
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:
         """Count Anthropic input tokens on a context worker."""
@@ -709,13 +730,12 @@ class OpenAIDisaggServer:
         return JSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
-        keep_alive_timeout = self._config.server_keep_alive_timeout
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level=logger.level,
-                                timeout_keep_alive=keep_alive_timeout)
-        await create_uvicorn_server(config).serve(sockets=sockets)
+        await serve_uvicorn(self.app,
+                            host=host,
+                            port=port,
+                            sockets=sockets,
+                            log_level=logger.level,
+                            timeout_keep_alive=self._config.server_keep_alive_timeout)
 
     async def _sync_server_clock(self, server: str):
         """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running).

@@ -19,7 +19,8 @@ from fastapi import Request
 from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
-from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._base import app_builder
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -55,12 +56,16 @@ async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
     config_factory = Mock(return_value=uvicorn_config)
     uvicorn_server = SimpleNamespace(serve=AsyncMock())
     server_factory = Mock(return_value=uvicorn_server)
-    monkeypatch.setattr(openai_disagg_server.uvicorn, "Config", config_factory)
-    monkeypatch.setattr(openai_disagg_server.uvicorn, "Server", server_factory)
+    # Both servers run uvicorn through serve_uvicorn, which looks the names up
+    # on the uvicorn module imported by app_builder.
+    monkeypatch.setattr(app_builder.uvicorn, "Config", config_factory)
+    monkeypatch.setattr(app_builder.uvicorn, "Server", server_factory)
 
     await server(host="localhost", port=8000)
 
     assert config_factory.call_args.kwargs["timeout_keep_alive"] == expected_timeout
+    # The disaggregated frontend logs at the TRT-LLM logger's level, not at "info".
+    assert config_factory.call_args.kwargs["log_level"] == logger.level
     server_factory.assert_called_once_with(uvicorn_config)
     uvicorn_server.serve.assert_awaited_once_with(sockets=None)
 

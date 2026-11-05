@@ -37,6 +37,7 @@ from tensorrt_llm.serve.api.anthropic.serving import (
     AnthropicCountTokensServing,
     AnthropicMessagesServing,
 )
+from tensorrt_llm.serve.exception_handling.register import ANTHROPIC, route_dialect
 
 # The serving objects the composition root sets on app.state before attaching.
 APP_STATE_KEYS = (
@@ -64,6 +65,7 @@ def _batches(raw_request: Request) -> AnthropicBatchesServing:
     return serving
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Request) -> Response:
     """Serve the Anthropic Messages API on top of the chat pipeline."""
     return await _messages(raw_request).create_message(
@@ -71,6 +73,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     )
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_count_tokens(
     request: AnthropicCountTokensRequest, raw_request: Request
 ) -> Response:
@@ -78,12 +81,14 @@ async def anthropic_count_tokens(
     return await _count_tokens(raw_request).anthropic_count_tokens(request)
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_create_batch(
     request: AnthropicCreateBatchRequest, raw_request: Request
 ) -> Response:
     return await _batches(raw_request).anthropic_create_batch(request)
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_list_batches(
     raw_request: Request,
     limit: int = Query(20, ge=1, le=100),
@@ -95,18 +100,22 @@ async def anthropic_list_batches(
     )
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_get_batch(batch_id: str, raw_request: Request) -> Response:
     return await _batches(raw_request).anthropic_get_batch(batch_id)
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_delete_batch(batch_id: str, raw_request: Request) -> Response:
     return await _batches(raw_request).anthropic_delete_batch(batch_id)
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_cancel_batch(batch_id: str, raw_request: Request) -> Response:
     return await _batches(raw_request).anthropic_cancel_batch(batch_id)
 
 
+@route_dialect(ANTHROPIC)
 async def anthropic_batch_results(batch_id: str, raw_request: Request) -> Response:
     return await _batches(raw_request).anthropic_batch_results(batch_id)
 

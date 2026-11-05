@@ -402,8 +402,17 @@ class TestOpenAIChatIntegration:
 
         rendered["create_chat_response"] = server._create_chat_response
 
+        from tensorrt_llm.serve.exception_handling.register import (
+            OPENAI,
+            default_error_renderers,
+            install_exception_handlers,
+        )
+
         app = FastAPI()
         app.state.server = server
+        # The handler renders its errors through the app's registry, which the
+        # servers install when they build their app; a bare app installs it here.
+        install_exception_handlers(app, renderers=default_error_renderers(), default_dialect=OPENAI)
         app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
         return TestClient(app), events, rendered
 
@@ -596,9 +605,9 @@ class TestOpenAIChatIntegration:
     def test_required_rejects_conflicting_requests(self, required_chat_client, change):
         client, server, rendered = required_chat_client
         response = client.post("/v1/chat/completions", json={**self.required_body(), **change})
-        # The bare app uses FastAPI's 422 for request-schema errors.
-        expected_status = 422 if change.get("tools") == [] else 400
-        assert response.status_code == expected_status, response.text
+        # Request-schema errors (`tools: []`) answer 400 too: the app carries the servers'
+        # validation handler, not FastAPI's default 422.
+        assert response.status_code == 400, response.text
         assert "generation" not in rendered
 
     @pytest.mark.parametrize(

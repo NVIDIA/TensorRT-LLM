@@ -65,15 +65,17 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
-from tensorrt_llm.serve._base.errors import (EngineFatalError, ServingError,
-                                             error_body, serving_error)
+from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
+from tensorrt_llm.serve._base.errors import (CHAT_LADDER, EngineFatalError,
+                                             ServingError, error_body,
+                                             serving_error,
+                                             serving_error_boundary)
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._base.request_context import RequestContext
 from tensorrt_llm.serve._base.routing import (RoleGroup, ServerCapabilities,
                                               attach_routers, role_group_of)
 from tensorrt_llm.serve._base.sse import chat_stream_generator
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
-from tensorrt_llm.serve.api.anthropic.adapter import anthropic_error_response
 from tensorrt_llm.serve.api.anthropic.serving import (
     AnthropicBatchesServing, AnthropicCountTokensServing,
     AnthropicMessagesServing)
@@ -89,7 +91,10 @@ from tensorrt_llm.serve.disagg_auth import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
+from tensorrt_llm.serve.exception_handling.register import (
+    OPENAI, VISUAL_GEN, default_error_renderers, install_exception_handlers)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
@@ -110,7 +115,6 @@ from tensorrt_llm.serve.openai_protocol import (
     to_llm_conversation_params, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
-                                             PerfMetricsMiddleware,
                                              build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -124,8 +128,7 @@ from tensorrt_llm.serve.render import (RenderResources, mount_render_endpoints,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
-                                                ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ResponsesStreamingProcessor)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
@@ -148,7 +151,6 @@ from tensorrt_llm.version import __version__ as VERSION
 from .._utils import (AdjustedSteadyClock,
                       get_global_steady_clock_now_in_seconds,
                       set_prometheus_multiproc_dir)
-from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 if TYPE_CHECKING:
@@ -560,6 +562,12 @@ class _AggregatedChatBackend:
         return error.body.message or json.dumps(error.body.model_dump())
 
 
+# Characters of a validation error's text kept in the OpenAI-shaped 400 body:
+# pydantic echoes each failing input verbatim, which can be megabytes of
+# base64; the error locations are what matters.
+_VALIDATION_ERROR_DETAIL_LIMIT = 4096
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -866,40 +874,55 @@ class OpenAIServer(_VideoRoutesMixin):
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
 
-        self.app = FastAPI(lifespan=lifespan)
+        # Validation errors are rendered per wire dialect: the dialect of the
+        # endpoint that matched, else the dialect of the server's role. The
+        # OpenAI-shaped 400 body keeps the shape integration tests (e.g.
+        # ``test_malformed_json_request``) and existing clients expect.
+        self._error_renderers = default_error_renderers(
+            openai_validation_detail_limit=_VALIDATION_ERROR_DETAIL_LIMIT)
+        default_dialect = (VISUAL_GEN if self.server_role
+                           is ServerRole.VISUAL_GEN else OPENAI)
+        self.app = build_http_app(
+            lifespan=lifespan,
+            route_class=_MsgspecRoute,
+            dialect_error_renderers=functools.partial(
+                install_exception_handlers,
+                renderers=self._error_renderers,
+                default_dialect=default_dialect,
+                on_validation_error=self._observe_validation_error),
+            routers=(self._attach_role_routes, ),
+            middleware=lambda app: register_middlewares(
+                app,
+                collect_perf_metrics=self._collect_perf_metrics,
+                expose_perf_metrics=self._expose_perf_metrics,
+                perf_metrics_writer=self._perf_metrics_writer,
+                adjusted_clock=self._adjusted_steady_clock),
+        )
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
                                                   "0") == "1"
-        self.app.router.route_class = _MsgspecRoute
+        if (self.server_role is ServerRole.VISUAL_GEN
+                and not self._error_renderers.has(VISUAL_GEN,
+                                                  RequestValidationError)):
+            raise RuntimeError(
+                "VisualGen role started without its validation-error "
+                "renderer; the VisualGen route registration must register "
+                "it for the visual_gen dialect")
 
-        @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(request, exc):
-            if request.url.path.startswith("/v1/messages"):
-                # Anthropic clients expect a 400 with the Anthropic error
-                # envelope, not FastAPI's 422 shape.
-                if self.metrics_collector:
-                    self.metrics_collector.log_request_error(http_code=400)
-                return anthropic_error_response(str(exc),
-                                                "invalid_request_error", 400)
-            if self.server_role is ServerRole.VISUAL_GEN:
-                return self._create_visual_gen_validation_error_response(exc)
-            # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
-            # response shape that integration tests (e.g.
-            # ``test_malformed_json_request``) and existing clients
-            # expect.
-            if self.metrics_collector:
-                self.metrics_collector.log_request_error(http_code=400)
-            # pydantic echoes each failing input verbatim, which can be
-            # megabytes of base64; the error locations are what matters.
-            detail = str(exc)
-            if len(detail) > 4096:
-                detail = detail[:4096] + " ... [truncated %d bytes]" % (
-                    len(detail) - 4096)
-            return JSONResponse(status_code=400, content={"error": detail})
+    def _observe_validation_error(self, request: Request,
+                                  exc: RequestValidationError,
+                                  dialect: str) -> None:
+        # A rejected request counts as a 400 whichever dialect answers it;
+        # the VisualGen role has no metrics collector and counts nothing.
+        if dialect != VISUAL_GEN and self.metrics_collector:
+            self.metrics_collector.log_request_error(http_code=400)
 
+    def _attach_role_routes(self, app: FastAPI) -> None:
+        # The register_* methods below add their routes through self.app.
+        self.app = app
         # /health, /version and /v1/models for every role. The health
         # probe stays here, with its private accesses, until the public
         # health API exists.
-        self.app.state.ops_serving_system = SystemServing(
+        app.state.ops_serving_system = SystemServing(
             model=self.model, health_probe=self._health_probe)
         if role_group_of(self.server_role) is RoleGroup.LLM:
             # An attached frontend of a multi-frontend server forwards the
@@ -928,6 +951,12 @@ class OpenAIServer(_VideoRoutesMixin):
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
+            # VisualGen answers a validation error with its own 422 envelope;
+            # the renderer is registered with the VisualGen routes, so only
+            # the VisualGen role carries it.
+            self._error_renderers.register(
+                VISUAL_GEN, RequestValidationError, lambda request, exc: self.
+                _create_visual_gen_validation_error_response(exc))
             self.register_visual_gen_routes()
         elif self.server_role is ServerRole.MM_ENCODER:
             assert isinstance(
@@ -942,14 +971,6 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_embedding_routes()
         else:
             self.register_routes()
-
-        if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer,
-                                    adjusted_clock=self._adjusted_steady_clock)
-        self.app.add_middleware(ServerArrivalTimeMiddleware,
-                                adjusted_clock=self._adjusted_steady_clock)
 
     def _init_visual_gen(self):
         self.processor = None
@@ -2006,30 +2027,23 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._iteration_stats_buffer is not None:
             self._iteration_stats_buffer.append(llm_stat)
 
+    # The boundary renders the core's ServingError with its own status, answers
+    # an EngineFatalError as HTTP 200 with body null (FastAPI's rendering of
+    # None), which the in-process callers map to their own errors, and maps the
+    # rest with CHAT_LADDER: a response that cannot be encoded (JSONResponse
+    # encodes in its constructor, allow_nan=False) raises ValueError and is
+    # answered 400 without a log; any other failure is answered 400 with its
+    # traceback logged.
+    @serving_error_boundary(OPENAI,
+                            ladder=CHAT_LADDER,
+                            on_engine_fatal=lambda: None)
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
-        try:
-            result = await self.create_chat_completion(
-                request, RequestContext.from_http(raw_request))
-            if isinstance(result, ChatCompletionResponse):
-                return JSONResponse(content=result.model_dump())
-            return StreamingResponse(content=result,
-                                     media_type="text/event-stream")
-        except ServingError as e:
-            return JSONResponse(content=e.body.model_dump(),
-                                status_code=e.status)
-        except EngineFatalError:
-            # Answered as HTTP 200 with body null (FastAPI's rendering of
-            # None); the in-process callers map that to their own errors.
-            # Answering 5xx would be a behavior change of its own.
-            return None
-        except ValueError as e:
-            # JSONResponse encodes in its constructor (allow_nan=False), so a
-            # response that cannot be encoded fails here and keeps its 400.
-            return self.create_error_response(str(e))
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+        result = await self.create_chat_completion(
+            request, RequestContext.from_http(raw_request))
+        if isinstance(result, ChatCompletionResponse):
+            return JSONResponse(content=result.model_dump())
+        return StreamingResponse(content=result, media_type="text/event-stream")
 
     async def create_chat_completion(
         self, request: ChatCompletionRequest, ctx: RequestContext
@@ -3915,26 +3929,24 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        server = create_uvicorn_server(config)
+        await serve_uvicorn(self.app,
+                            host=host,
+                            port=port,
+                            sockets=sockets,
+                            log_level="info",
+                            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                            after_start=self._register_after_serving)
 
-        async def _register_after_serving():
-            with _StartupTimer("http_server_start"):
-                while not server.started:
-                    await asyncio.sleep(0.1)
-            if self.disagg_cluster_worker:
-                try:
-                    with _StartupTimer(
-                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
-                    ):
-                        await self.disagg_cluster_worker.register_worker()
-                except Exception as e:
-                    logger.error(f"Worker registration failed: {e}")
-                    server.should_exit = True
-
-        asyncio.create_task(_register_after_serving())
-        await server.serve(sockets=sockets)
+    async def _register_after_serving(self, server: uvicorn.Server) -> None:
+        with _StartupTimer("http_server_start"):
+            while not server.started:
+                await asyncio.sleep(0.1)
+        if self.disagg_cluster_worker:
+            try:
+                with _StartupTimer(
+                        f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                ):
+                    await self.disagg_cluster_worker.register_worker()
+            except Exception as e:
+                logger.error(f"Worker registration failed: {e}")
+                server.should_exit = True

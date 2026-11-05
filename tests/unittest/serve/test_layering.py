@@ -85,6 +85,20 @@ CONTRACTS = (
         ),
     ),
     Contract(
+        name="serve/middleware/ depends on no server, endpoint or Responses module",
+        importers=("tensorrt_llm.serve.middleware",),
+        forbidden=(
+            "tensorrt_llm.serve.api",
+            "tensorrt_llm.serve.openai_server",
+            "tensorrt_llm.serve.openai_disagg_server",
+            "tensorrt_llm.serve.responses_utils",
+        ),
+        fix=(
+            "Middleware is shared by both apps: pass what it needs into register_middlewares "
+            "from the composition root instead of importing a server or an endpoint package."
+        ),
+    ),
+    Contract(
         name="serve/_base/ does not import serve/api/",
         importers=("tensorrt_llm.serve._base",),
         forbidden=("tensorrt_llm.serve.api",),
@@ -113,6 +127,40 @@ CONTRACTS = (
             "Endpoint packages and serve/_base/ must not import the composition root "
             "(serve/openai_server.py or serve/app.py); the root imports them and injects "
             "what they need. Move the shared helper to serve/_base/ instead."
+        ),
+    ),
+    Contract(
+        name="serve/exception_handling/ imports no server, VisualGen or Responses module",
+        importers=("tensorrt_llm.serve.exception_handling",),
+        forbidden=(
+            "tensorrt_llm.serve.openai_server",
+            "tensorrt_llm.serve.openai_disagg_server",
+            "tensorrt_llm.serve.app",
+            "tensorrt_llm.serve.api.visual_gen",
+            "tensorrt_llm.serve._visual_gen_errors",
+            "tensorrt_llm.serve.openai_video_routes",
+            "tensorrt_llm.serve.responses_utils",
+        ),
+        fix=(
+            "The error registry is shared by both apps and every role: the composition root "
+            "injects what it needs, and VisualGen code registers the VisualGen renderer on "
+            "app.state.error_renderers from its own route registration, which only the "
+            "VisualGen role runs."
+        ),
+    ),
+    Contract(
+        name="serve/exception_handling/ and serve/_base/errors.py import no VisualGen module",
+        importers=("tensorrt_llm.serve.exception_handling", "tensorrt_llm.serve._base.errors"),
+        forbidden=(
+            "tensorrt_llm.serve.api.visual_gen",
+            "tensorrt_llm.serve._visual_gen_errors",
+            "tensorrt_llm.serve.openai_video_routes",
+        ),
+        include_type_checking=True,
+        fix=(
+            "The error registry and serve/_base/errors.py serve every role, and only the "
+            "VisualGen role may load VisualGen code, not even for type checking: VisualGen "
+            "code registers its renderer from its own route registration."
         ),
     ),
 )

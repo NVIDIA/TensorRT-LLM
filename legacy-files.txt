@@ -417,6 +417,8 @@ tensorrt_llm/serve/cluster_storage.py
 tensorrt_llm/serve/disagg_auto_scaling.py
 tensorrt_llm/serve/harmony_adapter.py
 tensorrt_llm/serve/metadata_server.py
+tensorrt_llm/serve/middleware/arrival_time.py
+tensorrt_llm/serve/middleware/user_middleware.py
 tensorrt_llm/serve/openai_disagg_server.py
 tensorrt_llm/serve/openai_protocol.py
 tensorrt_llm/serve/openai_server.py
