@@ -318,7 +318,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
 | **FastH3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image 2.1** | No | No | No | No | No | No | No | No | No | No | No | No | No |
+| **Qwen-Image 2.1** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |

@@ -72,7 +72,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
-| **Qwen-Image 2.1** | No | No | No | No | No | No | No | No | No | No | No | No | No | No | No | No |
+| **Qwen-Image 2.1** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
@@ -232,6 +232,13 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 ```
 
 Omit `quant_config` for BF16/FP16 baseline.
+
+Qwen-Image 2.1 supports dynamic `FP8`, `FP8_BLOCK_SCALES`, and `NVFP4`
+quantization of transformer-block attention and feed-forward linear layers.
+Conditioning and input/output projections remain in BF16. Use `dynamic: true`
+with the original BF16 checkpoint; pre-quantized checkpoints are not supported.
+NVFP4 requires Blackwell or newer GPUs. Quantization is lossy; validate image
+quality for your prompts and settings.
 
 #### Wan VAE NVFP4
 

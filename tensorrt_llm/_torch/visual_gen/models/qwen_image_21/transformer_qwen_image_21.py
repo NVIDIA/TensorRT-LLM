@@ -23,7 +23,10 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import RMSNorm
 
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.quantization import QuantAlgo
 
 _IMG_TOKENS_PER_SLOT = 4
 
@@ -548,6 +551,48 @@ class QwenImage21Transformer2DModel(BaseDiffusionModel):
             self.inner_dim, self.patch_size * self.patch_size * self.out_channels, bias=False
         )
         self.gradient_checkpointing = False
+        self._configure_dynamic_quantization()
+
+    def _configure_dynamic_quantization(self) -> None:
+        quant_config = self.model_config.quant_config
+        if quant_config is None or quant_config.quant_algo is None:
+            return
+        if (
+            quant_config.quant_algo
+            not in (
+                QuantAlgo.FP8,
+                QuantAlgo.FP8_BLOCK_SCALES,
+                QuantAlgo.NVFP4,
+            )
+            or not self.model_config.dynamic_weight_quant
+        ):
+            raise ValueError(
+                "Qwen-Image 2.1 supports FP8, FP8_BLOCK_SCALES, and NVFP4 "
+                "with dynamic weight quantization; set quant_config.dynamic=true."
+            )
+
+        # Validate against the original BF16 checkpoint, not generated scale tensors.
+        self._checkpoint_shapes = {
+            name: tensor.shape for name, tensor in self.state_dict(keep_vars=True).items()
+        }
+        for name, module in list(self.named_modules()):
+            # Keep conditioning and input/output projections in high precision.
+            if not name.startswith("transformer_blocks.") or not isinstance(module, nn.Linear):
+                continue
+            if quant_config.is_module_excluded_from_quantization(name):
+                continue
+            self.set_submodule(
+                name,
+                Linear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None,
+                    dtype=self.model_config.torch_dtype,
+                    quant_config=quant_config,
+                    skip_create_weights_in_init=self.model_config.skip_create_weights_in_init,
+                    force_dynamic_quantization=True,
+                ),
+            )
 
     @property
     def device(self) -> torch.device:
@@ -595,6 +640,34 @@ class QwenImage21Transformer2DModel(BaseDiffusionModel):
             self._cache_branch = old
 
     def load_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        if hasattr(self, "_checkpoint_shapes"):
+            missing = sorted(self._checkpoint_shapes.keys() - weights.keys())
+            unexpected = sorted(weights.keys() - self._checkpoint_shapes.keys())
+            if missing or unexpected:
+                raise RuntimeError(
+                    "Qwen-Image 2.1 transformer checkpoint mismatch: "
+                    f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+                )
+            for name, shape in self._checkpoint_shapes.items():
+                if weights[name].shape != shape:
+                    raise RuntimeError(
+                        f"Qwen-Image 2.1 checkpoint shape mismatch for {name}: "
+                        f"expected {tuple(shape)}, got {tuple(weights[name].shape)}"
+                    )
+            loader = DynamicLinearWeightLoader(self.model_config)
+            device = self.device
+            for name, module in self.named_modules():
+                if isinstance(module, Linear):
+                    module.create_weights()
+                    module.to(device)
+                    loader.load_linear_weights(
+                        module, name, loader.get_linear_weights(module, name, weights)
+                    )
+                else:
+                    module_weights = loader.filter_weights(name, weights)
+                    for param_name, param in module.named_parameters(recurse=False):
+                        param.data.copy_(module_weights[param_name].to(param.dtype))
+            return
         missing, unexpected = self.load_state_dict(weights, strict=False)
         if missing or unexpected:
             raise RuntimeError(
@@ -603,10 +676,19 @@ class QwenImage21Transformer2DModel(BaseDiffusionModel):
             )
 
     def to_inference_dtype(self) -> "QwenImage21Transformer2DModel":
-        return self.to(dtype=self.model_config.torch_dtype)
+        # Do not cast packed weights or FP32 quantization scales to BF16.
+        for module in self.modules():
+            if isinstance(module, Linear):
+                continue
+            for tensor in (*module.parameters(recurse=False), *module.buffers(recurse=False)):
+                if tensor.is_floating_point():
+                    tensor.data = tensor.data.to(self.model_config.torch_dtype)
+        return self
 
     def post_load_weights(self) -> None:
-        return None
+        for module in self.modules():
+            if isinstance(module, Linear):
+                module.post_load_weights()
 
     def register_cuda_graph_extra_key_fns(self, runner: Any) -> None:
         super().register_cuda_graph_extra_key_fns(runner)

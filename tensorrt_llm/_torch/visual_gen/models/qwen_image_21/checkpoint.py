@@ -55,7 +55,9 @@ def resolve_checkpoint_source(
         return QwenImage21CheckpointSource(
             source="local_path",
             path_or_id=str(Path(local_path).expanduser()),
-            revision=manifest.get("revision") if isinstance(manifest.get("revision"), str) else None,
+            revision=manifest.get("revision")
+            if isinstance(manifest.get("revision"), str)
+            else None,
             local_files_only=True,
         )
     hf_model_id = manifest.get("hf_model_id")
