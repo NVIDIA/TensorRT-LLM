@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -18,6 +18,9 @@ from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
 from transformers import Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VisionTransformerPretrainedModel
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -774,6 +777,282 @@ def test_qwen3_vision_encoder_inputs_keep_cpu_grids_with_cuda_pixels() -> None:
         _qwen_vision_request(images=[(3, (1, 2, 4))], pixel_device="cuda"),
     ]
     _assert_qwen3_vision_inputs_match_main(params)
+
+
+def _main_qwen2vl_parse_and_batch_multimodal_data(
+    multimodal_params: List[MultimodalParams],
+) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
+    """Verbatim copy of the Qwen2-VL packer that `input_fields` replaced."""
+    pixel_values_list = []
+    pixel_values_videos_list = []
+    image_grid_thw_list = []
+    video_grid_thw_list = []
+
+    for multimodal_param in multimodal_params:
+        # Process images if present
+        if multimodal_param.multimodal_data.get("image") is not None:
+            pixel_values_list.append(multimodal_param.multimodal_data["image"]["pixel_values"])
+            image_grid_thw_list.append(multimodal_param.multimodal_data["image"]["image_grid_thw"])
+
+        # Process videos if present
+        if multimodal_param.multimodal_data.get("video") is not None:
+            pixel_values_videos_list.append(
+                multimodal_param.multimodal_data["video"]["pixel_values_videos"]
+            )
+            video_grid_thw_list.append(multimodal_param.multimodal_data["video"]["video_grid_thw"])
+
+    # Concatenate tensors
+    mm_content_dict = {}
+    if pixel_values_list:
+        mm_content_dict["pixel_values"] = (
+            torch.cat(pixel_values_list, dim=0)
+            if len(pixel_values_list) > 1
+            else pixel_values_list[0]
+        )
+    if pixel_values_videos_list:
+        mm_content_dict["pixel_values_videos"] = (
+            torch.cat(pixel_values_videos_list, dim=0)
+            if len(pixel_values_videos_list) > 1
+            else pixel_values_videos_list[0]
+        )
+
+    # Prepare extra data
+    mm_extra_data = {}
+    if image_grid_thw_list:
+        mm_extra_data["image_grid_thw"] = (
+            torch.cat(image_grid_thw_list, dim=0)
+            if len(image_grid_thw_list) > 1
+            else image_grid_thw_list[0]
+        )
+    if video_grid_thw_list:
+        mm_extra_data["video_grid_thw"] = (
+            torch.cat(video_grid_thw_list, dim=0)
+            if len(video_grid_thw_list) > 1
+            else video_grid_thw_list[0]
+        )
+
+    return mm_content_dict, mm_extra_data
+
+
+def _main_qwen2vl_vision_forward(
+    visual, multimodal_params: List[MultimodalParams]
+) -> List[torch.Tensor]:
+    """Verbatim copy of main's `Qwen2VisionModelBase.forward` body: one ViT call
+    per modality, image rows then video rows."""
+    mm_content_data, mm_extra_data = _main_qwen2vl_parse_and_batch_multimodal_data(
+        multimodal_params
+    )
+    pixel_values = mm_content_data.get("pixel_values", None)
+    pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
+
+    image_grid_thw = mm_extra_data.get("image_grid_thw", None)
+    video_grid_thw = mm_extra_data.get("video_grid_thw", None)
+
+    embeds = []
+    if pixel_values is not None:
+        embed = visual(pixel_values, grid_thw=image_grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        embeds.append(embed)
+
+    if pixel_values_videos is not None:
+        embed = visual(pixel_values_videos, grid_thw=video_grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        embeds.append(embed)
+    return embeds
+
+
+def _qwen2_vision_groups(visual) -> tuple:
+    """The real Qwen2-VL group and encoder bound to `visual` on a CPU object."""
+    vision = SimpleNamespace(visual=visual)
+    vision.encode_batched = lambda **inputs: modeling_qwen2vl.Qwen2VisionModelBase.encode_batched(
+        vision, **inputs
+    )
+    vision.mm_encoder_groups = modeling_qwen2vl.Qwen2VisionModelBase.mm_encoder_groups.fget(vision)
+    return vision
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "requests",
+    [
+        [{"images": [(1, (1, 2, 2))]}],
+        [{"videos": [(1, (2, 2, 2))]}, {"videos": [(2, (1, 2, 4))]}],
+        [
+            {"images": [(1, (1, 2, 2)), (2, (1, 2, 4))], "videos": [(3, (2, 2, 2))]},
+            {"videos": [(4, (1, 2, 2))]},
+            {"images": [(5, (1, 4, 2))]},
+        ],
+        [{"videos": [(1, (2, 2, 2))]}, {"images": [(2, (1, 2, 2))]}],
+    ],
+    ids=["image_r1", "video_only", "mixed_r3", "video_first"],
+)
+def test_qwen2_vision_encoder_inputs_match_main_packer(requests: list) -> None:
+    params = [_qwen_vision_request(**r) for r in requests]
+    (group,) = _qwen2_vision_groups(visual=None).mm_encoder_groups
+    payloads, calls = _input_field_calls(group, params)
+    ((members, actual),) = calls
+    assert members == list(range(len(payloads)))
+    content, extra = _main_qwen2vl_parse_and_batch_multimodal_data(params)
+    # Main made one ViT call for the images and one for the videos; the group
+    # joins the same tensors in that order for one call.
+    expected = {
+        "pixel_values": torch.cat(
+            [content[k] for k in ("pixel_values", "pixel_values_videos") if k in content]
+        ),
+        "grid_thw": torch.cat(
+            [extra[k] for k in ("image_grid_thw", "video_grid_thw") if k in extra]
+        ),
+    }
+    assert actual.keys() == expected.keys()
+    for name, value in expected.items():
+        assert torch.equal(actual[name], value), name
+        assert actual[name].dtype == value.dtype, name
+        assert actual[name].device == value.device, name
+
+
+def _qwen2_prompt_request(items) -> MultimodalParams:
+    """One request from `(modality, marker, (t, h, w))` items in prompt order, with the
+    item metadata the processor builds (merge size 2). Patch rows are a fixed function
+    of the item's marker, so the item gets the same rows in any request."""
+    data = {}
+    for modality, pixel_key, grid_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        mine = [(marker, grid) for m, marker, grid in items if m == modality]
+        if mine:
+            data[modality] = {
+                pixel_key: torch.cat(
+                    [
+                        torch.sin(marker + 0.1 * torch.arange(t * h * w * 3.0)).reshape(-1, 3)
+                        for marker, (t, h, w) in mine
+                    ]
+                ),
+                grid_key: torch.tensor([grid for _, grid in mine]),
+            }
+    counts = {"image": 0, "video": 0}
+    item_refs = []
+    for modality, _, _ in items:
+        item_refs.append((modality, counts[modality]))
+        counts[modality] += 1
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        item_refs, output_embedding_lengths=[t * h * w // 4 for _, _, (t, h, w) in items]
+    )
+    return MultimodalParams(multimodal_data=data)
+
+
+_QWEN2_BATCHES = {
+    "image_only": [[("image", 1, (1, 2, 2))], [("image", 2, (1, 2, 4)), ("image", 3, (1, 4, 2))]],
+    "video_only": [[("video", 1, (2, 2, 2))], [("video", 2, (1, 2, 4))]],
+    "mixed_across_requests": [[("video", 1, (2, 2, 2))], [("image", 2, (1, 2, 2))]],
+    "video_before_image": [
+        [("video", 1, (2, 2, 2)), ("image", 2, (1, 2, 4)), ("video", 3, (1, 2, 2))],
+        [("image", 4, (1, 4, 2))],
+    ],
+}
+
+
+class _Qwen2StubVisual:
+    """Stands in for the ViT: each output row is the sum of `merge**2` patch rows, so a
+    row depends only on its own item and shows which item it came from."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
+        self.calls += 1
+        assert int(grid_thw.prod(dim=-1).sum()) == pixel_values.shape[0]
+        merged = pixel_values.reshape(-1, 4, pixel_values.shape[-1]).sum(dim=1)
+        return BaseModelOutputWithPooling(last_hidden_state=pixel_values, pooler_output=merged)
+
+
+def _qwen2_tiny_hf_visual():
+    """A random-weight HF Qwen2-VL ViT, small enough for the CPU (fp32, eager attention)."""
+    config = Qwen2VLVisionConfig(
+        depth=2,
+        embed_dim=32,
+        hidden_size=16,
+        mlp_ratio=2,
+        num_heads=2,
+        in_channels=3,
+        patch_size=1,
+        spatial_merge_size=2,
+        temporal_patch_size=1,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    return Qwen2VisionTransformerPretrainedModel(config).eval()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tower", ["stub", "tiny_hf"])
+@pytest.mark.parametrize("batch", list(_QWEN2_BATCHES))
+def test_qwen2_vision_batched_matches_per_request(batch: str, tower: str) -> None:
+    requests = _QWEN2_BATCHES[batch]
+    visual = _Qwen2StubVisual() if tower == "stub" else _qwen2_tiny_hf_visual()
+    params = [_qwen2_prompt_request(items) for items in requests]
+    vision = _qwen2_vision_groups(visual)
+    calls = []
+
+    def encode_batched(**inputs):
+        calls.append(inputs)
+        return modeling_qwen2vl.Qwen2VisionModelBase.encode_batched(vision, **inputs)
+
+    vision.mm_encoder_groups = modeling_qwen2vl.Qwen2VisionModelBase.mm_encoder_groups.fget(
+        SimpleNamespace(encode_batched=encode_batched)
+    )
+    with torch.inference_mode():
+        batched = modeling_qwen2vl.Qwen2VisionModelBase.forward(vision, params)
+        # Main's encoder on one item at a time gives each item's rows; a request's
+        # rows are its items in prompt order.
+        expected = torch.cat(
+            [
+                _main_qwen2vl_vision_forward(visual, [_qwen2_prompt_request([item])])[0]
+                for items in requests
+                for item in items
+            ]
+        )
+    # One tensor in request, then prompt order, from one ViT call for the batch.
+    assert len(batched) == 1
+    assert len(calls) == 1
+    if tower == "stub":
+        assert torch.equal(batched[0], expected)
+    else:
+        # The ViT GEMMs see more rows in one call, so only the FP order differs.
+        torch.testing.assert_close(batched[0], expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.cpu_only
+def test_qwen2_vision_encoder_inputs_match_main_packer_on_selected_items() -> None:
+    # Item scheduling and partial cache hits encode residual payloads whose
+    # fields are views of the request payload.
+    request = _qwen_vision_request(
+        images=[(1, (1, 2, 2)), (2, (1, 2, 4)), (3, (1, 2, 2))], videos=[(4, (2, 2, 2))]
+    )
+    image = request.multimodal_data["image"]
+    residual = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": MultimodalItemPartition(item_lengths=(4, 8, 4)).select(
+                    image["pixel_values"], [1, 2]
+                ),
+                "image_grid_thw": MultimodalItemPartition().select(image["image_grid_thw"], [1, 2]),
+            },
+            "video": request.multimodal_data["video"],
+        }
+    )
+    params = [residual, _qwen_vision_request(images=[(5, (1, 2, 2))])]
+    (group,) = _qwen2_vision_groups(visual=None).mm_encoder_groups
+    ((_, actual),) = _input_field_calls(group, params)[1]
+    content, extra = _main_qwen2vl_parse_and_batch_multimodal_data(params)
+    assert torch.equal(
+        actual["pixel_values"], torch.cat([content["pixel_values"], content["pixel_values_videos"]])
+    )
+    assert torch.equal(
+        actual["grid_thw"], torch.cat([extra["image_grid_thw"], extra["video_grid_thw"]])
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
