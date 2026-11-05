@@ -75,7 +75,9 @@ S5) run inside the sandbox.
 
 The same four parts for every harness: a fake server of the harness's protocol, the recorder in
 forward mode in front of it, the harness's session runner, and a verdict over the recorded trace.
-Work in a run directory outside the repository and pass every path absolute. Codex over Responses:
+Work in a run directory outside the repository and pass every path absolute. Each example uses a
+fresh run directory and stops the servers it started, so the next one can take the same ports.
+Codex over Responses:
 
 ```bash
 SKILL=$PWD/.claude/skills/trtllm-serve-model-harness     # from the repository root
@@ -83,15 +85,16 @@ RUN=$(mktemp -d "$HOME/mh-wiring.XXXX")                  # outside the repositor
 PY=<the validator environment>/bin/python                # scripts/validate/requirements.txt
 mkdir -p "$RUN/task_src" && printf 'print("hello")\n' > "$RUN/task_src/hello.py"
 cp "$SKILL/templates/matrix.yaml" "$RUN/matrix.yaml"
-$PY "$SKILL/scripts/validate/fake_responses_server.py" --port 8399 --max-tool-turns 2 &
+$PY "$SKILL/scripts/validate/fake_responses_server.py" --port 8399 --max-tool-turns 2 & FAKE=$!
 $PY "$SKILL/scripts/record_requests.py" --out-dir "$RUN/trace" --port 8397 \
-    --forward http://127.0.0.1:8399 --build-id wiring &
+    --forward http://127.0.0.1:8399 --build-id wiring & REC=$!
 printf '%s\t%s\n' "$RUN/task_src" "Run hello.py and tell me what it prints." > "$RUN/tasks.tsv"
 BASE_URL=http://127.0.0.1:8397/v1 MODEL=fake "$SKILL/scripts/run_codex_sessions.sh" \
     "$RUN/tasks.tsv" "$RUN/out"
 $PY "$SKILL/scripts/validate/verdict.py" --harness "$SKILL/profiles/harness/codex-default.yaml" \
     --model "$SKILL/profiles/model/<id>.yaml" --matrix "$RUN/matrix.yaml" --population smoke \
     --build-id wiring --out-dir "$RUN/verdict" "$RUN/trace"
+kill $FAKE $REC                                          # frees ports 8399 and 8397
 ```
 
 What a wiring run must show, read from `verdict.json` (the exit code is 2 while any claim is
@@ -122,15 +125,17 @@ conformant.
 **Claude Code.** Same wiring, with `fake_agent_server.py` and `run_claude_sessions.sh`:
 
 ```bash
-$PY "$SKILL/scripts/validate/fake_agent_server.py" --port 8400 --max-tool-turns 1 &
+RUN=$(mktemp -d "$HOME/mh-wiring.XXXX") && cp "$SKILL/templates/matrix.yaml" "$RUN/matrix.yaml"
+$PY "$SKILL/scripts/validate/fake_agent_server.py" --port 8400 --max-tool-turns 1 & FAKE=$!
 $PY "$SKILL/scripts/record_requests.py" --out-dir "$RUN/trace" --port 8397 \
-    --forward http://127.0.0.1:8400 --build-id wiring &
+    --forward http://127.0.0.1:8400 --build-id wiring & REC=$!
 printf '%s\t%s\n' - "Read the file named x and summarize it." > "$RUN/tasks.tsv"
 BASE_URL=http://127.0.0.1:8397 MODEL=fake-model "$SKILL/scripts/run_claude_sessions.sh" \
     "$RUN/tasks.tsv" "$RUN/out"
 $PY "$SKILL/scripts/validate/verdict.py" --harness "$SKILL/profiles/harness/claude-code.yaml" \
     --model "$SKILL/profiles/model/<id>.yaml" --matrix "$RUN/matrix.yaml" --population smoke \
     --build-id wiring --out-dir "$RUN/verdict" "$RUN/trace"
+kill $FAKE $REC
 ```
 
 - **Run every session under `env -i`.** A parent agent session exports variables a child must
@@ -146,11 +151,15 @@ own `HOME` and `PI_CODING_AGENT_DIR` (a generated `models.json`), and startup ne
 version checks, telemetry, extensions, MCP, skills and context files off. `API` picks the wire.
 
 ```bash
+RUN=$(mktemp -d "$HOME/mh-wiring.XXXX")
+$PY "$SKILL/scripts/validate/fake_agent_server.py" --port 8400 --max-tool-turns 1 & FAKE=$!
 $PY "$SKILL/scripts/record_requests.py" --out-dir "$RUN/trace" --port 8397 \
     --forward http://127.0.0.1:8400 --build-id wiring \
-    --session pi-s1 &                    # pi sends no session identity over Chat or Messages
+    --session pi-s1 & REC=$!             # pi sends no session identity over Chat or Messages
+printf '%s\t%s\n' - "Read the file named x and summarize it." > "$RUN/tasks.tsv"
 API=openai-completions MODEL=fake-model BASE_URL=http://127.0.0.1:8397/v1 TOOLS=read \
     "$SKILL/scripts/run_pi_sessions.sh" "$RUN/tasks.tsv" "$RUN/out"
+kill $FAKE $REC
 ```
 
 - **Verified with @earendil-works/pi-coding-agent 1.4.0** over all three APIs against the fake
@@ -532,7 +541,8 @@ PASS (`SKILL.md` section 5).
 
    ```bash
    python scripts/validate/verdict.py --harness profiles/harness/claude-code.yaml \
-       --model profiles/model/<id>.yaml --population smoke --raw <snap>/raw \
+       --model profiles/model/<id>.yaml --matrix <run>/matrix.yaml \
+       --population smoke --raw <snap>/raw \
        --build-id <the recorder's --build-id> --out-dir <snap>/verdict <snap>/trace
    ```
 
