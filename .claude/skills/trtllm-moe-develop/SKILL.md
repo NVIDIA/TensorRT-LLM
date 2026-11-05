@@ -31,16 +31,21 @@ Before proposing or editing MoE code, read:
 
 1. `CODING_GUIDELINES.md`
 2. `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md`: Architecture,
-   File Map, Backend Selection, Backend Capability Matrix, Canonical Examples
-   (including its notes on inheritance, one class per identity, class names,
-   and aliases), and Anti-Patterns. Its File Map names the file that owns each
-   area.
+   File Map, Implementation Families, Backend Selection, Backend Capability
+   Matrix, Canonical Examples (including its notes on inheritance, one class
+   per identity, class names, and aliases), and Anti-Patterns. Its File Map
+   says where each kind of code lives and how a family package is laid out;
+   Implementation Families says what each family is for and how its package
+   is built. The implementations themselves, with their ids, families and
+   priorities, are the catalog generated into
+   `docs/source/developer-guide/moe-perf-guide.md`.
 3. The target files and their tests under `tests/unittest/_torch/moe/`.
 
-Two places the File Map does not point to:
+Also read:
 
-- Model-side construction: the model's `create_moe(...)` call, in particular
-  how it computes `override_quant_config`.
+- Model-side construction, which the guide does not cover: the model's
+  `create_moe(...)` call, in particular how it computes
+  `override_quant_config`.
 - Shared test helpers: `tests/unittest/_torch/moe/moe_test_utils.py` and
   `quantize_utils.py`, whenever a change adds backend, quantization, skip, or
   parameter coverage.
@@ -58,10 +63,15 @@ or report it as follow-up.
 
 Guide-update checklist:
 
-- File map changed: update `File Map`.
-- New, renamed, or re-parented implementation: update `File Map` (and the
-  family's leaf table), `Backend Capability Matrix`, and every Canonical
-  Examples note that enumerates classes.
+- A new kind of code, directory, or family package: update `File Map`. A new
+  file inside an existing kind needs no entry there.
+- New, renamed, re-parented, or removed implementation: regenerate the catalog
+  (`python3 scripts/generate_moe_impl_catalog.py`; `test_moe_impl_catalog.py`
+  fails while it is stale) and, when it brings a new segment value, the serve
+  schemas (`python3 scripts/generate_trtllm_serve_schemas.py`). Update
+  `Implementation Families` when it changes what a family is or how its
+  package is built, `Backend Capability Matrix`, and every Canonical Examples
+  note that enumerates classes.
 - Backend or quant support changed: update `Backend Capability Matrix`.
 - Selection rule changed (priority, family membership, fallback, reject reason,
   environment probe): update `Backend Selection`.

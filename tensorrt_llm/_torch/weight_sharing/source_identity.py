@@ -407,7 +407,9 @@ class SourceIdentity:
         Returns:
             A hex digest covering attention/MoE backends, allowed GEMM
             backends, fusion flags, the all-reduce strategy, and -- only when
-            one is configured -- the MoE load-balancer config.
+            one is configured -- the MoE load-balancer config and the MoE
+            tactics of the target and of its draft, which pin implementations
+            within the ``moe_backend`` family.
         """
         payload = {
             "attn_backend": getattr(model_config, "attn_backend", None),
@@ -435,6 +437,12 @@ class SourceIdentity:
         load_balancer = getattr(model_config, "moe_load_balancer", None)
         if load_balancer is not None:
             payload["moe_load_balancer"] = load_balancer.model_dump(mode="python")
+        moe_tactic = getattr(model_config, "moe_tactic", None)
+        if moe_tactic is not None:
+            payload["moe_tactic"] = moe_tactic
+        draft_moe_tactic = getattr(getattr(model_config, "spec_config", None), "moe_tactic", None)
+        if draft_moe_tactic is not None:
+            payload["draft_moe_tactic"] = draft_moe_tactic
         return _canonical_hash(payload)
 
     @staticmethod

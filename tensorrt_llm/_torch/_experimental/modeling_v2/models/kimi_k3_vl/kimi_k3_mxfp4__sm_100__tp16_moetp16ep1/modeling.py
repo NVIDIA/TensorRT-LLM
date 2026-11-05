@@ -3207,6 +3207,12 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
     keeps the built-in one's.
     """
 
+    # Decode steps run k3_moe over the routed experts' TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers
+    # (decode_moe.py). Any draft comes from the inherited one-engine construction, whose
+    # draft config the draft tactic selects; the drafter fast path has dense MLPs only.
+    moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8"})
+    draft_moe_impls_honored = frozenset({"*"})
+
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
         """The V2 hybrid manager holds the KDA states; the step contract requires it."""

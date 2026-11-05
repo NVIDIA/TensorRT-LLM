@@ -114,8 +114,9 @@ from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllRed
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
+    _draft_loader_moe_kwargs,
+    _draft_moe_selection,
     _ensure_draft_vocab_size,
-    _get_requested_draft_moe_backend,
     _set_draft_kv_cache_quant_algo,
     _slice_spec_position_ids,
 )
@@ -4120,7 +4121,7 @@ def _build_speculation(shell, model_config: ModelConfig):
         spec.speculative_model,
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=_get_requested_draft_moe_backend(model_config, spec),
+        **_draft_loader_moe_kwargs(model_config, _draft_moe_selection(model_config, spec)),
         mapping=model_config.mapping,
         spec_config=model_config.spec_config,
         max_num_tokens=model_config.max_num_tokens,
@@ -4187,6 +4188,11 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp8(
     speculation, the drafter (``M3Eagle3Draft``, its weights from the speculative checkpoint through
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
+
+    # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
+    # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
+    # moe_config.tactic names, so it declares no moe_impls_honored.
+    draft_moe_impls_honored = frozenset({"*"})
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         assert torch.cuda.get_device_capability() == _SM, (

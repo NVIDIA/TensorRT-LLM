@@ -32,7 +32,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...models.modeling_utils import QuantConfig
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, MoESelection
 from ..utils import AuxStreamType
 from .modeling_deepseekv41 import (
     DeepseekV41DecoderLayer,
@@ -316,7 +316,7 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None,
         num_stages: int | None = None,
         block_size: int | None = None,
-        draft_moe_backend: str | None = None,
+        draft_moe_selection: MoESelection | None = None,
     ) -> None:
         draft_config = copy.copy(model_config)
         config = copy.deepcopy(model_config.pretrained_config)
@@ -377,9 +377,10 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
             aux_stream_dict,
             num_stages,
             block_size,
-            draft_moe_backend=draft_moe_backend,
+            draft_moe_selection=draft_moe_selection,
         )
         self._attn_params["q_b_norm_enabled"] = False
+        draft_moe_backend = draft_moe_selection.backend if draft_moe_selection is not None else None
         self.nvfp4_experts = _draft_experts_as_nvfp4(draft_moe_backend)
 
     @staticmethod
@@ -408,7 +409,9 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
                 quant_algo = QuantAlgo.NVFP4
                 group_size = 16
             elif mxfp4:
-                quant_algo = ModelConfig.get_mxfp4_quant_algo(model_config.moe_backend)
+                quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                    model_config.moe_backend, moe_tactic=model_config.moe_tactic
+                )
                 group_size = 32
             elif dtype == "U8":
                 quant_algo = QuantAlgo.NVFP4

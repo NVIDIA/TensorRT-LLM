@@ -20,6 +20,7 @@ tests touch no real model, GPU, or weights. Used by both
 """
 
 import hashlib
+from types import SimpleNamespace
 from typing import Optional, Sequence
 
 from tensorrt_llm._torch.weight_sharing import (
@@ -152,6 +153,8 @@ class FakeModelConfig:
         attn_backend: str = "TRTLLM",
         moe_backend: str = "CUTLASS",
         moe_load_balancer=None,
+        moe_tactic: Optional[str] = None,
+        draft_moe_tactic: Optional[str] = None,
     ):
         self.mapping = mapping or FakeMapping()
         self.pretrained_config = (
@@ -163,6 +166,10 @@ class FakeModelConfig:
         self.attn_backend = attn_backend
         self.moe_backend = moe_backend
         self.moe_load_balancer = moe_load_balancer
+        self.moe_tactic = moe_tactic
+        self.spec_config = (
+            None if draft_moe_tactic is None else SimpleNamespace(moe_tactic=draft_moe_tactic)
+        )
         self.nvfp4_gemm_allowed_backends = ["cutlass", "cublaslt", "cuda_core"]
         self.moe_disable_finalize_fusion = False
         self.use_low_precision_moe_combine = False

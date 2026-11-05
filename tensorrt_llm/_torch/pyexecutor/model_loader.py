@@ -2371,6 +2371,7 @@ class ModelLoader:
                 self.llm_args.mla_skip_correction_threshold
                 if self.llm_args.enable_mla_skip_correction else 0.0),
             moe_backend=self.llm_args.moe_config.backend,
+            moe_tactic=self.llm_args.moe_config.tactic,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             megamoe_fuse_shared_expert=self._megamoe_fuse_shared_expert(

@@ -37,7 +37,6 @@ the reference composition for the inputs it does not support.
 """
 
 import contextlib
-import copy
 import os
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
@@ -716,9 +715,10 @@ class MuseSparkOpenMoE(nn.Module):
         # exclude_modules), leaving their experts BF16. Backend resolution only
         # sees the global quant config, so give it the format the layer actually
         # has; it then resolves the TRTLLM-Gen BF16 implementation, which
-        # returns the unfinalized output the per-expert norm needs. The MegaMoE
-        # families have no BF16 implementation, so such a layer falls back to
-        # the TRTLLM backend.
+        # returns the unfinalized output the per-expert norm needs. A tactic
+        # pins implementations of the checkpoint's format, so it does not apply
+        # to such a layer. The MegaMoE families have no BF16 implementation, so
+        # under them the layer falls back to the TRTLLM backend.
         layer_model_config = model_config
         layer_quant_config = None
         global_quant_config = model_config.quant_config
@@ -732,14 +732,20 @@ class MuseSparkOpenMoE(nn.Module):
             layer_quant_config = QuantConfig(
                 kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo
             )
-            if str(getattr(model_config, "moe_backend", "")).upper() in (
-                "MEGAMOE_CUTEDSL",
-                "MEGAMOE_DEEPGEMM",
-            ):
-                layer_model_config = copy.copy(model_config)
-                layer_model_config._frozen = False
-                layer_model_config.moe_backend = "TRTLLM"
-                layer_model_config._frozen = True
+            moe_backend = str(getattr(model_config, "moe_backend", "")).upper()
+            moe_tactic = getattr(model_config, "moe_tactic", None)
+            under_mega_moe = moe_backend in ("MEGAMOE_CUTEDSL", "MEGAMOE_DEEPGEMM")
+            if moe_tactic is not None or under_mega_moe:
+                layer_model_config = model_config.copy_with(
+                    moe_backend="TRTLLM" if under_mega_moe else model_config.moe_backend,
+                    moe_tactic=None,
+                )
+            if moe_tactic is not None:
+                logger.warning(
+                    f"Layer {layer_idx} MoE experts are excluded from quantization; "
+                    f"the MoE tactic {moe_tactic!r} does not apply to them, and this "
+                    f"layer uses moe_backend={layer_model_config.moe_backend}."
+                )
         self.experts = create_moe(
             routing_method=MuseSparkOpenRoutingMethod(
                 top_k=self.top_k,

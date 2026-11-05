@@ -1749,6 +1749,12 @@ class ModelingV2Glm52Nvfp4Sm107LowLatency(
 ):
     """GLM-5.2-NVFP4 on Rubin, with tensor-parallel attention and experts."""
 
+    # Decode steps run this target's fused kernels over the routed experts' TRTLLM-Gen NVFP4
+    # buffers (DecodeTarget), and the MTP draft's MoE over a BF16 copy of its checkpoint
+    # weights (weights.py), not the draft module a draft tactic selects.
+    moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.nvfp4"})
+    draft_moe_impls_honored = frozenset()
+
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
         """The KV cache manager the context server's built-in implementation prefers."""
