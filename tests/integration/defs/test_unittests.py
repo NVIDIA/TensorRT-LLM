@@ -262,7 +262,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     # for MoE by prefixing with "moe-" (CI only collects files starting
     # with "results" for JUnit reporting). Their unfinished tests go to a
     # separate file too, so the stage does not report them as terminated
-    # unexpectedly from the shared unfinished_test.txt.
+    # unexpectedly from the shared unfinished_test.txt. Otherwise, MoE sub-test
+    # history can contain only terminated unexpectedly errors without corresponding
+    # passing results, skewing the test quality metrics.
     case_path = case.rstrip("/")
     unfinished_test_path = None
     if case_path == "unittest/_torch/moe" or case_path.startswith(
