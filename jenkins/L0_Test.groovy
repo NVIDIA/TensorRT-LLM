@@ -50,6 +50,32 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
 
+// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
+// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
+LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
+
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent.
+def llmArtifactsPrimary()
+{
+    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+// "Setup Environment" stashes jenkins/scripts/fetch_build_artifact.sh from the run's commit under
+// this name, because test stages read build artifacts before they have a source tree.
+FETCH_BUILD_ARTIFACT_STASH = "fetch-build-artifact"
+
+// Exit codes of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the
+// names the helper gives them. tests/unittest/scripts/test_fetch_build_artifact.py checks
+// that they match.
+FETCH_ABSENT = 2
+FETCH_TRANSFER_FAILED = 4
+
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
 
@@ -70,6 +96,9 @@ ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 // Read-only artifactory pull credentials
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
+// Credential with which the read helper reads build artifacts on artifactory.nvidia.com: the
+// publishing credential, the one the pipelines publish build artifacts with.
+LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.09-py3"
@@ -138,8 +167,6 @@ MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 KITMAKER_CREDENTIALS_ID = env.kitmakerCredentialsId ? env.kitmakerCredentialsId : "svc_tensorrt_kitmaker_api_token"
 KITMAKER_DRY_RUN_PIC_EMAIL = env.kitmakerDryRunPicEmail ? env.kitmakerDryRunPicEmail : "kefu@nvidia.com"
 KITMAKER_PUBLISH_TO = env.kitmakerPublishTo ? env.kitmakerPublishTo : "both_devzone_pypi"
-RELEASE_SCRIPT_REPO = env.releaseScriptRepo ? env.releaseScriptRepo.trim() : ""
-RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim() : ""
 
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
@@ -798,11 +825,71 @@ def isValidSlurmJobId(def slurmJobID) {
     return slurmJobID && slurmJobID.toString() ==~ /\d+/
 }
 
+// Cache key formula is mirrored in fat_build_sbatch_body.sh (the only writer) and
+// prepare_container.sh; a divergent key misses the cache silently forever.
+// Hashed on the Jenkins controller so no $()/\${} has to survive SSH quoting.
+def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatBuildScriptLocalPath) {
+    def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -d' ' -f1 | head -c 8").trim()
+    def hash = sh(returnStdout: true, script: "printf '%s' '${llmTarArtifactPath}|${LLM_DOCKER_IMAGE}|${scriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
+    return [scriptHash: scriptHash, hash: hash, path: "${fatSqshDir}/fat-${hash}.sqsh"]
+}
+
+// Shared by the SLURM agent and sbatch flows.
+def generateFatBuildSbatchScript(Map args) {
+    return """\
+#!/bin/bash
+#SBATCH --output=${args.fatBuildLogPath}
+#SBATCH ${args.fatBuilderArgs}
+export FAT_CONTAINER_DIR="${args.containerDir}"
+export FAT_CONTAINER="${args.container}"
+export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
+export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
+export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_TAR_NAME="${args.tarName}"
+export FAT_FETCH_HELPER_PATH="${args.fetchHelperPathNode}"
+export LLM_ARTIFACTS_PRIMARY="${llmArtifactsPrimary()}"
+export ARTIFACTORY_NETRC="${args.artifactoryNetrcPathNode}"
+export ARTIFACTORY_CREDENTIAL_ID="${LLM_ARTIFACTS_CREDENTIALS_ID}"
+bash "${args.fatBuildBodyPathNode}"
+""".stripIndent()
+}
+
+def generateFatPrepareScript(Map args) {
+    return """\
+#!/bin/bash
+export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
+export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
+export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_BUILD_SBATCH_PATH="${args.fatBuildSbatchPathNode}"
+export FAT_BUILD_LOG_TEMPLATE="${args.fatBuildLogPath}"
+export FAT_ARTIFACTORY_NETRC="${args.artifactoryNetrcPathNode}"
+bash "${args.prepareBodyPathNode}"
+""".stripIndent()
+}
+
+// Delivers the netrc with which the fat sqsh builder reads the packaged build. It is separate from
+// the GPU job's netrc, which slurm_install.sh deletes after its own download while a builder that
+// is still queued has yet to read the package. The builder deletes it once its download is done,
+// and prepare_container.sh deletes it when this stage submits no builder.
+def deliverFatBuilderNetrc(pipeline, def remote, String netrcPathNode) {
+    def netrcPathLocal = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+    try {
+        writeArtifactoryNetrc(pipeline, netrcPathLocal)
+        // scp -p keeps the netrc's 600 mode on the node.
+        Utils.copyFileToRemoteHost(pipeline, remote, netrcPathLocal, netrcPathNode)
+    } finally {
+        sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPathLocal}'")
+    }
+}
+
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
         def s3SpoolRoot = "/home/svc_tensorrt/bloom/scripts/.s3-spool-${jobUID}"
 
+        Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] START: \$(date '+%Y-%m-%d %H:%M:%S') jobUID=${jobUID} ===\"")
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
         def slurmJobID = Utils.exec(
@@ -819,7 +906,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
         if (!isValidSlurmJobId(slurmJobID)) {
             echo "Slurm job may not submit successfully. No job ID found."
         } else {
-            Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+            Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] gpu_job_id=${slurmJobID} ===\"")
 
             Utils.exec(
                 pipeline,
@@ -835,9 +922,18 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
         def cleanupCommands = [
             // .sqsh is shared across jobs (named by image digest), so age-prune
             // instead of deleting per job; reused images keep a refreshed mtime.
-            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
+            // Fat sqsh files are shared across jobs (keyed by package, image and builder script),
+            // so age-prune rather than delete per job; reused ones keep a refreshed mtime.
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
+            // Keep the job workspace (job-output.log etc.) for debugging; the
+            // PruneSlurmOutputs job removes it after the retention period. Drop the
+            // S3 spool and anything holding credentials right away: the launch
+            // script embeds HF/GitHub tokens and OpenSearch credentials, and the
+            // netrc files hold the Artifactory credentials.
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -847,7 +943,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             )
         )
 
-        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
+        Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] END: \$(date '+%Y-%m-%d %H:%M:%S') gpu_job_id=${slurmJobID} jobUID=${jobUID} cleaned up ===\"")
     }
 }
 
@@ -884,10 +980,15 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName} || true",
+            // The fat sqsh builder's netrc, in case neither the builder nor Prepare Container
+            // removed it.
+            "rm -f /home/svc_tensorrt/bloom/scripts/${nodeName}/fat-artifactory-netrc || true",
             // .sqsh is shared across jobs (named by image digest), so age-prune
             // instead of deleting per job; reused images keep a refreshed mtime.
-            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -906,15 +1007,17 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 // login node. If that pod dies mid-run (eviction, container error, agent
 // offline), the in-pod cleanup can no longer reach the controller, so the SLURM
 // job and any Jenkins agent node leak. State + reconciliation live in the shared
-// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers two
+// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers
 // sibling entries -- "<stage>/dispatcher-pod" (the pod spec, from the pod
-// wrapper) and "<stage>/slurm" (the per-attempt SLURM job / Jenkins node, from
-// the stage body) -- so freeing the job/node after a successful in-pod cleanup
-// (markReclaimed) never disturbs the pod spec a *later* attempt's off-pod
-// reconciliation needs. The ledger stores only serializable primitives (it
-// rejects anything else) so pipeline persistence is unaffected; the SlurmCluster
-// is rebuilt from clusterName at reconcile time. The functions below are thin
-// SLURM-specific adapters over that generic ledger.
+// wrapper) and one "<stage>/slurm/<job UID or node name>" per attempt (that
+// attempt's SLURM job / Jenkins node, from the stage body) -- so freeing the
+// job/node after a successful in-pod cleanup (markReclaimed) never disturbs the
+// pod spec a *later* attempt's off-pod reconciliation needs, and an attempt
+// whose cleanup failed stays registered beside the next one. The ledger stores
+// only serializable primitives (it rejects anything else) so pipeline
+// persistence is unaffected; the SlurmCluster is rebuilt from clusterName at
+// reconcile time. The functions below are thin SLURM-specific adapters over
+// that generic ledger.
 //
 // Shared-library contract used below (trtllm-jenkins-shared-lib), documented here
 // for equivalence with the pre-shared inlined finalizer this replaced:
@@ -936,8 +1039,9 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 
 // Register a live SLURM resource. The pod wrapper passes a podSpec (recorded
 // under "<stage>/dispatcher-pod"); the stage body passes the SLURM job / Jenkins
-// node identity (recorded under "<stage>/slurm"). Keyed separately so they are
-// reclaimed independently. Absent fields are skipped by the ledger.
+// node identity (recorded under "<stage>/slurm/<jobUID or nodeName>", one entry
+// per attempt). Keyed separately so they are reclaimed independently. Absent
+// fields are skipped by the ledger.
 void registerSlurmResource(String stageName, Map fields) {
     if (!stageName) {
         return
@@ -947,7 +1051,7 @@ void registerSlurmResource(String stageName, Map fields) {
             fields: [podSpec: fields.podSpec, containerName: fields.containerName],
             ownerBuildTag: env.BUILD_TAG)
     } else {
-        resourceLedger.register(id: "${stageName}/slurm",
+        resourceLedger.register(id: "${stageName}/slurm/${fields.jobUID ?: fields.nodeName}",
             type: fields.usedSbatch ? 'slurmJob' : 'slurmNode',
             fields: [clusterName: fields.clusterName, nodeName: fields.nodeName,
                      jobUID: fields.jobUID, slurmJobId: fields.slurmJobId, usedSbatch: fields.usedSbatch],
@@ -955,14 +1059,15 @@ void registerSlurmResource(String stageName, Map fields) {
     }
 }
 
-// Called once an attempt's resources are actually torn down: drop the per-attempt
-// SLURM job/node entry. The stage's dispatcher-pod entry is a separate id and is
-// left intact (a later attempt's off-pod reconciliation still needs its pod spec).
-void deregisterSlurmResource(String stageName) {
+// Called once an attempt's resources are actually torn down: drop that attempt's
+// SLURM job/node entry (`attempt` is its jobUID or nodeName). The stage's
+// dispatcher-pod entry is a separate id and is left intact (a later attempt's
+// off-pod reconciliation still needs its pod spec).
+void deregisterSlurmResource(String stageName, String attempt) {
     if (!stageName) {
         return
     }
-    resourceLedger.markReclaimed("${stageName}/slurm")
+    resourceLedger.markReclaimed("${stageName}/slurm/${attempt}")
 }
 
 // Reclaim one orphaned SLURM entry off the (dead) dispatcher pod: launch a fresh
@@ -986,7 +1091,7 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     if (!entry.jobUID && !entry.nodeName) {
         return true
     }
-    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm$/, "/dispatcher-pod"))
+    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm\/[^\/]+$/, "/dispatcher-pod"))
     def podSpec = podSpecOverride ?: podEntry?.podSpec
     def containerName = podEntry?.containerName ?: "trt-llm"
     def cluster = entry.clusterName ? SlurmConfig.clusterConfig[entry.clusterName] : null
@@ -1014,15 +1119,15 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     }
 }
 
-// Reconcile this stage's orphaned SLURM job/node off-pod (in-catch, on a detected
-// dispatcher-pod death). podSpecOverride is the failing attempt's pod spec so
-// reconciliation never depends on the sibling entry surviving.
+// Reconcile this stage's orphaned SLURM jobs/nodes off-pod, every attempt's (in-catch,
+// on a detected dispatcher-pod death). podSpecOverride is the failing attempt's pod
+// spec so reconciliation never depends on the sibling entry surviving.
 def finalizeOrphanedSlurmResource(pipeline, String stageName, def podSpecOverride = null) {
     if (!stageName) {
         return
     }
     resourceLedger.reconcile(pipeline,
-        { it.id == "${stageName}/slurm" },
+        { (it.id as String).startsWith("${stageName}/slurm/") },
         { p, entry -> reconcileSlurmResource(p, entry, podSpecOverride) })
 }
 
@@ -1076,7 +1181,7 @@ boolean isNonTerminalSlurmState(String state) {
     return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1100,11 +1205,119 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     Throwable primaryError = null
 
     try {
-        // Run ssh command to start node in desired cluster via SLURM
+        // Run ssh command to start node in desired cluster via SLURM.
+        // Prepare Container runs first (inside the same SSH session) so that the fat sqsh
+        // is on disk before the GPU agent job starts and slurm_install.sh checks for it.
         CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
-            stage('Request Node Via Slurm') {
-                println("Selected Cluster: ${cluster.name}")
 
+            def tarName = BUILD_CONFIGS[config][TARNAME]
+            // The fat sqsh replaces the download in runLLMTestlistOnPlatformImpl, so it
+            // must bake the same build that function would have fetched.
+            def llmTarArtifactPath = cluster.fatBuilderArgs != null ? boltedTarArtifactPath(pipeline, config, tarName) : null
+            def llmPath = sh(script: "realpath .", returnStdout: true).trim()
+            def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
+            def agentJobWorkspace = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+            def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
+            def scriptFatBuildPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_inline.sh"
+            def scriptFatBuildSbatchPathLocal = Utils.createTempLocation(pipeline, "./fat_build_sbatch.sh")
+            def scriptFatBuildSbatchPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_sbatch.sh"
+            def scriptPreparePathLocal = Utils.createTempLocation(pipeline, "./prepare_container.sh")
+            def scriptPreparePathNode = "${agentJobWorkspace}/${nodeName}-prepare_container.sh"
+            def scriptFatBuildBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_sbatch_body.sh"
+            def scriptFatBuildBodyPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_sbatch_body.sh"
+            def scriptPrepareBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/prepare_container.sh"
+            def scriptPrepareBodyPathNode = "${agentJobWorkspace}/${nodeName}-prepare_container_body.sh"
+            def scriptFetchHelperPathNode = "${agentJobWorkspace}/${nodeName}-fetch_build_artifact.sh"
+            def fatArtifactoryNetrcPathNode = "${agentJobWorkspace}/fat-artifactory-netrc"
+
+            stage("Initialize Test") {
+                println("Selected Cluster: ${cluster.name}")
+                Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${agentJobWorkspace}\""), numRetries: 3)
+
+                if (cluster.fatBuilderArgs != null) {
+                    timeout(time: 30, unit: 'MINUTES') {
+                        fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
+                    }
+                    sh "cd ${llmPath} && tar -zxf ${tarName}"
+
+                    Utils.exec(pipeline, script: "echo 'Script to build fat sqsh inline:' && cat ${scriptFatBuildLocalPath}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildLocalPath, scriptFatBuildPathNode, true)
+
+                    // Must match the agent's enroot form, or the two import separate
+                    // copies of the same base sqsh.
+                    def container = LLM_DOCKER_IMAGE
+                    if (cluster.containerRuntime.toString() == "ENROOT") {
+                        container = LLM_DOCKER_IMAGE
+                            .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                    }
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${nodeName}-fat_build")
+
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, readHelperPath(pipeline), scriptFetchHelperPathNode, true)
+                    deliverFatBuilderNetrc(pipeline, remote, fatArtifactoryNetrcPathNode)
+
+                    def scriptFatBuildSbatchContent = generateFatBuildSbatchScript(
+                        fatBuildLogPath: fatBuildLogPath,
+                        fatBuilderArgs: cluster.fatBuilderArgs,
+                        containerDir: containerDir,
+                        container: container,
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        tarName: tarName,
+                        fetchHelperPathNode: scriptFetchHelperPathNode,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        fatBuildBodyPathNode: scriptFatBuildBodyPathNode
+                    )
+                    pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
+                    Utils.exec(pipeline, script: "echo 'Fat builder sbatch script:' && cat ${scriptFatBuildSbatchPathLocal}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildSbatchPathLocal, scriptFatBuildSbatchPathNode, true)
+
+                    def scriptPrepareContent = generateFatPrepareScript(
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
+                        fatBuildLogPath: fatBuildLogPath,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        prepareBodyPathNode: scriptPrepareBodyPathNode
+                    )
+                    pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
+                    Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPreparePathLocal, scriptPreparePathNode, true)
+                } else {
+                    echo "No fat sqsh builder configured for cluster ${cluster.name}; skipping fat sqsh script preparation."
+                }
+            }
+
+            // Runs on every attempt: prepare_container.sh exits immediately if the fat
+            // sqsh already exists, and a retry whose attempt 1 died before the build
+            // still needs one.
+            stage("[${stageName}] Prepare Container") {
+                if (cluster.fatBuilderArgs != null) {
+                    try {
+                        Utils.exec(
+                            pipeline,
+                            timeout: false,
+                            script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                            numRetries: 3
+                        )
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
+                    }
+                } else {
+                    echo "No fat sqsh builder configured; skipping Prepare Container."
+                }
+            }
+
+            stage('Request Node Via Slurm') {
                 def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, entrypoint)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
@@ -1149,12 +1362,38 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 }
 
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
-                def imageForSlurm = LLM_DOCKER_IMAGE
+
+                def containerImageForAgent = LLM_DOCKER_IMAGE
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    imageForSlurm = LLM_DOCKER_IMAGE
+                    containerImageForAgent = LLM_DOCKER_IMAGE
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
-                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
+                // Run the agent inside the pre-built fat sqsh (TRT-LLM + pip deps baked in).
+                // ENROOT only: a .sqsh path is not a valid image for a Docker runtime.
+                if (cluster.fatBuilderArgs != null && cluster.containerRuntime.toString() == "ENROOT") {
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
+                    def fatHash = fatSqsh.hash
+                    def fatSqshPath = fatSqsh.path
+                    echo "Fat sqsh check: hash=${fatHash} path=${fatSqshPath}"
+                    // Simple SSH check: just test the pre-computed literal path.
+                    def fatCheckResult = Utils.exec(
+                        pipeline,
+                        returnStdout: true,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            "\"test -f '${fatSqshPath}' && echo '${fatSqshPath}' || echo MISSING\""
+                        )
+                    ).trim()
+                    if (fatCheckResult != "MISSING" && fatCheckResult) {
+                        echo "Fat sqsh ready; using it as agent container image: ${fatCheckResult}"
+                        containerImageForAgent = fatCheckResult
+                    } else {
+                        echo "Fat sqsh not ready; falling back to base image."
+                    }
+                }
+
+                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, containerImageForAgent, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
@@ -1170,6 +1409,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (enrootConfigDir) {
                     slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
                 }
+                slurmSubmitCommand = SlurmConfig.withGpuBudget(pipeline, partition.clusterName, slurmSubmitCommand, gpuCount)
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -1496,7 +1736,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1539,19 +1779,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             }
             // Reaching here means cleanup succeeded within its retry budget. If all
             // attempts fail, the throw skips deregistration and leaves the entry for sweep.
-            deregisterSlurmResource(stageName)
+            deregisterSlurmResource(stageName, nodeName)
         }
         }
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(pipeline, stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations, retryContext)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -1618,7 +1858,8 @@ def getPytestBaseCommandLine(
     String pytestUtil = "",
     List<String> extraArgs = [],
     int containerPortStart = 0,
-    int containerPortNum = 0
+    int containerPortNum = 0,
+    String clusterName = ""
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
@@ -1630,6 +1871,10 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
+    // GB200 stages run on multiple clusters; only gcp-iad needs the gIB NCCL network plugin over IB.
+    if (stageName.startsWith("GB200") && clusterName == "gcp-iad") {
+        extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
+    }
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
     // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
@@ -1760,7 +2005,100 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-// Which build of <tarName> this stage tests.
+// Writes a netrc for artifactory.nvidia.com with LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its
+// owner. The shell's printf builtin moves the secret from the bound variables into the file, so it
+// never appears on a command line or in the trace. Callers remove the file in a finally block.
+def writeArtifactoryNetrc(pipeline, String netrcPath)
+{
+    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
+            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+        pipeline.withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
+            pipeline.sh(label: "Write Artifactory netrc", script: '''
+                set +x
+                umask 077
+                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+            ''')
+        }
+    }
+}
+
+// Returns the path of the read helper, jenkins/scripts/fetch_build_artifact.sh from the run's
+// commit, in the node's temporary directory, which workspace resets and package extraction leave
+// alone. Unstashes it there the first time.
+def readHelperPath(pipeline)
+{
+    def helperDir = "${pipeline.pwd(tmp: true)}/fetch-build-artifact"
+    def helper = "${helperDir}/fetch_build_artifact.sh"
+    if (!pipeline.fileExists(helper)) {
+        pipeline.dir(helperDir) {
+            pipeline.unstash(FETCH_BUILD_ARTIFACT_STASH)
+        }
+    }
+    return helper
+}
+
+// Reads one in-scope build artifact with the read helper, which tries the primary location first
+// and the other one only when the file is absent there, and checks each download against the
+// SHA-1 that the serving location reports. The helper's netrc lives in the node's temporary
+// directory beside the helper, and is removed before this returns.
+//
+// "download" writes dest and returns null. "exists" writes nothing and returns "<url> <sha1>" of
+// the location that holds the file. Both fail the step at once on a final failure of the helper,
+// such as FETCH_ABSENT or a rejected credential, and on FETCH_TRANSFER_FAILED once the helper's
+// and llmExecStepWithRetry's retries are spent. "properties" writes the properties JSON to dest and
+// returns the helper's exit status instead of failing: 0 when found, otherwise one of the exit
+// codes the helper names, such as FETCH_ABSENT when neither location has properties for it.
+def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode = "download")
+{
+    if (!(mode in ["download", "exists", "properties"])) {
+        pipeline.error("fetchBuildArtifact: unknown mode '${mode}'")
+    }
+    def primary = llmArtifactsPrimary()
+    def helper = readHelperPath(pipeline)
+    def command = "bash '${helper}'" + (mode == "download" ? "" : " --${mode}") + " '${artifactPath}'" +
+        (mode == "exists" ? "" : " '${dest}'")
+    def netrcPath = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+    def statusPath = "${pipeline.pwd(tmp: true)}/fetch-status-${UUID.randomUUID().toString()}"
+    try {
+        writeArtifactoryNetrc(pipeline, netrcPath)
+        return pipeline.withEnv([
+            "LLM_ARTIFACTS_PRIMARY=${primary}",
+            "ARTIFACTORY_NETRC=${netrcPath}",
+            "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+        ]) {
+            if (mode == "properties") {
+                // The helper retries transient errors itself.
+                return pipeline.sh(label: "Fetch properties of ${artifactPath}", script: command, returnStatus: true)
+            }
+            // The helper retries transient errors itself, so only FETCH_TRANSFER_FAILED fails the
+            // script and lets llmExecStepWithRetry repeat it. Any other status is final: the script
+            // records it and succeeds, and the step fails on it below without a retry.
+            def script = "status=0; ${command} || status=\$?; " +
+                "if [ \"\$status\" -eq ${FETCH_TRANSFER_FAILED} ]; then exit \"\$status\"; fi; " +
+                "echo \"\$status\" > '${statusPath}'"
+            def stdout = trtllm_utils.llmExecStepWithRetry(pipeline, label: "Fetch ${artifactPath}", script: script,
+                returnStdout: mode == "exists")
+            def status = pipeline.readFile(statusPath).trim()
+            if (status != "0") {
+                pipeline.error("fetch_build_artifact.sh could not read ${artifactPath} (exit status ${status}); " +
+                    "its message above says why.")
+            }
+            if (mode == "download") {
+                return null
+            }
+            def location = stdout.trim()
+            if (!(location ==~ /\S+ [0-9a-f]{40}/)) {
+                pipeline.error("fetchBuildArtifact: unexpected location '${location}' for ${artifactPath}")
+            }
+            return location
+        }
+    } finally {
+        pipeline.sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}' '${statusPath}'")
+    }
+}
+
+// Which build of <tarName> this stage tests, as the artifact path to read it
+// from with fetchBuildArtifact.
 //
 // Deterministic, not discovered. The pipeline already decided whether the build
 // published a BOLTed variant, so there is nothing to probe for: fetch
@@ -1773,38 +2111,48 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
 // by name proves only that something is there; the property proves it is the
 // right something, which is what keeps the tested build and the released wheel
 // on one profile set. Absent property means an artifact predating the label:
-// reported and allowed rather than failed.
-def boltedTarUrl(String config, String tarName)
+// reported and allowed rather than failed, as is a property lookup that keeps
+// failing. A rejected credential fails the stage.
+def boltedTarArtifactPath(pipeline, String config, String tarName)
 {
-    def base = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}"
     // Only the SBSA build is BOLTed, so only its tarball has a bolted- variant.
     // Asking for one on any other config would 404 the stage rather than fail
     // honestly, so the arch gate has to match the build's exactly.
     if (!BOLT_TEST_BOLTED_TARBALL || config != LINUX_AARCH64_CONFIG) {
-        return "${base}/${tarName}"
+        return "${ARTIFACT_PATH}/${tarName}"
     }
     if (BOLT_PINNED_REF) {
-        def propsUrl = "${URM_ARTIFACTORY_BASE}/api/storage/${ARTIFACT_PATH}/bolted-${tarName}?properties"
-        // -L: Artifactory redirects metadata reads, and without it curl returns
-        // the redirect rather than the document.
-        def got = sh(returnStdout: true, script: """
-            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 '${propsUrl}' 2>/dev/null \\
-              | tr -d ' \\n' \\
-              | sed -n 's/.*"bolt\\.ref":\\["\\([^"]*\\)"\\].*/\\1/p' || true
-        """).trim()
+        def propsFile = "${pipeline.pwd(tmp: true)}/bolted-${tarName}.properties.json"
+        def propsStatus = fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/bolted-${tarName}", propsFile, "properties")
+        // FETCH_ABSENT: no properties on either location. FETCH_TRANSFER_FAILED: the lookup kept
+        // failing.
+        if (!(propsStatus in [0, FETCH_ABSENT, FETCH_TRANSFER_FAILED])) {
+            error("[BOLT] Could not read the properties of bolted-${tarName}: " +
+                  "fetch_build_artifact.sh exited ${propsStatus} (see its message above).")
+        }
+        def got = ""
+        if (propsStatus == 0) {
+            got = sh(returnStdout: true, script: """
+                tr -d ' \\n' < '${propsFile}' \\
+                  | sed -n 's/.*"bolt\\.ref":\\["\\([^"]*\\)"\\].*/\\1/p'
+                rm -f '${propsFile}'
+            """).trim()
+        }
         if (got && got != BOLT_PINNED_REF) {
             error("[BOLT] bolted-${tarName} carries bolt.ref=${got}, but this pipeline pinned ${BOLT_PINNED_REF}. " +
                   "Refusing to test a build optimized with a different profile bundle than the release artifacts use.")
         }
-        if (!got) {
+        if (propsStatus == FETCH_TRANSFER_FAILED) {
+            echo "[BOLT] the bolt.ref lookup for bolted-${tarName} failed (fetch_build_artifact.sh exited ${propsStatus}, see its message above); proceeding on pin ${BOLT_PINNED_REF}"
+        } else if (!got) {
             echo "[BOLT] bolted-${tarName} carries no bolt.ref (artifact predates the label); proceeding on pin ${BOLT_PINNED_REF}"
         }
     }
     echo "[BOLT] testing the BOLTed build: bolted-${tarName}"
-    return "${base}/bolted-${tarName}"
+    return "${ARTIFACT_PATH}/bolted-${tarName}"
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1847,7 +2195,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
-            def llmTarfile = boltedTarUrl(config, tarName)
+            def llmTarArtifactPath = boltedTarArtifactPath(pipeline, config, tarName)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
@@ -1856,8 +2204,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_install.sh"
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
+            def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
+            def scriptFatBuildPathNode = "${jobWorkspace}/${jobUID}-fat_build_inline.sh"
+            // Fat builder sbatch wrapper: generated inline by Groovy (not a static file).
+            def scriptFatBuildSbatchPathLocal = Utils.createTempLocation(pipeline, "./fat_build_sbatch.sh")
+            def scriptFatBuildSbatchPathNode = "${jobWorkspace}/${jobUID}-fat_build_sbatch.sh"
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
+            def scriptFetchHelperPathNode = "${jobWorkspace}/${jobUID}-fetch_build_artifact.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def waivesListPathLocal = infraDryRun
@@ -1866,6 +2220,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def slurmJobLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
+            def scriptPreparePathLocal = Utils.createTempLocation(pipeline, "./prepare_container.sh")
+            def scriptPreparePathNode = "${jobWorkspace}/${jobUID}-prepare_container.sh"
+            def scriptFatBuildBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_sbatch_body.sh"
+            def scriptFatBuildBodyPathNode = "${jobWorkspace}/${jobUID}-fat_build_sbatch_body.sh"
+            def scriptPrepareBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/prepare_container.sh"
+            def scriptPrepareBodyPathNode = "${jobWorkspace}/${jobUID}-prepare_container_body.sh"
+            // The fat sqsh builder's own netrc; see deliverFatBuilderNetrc.
+            def fatArtifactoryNetrcPathNode = "${jobWorkspace}/fat-artifactory-netrc"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def sbatchFailureMarker = "[TRTLLM_SBATCH_FINAL_FAILURE]"
@@ -1875,6 +2237,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def s3SecretKeyPathNode = "${jobWorkspace}/s3_secret_key"
             // Per-job enroot config (never shared ~/.config/enroot — that races across jobs).
             def enrootConfigDirNode = "${jobWorkspace}/enroot-config"
+            // Per-job netrc for the read helper that slurm_install.sh runs. It is not kept in
+            // enrootConfigDirNode, which the ENROOT srun prologue deletes before slurm_install.sh runs.
+            // The package's slurm_install.sh deletes it once every node of its step has finished
+            // downloading the package, before the tests start; a package whose slurm_install.sh has
+            // no remove_artifactory_netrc leaves it to cleanUpSlurmResources.
+            def artifactoryNetrcPathNode = "${jobWorkspace}/artifactory-netrc"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
@@ -1882,11 +2250,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
-                // Download and Unzip Tar File
+                // Download and Unzip Tar File. The node downloads it again itself, with the read
+                // helper. The URL that --exists resolves is for the older slurm_install.sh inside a
+                // package built before the helper existed, which downloads that URL instead.
+                def llmTarfileLocation = ""
                 timeout(time: 30, unit: 'MINUTES') {
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${BUILD_CONFIGS[config][TARNAME]}' '${llmTarfile}'")
+                    llmTarfileLocation = fetchBuildArtifact(pipeline, llmTarArtifactPath, null, "exists")
+                    fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
                 }
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+                def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -1905,12 +2278,68 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptInstallPathNode,
                     true
                 )
+                // Image for both the fat sqsh builder and the job launch script below.
+                def container = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    container = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
+                if (cluster.fatBuilderArgs != null) {
+                    Utils.exec(pipeline, script: "echo \"Script to build fat sqsh inline: \" && cat ${scriptFatBuildLocalPath}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        scriptFatBuildLocalPath,
+                        scriptFatBuildPathNode,
+                        true
+                    )
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
+
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
+
+                    def scriptFatBuildSbatchContent = generateFatBuildSbatchScript(
+                        fatBuildLogPath: fatBuildLogPath,
+                        fatBuilderArgs: cluster.fatBuilderArgs,
+                        containerDir: containerDir,
+                        container: container,
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        tarName: tarName,
+                        fetchHelperPathNode: scriptFetchHelperPathNode,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        fatBuildBodyPathNode: scriptFatBuildBodyPathNode
+                    )
+                    pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
+                    Utils.exec(pipeline, script: "echo \"Fat builder sbatch script: \" && cat ${scriptFatBuildSbatchPathLocal}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        scriptFatBuildSbatchPathLocal,
+                        scriptFatBuildSbatchPathNode,
+                        true
+                    )
+                }
                 Utils.exec(pipeline, script: "echo \"Script for Bash utilities: \" && cat ${scriptBashUtilsLocalPath}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     scriptBashUtilsLocalPath,
                     scriptBashUtilsPathNode,
+                    true
+                )
+                // The read helper from the run's commit, which slurm_install.sh runs to download
+                // the packaged build.
+                def scriptFetchHelperLocalPath = readHelperPath(pipeline)
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptFetchHelperLocalPath,
+                    scriptFetchHelperPathNode,
                     true
                 )
 
@@ -2000,6 +2429,34 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     }
                 }
 
+                // Record this attempt's job before the token reaches its workspace, so that
+                // the off-pod cleanup removes the workspace even if this pod dies before the
+                // job is submitted. The registration after submission adds the job ID to the
+                // same entry; an earlier attempt's entry stays for its own cleanup.
+                registerSlurmResource(stageName, [clusterName: partition.clusterName, jobUID: jobUID, usedSbatch: true])
+                // Every job gets the helper's netrc: the read helper on the node contacts
+                // artifactory.nvidia.com whenever aws is the primary, wherever the package is.
+                // A frontend failover reruns this closure, which copies it again; when the submit
+                // script then reuses a job that has already downloaded, that copy stays until
+                // cleanUpSlurmResources. A job that the submit script resubmits, or that Slurm
+                // requeues, after the first run deleted it has no netrc, and its download fails.
+                def artifactoryNetrcPathLocal = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+                try {
+                    writeArtifactoryNetrc(pipeline, artifactoryNetrcPathLocal)
+                    // scp -p keeps the netrc's 600 mode on the node.
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        artifactoryNetrcPathLocal,
+                        artifactoryNetrcPathNode
+                    )
+                } finally {
+                    sh(label: "Remove Artifactory netrc", script: "rm -f '${artifactoryNetrcPathLocal}'")
+                }
+                if (cluster.fatBuilderArgs != null) {
+                    deliverFatBuilderNetrc(pipeline, remote, fatArtifactoryNetrcPathNode)
+                }
+
                 // Generate .coveragerc: CBTS stages render coveragerc.template; all other stages get an empty rcfile (no coverage).
                 if (isCbtsStage(stageName)) {
                     // @TRTLLM_WHEEL_PATH@ stays a placeholder; slurm_run.sh substitutes it on the worker.
@@ -2058,16 +2515,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
+                    0,
+                    0,
+                    partition.clusterName,
                 )
                 pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
                 def pytestCommand = pytestCommandParts.join(" ")
 
                 // Generate Job Launch Script
-                def container = LLM_DOCKER_IMAGE
-                if (cluster.containerRuntime.toString() == "ENROOT") {
-                    container = LLM_DOCKER_IMAGE
-                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
-                }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
                 // Multi-node perf-sanity and SingleNvlinkDomain stages must land in one NVLink
                 // domain: across racks the wide-EP MoE all-to-all cannot use MNNVL.
@@ -2082,86 +2537,97 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def containerImageArg = container
                 def srunPrologue = ""
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
-                    // Name the .sqsh by image digest (not job ID) so jobs sharing
-                    // an image reuse one .sqsh instead of re-running `enroot import`
-                    // per job. Path is resolved at runtime into ${enrootImagePath}.
+                    // containerImageArg is resolved at bash runtime via $enrootImagePath,
+                    // which srunPrologue sets to the fat sqsh (pre-built) or the digest-named
+                    // base sqsh (fallback). Base sqsh is shared across jobs by image digest.
                     containerImageArg = "\${enrootImagePath}"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
+                    def fatBuildScriptHash = fatSqsh.scriptHash
+                    def fatHash = fatSqsh.hash
+                    def fatSqshPath = fatSqsh.path
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
-                    # Job-private enroot config (under jobWorkspace). Avoids racing on
-                    # the shared ~/.config/enroot/.credentials across concurrent jobs.
-                    export ENROOT_CONFIG_PATH="${enrootConfigDirNode}"
-                    cleanup_enroot_config() { rm -rf "\${ENROOT_CONFIG_PATH}"; }
-                    trap cleanup_enroot_config EXIT
-
-                    containerDir="$containerDir"
-                    mkdir -p "\$containerDir"
-                    # If the image URI already contains a manifest digest (@sha256:…) use
-                    # it directly for content-addressed caching; otherwise hash the tag
-                    # string, which is stable for per-build images but will not detect a
-                    # re-pushed mutable tag within the 3-day TTL window.
-                    if printf '%s' "$container" | grep -q '@sha256:'
-                    then
-                        imageDigest=\$(printf '%s' "$container" | grep -oP '(?<=@sha256:)[a-f0-9]+')
+                    # Fat sqsh: pre-built on CPU node; if present, skip all pip installs.
+                    # Path pre-computed on Jenkins controller (hash=${fatBuildScriptHash}, fatHash=${fatHash}).
+                    if [ -f "${fatSqshPath}" ]; then
+                        echo "Reusing fat sqsh: ${fatSqshPath} (SKIP_INSTALL=1)"
+                        export enrootImagePath="${fatSqshPath}"
+                        export SKIP_INSTALL=1
+                        touch "${fatSqshPath}" || true
+                        # The fat sqsh is a local file, so enroot needs no registry credentials.
+                        rm -rf "${enrootConfigDirNode}"
                     else
-                        imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
-                    fi
-                    export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
-
-                    importContainerWithRetries() {
-                        local docker_uri=\$1
-                        local output_path=\$2
-                        local max_attempts=\${3:-3}
-                        local delay=\${4:-60}
-                        local attempt=1
-                        local tmp_path
-
-                        # Best-effort lock so racing jobs don't all import the same
-                        # image. flock may be a no-op on some shared filesystems;
-                        # correctness still holds since the import publishes atomically.
-                        exec 9>"\${output_path}.lock" || true
-                        flock 9 || true
-
-                        if [ -f "\$output_path" ]
+                        # Fat sqsh not ready; use digest-cached base sqsh + full install.
+                        # Job-private enroot config (under jobWorkspace). Avoids racing on
+                        # the shared ~/.config/enroot/.credentials across concurrent jobs.
+                        export ENROOT_CONFIG_PATH="${enrootConfigDirNode}"
+                        cleanup_enroot_config() { rm -rf "\${ENROOT_CONFIG_PATH}"; }
+                        trap cleanup_enroot_config EXIT
+                        containerDir="$containerDir"
+                        mkdir -p "\$containerDir"
+                        # If the image URI already contains a manifest digest (@sha256:...) use
+                        # it directly for content-addressed caching; otherwise hash the tag
+                        # string, which is stable for per-build images but will not detect a
+                        # re-pushed mutable tag while the cached .sqsh is kept.
+                        if printf '%s' "$container" | grep -q '@sha256:'
                         then
-                            echo "Reusing cached container image: \$output_path"
-                            # Refresh mtime so reused images survive age-based pruning.
-                            touch "\$output_path" || true
-                            flock -u 9 || true
-                            return 0
+                            imageDigest=\$(printf '%s' "$container" | grep -oP '(?<=@sha256:)[a-f0-9]+')
+                        else
+                            imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
                         fi
+                        export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
 
-                        # Import to a temp path, then mv to publish atomically so
-                        # other jobs never see a partial .sqsh.
-                        tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
-                        rm -f "\$tmp_path"
+                        importContainerWithRetries() {
+                            local docker_uri=\$1
+                            local output_path=\$2
+                            local max_attempts=\${3:-3}
+                            local delay=\${4:-60}
+                            local attempt=1
+                            local tmp_path
 
-                        until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
-                        do
-                            if ((attempt >= max_attempts))
+                            # Best-effort lock so racing jobs don't all import the same image.
+                            exec 9>"\${output_path}.lock" || true
+                            flock 9 || true
+
+                            if [ -f "\$output_path" ]
                             then
-                                echo "enroot import failed after \$max_attempts attempts"
-                                rm -f "\$tmp_path"
+                                echo "Reusing cached container image: \$output_path"
+                                touch "\$output_path" || true
                                 flock -u 9 || true
-                                return 1
+                                return 0
                             fi
 
-                            echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
                             rm -f "\$tmp_path"
-                            sleep \$delay
-                            attempt=\$((attempt + 1))
-                        done
 
-                        mv -f "\$tmp_path" "\$output_path"
-                        flock -u 9 || true
-                    }
+                            until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
+                            do
+                                if ((attempt >= max_attempts))
+                                then
+                                    echo "enroot import failed after \$max_attempts attempts"
+                                    rm -f "\$tmp_path"
+                                    flock -u 9 || true
+                                    return 1
+                                fi
 
-                    importContainerWithRetries "$container" "\$enrootImagePath"
-                    cleanup_enroot_config
-                    trap - EXIT
+                                echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                                rm -f "\$tmp_path"
+                                sleep \$delay
+                                attempt=\$((attempt + 1))
+                            done
+
+                            mv -f "\$tmp_path" "\$output_path"
+                            flock -u 9 || true
+                        }
+
+                        importContainerWithRetries "$container" "\$enrootImagePath"
+                        cleanup_enroot_config
+                        trap - EXIT
+                    fi
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
@@ -2188,7 +2654,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
                     "--no-container-mount-home",
-                    "--container-env=NVIDIA_IMEX_CHANNELS"
+                    "--container-env=NVIDIA_IMEX_CHANNELS",
+                    "--container-env=SKIP_INSTALL"
                 ]
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
@@ -2234,6 +2701,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
+                    export llmTarArtifactPath=$llmTarArtifactPath
+                    export LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}
+                    export ARTIFACTORY_NETRC=$artifactoryNetrcPathNode
+                    export ARTIFACTORY_CREDENTIAL_ID=$LLM_ARTIFACTS_CREDENTIALS_ID
                     export llmTarfile=$llmTarfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
@@ -2254,7 +2725,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
+                    # Keep xtrace off here too: the exported pipeline env includes OpenSearch credentials.
+                    set +x
                     ${envExportStatements}
+                    set -x
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
@@ -2316,8 +2790,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def filesToKeepWhenRetry = [
                     scriptRunPathNode,
                     scriptInstallPathNode,
+                    scriptFatBuildPathNode,
+                    scriptFatBuildSbatchPathNode,
+                    scriptFatBuildBodyPathNode,
+                    scriptPrepareBodyPathNode,
                     scriptBashUtilsPathNode,
+                    scriptFetchHelperPathNode,
+                    artifactoryNetrcPathNode,
+                    fatArtifactoryNetrcPathNode,
                     scriptLaunchPathNode,
+                    scriptPreparePathNode,
                     scriptSubmitPathNode,
                     scriptTrackPathNode,
                     testListPathNode,
@@ -2335,6 +2817,35 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ]
                 }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
+
+                // Generate Prepare Container script: submits the CPU fat-sqsh builder job
+                // (if needed) and polls until it completes. Run Pytest starts only after
+                // this stage returns, so the fat sqsh is already on disk when the GPU job
+                // starts and the srunPrologue can reuse it (SKIP_INSTALL=1).
+                def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
+                if (cluster.fatBuilderArgs != null) {
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
+                    scriptPrepareContent = generateFatPrepareScript(
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
+                        fatBuildLogPath: fatBuildLogPath,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        prepareBodyPathNode: scriptPrepareBodyPathNode
+                    )
+                }
+                pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
+                Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptPreparePathLocal,
+                    scriptPreparePathNode,
+                    true
+                )
 
                 def scriptSubmit = """#!/bin/bash
                     set -xEeuo pipefail
@@ -2365,6 +2876,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Clean up workspace: remove all files/dirs not in the keep list
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
 
+                    echo "=== [Run Pytest] Submitting GPU SLURM job: \$(date '+%Y-%m-%d %H:%M:%S') on \$(hostname) ==="
+                    # Prepare Container stage has already completed; fat sqsh is ready on disk
+                    # (or builder failed, in which case the GPU job falls back to base sqsh).
                     touch ${slurmJobLogPath}
                     # Control-plane failover backoff: during a slurmctld failover the
                     # backup controller rejects submissions with "Slurm backup
@@ -2393,9 +2907,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sbatch_max_attempts=6
                     sbatch_attempt=1
                     while true; do
+                        # Silence xtrace around the capture and prints: it would re-echo the
+                        # multi-line sbatch output in every traced command. Restore it only
+                        # if it was on, so a caller that turned it off stays off.
+                        case \$- in
+                            *x*) xtrace_was_on=1 ;;
+                            *)   xtrace_was_on=0 ;;
+                        esac
+                        { set +x; } 2>/dev/null
                         sbatch_rc=0
-                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
-                        printf '%s\\n' "\${sbatch_output}"
+                        sbatch_output=\$(${SlurmConfig.withGpuBudget(pipeline, partition.clusterName, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
+                        printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                        if [ "\${xtrace_was_on}" -eq 1 ]; then
+                            set -x
+                        fi
                         if [ "\${sbatch_rc}" -eq 0 ]; then
                             break
                         fi
@@ -2415,7 +2940,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
                     fi
-                    echo "Submitted Slurm job \$jobId"
+                    echo "=== [Run Pytest] GPU SLURM job submitted: gpu_job_id=\$jobId time=\$(date '+%Y-%m-%d %H:%M:%S') ==="
                     # Save Slurm job ID for later steps to retrieve
                     echo "\$jobId" > "${jobWorkspace}/slurm_job_id.txt"
                 """.replaceAll("(?m)^\\s*", "").trim()
@@ -2429,6 +2954,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptSubmitPathNode,
                     true
                 )
+            }
+
+            // Submit the CPU fat-sqsh builder job (if configured) and poll until it
+            // completes. Non-fatal: any failure here lets the GPU job fall back to base
+            // sqsh + full pip install. Runs on every attempt: prepare_container.sh exits
+            // immediately if the fat sqsh already exists, and a retry whose attempt 1
+            // died before the build still needs one.
+            stage("[${stageName}] Prepare Container") {
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
+                }
             }
 
             stage("[${stageName}] Run Pytest") {
@@ -2502,6 +3047,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
 
                     jobId=${slurmJobId}
+                    echo "=== [Run Pytest] Tracking GPU SLURM job_id=\$jobId START: \$(date '+%Y-%m-%d %H:%M:%S') ==="
                     tail -n +1 -F -- "${slurmJobLogPath}" &
                     tailPid=\$!
 
@@ -2588,6 +3134,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Slurm job \$jobId nodelist: \${NODE_LIST:-UNKNOWN}"
                     printf '%s\n' "\$NODE_LIST" > "${jobWorkspace}/slurm_node_list.txt"
 
+                    echo "=== [Run Pytest] Tracking GPU SLURM job_id=\$jobId END: \$(date '+%Y-%m-%d %H:%M:%S') node=\${NODE_LIST:-UNKNOWN} status=\$STATUS exit_code=\$EXIT_CODE ==="
                     # Record the verdict and always exit 0: a re-run can't change a
                     # terminal state, so numRetries should only fire on transport loss.
                     printf '%s|%s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
@@ -2817,7 +3364,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
             // Reaching here means cleanup succeeded within its retry budget. If all
             // attempts fail, the throw skips deregistration and leaves the entry for sweep.
-            deregisterSlurmResource(stageName)
+            deregisterSlurmResource(stageName, jobUID)
         }
         }
     }
@@ -2879,6 +3426,13 @@ def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFi
                (needsSanity && key =~ /PackageSanityCheck/) ||
                (needsPerfSanity && key =~ /PerfSanity/)
     }
+    // Preserve baseline auto-triggered stages when coverage replaces the selected stage set.
+    if (cbts.scope == "coverage") {
+        def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
+        filtered += parallelJobsFiltered.findAll { key, _ ->
+            autoTriggerTags.any { key.contains(it) }
+        }
+    }
     if (affectedSet.isEmpty()) {
         if (filtered.isEmpty()) {
             echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
@@ -2917,7 +3471,7 @@ boolean isDispatcherPodFailure(Throwable e) {
     return ContextDeath.isContextDeath(e)
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
@@ -2975,9 +3529,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       }
 
       // Job succeeded
@@ -3239,12 +3793,16 @@ def BOLT_PROFILE_REF = "bolt_profile_ref"
 def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 // Hoisted out of globalVars into BINDING variables in launchTestJobs. globalVars
 // is not a parameter of runLLMTestlistWithSbatch or runLLMTestlistOnPlatformImpl,
 // so reading it inside them throws MissingPropertyException; Build.groovy handles
 // BOLT_CONSUME_ENABLED the same way.
 BOLT_PINNED_REF = ""
 BOLT_TEST_BOLTED_TARBALL = false
+// Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
+TRTLLM_RELEASE_REPO = null
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3262,6 +3820,10 @@ def globalVars = [
     (BOLT_PUBLISH_VARIANT): false,
     (BOLT_PROFILE_BRANCH): "",
     (JOB_TYPE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent (see
+    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
+    (LLM_ARTIFACTS_PRIMARY_KEY): "",
+    "TRTLLM_RELEASE_REPO": null,
 ]
 
 class GlobalState {
@@ -4018,12 +4580,15 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     imagePullPolicy: Always
         """
     }
-    // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
+    // CPU test pods mount the model scratch from 10.117.145.14, which can't be accessed from ipp6/ipp9 DC.
+    // Pods placed there stay in ContainerCreating. Build stage pods do not mount the model scratch,
+    // so they can still use these nodes.
+    def scratchUnreachableNodeAffinity = type == "cpu" ? '''
+                              - key: "region"
                                 operator: NotIn
                                 values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
+                                - "ipp6"
+                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -4046,8 +4611,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
 
-    // RTXPro6000D, RTX5080 and GH200 use the Austin model scratch.
-    if (type.contains("6000d") || type.contains("rtx-5080") || type == "gh200") {
+    // RTXPro6000D and RTX5080 use the Austin model scratch.
+    if (type.contains("6000d") || type.contains("rtx-5080")) {
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
@@ -4077,7 +4642,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
+${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -4145,13 +4710,10 @@ def runLLMDocBuild(pipeline, config)
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
 
     // Step 2: download TRT-LLM tarfile
-    def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${BUILD_CONFIGS[config][TARNAME]}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${BUILD_CONFIGS[config][TARNAME]}' '${llmTarfile}'")
-    sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+    def tarName = BUILD_CONFIGS[config][TARNAME]
+    fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/${tarName}", "${llmPath}/${tarName}")
+    sh "cd ${llmPath} && tar -zxf ${tarName}"
     // install python package
-    if (env.alternativeTRT) {
-        sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
@@ -4242,9 +4804,17 @@ def runLLMAgentFlowTest(pipeline, stageName)
 
 def generateTimeoutTestResultXml(pipeline, stageName) {
     def scriptPath = sh(
-        script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
+        script: "find -L . -name generate_timeout_xml.py | head -n 1 | xargs --no-run-if-empty realpath",
         returnStdout: true
     ).trim()
+    if (!scriptPath) {
+        // Without the script no results-timeout.xml is written, but the tests that did not
+        // finish must still fail the stage.
+        def hasUnfinished = sh(script: "grep -q '[^[:space:]]' '${stageName}/unfinished_test.txt'", returnStatus: true) == 0
+        echo "generate_timeout_xml.py not found (source tree may have been cleaned up); skipping timeout XML generation" +
+            (hasUnfinished ? ", but ${stageName}/unfinished_test.txt lists unfinished tests." : ".")
+        return hasUnfinished
+    }
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
     sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
@@ -4386,12 +4956,8 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     } else if (stageName.contains("-Generic-")) {
         // Generic stages select tests by marker expression rather than backend ownership.
         makoArgs += ["backend=generic"]
-    } else if (stageName.contains("-Verl-")) {
-        // If stageName contains "-Verl-", add "backend=verl" to makoArgs
-        // At this point, only tests with backend=verl or unspecified backend will be run
-        makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", or "-Verl-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", or "-FMHA-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -4877,9 +5443,8 @@ def generateRerunReport(stageName, llmSrc) {
 }
 
 def mergeWaivesTxt(pipeline, llmSrc, stageName) {
-    def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
     try {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+        fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/waive_list/waives.txt", "waives.txt")
         if (!fileExists("waives.txt")) {
             error "There is no merged waives.txt file, use the default waives.txt."
         }
@@ -5144,7 +5709,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map retryContext=null)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -5160,12 +5725,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     def llmPath = sh (script: "realpath ${llmRootConfig}", returnStdout: true).trim()
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
     echoNodeAndGpuInfo(pipeline, stageName)
-
-    if (env.alternativeTRT && cpver) {
-        stage("Replace TensorRT") {
-            trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        }
-    }
 
     // Step 2: run tests
     stage ("Setup Environment")
@@ -5195,28 +5754,42 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "python3 --version"
 
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
-        // download TRT-LLM tarfile
+        // Inside a fat sqsh (SLURM agent) TRT-LLM is pre-extracted at /tmp/TensorRT-LLM;
+        // symlink it to skip the ~2-min download.  In all other contexts (K8s pods,
+        // non-fat-sqsh SLURM) the directory does not exist, so fall back to download + tar.
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        def llmTarfile = boltedTarUrl(config, tarName)
-        timeout(time: 30, unit: 'MINUTES') {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${tarName}' '${llmTarfile}'")
+        // /tmp/trtllm_installed.txt is written only by fat_build_inline.sh, distinguishing
+        // a pre-baked fat sqsh from a base image that merely has /tmp/TensorRT-LLM after
+        // a prior normal install on the same node.
+        def isFatSqsh = sh(script: "test -f /tmp/trtllm_installed.txt && test -d /tmp/TensorRT-LLM && echo yes || echo no", returnStdout: true).trim() == "yes"
+        if (isFatSqsh) {
+            sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
+            // Resolve to real path so pytest --rootdir doesn't produce ../../../ node IDs.
+            llmSrc = sh(script: "realpath ${llmPath}/TensorRT-LLM/src", returnStdout: true).trim()
+        } else {
+            def llmTarArtifactPath = boltedTarArtifactPath(pipeline, config, tarName)
+            timeout(time: 30, unit: 'MINUTES') {
+                fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
+            }
+            sh "cd ${llmPath} && tar -zxf ${tarName}"
         }
-        sh "cd ${llmPath} && tar -zxf ${tarName}"
 
         // install python package
-        timeout(time: 45, unit: 'MINUTES') {
-            if (env.alternativeTRT) {
-                sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+        // isFatSqsh: deps and wheel are pre-baked in the fat sqsh — skip all installs.
+        // skipInstallWheel: wheel already installed externally (e.g. K8s sanity check
+        //   pre-installs a platform-specific wheel) — install deps but skip the wheel.
+        timeout(time: 60, unit: 'MINUTES') {
+            if (!isFatSqsh) {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
+                // SMG's generated package remains an opt-in dependency. OpenEngine's
+                // private bindings and grpcio dependency are part of the base package.
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // SMG's generated package remains an opt-in dependency. OpenEngine's
-            // private bindings and grpcio dependency are part of the base package.
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash ${llmSrc}/jenkins/scripts/install_mamba.sh")
             }
-            if (!skipInstallWheel) {
+            if (!isFatSqsh && !skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
             }
             if (stageName.contains("-ModelExpress-")) {
@@ -5654,7 +6227,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(pipeline, stageName, {
         // PMIx builds a singleton ID, singleton.{hostname}.{pid}, that must fit a
@@ -5669,7 +6242,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
             "PMIX_HOSTNAME=mpi-node0",
         ]
         withEnv(testEnv) {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations, retryContext)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
         }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
@@ -5742,8 +6315,11 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
     def kitmakerDryRunMetadata = null
     stage("Kitmaker Publish Dry Run") {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            if (!TRTLLM_RELEASE_REPO?.url || !TRTLLM_RELEASE_REPO?.commit) {
+                error "TRTLLM_RELEASE_REPO is missing from globalVars; it is resolved by L0_MergeRequest"
+            }
             sh "rm -rf ${releaseScriptsDir}"
-            trtllm_utils.checkoutSource(RELEASE_SCRIPT_REPO, RELEASE_SCRIPT_COMMIT, releaseScriptsDir, false, true)
+            trtllm_utils.checkoutSource(TRTLLM_RELEASE_REPO.url, TRTLLM_RELEASE_REPO.commit, releaseScriptsDir, false, true)
             trtllm_utils.llmExecStepWithRetry(
                 pipeline,
                 script: "${python_bin} -m pip install -r ${releaseScriptsDir}/requirements.txt")
@@ -5769,12 +6345,6 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
         }
     }
     return kitmakerDryRunMetadata
-}
-
-
-def isKitmakerWheelDryRunEnabled()
-{
-    return RELEASE_SCRIPT_REPO && RELEASE_SCRIPT_COMMIT
 }
 
 
@@ -5901,16 +6471,14 @@ def runLLMBuild(
     is_dlfw=false,
     boltConsume=false,
     boltProfileRef="",
-    boltProfileBranch="")
+    boltProfileBranch="",
+    kitmakerDryRun=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
     sh "ccache -sv"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
-    if (env.alternativeTRT) {
-        sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
     sh "curl ifconfig.me || true"
@@ -5924,12 +6492,11 @@ def runLLMBuild(
 
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-grpc-smg.txt")
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-    }
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
-        buildArgs += " -a '90-real;100-real;103-real;120-real'"
+        buildArgs += " -a '90;100;103;107;120;121'"
+    } else {
+        buildArgs += " -a '80;86;89;90;100;103;107;120'"
     }
     def platNameArg = plat_name ? " --plat-name ${plat_name}" : ""
 
@@ -5938,9 +6505,6 @@ def runLLMBuild(
         "TRTLLM_VERSION_OVERRIDE=${version_override}",
     ]) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
-    }
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
     }
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
@@ -6009,8 +6573,8 @@ def runLLMBuild(
     def kitmakerDryRunMetadata = null
     if (version_override?.contains("+")) {
         echo "Skipping Kitmaker wheel dry run for local version '${version_override}'"
-    } else if (!isKitmakerWheelDryRunEnabled()) {
-        echo "Skipping Kitmaker wheel dry run because releaseScriptRepo or releaseScriptCommit is not set"
+    } else if (!kitmakerDryRun) {
+        echo "Skipping Kitmaker wheel dry run outside post-merge"
     } else {
         def kitmakerPython = "tensorrt_llm/.venv-${pythonVersionFromCpver(cpver)}/bin/python3"
         kitmakerDryRunMetadata = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO)
@@ -6020,20 +6584,12 @@ def runLLMBuild(
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
-        def remove_trt = "rm -rf /usr/local/tensorrt"
-        if (env.alternativeTRT) {
-            pip_keep += "|^tensorrt=="
-            remove_trt = "echo keep /usr/local/tensorrt"
-        }
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
-        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
+        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
     }
 
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install pytest build/tensorrt_llm-*.whl")
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
 
     // Upload attribution files when they exist
     def attrDir = "tensorrt_llm/cpp/build/attribution"
@@ -6049,7 +6605,7 @@ def runLLMBuild(
 }
 
 
-def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cpver="cp312")
+def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
 {
     def whlUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
 
@@ -6064,31 +6620,18 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     sh "pwd && ls -alh"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
 
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
-
     if (reinstall_dependencies) {
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
-        def remove_trt = "rm -rf /usr/local/tensorrt"
-        if (env.alternativeTRT) {
-            pip_keep += "|^tensorrt=="
-            remove_trt = "echo keep /usr/local/tensorrt"
-        }
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
-        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
+        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
     }
     //WAR: remove python3-pygments first since it is installed in NGC PyTorch image
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
 
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
 
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
@@ -6461,6 +7004,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
     BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
+    TRTLLM_RELEASE_REPO = globalVars["TRTLLM_RELEASE_REPO"]
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
@@ -6479,7 +7023,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-x86-2": ["cpu", "l0_cpu", 2, 2],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -6545,7 +7090,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -6596,13 +7141,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
         "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        // Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and
-        // pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the
-        // numpy>=2.0.0 TensorRT-LLM asks for, so the install downgrades numpy out from under
-        // the interpreter. Importing tensorrt_llm then fails and every test in the stage goes
-        // with it, which makes the whole stage noise rather than signal.
-        // "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
@@ -6634,7 +7172,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, false, retryContext?.infraRetryMax)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, false, retryContext?.infraRetryMax)
     }, [singleAttempt: true, slurmDispatcher: true]]]}
     // SLURM dispatcher pods run their own inner retry loop
     // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
@@ -6648,7 +7186,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-arm-2": ["cpu", "l0_cpu", 2, 2],
         "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
@@ -6672,15 +7211,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
-        // PerfSanity pre-merge tests. GB300 x4 capacity is the binding constraint, so
-        // pre-merge gating is one stage on one node: the two DeepSeek-V4-Pro ctx_only cases.
-        "GB300-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 1, 4, 1, true, false],
         // PerfSanity post-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 4, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 4, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 4, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 4, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 7, 7, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -6798,7 +7337,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        4,
+        6,
         8,
         2
     )
@@ -6807,7 +7346,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16",
-        1,
+        2,
         16,
         4
     )
@@ -6820,12 +7359,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         32,
         8
     )
-    // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
+    // Nemotron-Ultra-V3 8k64k con1 and GLM-5.3-Flash FP8 8k1k con16: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-        1,
+        2,
         8,
         2
     )
@@ -6846,7 +7385,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -6865,7 +7404,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
         parallelJobs += parallelSlurmJobs
 
@@ -6879,7 +7418,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
@@ -7038,10 +7577,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             def isDlfw = values[4]
             def wheelPath = ""
             def cpver = "cp312"
-            def pyver = "3.12"
             if (key.contains("PY310")) {
                 cpver = "cp310"
-                pyver = "3.10"
             }
 
             // Same switch the build helpers use for the tarball, so the released
@@ -7053,16 +7590,18 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             // behaviour.
             def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
             def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
+            def kitmakerDryRun = testFilter[(IS_POST_MERGE)] ?: false
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch)
+                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch,
+                    kitmakerDryRun)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
             // sanityRunner("Sanity check") {
-            //     runPackageSanityCheck(pipeline, wheelPath, values[3], cpver)
+            //     runPackageSanityCheck(pipeline, wheelPath, values[3])
             // }
 
             def checkPipStage = false
@@ -7073,7 +7612,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             }
 
             if (checkPipStage) {
-                stage("Run LLMAPI Test") {
+                stage("[${toStageName(values[1], key)}] Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
@@ -7111,8 +7650,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // Must match what requirements.txt resolves to from the public index: the
                             // wheel under test is linked against that libtorch, and a mismatch fails
                             // the import with an undefined c10 symbol instead of a version error.
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
+                            // The internal mirror proxies https://download.pytorch.org/whl/cu132.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cuda-thirteen-two-remote/simple")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
@@ -7129,13 +7668,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
                             "PMIX_HOSTNAME=mpi-node0",
                         ]
-                        if (env.alternativeTRT) {
-                            stage("Replace TensorRT") {
-                                trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-                            }
-                            libEnv += ["LD_LIBRARY_PATH+tensorrt=/usr/local/tensorrt/lib"]
-                            libEnv += ["LD_LIBRARY_PATH+nvrtc=/usr/local/lib/python${pyver}/dist-packages/nvidia/cuda_nvrtc/lib"]
-                        }
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
                             // Retry 2 times if timeout occurs.
@@ -7168,7 +7700,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -7209,9 +7741,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         println parallelJobsFiltered.keySet()
     }
 
-    // Check --post-merge, post-merge or TRT dependency testing pipelines.
+    // Check --post-merge or post-merge pipelines.
     // If true, add post-merge only test stages and multi-GPU test stages.
-    if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
+    if (testFilter[(IS_POST_MERGE)]) {
         parallelJobsFiltered += multiGpuJobs
         parallelJobsFiltered += postMergeJobs
     }
@@ -7454,7 +7986,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
                 })
             }
         } else {
@@ -7511,6 +8043,16 @@ pipeline {
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
+                        LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
+                        echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
+                    }
+                    // The read helper that fetchBuildArtifact unstashes on every node.
+                    def fetchHelperDir = "${pwd(tmp: true)}/fetch-build-artifact"
+                    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/fetch_build_artifact.sh", fetchHelperDir)
+                    dir(fetchHelperDir) {
+                        stash(name: FETCH_BUILD_ARTIFACT_STASH, includes: "fetch_build_artifact.sh")
+                    }
                 }
             }
         }

@@ -216,20 +216,12 @@ class NcclEpContext:
             use_internal_fp8_dispatch or external_fp8 or external_nvfp4
         ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
 
-        # EP communicator bootstrap. Under the MPI orchestrator, and in the
-        # MPI-based test infrastructure (mpi_pool_executor) and microbenchmarks,
-        # split MPI_COMM_WORLD by pp_rank so each pipeline stage gets its own EP
-        # comm, keyed by moe_ep_rank (mirrors the DeepEPLowLatency pattern in
-        # deep_ep_utils.py). Under the Ray orchestrator (TLLM_DISABLE_MPI=1)
-        # every GPU actor is an MPI singleton, so that Split() yields a 1-rank
-        # communicator while the receive buffers are sized by
-        # mapping.moe_ep_size. The Ray worker has already initialized
-        # torch.distributed and the DeviceMesh mapping exposes the EP process
-        # group, so seed the communicator from that group instead.
+        # Ray actors have singleton MPI worlds; bootstrap from their torch EP
+        # group. MPI workers and microbenchmarks need no torch process group.
+        self._ep_mpi_comm = None
         if mpi_disabled():
             from nccl.ep.interop.torch import get_nccl_comm_from_group
 
-            self._ep_mpi_comm = None
             self.comm = get_nccl_comm_from_group(mapping.moe_ep_group_pg)
         else:
             self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)

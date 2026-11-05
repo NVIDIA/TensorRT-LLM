@@ -35,14 +35,17 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
     is_qwen4_exp, load_pretrained_config)
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+# Callers import MoeLoadBalancerConfig from this module.
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig  # noqa: F401
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          KvCacheConfig,
+                                          MoeLoadBalancerConfigType,
                                           MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -52,7 +55,8 @@ from tensorrt_llm.models.quant_config_utils import \
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo, is_modelopt_quant_config,
-    read_modelopt_quant_config, warn_if_inline_diverges)
+    read_modelopt_quant_config, reject_checkpoint_nvfp4_plus,
+    warn_if_inline_diverges)
 from tensorrt_llm.quantization.utils.fp4_utils import (
     NVFP4_SF_VEC_SIZE, W4A16_NVFP4_LINEAR_SF_VEC_SIZES,
     nvfp4_scaling_vector_size)
@@ -103,6 +107,11 @@ _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 _KIMI_K3_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",
+}
+
+_GLM5_NEXT_ARCHITECTURES = {
+    "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
 }
 
 _MINIMAX_M3_ARCHITECTURES = {
@@ -281,7 +290,7 @@ class ModelConfig(Generic[TConfig]):
     _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
                                                            repr=False,
                                                            compare=False)
-    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
+    moe_load_balancer: Optional[MoeLoadBalancerConfigType] = None
 
     attn_backend: str = 'TRTLLM'
     # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
@@ -300,6 +309,13 @@ class ModelConfig(Generic[TConfig]):
         default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+    # Lossy: the model's two-shot MNNVL all-reduces fused with a residual
+    # RMSNorm exchange E4M3 (AllReduceParams.fp8_payload).
+    mnnvl_allreduce_fp8_payload: bool = False
+    # Every tensor-parallel rank holds the whole embedding table.
+    replicate_embedding: bool = False
+    # Batch sizes of the generation CUDA graphs (empty without them).
+    cuda_graph_batch_sizes: Tuple[int, ...] = ()
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
@@ -383,6 +399,11 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        # Fused expert reduction can change accumulation order between runs.
+        if (os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+                or os.getenv("FORCE_MOE_KERNEL_DETERMINISTIC", "0") == "1"):
+            self.moe_disable_finalize_fusion = True
+
         if (self.sparse_attention_config is None
                 and getattr(self.pretrained_config, "model_type",
                             None) in ("deepseek_v41", "deepseek_v41_text")):
@@ -555,6 +576,11 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        # NVFP4_PLUS, which OVERRIDE_QUANT_ALGO selects for MXFP4 experts, runs
+        # on the CuteDSL grouped GEMM only.
+        if ModelConfig.override_quant_algo() == QuantAlgo.NVFP4_PLUS:
+            return "CUTEDSL"
+
         if architecture in _KIMI_K3_ARCHITECTURES:
             return "TRTLLM"
 
@@ -564,6 +590,9 @@ class ModelConfig(Generic[TConfig]):
             if 100 <= sm_version < 120:
                 return "TRTLLM"
 
+        if architecture in _GLM5_NEXT_ARCHITECTURES and is_sm_100f():
+            return "TRTLLM"
+
         is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))
         if is_w4a16_nvfp4:
@@ -571,7 +600,7 @@ class ModelConfig(Generic[TConfig]):
             # CuteDslB12xW4a16Nvfp4FusedMoE on SM120/121 (reached through the
             # CUTEDSL family), MarlinFusedMoE on Hopper. Any
             # other SM falls through to CUTLASS, which dequantizes on the fly.
-            if sm_version in (120, 121):
+            if is_sm_120f(sm_version):
                 return "CUTEDSL"
             if 90 <= sm_version < 100:
                 return "MARLIN"
@@ -702,6 +731,8 @@ class ModelConfig(Generic[TConfig]):
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
+                reject_checkpoint_nvfp4_plus(layer_cfg['quant_algo'],
+                                             f"Quantized layer {layer}")
                 config.quant_algo = QuantAlgo(
                     canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
@@ -727,8 +758,27 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def require_nvfp4_plus_moe_backend(
+            moe_backend: Optional[str],
+            backend_setting: str = "moe_config.backend") -> None:
+        """Reject an explicit MoE backend that cannot run NVFP4_PLUS experts.
+
+        Only the CuteDSL grouped GEMM implements NVFP4_PLUS, and AUTO resolves
+        to it under the override (``resolve_moe_backend``).
+        """
+        if moe_backend is None or str(moe_backend).upper() in ("AUTO",
+                                                               "CUTEDSL"):
+            return
+        raise ValueError(
+            "OVERRIDE_QUANT_ALGO=NVFP4_PLUS runs MXFP4 experts on the CuteDSL "
+            f"MoE only, but {backend_setting} is {moe_backend}; set "
+            f"{backend_setting}: CUTEDSL or leave it AUTO.")
+
+    @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
         quant_algo = ModelConfig.override_quant_algo()
+        if quant_algo == QuantAlgo.NVFP4_PLUS:
+            ModelConfig.require_nvfp4_plus_moe_backend(moe_backend)
         if quant_algo is None and not is_dynamic_quant:
             if get_sm_version() >= 100:
                 if moe_backend == 'TRITON':
@@ -777,7 +827,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
         # MXFP4 checkpoints.
@@ -795,7 +845,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
 
@@ -1060,7 +1110,9 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        exclude_modules = set()
+        # Keyed by module name in checkpoint order; a set would order the
+        # names by string hash, which varies between processes.
+        exclude_modules: dict[str, None] = {}
         has_mxfp4 = False
         is_dynamic_quant = False
         with open(dtypes_json_file) as f:
@@ -1069,7 +1121,7 @@ class ModelConfig(Generic[TConfig]):
                 if layer.endswith("weight"):
                     if dtype == "BF16" or dtype == "FP16":
                         names = layer.split(".")
-                        exclude_modules.add('.'.join(names[:-1]))
+                        exclude_modules.setdefault('.'.join(names[:-1]))
                     elif dtype == "MXFP4":
                         # This is the path for the fp8 checkpoint which requires dynamic quantization.
                         is_dynamic_quant = True
@@ -1097,6 +1149,9 @@ class ModelConfig(Generic[TConfig]):
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,
             "W4A8_MXFP4_FP8": QuantAlgo.W4A8_MXFP4_FP8,
+            # MXFP4 weights with E8M0 scales converted to UE5M3 at load, and
+            # E2M1 activations with UE5M3 block scales (Rubin SM107 only).
+            "NVFP4_PLUS": QuantAlgo.NVFP4_PLUS,
         }
         if new_algo is not None:
             if new_algo.upper() in supported_algos:

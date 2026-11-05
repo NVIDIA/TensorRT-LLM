@@ -113,13 +113,29 @@ class ModelingV2Mode(str, enum.Enum):
         return cls(llm_args.modeling_v2)
 
 
-class NoTarget(Exception):
-    """Raised by a family's ``route`` when no target fits.
+class NoTarget(ValueError):
+    """Raised by a family's ``route`` when no target fits, or by a target at construction when the runtime
+    the engine arguments set is not the one it is written for.
 
     The message says, in words, which fact ruled the targets out. Under
-    ``auto`` the resolver logs it and falls back to the built-in implementation;
+    ``auto`` the resolver logs it and falls back to the built-in implementation
+    (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
     under ``require`` it becomes the error the user sees.
     """
+
+
+# The mode each target class was last resolved under (the loader builds the class right after resolving it).
+_RESOLVED_MODES: Dict[type, ModelingV2Mode] = {}
+
+
+def resolved_mode(target: type) -> ModelingV2Mode:
+    """The mode ``modeling_v2_resolve`` returned ``target`` under; ``auto`` for a class built without it.
+
+    A target reads it at construction: under ``require`` its in-target dispatch
+    raises where it would otherwise fall back to a built-in path inside the
+    shapes it claims.
+    """
+    return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
 
 
 def tp_reaches_across_nodes(mapping) -> bool:
@@ -182,6 +198,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -197,7 +214,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         if route is None:
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(config, llm_args, _device_compute_capability())
+        target = route(config, llm_args, _device_compute_capability())
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
@@ -205,3 +222,60 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
+    if target is not None:
+        _RESOLVED_MODES[target] = mode
+    return target
+
+
+def _qualified(target: Optional[type]) -> Optional[str]:
+    return None if target is None else f"{target.__module__}.{target.__qualname__}"
+
+
+def modeling_v2_resolve_on_all_ranks(
+    config: "ModelConfig", llm_args: "TorchLlmArgs"
+) -> Optional[type]:
+    """:func:`modeling_v2_resolve`, agreed by every rank of the engine.
+
+    Each rank routes on its own facts -- its device, and whether this
+    installation built the target's native code -- so one rank can land on the
+    built-in model while its peers build the target, and the first collective
+    then hangs instead of failing. Every rank therefore reports its outcome, and
+    all of them raise unless the outcomes agree. A rank's error is reported
+    after the exchange, not before, so its peers are never left waiting in it.
+
+    ``off`` returns before any exchange: nothing in this package runs then.
+    """
+    if ModelingV2Mode.of(llm_args) is ModelingV2Mode.OFF:
+        return None
+
+    target = error = None
+    try:
+        target = modeling_v2_resolve(config, llm_args)
+    except Exception as caught:  # noqa: BLE001 -- re-raised below, after every rank has reported
+        error = caught
+    outcome = (_qualified(target), None if error is None else f"{type(error).__name__}: {error}")
+
+    mapping = config.mapping
+    outcomes = [outcome]
+    if mapping.world_size > 1:
+        from tensorrt_llm._torch.distributed.communicator import Distributed
+
+        outcomes = Distributed.get(mapping).allgather(outcome)
+
+    if error is not None:
+        raise error
+    failed = {rank: why for rank, (_, why) in enumerate(outcomes) if why is not None}
+    if failed:
+        detail = "; ".join(f"rank {rank}: {why}" for rank, why in sorted(failed.items()))
+        raise RuntimeError(f"modeling_v2: other ranks failed to resolve a target ({detail})")
+    if len({built for built, _ in outcomes}) > 1:
+        detail = "; ".join(
+            f"rank {rank}: {built or 'built-in'}" for rank, (built, _) in enumerate(outcomes)
+        )
+        raise RuntimeError(
+            f"modeling_v2: ranks disagree on the implementation to build ({detail}); "
+            "every rank has to run the same code"
+        )
+    if target is not None and mapping.rank == 0:
+        logger.warning(f"modeling_v2: building {_qualified(target)} on all {len(outcomes)} rank(s)")
+    return target
