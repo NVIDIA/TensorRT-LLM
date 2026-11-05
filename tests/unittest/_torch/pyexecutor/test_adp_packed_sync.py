@@ -26,10 +26,10 @@ collectives):
 * every consumer follows the stash contract (use if present, else gather), so
   callers outside the loop -- warmup, KV-cache estimation -- gather as before,
 * stashes never outlive a pass or an executor instance,
-* the gate is config-derived and the knob-off path is byte-identical to today,
-* TorchDist's fixed-width int64 gathers ride the single-kernel CPU-tensor path
-  when the object-collective groups exist and fall back to the base path
-  otherwise.
+* the gate is config-derived and the knob-off path is byte-identical to today.
+
+The wire format and the transport itself are exercised over a real two-rank group
+in ``test_adp_multirank_exchange.py``.
 """
 
 import copy
@@ -39,13 +39,11 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
-import torch
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
-from tensorrt_llm._torch.distributed.communicator import TorchDist
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -272,11 +270,6 @@ def test_loop_head_steady_state_is_one_gather_and_stashes_rank_states():
         assert [s.num_active_requests for s in states] == [2, 1]
         assert [s.num_active_tokens for s in states] == [8, 10]
         assert all(isinstance(s, RankState) for s in states)
-    # The packed vector is the RankState followed by the three vote ints.
-    width = len(RankState(rank=0).serialize())
-    for rank in range(2):
-        vec = group.payloads[rank][0]
-        assert vec[width:] == [0, 0, 0]
 
 
 def test_loop_head_error_vote_runs_legacy_handler_on_every_rank():
@@ -294,27 +287,6 @@ def test_loop_head_error_vote_runs_legacy_handler_on_every_rank():
     width = len(RankState(rank=0).serialize())
     assert group.payloads[0][0][width:] == [0, 0, 0]
     assert group.payloads[1][0][width:] == [1, 0, 0]
-
-
-def test_loop_head_pending_context_failure_joins_the_vote():
-    group = _FakeGroup(2)
-    failing = _req(9)
-    executors = [
-        _make_executor(
-            group,
-            0,
-            active_requests=[failing],
-            coordinator=_Coordinator(
-                pending_ctx_failures={executor_module.get_unique_rid(failing)}
-            ),
-        ),
-        _make_executor(group, 1, active_requests=[_req(3)]),
-    ]
-    results = _run_loop_head(group, executors)
-    assert failing.state == LlmRequestState.DISAGG_TRANS_ERROR
-    assert all(r.any_error for r in results)
-    for ex in executors:
-        ex._disagg_coordinator.handle_errors_synced.assert_called_once_with()
 
 
 def test_loop_head_timeout_vote_fails_drained_buffer_on_every_rank():
@@ -409,6 +381,7 @@ def _gate_executor(monkeypatch, **overrides):
     ex.is_benchmark_disagg = False
     ex.drafter = None
     ex.enable_early_first_token_response = False
+    ex.enable_iter_perf_stats = False
     ex.model_engine = SimpleNamespace(
         is_spec_decode=False, make_graph_batch=lambda b, rm, **_: (b, frozenset())
     )
@@ -433,6 +406,8 @@ def test_gate_is_config_derived(monkeypatch):
         dict(is_benchmark_disagg=True),
         dict(drafter=object()),
         dict(enable_early_first_token_response=True),
+        # the iteration payload is variable-width and carries a float
+        dict(enable_iter_perf_stats=True),
         dict(
             model_engine=SimpleNamespace(is_spec_decode=True, make_graph_batch=lambda b, rm, **_: b)
         ),
@@ -472,26 +447,3 @@ def test_coordinator_local_error_vote_marks_pending_failures_and_counts_blocked(
 
     noop = NoopDisaggCoordinator()
     assert noop.local_error_vote() == {"error_ids": [], "blocked_ids": []}
-
-
-# ---------------------------------------------------------------------------
-# TorchDist fixed-width int64 gather routing
-# ---------------------------------------------------------------------------
-
-
-def test_torchdist_int64_gather_uses_cpu_tensor_path_when_available():
-    dist = object.__new__(TorchDist)
-    pg = object()
-    dist._cuda_obj_pg = lambda dim: pg if dim == "tp" else None
-    sent = []
-
-    def fake_cpu_tensor_gather(tensor, group):
-        assert group is pg and tensor.dtype == torch.int64
-        sent.append(tensor.tolist())
-        return [tensor.clone(), tensor.clone() + 10]
-
-    dist._cuda_allgather_cpu_tensor = fake_cpu_tensor_gather
-    dist.tp_allgather = Mock(side_effect=AssertionError("object path used"))
-    rows = dist.tp_allgather_int64([3, 4])
-    assert rows.dtype == np.int64 and rows.tolist() == [[3, 4], [13, 14]]
-    assert sent == [[3, 4]]

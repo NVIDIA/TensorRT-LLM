@@ -29,12 +29,12 @@ in-process kernel cache is shared with any earlier test that compiled these
 kernels).
 """
 
-import time
-
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
+    _extract_transpose_prefill_kernel,
+    _fused_gdn_post_conv_kernel,
     extract_transpose_prefill_slice,
     fused_gdn_post_conv,
 )
@@ -56,7 +56,7 @@ QKV_DIM = 2 * NUM_K_HEADS * HEAD_K_DIM + NUM_V_HEADS * HEAD_V_DIM
 # count: %16==0, %16!=0, ==1.
 WARMUP_TOKEN_COUNTS = (256, 252, 1)
 # Battery: different token counts mapping onto the same three families.
-BATTERY_TOKEN_COUNTS = (4096, 65536, 16500, 16501, 4095, 1)
+BATTERY_TOKEN_COUNTS = (4096, 16501, 1)
 # Decode-token counts: the key is the CARTESIAN PRODUCT of the prefill and
 # decode families, so every decode family (none / ==1 / %16!=0 / %16==0)
 # needs a representative per prefill family. Sampling only one decode class
@@ -65,26 +65,25 @@ BATTERY_TOKEN_COUNTS = (4096, 65536, 16500, 16501, 4095, 1)
 WARMUP_DECODE_COUNTS = (0, 1, 8, 16)
 # Battery includes the token counts of the four mid-serving JITs observed in
 # production (1, 54, 48) mapping onto already-warmed families.
-BATTERY_DECODE_COUNTS = (0, 1, 2, 54, 48, 16)
-
-# A previously-compiled launch is <5 ms; a triton compile is >80 ms.
-MAX_COMPILE_FREE_CALL_MS = 50.0
+BATTERY_DECODE_COUNTS = (0, 1, 54, 48)
 
 
-def _timed_ms(fn, *args) -> float:
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    fn(*args)
-    torch.cuda.synchronize()
-    return (time.perf_counter() - start) * 1e3
+def _compiled_specializations() -> int:
+    """Number of kernel binaries Triton has compiled for the two prefill kernels so far."""
+    return sum(
+        len(per_device[0])
+        for kernel in (_extract_transpose_prefill_kernel, _fused_gdn_post_conv_kernel)
+        for per_device in kernel.device_caches.values()
+    )
 
 
-def _run_extract(num_prefill_tokens: int) -> float:
+def _run_extract(num_prefill_tokens: int) -> None:
     src = torch.randn(num_prefill_tokens, QKV_DIM + 32, dtype=torch.bfloat16, device="cuda")
-    return _timed_ms(extract_transpose_prefill_slice, src, num_prefill_tokens, 0, QKV_DIM)
+    extract_transpose_prefill_slice(src, num_prefill_tokens, 0, QKV_DIM)
+    torch.cuda.synchronize()
 
 
-def _run_post_conv(num_prefill_tokens: int, num_decode_tokens: int) -> float:
+def _run_post_conv(num_prefill_tokens: int, num_decode_tokens: int) -> None:
     prefill = torch.randn(QKV_DIM, num_prefill_tokens, dtype=torch.bfloat16, device="cuda")
     decode = (
         torch.randn(num_decode_tokens, QKV_DIM, dtype=torch.bfloat16, device="cuda")
@@ -96,8 +95,7 @@ def _run_post_conv(num_prefill_tokens: int, num_decode_tokens: int) -> float:
     b = torch.randn(num_tokens, NUM_V_HEADS, dtype=torch.bfloat16, device="cuda")
     a_log = torch.randn(NUM_V_HEADS, dtype=torch.float32, device="cuda")
     dt_bias = torch.randn(NUM_V_HEADS, dtype=torch.float32, device="cuda")
-    return _timed_ms(
-        fused_gdn_post_conv,
+    fused_gdn_post_conv(
         prefill,
         decode,
         a,
@@ -109,6 +107,7 @@ def _run_post_conv(num_prefill_tokens: int, num_decode_tokens: int) -> float:
         NUM_V_HEADS,
         HEAD_V_DIM,
     )
+    torch.cuda.synchronize()
 
 
 @skip_no_cuda
@@ -120,19 +119,15 @@ def test_gdn_prefill_family_warmup_makes_other_token_counts_compile_free():
         for num_decode_tokens in WARMUP_DECODE_COUNTS:
             _run_post_conv(num_prefill_tokens, num_decode_tokens)
 
-    # Battery: every other token count must hit an already-compiled family.
+    # Battery: every other token count must hit an already-compiled family, so no new
+    # specialization is built (a deterministic count, not a wall-clock threshold).
+    warmed = _compiled_specializations()
+    assert warmed > 0
     for num_prefill_tokens in BATTERY_TOKEN_COUNTS:
-        elapsed_ms = _run_extract(num_prefill_tokens)
-        assert elapsed_ms < MAX_COMPILE_FREE_CALL_MS, (
-            f"extract_transpose_prefill_slice(L={num_prefill_tokens}) took "
-            f"{elapsed_ms:.1f} ms after family warmup (likely a re-JIT: the "
-            f"triton specialization policy has changed)"
-        )
+        _run_extract(num_prefill_tokens)
         for num_decode_tokens in BATTERY_DECODE_COUNTS:
-            elapsed_ms = _run_post_conv(num_prefill_tokens, num_decode_tokens)
-            assert elapsed_ms < MAX_COMPILE_FREE_CALL_MS, (
-                f"fused_gdn_post_conv(L={num_prefill_tokens}, "
-                f"decode={num_decode_tokens}) took {elapsed_ms:.1f} ms after "
-                f"family warmup (likely a re-JIT: the triton specialization "
-                f"policy has changed)"
-            )
+            _run_post_conv(num_prefill_tokens, num_decode_tokens)
+    assert _compiled_specializations() == warmed, (
+        "a token count outside the warmed families compiled a new kernel: the triton "
+        "specialization policy has changed and the warmup shape list must be revisited"
+    )

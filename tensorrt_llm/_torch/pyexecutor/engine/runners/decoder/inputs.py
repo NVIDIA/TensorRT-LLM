@@ -785,6 +785,9 @@ class DecoderInputPreparer:
                     num_real, refresh_block_offsets=refresh_block_offsets
                 )
         else:
+            # The recorded object is now one step behind: never advance it in
+            # place again; a full pass re-records.
+            cache["attn_metadata"] = None
             if not attn_metadata.is_cuda_graph:
                 attn_metadata.seq_lens = cache["seq_lens_ones"]
             attn_metadata.beam_width = 1

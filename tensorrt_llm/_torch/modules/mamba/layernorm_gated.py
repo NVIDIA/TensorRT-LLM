@@ -198,8 +198,11 @@ def _rms_norm_gated_fwd_multirow_kernel(
     the whole program block is one contiguous span (widest possible global
     accesses); EVEN additionally drops the bounds masks. The silu gate uses
     the single-instruction MUFU tanh (sm_75+): silu(z) = 0.5*z*(1 + tanh(z/2)).
-    Its |error| is ~2^-11 relative, well below the bf16/fp8 output ulp; the
-    saturation and NaN behavior match z * sigmoid(z).
+    Its absolute error is below ~3e-3 of the normalized value for every z (and
+    far below it for z < -8, where the gate itself is ~0), so the output stays
+    within about one bf16 ulp of the row; the relative error of individual
+    elements with z < -8 is larger. Saturation and NaN behavior match
+    z * sigmoid(z).
     """
     r0 = tl.program_id(0) * ROWS
     rows = r0 + tl.arange(0, ROWS)

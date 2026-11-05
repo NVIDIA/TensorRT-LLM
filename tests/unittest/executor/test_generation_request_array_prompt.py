@@ -82,27 +82,8 @@ def test_num_prompt_tokens_reads_the_int32_buffer_without_a_list():
     assert listed.num_prompt_tokens == 3
 
 
-def test_record_stats_counts_prompt_tokens_without_building_the_list():
-    from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
-    from tensorrt_llm.metrics import MetricNames, RequestEventTiming
-
-    ids = _ids()
-    req = GenerationRequest(prompt_token_ids=ids, sampling_params=SamplingParams(max_tokens=4))
-    result = GenerationResult(req)
-    output = CompletionOutput(index=0, token_ids=[5, 6, 7], finish_reason="stop")
-    stats = {
-        RequestEventTiming.ARRIVAL_TIME: 1.0,
-        RequestEventTiming.FIRST_TOKEN_TIME: 1.5,
-        RequestEventTiming.LAST_TOKEN_TIME: 2.0,
-    }
-    result.record_stats(output, stats)
-    assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == len(ids)
-    # The prompt went to the engine as an int32 buffer; counting it for the
-    # metrics must not rebuild the O(ISL) list on the response path.
-    assert req.__dict__["_prompt_token_ids"] is None
-
-
-def test_record_stats_still_reads_the_ids_for_prompt_logprobs():
+@pytest.mark.parametrize("prompt_logprobs", [None, [-1.0, -2.0]])
+def test_record_stats_counts_prompt_tokens(prompt_logprobs):
     from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
     from tensorrt_llm.metrics import MetricNames, RequestEventTiming
 
@@ -110,14 +91,23 @@ def test_record_stats_still_reads_the_ids_for_prompt_logprobs():
     req = GenerationRequest(prompt_token_ids=ids, sampling_params=SamplingParams(max_tokens=4))
     result = GenerationResult(req)
     output = CompletionOutput(
-        index=0, token_ids=[5, 6, 7], finish_reason="stop", prompt_logprobs=[-1.0, -2.0]
+        index=0, token_ids=[5, 6, 7], finish_reason="stop", prompt_logprobs=prompt_logprobs
     )
-    stats = {RequestEventTiming.ARRIVAL_TIME: 1.0, RequestEventTiming.LAST_TOKEN_TIME: 2.0}
+    stats = {
+        RequestEventTiming.ARRIVAL_TIME: 1.0,
+        RequestEventTiming.FIRST_TOKEN_TIME: 1.5,
+        RequestEventTiming.LAST_TOKEN_TIME: 2.0,
+    }
     result.record_stats(output, stats)
     assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == len(ids)
-    assert MetricNames.PREFILL_PERPLEXITY in result.metrics_dict
-    # Prompt logprobs need the ids themselves, so here the list is built.
-    assert req.__dict__["_prompt_token_ids"] is not None
+    if prompt_logprobs is None:
+        # The prompt went to the engine as an int32 buffer; counting it for the
+        # metrics must not rebuild the O(ISL) list on the response path.
+        assert req.__dict__["_prompt_token_ids"] is None
+    else:
+        # Prompt logprobs need the ids themselves, so here the list is built.
+        assert MetricNames.PREFILL_PERPLEXITY in result.metrics_dict
+        assert req.__dict__["_prompt_token_ids"] is not None
 
 
 def test_do_tracing_reports_prompt_tokens_without_building_the_list(monkeypatch):

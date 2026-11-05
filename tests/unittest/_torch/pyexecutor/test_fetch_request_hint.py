@@ -15,11 +15,12 @@
 
 The hint is rank 0's request-queue snapshot piggybacked on the ADP rank-state
 allgather (RankState.num_pending_new_requests). On the busy path it must:
-- skip the fetch entirely when 0 (identically on every rank — the hint comes
-  from the same allgather everywhere),
-- skip the request-count probe broadcast when > 0,
 - be ignored on the idle path, which keeps the blocking probe as the wake
   mechanism, and when it is None (non-ADP callers).
+
+The busy-path behavior (a zero hint skips the fetch and a positive one skips the
+probe, on every rank) is covered over a real two-rank group in
+``test_adp_multirank_exchange.py``.
 """
 
 import datetime
@@ -65,44 +66,6 @@ def _fetch(stub, waiting_queue, total_num_active_requests, new_requests_hint):
         total_num_active_requests,
         new_requests_hint=new_requests_hint,
     )
-
-
-def test_busy_zero_hint_skips_fetch_and_collectives():
-    stub = _make_stub_executor(queued_items=[Mock()])
-    waiting_queue = FCFSWaitingQueue()
-
-    _fetch(stub, waiting_queue, total_num_active_requests=4, new_requests_hint=0)
-
-    stub.executor_request_queue.get_from_request_queue.assert_not_called()
-    stub.request_broadcaster.broadcast.assert_not_called()
-    assert len(waiting_queue) == 0
-
-
-def test_busy_positive_hint_skips_probe_but_fetches():
-    items = [Mock(), Mock()]
-    stub = _make_stub_executor(queued_items=items)
-    waiting_queue = FCFSWaitingQueue()
-
-    _fetch(stub, waiting_queue, total_num_active_requests=4, new_requests_hint=2)
-
-    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
-        datetime.timedelta(0)
-    )
-    stub.request_broadcaster.broadcast.assert_called_once()
-    assert stub.request_broadcaster.broadcast.call_args.kwargs["known_nonempty"] is True
-    assert len(waiting_queue) == len(items)
-
-
-def test_busy_no_hint_keeps_probe_path():
-    items = [Mock()]
-    stub = _make_stub_executor(queued_items=items)
-    waiting_queue = FCFSWaitingQueue()
-
-    _fetch(stub, waiting_queue, total_num_active_requests=4, new_requests_hint=None)
-
-    stub.executor_request_queue.get_from_request_queue.assert_called_once()
-    assert stub.request_broadcaster.broadcast.call_args.kwargs["known_nonempty"] is False
-    assert len(waiting_queue) == len(items)
 
 
 def test_idle_ignores_hint_and_keeps_blocking_probe():

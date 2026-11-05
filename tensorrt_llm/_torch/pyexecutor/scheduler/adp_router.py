@@ -343,6 +343,7 @@ class ADPRouter(ABC):
         connector_poll_failed: bool = False,
         include_kv_cache_load: bool = False,
         num_pending_new_requests: int = 0,
+        iter_stats_enabled: bool = False,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -369,6 +370,9 @@ class ADPRouter(ABC):
                 request count to piggyback on this allgather. Only rank 0
                 feeds the request queue, so callers pass a non-zero value
                 there exclusively (see RankState.num_pending_new_requests).
+            iter_stats_enabled: Whether iteration stats are collected. It must be
+                identical on every rank (config-derived, not "a payload is
+                pending"), because it picks the collective.
         """
         local_state = self._build_local_rank_state(
             active_requests,
@@ -379,10 +383,16 @@ class ADPRouter(ABC):
             num_connector_transfers,
             connector_poll_failed,
         )
-        # The serialized RankState is a fixed-size flat int list, so use the
-        # fixed-size int64 gather: one collective instead of an object
-        # allgather's size exchange plus pickling, on the per-iteration hot path.
-        responses = self.dist.tp_allgather_int64(local_state.serialize(include_kv_cache_load))
+        serialized = local_state.serialize(include_kv_cache_load)
+        if iter_stats_enabled:
+            # The iteration payload carries a float hit rate and a KV snapshot
+            # that only some ranks hold, so its width and types differ between
+            # ranks; only the object gather carries that.
+            return [RankState.deserialize(data=resp) for resp in self.dist.tp_allgather(serialized)]
+        # Without iteration stats the serialized RankState is a fixed-size flat
+        # int list: one int64 gather instead of an object allgather's size
+        # exchange plus pickling, on the per-iteration hot path.
+        responses = self.dist.tp_allgather_int64(serialized)
         return [RankState.deserialize(data=resp.tolist()) for resp in responses]
 
     def gather_all_rank_states_with_extras(
