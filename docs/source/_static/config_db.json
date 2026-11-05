@@ -275,6 +275,12 @@
           "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml"
         },
         {
+          "config_filename": "beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml",
+          "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml",
+          "config_path": "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml",
+          "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml"
+        },
+        {
           "config_filename": "beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
           "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
           "config_path": "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
@@ -285,6 +291,12 @@
           "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
           "config_path": "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
           "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml"
+        },
+        {
+          "config_filename": "beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml",
+          "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml",
+          "config_path": "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml",
+          "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml"
         }
       ],
       "gpu_compatibility": "GB300: one 4-GPU node (aggregated) or two 4-GPU nodes (disaggregated)",

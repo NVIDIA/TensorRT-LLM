@@ -13,6 +13,9 @@ model files.
 from __future__ import annotations
 
 import contextlib
+import subprocess
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +23,9 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
     _attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.component_bf16 import (  # noqa: E501
+    _check_ids,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (  # noqa: E501
     BeamFullModelNvfp4Sm103Tp4,
@@ -141,7 +147,7 @@ NUM_TOKENS = sum(n for _, n in REQUESTS)
 
 def _call_state(diagnostics, manager_checks):
     """The per-call state of the full model that ``check_call`` reads (no weights)."""
-    return SimpleNamespace(
+    state = SimpleNamespace(
         max_tokens=8192,
         device=torch.device("cuda", torch.cuda.current_device()),
         local_kv_heads=KV_HEADS,
@@ -151,6 +157,8 @@ def _call_state(diagnostics, manager_checks):
         _checked_manager=None,
         check_cache_manager=manager_checks.append,
     )
+    state._check_positions = types.MethodType(BeamFullModelNvfp4Sm103Tp4._check_positions, state)
+    return state
 
 
 def _call_inputs():
@@ -172,11 +180,151 @@ def test_call_returns_spans_and_compares_positions_in_diagnostic_mode_only(diagn
         assert torch.equal(flat, ids) and torch.equal(flat_positions, positions)
         shifted = positions + 1
         if diagnostics:
-            with pytest.raises(ValueError, match="positions must be exactly"):
+            with pytest.raises(ValueError, match="request 0 .* its positions are"):
                 check_call(state, ids, shifted, md)
         else:
             _, flat_positions, spans = check_call(state, ids, shifted, md)
             assert spans == REQUESTS and torch.equal(flat_positions, shifted)
+
+
+#: (cached tokens, rows) of speculative verification requests: the pending token and seven
+#: proposals each.
+VERIFY = ((100, 8), (37, 8), (9, 8))
+
+
+def test_diagnostic_positions_follow_the_device_kv_lengths():
+    """Under the overlap scheduler the host prepares a step assuming every proposal of the
+    previous one was accepted, and the engine corrects the device KV lengths and positions
+    before the forward. The diagnostic check reads the device lengths: corrected positions
+    pass, positions at the host's uncorrected offsets fail, and the host spans keep stating
+    the uncorrected value."""
+    with prepared_step((), VERIFY) as md:
+        state = _call_state(True, [])
+        rejected = torch.tensor([0, 7, 3], device="cuda", dtype=md.kv_lens_cuda.dtype)
+        md.kv_lens_cuda[: len(VERIFY)] -= rejected  # what preprocess_inputs applies in place
+        corrected = torch.cat(
+            [torch.arange(p - int(r), p - int(r) + n) for (p, n), r in zip(VERIFY, rejected.cpu())]
+        ).cuda()
+        ids = torch.zeros(corrected.numel(), dtype=torch.int64, device="cuda")
+        _, _, spans = check_call(state, ids, corrected, md, generation_rows=8)
+        assert spans == list(VERIFY)
+        host_positions = torch.cat([torch.arange(p, p + n) for p, n in VERIFY]).cuda()
+        with pytest.raises(ValueError, match="request 1 .* after 30 cached tokens"):
+            check_call(state, ids, host_positions, md, generation_rows=8)
+
+
+def test_diagnostic_mode_refuses_cuda_graph_capture():
+    with prepared_step(CONTEXTS, GENERATIONS) as md:
+        state = _call_state(True, [])
+        ids, positions = _call_inputs()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="runs eagerly only"):
+            with torch.cuda.graph(graph):
+                check_call(state, ids, positions, md)
+
+
+VOCAB = 151936
+
+
+def test_token_ids_are_range_checked_on_the_host_for_direct_calls():
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    ids = torch.tensor([0, 5, VOCAB - 1], device="cuda")
+    _check_ids(ids, VOCAB, ids.device, 16)
+    for bad in (-1, VOCAB):
+        with pytest.raises(ValueError, match=r"must be in \[0, 151936\)"):
+            _check_ids(torch.tensor([3, bad], device="cuda"), VOCAB, ids.device, 16)
+
+
+def test_engine_token_ids_are_asserted_on_the_device_without_reading_back():
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    ids = torch.tensor([0, 5, VOCAB - 1], device="cuda")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _check_ids(ids, VOCAB, ids.device, 16, values_on_host=False)
+        with pytest.raises(RuntimeError):  # the host check reads the device back
+            _check_ids(ids, VOCAB, ids.device, 16)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    static = ids.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _check_ids(static, VOCAB, static.device, 16, values_on_host=False)
+    static.copy_(torch.tensor([7, 8, 9], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+
+_DEVICE_ASSERT_CHILD = """
+import importlib
+import torch
+target = "tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4"
+check_ids = importlib.import_module(target + ".component_bf16")._check_ids
+ids = torch.tensor([3, {bad}], device="cuda")
+check_ids(ids, {vocab}, ids.device, 16, values_on_host=False)
+torch.cuda.synchronize()
+print("NOT-REJECTED")
+"""
+
+
+@pytest.mark.parametrize("bad", [-1, VOCAB])
+def test_out_of_range_engine_token_id_fails_the_device_assertion(bad):
+    """The device assertion poisons its CUDA context, so it runs in a child process."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    child = subprocess.run(
+        [sys.executable, "-c", _DEVICE_ASSERT_CHILD.format(bad=bad, vocab=VOCAB)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert child.returncode != 0, child.stdout
+    assert "NOT-REJECTED" not in child.stdout
+    assert "token ids must be in [0, 151936)" in child.stderr or "assert" in child.stderr.lower()
+
+
+_CAPTURED_DEVICE_ASSERT_CHILD = """
+import importlib
+import torch
+target = "tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4"
+check_ids = importlib.import_module(target + ".component_bf16")._check_ids
+static = torch.tensor([3, 4], device="cuda")
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    check_ids(static, {vocab}, static.device, 16, values_on_host=False)
+graph.replay()
+torch.cuda.synchronize()
+print("VALID-REPLAYED", flush=True)
+static.copy_(torch.tensor([3, {bad}], device="cuda"))
+graph.replay()
+torch.cuda.synchronize()
+print("NOT-REJECTED", flush=True)
+"""
+
+
+@pytest.mark.parametrize("bad", [-1, VOCAB])
+def test_out_of_range_engine_token_id_fails_the_assertion_in_a_captured_replay(bad):
+    """The engine path's check is captured once and fires on a replay whose ids are invalid.
+
+    Graph replay runs no Python: a captured forward's only id check is the device assertion.
+    A valid replay completes first; replaying the same graph with an out-of-range id in its
+    static input must fail. The assertion poisons the CUDA context, so it runs in a child.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    child = subprocess.run(
+        [sys.executable, "-c", _CAPTURED_DEVICE_ASSERT_CHILD.format(bad=bad, vocab=VOCAB)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert "VALID-REPLAYED" in child.stdout, child.stderr[-2000:]
+    assert child.returncode != 0, child.stdout
+    assert "NOT-REJECTED" not in child.stdout
+    assert "token ids must be in [0, 151936)" in child.stderr or "assert" in child.stderr.lower()
 
 
 @pytest.mark.parametrize("diagnostics", [False, True], ids=["off", "on"])

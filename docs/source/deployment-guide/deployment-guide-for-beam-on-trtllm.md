@@ -64,7 +64,7 @@ The values above illustrate the format only; use the calibrated table for your c
 | Speculative decoding | DFlash2 drafter (`decoding_type: DFlash`), seven proposals per step (eight verification rows), TRTLLM draft attention, strict greedy verification |
 | KV cache | One `KVCacheManagerV2` holding the target's 52 and the drafter's 5 KV layers, FP8 E4M3 with the explicit scale table; full-block prefix reuse enabled, partial-block reuse disabled |
 | Attention backend | TRTLLM |
-| Execution | Eager: CUDA graphs, overlap scheduling and chunked prefill disabled |
+| Execution | Eager recipes: CUDA graphs and overlap scheduling disabled. Graph-and-overlap (GO) recipes: native decode CUDA graphs for generation-only steps (batch sizes 1 to 64, padded to 1, 2, 4, 8, 16, 32 or 64) and the overlap scheduler; steps that contain a context request run eagerly. Chunked prefill disabled in every recipe |
 | Disaggregated KV transfer | Python cache transceiver over NIXL, 60,000 ms transfer timeout (both workers) |
 | Server | Native OpenAI-compatible server, one frontend, text-only |
 
@@ -72,9 +72,11 @@ The recipes under `examples/configs/curated/` hold these settings:
 
 | Recipe | Role |
 |---|---|
-| [`beam-nvfp4-dflash2-fp8kv-aggregated.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml) | Aggregated server |
+| [`beam-nvfp4-dflash2-fp8kv-aggregated.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml) | Aggregated server, eager |
+| [`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml) | Aggregated server with decode CUDA graphs and overlap scheduling |
 | [`beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml) | Disaggregated context worker |
-| [`beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml) | Disaggregated generation worker |
+| [`beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml) | Disaggregated generation worker, eager |
+| [`beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen-go.yaml) | Disaggregated generation worker with decode CUDA graphs and overlap scheduling |
 
 Each recipe selects the Beam target and its supporting pieces by name:
 
@@ -111,7 +113,8 @@ Export these in the shell that starts each `trtllm-serve` worker. The MPI sessio
 
 ### Capacity and batching
 
-All three recipes use the same limits:
+Each GO recipe differs from its eager counterpart only in `cuda_graph_config` and
+`disable_overlap_scheduler`. All five recipes use the same limits:
 
 | Limit | Recipe value | Basis |
 |---|---|---|
@@ -201,6 +204,15 @@ Stop the server with Ctrl+C in its terminal, or send SIGTERM to the `trtllm-serv
 TP4 workers exit with it. Confirm that `nvidia-smi` lists no remaining processes on the node's
 GPUs before starting another deployment there.
 
+To serve with decode CUDA graphs and the overlap scheduler, use
+`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml` in the same command. During startup the server
+captures the generation-only steps for each listed batch size (target verification of the eight
+rows per request, DFlash2 drafting and the TP all-reduces), so startup takes longer and
+each GPU holds about 1.6 GB more. Steps that contain a context (prefill) request always run
+eagerly, as does a generation-only step with more requests than the largest listed batch size
+(with the recipe's `max_batch_size` of 64, every generation-only step is captured). The eager
+recipe remains the fallback configuration.
+
 ### Python LLM API
 
 The aggregated recipe's settings, passed to `LLM()` in one process on the same node. The
@@ -261,6 +273,10 @@ llm.shutdown()
 
 Set both environment variables before constructing `LLM`, as above, or export them in the shell
 that starts Python: the worker processes it starts read them.
+
+For the GO recipe's settings, pass `disable_overlap_scheduler=False` and
+`cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8, 16, 32, 64], enable_padding=True)`
+(`from tensorrt_llm.llmapi import CudaGraphConfig`) instead of the two eager values above.
 
 ## Disaggregated serving
 
@@ -395,26 +411,38 @@ the same scale-table digest, and that the two disaggregated workers report the s
 The same recipes run behind the standard [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo)
 frontend and TensorRT LLM worker (`python3 -m dynamo.frontend` and `python3 -m dynamo.trtllm`),
 aggregated on one node or disaggregated with a prefill worker on one node and a decode worker on
-a second node. These steps were tested with the `ai-dynamo` and `ai-dynamo-runtime`
-`1.7.0.dev20261101` packages, unmodified; that release pins `tensorrt-llm==1.4.0rc2`, the version
-of the TensorRT LLM build containing this guide.
+a second node. Qualification used a patched Dynamo source build with TensorRT LLM `1.4.0rc2`
+and XGrammar `0.1.32`, not the unmodified preview packages. The Dynamo build includes fixes for
+Beam reply parsing, structural-tag registration, constraint validation and token-budget handling.
+These changes and their parser/protocol crate dependencies must be included in the deployment
+package. Installing a stock package with the same version number does not provide those fixes.
+
+The source revisions used for qualification are Dynamo `51f72d9b79255ced5c9755f2f4f6fe3bcaac5127`,
+the patched `dynamo-parsers-v2` crate `a47af00e2d1d` and the patched `dynamo-protocols` crate
+`c623202b57a8`. These identify the tested source builds; they are not published release tags.
+Obtain the corresponding reviewed deployment package before using the commands below.
 
 ### Install Dynamo next to TensorRT LLM
 
-Install the two Dynamo packages into a virtual environment that sees the TensorRT LLM
-installation, without Dynamo's `[trtllm]` extra (which would install a released TensorRT LLM
-wheel over this build):
+Use the deployment package's installation instructions and pinned dependency environment.
+Its base container must first have the package's required runtime dependencies installed and
+their versions checked; creating a venv over an unprepared base image is insufficient.
+Install the supplied Dynamo wheels into a virtual environment that sees this TensorRT LLM
+installation, without Dynamo's `[trtllm]` extra (which would replace it with a released wheel):
 
 ```bash
 python3 -m venv --system-site-packages <DYNAMO_VENV>
-<DYNAMO_VENV>/bin/pip install --dry-run ai-dynamo==1.7.0.dev20261101 ai-dynamo-runtime==1.7.0.dev20261101
-<DYNAMO_VENV>/bin/pip install ai-dynamo==1.7.0.dev20261101 ai-dynamo-runtime==1.7.0.dev20261101
+<DYNAMO_VENV>/bin/pip install --dry-run --no-index --no-deps <AI_DYNAMO_WHEEL> <AI_DYNAMO_RUNTIME_WHEEL>
+<DYNAMO_VENV>/bin/pip install --no-index --no-deps <AI_DYNAMO_WHEEL> <AI_DYNAMO_RUNTIME_WHEEL>
 <DYNAMO_VENV>/bin/python -c "import tensorrt_llm, dynamo.trtllm; print(tensorrt_llm.__file__)"
 ```
 
 The dry run must not plan to replace `torch`, `transformers`, `tensorrt`, `triton` or any `nvidia-*`
 package of the environment, and the last command must print the path of this TensorRT LLM
 installation. Run the frontend and workers with `<DYNAMO_VENV>/bin/python3`.
+Verify the installed package hashes and dependency versions against the deployment manifest.
+The original Dynamo qualification used the eager TensorRT LLM build; a new build combining
+these changes with the GO implementation needs combined runtime validation before distribution.
 
 ### Who processes the text
 
@@ -425,8 +453,10 @@ IDs only. Configure the frontend's text processing through the worker's registra
 - `--custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja`: the checkpoint's chat template.
 - `--dyn-reasoning-parser beam --dyn-tool-call-parser beam`: Dynamo's built-in Beam parser. Both
   flags are needed: Dynamo selects its Beam parser only when both name `beam`.
+- `--guided-decoding-backend xgrammar`: required on every worker for the qualified recipe.
+- `DYN_BEAM_TOOL_CALLS=0` on the frontend: this text-only recipe refuses tool-calling requests.
 
-Use the curated recipes as the worker's `--extra-engine-args`, with `<DRAFTER_CHECKPOINT>` replaced
+Use the eager curated recipes as the worker's `--extra-engine-args`, with `<DRAFTER_CHECKPOINT>` replaced
 and the `reasoning_parser` line removed (reasoning parsing belongs to the frontend here). The commands
 below call the three prepared files `beam-dynamo-aggregated.yaml`, `beam-dynamo-disagg-ctx.yaml` and
 `beam-dynamo-disagg-gen.yaml`. Export the
@@ -439,6 +469,7 @@ the TCP request plane:
 
 ```bash
 export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV=<SHARED_DISCOVERY_DIR> DYN_REQUEST_PLANE=tcp
+export DYN_BEAM_TOOL_CALLS=0 DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS=5000
 ```
 
 ### Aggregated
@@ -451,6 +482,7 @@ python3 -m dynamo.frontend --http-host 0.0.0.0 --http-port 8000 \
 
 python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> --served-model-name beam-nvfp4 \
   --extra-engine-args beam-dynamo-aggregated.yaml --disaggregation-mode agg \
+  --guided-decoding-backend xgrammar \
   --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja
 ```
@@ -470,12 +502,14 @@ later need etcd discovery instead. Each worker must advertise an address the fro
 DYN_TCP_RPC_HOST=<FIRST_NODE_ADDRESS> python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
   --served-model-name beam-nvfp4 --extra-engine-args beam-dynamo-disagg-ctx.yaml \
   --disaggregation-mode prefill --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
+  --guided-decoding-backend xgrammar \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja &
 
 # second node: decode worker
 DYN_TCP_RPC_HOST=<SECOND_NODE_ADDRESS> python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
   --served-model-name beam-nvfp4 --extra-engine-args beam-dynamo-disagg-gen.yaml \
   --disaggregation-mode decode --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
+  --guided-decoding-backend xgrammar \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja
 
 # first node, after both workers are ready: frontend
@@ -493,17 +527,25 @@ frontend lists its models at `/v1/models`, and the GSM8K
 evaluator below works against it in endpoint mode (`--endpoint http://<FIRST_NODE_ADDRESS>:8000
 --served-model-name beam-nvfp4`).
 
-### Differences from the native server
+### Qualified behavior and remaining limits
 
-- A reply that starts without a channel header is returned with empty content by Dynamo's Beam
-  parser, while the native `beam_harmony_text` parser returns that text as the final content.
-  Replies with an analysis or final channel are parsed the same way.
-- Dynamo's Beam parser attaches its turn grammar to every request as guided-decoding data, and
-  `--dyn-structural-tag false` does not remove it in the tested release. These recipes configure
-  no guided-decoding backend, so the TensorRT LLM worker does not apply it.
-- A request whose `max_tokens` exceeds the 69,632-token context is accepted and served; the native
-  server refuses it with HTTP 400.
-- Only the eager recipes (CUDA graphs and overlap scheduling disabled) were tested with Dynamo.
+- Headerless text is preserved as content; tagged and streaming replies separate reasoning and
+  final content without leaking channel markers.
+- XGrammar enforces the supported turn grammar and explicit constraints. Invalid schemas are
+  rejected before generation, and subsequent valid requests remain usable.
+- `--dyn-structural-tag false` disables the automatic turn grammar while preserving supported
+  explicit constraints. Keep XGrammar enabled when using this option.
+- Positive output budgets above the remaining context are accepted and capped to the available
+  context, matching the tested native accept-and-cap behavior. Invalid budgets and overlong
+  prompts are rejected before generation.
+- Omitting the guided-decoding backend is outside the qualified recipe. In that configuration,
+  constraints embedded in structural tags can be silently unenforced; this is a documented
+  limitation, not supported constraint enforcement.
+- One-model speculative decoding can ignore guided-decoder failure reports. Dynamo validates
+  supported constraints before generation, but an engine-side `failed during guided decoding`
+  message must still be investigated as possible unconstrained generation.
+- Only eager execution (CUDA graphs and overlap scheduling disabled) was qualified with Dynamo.
+  The native GO results do not qualify Dynamo with GO enabled.
 
 ## Accuracy and limitations
 
@@ -518,8 +560,12 @@ speculative decoding) does not qualify this configuration.
   sizes, between fresh and reused-cache execution, between speculative and ordinary decoding,
   and between aggregated and disaggregated serving, because the target's own numerics differ
   across these execution shapes. Exact token parity across these modes is not established.
-- Tool calling, CUDA graphs, overlap scheduling, chunked prefill, attention data parallelism,
-  other GPU architectures and other parallel layouts are not qualified by these recipes.
+- The GO recipes capture generation-only decode and speculative-verification steps; prefill
+  and piecewise CUDA graphs are not used. With overlap scheduling a request can run one more
+  step after it finishes; those tokens are discarded, never returned. Greedy outputs of the
+  eager and GO recipes can differ, and exact token parity between them is not established.
+- Tool calling, chunked prefill, attention data parallelism, other GPU architectures and other
+  parallel layouts are not qualified by these recipes.
 
 The model's implementation and generated-input regression coverage are described in the
 [Beam source README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/_experimental/modeling_v2/models/beam/README.md).
@@ -560,10 +606,12 @@ directory resumes) and `summary.json` (score, failures, timing and GPU memory).
 ## First-100 GSM8K regression
 
 The QA/LR functional list selects the first 100 GSM8K questions on one four-GB300 node,
-with a 45-minute timeout and a minimum score of 95/100. Execution errors, timeouts,
-truncations and parsing failures also fail the test. Two independent runs of the
-aggregated recipe on separate nodes scored 97/100 and 98/100 in approximately 25 and
-30 minutes, including model startup. This is a separate public
+with a 45-minute timeout and a minimum score of 95/100, served with the aggregated GO recipe
+(`beam-nvfp4-dflash2-fp8kv-aggregated-go.yaml`). Execution errors, timeouts, truncations and
+parsing failures also fail the test. Two independent runs of the eager aggregated recipe on
+separate nodes scored 97/100 and 98/100 in approximately 25 and 30 minutes, including model
+startup. On a later build, one run of this job with the GO recipe and a matched run of the
+eager recipe each scored 98/100, missing the same two questions. This is a separate public
 evaluation protocol; its score is not interchangeable with the full evaluation baseline.
 Neither this job nor full GSM8K runs in L0. Full GSM8K is excluded from all CI lists.
 

@@ -12,26 +12,36 @@ prefill/decode loop or sampler.
 This is the BF16 layout component (``component_bf16``) with NVFP4 expert
 storage and execution. Everything outside the routed experts -- ownership, the embedding,
 attention on TRTLLM attention and KVCacheManagerV2 metadata, the dense feed-forward, the
-replicated FP32 router with its diagnostic-mode all-rank agreement check, dispatch/combine, the
-norms, depth residuals, head and every collective -- is that component's code, unchanged, on
-the checkpoint's BF16/FP32 tensors copied byte for byte. The experts stay packed:
+replicated FP32 router with its diagnostic-mode all-rank agreement check, the norms, depth
+residuals, head and every collective -- is that component's code, unchanged, on the
+checkpoint's BF16/FP32 tensors copied byte for byte. The experts stay packed:
 
     storage   per sparse layer and projection kind, banks indexed by global expert id: packed
               E2M1 codes ``[256, rows, K/2]`` u8 and E4M3 block scales in the GEMM's 128x4
               swizzled order ``[256, rows * K/16]`` u8 (the rank's slice, see ``layout``), and
               ``input_scale``, ``weight_scale_2``, ``g = 1/input_scale``, ``alpha =
-              input_scale * weight_scale_2`` ``[256]`` fp32
-    compute   ``expert.nvfp4_swiglu_expert``: per selected expert, activation quantization,
-              three CUTLASS NVFP4 GEMMs and the fp32 SwiGLU, as the expert provider of
-              ``beam_dispatch_combine``; the combination (bf16 routes, fp32 ascending-expert
-              sum, x2.5, bf16) is unchanged, and the one MoE all-reduce sums the four bf16 rank
-              partials in fp32 and rounds the sum to bf16 once
+              input_scale * weight_scale_2`` ``[256]`` fp32. The up and gate banks of a layer
+              are the two halves of one ``[up; gate]`` storage (``[256, 2 * rows, K/2]`` codes,
+              ``[256, 2 * rows * K/16]`` scales), the FC1 operand of the grouped GEMM, so the
+              fused operand is a view rather than a second copy
+    compute   ``routed_experts.nvfp4_routed_experts``: every (token, route) as one row of the
+              CUTLASS NVFP4 grouped GEMM (fp32 SwiGLU of bf16 gate and up, rounded to bf16
+              before the FC2 quantization), then the combination (bf16 routes, fp32
+              ascending-expert sum, x2.5, bf16) on the device; the one MoE all-reduce sums the
+              four bf16 rank partials in fp32 and rounds the sum to bf16 once
 
 Loading streams bounded tiles straight into that storage and is a transaction: metadata
 (config.json, hf_quant_config.json, every index/header entry) is validated against the whole
 model before any storage changes, and the component is usable only after every rank loaded
-every selected tensor. Every parameter, bank and derived scalar is a registered parameter, so
+every selected tensor. The grouped GEMM takes one FC1 input scale and one alpha for gate and up
+and one FC2 input scale per layer, so loading also proves that every sparse layer's stored
+scales are exactly that (``check_expert_scales``) and refuses the checkpoint otherwise; no scale
+is recomputed or merged. Every parameter, bank and derived scalar is a registered parameter, so
 ``weight_state`` covers packed codes, block scales and scalars.
+
+``expert.nvfp4_swiglu_expert`` under ``dispatch_combine.beam_dispatch_combine`` computes the same
+experts one selected expert at a time with host-enumerated dispatch; it stays as the independent
+reference the provider is compared with, not as a serving path.
 """
 
 from __future__ import annotations
@@ -50,8 +60,7 @@ from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
-from . import dispatch_combine
-from . import expert as nvfp4_expert
+from . import routed_experts
 from .component_bf16 import (
     MAX_TOKENS,
     BeamCheckpointLayoutBf16Sm103Tp4,
@@ -90,10 +99,68 @@ _SM = (10, 3)
 #: Bank fields of one projection kind of one sparse layer.
 BANK_FIELDS = ("weight", "weight_scale", "input_scale", "weight_scale_2", "g", "alpha")
 _KINDS = tuple(p.removesuffix("_proj") for p in PROJECTIONS)
+#: The kinds whose banks share one FC1 storage, in its row order: the grouped GEMM reads
+#: ``[w3; w1]`` = ``[up; gate]``.
+FC1_KINDS = ("up", "gate")
 
 
 def _f32_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def check_expert_scales(layer: int, scales: Mapping[str, Mapping[str, torch.Tensor]]) -> None:
+    """Raise ``CheckpointFormatError`` unless sparse layer ``layer``'s scales fit the grouped GEMM.
+
+    ``scales[kind][field]`` is the ``[256]`` fp32 ``input_scale`` / ``weight_scale_2`` of
+    projection kind ``gate``, ``up`` or ``down``. The operator takes one FC1 input scale and one
+    alpha per expert for gate and up together, and one FC2 input scale, so required, bit for
+    bit: gate and up input scales equal and the same for every expert, gate and up
+    ``weight_scale_2`` equal per expert, and one down input scale for every expert. The stored
+    values are used as they are; none is replaced by a maximum or recomputed to fit.
+    """
+
+    def bits(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().to(torch.float32).cpu().view(torch.int32)
+
+    gate_in, up_in = bits(scales["gate"]["input_scale"]), bits(scales["up"]["input_scale"])
+    gate_w2, up_w2 = bits(scales["gate"]["weight_scale_2"]), bits(scales["up"]["weight_scale_2"])
+    down_in = bits(scales["down"]["input_scale"])
+    problems = []
+    if not torch.equal(gate_in, up_in):
+        problems.append("gate and up input scales differ")
+    if not bool((gate_in == gate_in[0]).all()):
+        problems.append("the FC1 input scale differs between experts")
+    if not torch.equal(gate_w2, up_w2):
+        problems.append("gate and up weight_scale_2 differ")
+    if not bool((down_in == down_in[0]).all()):
+        problems.append("the FC2 input scale differs between experts")
+    if problems:
+        raise CheckpointFormatError(
+            f"sparse layer {layer}: the grouped-GEMM experts need one FC1 input scale and alpha "
+            f"for gate and up and one FC2 input scale per layer; {', '.join(problems)}"
+        )
+
+
+def _joined(first: torch.Tensor, second: torch.Tensor, dim: int) -> Optional[torch.Tensor]:
+    """``first`` and ``second`` concatenated along ``dim`` as one contiguous view of their storage.
+
+    None unless both are equally shaped views of one storage in which ``second`` starts where
+    ``first`` ends along ``dim`` and the joined tensor is contiguous -- the layout of the two
+    halves of a fused bank. Reads tensor metadata only.
+    """
+    if (
+        first.shape != second.shape
+        or first.stride() != second.stride()
+        or first.dtype != second.dtype
+        or first.device != second.device
+        or first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
+        or second.storage_offset() != first.storage_offset() + first.shape[dim] * first.stride(dim)
+    ):
+        return None
+    size = list(first.shape)
+    size[dim] *= 2
+    joined = first.as_strided(size, first.stride(), first.storage_offset())
+    return joined if joined.is_contiguous() else None
 
 
 class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
@@ -150,6 +217,8 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self.bank_names: list = []
         self.expert_names: list = []
         experts = config["num_experts"]
+        # Per sparse layer: the [up; gate] codes and swizzled block scales the FC1 banks view.
+        fc1_storage = {}
         for spec in self.specs.values():
             if isinstance(spec, QuantSpec):
                 self.expert_names.append(spec.name)
@@ -157,20 +226,41 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
                     continue
                 rows, half = spec.local_packed_shape(self.rank)
                 _, scale_cols = spec.local_scale_shape(self.rank)
-                fields = {
-                    "weight": ((experts, rows, half), torch.uint8),
-                    "weight_scale": ((experts, swizzled_numel(rows, scale_cols)), torch.uint8),
-                    "input_scale": ((experts,), torch.float32),
-                    "weight_scale_2": ((experts,), torch.float32),
-                    "g": ((experts,), torch.float32),
-                    "alpha": ((experts,), torch.float32),
-                }
-                for field, (shape, dtype) in fields.items():
+                scale_bytes = swizzled_numel(rows, scale_cols)
+                kind = spec.proj.removesuffix("_proj")
+                if kind in FC1_KINDS:
+                    if spec.layer not in fc1_storage:
+                        fc1_storage[spec.layer] = (
+                            torch.empty(
+                                (experts, 2 * rows, half), dtype=torch.uint8, device=device
+                            ),
+                            torch.empty(
+                                (experts, 2 * scale_bytes), dtype=torch.uint8, device=device
+                            ),
+                        )
+                    codes, scales = fc1_storage[spec.layer]
+                    part = FC1_KINDS.index(kind)
+                    if codes.shape[1:] != (2 * rows, half) or scales.shape[1] != 2 * scale_bytes:
+                        raise ValueError(f"layer {spec.layer}: gate and up slices differ in shape")
+                    storage = {
+                        "weight": codes[:, part * rows : (part + 1) * rows],
+                        "weight_scale": scales[:, part * scale_bytes : (part + 1) * scale_bytes],
+                    }
+                else:
+                    storage = {
+                        "weight": torch.empty(
+                            (experts, rows, half), dtype=torch.uint8, device=device
+                        ),
+                        "weight_scale": torch.empty(
+                            (experts, scale_bytes), dtype=torch.uint8, device=device
+                        ),
+                    }
+                for field in BANK_FIELDS[2:]:
+                    storage[field] = torch.empty((experts,), dtype=torch.float32, device=device)
+                for field in BANK_FIELDS:
                     self.register_parameter(
                         _attr(f"{spec.bank}.{field}"),
-                        nn.Parameter(
-                            torch.empty(shape, dtype=dtype, device=device), requires_grad=False
-                        ),
+                        nn.Parameter(storage[field], requires_grad=False),
                     )
                 self.bank_names.append(spec.bank)
                 continue
@@ -188,6 +278,8 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self._init_diagnostics()
         #: Per sparse layer, per global expert: gate and up input scales bitwise equal.
         self._shared_fc1: dict = {}
+        #: Per sparse layer: (the bank parameters, the grouped GEMM's operands viewing them).
+        self._operands: dict = {}
 
     # ------------------------------------------------------------------ storage
 
@@ -213,6 +305,43 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             kind: {f: self.bank(f"layers.{layer}.experts.{kind}", f) for f in BANK_FIELDS}
             for kind in _KINDS
         }
+
+    def expert_operands(self, layer: int) -> routed_experts.ExpertOperands:
+        """The grouped GEMM's operands of sparse layer ``layer``: views of its current banks.
+
+        Resolved from the registered parameters, so a replaced bank is what the next call uses;
+        the views are rebuilt only when a parameter object changes. The up and gate banks must
+        still be the two adjacent halves of one storage (as construction allocates them), else
+        ``RuntimeError``. Reads tensor metadata only.
+        """
+        bank = self.expert_bank(layer)
+        params = tuple(bank[kind][field] for kind in _KINDS for field in BANK_FIELDS)
+        cached = self._operands.get(layer)
+        if cached is not None and len(cached[0]) == len(params):
+            if all(a is b for a, b in zip(cached[0], params)):
+                return cached[1]
+        up, gate, down = bank["up"], bank["gate"], bank["down"]
+        codes = _joined(up["weight"], gate["weight"], 1)
+        scales = _joined(up["weight_scale"], gate["weight_scale"], 1)
+        if codes is None or scales is None:
+            raise RuntimeError(
+                f"layer {layer}: the up and gate banks are no longer the two halves of one FC1 "
+                "storage; the grouped GEMM reads them as one operand"
+            )
+        experts, fc1_rows, half = codes.shape
+        hidden = down["weight"].shape[1]
+        operands = routed_experts.ExpertOperands(
+            fc1_weight=codes.view(torch.int64),
+            fc1_block_scales=scales.view(experts, fc1_rows, -1).view(torch.int32),
+            fc1_alpha=gate["alpha"],
+            fc1_input_scale_inv=gate["g"][0],
+            fc2_weight=down["weight"].view(torch.int64),
+            fc2_block_scales=down["weight_scale"].view(experts, hidden, -1).view(torch.int32),
+            fc2_input_scale_inv=down["g"],
+            fc2_alpha=down["alpha"],
+        )
+        self._operands[layer] = (params, operands)
+        return operands
 
     def expert_storage(self, layer: int, expert: int, proj: str) -> dict:
         """Views of one expert projection's rank-local storage (``proj`` in ``PROJECTIONS``)."""
@@ -273,12 +402,17 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             raise CheckpointFormatError(f"non-finite or non-positive scalars: {bad[:4]}")
         n_experts = self.config["num_experts"]
         shared = [False] * n_experts
+        stored = {}
         for kind in _KINDS:
             s = torch.empty(n_experts, dtype=torch.float32)
             w2 = torch.empty(n_experts, dtype=torch.float32)
             for e in range(n_experts):
                 p = f"model.layers.{layer}.mlp.experts.{e}.{kind}_proj"
                 s[e], w2[e] = values[p + ".input_scale"], values[p + ".weight_scale_2"]
+            stored[kind] = {"input_scale": s, "weight_scale_2": w2}
+        check_expert_scales(layer, stored)
+        for kind in _KINDS:
+            s, w2 = stored[kind]["input_scale"], stored[kind]["weight_scale_2"]
             g = torch.ones(n_experts, dtype=torch.float32) / s
             alpha = s * w2
             bank = f"layers.{layer}.experts.{kind}"
@@ -306,9 +440,10 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         stored tensor of the whole model must be exactly what the layout needs before any
         storage changes. Expert codes and block-scale bytes are copied unchanged (block scales
         then swizzled), scalars must be finite and positive, block scales finite and
-        non-negative. The component is unusable from the first write until every rank reports a
-        complete load; a failure on any rank raises ``LoadError`` on all ranks. Returns the
-        load record (recipe, coverage, source digests, bytes read).
+        non-negative, and every sparse layer's scales must fit the grouped GEMM
+        (``check_expert_scales``). The component is unusable from the first write until every
+        rank reports a complete load; a failure on any rank raises ``LoadError`` on all ranks.
+        Returns the load record (recipe, coverage, source digests, bytes read).
         """
         self._check_diagnostics_agree()
         error: Optional[BaseException] = None
@@ -340,6 +475,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self.usable = False
         self.load_record = None
         self._shared_fc1 = {}
+        self._operands = {}
         coverage = OrderedDict()
         scalars = OrderedDict()
         reader = None
@@ -386,6 +522,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         )
         if not self._agree(complete):
             self._shared_fc1 = {}
+            self._operands = {}
             raise LoadError(
                 f"rank {self.rank}: load did not complete on every rank: {error!r}"
             ) from error
@@ -394,7 +531,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             "checkpoint_dir": os.fspath(checkpoint_dir),
             "layers": list(self.layers),
             "recipe": recipe,
-            "contract": dict(nvfp4_expert.CONTRACT),
+            "contract": dict(routed_experts.CONTRACT),
             "tensors": len(coverage),
             "expert_projections": len(self.expert_names),
             "scalars": dict(scalars),
@@ -411,93 +548,61 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
     def moe(self, layer: int, h: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> MoE output after the one all-reduce.
 
-        The replicated FP32 router, the diagnostic-mode all-rank agreement on its input, ids
-        and weights and the combination are the BF16 component's; each selected expert runs
-        ``expert.nvfp4_swiglu_expert`` on this rank's packed slice. The rank partials are
-        reduced once, in FP32, then rounded to BF16.
+        The replicated FP32 router and the diagnostic-mode all-rank agreement on its input, ids
+        and weights are the BF16 component's; the experts and their combination run on the
+        device (``routed_experts.nvfp4_routed_experts``) on this rank's packed slice. The rank
+        partials are reduced once, in FP32, then rounded to BF16.
         """
         routing = self.route(layer, h)
         ids, weights = routing["ids"], routing["weights"]
         digests = self._digests_agree((h, ids, weights)) if self.diagnostics else None
-        bank = self.expert_bank(layer)
-        shared = self._shared_fc1[layer]
-        calls = [] if capture is not None else None
-
-        def provider(expert_id: int, rows: torch.Tensor) -> torch.Tensor:
-            return nvfp4_expert.nvfp4_swiglu_expert(rows, bank, expert_id, shared[expert_id], calls)
-
-        local = dispatch_combine.beam_dispatch_combine(h, ids, weights, provider)
+        record = {} if capture is not None else None
+        local = routed_experts.nvfp4_routed_experts(
+            h,
+            ids,
+            weights,
+            self.expert_operands(layer),
+            tune_max_rows=routed_experts.EXPERTS_PER_TOKEN * self.max_tokens,
+            record=record,
+        )
         # The four BF16 rank partials are summed once in FP32 and the sum is rounded once.
         out = self.all_reduce(local.float()).to(torch.bfloat16)
         if capture is not None:
-            _rec(capture, _moe_capture(routing, calls, local, out))
+            _rec(capture, _moe_capture(routing, record, out))
             if digests is not None:
                 capture["moe.agreement_sha256"] = digests
         return out
 
 
-def _flat_with_offsets(parts: list) -> tuple:
-    offsets = [0]
-    for p in parts:
-        offsets.append(offsets[-1] + p.numel())
-    return torch.cat([p.reshape(-1) for p in parts]), torch.tensor(offsets, dtype=torch.int64)
+def _moe_capture(routing: dict, record: dict, out: torch.Tensor) -> dict:
+    """Routing intermediates, the provider's operator inputs and per-route outputs, the output.
 
-
-def _moe_capture(routing: dict, calls: list, local: torch.Tensor, out: torch.Tensor) -> dict:
-    """Routing intermediates and every expert call's operands, in call (ascending expert) order."""
-    ids = routing["ids"]
-    tokens = [(ids == c["expert"]).any(-1).nonzero().reshape(-1) for c in calls]
-    fc1_sf, fc1_off = _flat_with_offsets([c["sf1"] for c in calls])
-    fc2_sf, fc2_off = _flat_with_offsets([c["sf2"] for c in calls])
-    items = {
+    ``moe.routes`` ``[T, 8, 5120]`` holds each route's unweighted expert output in the router's
+    slot order (``moe.ids``); ``moe.route_fc1_fp4`` / ``moe.route_fc1_sf_swizzled`` are the
+    quantized operator rows (row ``8t + j`` is token ``t``'s route ``j``).
+    """
+    return {
         "moe.logits": routing["logits"],
         "moe.scores": routing["scores"],
         "moe.selection": routing["selection_scores"],
         "moe.group_scores": routing["group_scores"],
         "moe.groups": routing["groups"],
         "moe.masked": routing["masked_selection_scores"],
-        "moe.ids": ids,
+        "moe.ids": routing["ids"],
         "moe.weights": routing["weights"],
-        "moe.call_expert": torch.cat(
-            [torch.full((c["rows"].shape[0],), c["expert"], dtype=torch.int64) for c in calls]
-        ),
-        "moe.call_token": torch.cat(tokens),
-        "moe.call_rows": torch.tensor([c["rows"].shape[0] for c in calls], dtype=torch.int64),
-        "moe.call_shared_fc1": torch.tensor([c["fc1_up"] is None for c in calls]),
-        "moe.call_scalars": torch.stack([c["scalars"] for c in calls]),
-        "moe.expert_in": torch.cat([c["rows"] for c in calls]),
-        "moe.fc1_fp4": torch.cat([c["fc1"] for c in calls]),
-        "moe.fc1_sf_swizzled": fc1_sf,
-        "moe.fc1_sf_offsets": fc1_off,
-        "moe.gate": torch.cat([c["gate"] for c in calls]),
-        "moe.up": torch.cat([c["up"] for c in calls]),
-        "moe.silu": torch.cat([c["silu"] for c in calls]),
-        "moe.product": torch.cat([c["product"] for c in calls]),
-        "moe.act": torch.cat([c["act"] for c in calls]),
-        "moe.fc2_fp4": torch.cat([c["fc2"] for c in calls]),
-        "moe.fc2_sf_swizzled": fc2_sf,
-        "moe.fc2_sf_offsets": fc2_off,
-        "moe.tp.y": torch.cat([c["y"] for c in calls]),
-        "moe.tp.local_out": local,
+        "moe.route_fc1_fp4": record["route_fc1_fp4"],
+        "moe.route_fc1_sf_swizzled": record["route_fc1_sf_swizzled"],
+        "moe.routes": record["routes"],
+        "moe.tp.local_out": record["local"],
         "moe.output": out,
         "mlp_out": out,
     }
-    unshared = [c for c in calls if c["fc1_up"] is not None]
-    if unshared:
-        sf, off = _flat_with_offsets([c["sf1_up"] for c in unshared])
-        items.update(
-            {
-                "moe.fc1_up_expert": torch.tensor([c["expert"] for c in unshared]),
-                "moe.fc1_up_fp4": torch.cat([c["fc1_up"] for c in unshared]),
-                "moe.fc1_up_sf_swizzled": sf,
-                "moe.fc1_up_sf_offsets": off,
-            }
-        )
-    return items
 
 
 __all__ = [
     "BANK_FIELDS",
+    "FC1_KINDS",
     "BeamCheckpointLayoutNvfp4Sm103Tp4",
     "LoadError",
+    "check_expert_scales",
 ]

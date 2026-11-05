@@ -110,6 +110,25 @@ class LoadError(RuntimeError):
     """A load failed on at least one rank; the component is not usable on any rank."""
 
 
+def capturing() -> bool:
+    """Whether the current CUDA stream is capturing a graph; False where CUDA is unavailable."""
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def check_eager_diagnostics() -> None:
+    """Raise ``RuntimeError`` under CUDA graph capture: diagnostic validation reads the device back.
+
+    Diagnostic mode (``TRTLLM_MODELING_V2_VALIDATE``) compares device values on the host and
+    agrees on host digests across ranks, so it is an eager-execution mode; a captured graph
+    would bake one capture-time answer into every replay. Serve with CUDA graphs off to use it.
+    """
+    if capturing():
+        raise RuntimeError(
+            f"diagnostic validation ({MODELING_V2_VALIDATE_ENV}) reads device values back and runs "
+            "eagerly only; it cannot run under CUDA graph capture"
+        )
+
+
 def check_max_tokens(max_tokens: int) -> int:
     """Return ``max_tokens`` if it is a positive int (the most tokens one call accepts)."""
     if type(max_tokens) is not int or max_tokens < 1:
@@ -447,8 +466,10 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         """Raise unless every rank holds byte-identical ``tensors``; return this rank's digests.
 
         Diagnostic (``self.diagnostics``): host hashing of device copies and one all-gather,
-        called on every rank alike or on none.
+        called on every rank alike or on none. It reads the device back, so it runs eagerly
+        only; under CUDA graph capture it raises ``RuntimeError`` instead.
         """
+        check_eager_diagnostics()
         digests = []
         for t in tensors:
             h = hashlib.sha256(f"{t.dtype}{list(t.shape)}".encode())
@@ -465,10 +486,26 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     # ------------------------------------------------------------------ computations
 
     @torch.no_grad()
-    def embed(self, token_ids: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
-        """Global token ids ``[T]`` int64 -> replicated embeddings ``[T, hidden]`` bf16."""
+    def embed(
+        self, token_ids: torch.Tensor, capture: Optional[dict] = None, *, ids_admitted: bool = False
+    ) -> torch.Tensor:
+        """Global token ids ``[T]`` int64 -> replicated embeddings ``[T, hidden]`` bf16.
+
+        An id outside ``[0, vocab)`` is refused, never embedded as zeros. A direct eager call
+        checks the values on the host (``ValueError``; one device read). ``ids_admitted`` states
+        that the ids are an engine step's -- prompt ids its admission check validated, the
+        others produced in range by its sampler and drafter -- and then, as under CUDA graph
+        capture, the check is an asynchronous device assertion: nothing is read back, so a
+        captured or overlapped step never waits on it.
+        """
         self._check_usable()
-        _check_ids(token_ids, self.config["vocab_size"], self.device, self.max_tokens)
+        _check_ids(
+            token_ids,
+            self.config["vocab_size"],
+            self.device,
+            self.max_tokens,
+            values_on_host=not ids_admitted and not capturing(),
+        )
         lo, hi = self.vocab_interval
         inside = (token_ids >= lo) & (token_ids < hi)
         local = nn.functional.embedding(
@@ -797,20 +834,38 @@ def _check_hidden(
 
 
 def _check_ids(
-    ids: torch.Tensor, vocab: int, device: torch.device, max_tokens: int = MAX_TOKENS
+    ids: torch.Tensor,
+    vocab: int,
+    device: torch.device,
+    max_tokens: int = MAX_TOKENS,
+    *,
+    values_on_host: bool = True,
 ) -> None:
+    """Refuse token ids of the wrong kind, count or device, or with a value outside ``[0, vocab)``.
+
+    The kind, count and device are host metadata. The values are compared on the device and
+    either read back (``values_on_host``: ``ValueError``) or asserted asynchronously on the
+    device, which reads nothing back and fails the CUDA context on an out-of-range id.
+    """
     if not isinstance(ids, torch.Tensor) or ids.dtype != torch.int64 or ids.dim() != 1:
         raise ValueError("token ids must be a 1-D torch.int64 tensor")
     if ids.device != device or not 1 <= ids.shape[0] <= max_tokens:
         raise ValueError(f"token ids must hold 1..{max_tokens} ids on the component's device")
-    if bool(((ids < 0) | (ids >= vocab)).any()):
-        raise ValueError(f"token ids must be in [0, {vocab})")
+    if values_on_host:
+        if bool(((ids < 0) | (ids >= vocab)).any()):
+            raise ValueError(f"token ids must be in [0, {vocab})")
+    else:
+        torch._assert_async(
+            ((ids >= 0) & (ids < vocab)).all(), f"token ids must be in [0, {vocab})"
+        )
 
 
 __all__ = [
     "BeamCheckpointLayoutBf16Sm103Tp4",
     "LoadError",
     "MAX_TOKENS",
+    "capturing",
+    "check_eager_diagnostics",
     "check_max_tokens",
     "TensorSpec",
 ]

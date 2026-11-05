@@ -294,6 +294,31 @@ def test_route_refuses_an_unsupported_token_budget_before_reading_the_checkpoint
         _router_index.modeling_v2_resolve(config, args)
 
 
+@pytest.mark.parametrize(
+    "tokens,refused",
+    [
+        ([0, 17, 151935], False),
+        ([], False),
+        ([5, 151936], True),
+        ([-1, 5], True),
+        ([200000], True),
+    ],
+)
+def test_admission_refuses_out_of_range_prompt_ids(tokens, refused):
+    """The forward never reads its ids back, so an out-of-range prompt id is refused on
+    admission, as that request's own ValueError, from the request's host-side tokens."""
+    target = routing_module("BeamForCausalLM").route(
+        _beam_config(), _mapping(), (10, 3), None, None
+    )
+    shell = SimpleNamespace(model=SimpleNamespace(vocab_size=151936))
+    request = SimpleNamespace(get_tokens=lambda beam: list(tokens) if beam == 0 else None)
+    if refused:
+        with pytest.raises(ValueError, match=r"prompt token ids must be in \[0, 151936\)"):
+            target.validate_request(shell, request)
+    else:
+        target.validate_request(shell, request)
+
+
 @pytest.mark.parametrize("max_num_tokens", [1, 8192])
 def test_route_accepts_token_budget_boundaries(max_num_tokens):
     route = routing_module("BeamForCausalLM").route
@@ -344,11 +369,13 @@ def _mtp():
 
 
 def test_route_claims_the_dflash_deployment():
+    """With the overlap scheduler on or off: the target reads corrected positions on the device."""
     route = routing_module("BeamForCausalLM").route
     target = route(_beam_config(), _mapping(), (10, 3), _dflash(), None)
     assert target.__name__ == "ModelingV2BeamFullModelNvfp4Sm103Tp4"
-    args = SimpleNamespace(disable_overlap_scheduler=True)
-    assert route(_beam_config(), _mapping(), (10, 3), _dflash(), None, llm_args=args) is target
+    for overlap_off in (True, False):
+        args = SimpleNamespace(disable_overlap_scheduler=overlap_off)
+        assert route(_beam_config(), _mapping(), (10, 3), _dflash(), None, llm_args=args) is target
 
 
 @pytest.mark.parametrize(
@@ -361,14 +388,9 @@ def test_route_claims_the_dflash_deployment():
         (lambda: _dflash(draft_len_schedule={1: 7, 4: 3}), None, "draft_len_schedule"),
         (lambda: _dflash(use_rejection_sampling=True), None, "rejection sampling"),
         (lambda: _dflash(speculative_model=None), None, "drafter checkpoint"),
-        (
-            lambda: _dflash(),
-            SimpleNamespace(disable_overlap_scheduler=False),
-            "overlap scheduler",
-        ),
         (lambda: _mtp(), None, "is not DFlash"),
     ],
-    ids=["vanilla", "fa4", "k15", "k3", "schedule", "rejection", "no-drafter", "overlap", "mtp"],
+    ids=["vanilla", "fa4", "k15", "k3", "schedule", "rejection", "no-drafter", "mtp"],
 )
 def test_route_refuses_other_speculation_clearly(spec, args, reason):
     route = routing_module("BeamForCausalLM").route

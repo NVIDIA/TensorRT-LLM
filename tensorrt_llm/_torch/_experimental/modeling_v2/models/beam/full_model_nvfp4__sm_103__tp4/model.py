@@ -37,10 +37,17 @@ sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 4
 runs; a call with T above ``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
 the supported deployment's native ``max_num_tokens``).
 
-Validation runs once per call: the step's metadata and request lengths, the token-id range (one
-device comparison read back), the cache manager's geometry once per manager. The expert
-dispatch synchronizes with the host per sparse layer. Diagnostic mode (``diagnostics``,
-``TRTLLM_MODELING_V2_VALIDATE``) adds the position and ``gather_ids`` value comparisons, the
+Validation runs once per call, on what the host knows exactly: the step's request structure
+(``_attention.check_batch_metadata``: request kinds, new-token counts, the speculative shape,
+the cache's capacity and geometry) and the cache manager's geometry once per manager, plus the
+token-id range (``embed``). Nothing in an ordinary call reads the device back: the experts run
+on the device (``routed_experts``), and with ``ids_admitted`` (the engine's ids) the token-id
+range is an asynchronous device assertion, so a step can be captured in a CUDA graph and
+prepared ahead by the overlap scheduler. Live positions and KV lengths are the device's: the
+engine corrects them there after the host prepared the step (speculative acceptance under the
+overlap scheduler), and the attention op reads them from the metadata's device tensors.
+Diagnostic mode (``diagnostics``, ``TRTLLM_MODELING_V2_VALIDATE``) adds, eagerly only, the
+position check against those device KV lengths, the ``gather_ids`` value comparison, the
 per-layer metadata re-checks and the per-sparse-layer router agreement across ranks.
 """
 
@@ -55,6 +62,7 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from . import _attention
 from .component import BeamCheckpointLayoutNvfp4Sm103Tp4
+from .component_bf16 import check_eager_diagnostics
 
 #: Logical decoder layers, all executed by every call.
 NUM_LAYERS = 52
@@ -201,12 +209,14 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         generation request and ``extra_kv_tokens`` reserved KV slots per request;
         ``position_ids``: an integer tensor of T positions, each request's
         ``past .. past + n - 1`` in request order. Returns the flat ids, the flat int64
-        positions and the spans ``[(past, n), ...]`` of ``_attention.check_batch_metadata``.
+        positions and the spans ``[(past, n), ...]`` of ``_attention.check_batch_metadata``
+        (``past`` there is the host's value; the device KV lengths are the live authority).
         Raises ValueError otherwise.
 
         Every call re-validates its requests (the step's metadata changes every step); the
         manager's fixed geometry is checked once per manager. Comparing the positions' values
-        with the spans reads the device back, so it runs in diagnostic mode only.
+        with the device KV lengths reads the device back, so it runs in diagnostic mode only,
+        eagerly (``_check_positions``; under CUDA graph capture diagnostic mode raises).
         """
         if not isinstance(input_ids, torch.Tensor) or input_ids.dtype != torch.int64:
             raise ValueError("input_ids must be a torch.int64 tensor")
@@ -254,18 +264,40 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         positions = position_ids.reshape(-1).to(torch.int64)
         if not self.diagnostics:
             return input_ids, positions, spans
-        expected = torch.cat([torch.arange(past, past + n, dtype=torch.int64) for past, n in spans])
-        if not torch.equal(positions, expected.to(self.device, non_blocking=True)):
-            got, start = positions.cpu(), 0
-            for i, (past, n) in enumerate(spans):
-                if not torch.equal(got[start : start + n], expected[start : start + n]):
-                    break
-                start += n
-            raise ValueError(
-                f"request {i} of the call appends tokens {past}..{past + n - 1} after {past} "
-                "cached tokens; its positions must be exactly those"
-            )
+        check_eager_diagnostics()
+        self._check_positions(positions, attn_metadata, spans)
         return input_ids, positions, spans
+
+    def _check_positions(
+        self, positions: torch.Tensor, attn_metadata: TrtllmAttentionMetadata, spans: list
+    ) -> None:
+        """Diagnostic: raise ValueError unless every request's rows sit right before its KV end.
+
+        The authority is the metadata's device KV lengths as the engine left them for this
+        forward, including corrections the host could not state when it prepared the step
+        (accepted speculative tokens under the overlap scheduler): request ``i`` with ``n_i``
+        new rows and device KV length ``L_i`` must place them at ``L_i - n_i .. L_i - 1``, in
+        order. One device comparison, read back.
+        """
+        counts = [n for _, n in spans]
+        n = torch.tensor(counts, dtype=torch.int64).to(self.device)
+        kv_lens = attn_metadata.kv_lens_cuda_runtime[: len(counts)].to(torch.int64)
+        starts = torch.repeat_interleave(kv_lens - n, n, output_size=positions.numel())
+        offsets = torch.cat([torch.arange(c, dtype=torch.int64) for c in counts])
+        expected = starts + offsets.to(self.device)
+        if torch.equal(positions, expected):
+            return
+        got, want, start = positions.cpu(), expected.cpu(), 0
+        for i, count in enumerate(counts):
+            if not torch.equal(got[start : start + count], want[start : start + count]):
+                break
+            start += count
+        past = int(want[start])
+        raise ValueError(
+            f"request {i} of the call appends {count} tokens after {past} cached tokens (device KV "
+            f"length {past + count}); its positions are {got[start : start + count].tolist()}, "
+            f"not {past}..{past + count - 1}"
+        )
 
     @torch.no_grad()
     def forward(
@@ -282,6 +314,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         block_output: Optional[Callable[[int, torch.Tensor], None]] = None,
         gather_ids: Optional[torch.Tensor] = None,
         return_hidden: bool = False,
+        ids_admitted: bool = False,
     ) -> Union[torch.Tensor, tuple]:
         """One engine step through all 52 layers; FP32 softcapped logits ``[R, vocab]``.
 
@@ -293,7 +326,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         ``block_output`` is called with each layer's completed block output. ``gather_ids``,
         the engine's own logits rows when it states them, must name exactly the rows
         ``logit_rows`` selects. With ``return_hidden`` the result is ``(logits, x)``, ``x``
-        the last block's output ``[T, hidden]`` before the final norm.
+        the last block's output ``[T, hidden]`` before the final norm. ``ids_admitted`` states
+        that ``input_ids`` are an engine step's, whose range the engine's admission check and
+        sampler guarantee (``embed``).
         """
         self._check_usable()
         ids, positions, spans = self.check_call(
@@ -307,7 +342,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         rows = self._select_rows(logit_rows, spans, attn_metadata.num_contexts)
         if gather_ids is not None:
             self._check_gather_ids(gather_ids, rows)
-        x = self.embed(ids)
+        x = self.embed(ids, ids_admitted=ids_admitted)
         if trace is not None:
             trace.append({"stage": "embed", "tokens": num_tokens, "requests": spans})
         for layer in range(NUM_LAYERS):

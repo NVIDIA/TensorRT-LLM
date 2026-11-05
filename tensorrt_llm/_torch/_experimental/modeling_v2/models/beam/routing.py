@@ -31,9 +31,10 @@ def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Opt
     The one speculative mode is DFlash with a separate drafter checkpoint, the TRTLLM draft
     attention backend (the drafter's context in its paged KV-cache layers), a fixed
     draft length of ``DFLASH_MAX_DRAFT_LEN`` and strict greedy verification (no rejection
-    sampling, no draft-length schedule). The engine must run it eagerly: the overlap
-    scheduler would hand the target device-corrected positions and KV lengths its host-side
-    step check cannot state.
+    sampling, no draft-length schedule). CUDA graphs and the overlap scheduler are the engine's
+    choice: the target's host-side step check states only the step's structure, and positions
+    and KV lengths the overlap scheduler corrects on the device are read there. ``llm_args`` is
+    accepted for the routing interface; no engine setting refuses DFlash here.
     """
     if spec_config is None:
         return None
@@ -53,8 +54,6 @@ def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Opt
         return "a DFlash draft_len_schedule changes the verification width per step"
     if spec_config.use_rejection_sampling:
         return "DFlash rejection sampling; verification is strict greedy"
-    if llm_args is not None and not llm_args.disable_overlap_scheduler:
-        return "the overlap scheduler with DFlash"
     return None
 
 
@@ -163,5 +162,5 @@ def route(
         "TP4/EP1, PP1, with a BF16 or FP8 KV cache and without attention DP, at most 8192 "
         "tokens per engine step, with speculative decoding "
         f"off or DFlash (TRTLLM draft attention, max_draft_len {DFLASH_MAX_DRAFT_LEN}, strict "
-        "greedy verification, no overlap scheduler)"
+        "greedy verification)"
     )

@@ -20,9 +20,12 @@ Each engine step is the native runtime's batch of one or more requests (up to th
 
 Both return FP32 softcapped logits ``[rows, 151936]`` in request order; the engine's
 TorchSampler selects tokens from them. The KV cache is the engine's ``KVCacheManagerV2``; the
-component validates its layers, windows and the step's metadata before any kernel runs. Eager
-execution only: the expert provider synchronizes with the host, so CUDA graphs and the overlap
-scheduler are not supported.
+component validates its layers, windows and the step's request structure before any kernel
+runs. The prompt ids of a new request are range-checked on admission (``validate_request``), on
+the host, so a step reads nothing back: the experts run on the device and the step's ids are
+asserted in range on the device. A generation step can therefore run as the engine's CUDA graph
+and be prepared ahead by its overlap scheduler, whose speculative corrections to positions and
+KV lengths are applied on the device and read there; context-containing steps run eagerly.
 
 With a DFlash speculative config (``routing.route`` admits only the DFlash 2 drafter on the
 TRTLLM draft-attention backend) the target composes the native one-model pieces rather than a
@@ -56,6 +59,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .component_bf16 import capturing
 from .layout import (
     EMBED,
     HEAD,
@@ -97,7 +101,11 @@ def _log_trace(phase: str, trace: list) -> None:
 
 
 class _Target:
-    """One engine step through all 52 layers; traces the first single- and multi-request step."""
+    """One engine step through all 52 layers; traces the first single- and multi-request step.
+
+    The step's ids are the engine's (``ids_admitted``). A step under CUDA graph capture is not
+    traced: its eager warmup run was.
+    """
 
     phase = ""
 
@@ -107,9 +115,15 @@ class _Target:
 
     def _run(self, attn_metadata, input_ids, position_ids, logit_rows, **kwargs):
         kind = "batched" if attn_metadata.num_seqs > 1 else "single-request"
-        trace = None if kind in self.traced else []
+        trace = None if kind in self.traced or capturing() else []
         out = self.model(
-            input_ids, position_ids, attn_metadata, logit_rows=logit_rows, trace=trace, **kwargs
+            input_ids,
+            position_ids,
+            attn_metadata,
+            logit_rows=logit_rows,
+            trace=trace,
+            ids_admitted=True,
+            **kwargs,
         )
         if trace is not None:
             self.traced.add(kind)
@@ -357,6 +371,22 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
     @property
     def vocab_size_padded(self) -> int:
         return self.model.vocab_size
+
+    def validate_request(self, request) -> None:
+        """Admission check, run by the executor on every new request: prompt ids in vocabulary.
+
+        A step never reads its ids back -- the forward asserts their range on the device -- so
+        an out-of-range prompt id is refused here, on the host, as that request's own
+        ``ValueError``, before any of its tokens reach a step. Every rank admits the same
+        requests and decides alike. Reads the request's host-side tokens only.
+        """
+        tokens = request.get_tokens(0)
+        vocab = self.model.vocab_size
+        if tokens and (min(tokens) < 0 or max(tokens) >= vocab):
+            raise ValueError(
+                f"prompt token ids must be in [0, {vocab}); the request holds ids from "
+                f"{min(tokens)} to {max(tokens)}"
+            )
 
     def load_checkpoint(self, checkpoint_dir: str, kv_cache_scales: Optional[dict] = None) -> dict:
         """Fill every parameter from ``checkpoint_dir`` (collective; see the component's load).
@@ -676,6 +706,13 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         """Drop a received draft-context cursor that was never bound to a drafter slot."""
         if self.spec_worker is not None:
             self.spec_worker.release_request_state(request_id)
+
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        """Hand the executor's capturable guided decoder to the DFlash worker, which masks the
+        verification rows and rolls back rejected proposals (as SpecDecOneEngineForCausalLM)."""
+        if self.spec_worker is not None and hasattr(self.spec_worker, "set_guided_decoder"):
+            return self.spec_worker.set_guided_decoder(guided_decoder)
+        return False
 
     def forward(
         self,

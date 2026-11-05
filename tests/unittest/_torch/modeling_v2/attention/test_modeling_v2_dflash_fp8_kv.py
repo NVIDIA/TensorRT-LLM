@@ -320,6 +320,191 @@ def test_stale_tail_and_foreign_pages_contribute_nothing(ctx):
 
 
 # ---------------------------------------------------------------------------------------------
+# Exact read-outs, eagerly and from CUDA-graph replays
+# ---------------------------------------------------------------------------------------------
+#
+# The one-model runtime runs the draft step inside its captured generation graphs: the window
+# gather from the device context lengths and block table, then this read. `_CapturedRead`
+# captures that pair once and replays it after writing a request's query block, pool contents,
+# block table and context length into the graph's buffers.
+
+#: Q and the hot K are this value in every element: the hot logit is 128 * 36 / sqrt(128) ~ 407
+#: above every zero key's, whose softmax weight underflows to exactly 0.
+HOT = 6.0
+#: The BF16 read-out tests' relative band for a weight inside the key set.
+WINDOW_WEIGHT_RTOL = 6e-3
+
+
+def _pool_rows(ctx: int, pages_per_row: int, poison: int = 0):
+    """One request's FP8 HND pool of ``pages_per_row`` pages, in order (cf. ``_fp8_pool``)."""
+    pool = torch.full((pages_per_row, 2, HKV, PAGE, D), poison, dtype=torch.uint8, device="cuda")
+    tables = torch.arange(pages_per_row, dtype=torch.int32, device="cuda").view(1, pages_per_row)
+    return pool.view(torch.float8_e4m3fn), tables
+
+
+def _pages_for(ctx: int) -> int:
+    return (ctx + BLOCK + PAGE - 1) // PAGE + 1
+
+
+class _CapturedRead:
+    """The window gather and the FP8 windowed read captured in one CUDA graph."""
+
+    def __init__(self, q, pool, tables, num_ctx, kv_scale: float):
+        self.q = q.clone()
+        self.pool = pool.view(torch.uint8).clone().view(torch.float8_e4m3fn)
+        self.tables = tables.clone()
+        self.num_ctx = num_ctx.clone()
+        self.kv_scale = kv_scale
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self._read()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=stream, capture_error_mode="thread_local"):
+            self.out = self._read()
+        torch.cuda.synchronize()
+
+    def _read(self) -> torch.Tensor:
+        gather = dflash_window_gather(self.tables, self.num_ctx, BLOCK, WINDOW, PAGE)
+        return dflash_windowed_block_attention(
+            self.q, self.pool, gather, SCALE, kv_scale=self.kv_scale
+        )
+
+    def replay(self, q, pool, tables, num_ctx) -> torch.Tensor:
+        self.q.copy_(q)
+        self.pool.view(torch.uint8).copy_(pool.view(torch.uint8))
+        self.tables.copy_(tables)
+        self.num_ctx.copy_(num_ctx)
+        self.graph.replay()
+        torch.cuda.synchronize()
+        return self.out.clone()
+
+
+def _eager_read(q, pool, tables, num_ctx, kv_scale: float) -> torch.Tensor:
+    gather = dflash_window_gather(tables, num_ctx, BLOCK, WINDOW, PAGE)
+    return dflash_windowed_block_attention(q, pool, gather, SCALE, kv_scale=kv_scale)
+
+
+def _peaked_case(ctx: int, scale: float, hot: int, seed: int, pages_per_row: int):
+    """A block whose softmax collapses on key ``hot``; returns the read inputs and the value row
+    every query head must return: the hot key's stored codes times s, in BF16."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    n = ctx + BLOCK
+    k = torch.zeros(n, HKV, D, dtype=torch.bfloat16)
+    k[hot] = HOT
+    v = (torch.randn(n, HKV, D, generator=g) * 4 * scale).to(torch.bfloat16)
+    kc, vc = encode(k.cuda(), scale), encode(v.cuda(), scale)
+    pool, tables = _pool_rows(ctx, pages_per_row)
+    _place(pool, tables, 0, range(n), kc, vc)
+    q = torch.full((1, BLOCK, HQ, D), HOT, dtype=torch.bfloat16, device="cuda")
+    expect = decode(vc[hot], scale).to(torch.bfloat16).repeat_interleave(HQ // HKV, dim=0)
+    return (q, pool, tables, torch.tensor([ctx], device="cuda")), expect
+
+
+@pytest.mark.parametrize("execution", ["eager", "captured"])
+@pytest.mark.parametrize("scale", [2.0, 8.0, 4.0, 1.0], ids=["s2", "s8", "s4", "s1"])
+def test_peaked_read_returns_the_hot_value_row(scale, execution):
+    """A query block whose softmax collapses on one key returns, in every row and query head,
+    that key's stored codes times s rounded to BF16 (exact at a power-of-two s), bit for bit.
+    Captured: one graph serves two requests whose hot keys, values and context lengths differ."""
+    pages = _pages_for(4097)
+    cases = [
+        _peaked_case(4097, scale, hot=2048, seed=11, pages_per_row=pages),
+        _peaked_case(300, scale, hot=150, seed=12, pages_per_row=pages),
+        _peaked_case(4095, scale, hot=7, seed=13, pages_per_row=pages),
+    ]
+    read = _CapturedRead(*cases[1][0], scale) if execution == "captured" else None
+    for i, (inputs, expect) in enumerate(cases):
+        out = read.replay(*inputs) if read else _eager_read(*inputs, scale)
+        for j in range(BLOCK):
+            diff = (out[0, j].float() - expect.float()).abs().max().item()
+            assert torch.equal(out[0, j], expect), f"case {i} row {j}: not the hot V row ({diff})"
+
+
+def _onehot_window_case(ctx: int, scale: float, seed: int, pages_per_row: int):
+    """K = 0, so each row's softmax is uniform over exactly its keys, and V[t] = s * e_t for
+    t < 128 (stored as the e4m3 code of 1.0), so column t / s is key t's weight."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    n = ctx + BLOCK
+    k = torch.zeros(n, HKV, D, dtype=torch.bfloat16)
+    v = torch.zeros(n, HKV, D, dtype=torch.bfloat16)
+    for t in range(min(n, D)):
+        v[t, :, t] = scale
+    pool, tables = _pool_rows(ctx, pages_per_row)
+    _place(pool, tables, 0, range(n), encode(k.cuda(), scale), encode(v.cuda(), scale))
+    q = (torch.randn(1, BLOCK, HQ, D, generator=g) * 0.25).to(torch.bfloat16).cuda()
+    return q, pool, tables, torch.tensor([ctx], device="cuda")
+
+
+def _assert_window_weights(out: torch.Tensor, ctx: int, scale: float, label: str) -> None:
+    """Row j at position ctx + j: keys below ctx + j - 4095 carry exactly zero weight, every key
+    from there up to 127 carries 1 / n_j within the band (n_j = the row's key count)."""
+    w = out[0].float() / scale  # [BLOCK, HQ, D]
+    for j in range(BLOCK):
+        lo = max(0, ctx + j - (WINDOW - 1))
+        n = ctx + BLOCK - lo
+        assert bool((w[j, :, :lo] == 0).all()), f"{label} row {j}: a key below {lo} is attended"
+        torch.testing.assert_close(
+            w[j, :, lo:],
+            torch.full_like(w[j, :, lo:], 1.0 / n),
+            rtol=WINDOW_WEIGHT_RTOL,
+            atol=0.0,
+            msg=lambda m, j=j: f"{label} row {j}: weights inside the key set are off\n{m}",
+        )
+
+
+@pytest.mark.parametrize("execution", ["eager", "captured"])
+@pytest.mark.parametrize("ctx", [4095, 4096, 4097])
+def test_window_readout_attends_exactly_the_integer_key_set(ctx, execution):
+    """The one-hot read-out of the 4096-token window over an e4m3 pool at s = 2: each row of the
+    block gives the keys outside its integer key set exactly zero weight and the keys inside
+    their uniform weight. Captured: the graph is captured at another context length and then
+    replayed at ``ctx``, so the window follows the device context length of the replay."""
+    scale = 2.0
+    pages = _pages_for(4097)
+    inputs = _onehot_window_case(ctx, scale, seed=ctx, pages_per_row=pages)
+    if execution == "captured":
+        read = _CapturedRead(*_onehot_window_case(300, scale, seed=1, pages_per_row=pages), scale)
+        out = read.replay(*inputs)
+    else:
+        out = _eager_read(*inputs, scale)
+    _assert_window_weights(out, ctx, scale, f"{execution} ctx {ctx}")
+
+
+@pytest.mark.parametrize("ctx", [4095, 4096, 4097])
+def test_replayed_read_ignores_stale_tail_and_foreign_pages(ctx):
+    """``test_stale_tail_and_foreign_pages_contribute_nothing`` from a captured graph: replayed
+    over the poisoned pool (stale tail and interleaved foreign pages at code 0x7E), the read
+    equals the clean eager read bitwise; after the block table's first valid page is pointed at
+    the foreign page in place, the next replay leaves the oracle bounds; restoring the table
+    restores the bitwise read."""
+    scale = 4.0
+    q, pool, tables, gather, kc, vc, ref = _case(ctx, scale, seed=ctx)
+    clean = dflash_windowed_block_attention(q, pool, gather, SCALE, kv_scale=scale)
+    pool2, tables2 = _fp8_pool([ctx, ctx], poison=0x7E)
+    n = ctx + BLOCK
+    _place(pool2, tables2, 0, range(n), kc, vc)
+    raw = pool2.view(torch.uint8)
+    last_page = int(tables2[0, (n - 1) // PAGE])
+    raw[last_page, :, :, (n - 1) % PAGE + 1 :] = 0x7E
+    num_ctx = torch.tensor([ctx], device="cuda")
+    own = tables2[:1].clone()
+    read = _CapturedRead(q, pool2, own, num_ctx, scale)
+    assert torch.equal(read.replay(q, pool2, own, num_ctx), clean), (
+        "a stale or foreign slot was read"
+    )
+    bad = own.clone()
+    first = (ctx - (WINDOW - 1)) // PAGE if ctx >= WINDOW else 0
+    bad[0, first] = tables2[1, first]
+    rel_rms, worst = _metrics(read.replay(q, pool2, bad, num_ctx)[0], ref)
+    assert rel_rms > REL_RMS_BOUND or worst > WORST_ROW_BOUND, "foreign page not detected"
+    assert torch.equal(read.replay(q, pool2, own, num_ctx), clean), "the restored table differs"
+
+
+# ---------------------------------------------------------------------------------------------
 # Capability and configuration
 # ---------------------------------------------------------------------------------------------
 
