@@ -121,6 +121,7 @@ labels depend on the metric family:
 | `cache_level`, `cache_tier` | Tiered prompt cache-hit tokens | Configured level index and backing tier. Connector loads use an empty level and `connector` tier. |
 | `token_position` | Per-position speculative counters | Draft position, starting at 0; at most 16 positions are exported. |
 | `scheduler_mode` | Host-loop/device/GPU-forward timings | `overlap`, `non_overlap`, or `unknown` for missing or unrecognized modes. |
+| `outcome` | KV-transfer request outcomes | `success`, `error`, or `timeout`; one outcome per request on each reporting rank. |
 | `phase`, `outcome` | OpenEngine RPC outcomes | Execution phase and terminal RPC outcome. |
 
 Configuration info gauges add configuration values as labels and have a
@@ -222,6 +223,7 @@ not be combined in a single rate calculation.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
+| `kv_cache_transfer_requests_total` | Counter | Whole-request transfer outcomes by `dp_rank` and `outcome`; cumulative across sampled iterations. |
 | `kv_cache_allocated_blocks_total` | Counter | Positive deltas of the rank's cumulative total-allocation snapshot. |
 | `kv_cache_new_blocks_total` | Counter | Positive deltas of the rank's cumulative new-allocation snapshot. |
 | `kv_cache_evictable_blocks` | Gauge | Reclaimable primary blocks summed across reported pool groups. |
@@ -250,6 +252,22 @@ not be combined in a single rate calculation.
 | `kv_cache_disk_prefetch_blocks_total` | Counter | V2 blocks prefetched from disk to host. |
 | `kv_cache_intra_device_copy_bytes_total` | Counter | Bytes copied within the GPU for block copies. |
 | `prompt_cache_hit_tokens_total` | Counter | Prompt cache-hit tokens by `dp_rank`, `cache_level`, and `cache_tier`, accumulated from engine iteration records. |
+
+`kv_cache_transfer_requests_total` counts each request once on each reporting
+rank. `success` requires the whole KV transfer (including required auxiliary
+state) to complete, not a chunk, layer, task, or sender polling slice. `timeout`
+means the overall transfer deadline was exceeded; a later completion or cleanup
+error does not count again. Other terminal transfer failures count as `error`.
+User cancellation alone is excluded. CTX send and GEN receive workers each
+report their own side; summing both counts both endpoints.
+
+Counts accumulate on the executor CPU and ride the existing sampled iteration
+records and attention-DP exchange as three integers, without extra collectives,
+CUDA synchronization, or request iteration stats. Skipped iterations do not lose
+outcomes. Export waits for a subsequent stats record, so idle workers can show
+stale counts until another record is produced. Non-ADP uses the existing rank-0
+export ownership. This family covers disaggregated transceiver transfers, not
+external KV connector operations.
 
 The basic allocation snapshots and context-length summaries use fields
 already transported in rank-local records. Rich KV iteration details such as

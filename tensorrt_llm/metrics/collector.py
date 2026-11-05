@@ -72,6 +72,7 @@ class MetricsCollector:
             trtllm_kv_cache_transfer_bytes_total
 
         Iteration-level metrics:
+            trtllm_kv_cache_transfer_requests_total
             trtllm_kv_cache_allocated_blocks_total
             trtllm_kv_cache_new_blocks_total
             trtllm_kv_cache_evictable_blocks
@@ -402,6 +403,11 @@ class MetricsCollector:
             labelnames=iteration_labelnames)
         self._prev_allocated_blocks: dict[str, int] = {}
         self._prev_new_blocks: dict[str, int] = {}
+        self.kv_cache_transfer_requests = Counter(
+            name=self.metric_prefix + "kv_cache_transfer_requests_total",
+            documentation="Whole-request KV-transfer outcomes on this rank",
+            labelnames=[*iteration_labelnames, "outcome"])
+        self._prev_transfer_outcomes: dict[tuple[str, str], int] = {}
         self.kv_cache_evictable_blocks = Gauge(
             name=self.metric_prefix + "kv_cache_evictable_blocks",
             documentation=
@@ -1211,6 +1217,19 @@ class MetricsCollector:
             rank: Normalized data-parallel rank label.
         """
         rank_labels = {self.labelname_dp_rank: rank}
+        outcomes = iteration_stats.get("kvTransferOutcomes", {})
+        for outcome in ("success", "error", "timeout"):
+            value = outcomes.get(outcome)
+            if not isinstance(value, int) or isinstance(value,
+                                                        bool) or value < 0:
+                continue
+            key = (rank, outcome)
+            previous = self._prev_transfer_outcomes.get(key, 0)
+            if value >= previous:
+                self._log_counter(self.kv_cache_transfer_requests, {
+                    **rank_labels, "outcome": outcome
+                }, value - previous)
+            self._prev_transfer_outcomes[key] = value
 
         for field, counter in (
             ("iterSuspendedRequests", self.kv_cache_requests_suspended),

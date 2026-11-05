@@ -212,6 +212,33 @@ class TestIterationLogTimingMetrics:
 
 
 class TestExistingRankAndTransferMetrics:
+    def test_transfer_outcomes_are_cumulative_and_rank_local(self, collector):
+        for rank, counts in [(0, (2, 1, 0)), (1, (1, 0, 2)), (0, (2, 1, 0)), (0, (5, 2, 1))]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "kvTransferOutcomes": dict(zip(("success", "error", "timeout"), counts)),
+                }
+            )
+        for rank, counts in [(0, (5, 2, 1)), (1, (1, 0, 2))]:
+            for outcome, count in zip(("success", "error", "timeout"), counts):
+                assert (
+                    collector._registry.get_sample_value(
+                        "trtllm_kv_cache_transfer_requests_total",
+                        {**collector.labels, "dp_rank": str(rank), "outcome": outcome},
+                    )
+                    == count
+                )
+        # Missing/invalid values and repeated snapshots must not add outcomes.
+        collector.log_iteration_stats({"kvTransferOutcomes": {"success": -1, "error": "2"}})
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_kv_cache_transfer_requests_total",
+                {**collector.labels, "dp_rank": "0", "outcome": "success"},
+            )
+            == 5
+        )
+
     def test_existing_rank_snapshots_and_optional_kv_details(self, collector):
         for rank, total, new in [(0, 5, 3), (1, 7, 2), (0, 8, 4)]:
             collector.log_iteration_stats(

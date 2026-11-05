@@ -226,6 +226,21 @@ class TestBuildActiveRequestsForOverlap:
 
 
 class TestRankState:
+    def test_transfer_outcomes_roundtrip_with_legacy_and_kv_snapshots(self):
+        for snapshot in (None, RankKvCacheStats(20, 12, 8, 16, 10, 4, 6, 2, 0.75)):
+            for include_load in (False, True):
+                for outcomes in (None, (13, 2, 3)):
+                    payload = RankIterStatsPayload(
+                        has_iter_stats=1,
+                        iter_stats_iter=7,
+                        kv_cache_stats=snapshot,
+                        cross_kv_cache_stats=snapshot,
+                        kv_transfer_outcomes=outcomes,
+                    )
+                    state = RankState(rank=2, iter_stats=payload, num_connector_transfers=5)
+                    restored = RankState.deserialize(state.serialize(include_load))
+                    assert restored == state
+
     # RankState is the wire payload shared across attention-DP ranks. Keep its
     # serialization stable because iter-stats now ride on the same allgather.
     def test_creation(self):
