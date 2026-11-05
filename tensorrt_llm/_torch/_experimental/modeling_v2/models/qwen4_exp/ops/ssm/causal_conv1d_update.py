@@ -25,9 +25,6 @@ from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240
-#: TRT-LLM's kernel forms a slot's offset as `int slot * uint32_t conv_state_batch_stride`:
-#: a pool of this many elements or more (slots x slot stride) wraps, so the op refuses it.
-TRTLLM_SLOT_OFFSET_LIMIT = 2**32
 #: Largest conv-pool slot count the cache manager allocates for this checkpoint at a batch
 #: of at most 32. The decode step hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
@@ -502,14 +499,11 @@ class CausalConv1dUpdate(OpWrapper):
     `cpp/tensorrt_llm/thop/causalConv1dOp.cpp`); the CuTe kernel is JIT-compiled
     by `cute.compile` on its first call for the running device, sm_103 here.
 
-    Hard limits (from source, not probed: the measured pools stay far below)
-      The TRT-LLM kernel forms a slot's offset as `int slot * uint32_t
-      conv_state_batch_stride`, 32-bit unsigned elements: it wraps from slot
-      15535 at stride 276480 (tp4 / tep4) and slot 3884 at 1105920 (dep4).
-      The measured pools reach 518,123,519 (tep4) and 940,031,999 (dep4)
-      elements, under 2^31 elements and bytes. A call that would run it over a
-      pool of 2^32 elements or more (`TRTLLM_SLOT_OFFSET_LIMIT`) raises
-      ValueError instead. The CuTe kernel forms slot and row offsets in 64 bits.
+    Offsets: both kernels form a slot's offset in 64 bits (the TRT-LLM kernel
+    as `int64_t slot * conv_state_batch_stride`), so a pool past 2^32 elements
+    is addressed whole; the TRT-LLM op refuses a slot stride of 2^32 elements
+    or more, which it keeps in 32 bits. The measured pools reach 518,123,519
+    (tep4) and 940,031,999 (dep4) elements.
     """
 
     def __call__(
@@ -528,14 +522,6 @@ class CausalConv1dUpdate(OpWrapper):
         ):
             _decode_conv(x, conv_state, weight, conv_state_indices, pad_slot_id)
             return x
-        if conv_state.shape[0] * conv_state.stride(0) >= TRTLLM_SLOT_OFFSET_LIMIT:
-            last = (TRTLLM_SLOT_OFFSET_LIMIT - 1) // conv_state.stride(0)
-            raise ValueError(
-                f"a conv-state pool of {conv_state.shape[0]} slots at stride "
-                f"{conv_state.stride(0)}: TRT-LLM's C++ conv kernel addresses a slot in 32 bits "
-                f"and would wrap past slot {last}; lower free_gpu_memory_fraction or the "
-                "recurrent-state share of the KV cache"
-            )
         torch.ops.trtllm.causal_conv1d_update(
             x.unsqueeze(-1) if x.dim() == 2 else x,
             conv_state,
