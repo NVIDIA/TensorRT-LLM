@@ -1502,7 +1502,15 @@ def test_writer_result_correlation_uses_session_provenance_not_wire_id(
     monkeypatch.setattr(
         transfer_mod.disagg_diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True
     )
-    message = transfer_mod._make_kv_result_msg(2, rid, 0, True, AgentResult.SUCCESS, 256)
+    message = transfer_mod._make_kv_result_msg(
+        2,
+        rid,
+        0,
+        True,
+        AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        transfer_size=256,
+    )
     wire_message = tuple(message)
 
     receiver._process_kv_agent_result(b"sender", message)
@@ -1518,6 +1526,7 @@ def test_writer_result_correlation_uses_session_provenance_not_wire_id(
             0,
             True,
             AgentResult.SUCCESS,
+            _KV_RESULT_REPORT_TOKEN,
             transfer_size=256,
         )
 
