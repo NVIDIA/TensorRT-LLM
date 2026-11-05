@@ -12,12 +12,16 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image_21.transformer_qwen_image_
 )
 
 
-def _regular_rmsnorm_reference(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _regular_rmsnorm_reference(
+    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
     return hidden_states * torch.rsqrt(variance + eps) * weight
 
 
-def _zero_center_rmsnorm_reference(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _zero_center_rmsnorm_reference(
+    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
     return hidden_states * torch.rsqrt(variance + eps) * (weight + 1)
 
@@ -44,7 +48,9 @@ def test_attention_qk_norm_uses_regular_rmsnorm_checkpoint_scale() -> None:
     torch.testing.assert_close(q_actual, q_expected)
     torch.testing.assert_close(k_actual, k_expected)
 
-    zero_center_wrong = _zero_center_rmsnorm_reference(hidden_states, weight, eps=attention.norm_q.eps)
+    zero_center_wrong = _zero_center_rmsnorm_reference(
+        hidden_states, weight, eps=attention.norm_q.eps
+    )
     assert not torch.allclose(q_actual, zero_center_wrong)
 
 

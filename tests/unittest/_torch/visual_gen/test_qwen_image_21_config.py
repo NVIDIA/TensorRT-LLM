@@ -40,7 +40,9 @@ def test_qwen_image_21_shape_defaults_match_native_pipeline():
     assert transformer.patch_size == 1
     assert transformer.vae_scale_factor == 16
     assert transformer.latent_shape(1024, 1024) == (64, 64, 64)
-    config = QwenImage21PipelineConfig.from_manifest_and_env({"height": 1024, "width": 1024, "num_inference_steps": 40})
+    config = QwenImage21PipelineConfig.from_manifest_and_env(
+        {"height": 1024, "width": 1024, "num_inference_steps": 40}
+    )
     assert config.max_sequence_length == 4096
     assert config.guidance_scale == 1.0
     assert config.num_inference_steps == 40
