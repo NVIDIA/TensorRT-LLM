@@ -148,7 +148,6 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
 from tensorrt_llm.serve.visual_gen_utils import (check_path_response_policy,
-                                                 parse_visual_gen_params,
                                                  path_response_is_disabled)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -3909,9 +3908,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                # Parsing may read a ``format='path'`` reference from disk.
-                params = await asyncio.to_thread(parse_visual_gen_params,
-                                                 request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -4168,9 +4165,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                # Parsing may read a ``format='path'`` reference from disk.
-                params = await asyncio.to_thread(parse_visual_gen_params,
-                                                 request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )

@@ -473,7 +473,7 @@ def _create_server(
     return client
 
 
-def _create_async_client(generator: MockVisualGen, model_name: str = "test-model"):
+def _create_async_client(generator: MockVisualGen, model_name: str = "test-model", **server_kwargs):
     """Build the VISUAL_GEN server and return an ``httpx.AsyncClient`` over its
     ASGI app.
 
@@ -495,6 +495,7 @@ def _create_async_client(generator: MockVisualGen, model_name: str = "test-model
             tool_parser=None,
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,
+            **server_kwargs,
         )
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=server.app), base_url="http://testserver"
@@ -3614,3 +3615,48 @@ async def test_video_omni_invalid_reference_part(value, status, repeat, omni_ref
         resp = await client.post("/v1/videos", data={"prompt": "Invalid reference"}, files=files)
     assert resp.status_code == status, resp.text
     assert generator.last_inputs is None
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
+    tmp_path, monkeypatch
+):
+    """Request parsing, which may read ``format='path'`` references, runs on the
+    media-load pool: its size bounds the parses in flight, and a parse whose
+    request was cancelled holds its worker until it returns."""
+    from tensorrt_llm.serve import openai_video_routes
+
+    parse = openai_video_routes.parse_visual_gen_params
+    release = threading.Event()
+    started = []
+
+    def blocking_parse(request, generator):
+        started.append(threading.current_thread().name)
+        if len(started) == 1:
+            release.wait(10)
+        return parse(request, generator)
+
+    monkeypatch.setattr(openai_video_routes, "parse_visual_gen_params", blocking_parse)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    generator = MockVisualGen(image_output=_make_dummy_image_tensor())
+    body = {"prompt": "cat", "response_format": "b64_json", "size": "64x64"}
+    try:
+        async with _create_async_client(generator, media_load_workers=1) as client:
+            first = asyncio.create_task(client.post("/v1/images/generations", json=body))
+            deadline = time.monotonic() + 10
+            while not started and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert started
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            second = asyncio.create_task(client.post("/v1/images/generations", json=body))
+            await asyncio.sleep(0.2)
+            assert len(started) == 1
+            release.set()
+            resp = await second
+    finally:
+        release.set()
+    assert resp.status_code == 200, resp.text
+    assert all(name.startswith("trtllm_media_load") for name in started)
