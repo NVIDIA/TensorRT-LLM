@@ -734,7 +734,15 @@ def test_fp4_mla_v2_encoded_page_capacity_is_layer_invariant(layer_offset: int) 
     assert manager._role_encoded_page_capacity(0, Role.KEY) == 17
 
 
-def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
+@pytest.mark.parametrize("preemption", [False, True])
+def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(preemption, monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
+
+    monkeypatch.setattr(
+        gen_preemption,
+        "_active_settings",
+        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
+    )
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
@@ -753,53 +761,12 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
     )
 
     assert slope == 2 * (320 + 40 + 32)
-    assert intercept == 3 * 2 * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
-
-
-@pytest.mark.parametrize("preemption", [False, True])
-def test_fp4_mla_v2_hp_intercept_covers_paused_cap(preemption, monkeypatch) -> None:
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
-    monkeypatch.setattr(
-        gen_preemption,
-        "_active_settings",
-        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
-    )
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
-    )
-
-    slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
-        model_config,
-        Mapping(world_size=2, tp_size=1, pp_size=2, rank=0),
-        num_layers=2,
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        max_batch_size=3,
-        spec_config=SimpleNamespace(tokens_per_gen_step=4),
-    )
-
-    # 3 in-flight microbatches over 2 pipeline stages; preemption adds the
-    # paused cap round(0.375 * 3) = 1 to the resident HP ring pages.
     residents = 3 * 2 + (1 if preemption else 0)
-    assert slope == 2 * (320 + 40 + 32)
     assert intercept == residents * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
-
-
-@pytest.mark.parametrize("preemption", [False, True])
-def test_fp4_mla_v2_generation_capacity_covers_paused_cap(preemption, monkeypatch) -> None:
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
-    monkeypatch.setattr(
-        gen_preemption,
-        "_active_settings",
-        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
-    )
     manager = object.__new__(Fp4MlaKVCacheManagerV2)
     manager.max_batch_size = 3
     manager.mapping = Mapping(world_size=2, tp_size=1, pp_size=2, rank=0)
-
-    assert manager._get_generation_request_capacity() == 3 * 2 + (1 if preemption else 0)
+    assert manager._get_generation_request_capacity() == residents
 
 
 def test_fp4_mla_v2_cache_size_accounts_for_fp8_fallback(

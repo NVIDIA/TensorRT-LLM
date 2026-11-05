@@ -525,7 +525,12 @@ def test_build_cache_config_long_decode_constraint(
         assert config.constraints == []
 
 
-def test_cache_size_estimation_uses_model_attention_layer_count():
+@pytest.mark.parametrize("preemption", [False, True])
+def test_cache_size_estimation_uses_model_attention_layer_count(preemption, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
+
+    monkeypatch.setattr(gen_preemption, "_active_settings", gen_preemption.GenPreemptionSettings())
+
     class FakeModelConfig:
         sparse_attention_config = SimpleNamespace(
             index_head_dim=128,
@@ -552,9 +557,40 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     cost = CacheCost.from_raw(size_per_token)
     assert cost.slope > 0
     assert cost.intercept == 0
+    monkeypatch.setattr(
+        gen_preemption,
+        "_active_settings",
+        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
+    )
+    config = FakeModelConfig()
+    cost = CacheCost.from_raw(
+        DeepseekV4CacheManager.get_cache_size_per_token(
+            config,
+            Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            tokens_per_block=128,
+            max_batch_size=4,
+        )
+    )
+    _, per_request = deepseek_v4_cache._estimate_swa_cache_size(
+        576,
+        128,
+        config.sparse_attention_config.compress_ratios,
+        False,
+        128,
+        128,
+        context=False,
+        scratch=False,
+        indexer_k_dtype="fp8",
+        use_fp8_ds_mla=False,
+    )
+    assert cost.intercept == (6 if preemption else 4) * per_request
 
 
-def test_quota_from_max_tokens_models_context_swa_scratch():
+@pytest.mark.parametrize("preemption", [False, True])
+def test_quota_from_max_tokens_models_context_swa_scratch(preemption, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
+
+    monkeypatch.setattr(gen_preemption, "_active_settings", gen_preemption.GenPreemptionSettings())
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
@@ -588,99 +624,13 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
     assert no_scratch_small_quota < no_scratch_large_quota
     assert no_scratch_delta > scratch_delta
     assert manager._get_max_tokens_from_quota(no_scratch_large_quota) == 4096
-
-
-@pytest.mark.parametrize("preemption", [False, True])
-def test_quota_covers_paused_requests(preemption, monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
-    def activate(enabled):
-        monkeypatch.setattr(
-            gen_preemption,
-            "_active_settings",
-            gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if enabled else None),
-        )
-
-    activate(False)
-    manager = object.__new__(DeepseekV4CacheManager)
-    manager.pp_layers = [0, 1]
-    manager._compress_ratios = [4, 4]
-    manager.dtype = DataType.BF16
-    manager._use_nvfp4_compress = False
-    manager.head_dim = 512 + 64
-    manager.index_head_dim = 128
-    manager._indexer_k_dtype = "fp8"
-    manager.use_fp8_ds_mla = False
-    manager._swa_window_size = 128
-    manager._max_draft_len = 0
-    manager._max_num_tokens = 1024
-    manager.tokens_per_block = 128
-    manager.max_batch_size = 2
-    manager.enable_swa_scratch_reuse = False
-
-    assert manager._get_generation_request_capacity() == 2
-    quota_without_headroom = manager._get_quota_from_max_tokens(1)
-
-    # Paused decode requests keep their SWA pools: the quota covers the
-    # active batch plus the paused cap round(0.375 * 2) = 1.
-    activate(preemption)
-    residents = 2 + (1 if preemption else 0)
-    assert manager._get_generation_request_capacity() == residents
-
-    _, swa_size_per_request = deepseek_v4_cache._estimate_swa_cache_size(
-        manager.head_dim,
-        manager.index_head_dim,
-        manager._compress_ratios,
-        False,
-        manager.tokens_per_block,
-        manager._swa_window_size,
-        context=False,
-        scratch=False,
-        indexer_k_dtype="fp8",
-        use_fp8_ds_mla=False,
-    )
-    quota = manager._get_quota_from_max_tokens(1)
-    assert quota - quota_without_headroom == (residents - 2) * swa_size_per_request
-    # The inverse helper reads the same resident batch size, so the
-    # token-capacity round trip stays exact with the paused cap reserved.
-    assert manager._get_max_tokens_from_quota(quota) == 1
-    assert manager._get_max_tokens_from_quota(manager._get_quota_from_max_tokens(4096)) == 4096
-
-
-@pytest.mark.parametrize("preemption", [False, True])
-def test_static_cost_covers_paused_requests(preemption, monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
     monkeypatch.setattr(
         gen_preemption,
         "_active_settings",
         gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
     )
-
-    class FakeModelConfig:
-        sparse_attention_config = SimpleNamespace(
-            index_head_dim=128,
-            compress_ratios=[4, 4],
-            indexer_k_dtype="fp8",
-            window_size=128,
-        )
-        pretrained_config = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
-        quant_config = None
-
-        def get_num_attention_layers(self) -> int:
-            return len(self.sparse_attention_config.compress_ratios)
-
-    cost = CacheCost.from_raw(
-        DeepseekV4CacheManager.get_cache_size_per_token(
-            FakeModelConfig(),
-            Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-            tokens_per_block=128,
-            max_batch_size=4,
-        )
-    )
-
-    _, swa_size_per_request = deepseek_v4_cache._estimate_swa_cache_size(
-        512 + 64,
+    _, per_request = deepseek_v4_cache._estimate_swa_cache_size(
+        576,
         128,
         [4, 4],
         False,
@@ -691,10 +641,11 @@ def test_static_cost_covers_paused_requests(preemption, monkeypatch):
         indexer_k_dtype="fp8",
         use_fp8_ds_mla=False,
     )
-    # The SWA per-request cost is charged for every resident request, not
-    # just the active ones: max_batch_size plus the paused cap round(0.375*4).
-    residents = 4 + (2 if preemption else 0)
-    assert cost.intercept == residents * swa_size_per_request
+    assert manager._get_generation_request_capacity() == (3 if preemption else 2)
+    for tokens, baseline in [(1, no_scratch_small_quota), (4096, no_scratch_large_quota)]:
+        quota = manager._get_quota_from_max_tokens(tokens)
+        assert quota == baseline + (per_request if preemption else 0)
+        assert manager._get_max_tokens_from_quota(quota) == tokens
 
 
 def test_needed_resource_uses_context_swa_scratch_slope():

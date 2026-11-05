@@ -1,28 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GEN slot preemption for disaggregated serving (pause in place).
+"""Pause resident GEN requests to admit waiters at risk of missing TTFT.
 
-When every GEN slot is taken and the next GEN admission is at risk of missing
-the TTFT target X (slack within the at-risk window, or late), a decode request
-is paused in place: it keeps its KV cache, recurrent and drafter state and
-slot, but is left out of the batch until a slot frees or it is due.  Pools
-with one entry per resident request reserve ``resident_headroom`` more.
-
-With D the running mean decode time of completed requests (pauses excluded):
-at most 0.375 x max_num_active_requests are paused, a pause lasts at most
-0.35 D, a request is preemptible after 0.07 D of decoding, one pause per pass.
-
-* ``tpot_budget`` B: pause the longest resident request (at most twice); an
-  integral controller on g in the at-risk window g x 0.15 D holds the mean TPOT
-  inflation from pauses at 0.8 B.
-* ``target_output_tps`` T, met by >= 80% of requests: laxity is
-  ``t_first + (max_tokens - 1) / T - (now + remaining / own unpaused rate)``.
-  Pause the largest laxity >= 0.02 D (resumed at 0.01 D), else a request already
-  below T, else sacrifice one on a credit (+0.2 per completion, -1 per
-  completion below T).
-
-All inputs (active requests, token counts, the broadcast queue, rank 0's
-clock) are rank-identical, so every rank decides the same.
+The TPOT-budget policy prefers long-running requests; the output-rate policy
+spends request laxity or bounded sacrifice credit. Decisions use rank-identical
+request state and rank 0's clock. Paused requests retain all resident resources.
 """
 
 import collections
@@ -33,7 +15,7 @@ from typing import Optional
 
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequestState
+from ..llm_request import LlmRequest, LlmRequestState
 from .gen_admission_queue import STATS_LOG_PERIOD_S, GenAdmissionConfig, GenAdmissionWaitingQueue
 
 
@@ -75,22 +57,10 @@ def resident_headroom(max_batch_size: int, settings: Optional[GenPreemptionSetti
 
 
 def unsupported_headroom_reason(config, llm_args) -> Optional[str]:
-    """Why pool sizing must not reserve the resident headroom, else ``None``.
+    """Resolve prerequisites before reserving pool headroom.
 
-    The creator reserves the paused cap in every pool before the model is
-    loaded; when ``create_gen_preemption`` would then disable the feature
-    anyway, the worker keeps a smaller cache pool for headroom it never
-    uses. This resolves the same prerequisites from the LLM args alone (the
-    message strings are ``_unsupported``'s):
-
-    * pipeline parallelism and attention DP disable it outright;
-    * the auto GEN admission policy is read from the same environment;
-    * ``use_kv_cache_manager_v2=True`` is demotable only by the runtime
-      features ``resolved_kv_cache_manager_is_v2`` checks. An explicit
-      ``False`` keeps the headroom out, which only mispredicts a
-      variable-KV-geometry model that forces V2 despite it; an unresolved
-      ``"auto"`` keeps the headroom in, and ``create_gen_preemption``
-      decides with the real scheduler.
+    An unresolved V2 ``"auto"`` keeps headroom until the runtime check; explicit
+    V1 or settings that demote V2 do not reserve it.
     """
     if config is None or not GenPreemptionSettings.from_config(config).enabled:
         return None
@@ -149,7 +119,7 @@ class GenPreemption:
     target_frac = 0.8  # controller setpoint, x tpot_budget
     max_pause_frac, min_run_frac = 0.35, 0.07  # x D
     warmup_max_pause_s, warmup_min_run_s = 10.0, 2.0  # until the first completion
-    max_per_request, max_per_pass = 2, 1
+    max_per_request = 2
     hysteresis_iters = 64  # decode steps after a resume
     min_remaining_tokens = 32
     slo_eps, slo_credit_depth = 0.2, 3000.0  # share allowed below T; credit clamp, x eps
@@ -208,8 +178,9 @@ class GenPreemption:
         num_active -= len(self._paused)
         num_active += self._resume(capacity - num_active)
         if num_active >= capacity and gen_queue:
-            for req in self._victims(active_requests, waiting_queue.num_at_risk(self.slack_s)):
-                self._pause(req)
+            victim = self._victim(active_requests, waiting_queue.num_at_risk(self.slack_s))
+            if victim is not None:
+                self._pause(victim)
                 num_active -= 1
         return num_active
 
@@ -351,22 +322,15 @@ class GenPreemption:
             and req.py_max_new_tokens - generated_tokens(req) > self.min_remaining_tokens
         )
 
-    def _victims(self, active_requests, num_at_risk: int) -> list:
-        n = min(num_at_risk, self.max_per_pass, self.max_paused - len(self._paused))
-        if n <= 0:
-            return []
+    def _victim(self, active_requests, num_at_risk: int) -> Optional[LlmRequest]:
+        if num_at_risk <= 0 or len(self._paused) >= self.max_paused:
+            return None
         candidates = [req for req in active_requests if self._eligible(req)]
-        victims = []
-        while len(victims) < n:
-            if self.slo:
-                victim = self._slo_victim(candidates)
-            else:
-                victim = min(candidates, key=self._key, default=None)
-            if victim is None:
-                break
-            victims.append(victim)
-            candidates.remove(victim)
-        return victims
+        return (
+            self._slo_victim(candidates)
+            if self.slo
+            else min(candidates, key=self._key, default=None)
+        )
 
     def _slo_victim(self, candidates: list):
         """The largest laxity (>= 0.02 D), else the longest resident request

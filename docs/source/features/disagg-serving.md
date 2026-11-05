@@ -417,42 +417,32 @@ configured retry policy, including the transient TCP retry budget.
 
 ### Generation slot preemption (prototype)
 
-When every slot of a generation worker is taken and the request it would admit
-next is about to miss its TTFT target, GEN slot preemption pauses a decode
-request in place (it keeps its KV cache and slot, and is only left out of the
-batch) and gives the slot to the waiting request. Bound the TPOT cost with one
-of the two fields (neither: off; both: an error):
+GEN slot preemption pauses a resident decode request when all batch slots are
+occupied and a waiter risks missing its TTFT target. Configure exactly one bound
+(neither: disabled):
 
 ```yaml
 scheduler_config:
   gen_preemption:
     tpot_budget: 0.10          # up to +10% mean TPOT from pauses
-    # target_output_tps: 35.0  # or: a per-request tokens/s floor for ~80% of requests
+    # target_output_tps: 35.0  # alternative: output-rate floor for ~80% of requests
 ```
 
-Everything else is derived online from completed requests. Preemption needs
-the TTFT-percentile GEN admission policy (`TLLM_GEN_ADMISSION_TTFT_PERCENTILE`
-between 0 and 99) and the KV cache manager V2 scheduler; pipeline parallelism
-and attention DP are rejected. Pools are sized only when the feature can
-run: the creator checks these prerequisites before reserving the paused cap,
-so a worker that cannot pause logs one warning and keeps the full pool
-instead of spending headroom it would never use.
+Preemption requires the auto GEN admission policy
+(`0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99`) and the V2 KV scheduler.
+Pipeline parallelism and attention DP are rejected. Startup checks these
+prerequisites before reserving paused-request headroom.
 
-`target_output_tps` has simulation coverage only; GPU validation is currently
-limited to `tpot_budget`.
+Pauses free batch slots while retaining KV, recurrent, and drafter state. Cache
+sizing must cover active plus paused requests: SWA and NVFP4-MLA HP-ring
+reservations include the paused cap; full-attention demand depends on sequence
+lengths. Paused requests are excluded from KV eviction. Disaggregated GEN cannot
+recompute context locally, and Helix CP raises on decode allocation failure.
+Reduce concurrency or increase the KV budget when both slots and pages are full.
 
-Pausing frees a batch slot, not KV pages. Size the KV cache for active plus
-paused requests: per-resident-request reservations - sliding-window pages,
-DeepSeek-V4 generation SWA pools and the NVFP4-MLA HP ring alike - include
-the paused cap, but full-attention cache demand still depends on request
-lengths. Paused requests
-are excluded from KV eviction candidates, and disaggregated GEN workers cannot
-recompute their context locally. Under Helix CP, a decode allocation failure
-raises an error rather than evicting another request. Reduce concurrency or
-increase the KV budget when both slots and KV pages are under pressure.
-
-Pool sizing assumes one executor per process. The same
-preemption configuration on a context worker also reserves pool headroom.
+Pool sizing assumes one executor per process. Configuring preemption on a context
+worker also reserves headroom. `target_output_tps` has simulation coverage only;
+GPU validation is limited to `tpot_budget`.
 
 ## Environment Variables
 

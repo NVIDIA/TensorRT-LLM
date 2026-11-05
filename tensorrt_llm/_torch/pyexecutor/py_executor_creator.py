@@ -590,12 +590,7 @@ def _create_py_executor(
     kv_connector_config = llm_args.kv_connector_config
 
     scheduler_config = llm_args.scheduler_config
-    # The pools sized below reserve GEN slot preemption's resident headroom,
-    # but only when the feature will run: these prerequisites, resolvable
-    # from the LLM args before the model is loaded, mirror
-    # create_gen_preemption's executor-side checks, which stay the authority
-    # for what only the model decides. Without the gate a worker that can
-    # never pause keeps a smaller cache pool for headroom it never uses.
+    # Reserve paused-request headroom only when startup prerequisites allow it.
     headroom_reason = gen_preemption.unsupported_headroom_reason(
         scheduler_config.gen_preemption, llm_args)
     if headroom_reason:
