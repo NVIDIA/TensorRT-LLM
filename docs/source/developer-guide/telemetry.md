@@ -32,13 +32,14 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-336 captured fields.
+373 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
 | `allreduce_strategy` | `literal\|none` | `categorical` | `AUTO`, `NCCL`, `UB`, `MINLATENCY`, `ONESHOT`, `TWOSHOT`, `LOWPRECISION`, `MNNVL`, `NCCL_SYMMETRIC` |
 | `attention_dp_config.batching_wait_iters` | `int` | `value` |  |
 | `attention_dp_config.enable_balance` | `bool` | `value` |  |
+| `attention_dp_config.enable_kv_balanced_admission` | `bool` | `value` |  |
 | `attention_dp_config.enable_kv_cache_aware_routing` | `bool` | `value` |  |
 | `attention_dp_config.enable_packed_sync` | `bool` | `value` |  |
 | `attention_dp_config.kv_cache_routing_account_for_in_transfer` | `bool` | `value` |  |
@@ -51,6 +52,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_new_conv_placement` | `literal` | `categorical` | `round_robin`, `least_queued`, `least_tokens` |
 | `attention_dp_config.timeout_iters` | `int` | `value` |  |
 | `attn_backend` | `allowlist` | `categorical` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `autotuner_nvmmh_config.max_tactics` | `int` | `value` |  |
 | `backend` | `literal` | `categorical` | `pytorch` |
 | `batch_wait_max_tokens_ratio` | `float` | `value` |  |
 | `batch_wait_timeout_iters` | `int` | `value` |  |
@@ -64,7 +66,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `int\|none` | `value` |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `int\|none` | `value` |  |
 | `cache_transceiver_config.transceiver_runtime` | `literal\|none` | `categorical` | `CPP`, `PYTHON`, `auto` |
-| `checkpoint_io_policy` | `literal` | `categorical` | `auto`, `native`, `rank_striped_read_ahead` |
+| `checkpoint_io_policy` | `enum[CheckpointIOPolicy]` | `categorical` | `auto`, `native`, `rank_striped_read_ahead` |
 | `context_parallel_size` | `int` | `value` |  |
 | `cp_config.cp_type` | `enum[CpType]` | `categorical` | `ULYSSES`, `RING`, `HELIX` |
 | `cp_config.fifo_version` | `int\|none` | `value` |  |
@@ -83,7 +85,11 @@ unset or when the safety sanitizer rejects the runtime value.
 | `disable_overlap_scheduler` | `bool` | `value` |  |
 | `dtype` | `allowlist` | `categorical` | `auto`, `float16`, `bfloat16`, `float32` |
 | `dwdp_config.contention_opt` | `bool` | `value` |  |
+| `dwdp_config.copy_mode` | `literal\|none` | `categorical` | `per_slice`, `batched`, `gather` |
 | `dwdp_config.dwdp_size` | `int` | `value` |  |
+| `dwdp_config.enable_dense` | `bool` | `value` |  |
+| `dwdp_config.enable_experts` | `bool` | `value` |  |
+| `dwdp_config.gather_kernel` | `literal\|none` | `categorical` | `register`, `tma` |
 | `dwdp_config.num_experts_per_worker` | `int` | `value` |  |
 | `dwdp_config.num_groups` | `int` | `value` |  |
 | `dwdp_config.num_prefetch_experts` | `int` | `value` |  |
@@ -133,6 +139,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_compression_config.beta` | `int` | `value` |  |
 | `kv_cache_compression_config.budget` | `int` | `value` |  |
 | `kv_cache_compression_config.eviction_mode` | `literal` | `categorical` | `union`, `per_head`, `per_layer_perhead` |
+| `kv_cache_compression_config.mixed_precision_first_n` | `int` | `value` |  |
+| `kv_cache_compression_config.mixed_precision_last_n` | `int` | `value` |  |
 | `kv_cache_compression_config.normalize_scores` | `bool` | `value` |  |
 | `kv_cache_compression_config.nvfp4_residual_dim` | `literal` | `categorical` | `0`, `64` |
 | `kv_cache_compression_config.quant` | `literal` | `categorical` | `nvfp4` |
@@ -186,8 +194,10 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.use_kv_cache_manager_v2` | `bool\|literal` | `categorical` | `auto` |
 | `kv_cache_config.use_uvm` | `bool` | `value` |  |
 | `kv_connector_config.connector` | `allowlist\|none` | `categorical` | `lmcache`, `lmcache-mp`, `kvbm`, `mooncake-store` |
+| `kv_connector_config.control_grace_sec` | `float` | `value` |  |
 | `kv_connector_config.mooncake_store.role` | `literal` | `categorical` | `both`, `producer`, `consumer`, `capacity` |
 | `kv_connector_config.mooncake_store.segment_size` | `int` | `value` |  |
+| `kv_connector_config.transfer_timeout_sec` | `float` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_layer_indices` | `list[int]\|none` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_mode` | `literal` | `categorical` | `NONE`, `MARK`, `COLLECT` |
 | `lm_head_output_dtype` | `literal` | `categorical` | `auto`, `float32` |
@@ -207,10 +217,16 @@ unset or when the safety sanitizer rejects the runtime value.
 | `max_stats_len` | `int` | `value` |  |
 | `mla_skip_correction_threshold` | `float` | `value` |  |
 | `mm_encoder_only` | `bool` | `value` |  |
+| `mnnvl_allreduce_fp8_payload` | `bool` | `value` |  |
 | `modeling_v2` | `literal` | `categorical` | `off`, `auto`, `require` |
 | `moe_cluster_parallel_size` | `int\|none` | `value` |  |
 | `moe_config.backend` | `literal` | `categorical` | `AUTO`, `CUTLASS`, `CUTEDSL`, `CUTEDSL_FC12`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
 | `moe_config.disable_finalize_fusion` | `bool` | `value` |  |
+| `moe_config.load_balancer.auxiliary_sms` | `int` | `value` |  |
+| `moe_config.load_balancer.helper_slot_mode` | `literal` | `categorical` | `per_layer_resident`, `shared_banks` |
+| `moe_config.load_balancer.layer_updates_per_iter` | `int` | `value` |  |
+| `moe_config.load_balancer.mode` | `literal` | `categorical` | `standard`, `per_layer_dynamic` |
+| `moe_config.load_balancer.num_slots` | `int\|none` | `value` |  |
 | `moe_config.max_num_tokens` | `int\|none` | `value` |  |
 | `moe_config.use_low_precision_moe_combine` | `bool` | `value` |  |
 | `moe_expert_parallel_size` | `int\|none` | `value` |  |
@@ -219,6 +235,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `multimodal_config.encoder_scheduling_policy` | `enum[MultimodalEncoderSchedulingPolicy]` | `categorical` | `DISABLED`, `DEFAULT`, `EAGER` |
 | `multimodal_config.encoder_side_stream_max_ahead` | `int` | `value` |  |
 | `multimodal_config.video_pruning_rate` | `float\|none` | `value` |  |
+| `multimodal_config.vision_gpu_normalize` | `bool` | `value` |  |
 | `mx_config.preshard_strategy` | `allowlist` | `categorical` | `per_module` |
 | `mx_config.server_query_timeout_s` | `int\|none` | `value` |  |
 | `num_postprocess_workers` | `int` | `value` |  |
@@ -257,17 +274,24 @@ unset or when the safety sanitizer rejects the runtime value.
 | `reorder_policy_config.policy_args.agent_inflight_seq_num` | `int` | `value` |  |
 | `reorder_policy_config.policy_args.agent_percentage` | `float` | `value` |  |
 | `reorder_policy_config.policy_name` | `literal\|none` | `categorical` | `AgentTree` |
+| `replicate_embedding` | `bool` | `value` |  |
 | `request_stats_max_iterations` | `int\|none` | `value` |  |
 | `return_perf_metrics` | `bool` | `value` |  |
 | `sampler_force_async_worker` | `bool` | `value` |  |
 | `scheduler_config.capacity_scheduler_policy` | `enum[CapacitySchedulerPolicy]` | `categorical` | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `enum[ContextChunkingPolicy]\|none` | `categorical` | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
+| `scheduler_config.context_scheduling_policy` | `enum[ContextSchedulingPolicy]` | `categorical` | `fcfs`, `shortest_uncached_first` |
+| `scheduler_config.context_starvation_iterations` | `int\|none` | `value` |  |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `int` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_batch_size_tuning` | `bool` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning` | `bool` | `value` |  |
 | `scheduler_config.enable_prefix_aware_scheduling` | `bool` | `value` |  |
+| `scheduler_config.gen_preemption.target_output_tps` | `float\|none` | `value` |  |
+| `scheduler_config.gen_preemption.tpot_budget` | `float\|none` | `value` |  |
 | `scheduler_config.use_python_scheduler` | `bool` | `value` |  |
 | `scheduler_config.waiting_queue_policy` | `enum[WaitingQueuePolicy]` | `categorical` | `fcfs`, `priority` |
+| `serve_frontend_affinity_port_stride` | `int\|none` | `value` |  |
+| `serve_graceful_shutdown_timeout_s` | `int\|none` | `value` |  |
 | `skip_tokenizer_init` | `bool` | `value` |  |
 | `sparse_attention_config.algorithm` | `literal` | `categorical` | `csa2`, `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
 | `sparse_attention_config.compress_ratios` | `list[int]` | `value` |  |
@@ -321,11 +345,16 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM`, `FA4`, `AUTO`, `CUTEDSL` |
 | `speculative_config.begin_thinking_phase_token` | `int` | `value` |  |
 | `speculative_config.block_size` | `int\|none` | `value` |  |
+| `speculative_config.confidence_min_predicted_gain` | `float` | `value` |  |
 | `speculative_config.context_recompute_tail` | `int\|none` | `value` |  |
 | `speculative_config.decoding_type` | `literal` | `categorical` | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
+| `speculative_config.draft_lm_head_dtype` | `literal` | `categorical` | `auto`, `mxfp8` |
+| `speculative_config.draft_moe_dtype` | `literal` | `categorical` | `auto`, `nvfp4` |
 | `speculative_config.dynamic_tree_max_topK` | `int\|none` | `value` |  |
 | `speculative_config.eagle3_layers_to_capture` | `none\|set[int]` | `value` |  |
 | `speculative_config.eagle3_model_arch` | `literal` | `categorical` | `llama3`, `mistral_large3` |
+| `speculative_config.enable_confidence_scheduling` | `bool` | `value` |  |
+| `speculative_config.enable_fused_confidence_scheduler` | `bool` | `value` |  |
 | `speculative_config.enable_global_pool` | `bool` | `value` |  |
 | `speculative_config.enable_penalty` | `bool` | `value` |  |
 | `speculative_config.end_thinking_phase_token` | `int` | `value` |  |
@@ -373,3 +402,10 @@ unset or when the safety sanitizer rejects the runtime value.
 | `use_cute_dsl_blockscaling_bmm` | `bool` | `value` |  |
 | `use_cute_dsl_blockscaling_mm` | `bool` | `value` |  |
 | `use_fine_grained_sync` | `bool` | `value` |  |
+| `watermark_config.algorithm` | `literal` | `categorical` | `gumbel`, `gumbel_dual_key` |
+| `watermark_config.allow_request_opt_out` | `bool` | `value` |  |
+| `watermark_config.allow_target_only_watermarking` | `bool` | `value` |  |
+| `watermark_config.context_width` | `int` | `value` |  |
+| `watermark_config.deduplicate_contexts` | `literal` | `categorical` | `none`, `single_turn`, `all` |
+| `watermark_config.deduplicate_contexts_max_history` | `int\|none` | `value` |  |
+| `watermark_config.prf` | `literal` | `categorical` | `philox` |
