@@ -29,6 +29,7 @@ import pytest
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve._base.service_types import ResponseHooks
 from tensorrt_llm.serve.conversation_id import SUBAGENT_AFFINITY_HEADER
 from tensorrt_llm.serve.disagg_auth import (
     INTERNAL_DISAGG_AUTH_HEADER,
@@ -56,7 +57,7 @@ from tensorrt_llm.serve.perf_metrics import (
     PerfMetricsMiddleware,
     adjusted_clock_from_headers,
 )
-from tensorrt_llm.serve.responses_utils import ResponseHooks, ServerArrivalTimeMiddleware
+from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 from tensorrt_llm.serve.router import Router
 
 pytestmark = pytest.mark.cpu_only

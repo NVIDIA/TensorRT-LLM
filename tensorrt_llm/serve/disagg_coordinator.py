@@ -221,7 +221,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         """
         cache = self.__dict__.setdefault("_coord_api_lat", {})
         if name not in cache:
-            from tensorrt_llm.serve.responses_utils import PeriodicLatencyLogger
+            from tensorrt_llm.serve._base.latency_logger import PeriodicLatencyLogger
 
             cache[name] = PeriodicLatencyLogger(f"owner.{name}")
         return cache[name]
