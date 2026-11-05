@@ -65,6 +65,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheLayerOwner,
     KVCacheLayerSpec,
@@ -89,6 +91,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     _stack_state_views,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+    _low_priority_recurrent_state,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -123,6 +128,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -4437,6 +4443,43 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
             "content_divergence_tokens=112 "
             "latest_recurrent_snapshot_tokens=64"
         )
+
+
+def test_low_priority_recurrent_state_demotes_only_recurrent_pages() -> None:
+    attention = AttnLifeCycle.make(None, None, 32)
+    assert _low_priority_recurrent_state(0, attention) == PAGE_PRIORITY_DEFAULT
+    assert _low_priority_recurrent_state(3, object()) == PAGE_PRIORITY_MIN
+
+
+@pytest.mark.parametrize(
+    ("threshold", "prompt_len", "is_dummy", "num_mamba_layers", "demoted"),
+    [
+        (16384, 1000, False, 1, True),
+        (16384, 16384, False, 1, False),
+        (16384, 1000, True, 1, False),
+        (16384, 1000, False, 0, False),
+        (0, 1000, False, 1, False),
+    ],
+)
+def test_v2_hybrid_low_priority_snapshot_prompt_len(
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: int,
+    prompt_len: int,
+    is_dummy: bool,
+    num_mamba_layers: int,
+    demoted: bool,
+) -> None:
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = num_mamba_layers
+    mgr._low_priority_snapshot_prompt_len = threshold
+    req = SimpleNamespace(is_dummy=is_dummy, prompt_len=prompt_len)
+    callback = mgr._context_priority_callback(req)
+    assert callback is (_low_priority_recurrent_state if demoted else None)
+
+    create_kv_cache = MagicMock(return_value=None)
+    monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
+    mgr._create_kv_cache(1, None, None, custom_priority_callback=callback)
+    assert create_kv_cache.call_args.kwargs["custom_priority_callback"] is callback
 
 
 @pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])

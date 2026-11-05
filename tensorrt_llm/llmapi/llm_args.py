@@ -4862,6 +4862,16 @@ class MambaStateConfig(StrictBaseModel):
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
 
+    low_priority_snapshot_prompt_len: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Context requests whose prompt is shorter than this many tokens create "
+        "their recurrent-state pages (live state and snapshots) at the lowest "
+        "eviction priority; attention pages keep the default priority. 0 "
+        "disables. Requires KV cache manager V2 and block reuse.")
+
     enable_branch_snapshot: bool = Field(
         default=False,
         status="deprecated",
@@ -5503,6 +5513,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "block_reuse_config.swa_endpoint_rewind_tokens requires "
                     "kv_cache_config.use_kv_cache_manager_v2=True.")
+            if self.mamba_state_config.low_priority_snapshot_prompt_len > 0:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens cannot be "
+                    "combined with mamba_state_config."
+                    "low_priority_snapshot_prompt_len.")
         return self
 
     @model_validator(mode='after')

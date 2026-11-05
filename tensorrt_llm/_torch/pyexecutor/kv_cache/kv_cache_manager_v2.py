@@ -383,6 +383,15 @@ class KVCacheLayerSpec:
         return 2 if Role.VALUE in self.buffer_roles else 1
 
 
+# Page eviction priorities of the v2 cache backend: [0, 100], default 35. Lower values are
+# evicted first; pages of one priority are evicted least recently used first.
+PAGE_PRIORITY_MIN = 0
+PAGE_PRIORITY_DEFAULT = 35
+
+PagePriorityCallback = Callable[[int, object], int]
+"""Maps (block ordinal, life cycle) to the eviction priority of a page created by one cache."""
+
+
 def _swa_endpoint_priority(
     prompt_length: int, tokens_per_block: int, rewind_tokens: int
 ) -> Callable[[int, object], int]:
@@ -5275,6 +5284,10 @@ class KVCacheManagerV2(BaseResourceManager):
             self._context_reuse_tokens(req),
         )
 
+    def _context_priority_callback(self, req: LlmRequest) -> PagePriorityCallback | None:
+        """Page priority callback for a context request's new cache; None keeps the default."""
+        return None
+
     def _retention_config_for_request(self, req: LlmRequest) -> KvCacheRetentionConfig | None:
         config = req.kv_cache_retention_config
         if config is None or not self._has_cp_helix:
@@ -5335,6 +5348,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 # prompt_len - 1, because augmentation can change the length
                 # for multimodal requests.
                 num_lookup_tokens = len(tokens) if tokens is not None else None
+                # Passed only when a subclass overrides the page priorities.
+                priority_callback = self._context_priority_callback(req)
+                priority_kwargs = (
+                    {}
+                    if priority_callback is None
+                    else {"custom_priority_callback": priority_callback}
+                )
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -5346,6 +5366,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     expected_prompt_length=(
                         req.total_input_len_cp if self._has_cp_helix else req.prompt_len
                     ),
+                    **priority_kwargs,
                 )
                 if kv_cache is None:
                     return None
@@ -8414,6 +8435,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        custom_priority_callback: PagePriorityCallback | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
@@ -8437,7 +8459,9 @@ class KVCacheManagerV2(BaseResourceManager):
         reuse_salt = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
-        if (
+        if custom_priority_callback is not None and not is_dummy:
+            priority_kwargs["custom_priority_callback"] = custom_priority_callback
+        elif (
             self._swa_endpoint_rewind > 0
             and self.enable_block_reuse
             and self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE

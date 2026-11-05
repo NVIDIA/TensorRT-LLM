@@ -44,10 +44,13 @@ else:
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheLayerOwner,
     KVCacheLayerSpec,
     KVCacheManagerV2,
+    PagePriorityCallback,
     Role,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
@@ -111,6 +114,13 @@ GB = 1 << 30
 # allocated after the pools, outside the GPU cache quota.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
+
+
+def _low_priority_recurrent_state(_ordinal: int, life_cycle: object) -> int:
+    """Lowest eviction priority for recurrent-state pages, default for attention pages."""
+    if isinstance(life_cycle, AttnLifeCycle):
+        return PAGE_PRIORITY_DEFAULT
+    return PAGE_PRIORITY_MIN
 
 
 def _insert_draft_pool_ratio(
@@ -217,6 +227,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Set per instance by the FP4 MLA layout on a disaggregated context
     # worker, which keeps no generation-only V scales or packed V.
     fp4_mla_context_only_cache = False
+    # Prompts shorter than this create their recurrent-state pages at the lowest
+    # eviction priority (mamba_state_config.low_priority_snapshot_prompt_len).
+    _low_priority_snapshot_prompt_len = 0
 
     # Construction and cache configuration
 
@@ -311,6 +324,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._page_pruned_tokens_total = 0
         self._branch_snapshots_taken_total = 0
         self._branch_snapshots_skipped_total: Dict[str, int] = {}
+        if kv_cache_config.enable_block_reuse:
+            self._low_priority_snapshot_prompt_len = (
+                kv_cache_config.mamba_state_config.low_priority_snapshot_prompt_len
+            )
         num_cuda_graph_padding_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size
         )
@@ -1469,6 +1486,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         enable_request_stats: bool = False,
         expected_prompt_length: Optional[int] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        custom_priority_callback: Optional[PagePriorityCallback] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -1479,6 +1497,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
+            custom_priority_callback=custom_priority_callback,
         )
         if (
             self.mapping.rank == 0
@@ -1848,6 +1867,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if self.enable_block_reuse and self._waiter_snapshot_points:
             for request in requests:
                 self._merge_waiter_snapshot_points(request)
+
+    @override
+    def _context_priority_callback(self, req: LlmRequest) -> Optional[PagePriorityCallback]:
+        """Demote the recurrent state of prompts shorter than low_priority_snapshot_prompt_len."""
+        if (
+            self.local_num_mamba_layers > 0
+            and not req.is_dummy
+            and req.prompt_len < self._low_priority_snapshot_prompt_len
+        ):
+            return _low_priority_recurrent_state
+        return None
 
     @override
     def _can_share_inflight_prefix(self) -> bool:
