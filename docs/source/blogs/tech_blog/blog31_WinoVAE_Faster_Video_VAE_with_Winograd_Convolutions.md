@@ -261,9 +261,9 @@ For a 360 × 640 feature frame with 256 input and output channels, spatial F2 pr
 
 <a id="figure-9"></a>
 
-![Separate coordinate GEMMs for indices 0, 1, through 15, with tile A rows from every product matrix feeding its output transform](../media/tech_blog31/coordinate_gemm.svg)
+![Input and filter transforms produce 16 pairs of coordinate matrices for GEMMs; tile A rows from every product feed an output transform that reconstructs the output tile](../media/tech_blog31/coordinate_gemm.svg)
 
-*Figure 9. The 16 coordinate GEMMs for F(2 × 2, 3 × 3). Each coordinate has its own transformed input matrix Vᵢ, transformed filter matrix Uᵢ, and product matrix Mᵢ. Green and orange rows identify tiles A and B. Additional tiles continue down each matrix. The green connectors collect tile A’s row from every Mᵢ. The output transform combines those 16 rows into a 2 × 2 tile for each output channel. Tile B and the remaining tiles are reconstructed in the same way.*
+*Figure 9. The 16 coordinate GEMMs for F(2 × 2, 3 × 3). The input transform maps 4 × 4 input tiles to the Vᵢ matrices; the filter transform maps 3 × 3 filters to the Uᵢ matrices once at weight loading. Each coordinate has its own transformed input matrix Vᵢ, transformed filter matrix Uᵢ, and product matrix Mᵢ. Green and orange rows identify tiles A and B. Additional tiles continue down each matrix. The green connectors collect tile A’s row from every Mᵢ. The output transform combines those 16 rows into a 2 × 2 tile for each output channel. Tile B and the remaining tiles are reconstructed in the same way.*
 
 The same idea applies along time. Temporal F4 combines four current frames and two history frames into six spatial-convolution problems, replacing twelve direct temporal contributions. Combined with spatial F4, the product count is $6\times36/(4\times16)=3.375$ per output and input/output-channel pair, compared with 27 for direct 3D convolution. This eightfold arithmetic reduction applies to that convolution. A complete decoder still includes transforms and other layers, and some levels have too few frames available to use temporal F4.
 
