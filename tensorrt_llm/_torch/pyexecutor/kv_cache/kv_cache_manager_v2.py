@@ -500,9 +500,7 @@ def _skips_auto_host_tier(has_cp_helix: bool, is_disagg: bool, spec_config) -> b
     pages. An explicit ``host_cache_size`` still provisions a tier.
     """
     return (
-        has_cp_helix
-        and not is_disagg
-        and getattr(spec_config, "decoding_type", None) == "DSpark"
+        has_cp_helix and not is_disagg and getattr(spec_config, "decoding_type", None) == "DSpark"
     )
 
 
