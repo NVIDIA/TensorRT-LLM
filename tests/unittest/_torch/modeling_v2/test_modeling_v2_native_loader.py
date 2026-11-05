@@ -21,7 +21,6 @@ import subprocess
 import sys
 import textwrap
 import types
-from pathlib import Path
 
 import pytest
 
@@ -119,9 +118,21 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     import tensorrt_llm  # noqa: F401 -- loads libth_common.so
     from tensorrt_llm._torch._experimental.modeling_v2 import _native
 
-    built = sorted(_native._load_family_library(sys.argv[1]))
-    schemas = sorted(s.name for s in torch._C._jit_get_all_schemas() if s.name.startswith("mv2_"))
-    print(json.dumps({"built": built, "ops": schemas}))
+    family = sys.argv[1]
+    built = sorted(_native._load_family_library(family))
+    # Loading each target imports its fake_ops.py, so the fakes below are the registered ones.
+    for target in built:
+        _native.load_target_ops(f"{_native._MODELS_PACKAGE}.{family}.{target}")
+    namespaces = {_native._namespace(family)} | {_native._namespace(family, t) for t in built}
+    unfaked = sorted(
+        s.name
+        for s in torch._C._jit_get_all_schemas()
+        if s.name.split("::")[0] in namespaces
+        # built_targets() is the library's own metadata query, not a tensor op.
+        and s.name != f"{_native._namespace(family)}::built_targets"
+        and not torch._C._dispatch_has_kernel_for_dispatch_key(s.name, "Meta")
+    )
+    print(json.dumps({"unfaked": unfaked}))
     """
 )
 
@@ -130,7 +141,6 @@ def test_every_installed_family_library_loads():
     libraries = sorted(_native._LIBS_DIR.glob("libth_modeling_v2_*.so"))
     if not libraries:
         pytest.skip("this installation has no modeling_v2 family library")
-    models = Path(_native.__file__).resolve().parent / "models"
     for library in libraries:
         family = library.name[len("libth_modeling_v2_") : -len(".so")]
         result = subprocess.run(
@@ -141,13 +151,5 @@ def test_every_installed_family_library_loads():
         assert result.returncode == 0, (
             f"{library.name} failed to load:\n{result.stdout}\n{result.stderr}"
         )
-        report = json.loads(result.stdout.strip().splitlines()[-1])
-        # The family's ops are faked in <family>/fake_ops.py, a target's in <target>/fake_ops.py.
-        fakes = {_native._namespace(family): models / family / "fake_ops.py"}
-        for target in report["built"]:
-            fakes[_native._namespace(family, target)] = models / family / target / "fake_ops.py"
-        for namespace, fake_ops in fakes.items():
-            ops = [op.split("::", 1)[1] for op in report["ops"] if op.startswith(f"{namespace}::")]
-            text = fake_ops.read_text() if fake_ops.is_file() else ""
-            unfaked = [op for op in ops if f'::{op}"' not in text]
-            assert not unfaked, f"{namespace} defines {unfaked} with no fake in {fake_ops}"
+        unfaked = json.loads(result.stdout.strip().splitlines()[-1])["unfaked"]
+        assert not unfaked, f"{library.name} defines {unfaked} with no fake in a fake_ops.py"
