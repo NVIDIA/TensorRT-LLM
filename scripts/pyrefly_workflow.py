@@ -1,49 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Report and diff helpers used by the Pyrefly shell workflows."""
+"""Report and diff helpers used by the Pyrefly shell workflow."""
 
 import argparse
 import json
-import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
-
-
-def copy_untracked_product_files(source_root: Path, worktree: Path) -> None:
-    """Copy new product Python files and include them in the worktree's diff."""
-    paths = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "tensorrt_llm/"],
-        cwd=source_root,
-        capture_output=True,
-        check=True,
-    ).stdout.split(b"\0")
-    for raw_path in paths:
-        if not raw_path:
-            continue
-        relative = Path(os.fsdecode(raw_path))
-        if relative.suffix not in (".py", ".pyi"):
-            continue
-        target = worktree / relative
-        if target.exists() or target.is_symlink():
-            raise FileExistsError(f"Untracked source file conflicts with rebased path: {relative}")
-        if not target.parent.resolve().is_relative_to(worktree.resolve()):
-            raise ValueError(f"Untracked file destination escapes the worktree: {relative}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Materialize symlinks so relative targets remain readable after relocation.
-        shutil.copy2(source_root / relative, target)
-        subprocess.run(
-            ["git", "add", "--intent-to-add", "--force", "--", str(relative)],
-            cwd=worktree,
-            check=True,
-        )
 
 
 def report_status(report_path: Path) -> int:
     """Fail strict checks on remaining diagnostics or an unsuccessful tool invocation."""
     report = json.loads(report_path.read_text())
-    if report.get("report_error") or report.get("workflow_error"):
+    if report.get("report_error"):
         return 2
     status = report.get("pyrefly_exit_code", 0)
     if status not in (0, 1):
@@ -139,9 +108,13 @@ def wrap_unfiltered_report(
 
 
 def filter_diff_lines(
-    source_path: Path, destination_path: Path, project_root: Path, diff_base: str
+    source_path: Path,
+    destination_path: Path,
+    project_root: Path,
+    diff_base: str,
+    files: list[str],
 ) -> None:
-    """Keep diagnostics whose source lines are added by the Git diff."""
+    """Filter supplied files by added and modified lines when Git identifies them."""
     project_root = project_root.resolve()
     report = json.loads(source_path.read_text())
     if isinstance(report, dict) and report.get("report_error"):
@@ -152,132 +125,91 @@ def filter_diff_lines(
         raise ValueError("filtered Pyrefly report must contain an errors array")
 
     hunk_pattern = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-    added_lines_by_path: dict[str, set[int]] = {}
+    changed_lines_by_path: dict[str, set[int] | None] = {}
 
-    def added_lines(path_text: str) -> set[int]:
+    def relative_path(path_text: str) -> str | None:
         path = Path(path_text)
-        resolved = path.resolve() if path.is_absolute() else (project_root / path).resolve()
         try:
-            relative = resolved.relative_to(project_root)
-        except ValueError:
-            return set()
-        path_key = relative.as_posix()
-        if path_key in added_lines_by_path:
-            return added_lines_by_path[path_key]
-        tracked = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", path_key],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if tracked.returncode == 1 and (project_root / relative).is_file():
-            source_file = project_root / relative
-            lines = set(range(1, len(source_file.read_text().splitlines()) + 1))
-        elif tracked.returncode != 0:
-            raise ValueError(
-                f"cannot check Git tracking state for {path_key}: {tracked.stderr.strip()}"
-            )
-        else:
-            diff = subprocess.run(
-                [
-                    "git",
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-renames",
-                    "--unified=0",
-                    diff_base,
-                    "--",
-                    path_key,
-                ],
+            resolved = path.resolve() if path.is_absolute() else (project_root / path).resolve()
+            return resolved.relative_to(project_root).as_posix()
+        except (OSError, ValueError):
+            return None
+
+    requested_paths = {path for name in files if (path := relative_path(name)) is not None}
+
+    def changed_lines(path_key: str) -> set[int] | None:
+        if path_key in changed_lines_by_path:
+            return changed_lines_by_path[path_key]
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", path_key],
                 cwd=project_root,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            if diff.returncode != 0:
-                raise ValueError(f"cannot read diff for {path_key}: {diff.stderr.strip()}")
-            lines = set()
-            for diff_line in diff.stdout.splitlines():
-                match = hunk_pattern.match(diff_line)
-                if match:
-                    start = int(match[1])
-                    count = int(match[2] or 1)
-                    lines.update(range(start, start + count))
-        added_lines_by_path[path_key] = lines
+            if tracked.returncode == 1 and (project_root / path_key).is_file():
+                source_file = project_root / path_key
+                lines = set(range(1, len(source_file.read_text().splitlines()) + 1))
+            elif tracked.returncode != 0:
+                lines = None
+            else:
+                diff = subprocess.run(
+                    [
+                        "git",
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-renames",
+                        "--unified=0",
+                        diff_base,
+                        "--",
+                        path_key,
+                    ],
+                    cwd=project_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                lines = set()
+                if diff.returncode == 0:
+                    for diff_line in diff.stdout.splitlines():
+                        match = hunk_pattern.match(diff_line)
+                        if match:
+                            start = int(match[1])
+                            count = int(match[2] or 1)
+                            lines.update(range(start, start + count))
+        except (OSError, UnicodeError):
+            lines = None
+        if not lines:
+            lines = None
+        changed_lines_by_path[path_key] = lines
         return lines
 
     original = result["errors"]
-    result["errors"] = [
-        error
-        for error in original
-        if isinstance(error, dict)
-        and isinstance(error.get("line"), int)
-        and error["line"] in added_lines(str(error.get("path", "")))
-    ]
+    remaining = []
+    for error in original:
+        if not isinstance(error, dict):
+            continue
+        path_key = relative_path(str(error.get("path", "")))
+        if path_key is None or path_key not in requested_paths:
+            continue
+        lines = changed_lines(path_key)
+        if lines is None or not isinstance(error.get("line"), int) or error["line"] in lines:
+            remaining.append(error)
+    result["errors"] = remaining
     report["diff_base"] = diff_base
     report["diff_filtered_count"] = len(original) - len(result["errors"])
+    report["diff_filter_unavailable_paths"] = sorted(
+        path for path, lines in changed_lines_by_path.items() if lines is None
+    )
     if "remaining_diagnostic_count" in report:
         report["remaining_diagnostic_count"] = len(result["errors"])
     destination_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
 
-def annotate_rebased_report(
-    report_path: Path,
-    source_branch: str,
-    upstream_source: str,
-    target_ref: str,
-    base: str,
-    head: str,
-    worktree: str,
-    diff_report: str,
-    diff_filter: bool,
-    path_module_filter: bool,
-    checked_files: list[str],
-) -> None:
-    """Add rebase and filter metadata to the Pyrefly report."""
-    try:
-        report = json.loads(report_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        report = {"tool": "pyrefly", "report_error": "Pyrefly report is not valid JSON"}
-    report.update(
-        source_branch=source_branch,
-        upstream_source=upstream_source,
-        rebase_target=target_ref,
-        rebase_target_sha=base,
-        rebased_head=head,
-        worktree=worktree,
-        diff_report=diff_report,
-        diff_line_filter=diff_filter,
-        path_module_filter=path_module_filter,
-        checked_files=checked_files,
-    )
-    if target_ref == "main":
-        report["upstream_main_sha"] = base
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-
-
-def record_rebase_failure(report_path: Path, status: int, failed_command: str) -> None:
-    """Record an advisory failure that stopped the upstream-rebase workflow."""
-    try:
-        report = json.loads(report_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        report = {"tool": "pyrefly"}
-    report.update(
-        workflow_error="rebase-upstream check failed before completion",
-        workflow_exit_code=status,
-        failed_command=failed_command,
-    )
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    copy_parser = subparsers.add_parser("copy-untracked-product-files")
-    copy_parser.add_argument("source_root", type=Path)
-    copy_parser.add_argument("worktree", type=Path)
 
     summary_parser = subparsers.add_parser("print-summary")
     summary_parser.add_argument("report", type=Path)
@@ -300,29 +232,10 @@ def main() -> int:
     diff_parser.add_argument("destination", type=Path)
     diff_parser.add_argument("project_root", type=Path)
     diff_parser.add_argument("diff_base")
-
-    annotate_parser = subparsers.add_parser("annotate-rebased-report")
-    annotate_parser.add_argument("report", type=Path)
-    annotate_parser.add_argument("source_branch")
-    annotate_parser.add_argument("upstream_source")
-    annotate_parser.add_argument("target_ref")
-    annotate_parser.add_argument("base")
-    annotate_parser.add_argument("head")
-    annotate_parser.add_argument("worktree")
-    annotate_parser.add_argument("diff_report")
-    annotate_parser.add_argument("diff_filter", type=int)
-    annotate_parser.add_argument("path_module_filter", type=int)
-    annotate_parser.add_argument("checked_files", nargs="*")
-
-    failure_parser = subparsers.add_parser("record-rebase-failure")
-    failure_parser.add_argument("report", type=Path)
-    failure_parser.add_argument("status", type=int)
-    failure_parser.add_argument("failed_command")
+    diff_parser.add_argument("--files", nargs="+", required=True)
 
     args = parser.parse_args()
-    if args.command == "copy-untracked-product-files":
-        copy_untracked_product_files(args.source_root, args.worktree)
-    elif args.command == "print-summary":
+    if args.command == "print-summary":
         print_summary(args.report)
     elif args.command == "report-status":
         return report_status(args.report)
@@ -331,22 +244,8 @@ def main() -> int:
     elif args.command == "wrap-unfiltered-report":
         wrap_unfiltered_report(args.source, args.destination, args.stderr, args.status)
     elif args.command == "filter-diff-lines":
-        filter_diff_lines(args.source, args.destination, args.project_root, args.diff_base)
-    elif args.command == "record-rebase-failure":
-        record_rebase_failure(args.report, args.status, args.failed_command)
-    else:
-        annotate_rebased_report(
-            args.report,
-            args.source_branch,
-            args.upstream_source,
-            args.target_ref,
-            args.base,
-            args.head,
-            args.worktree,
-            args.diff_report,
-            args.diff_filter == 1,
-            args.path_module_filter == 1,
-            args.checked_files,
+        filter_diff_lines(
+            args.source, args.destination, args.project_root, args.diff_base, args.files
         )
     return 0
 
