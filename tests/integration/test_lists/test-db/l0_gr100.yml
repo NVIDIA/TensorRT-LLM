@@ -26,6 +26,7 @@ l0_gr100:
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_dense_prefill_fa4_patched.py
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_tile_select.py
   - unittest/_torch/attention/sparse/msa/test_msa_prefill_nvfp4_out_in_place.py
+  - unittest/_torch/attention/sparse/msa/test_msa_k2q_ws_stream.py::test_k2q_workspace_matches_stock_contents
   - unittest/_torch/attention/sparse/msa/test_msa_q_e4m3.py
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_proxy_nofill.py
   - unittest/_torch/attention/test_drafter_kv_tail_zero.py
