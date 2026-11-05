@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -23,6 +22,7 @@ from transformers import ExaoneMoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -220,7 +220,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         self.fusion_config = EagerFusionConfig()
         # MoE fusions are disabled by default in K-EXAONE since
         # it may cause a slight accuracy drop due to numerical gap.
-        self.enable_fusion = os.environ.get("TRTLLM_EXAONE_EAGER_FUSION_ENABLED", "0") == "1"
+        self.enable_fusion = get_env_flag("TRTLLM_EXAONE_EAGER_FUSION_ENABLED", False)
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode

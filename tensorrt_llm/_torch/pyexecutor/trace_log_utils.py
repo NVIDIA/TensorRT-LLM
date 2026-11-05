@@ -5,10 +5,9 @@ Leaf module — no other pyexecutor file is imported here, so any consumer
 can import freely without creating circular dependencies.
 """
 
-import os
-
 import torch
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 _GIB = 1 << 30
@@ -36,7 +35,7 @@ def log_mem_snapshot(tag: str) -> None:
       cudaMalloc, NCCL buffers, cuBLAS workspace, CUDA driver context,
       CUDA graph mempool, etc.)
     """
-    if os.environ.get("TLLM_LOG_MEM_PROFILE", "") != "1":
+    if not get_env_flag("TLLM_LOG_MEM_PROFILE", False):
         return
     free, total = torch.cuda.mem_get_info()
     alloc = torch.cuda.memory_allocated()
@@ -61,7 +60,7 @@ def log_tensor_size(tag: str, tensor: torch.Tensor, **extra) -> None:
     Bytes = ``numel * element_size``. Any keyword arguments are appended
     as ``key=value`` for caller-specific context (e.g. routing config).
     """
-    if os.environ.get("TLLM_LOG_MEM_PROFILE", "") != "1":
+    if not get_env_flag("TLLM_LOG_MEM_PROFILE", False):
         return
     size_bytes = tensor.numel() * tensor.element_size()
     extras = "".join(f" {k}={v}" for k, v in extra.items())

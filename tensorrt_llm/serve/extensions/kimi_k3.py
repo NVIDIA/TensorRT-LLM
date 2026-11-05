@@ -20,10 +20,10 @@ policy, default streaming usage, request-field to chat-template-kwarg
 derivation, and the K3 XTML placement of guided-decoding constraints.
 """
 
-import os
 import re
 from typing import Any, Dict, List, Optional
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -48,7 +48,7 @@ def enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
     of rejected. Off unless ``TRTLLM_KIMI_PARAM_POLICY=1``, so deployments keep
     accepting the requests they accept without the policy.
     """
-    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
+    if not get_env_flag("TRTLLM_KIMI_PARAM_POLICY", False):
         return
     if request.top_p is None or request.top_p == 1.0:
         # None would fall back to 1.0 in to_sampling_params; an explicit 1.0

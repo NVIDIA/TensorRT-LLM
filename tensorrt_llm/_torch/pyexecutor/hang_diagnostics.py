@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
-import os
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Protocol
+
+from tensorrt_llm._utils import get_env_flag
 
 from .hang_detector import HangDetector
 
@@ -30,7 +31,7 @@ _KEEP_CURRENT_EVENT: Any = object()
 @contextmanager
 def monitor_executor_initialization() -> Iterator[None]:
     """Dump worker stacks if opt-in executor initialization stalls."""
-    if os.environ.get(HANG_DIAGNOSTICS_ENV) != "1":
+    if not get_env_flag(HANG_DIAGNOSTICS_ENV, False):
         yield
         return
 
@@ -78,7 +79,7 @@ class ExecutorHangDiagnostics:
 
     @classmethod
     def from_environment(cls, rank: int) -> Optional["ExecutorHangDiagnostics"]:
-        if os.environ.get(HANG_DIAGNOSTICS_ENV) != "1":
+        if not get_env_flag(HANG_DIAGNOSTICS_ENV, False):
             return None
         return cls(rank)
 

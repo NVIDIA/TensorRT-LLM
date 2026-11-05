@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-import os
 from typing import Callable, List, Optional, Sequence, Union
 from unittest.mock import patch
 
@@ -13,6 +12,7 @@ from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Interpreter
 from torch.fx.passes.split_module import split_module
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 from ..nccl_window_graph import nccl_window_graph_capture
@@ -26,7 +26,7 @@ from .utils import (get_capture_piecewise_cuda_graph_flag,
 
 # TLLM_PWCG_NVTX_PROBE=1 brackets every piecewise runner call in an NVTX range
 # (host-side attribution of the glue between graph launches in nsys traces).
-_PWCG_NVTX_PROBE = os.environ.get("TLLM_PWCG_NVTX_PROBE", "0") == "1"
+_PWCG_NVTX_PROBE = get_env_flag("TLLM_PWCG_NVTX_PROBE", False)
 
 
 def _piecewise_boundary_ops():

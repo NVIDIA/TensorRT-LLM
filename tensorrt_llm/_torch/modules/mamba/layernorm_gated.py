@@ -17,14 +17,13 @@
 # limitations under the License.
 
 import functools
-import os
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
-from ...._utils import get_sm_version
+from ...._utils import get_env_flag, get_sm_version
 from ...utils import Fp4QuantizedTensor
 
 
@@ -146,8 +145,7 @@ def _pdl_device_policy(device_index: int) -> tuple[bool, int]:
     """Whether PDL is allowed on this device, and its SM count."""
     props = torch.cuda.get_device_properties(device_index)
     sm_version = props.major * 10 + props.minor
-    allowed = (sm_version >= 90
-               and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    allowed = (sm_version >= 90 and get_env_flag("TRTLLM_ENABLE_PDL", True))
     return allowed, props.multi_processor_count
 
 

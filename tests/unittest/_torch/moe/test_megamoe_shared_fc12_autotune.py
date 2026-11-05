@@ -459,6 +459,8 @@ class CpuContractTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
     def test_original_autotuner_primes_each_cached_tactic_before_serving(self):
+        from tensorrt_llm._utils import get_env_flag
+
         source = ast.parse(_AUTOTUNER.read_text())
         autotuner_class = next(
             n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "AutoTuner"
@@ -471,7 +473,7 @@ class CpuContractTests(unittest.TestCase):
             )
         )
         namespace = dict(
-            os=os,
+            get_env_flag=get_env_flag,
             inspect=inspect,
             nvtx_range=lambda name: nullcontext(),
             DistributedTuningStrategy=SimpleNamespace(MERGE=object()),

@@ -274,6 +274,7 @@ _NON_COMPUTE_IMPORTS = frozenset(
         "QuantAlgo",
         "QuantConfig",
         "SiTuActivation",
+        "get_env_flag",
         "is_in_breakable_cuda_graph",
         "k3_mla_decode_view",
         "logger",

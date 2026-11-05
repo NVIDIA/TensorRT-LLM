@@ -26,7 +26,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import Prefill
 from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.utils import set_torch_compiling
-from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm._utils import get_env_flag, mpi_disabled
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     PrefillCudaGraphBackend,
@@ -378,7 +378,7 @@ def _configure_deep_gemm_pdl() -> None:
 
     from tensorrt_llm import deep_gemm
 
-    deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    deep_gemm.set_pdl(get_env_flag("TRTLLM_ENABLE_PDL", True))
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 

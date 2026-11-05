@@ -67,13 +67,13 @@ Runs on SM100+ (Blackwell) GPUs.
 
 from __future__ import annotations
 
-import os
-
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 from cutlass.experimental import primitives as prims
+
+from tensorrt_llm._utils import get_env_flag
 
 from ..common import compat48 as _compat48
 from .device_bound_scheduler import DeviceBoundPersistentTileScheduler
@@ -141,7 +141,7 @@ L2_POLICY_B = "evict_first"
 # See moe_gather_grouped_gemm_act_fusion.py for why an e2e comparison without this
 # measures the missing
 # feature rather than the kernel.
-USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1").lower() in ("1", "true", "yes", "on")
+USE_PDL = get_env_flag("TRTLLM_ENABLE_PDL", True)
 assert L2_POLICY_B in ("", "evict_first", "evict_last", "evict_normal"), (
     f"L2_POLICY_B={L2_POLICY_B!r} is not a valid createpolicy.fractional priority"
 )

@@ -14,12 +14,12 @@
 # limitations under the License.
 
 import math
-import os
 from typing import Optional
 
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -32,8 +32,7 @@ from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
                                               fused_qkv_rope_gate_fp8_append,
                                               fused_sigmoid_mul_inplace)
 
-_QKV_ROPE_TILING_ENABLED = os.environ.get("TRTLLM_ENABLE_QKV_ROPE_TILING",
-                                          "0") == "1"
+_QKV_ROPE_TILING_ENABLED = get_env_flag("TRTLLM_ENABLE_QKV_ROPE_TILING", False)
 
 
 # Move out from this class

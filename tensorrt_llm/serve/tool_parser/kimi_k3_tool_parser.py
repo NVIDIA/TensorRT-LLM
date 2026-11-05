@@ -28,10 +28,10 @@ is seen.
 """
 
 import json
-import os
 import re
 from typing import Any, Dict, List
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 from ..openai_protocol import ChatCompletionToolsParam as Tool
@@ -122,7 +122,7 @@ class KimiK3ToolParser(BaseToolParser):
         forbid the think/response text before the section and the message
         close after it, deadlocking generation.
         """
-        if os.getenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", "0") != "1":
+        if not get_env_flag("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", False):
             # Experimental, opt-in: under concurrent guided load with
             # production tool schemas, sampling tripped a device-side assert
             # and hard-killed the deployment (KVV schema suite, job 3054205:

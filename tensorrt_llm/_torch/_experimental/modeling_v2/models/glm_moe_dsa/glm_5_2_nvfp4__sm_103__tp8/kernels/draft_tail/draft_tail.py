@@ -50,12 +50,13 @@ graph capture, by ``DraftTailRunner.prepare``; all ranks agree on the outcome
 before any rank uses the candidate path.
 """
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 from ... import native_ops
 from ...dispatch import log_capability
@@ -137,7 +138,7 @@ class DraftTailOptions:
     def served() -> "DraftTailOptions":
         """The defaults, with PDL as the native kernels have it (``TRTLLM_ENABLE_PDL``, on
         unless set to 0)."""
-        return DraftTailOptions(pdl=os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0")
+        return DraftTailOptions(pdl=get_env_flag("TRTLLM_ENABLE_PDL", True))
 
     def validate(self) -> None:
         if self.mode not in ("fused", "logits"):
@@ -231,9 +232,7 @@ class DraftTailRunner:
         if self.mapping is None:
             raise ValueError("draft_tail: exchange needs the TP mapping")
         self._comm = _get_mnnvl_workspace_comm(self.mapping)
-        use_fabric = (
-            self.mapping.is_multi_node() or os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
-        )
+        use_fabric = self.mapping.is_multi_node() or get_env_flag("TRTLLM_FORCE_MNNVL_AR", False)
         self._mcast = _make_mnnvl_mcast_buffer(
             self._comm, EXCHANGE_WORDS * 8, self.mapping, use_fabric
         )

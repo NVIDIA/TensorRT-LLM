@@ -24,11 +24,12 @@ ordered on one stream would mix their arrivals.
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Dict, List
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
@@ -189,7 +190,7 @@ def k3_ctx_kv(
     )  # fmt: skip
     scalars = (float(eps), int(max_ctx), int(page), int(block_size), int(table.stride(0)), int(page_stride),
                int(kv_stride), int(head_stride))  # fmt: skip
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    use_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
     consts = (n_rows, k_in, split, ring, nkv, k1, n_tokens, True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = consts + (use_pdl,)

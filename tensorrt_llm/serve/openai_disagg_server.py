@@ -16,7 +16,6 @@
 # yapf: disable
 import asyncio
 import json
-import os
 import signal
 import socket
 import traceback
@@ -31,6 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
@@ -293,7 +293,7 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.state.trust_kv_hints = get_env_flag("TRTLLM_TRUST_KV_HINTS", False)
         self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:

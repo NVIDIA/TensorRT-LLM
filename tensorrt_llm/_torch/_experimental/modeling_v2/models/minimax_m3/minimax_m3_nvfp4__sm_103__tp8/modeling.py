@@ -142,6 +142,7 @@ from tensorrt_llm._torch.speculative.interface import (
     should_use_separate_draft_kv_cache,
 )
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -671,7 +672,7 @@ ACT_SWIGLU = int(ActType_TrtllmGen.SwiGlu)
 # takes, recorded on eager steps and captures (replay runs no Python), printed once at exit.
 # --------------------------------------------------------------------------------------------------------------------
 
-_VALUE_DUMP = os.environ.get("TRTLLM_MODELING_V2_VALUE_DUMP") == "1"
+_VALUE_DUMP = get_env_flag("TRTLLM_MODELING_V2_VALUE_DUMP", False)
 _VALUES: set = set()
 
 

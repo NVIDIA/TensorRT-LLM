@@ -60,12 +60,11 @@ itself are not caught.
 from __future__ import annotations
 
 import functools
-import os
 from typing import Callable, Optional
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.logger import logger
 
 HEAD_DIM = 128
@@ -142,7 +141,7 @@ def _cute_runtime_available() -> bool:
 def _strict() -> bool:
     """Whether TRTLLM_SOL_ATTN_STRICT=1 asks us to raise on an unservable input."""
 
-    return os.environ.get("TRTLLM_SOL_ATTN_STRICT", "0") == "1"
+    return get_env_flag("TRTLLM_SOL_ATTN_STRICT", False)
 
 
 def _dense_bthd(q, k, v):

@@ -48,6 +48,7 @@ from .block_scaled_swap_ab_fc12_epilogue_dedup import GatedActEpilogueArgsDedup,
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
 from .topk_reduce_dedup import TopkReduceDedup
+from tensorrt_llm._utils import get_env_flag
 
 
 _aot_symbol_prefix = "rubin_mega_moe_aot"
@@ -202,7 +203,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.combine_dedup = bool(impl_desc.get("combine_dedup", False))
         # Diagnostic only (MEGA_DIAG_SKIP_TOKEN_BACK=1): combine warps do nothing, so the timed kernel is
         # MMA + epilogue + dispatch alone. Output is wrong; run with MEGA_TIMING_ONLY=1.
-        self._diag_skip_token_back = os.environ.get("MEGA_DIAG_SKIP_TOKEN_BACK", "0") == "1"
+        self._diag_skip_token_back = get_env_flag("MEGA_DIAG_SKIP_TOKEN_BACK", False)
         self.occupancy = 1
         self.architecture = "sm_107"
         self.local_expert_count = self.expert_count // self.world_size

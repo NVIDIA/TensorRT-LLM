@@ -44,12 +44,12 @@ see ``health.check_health`` for the host-side report.
 """
 
 import contextlib
-import os
 import platform
 from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.mapping import Mapping
 
 from ... import dispatch
@@ -104,7 +104,7 @@ def _local_capability(
     major, _ = torch.cuda.get_device_capability()
     if major < 9:
         return False, f"SM {major}x < 90"
-    if "aarch64" not in platform.machine().lower() and os.environ.get("TLLM_TEST_MNNVL") != "1":
+    if "aarch64" not in platform.machine().lower() and not get_env_flag("TLLM_TEST_MNNVL", False):
         return False, "MNNVL multicast workspace requires an aarch64 NVLink domain"
     try:
         import triton  # noqa: F401
@@ -112,7 +112,7 @@ def _local_capability(
         from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
     except ImportError as exc:
         return False, f"import failed: {exc}"
-    if not MnnvlMemory.supports_mnnvl() and os.environ.get("TLLM_TEST_MNNVL") != "1":
+    if not MnnvlMemory.supports_mnnvl() and not get_env_flag("TLLM_TEST_MNNVL", False):
         return False, "MNNVL not supported on this device"
     return True, ""
 
@@ -219,7 +219,7 @@ class PostMoeHop:
         self.workspace: Optional[PostMoeHopWorkspace] = None
         if use_pdl is None:
             use_pdl = (
-                os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
+                get_env_flag("TRTLLM_ENABLE_PDL", True)
                 and torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] >= 9
             )

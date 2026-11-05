@@ -21,7 +21,6 @@
 # limitations under the License.
 
 import copy
-import os
 from types import SimpleNamespace
 from typing import (TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional,
                     Tuple, Union)
@@ -41,7 +40,8 @@ from tensorrt_llm._torch.moe.fused_shared_expert import \
     fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_120f
+from tensorrt_llm._utils import (get_env_flag, is_blackwell_datacenter,
+                                 is_sm_120f)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
@@ -153,7 +153,7 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
 
 
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
-    return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+    return (not get_env_flag("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", False)
             and not enable_attention_dp)
 
 
