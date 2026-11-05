@@ -2604,6 +2604,8 @@ class TestNemotronEpdEvs:
         encoder = object.__new__(NemotronHMultimodalEncoder)
         torch.nn.Module.__init__(encoder)
         encoder.video_temporal_patch_size = 2
+        # The stand-in image payload is routed by `forward`, as dynamic-resolution images are.
+        encoder.dynamic_resolution = True
         params = [
             MultimodalParams(
                 multimodal_data={

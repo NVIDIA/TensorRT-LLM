@@ -281,6 +281,16 @@ class DynamicResolutionParams:
     patch_size: Tuple[int, int]  # (width_patches, height_patches)
 
 
+def _uses_dynamic_resolution(config: transformers.PretrainedConfig) -> bool:
+    """Whether images are encoded at dynamic resolution (`vision_config.args.min_num_patches`).
+
+    Dynamic resolution sends each raw image with its own target size; otherwise images
+    arrive as fixed-size tiles.
+    """
+    vision_args = getattr(getattr(config, "vision_config", None), "args", None)
+    return isinstance(vision_args, dict) and "min_num_patches" in vision_args
+
+
 def _get_vision_encoder_cuda_graph_config(
     mm_config: Optional["MultimodalConfig"],
 ) -> Optional["MultimodalEncoderCudaGraphConfig"]:
@@ -605,6 +615,9 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         self.spatial_merge_size = int(self.patch_size / self.downsample_ratio)
         # Pixel shuffle version.
         self.ps_version = config.ps_version
+        # Dynamic-resolution images are raw images with per-image target sizes;
+        # otherwise images are fixed-size tiles.
+        self.dynamic_resolution = _uses_dynamic_resolution(config)
         if self.ps_version not in (supported_versions := {"v1", "v2"}):
             raise NotImplementedError(
                 f"Unsupported {config.ps_version=}. Supported versions: {supported_versions}."
@@ -983,6 +996,23 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
             cursor += n_images
         return list(torch.split(batched_embeds, per_request_token_counts, dim=1))
 
+    def encode_image_tiles(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Encode fixed-size image tiles, joined across requests, in one ViT pass."""
+        return self.extract_feature(pixel_values).reshape(-1, self.llm_hidden_size)
+
+    @property
+    def image_tile_group(self) -> EncoderGroup:
+        """Fixed-tile images: the tiles of all requests go through one ViT pass.
+
+        Dynamic-resolution images are raw images of different sizes with
+        per-image target sizes held in lists, so they are routed by `forward`.
+        """
+        return EncoderGroup(
+            ("image",),
+            self.encode_image_tiles,
+            input_fields={"pixel_values": {"image": "pixel_values"}},
+        )
+
     def _encode_fixed_tile(self, data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
         """Encode all fixed-tile requests (images + T==1 videos) in a single ViT forward.
 
@@ -1136,10 +1166,15 @@ class NemotronHMultimodalEncoder(NemotronHVisionEncoder):
             return torch.cat(embeds, dim=0)
 
         pack = lambda params: {"multimodal_params": params}  # noqa: E731
+        image_group = (
+            EncoderGroup(("image",), partial(_encoder_fn, modality="image"), pack)
+            if self.dynamic_resolution
+            else self.image_tile_group
+        )
         return [
             encode_multimodal_by_groups(
                 (
-                    EncoderGroup(("image",), partial(_encoder_fn, modality="image"), pack),
+                    image_group,
                     EncoderGroup(("video",), partial(_encoder_fn, modality="video"), pack),
                 ),
                 multimodal_params,
@@ -1269,7 +1304,7 @@ class NemotronHMultimodalInputProcessor(
         # Detect dynamic resolution from config.
         self.dynamic_tiler = None
         vision_args = getattr(getattr(config, "vision_config", None), "args", None)
-        if isinstance(vision_args, dict) and "min_num_patches" in vision_args:
+        if _uses_dynamic_resolution(config):
             pixel_shuffle_version = config.ps_version
             if pixel_shuffle_version != "v2":
                 raise NotImplementedError(
@@ -3314,21 +3349,9 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         all_features = torch.cat(padded_features, dim=0)
         all_masks = torch.cat(padded_masks, dim=0)
 
-        sound_embeds = self.sound_encoder(all_features, all_masks)
-
-        if not has_output_lengths:
-            # Compatibility for feature dicts not built by ParakeetExtractor.
-            # Keep one batched readback rather than synchronizing per input.
-            valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
-                all_masks.sum(dim=1)
-            ).tolist()
-
-        per_clip_embeds: List[torch.Tensor] = []
-        per_clip_counts: List[int] = []
-        for i in range(sound_embeds.shape[0]):
-            valid_len = valid_output_lens[i]
-            per_clip_embeds.append(sound_embeds[i, :valid_len])
-            per_clip_counts.append(valid_len)
+        per_clip_embeds, per_clip_counts = self._encode_audio_clips(
+            all_features, all_masks, valid_output_lens if has_output_lengths else None
+        )
 
         results: List[Tuple[torch.Tensor, List[int]]] = []
         cursor = 0
@@ -3338,6 +3361,27 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             results.append((input_embeds, input_counts))
             cursor += n_clips
         return results
+
+    def _encode_audio_clips(
+        self,
+        features: torch.Tensor,
+        masks: torch.Tensor,
+        output_lengths: Optional[List[int]],
+    ) -> Tuple[List[torch.Tensor], List[int]]:
+        """Encode audio clips padded to one length in a single ``sound_encoder`` call.
+
+        The encoder uses the mask to keep valid output lengths intact, so
+        padded positions don't leak into the kept rows. Returns each clip's
+        valid embedding rows and their counts, clip by clip.
+        """
+        sound_embeds = self.sound_encoder(features.to(dtype=self.model_dtype), masks)
+        if output_lengths is None:
+            # Compatibility for feature dicts not built by ParakeetExtractor.
+            # Keep one batched readback rather than synchronizing per input.
+            output_lengths = self.sound_encoder.encoder._get_subsampling_output_length(
+                masks.sum(dim=1)
+            ).tolist()
+        return [sound_embeds[i, :n] for i, n in enumerate(output_lengths)], output_lengths
 
     def _interleave_video_audio_embeddings(
         self,
@@ -3463,10 +3507,20 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             rows.append(emb)
         return torch.cat(rows, dim=0)
 
-    def _encode_audio_group(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
-        """Audio group encoder_fn: one `sound_encoder` call over standalone audio items."""
-        outs = self._encode_audio([p.multimodal_data["audio"] for p in multimodal_params])
-        return torch.cat([emb for emb, _ in outs], dim=0)
+    def _encode_audio_group(
+        self,
+        input_audio_features: torch.Tensor,
+        feature_attention_mask: torch.Tensor,
+        audio_output_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Audio group encoder_fn: one `sound_encoder` call over the clips of
+        all standalone audio items, zero-padded to the longest clip."""
+        clips, _ = self._encode_audio_clips(
+            input_audio_features,
+            feature_attention_mask,
+            None if audio_output_lengths is None else audio_output_lengths.tolist(),
+        )
+        return torch.cat(clips, dim=0)
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
@@ -3474,14 +3528,33 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # batch image + video in a single ViT forward (dynamic-image,
         # fixed-tile, and video-temporal have different preprocessing),
         # so image and video get separate groups even though they share
-        # the `vision_encoder` module. `build_batched_input` is trivial
-        # because our encoder_fns consume the group-filtered params list
-        # directly rather than plain concatenated tensors.
+        # the `vision_encoder` module.
+        # Fixed-tile images and standalone audio declare their payload
+        # fields. Dynamic-resolution images (raw images with per-image
+        # target sizes in lists) and videos (EVS counts written back per
+        # request, audio interleaved per video) pass the params through to
+        # encoder_fns that route by payload.
         pack = lambda params: {"multimodal_params": params}  # noqa: E731
+        vision = self.vision_encoder
+        image_group = (
+            EncoderGroup(("image",), self._encode_image_group, pack)
+            if vision is None or vision.dynamic_resolution
+            else vision.image_tile_group
+        )
         return (
-            EncoderGroup(("image",), self._encode_image_group, pack),
+            image_group,
             EncoderGroup(("video",), self._encode_video_group, pack),
-            EncoderGroup(("audio",), self._encode_audio_group, pack),
+            EncoderGroup(
+                ("audio",),
+                self._encode_audio_group,
+                # Clips hold items along dim 0 and are zero-padded on time
+                # (mask False/0) to the longest clip.
+                input_fields={
+                    "input_audio_features": {"audio": "input_audio_features"},
+                    "feature_attention_mask": {"audio": "feature_attention_mask"},
+                    "audio_output_lengths": {"audio": "audio_output_lengths"},
+                },
+            ),
         )
 
     def encode_multimodal_inputs(
