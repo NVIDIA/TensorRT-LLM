@@ -643,6 +643,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # the first request that consults it.
         load_builtin_extensions()
         self.generator = generator
+        self._uvicorn_server: Optional[uvicorn.Server] = None
+        self._http_shutdown_requested = False
         self._is_visual_gen = _is_visual_gen_instance(generator)
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
@@ -847,6 +849,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
             yield
 
+            self._http_shutdown_requested = True
             await self._perf_metrics_writer.close()
             for task in (self._launcher_watchdog_task, self._clock_offset_task):
                 if task is not None:
@@ -1705,6 +1708,16 @@ class OpenAIServer(_VideoRoutesMixin):
         logger.info(f"Following the launcher's steady clock offset between "
                     f"local and disagg server: {offset} second")
 
+    def _request_http_shutdown(self) -> None:
+        """Stop HTTP serving once, independently of executor cleanup."""
+        server = getattr(self, '_uvicorn_server', None)
+        if (getattr(self, '_http_shutdown_requested', False)
+                or (server is not None and server.should_exit)):
+            return
+        self._http_shutdown_requested = True
+        _record_generator_termination(self.generator)
+        signal.raise_signal(signal.SIGINT)
+
     def _on_launcher_lost(self, error: BaseException) -> None:
         """Watchdog callback: fail requests with EngineDeadError, then shut down.
 
@@ -1714,31 +1727,22 @@ class OpenAIServer(_VideoRoutesMixin):
         if executor is None:  # the LLM already shut down
             return
         executor._set_fatal_error(error)  # keeps only the first error
-        if not executor.doing_shutdown:
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+        self._request_http_shutdown()
 
     async def health(self) -> Response:
         if self._check_health():
             return Response(status_code=200)
         else:
-            # If the engine has a fatal error, trigger server shutdown so the
-            # pod doesn't linger as a zombie that accepts connections but never
-            # produces tokens.  Uses SIGINT (not SIGTERM) to match the
-            # existing CppExecutorError handlers and let uvicorn perform
-            # its graceful shutdown sequence.  The doing_shutdown guard
-            # ensures we only send SIGINT once — repeated health probes
-            # won't stack signals during an in-progress teardown.
+            # Executor cleanup can precede HTTP shutdown. A fatal engine must
+            # also stop serving, without stacking signals during HTTP teardown.
             executor = getattr(self.generator, '_executor', None)
             headers = {}
             if executor is not None and getattr(executor, '_fatal_error',
                                                 None) is not None:
-                if not getattr(executor, 'doing_shutdown', True):
-                    logger.error(
-                        "Health check detected fatal engine error, initiating "
-                        f"server shutdown: {executor._fatal_error}")
-                    _record_generator_termination(self.generator)
-                    signal.raise_signal(signal.SIGINT)
+                logger.error(
+                    "Health check detected fatal engine error, initiating "
+                    f"server shutdown: {executor._fatal_error}")
+                self._request_http_shutdown()
             elif (executor is not None
                   and not getattr(executor, '_engine_dead', False)
                   and not getattr(executor, 'doing_shutdown', True)):
@@ -2038,8 +2042,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
-                    logger.error(f"Error collecting iteration stats: {e}",
-                                 exc_info=True)
+                    logger.error(f"Error collecting iteration stats: {e}\n"
+                                 f"{traceback.format_exc()}")
                     # Brief sleep to avoid tight loop on persistent errors
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:
@@ -2544,8 +2548,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except ValueError as e:
             return self._create_exception_response(e)
         except Exception as e:
@@ -2958,8 +2961,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_exception_response(e)
@@ -3186,14 +3188,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     promise.abort()
                 except Exception:
                     logger.warning(
-                        "Failed to abort a partially admitted request",
-                        exc_info=True)
+                        "Failed to abort a partially admitted request:\n"
+                        f"{traceback.format_exc()}")
             return self._create_exception_response(error)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_exception_response(e)
@@ -3618,8 +3619,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_exception_response(e)
@@ -4293,6 +4293,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         server = create_uvicorn_server(config)
+        self._uvicorn_server = server
 
         async def _register_after_serving():
             with _StartupTimer("http_server_start"):
