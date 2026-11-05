@@ -1,20 +1,27 @@
+diff --git a/include/nanobind/nb_attr.h b/include/nanobind/nb_attr.h
+--- a/include/nanobind/nb_attr.h
++++ b/include/nanobind/nb_attr.h
+@@ -191,6 +191,11 @@
+     /// Does this function potentially modify the elements of the PyObject*[] array
+     /// representing its arguments? (nb::keep_alive() or call_policy annotations)
+     can_mutate_args = (1 << 17)
++#if defined(TLLM_NANOBIND_PROFILING)
++    ,
++    /// Private marker: name owns "Python name\0profiler label\0" (no ABI layout change).
++    has_profiler_name = (1u << 31)
++#endif
+ };
+ 
+ enum cast_flags : uint8_t {
 diff --git a/include/nanobind/nb_class.h b/include/nanobind/nb_class.h
 --- a/include/nanobind/nb_class.h
 +++ b/include/nanobind/nb_class.h
-@@ -648,15 +648,26 @@
-     NB_INLINE class_ &def_prop_rw(const char *name_, Getter &&getter,
-                                   Setter &&setter, const Extra &...extra) {
-         object get_p, set_p;
-+#if defined(TLLM_NANOBIND_PROFILING)
-+        object profiler_name = steal(PyUnicode_FromFormat(
-+            "%U.%U.%s", this->attr("__module__").ptr(),
-+            this->attr("__qualname__").ptr(), name_));
-+#endif
+@@ -651,12 +651,18 @@
  
          if constexpr (!std::is_same_v<Getter, std::nullptr_t>)
              get_p = cpp_function<T>((detail::forward_t<Getter>) getter,
 +#if defined(TLLM_NANOBIND_PROFILING)
-+                                    name(PyUnicode_AsUTF8(profiler_name.ptr())),
++                                    name(name_),
 +#endif
                                      is_method(), is_getter(),
                                      rv_policy::reference_internal,
@@ -23,26 +30,19 @@ diff --git a/include/nanobind/nb_class.h b/include/nanobind/nb_class.h
          if constexpr (!std::is_same_v<Setter, std::nullptr_t>)
              set_p = cpp_function<T>((detail::forward_t<Setter>) setter,
 +#if defined(TLLM_NANOBIND_PROFILING)
-+                                    name(PyUnicode_AsUTF8(profiler_name.ptr())),
++                                    name(name_),
 +#endif
                                      is_method(), detail::filter_setter(extra)...);
  
          detail::property_install(m_ptr, name_, get_p.ptr(), set_p.ptr());
-@@ -668,14 +679,26 @@
-                                          Setter &&setter,
-                                          const Extra &...extra) {
+@@ -670,12 +676,19 @@
          object get_p, set_p;
-+#if defined(TLLM_NANOBIND_PROFILING)
-+        object profiler_name = steal(PyUnicode_FromFormat(
-+            "%U.%U.%s", this->attr("__module__").ptr(),
-+            this->attr("__qualname__").ptr(), name_));
-+#endif
  
          if constexpr (!std::is_same_v<Getter, std::nullptr_t>)
 -            get_p = cpp_function((detail::forward_t<Getter>) getter, is_getter(),
 +            get_p = cpp_function((detail::forward_t<Getter>) getter,
 +#if defined(TLLM_NANOBIND_PROFILING)
-+                                 name(PyUnicode_AsUTF8(profiler_name.ptr())),
++                                 name(name_),
 +#endif
 +                                 is_getter(),
                                   rv_policy::reference,
@@ -51,25 +51,17 @@ diff --git a/include/nanobind/nb_class.h b/include/nanobind/nb_class.h
          if constexpr (!std::is_same_v<Setter, std::nullptr_t>)
              set_p = cpp_function((detail::forward_t<Setter>) setter,
 +#if defined(TLLM_NANOBIND_PROFILING)
-+                                 name(PyUnicode_AsUTF8(profiler_name.ptr())),
++                                 name(name_),
 +#endif
                                   detail::filter_setter(extra)...);
  
          detail::property_install_static(m_ptr, name_, get_p.ptr(), set_p.ptr());
-@@ -812,15 +835,26 @@
-     NB_INLINE enum_ &def_prop_rw(const char *name_, Getter &&getter,
-                                  Setter &&setter, const Extra &...extra) {
-         object get_p, set_p;
-+#if defined(TLLM_NANOBIND_PROFILING)
-+        object profiler_name = steal(PyUnicode_FromFormat(
-+            "%U.%U.%s", this->attr("__module__").ptr(),
-+            this->attr("__qualname__").ptr(), name_));
-+#endif
+@@ -815,12 +828,18 @@
  
          if constexpr (!std::is_same_v<Getter, std::nullptr_t>)
              get_p = cpp_function<T>((detail::forward_t<Getter>) getter,
 +#if defined(TLLM_NANOBIND_PROFILING)
-+                                    name(PyUnicode_AsUTF8(profiler_name.ptr())),
++                                    name(name_),
 +#endif
                                      is_method(), is_getter(),
                                      rv_policy::reference_internal,
@@ -78,11 +70,94 @@ diff --git a/include/nanobind/nb_class.h b/include/nanobind/nb_class.h
          if constexpr (!std::is_same_v<Setter, std::nullptr_t>)
              set_p = cpp_function<T>((detail::forward_t<Setter>) setter,
 +#if defined(TLLM_NANOBIND_PROFILING)
-+                                    name(PyUnicode_AsUTF8(profiler_name.ptr())),
++                                    name(name_),
 +#endif
                                      is_method(), detail::filter_setter(extra)...);
  
          detail::property_install(m_ptr, name_, get_p.ptr(), set_p.ptr());
+diff --git a/src/common.cpp b/src/common.cpp
+--- a/src/common.cpp
++++ b/src/common.cpp
+@@ -10,6 +10,15 @@
+ #include <nanobind/nanobind.h>
+ #include <complex>
+ #include "nb_internals.h"
++
++#if defined(TLLM_NANOBIND_PROFILING)
++#  include "tensorrt_llm/common/profiler.h"
++#  include <cstdlib>
++#  include <cstring>
++#  include <limits>
++#  include <new>
++#  include <stdexcept>
++#endif
+ 
+ NAMESPACE_BEGIN(NB_NAMESPACE)
+ NAMESPACE_BEGIN(detail)
+@@ -880,9 +889,63 @@
+ 
+ // ========================================================================
+ 
++#if defined(TLLM_NANOBIND_PROFILING)
++/// Cache qualified trace labels without changing accessor names, scopes, or ABI.
++static void property_set_profiler_name(PyObject *scope, const char *name,
++                                       PyObject *getter, PyObject *setter) noexcept {
++    error_scope error_state;
++    try {
++        object module = steal(PyObject_GetAttrString(scope, "__module__"));
++        object qualname = steal(PyObject_GetAttrString(scope, "__qualname__"));
++        if (!module.is_valid() || !qualname.is_valid() ||
++            !PyUnicode_Check(module.ptr()) || !PyUnicode_Check(qualname.ptr()))
++            throw std::runtime_error("nanobind property profiler scope unavailable");
++        object label = steal(PyUnicode_FromFormat(
++            "%U.%U.%s", module.ptr(), qualname.ptr(), name));
++        const char *label_utf8 = label.is_valid() ? PyUnicode_AsUTF8(label.ptr()) : nullptr;
++        if (!label_utf8)
++            throw std::runtime_error("nanobind property profiler name unavailable");
++        const size_t label_size = strlen(label_utf8) + 1;
++        PyObject *accessors[] = { getter, setter };
++        for (PyObject *accessor : accessors) {
++            if (!accessor || (Py_TYPE(accessor) != internals->nb_func &&
++                              Py_TYPE(accessor) != internals->nb_method))
++                continue;
++            func_data *f = nb_func_data(accessor);
++            for (Py_ssize_t i = 0; i < Py_SIZE(accessor); ++i) {
++                if (!(f[i].flags & (uint32_t) func_flags::has_name) || !f[i].name)
++                    continue;
++                const size_t name_size = strlen(f[i].name) + 1;
++                if (name_size > std::numeric_limits<size_t>::max() - label_size)
++                    throw std::bad_alloc();
++                char *packed = (char *) malloc(name_size + label_size);
++                if (!packed)
++                    throw std::bad_alloc();
++                // One owned allocation retains the exact public name before the
++                // first NUL and a private trace label after it. Existing overload
++                // moves and deallocation retain their pointer/flags ownership.
++                memcpy(packed, f[i].name, name_size);
++                memcpy(packed + name_size, label_utf8, label_size);
++                free((char *) f[i].name);
++                f[i].name = packed;
++                f[i].flags |= (uint32_t) func_flags::has_profiler_name;
++            }
++        }
++    } catch (const std::exception &error) {
++        tensorrt_llm::common::reportProfilerFailure(error.what());
++    } catch (...) {
++        tensorrt_llm::common::reportProfilerFailure(
++            "non-standard exception naming a nanobind property");
++    }
++}
++#endif
++
+ static void property_install_impl(PyTypeObject *tp, PyObject *scope,
+                                   const char *name, PyObject *getter,
+                                   PyObject *setter) {
++#if defined(TLLM_NANOBIND_PROFILING)
++    property_set_profiler_name(scope, name, getter, setter);
++#endif
+     PyObject *m = getter ? getter : setter;
+     object doc = none();
+ 
 diff --git a/src/nb_func.cpp b/src/nb_func.cpp
 --- a/src/nb_func.cpp
 +++ b/src/nb_func.cpp
@@ -101,7 +176,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
  #include "nb_internals.h"
  #include "buffer.h"
-@@ -28,6 +36,117 @@
+@@ -28,6 +36,121 @@
  
  // Forward/external declarations
  extern Buffer buf;
@@ -137,6 +212,10 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
 +static std::string nb_func_profiler_name(PyObject *self) {
 +    const func_data *f = nb_func_data(self);
 +    std::string name = "trtllm::nanobind::";
++    if (f->flags & (uint32_t) func_flags::has_profiler_name) {
++        name += f->name + strlen(f->name) + 1;
++        return name;
++    }
 +    if (f->flags & (uint32_t) func_flags::has_scope) {
 +        const bool module_scope = PyModule_Check(f->scope);
 +        object module = steal<object>(PyObject_GetAttrString(
@@ -219,7 +298,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
  static PyObject *nb_func_vectorcall_simple_0(PyObject *, PyObject *const *,
                                               size_t, PyObject *) noexcept;
-@@ -610,6 +729,10 @@
+@@ -610,6 +733,10 @@
  
      func_data *fr = nb_func_data(self);
  
@@ -230,7 +309,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
      const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
                 is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
-@@ -888,6 +1011,10 @@
+@@ -888,6 +1015,10 @@
      const size_t count         = (size_t) Py_SIZE(self),
                   nargs_in      = (size_t) NB_VECTORCALL_NARGS(nargsf);
  
@@ -241,7 +320,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
      const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
                 is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
-@@ -977,6 +1104,10 @@
+@@ -977,6 +1108,10 @@
                                               PyObject *kwargs_in) noexcept {
      func_data *fr = nb_func_data(self);
      const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
@@ -252,7 +331,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
      // Handler routine that will be invoked in case of an error condition
      PyObject *(*error_handler)(PyObject *, PyObject *const *, size_t,
-@@ -1017,6 +1148,10 @@
+@@ -1017,6 +1152,10 @@
                                               PyObject *kwargs_in) noexcept {
      func_data *fr = nb_func_data(self);
      const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
