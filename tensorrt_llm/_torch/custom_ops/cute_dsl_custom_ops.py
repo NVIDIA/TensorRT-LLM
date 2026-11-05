@@ -5897,8 +5897,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # that bypass the scheduler cannot read the kernel's limits off a decline,
     # so the op re-raises ``kimi_k3_routing.can_run``'s rejection.
     @fast_custom_op("trtllm::noaux_tc_route_sort",
-                    mutates_args=(),
-                    device_types="cuda")
+                    mutates_args=())
     def noaux_tc_route_sort(
         logits: torch.Tensor, e_score_correction_bias: torch.Tensor,
         routed_scaling_factor: float, local_expert_offset: int,
@@ -5964,8 +5963,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # (``kimi_k3_router_logits.py``); inputs as ``kimi_k3_router_logits.can_run``
     # accepts them.
     @fast_custom_op("trtllm::kimi_k3_router_logits",
-                    mutates_args=(),
-                    device_types="cuda")
+                    mutates_args=())
     def kimi_k3_router_logits_op(hidden_states: torch.Tensor,
                                  weight: torch.Tensor) -> torch.Tensor:
         if not kimi_k3_router_logits.can_run(hidden_states, weight):
