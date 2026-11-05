@@ -15,7 +15,6 @@
 import asyncio
 import json
 import os
-import re
 from typing import Callable, Optional
 
 from fastapi import HTTPException
@@ -28,6 +27,10 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensResponse,
 )
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+from tensorrt_llm.serve.disagg_request_deadline import (
+    DisaggRequestDeadline,
+    DisaggRequestTimeoutError,
+)
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -47,9 +50,11 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.openai_service import OpenAIService
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
+    SseFrameBuffer,
     UCompletionResponseOrGenerator,
     done_generator,
     responses_done_generator,
+    sse_frame_data,
 )
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
 
@@ -99,55 +104,44 @@ def _drop_ctx_handoff(response: UCompletionResponse) -> None:
         response.finish_reason = None
 
 
-class _SseErrorObserver:
+class _SseErrorObserver(SseFrameBuffer):
     """Observe worker error events without changing the forwarded SSE bytes."""
-
-    _EVENT_END = re.compile(rb"\r?\n\r?\n")
 
     def __init__(self, *, responses_api: bool = False) -> None:
         """Retain only the incomplete event between network chunks."""
-        self._pending = bytearray()
-        self._scan_from = 0
+        super().__init__()
         self._responses_api = responses_api
 
-    def feed(self, chunk: str | bytes) -> bool:
+    def feed(self, chunk: str | bytes, *, on_error: Callable[[], None] | None = None) -> bool:
         """Report a complete top-level error event in LF/CRLF worker SSE.
 
         Args:
             chunk: Original stream data, possibly splitting an event or UTF-8 character.
+            on_error: Observe errors immediately, but for Responses keep scanning
+                until response.failed instead of stopping at the first error.
 
         Returns:
-            Whether a complete event contains the worker's JSON error envelope.
+            Whether consumption stopped at a complete failure event.
         """
-        self._pending.extend(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
-        event_start = 0
-        scan_from = self._scan_from
-        found_error = False
-        while match := self._EVENT_END.search(self._pending, scan_from):
-            event = self._pending[event_start : match.start()]
-            event_start = scan_from = match.end()
-            data = b"\n".join(
-                line[5:].removeprefix(b" ")
-                for line in event.splitlines()
-                if line.startswith(b"data:")
-            )
-            try:
-                payload = json.loads(data)
-            except ValueError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            found_error = isinstance(payload.get("error"), dict) or (
-                self._responses_api and payload.get("type") in ("error", "response.failed")
-            )
-            if found_error:
-                break
-        # Compact once per feed, not once per event in a coalesced chunk.
-        del self._pending[:event_start]
-        # An early error leaves the tail unscanned. Otherwise only a split
-        # delimiter needs revisiting; CRLF/CRLF has at most three prior bytes.
-        self._scan_from = 0 if found_error else max(0, len(self._pending) - 3)
-        return found_error
+        if on_error is not None:
+            return self.consume(chunk, lambda frame: self._observe_frame(frame, on_error=on_error))
+        return self.consume(chunk, self._observe_frame)
+
+    def _observe_frame(self, frame: bytes, *, on_error: Callable[[], None] | None = None) -> bool:
+        """Observe a complete worker error and decide whether it ends the scan."""
+        data = sse_frame_data(frame)
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            return False
+        failed = isinstance(payload, dict) and (
+            isinstance(payload.get("error"), dict)
+            or (self._responses_api and payload.get("type") in ("error", "response.failed"))
+        )
+        if failed and on_error is not None:
+            on_error()
+            return not self._responses_api or payload.get("type") == "response.failed"
+        return failed
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -167,6 +161,16 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_router = coordinator.gen_router
         self._client_factory = client_factory
         self._req_timeout_secs = req_timeout_secs
+        self._request_deadline_config = config.request_deadline
+        if self._request_deadline_config is not None:
+            if config.schedule_style != "generation_first":
+                raise ValueError("request_deadline currently requires generation_first scheduling")
+            if os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") != "1":
+                raise ValueError("request_deadline requires TRTLLM_DISAGG_NO_RETRY=1")
+            if config.bounded_replay_on_generation:
+                raise ValueError("request_deadline does not support bounded_replay_on_generation")
+            if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+                raise ValueError("request_deadline requires paired CTX/GEN serving")
         # Opt-in body-shrink for generation_only requests; see _get_gen_request.
         self._strip_gen_message_history = config.gen_strip_message_history
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
@@ -592,6 +596,39 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_gen_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        """Dispatch a paired request, optionally under one serving deadline.
+
+        Args:
+            request: Validated request accepted for placement and execution.
+            hooks: Existing serving observations for the request.
+
+        Returns:
+            A complete response or a stream that retains the original deadline.
+
+        Raises:
+            DisaggRequestTimeoutError: The configured E2E budget expires.
+        """
+        if self._request_deadline_config is None:
+            return await self._dispatch_gen_first(request, hooks)
+        deadline = DisaggRequestDeadline(self._request_deadline_config.total_seconds)
+        return await deadline.run(lambda: self._dispatch_gen_first(request, hooks, deadline))
+
+    async def _dispatch_gen_first(
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks],
+        deadline: DisaggRequestDeadline | None = None,
+    ) -> UCompletionResponseOrGenerator:
+        """Run CTX and GEN using existing paired cancellation and stream ownership.
+
+        Args:
+            request: Accepted generation-first request.
+            hooks: Existing serving observations for the request.
+            deadline: Shared serving budget, or None for legacy behavior.
+
+        Returns:
+            The GEN response or its cleanup-owning stream.
+        """
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -636,24 +673,97 @@ class OpenAIDisaggregatedService(OpenAIService):
             #
             # Fix: eagerly start consuming the gen generator in a background
             # task so the HTTP POST fires, then pipe chunks through a queue.
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
-            )
+            try:
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                )
+            except (Exception, asyncio.CancelledError) as error:
+                if deadline is not None and isinstance(error, Exception):
+                    deadline.record_failure(error)
+
+                # CTX placement is reserved, but no CTX HTTP leg owns it yet.
+                async def release_placement() -> None:
+                    """Return CTX placement that never acquired an HTTP owner."""
+                    await self._ctx_router.finish_request(
+                        request, success=False, req_id=disagg_request_id
+                    )
+
+                if deadline is None:
+                    await release_placement()
+                else:
+                    deadline.begin_failure_cleanup()
+                    await deadline.run_cleanup(release_placement)
+                raise
 
             queue: asyncio.Queue = asyncio.Queue()
             gen_error: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             error_observer = _SseErrorObserver(responses_api=isinstance(request, ResponsesRequest))
+            worker_failure_selected = False
 
-            async def _consume_gen():
+            def observe_worker_failure() -> None:
+                """Select the worker error and stop CTX before relaying its failure tail."""
+                nonlocal worker_failure_selected
+                assert deadline is not None
+                if not worker_failure_selected:
+                    if not deadline.record_failure():
+                        raise DisaggRequestTimeoutError(deadline.total_seconds)
+                    worker_failure_selected = True
+                deadline.cancel_work(ctx_task)
+                deadline.begin_failure_cleanup()
+                if not gen_error.done():
+                    gen_error.set_result(None)
+
+            async def _consume_gen() -> None:
+                """Relay GEN output and stop work at a complete terminal failure."""
                 try:
                     async for chunk in gen_response:
-                        await queue.put(chunk)
-                        if not gen_error.done() and error_observer.feed(chunk):
-                            gen_error.set_result(None)
+                        failed = (
+                            error_observer.feed(chunk, on_error=observe_worker_failure)
+                            if deadline is not None
+                            else not gen_error.done() and error_observer.feed(chunk)
+                        )
+                        if failed and deadline is not None:
+                            chunk = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+                            tail_size = len(error_observer.remainder())
+                            if tail_size:
+                                chunk = chunk[:-tail_size]
+                        queue.put_nowait(chunk)
+                        if failed:
+                            if not gen_error.done():
+                                gen_error.set_result(None)
+                            if deadline is not None:
+                                break
+                except Exception as error:
+                    if deadline is not None:
+                        deadline.record_failure(error)
+                    raise
                 finally:
-                    queue.put_nowait(None)  # sentinel; the task retains any error
+                    try:
+                        if deadline is not None:
+                            await deadline.run_cleanup(gen_response.aclose)
+                    finally:
+                        if deadline is None:
+                            queue.put_nowait(None)  # sentinel; the task retains any error
 
-            consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
+            async def consume_with_deadline() -> None:
+                """Bound GEN reads independently of CTX cleanup and preserve its worker error."""
+                assert deadline is not None
+                try:
+                    await deadline.run(_consume_gen, allow_failure_cleanup=False)
+                except Exception as error:
+                    if not worker_failure_selected:
+                        raise
+                    logger.debug(
+                        "GEN failure response ended after its worker error: %s",
+                        type(error).__name__,
+                    )
+                finally:
+                    # Also finish the queue if expiry prevents the reader from starting.
+                    queue.put_nowait(None)
+
+            consume_task: asyncio.Task = asyncio.create_task(
+                _consume_gen() if deadline is None else consume_with_deadline()
+            )
             ctx_task = asyncio.create_task(
                 self._ctx_client.send_request(
                     ctx_req,
@@ -664,10 +774,8 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
             tasks = (ctx_task, consume_task)
 
-            async def _close_gen_response() -> None:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
+            async def _drain_gen_response() -> None:
+                """Drain cancelled paired work and close its stream."""
                 try:
                     # Drain without replacing the error that triggered cleanup.
                     await asyncio.gather(*tasks, return_exceptions=True)
@@ -676,25 +784,54 @@ class OpenAIDisaggregatedService(OpenAIService):
                     # so waiting for its task does not necessarily close GEN.
                     await gen_response.aclose()
 
+            async def _close_gen_response() -> None:
+                """Close paired work without letting repeated cancellation interrupt cleanup."""
+                for task in tasks:
+                    if deadline is not None:
+                        deadline.cancel_work(task)
+                    elif not task.done():
+                        task.cancel()
+                if deadline is None:
+                    await _drain_gen_response()
+                else:
+                    deadline.begin_failure_cleanup()
+                    await deadline.run_cleanup(_drain_gen_response)
+
             try:
                 completed, _ = await asyncio.wait(
                     (*tasks, gen_error), return_when=asyncio.FIRST_COMPLETED
                 )
-                if ctx_task in completed:
+                in_band_failure = gen_error.done() and not gen_error.cancelled()
+                if ctx_task in completed and not (deadline is not None and in_band_failure):
                     ctx_task.result()
                 if consume_task in completed:
                     consume_task.result()
-                if gen_error.done() and not ctx_task.done():
-                    # In-band failure closes CTX, but the original GEN error
-                    # stream still belongs to the caller, including its [DONE].
-                    ctx_task.cancel()
-                    await asyncio.gather(ctx_task, return_exceptions=True)
-                    if not ctx_task.cancelled():
+                if in_band_failure and (deadline is not None or not ctx_task.done()):
+
+                    async def drain_context() -> None:
+                        """Stop CTX after GEN failure and preserve its cleanup."""
+                        if deadline is None:
+                            ctx_task.cancel()
+                        else:
+                            deadline.cancel_work(ctx_task)
+                            deadline.begin_failure_cleanup()
+                        await asyncio.gather(ctx_task, return_exceptions=True)
+
+                    if deadline is None:
+                        await drain_context()
+                    else:
+                        await deadline.run_cleanup(drain_context)
+                    if deadline is None and not ctx_task.cancelled():
                         ctx_task.result()
                 else:
                     # Normal GEN completion does not replace the CTX result.
-                    await ctx_task
-            except (Exception, asyncio.CancelledError):
+                    if deadline is None:
+                        await ctx_task
+                    else:
+                        await asyncio.shield(ctx_task)
+            except (Exception, asyncio.CancelledError) as error:
+                if deadline is not None and isinstance(error, Exception):
+                    deadline.record_failure(error)
                 await _close_gen_response()
                 raise
             finally:
@@ -707,7 +844,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                     while True:
                         item = await queue.get()
                         if item is None:
-                            await consume_task
+                            if deadline is None:
+                                await consume_task
+                            else:
+                                await asyncio.shield(consume_task)
                             break
                         yield item
                 finally:
@@ -758,11 +898,26 @@ class OpenAIDisaggregatedService(OpenAIService):
                         ctx_error,
                     )
                     return gen_response
-                return await gen_task
+                return await gen_task if deadline is None else await asyncio.shield(gen_task)
+            except Exception as error:
+                if deadline is not None:
+                    deadline.record_failure(error)
+                raise
             finally:
                 # Closing the HTTP leg requests worker cancellation. It does not
                 # authorize reuse of KV memory still owned by a physical transfer.
                 for task in tasks:
-                    if not task.done():
+                    if deadline is not None:
+                        deadline.cancel_work(task)
+                    elif not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+
+                async def drain_workers() -> None:
+                    """Await paired cleanup after cancellation was requested."""
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                if deadline is None:
+                    await drain_workers()
+                else:
+                    deadline.begin_failure_cleanup()
+                    await deadline.run_cleanup(drain_workers)

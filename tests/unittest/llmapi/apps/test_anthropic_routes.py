@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
+from tensorrt_llm.llmapi.disagg_utils import DisaggRequestDeadlineConfig
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
@@ -385,7 +386,7 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert backend.await_args.args[0].stream
 
 
-def _disagg_route_client(answer):
+def _disagg_route_client(answer, *, request_deadline=None):
     """A disaggregated server whose real request wrapper and hooks call ``answer``."""
     server = object.__new__(OpenAIDisaggServer)
     server._service = SimpleNamespace(openai_chat_completion=answer)
@@ -397,7 +398,10 @@ def _disagg_route_client(answer):
         queue_latency_seconds=Mock(),
     )
     server._allow_request_chat_template = False
-    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
+    server._config = SimpleNamespace(
+        conversation_affinity_header_for_subagents=None,
+        request_deadline=request_deadline,
+    )
     server._collect_perf_metrics = False
     app = FastAPI()
     app.add_middleware(ServerArrivalTimeMiddleware)
@@ -405,9 +409,18 @@ def _disagg_route_client(answer):
     return TestClient(app)
 
 
-@pytest.mark.parametrize("disagg_request_ids", [[17], [16, 17]], ids=["once", "ctx_retried"])
+@pytest.mark.parametrize(
+    "disagg_request_ids,deadline_enabled",
+    [
+        pytest.param([17], False, id="once"),
+        pytest.param([16, 17], False, id="ctx_retried"),
+        pytest.param([17], True, id="deadline_once"),
+    ],
+)
 @pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
-def test_disagg_message_is_named_after_the_disagg_request(stream, disagg_request_ids):
+def test_disagg_message_is_named_after_the_disagg_request(
+    stream, disagg_request_ids, deadline_enabled
+):
     """Not after the generation worker's id for it: each worker numbers its own.
 
     The worker names its chat stream ``chatcmpl-<its id for the request>``, and a
@@ -423,7 +436,10 @@ def test_disagg_message_is_named_after_the_disagg_request(stream, disagg_request
             return _streaming_chat_response(chat_id="chatcmpl-5").body_iterator
         return _chat_response()
 
-    response = _disagg_route_client(answer).post("/v1/messages", json=_request(stream=stream))
+    request_deadline = DisaggRequestDeadlineConfig(total_seconds=5.0) if deadline_enabled else None
+    response = _disagg_route_client(answer, request_deadline=request_deadline).post(
+        "/v1/messages", json=_request(stream=stream)
+    )
 
     assert response.status_code == 200, response.text
     assert re.fullmatch(r"msg_17_[0-9a-f]{16}", _message_id(response, stream))

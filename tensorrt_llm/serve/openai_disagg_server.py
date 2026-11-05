@@ -21,7 +21,8 @@ import signal
 import socket
 import traceback
 import uuid
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Callable, Optional
 
 import aiohttp
@@ -57,6 +58,7 @@ from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
+from tensorrt_llm.serve.disagg_request_deadline import DisaggRequestTimeoutError
 from tensorrt_llm.serve.kv_hints import KvHintsRoute
 from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
                                               _server_base_url)
@@ -70,9 +72,12 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
+                                                ServerArrivalTimeMiddleware,
+                                                SseFrameBuffer,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
+                                                sse_frame_data,
                                                 stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
@@ -110,6 +115,75 @@ _CLOCK_SYNC_TOTAL_BUDGET_SECONDS = 15.0
 # aligned to well under a millisecond, so discarding a noisier estimate is
 # strictly better than applying it.
 _CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
+
+
+async def _prepare_deadline_stream(
+        stream: AsyncGenerator[str | bytes, None],
+        *,
+        responses_api: bool = False,
+        report_timeout: bool = True,
+        upstream: AsyncGenerator[str | bytes, None] | None = None
+) -> AsyncGenerator[str | bytes, None]:
+    """Own a deadline-enabled stream before ASGI starts reading its body.
+
+    Args:
+        stream: Service stream or protocol adapter to relay.
+        responses_api: Whether to use the Responses terminal-event guard.
+        report_timeout: Emit an OpenAI error, or let an adapter handle it.
+        upstream: Source owned by an adapter, including before it is started.
+
+    Returns:
+        A primed iterator that closes its sources on every exit path.
+    """
+    async def complete_frames() -> AsyncGenerator[bytes, None]:
+        """Relay only complete events, discarding any incomplete tail on exit."""
+        buffer = SseFrameBuffer()
+        frames: list[bytes] = []
+
+        def collect(frame: bytes) -> bool:
+            """Collect one complete frame without stopping the scan."""
+            frames.append(frame)
+            return False
+
+        async for chunk in stream:
+            buffer.consume(chunk, collect)
+            for frame in frames:
+                yield frame
+            frames.clear()
+
+    framed = complete_frames()
+    guarded = (guard_responses_stream(framed, stream_error_event)
+               if responses_api else framed)
+
+    async def relay() -> AsyncGenerator[str | bytes, None]:
+        async with AsyncExitStack() as cleanup:
+            if upstream is not None:
+                cleanup.push_async_callback(upstream.aclose)
+            cleanup.push_async_callback(stream.aclose)
+            cleanup.push_async_callback(framed.aclose)
+            if guarded is not framed:
+                cleanup.push_async_callback(guarded.aclose)
+            # Enter the cleanup scope without consuming worker output.
+            yield ""
+            completed = False
+            try:
+                async for chunk in guarded:
+                    if not responses_api and report_timeout:
+                        completed |= sse_frame_data(chunk).strip() == b"[DONE]"
+                    yield chunk
+            except DisaggRequestTimeoutError as error:
+                if not report_timeout:
+                    raise
+                if not responses_api and not completed:
+                    payload = ErrorResponse(message=str(error),
+                                            type="request_timeout",
+                                            code="request_timeout")
+                    yield f"data: {json.dumps({'error': payload.model_dump()})}\n\n"
+
+    result = relay()
+    await result.__anext__()
+    return result
+
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
@@ -423,7 +497,8 @@ class OpenAIDisaggServer:
                 conversation_id=f"subagent:{uuid.uuid4()}")
         req.conversation_params.subagent_affinity_id = parent
 
-    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
+    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest,
+                         *, report_stream_timeout: bool = True) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
         # CompletionRequest first and 400 every chat body, so override the wrapper's
@@ -451,6 +526,13 @@ class OpenAIDisaggServer:
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     stream = response_or_generator
+                    if self._config.request_deadline is not None:
+                        stream = await _prepare_deadline_stream(
+                            stream,
+                            responses_api=isinstance(req, ResponsesRequest),
+                            report_timeout=report_stream_timeout)
+                        return ClosingStreamingResponse(
+                            content=stream, media_type="text/event-stream")
                     if isinstance(req, ResponsesRequest):
                         # A relayed Responses stream that fails early ends with
                         # an `error` event; other protocols end on a sentinel.
@@ -479,7 +561,8 @@ class OpenAIDisaggServer:
 
         try:
             openai_response = await self._wrap_entry_point(
-                self._service.openai_chat_completion)(chat_request, raw_request)
+                self._service.openai_chat_completion,
+                report_stream_timeout=False)(chat_request, raw_request)
         except HTTPException as e:
             error_type = ("invalid_request_error"
                           if 400 <= e.status_code < 500 else "api_error")
@@ -491,6 +574,15 @@ class OpenAIDisaggServer:
         disagg_request_id = getattr(raw_request.state, "disagg_request_id",
                                     None)
         if isinstance(openai_response, StreamingResponse):
+            if isinstance(openai_response, ClosingStreamingResponse):
+                stream = await _prepare_deadline_stream(
+                    reframe_openai_stream(openai_response.body_iterator,
+                                          model=request.model,
+                                          request_id=disagg_request_id),
+                    report_timeout=False,
+                    upstream=openai_response.body_iterator)
+                return ClosingStreamingResponse(
+                    content=stream, media_type="text/event-stream")
             return StreamingResponse(
                 content=reframe_openai_stream(openai_response.body_iterator,
                                               model=request.model,
@@ -561,7 +653,11 @@ class OpenAIDisaggServer:
         return JSONResponse(content=response.model_dump())
 
     def _handle_exception(self, exception):
-        if isinstance(exception, CppExecutorError):
+        if isinstance(exception, DisaggRequestTimeoutError):
+            self._perf_metrics_collector.http_exceptions.inc()
+            raise HTTPException(status_code=504,
+                                detail=str(exception)) from exception
+        elif isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
             record_termination_observation(
                 TerminalOutcome(
