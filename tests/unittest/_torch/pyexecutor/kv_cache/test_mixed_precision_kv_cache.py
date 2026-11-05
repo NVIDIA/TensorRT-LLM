@@ -289,11 +289,10 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert [buffer.size for buffer in config.layers[1].buffers] == [
         buffer.size for buffer in config.layers[0].buffers
     ]
-    # The high layer's K and V blocks follow the layer's in every slot of the shared pool, so a
-    # held block's high rows are its rows two blocks further: the per-pool delta dense attention
-    # applies to its block offsets.
-    assert manager.mixed_precision_high_layer_offsets == {0: 2}
-    assert manager.mixed_precision_high_block_deltas == {0: 2}
+    # The high layer's pages are pages of the layer's own pool with the same slot layout, so a
+    # held block's high rows are the high page's rows at the layer's slot: no block distance.
+    assert manager.mixed_precision_high_layer_offsets == {0: 0}
+    assert manager.mixed_precision_high_block_deltas == {0: 0}
 
 
 def test_cold_page_window_skips_the_codec_while_estimating(make_manager):
@@ -581,7 +580,8 @@ def test_dsa_prepare_fills_the_mixed_precision_high_page_table():
 
 @pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
 def test_cold_page_window_appended_draft_layers(make_manager, drafter):
-    """The cold-page window follows the same rule: MTP layers go mixed, an Eagle3 layer does not."""
+    """Every drafter layer appended to the target cache keeps its first/last tokens: its group's
+    pages must keep the high layers' geometry for them to share the pool."""
     from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
 
     spec_config = (
@@ -597,9 +597,8 @@ def test_cold_page_window_appended_draft_layers(make_manager, drafter):
         cold_page_codec_provider=provider,
     )
     assert manager.pp_layers == [0, 1, 2]
-    assert manager.mixed_precision_high_layers == (
-        {0: 3, 1: 4, 2: 5} if drafter == "mtp" else {0: 3, 1: 4}
-    )
+    assert manager.mixed_precision_high_layers == {0: 3, 1: 4, 2: 5}
+    assert manager.mixed_precision_high_block_deltas == {0: 0}
     # The codec sees the model's layers only, never a mixed-precision high layer.
     assert [
         [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
