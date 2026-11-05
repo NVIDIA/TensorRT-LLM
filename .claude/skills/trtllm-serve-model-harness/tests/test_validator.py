@@ -377,6 +377,22 @@ def test_native_goldens_check_reads_the_served_checkpoints_renders_back(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt"]
 
 
+def test_native_goldens_check_names_a_render_other_than_the_shipped_one(tmp_path, capsys):
+    """A checkpoint's render that reads back exactly passes, and one unlike the shipped is named."""
+    skill = os.path.dirname(os.path.dirname(VALIDATE))
+    with open(os.path.join(skill, "tests", "fixtures", "native_goldens.json")) as fh:
+        fixture = json.load(fh)
+    renders = [g for g in fixture["goldens"] if g["model"] == "glm-5"]
+    shipped = tmp_path / "shipped.json"
+    first = dict(renders[0], text=renders[0]["text"] + " ")  # another checkpoint's render, say
+    shipped.write_text(json.dumps(dict(fixture, goldens=[first] + renders[1:])))
+
+    assert native_goldens.check(renders, shipped_path=str(shipped)) == 0
+    out = capsys.readouterr().out
+    assert "glm-5: 5 renders, 5 read back exactly, 4 equal to the shipped goldens" in out
+    assert f"DIFFERS {renders[0]['case']}: reads back exactly" in out and "FAIL" not in out
+
+
 def test_native_reader_flags_the_models_slips():
     card = {"kind": "glm_xml", "prompt_opens": "think", "stop_markers": ["<|observation|>"]}
     turn = native.read(card, "Plan.</think>Reading.<tool_call>Read<arg_key>p</arg_key><arg_value>a")

@@ -26,8 +26,10 @@ reading is recorded beside the expected one.
 reads every render of the checkpoint you serve back with its model profile's own reader, and
 compares it with the shipped goldens (``tests/fixtures/native_goldens.json``). It writes nothing,
 prints each encoder file's ``template_sha256`` (the first 16 hex digits of its SHA-256, as model
-profiles record it), and exits 1 when a render does not read back exactly. Run it before trusting
-C-13 on a checkpoint whose ``template_sha256`` the profile does not list.
+profiles record it), and exits 1 when a render does not read back exactly. A render that reads
+back exactly but differs from the shipped one passes and is named (DIFFERS): the shipped goldens
+pin the reader, not a checkpoint, and the reader has just read this checkpoint's own render. Run
+it before trusting C-13 on a checkpoint whose ``template_sha256`` the profile does not list.
 
     native_goldens.py --kimi-k3 <ckpt dir> --glm <ckpt dir> --deepseek-v41 <ckpt dir> --out <file>
 
@@ -202,11 +204,13 @@ def check(goldens, shipped_path=SHIPPED, profile_dir=PROFILES):
         renders = [g for g in goldens if g["model"] == model]
         problems = [(g["case"], read_back(g, profile)) for g in renders]
         problems = [(case, why) for case, why in problems if why]
-        same = sum(shipped.get((model, g["case"])) == g["text"] for g in renders)
+        differ = [g["case"] for g in renders if shipped.get((model, g["case"])) != g["text"]]
         print(f"{model}: {len(renders)} renders, {len(renders) - len(problems)} read back exactly, "
-              f"{same} equal to the shipped goldens")  # fmt: skip
+              f"{len(renders) - len(differ)} equal to the shipped goldens")  # fmt: skip
         for case, why in problems:
             print(f"  FAIL {case}: {why}")
+        for case in (c for c in differ if c not in dict(problems)):
+            print(f"  DIFFERS {case}: reads back exactly, but is not the shipped render")
         failures += len(problems)
     return 1 if failures else 0
 
