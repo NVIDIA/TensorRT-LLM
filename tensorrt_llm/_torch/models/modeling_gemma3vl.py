@@ -3,11 +3,14 @@
 
 import copy
 import dataclasses
+import math
 from typing import Any, List, Literal, Optional, Tuple
 
 import torch
 from transformers import (AutoProcessor, AutoTokenizer, Gemma3Config,
                           PretrainedConfig, PreTrainedModel)
+from transformers.image_utils import get_image_size, is_pil_image
+from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -18,6 +21,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
+from ...inputs.multimodal import MultimodalItemMetadata
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
@@ -26,6 +30,7 @@ from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma3 import Gemma3ForCausalLM
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import (_MULTIMODAL_ENV_NAME, _is_mm_disagg,
                                         fuse_input_embeds)
 from .modeling_siglip import SiglipVisionModel
@@ -96,23 +101,75 @@ class Gemma3InputProcessor(BaseMultimodalInputProcessor,
         input_ids = processor_output["input_ids"]
         pixel_values = processor_output.get("pixel_values")
 
-        return input_ids, pixel_values
+        # Pan-and-scan crops belong to their original image item.
+        output_lengths = []
+        if pixel_values is not None:
+            image_kwargs = self.processor._merge_kwargs(
+                Gemma3ProcessorKwargs,
+                tokenizer_init_kwargs=self.processor.tokenizer.init_kwargs,
+                do_rescale=do_rescale,
+                return_tensors="pt",
+            )["images_kwargs"]
+            for image in images:
+                height, width = ((image.height, image.width) if
+                                 is_pil_image(image) else get_image_size(image))
+                num_crops = 0
+                if image_kwargs["do_pan_and_scan"]:
+                    short, long = min(height, width), max(height, width)
+                    if long / short >= image_kwargs[
+                            "pan_and_scan_min_ratio_to_activate"]:
+                        num_crops = min(
+                            image_kwargs["pan_and_scan_max_num_crops"],
+                            max(
+                                2,
+                                min(
+                                    math.floor(long / short + 0.5), long //
+                                    image_kwargs["pan_and_scan_min_crop_size"]))
+                        )
+                        if min(short, math.ceil(long / num_crops)
+                               ) < image_kwargs["pan_and_scan_min_crop_size"]:
+                            num_crops = 0
+                output_lengths.append(
+                    (1 + num_crops) * self.config.mm_tokens_per_image)
+        return input_ids, pixel_values, output_lengths
 
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        input_ids, pixel_values = self._preprocess(inputs)
+        input_ids, pixel_values, output_lengths = self._preprocess(inputs)
         multimodal_data = None
         if pixel_values is not None:
             multimodal_data = {
                 "multimodal_data": {
                     "image": {
-                        "pixel_values": pixel_values
+                        "pixel_values": pixel_values,
+                        "output_embedding_lengths": output_lengths,
                     }
                 },
             }
         return input_ids[0].to(torch.int32).tolist(), multimodal_data
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: dict,
+        mm_item_order: Optional[List[dict]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids,
+                                                multimodal_data, mm_item_order)
+        if metadata is not None or "image" not in multimodal_data:
+            return metadata
+        image = multimodal_data["image"]
+        rows = image.get("output_embedding_lengths")
+        if rows is None:
+            rows = [self.config.mm_tokens_per_image
+                    ] * image["pixel_values"].shape[0]
+        refs = ([(entry["modality"], entry["index"]) for entry in mm_item_order]
+                if mm_item_order else [("image", index)
+                                       for index in range(len(rows))])
+        return MultimodalItemMetadata(
+            refs, output_embedding_lengths=[rows[index] for _, index in refs])
 
 
 # Original HF implementation:
@@ -305,16 +362,11 @@ class Gemma3VLM(PreTrainedModel):
         )
 
         multimodal_params = kwargs.get("multimodal_params", [])
-        pixel_values = [
-            multimodal_param.multimodal_data["image"]["pixel_values"]
-            for multimodal_param in multimodal_params
-        ]
-
         mm_embeds = []
         mm_token_mask = None
-        if len(pixel_values) > 0:
-            image_features = self._get_image_features(
-                pixel_values=torch.cat(pixel_values))
+        if multimodal_params:
+            image_features = encode_multimodal_by_groups(
+                self.mm_encoder_groups, multimodal_params)
             mm_embeds = [image_features.contiguous()]
 
             # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens.
@@ -338,6 +390,16 @@ class Gemma3VLM(PreTrainedModel):
             lora_params=kwargs.get("lora_params", None),
         )
         return logits
+
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (EncoderGroup(
+            modalities=("image", ),
+            encoder_fn=self._get_image_features,
+            input_fields={"pixel_values": {
+                "image": "pixel_values"
+            }},
+        ), )
 
     @nvtx_range("[Vision] process")
     def _get_image_features(self, pixel_values):
