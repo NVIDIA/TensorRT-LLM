@@ -72,7 +72,7 @@ LayerConfig = Union[AttentionLayerConfig, SsmLayerConfig]
 class AllocationUnit(StrEnum):
     """How a region's memory grows over a request's life."""
 
-    TOKEN_BLOCK = "token_block"
+    TOKEN_BLOCK = "token_block"  # nosec B105 - an allocation unit name, not a password
     """One slot per token block: the region grows with the sequence."""
 
     REQUEST = "request"
