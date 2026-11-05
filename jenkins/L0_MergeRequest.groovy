@@ -3100,6 +3100,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Build-Docker-Images": {
             script {
                 def imageBuildStatus
+                // Nightly scans can inspect published images even when later build checks fail.
+                def scanAfterImageBuildFailure = runContainerScanning && runMode == "nightly_release" && !enableFailFast
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     try {
@@ -3179,12 +3181,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 stageResult: 'FAILURE') {
                                 error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
                             }
+                        } else if (scanAfterImageBuildFailure) {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                                throw e
+                            }
                         } else {
                             throw e
                         }
                     }
                 }
-                if (!runContainerScanning || imageBuildStatus != "SUCCESS") {
+                if (!runContainerScanning || (imageBuildStatus != "SUCCESS" && !scanAfterImageBuildFailure)) {
                     return
                 }
                 stage("[NGC-Container-Compliance-Check] Run") {
