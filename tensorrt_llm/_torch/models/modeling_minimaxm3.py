@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -60,6 +60,7 @@ from ..attention.backends.sparse.minimax_m3 import (
 from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
+from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..flashinfer_utils import get_env_enable_pdl
 from ..modules import linear as linear_module
@@ -820,22 +821,35 @@ def _bcg_bucket_takes_eager_qkv(captured_rows: int) -> bool:
     )
 
 
-_CTX_QKV_FUSED_RUNNERS: Dict[Tuple[int, int, int], Any] = {}
+if TYPE_CHECKING:
+    from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
+
+
+_CTX_QKV_FUSED_RUNNERS: dict[tuple[int, int, int], M3QkvFusedRunner | None] = {}
 _CTX_QKV_FUSED_LOGGED = False
 
 
-def _ctx_qkv_fused_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: int):
+def _ctx_qkv_fused_runner(
+    num_heads_q: int, num_heads_kv: int, num_heads_index: int
+) -> M3QkvFusedRunner | None:
     """The compiled fused QKV runner for one per-rank head geometry (compiled on first use, outside capture)."""
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return None
     key = (num_heads_q, num_heads_kv, num_heads_index)
-    runner = _CTX_QKV_FUSED_RUNNERS.get(key)
-    if runner is None:
-        from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
+    if key not in _CTX_QKV_FUSED_RUNNERS:
+        try:
+            from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
 
-        runner = M3QkvFusedRunner(
-            num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
-        )
+            runner = M3QkvFusedRunner(
+                num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
+            )
+        except Exception as exc:  # noqa: BLE001 — initialization must leave the stock path available
+            logger.warning(
+                f"MiniMax-M3 fused QKV initialization failed for heads {key}: {exc}; using stock QKV"
+            )
+            runner = None
         _CTX_QKV_FUSED_RUNNERS[key] = runner
-    return runner
+    return _CTX_QKV_FUSED_RUNNERS[key]
 
 
 # CTX prefill router: a fixed-tile TF32 tensor-core GEMM (router_gemm_tf32) reads the BF16 hidden states directly
@@ -2536,6 +2550,8 @@ class MiniMaxM3Attention(Attention):
         runner = _ctx_qkv_fused_runner(
             self.num_heads, self.num_key_value_heads, self.sparse_num_index_heads
         )
+        if runner is None:
+            return None
         q = hidden_states.new_empty(
             (num_tokens, self.num_heads, self.head_dim), dtype=torch.float8_e4m3fn
         )

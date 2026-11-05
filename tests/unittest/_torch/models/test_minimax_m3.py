@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import json
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, create_autospec
 
 import pytest
@@ -3284,6 +3285,67 @@ def test_ctx_qkv_fused_skips_autotune_pass(monkeypatch, tuning: bool) -> None:
     assert m3._autotuner_tuning() is tuning
     # The yield is logged once per process, and only when it happens.
     assert m3._CTX_QKV_FUSED_YIELD_LOGGED is tuning
+
+
+@pytest.mark.cpu_only
+def test_ctx_qkv_fused_keeps_native_mxfp8_without_rubin_dsl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native MXFP8 support does not imply that the optional Rubin DSL is installed."""
+    monkeypatch.setattr(modeling_minimaxm3, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", False)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_RUNNERS", {})
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_autotuner_tuning", lambda: False)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.kernels.rubin.m3_qkv_fusion.kernel", None)
+
+    attention = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    nn.Module.__init__(attention)
+    attention.num_heads = 8
+    attention.num_key_value_heads = 1
+    attention.sparse_num_index_heads = 1
+    attention.head_dim = 128
+    attention.qkv_proj = nn.Linear(64, 1536, bias=False, dtype=torch.bfloat16)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    attention.qkv_proj.quant_method = method
+    hidden = torch.zeros(1025, 64, dtype=torch.bfloat16)
+    unused_cache = torch.empty(0)
+    assert (
+        attention._ctx_fused_qkv_gemm_producer(
+            hidden, unused_cache, unused_cache, unused_cache, unused_cache, (), (), 1e-6
+        )
+        is None
+    )
+    assert not modeling_minimaxm3._CTX_QKV_FUSED_RUNNERS
+
+
+@pytest.mark.cpu_only
+def test_ctx_qkv_fused_memoizes_initialization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed optional runner is tried and logged once for each head geometry."""
+
+    def construct_runner(*, num_heads_q: int, num_heads_kv: int, num_heads_index: int) -> object:
+        return object()
+
+    module = ModuleType("tensorrt_llm._torch.kernels.rubin.m3_qkv_fusion.kernel")
+    constructor = create_autospec(
+        construct_runner, spec_set=True, side_effect=RuntimeError("compile failed")
+    )
+    module.M3QkvFusedRunner = constructor
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(modeling_minimaxm3, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_RUNNERS", {})
+    warning = create_autospec(modeling_minimaxm3.logger.warning, spec_set=True)
+    monkeypatch.setattr(modeling_minimaxm3.logger, "warning", warning)
+    for _ in range(2):
+        assert modeling_minimaxm3._ctx_qkv_fused_runner(8, 1, 1) is None
+    constructor.assert_called_once_with(num_heads_q=8, num_heads_kv=1, num_heads_index=1)
+    assert warning.call_count == 1
+    assert modeling_minimaxm3._ctx_qkv_fused_runner(16, 1, 1) is None
+    assert constructor.call_count == warning.call_count == 2
 
 
 @pytest.mark.cpu_only

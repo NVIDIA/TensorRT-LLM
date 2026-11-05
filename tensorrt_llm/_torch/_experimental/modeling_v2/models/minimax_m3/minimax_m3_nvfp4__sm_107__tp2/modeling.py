@@ -1983,6 +1983,8 @@ def _ctx_fused_qkv(core, i: int, hidden: torch.Tensor, position_ids, step: dict)
         return None
     w = core.w
     runner = builtin._ctx_qkv_fused_runner(core.heads, core.kv_heads, core.index_heads)
+    if runner is None:
+        return None
     q = hidden.new_empty((rows, core.heads, core.head_dim), dtype=torch.float8_e4m3fn)
     index_q = hidden.new_empty((rows, core.index_heads, core.head_dim), dtype=torch.float8_e4m3fn)
     prequant = take_prequantized_mxfp8(hidden)

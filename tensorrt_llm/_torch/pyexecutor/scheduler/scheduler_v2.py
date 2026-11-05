@@ -1650,9 +1650,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"{minimum_suffix} new tokens for this suffix"
                 )
         if remaining_budget is not None:
-            remaining_budget -= replay_tokens
-            if remaining_budget <= 0:
-                return ScheduleAction.SKIP, 0, False
+            # A replay that exhausts the reduced budget takes the same optional
+            # reserve-release retry as an indivisible context chunk below.
+            remaining_budget = max(0, remaining_budget - replay_tokens)
         if force_chunk:
             # Snapshot boundaries can be shorter than chunk_unit_size.
             assert isinstance(req.expect_snapshot_points, list)
@@ -1707,8 +1707,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # gets a fresh budget; under steady-state load this resolves quickly.
         if chunk_size <= 0:
             if full_token_budget is not None:
-                # The reserve is optional. Release it once when MM alignment or
-                # exact pre-grown replay cannot advance; token_cap still applies.
+                # The reserve is optional. Release it once when encoder replay,
+                # MM alignment or exact pre-grown replay cannot advance; token_cap still applies.
                 # No resize/allocation has happened, so prepare_context is safe to repeat.
                 budget.max_num_tokens = full_token_budget
                 return self._try_schedule_context_chunked_impl(

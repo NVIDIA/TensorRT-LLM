@@ -5272,6 +5272,19 @@ class TestAppendReserveShortestFirst:
         assert ids(out.context_requests) == [0]
         assert requests[0].context_chunk_size == 7168
 
+    def test_reserve_released_when_encoder_replay_exhausts_reduced_budget(self) -> None:
+        """Two replaying contexts must not both wait on the optional append reserve."""
+        manager = make_kv_cache_manager(tokens_per_block=64)
+        manager.context_replay_tokens.side_effect = None
+        manager.context_replay_tokens.return_value = 6500
+        requests = [make_ctx_request(i, 10000, prompt_len=16500) for i in range(2)]
+        for request in requests:
+            request.context_current_position = 6500
+            request.py_multimodal_data = None
+        out = self._schedule(manager, requests)
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 1664
+
     def test_short_request_takes_the_reserve_ahead_of_a_second_long_one(self):
         head = make_ctx_request(0, context_remaining_length=20000)
         long_second = make_ctx_request(1, context_remaining_length=6000)
