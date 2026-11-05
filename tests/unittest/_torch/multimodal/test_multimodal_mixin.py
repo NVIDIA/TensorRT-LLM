@@ -19,17 +19,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from utils.util import assert_no_cuda_sync
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
+    encode_multimodal_by_groups,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
     MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -953,3 +957,41 @@ def test_build_multimodal_encoder_input_unhandled_layout_raises(mm_data, expecte
     model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
     with pytest.raises(NotImplementedError, match=expected_match):
         model.build_multimodal_encoder_input(param, [0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("device, calls", [("cpu", [[1.0, 2.0]]), ("cuda", [[1.0], [2.0]])])
+def test_equal_shared_tensors_share_a_call_only_on_the_host(device, calls):
+    """Requests holding equal copies of a shared tensor share one encoder call when the copies
+    are on the host. Copies on the GPU are not compared, which would synchronize the host: each
+    goes to its own call, and the rows come back in group order."""
+    received = []
+
+    def encode(pixels, table):
+        received.append(pixels[:, 0].tolist())
+        return pixels * 2
+
+    partitions = {
+        "image": {
+            "pixels": MultimodalItemPartition(),
+            "table": MultimodalItemPartition(item_axis=None),
+        }
+    }
+    params = [
+        MultimodalParams(
+            multimodal_data={
+                "image": {
+                    "pixels": torch.full((1, 4), marker),
+                    "table": torch.ones(3, device=device),
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1], input_partitions=partitions
+                ),
+            }
+        )
+        for marker in (1.0, 2.0)
+    ]
+    with assert_no_cuda_sync():
+        out = encode_multimodal_by_groups([EncoderGroup(("image",), encode)], params)
+    assert received == calls
+    assert out[:, 0].tolist() == [2.0, 4.0]

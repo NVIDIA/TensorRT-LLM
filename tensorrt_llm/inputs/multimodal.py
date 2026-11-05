@@ -43,11 +43,15 @@ class MultimodalItemPartition(NamedTuple):
     for a value shared by every item. Lists and tuples have item axis zero.
     ``item_lengths`` partitions a packed input along that axis, for example
     patch counts for vision or frame counts for audio. Lengths are host-side
-    metadata, independent of the payload tensor's device.
+    metadata, independent of the payload tensor's device. ``padding_value``
+    fills the other dims of a tensor input when items of different sizes are
+    batched together for one encoder call: zero (False for bool) by default,
+    or for example ``-1`` for position ids whose ``-1`` marks padding.
     """
 
     item_axis: int | None = 0
     item_lengths: tuple[int, ...] | None = None
+    padding_value: int | float = 0
 
     def select(self, value: Any, item_indices: Sequence[int]) -> Any:
         """Select items in the requested order, preserving tensor dtype/device.
@@ -59,7 +63,7 @@ class MultimodalItemPartition(NamedTuple):
         read-only. Other selections copy only the selected items; shared values
         retain identity.
         """
-        axis, lengths = self
+        axis, lengths = self.item_axis, self.item_lengths
         if axis is None or value is None:
             return value
         if isinstance(value, torch.Tensor):
@@ -138,6 +142,62 @@ def select_multimodal_fields(
         if name in modality_data:
             selected[name] = partition.select(modality_data[name], item_indices)
     return selected
+
+
+def _batch_item_values(values: Sequence[Any],
+                       axis: int,
+                       padding_value: int | float = 0) -> Any:
+    """Batch the item values of one input field along ``axis``.
+
+    Tensors whose other dims differ are padded at the end of those dims with
+    ``padding_value`` (`_cat_padded`); lists and tuples are concatenated on
+    item axis zero. The encoder builder batches each declared key with it.
+    """
+    first = values[0]
+    if isinstance(first, torch.Tensor):
+        return _cat_padded(values, axis, padding_value)
+    if isinstance(first, (list, tuple)) and axis == 0:
+        return type(first)([item for items in values for item in items])
+    raise TypeError(
+        "Item fields must be tensors or lists/tuples on item axis zero")
+
+
+def _cat_padded(values: Sequence[torch.Tensor], axis: int,
+                padding_value: int | float) -> torch.Tensor:
+    """Concatenate along ``axis``, padding other dims at their end.
+
+    Values whose other dims agree take one ``torch.cat``, which checks the
+    sizes itself; the first and last value pick that path. Otherwise each
+    value is copied into its span of one tensor filled with ``padding_value``.
+    """
+    first = values[0]
+    # Checked before torch.cat, which also accepts a 1-D empty tensor next to
+    # tensors of another rank.
+    if len({(value.dtype, value.ndim) for value in values}) > 1:
+        raise ValueError("Item tensors of one field must share dtype and rank")
+    axis %= first.dim()
+    head, tail = first.shape, values[-1].shape
+    if head[:axis] + head[axis + 1:] == tail[:axis] + tail[axis + 1:]:
+        try:
+            return torch.cat(values, dim=axis)
+        except RuntimeError:
+            # Another value differs in its other dims: pad below. Re-raise other errors.
+            if len({
+                    value.shape[:axis] + value.shape[axis + 1:]
+                    for value in values
+            }) == 1:
+                raise
+    shapes = [value.shape for value in values]
+    padded = [max(sizes) for sizes in zip(*shapes)]
+    spans = [shape[axis] for shape in shapes]
+    padded[axis] = sum(spans)
+    batched = first.new_full(padded, padding_value)
+    for value, span in zip(values, batched.split_with_sizes(spans, axis)):
+        for dim, size in enumerate(value.shape):
+            if size != padded[dim] and dim != axis:
+                span = span.narrow(dim, 0, size)
+        span.copy_(value)
+    return batched
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -252,7 +312,8 @@ class MultimodalItemMetadata:
                         name:
                         partition if partition.item_lengths is None else
                         MultimodalItemPartition(partition.item_axis, (
-                            partition.item_lengths[local_index], ))
+                            partition.item_lengths[local_index], ),
+                                                partition.padding_value)
                         for name, partition in partitions.items()
                     }
                 },
@@ -268,11 +329,12 @@ class MultimodalItemMetadata:
         for modality, indices in local_indices.items():
             if modality in self.input_partitions:
                 partitions[modality] = {
-                    name: (partition if partition.item_lengths is None else
-                           MultimodalItemPartition(
-                               partition.item_axis,
-                               tuple(partition.item_lengths[i]
-                                     for i in indices)))
+                    name:
+                    (partition if partition.item_lengths is None else
+                     MultimodalItemPartition(
+                         partition.item_axis,
+                         tuple(partition.item_lengths[i]
+                               for i in indices), partition.padding_value))
                     for name, partition in
                     self.input_partitions[modality].items()
                 }

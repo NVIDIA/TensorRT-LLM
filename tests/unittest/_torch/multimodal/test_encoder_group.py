@@ -9,18 +9,29 @@ Covers the pure helpers behind ``encode_multimodal_by_groups``:
 * ``MultimodalParams.get_item_layout`` — item metadata with legacy fallbacks.
 * ``_reorder_embeds_by_manifest`` — slice per-modality tensors and concat in
   each request's prompt-order manifest.
+* ``EncoderGroup`` batching — the default builder, splitting payloads that
+  cannot share a call, and the encoder row-count check.
 """
+
+import functools
+from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalEncoderContractError,
     _lengths_by_modality,
     _reorder_embeds_by_manifest,
+    build_batched_input_by_partitions,
+    encode_multimodal_by_groups,
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
 )
 
@@ -265,3 +276,300 @@ class TestReorderEmbedsByManifest:
         mp = _mp(buckets={})
         out = _reorder_embeds_by_manifest([(mp.item_metadata.item_refs, ())], {}, {})
         assert out.numel() == 0
+
+
+def _rows(*markers_and_rows, dtype=torch.float32):
+    """A packed payload: ``rows`` rows holding ``marker`` per item."""
+    return torch.cat(
+        [torch.full((rows, 1), float(marker)) for marker, rows in markers_and_rows]
+    ).to(dtype)
+
+
+class _Scale(NamedTuple):
+    """A per-processor record, like a normalization record."""
+
+    factor: float
+
+
+def _request(items, buckets, partitions):
+    """One request: prompt-ordered ``(modality, index, rows)`` items and its payloads."""
+    metadata = MultimodalItemMetadata(
+        [(modality, index) for modality, index, _ in items],
+        output_embedding_lengths=[rows for *_, rows in items],
+        input_partitions=partitions,
+    )
+    metadata.validate()
+    return MultimodalParams(
+        multimodal_data={**buckets, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
+    )
+
+
+def _image(markers_and_rows, dtype=torch.float32, scale=None):
+    """An image payload with one packed item per (marker, rows) and its partitions."""
+    data = {"pixels": _rows(*markers_and_rows, dtype=dtype), "undeclared": torch.zeros(1)}
+    partitions = {
+        "pixels": MultimodalItemPartition(item_lengths=tuple(r for _, r in markers_and_rows))
+    }
+    if scale is not None:
+        data["scale"] = scale
+        partitions["scale"] = MultimodalItemPartition(item_axis=None)
+    return data, partitions
+
+
+class TestDefaultBuilder:
+    def test_group_binds_the_default_builder_and_keeps_its_own(self):
+        group = EncoderGroup(("image", "video"), lambda pixels: pixels)
+        builder = group.build_batched_input
+        assert isinstance(builder, functools.partial)
+        assert builder.func is build_batched_input_by_partitions
+        assert builder.args == (("image", "video"),)
+
+        def build(params):
+            return {}
+
+        # Positional, as models construct groups on main.
+        assert EncoderGroup(("image",), lambda: None, build).build_batched_input is build
+
+    def test_modality_then_request_order_with_declared_keys_only(self):
+        image_a, image_a_partitions = _image([(1, 2)])
+        image_b, image_b_partitions = _image([(3, 1), (4, 2)])
+        video = {"pixels": _rows((2, 3)), "frames": torch.tensor([3])}
+        video_partitions = {"pixels": MultimodalItemPartition(item_lengths=(3,))}
+        params = [
+            _request(
+                [("video", 0, 3), ("image", 0, 2)],
+                {"image": image_a, "video": video},
+                {"image": image_a_partitions, "video": video_partitions},
+            ),
+            _request([("audio", 0, 1)], {"audio": {"pixels": torch.ones(1, 1)}}, {}),
+            _request(
+                [("image", 0, 1), ("image", 1, 2)],
+                {"image": image_b},
+                {"image": image_b_partitions},
+            ),
+        ]
+        group_params = [params[0], params[2]]
+        inputs = build_batched_input_by_partitions(("image", "video"), group_params)
+        # Image items of both requests, then the video item, all batched in `pixels`.
+        assert list(inputs) == ["pixels"]
+        assert inputs["pixels"][:, 0].tolist() == [1, 1, 3, 4, 4, 2, 2, 2]
+
+    def test_different_keys_per_modality_stay_apart(self):
+        image, image_partitions = _image([(1, 2)])
+        video = {"video_pixels": _rows((2, 1)), "grid": torch.tensor([[1, 1, 1]])}
+        params = [
+            _request(
+                [("image", 0, 2), ("video", 0, 1)],
+                {"image": image, "video": video},
+                {
+                    "image": image_partitions,
+                    "video": {
+                        "video_pixels": MultimodalItemPartition(item_lengths=(1,)),
+                        "grid": MultimodalItemPartition(),
+                    },
+                },
+            )
+        ]
+        inputs = build_batched_input_by_partitions(("image", "video"), params)
+        assert sorted(inputs) == ["grid", "pixels", "video_pixels"]
+        assert torch.equal(inputs["pixels"], image["pixels"])
+        assert torch.equal(inputs["video_pixels"], video["video_pixels"])
+
+    def test_padding_value_of_a_key_reaches_the_encoder(self):
+        partitions = {"positions": MultimodalItemPartition(padding_value=-1)}
+        params = [
+            _request(
+                [("image", 0, 1)],
+                {"image": {"positions": torch.tensor([[1, 2, 3]])}},
+                {"image": partitions},
+            ),
+            _request(
+                [("image", 0, 1)],
+                {"image": {"positions": torch.tensor([[4]])}},
+                {"image": partitions},
+            ),
+        ]
+        inputs = build_batched_input_by_partitions(("image",), params)
+        assert inputs["positions"].tolist() == [[1, 2, 3], [4, -1, -1]]
+
+    @pytest.mark.parametrize(
+        "other",
+        [MultimodalItemPartition(1), MultimodalItemPartition(padding_value=-1)],
+        ids=["item_axis", "padding_value"],
+    )
+    def test_payloads_must_share_how_a_key_is_batched(self, other):
+        params = [
+            _request(
+                [("image", 0, 1)],
+                {"image": {"pixels": torch.ones(1, 2)}},
+                {"image": {"pixels": partition}},
+            )
+            for partition in (MultimodalItemPartition(), other)
+        ]
+        with pytest.raises(ValueError, match="share their item axis and padding value"):
+            build_batched_input_by_partitions(("image",), params)
+        group = EncoderGroup(("image",), lambda pixels: pixels)
+        with pytest.raises(ValueError, match="share their item axis and padding value"):
+            encode_multimodal_by_groups([group], params)
+
+    def test_payload_without_partitions_is_rejected(self):
+        params = [_request([("image", 0, 1)], {"image": {"pixels": torch.ones(1, 1)}}, {})]
+        with pytest.raises(MultimodalEncoderContractError, match="declares no input partitions"):
+            build_batched_input_by_partitions(("image",), params)
+
+    def test_packed_size_must_match_item_lengths(self):
+        # 3 rows for one item of 2 rows; the encoder returns the 2 rows the metadata expects,
+        # so only the size check finds it.
+        params = [
+            _request(
+                [("image", 0, 2)],
+                {"image": {"pixels": torch.arange(6.0).view(3, 2)}},
+                {"image": {"pixels": MultimodalItemPartition(item_lengths=(2,))}},
+            )
+        ]
+        with pytest.raises(ValueError, match="does not match its item lengths"):
+            build_batched_input_by_partitions(("image",), params)
+        group = EncoderGroup(("image",), lambda pixels: pixels[:2])
+        with pytest.raises(ValueError, match="does not match its item lengths"):
+            encode_multimodal_by_groups([group], params)
+
+    def test_item_metadata_must_be_the_record_type(self):
+        record = _request(
+            [("image", 0, 1)],
+            {"image": {"pixels": torch.ones(1, 1)}},
+            {"image": {"pixels": MultimodalItemPartition()}},
+        )
+        stand_in = SimpleNamespace(
+            item_refs=record.item_metadata.item_refs,
+            output_embedding_lengths=record.item_metadata.output_embedding_lengths,
+            input_partitions=record.item_metadata.input_partitions,
+        )
+        params = [
+            MultimodalParams(
+                multimodal_data={
+                    "image": record.multimodal_data["image"],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: stand_in,
+                }
+            )
+        ]
+        with pytest.raises(TypeError, match="must be a MultimodalItemMetadata"):
+            build_batched_input_by_partitions(("image",), params)
+        group = EncoderGroup(("image",), lambda pixels: pixels)
+        with pytest.raises(TypeError, match="must be a MultimodalItemMetadata"):
+            encode_multimodal_by_groups([group], params)
+
+
+class TestEncodeByGroups:
+    @staticmethod
+    def _recording_group(modalities=("image", "video")):
+        calls = []
+
+        def encode(pixels, scale=None):
+            calls.append((pixels.dtype, scale, pixels[:, 0].tolist()))
+            return pixels.to(torch.float32) * (1 if scale is None else scale.factor)
+
+        return EncoderGroup(modalities, encode), calls
+
+    def test_compatible_payloads_make_one_call_and_restore_prompt_order(self):
+        group, calls = self._recording_group()
+        image_a, image_a_partitions = _image([(1, 2), (3, 1)])
+        video, video_partitions = _image([(2, 3)])
+        image_b, image_b_partitions = _image([(4, 1)])
+        params = [
+            _request(
+                [("image", 1, 1), ("video", 0, 3), ("image", 0, 2)],
+                {"image": image_a, "video": video},
+                {"image": image_a_partitions, "video": video_partitions},
+            ),
+            _request([("image", 0, 1)], {"image": image_b}, {"image": image_b_partitions}),
+        ]
+        out = encode_multimodal_by_groups([group], params)
+        assert len(calls) == 1
+        assert calls[0][2] == [1, 1, 3, 4, 2, 2, 2]
+        assert out[:, 0].tolist() == [3, 2, 2, 2, 1, 1, 4]
+
+    def test_payloads_with_different_shared_values_are_encoded_apart(self):
+        group, calls = self._recording_group(("image",))
+        params = []
+        for marker, factor in ((1, 2.0), (2, 3.0), (3, 2.0)):
+            image, partitions = _image([(marker, 1)], scale=_Scale(factor))
+            params.append(_request([("image", 0, 1)], {"image": image}, {"image": partitions}))
+        out = encode_multimodal_by_groups([group], params)
+        assert [(scale, rows) for _, scale, rows in calls] == [
+            (_Scale(2.0), [1.0, 3.0]),
+            (_Scale(3.0), [2.0]),
+        ]
+        assert out[:, 0].tolist() == [2.0, 6.0, 6.0]
+
+    def test_equal_shared_records_share_one_call(self):
+        # Each request carries its own record object; equal records still share a call.
+        group, calls = self._recording_group(("image",))
+        params = []
+        for marker in (1, 2):
+            image, partitions = _image([(marker, 1)], scale=_Scale(2.0))
+            params.append(_request([("image", 0, 1)], {"image": image}, {"image": partitions}))
+        assert (
+            params[0].multimodal_data["image"]["scale"]
+            is not (params[1].multimodal_data["image"]["scale"])
+        )
+        out = encode_multimodal_by_groups([group], params)
+        assert [(scale, rows) for _, scale, rows in calls] == [(_Scale(2.0), [1.0, 2.0])]
+        assert out[:, 0].tolist() == [2.0, 4.0]
+
+    def test_payloads_with_different_dtypes_are_encoded_apart(self):
+        # Raw uint8 pixels next to already normalized ones, also inside one request.
+        group, calls = self._recording_group()
+        raw, raw_partitions = _image([(1, 2)], dtype=torch.uint8, scale=_Scale(0.5))
+        image, image_partitions = _image([(3, 1)], dtype=torch.bfloat16)
+        video, video_partitions = _image([(5, 3)], dtype=torch.uint8, scale=_Scale(0.5))
+        params = [
+            _request([("image", 0, 2)], {"image": raw}, {"image": raw_partitions}),
+            _request(
+                [("video", 0, 3), ("image", 0, 1)],
+                {"image": image, "video": video},
+                {"image": image_partitions, "video": video_partitions},
+            ),
+        ]
+        out = encode_multimodal_by_groups([group], params)
+        assert [(dtype, scale, rows) for dtype, scale, rows in calls] == [
+            (torch.uint8, _Scale(0.5), [1, 1, 5, 5, 5]),
+            (torch.bfloat16, None, [3.0]),
+        ]
+        assert out.dtype == torch.float32
+        assert out[:, 0].tolist() == [0.5, 0.5, 2.5, 2.5, 2.5, 3.0]
+
+    def test_own_builder_gets_the_original_params_in_one_call(self):
+        received = []
+
+        def build(params):
+            received.append(params)
+            return {
+                "pixels": torch.cat([p.multimodal_data["image"]["pixels"].float() for p in params])
+            }
+
+        group = EncoderGroup(("image",), lambda pixels: pixels, build)
+        raw, raw_partitions = _image([(1, 2)], dtype=torch.uint8, scale=_Scale(0.5))
+        image, image_partitions = _image([(3, 1)], dtype=torch.bfloat16)
+        params = [
+            _request([("image", 0, 2)], {"image": raw}, {"image": raw_partitions}),
+            _request([("image", 0, 1)], {"image": image}, {"image": image_partitions}),
+        ]
+        out = encode_multimodal_by_groups([group], params)
+        assert len(received) == 1
+        assert all(actual is expected for actual, expected in zip(received[0], params, strict=True))
+        assert out[:, 0].tolist() == [1.0, 1.0, 3.0]
+
+    @pytest.mark.parametrize(
+        "factors, message",
+        [((1.0, 1.0), "returned 5 rows, item metadata expects 4"), ((1.0, 2.0), "returned 3 rows")],
+        ids=["one_call", "split"],
+    )
+    def test_encoder_rows_must_match_item_metadata(self, factors, message):
+        # Extra rows, such as padding an encoder kept, must not be sliced away silently.
+        group = EncoderGroup(("image",), lambda pixels, scale=None: torch.cat([pixels, pixels[:1]]))
+        params = []
+        for factor in factors:
+            image, partitions = _image([(1, 2)], scale=_Scale(factor))
+            params.append(_request([("image", 0, 2)], {"image": image}, {"image": partitions}))
+        with pytest.raises(MultimodalEncoderContractError, match=message):
+            encode_multimodal_by_groups([group], params)
