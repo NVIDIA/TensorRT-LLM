@@ -47,6 +47,12 @@ from tensorrt_llm.mapping import Mapping
 _NCCL_SYMMETRIC_ZERO_COPY: bool = get_env_flag("TLLM_NCCL_SYMMETRIC_ZERO_COPY",
                                                True)
 
+# In case that AutoTuner brings potential perf regression
+# TODO: Remove this if no perf regression is observed.
+# Read once at import; AllReduce.forward checks it on every call.
+_DISABLE_ALLREDUCE_AUTOTUNE: bool = get_env_flag(
+    "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", False)
+
 # Bytes of the full all-reduce message (tokens * hidden * ranks * element size) up to which the
 # MNNVL path uses the one-shot kernel; mirrors kOneShotSizeThreshold in thop/allreduceOp.cpp and
 # the same TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES override, so the lamport workspace is sized for it.
@@ -1605,12 +1611,7 @@ class AllReduce(nn.Module):
                 "group_name": self._group_name,
             }
 
-        # In case that AutoTuner brings potential perf regression
-        # TODO: Remove this if no perf regression is observed.
-        disable_allreduce_autotune = get_env_flag(
-            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", False)
-
-        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+        if allreduce_strategy == AllReduceStrategy.AUTO and not _DISABLE_ALLREDUCE_AUTOTUNE and not self._disable_mpi:
             # Use native lookup after tuning unless its Python/C++ contract
             # failed; then retain the existing Python cache and selection path.
             if (_ALLREDUCE_AUTOTUNER_TUNING_MODE

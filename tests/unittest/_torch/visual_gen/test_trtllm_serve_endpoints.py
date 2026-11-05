@@ -37,6 +37,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.serve import visual_gen_utils
 from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
@@ -661,7 +662,7 @@ def _mock_video_encoding():
 def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endpoint, payload):
     """With ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``, ``response_format='path'``
     is rejected with 400 on the image and video (sync + async) endpoints."""
-    monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+    monkeypatch.setattr(visual_gen_utils, "_LOCAL_MEDIA_PATH_DISALLOWED", True)
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
     gen = MockVisualGen(
         image_output=_make_dummy_image_tensor(),
@@ -1299,7 +1300,7 @@ class TestImageEdit:
         so the path transport cannot leak server-side paths on shared
         deployments."""
         client, _ = self._client(tmp_path, monkeypatch)
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+        monkeypatch.setattr(visual_gen_utils, "_LOCAL_MEDIA_PATH_DISALLOWED", True)
 
         resp = client.post(
             "/v1/images/edits",

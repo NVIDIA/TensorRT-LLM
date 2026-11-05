@@ -892,7 +892,7 @@ def test_embedded_audio_reserves_chunks_and_concatenation(outcome, monkeypatch):
             AudioResampler=lambda **_kwargs: SimpleNamespace(resample=lambda frame: [frame]),
         ),
     )
-    monkeypatch.setenv("TRTLLM_ENABLE_PYAV", "1")
+    monkeypatch.setattr(media_io, "_PYAV_ENABLED", True)
     concatenate = np.concatenate
 
     def checked_concatenate(chunks, **kwargs):

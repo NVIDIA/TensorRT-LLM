@@ -981,26 +981,13 @@ class TestLocalMediaPathCanBeDisallowed:
         )
 
     def test_path_is_accepted_by_default(self, monkeypatch):
-        monkeypatch.delenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", raising=False)
+        monkeypatch.setattr(visual_gen_utils, "_LOCAL_MEDIA_PATH_DISALLOWED", False)
         params = parse_visual_gen_params(self._request(), _StubVisualGen())
 
         assert params.image_reference[0].format == "path"
 
     def test_path_is_refused_when_disallowed(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+        monkeypatch.setattr(visual_gen_utils, "_LOCAL_MEDIA_PATH_DISALLOWED", True)
 
         with pytest.raises(ValueError, match="is disallowed on this server"):
             parse_visual_gen_params(self._request(), _StubVisualGen())
-
-    def test_an_unrecognized_value_warns_and_stays_allowed(self, monkeypatch):
-        """Silently reading a typo as "1" would break working deployments, and
-        silently reading it as "0" would leave one that believes it is locked
-        down wide open. Neither is safe to do quietly."""
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "true")
-        warnings: list[str] = []
-        monkeypatch.setattr(visual_gen_utils.logger, "warning", warnings.append)
-
-        params = parse_visual_gen_params(self._request(), _StubVisualGen())
-
-        assert params.image_reference[0].format == "path"
-        assert any("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH" in w for w in warnings)

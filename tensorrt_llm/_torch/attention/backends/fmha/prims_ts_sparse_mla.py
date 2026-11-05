@@ -660,6 +660,9 @@ class PrimsTSSparseMlaFmha(Fmha):
 
         from . import prims_ts_precompile
 
+        # Read TLLM_PRIMTS_WARM_STRICT before the best-effort try blocks below, so
+        # a bad value fails on every node, not only on a node where a worker fails.
+        strict = prims_ts_precompile.strict()
         workers = prims_ts_precompile.worker_count(len(rows_list), local_ranks=local_ranks)
         if workers <= 1:
             return
@@ -672,7 +675,7 @@ class PrimsTSSparseMlaFmha(Fmha):
         except _compile_cache.KernelNotCached:
             pass
         except Exception as error:  # noqa: BLE001 -- a probe failure only costs the fan-out
-            if prims_ts_precompile.strict():
+            if strict:
                 raise
             logger.warning(
                 f"PrimTS sparse MLA cache probe failed: {error!r}; compiling in-process."
@@ -690,11 +693,11 @@ class PrimsTSSparseMlaFmha(Fmha):
         try:
             ok = prims_ts_precompile.run_precompile_workers(payloads, workers)
         except Exception as error:  # noqa: BLE001 -- warmup must not fail on a helper
-            if prims_ts_precompile.strict():
+            if strict:
                 raise
             logger.warning(f"PrimTS sparse MLA parallel precompile skipped: {error!r}")
             return
-        if not ok and prims_ts_precompile.strict():
+        if not ok and strict:
             raise RuntimeError(
                 "PrimTS sparse MLA precompile workers failed (TLLM_PRIMTS_WARM_STRICT=1)"
             )

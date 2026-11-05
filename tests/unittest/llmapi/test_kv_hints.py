@@ -536,7 +536,7 @@ def test_request_broadcast_transports_hints(broadcast_kind: str) -> None:
     hang_detector = SimpleNamespace(pause=nullcontext)
     broadcaster = RequestBroadcaster(transport, hang_detector)
     collected = broadcaster._collect_py_objects(items)
-    with patch.dict("os.environ", {"TRTLLM_PP_REQ_SEND_ASYNC": "0"}):
+    with patch("tensorrt_llm._torch.pyexecutor.request_utils._PP_REQ_SEND_ASYNC", False):
         if broadcast_kind == "single_round":
             original_requests, _ = broadcaster.broadcast(items)
             assert original_requests is items
