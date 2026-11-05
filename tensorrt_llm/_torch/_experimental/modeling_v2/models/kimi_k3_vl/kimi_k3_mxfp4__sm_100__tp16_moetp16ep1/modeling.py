@@ -125,7 +125,10 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     GQADSparkForCausalLM,
     draft_is_embedded_in_target,
 )
-from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+from tensorrt_llm._torch.models.modeling_kimi_linear import (
+    KimiLinearForCausalLM,
+    k3_router_gemm_bf16,
+)
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
@@ -923,8 +926,9 @@ class KimiK3MoERuntime(nn.Module):
         # Routing scores stay fp32; the gate GEMM runs bf16xbf16 with fp32
         # accumulate/output (checkpoint stores the gate weight in bf16; saves a
         # per-layer input cast + fp32 splitK pair on the bs1 decode path).
-        # KIMI_K3_ROUTER_BF16=0 forces the upcast-to-fp32 GEMM.
-        _router_bf16 = get_env_flag("KIMI_K3_ROUTER_BF16", True)
+        # KIMI_K3_ROUTER_BF16=0 forces the upcast-to-fp32 GEMM;
+        # k3_router_gemm_bf16 lists the other values.
+        _router_bf16 = k3_router_gemm_bf16(model_config.mapping.tp_group_shares_requests)
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
