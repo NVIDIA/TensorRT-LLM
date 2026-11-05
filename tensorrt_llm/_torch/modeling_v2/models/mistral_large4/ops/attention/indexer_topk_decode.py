@@ -20,8 +20,9 @@ SPLIT_WORK_COLUMNS = 4096
 #: `4 * index_topk` (one block) or `8 * index_topk` (split) bytes of dynamic
 #: shared memory on top of their static use, against the 48 KB default. Above
 #: it the launch fails at configuration and `indices` keeps its old contents.
-#: The call raises nothing; the error stays pending and the next torch kernel
-#: launch raises it as `CUDA error: invalid argument`. Found by bisection on
+#: The call raises nothing, and torch does not report the failure either: the
+#: launch goes through the CUDA runtime that libth_common links statically, so
+#: its error never reaches torch's own runtime. Found by bisection on
 #: sm_100 and again on sm_103 (the split ceiling at 4096 and 9216 columns,
 #: and at 32768).
 MAX_INDEX_TOPK_SINGLE_BLOCK = 8188
