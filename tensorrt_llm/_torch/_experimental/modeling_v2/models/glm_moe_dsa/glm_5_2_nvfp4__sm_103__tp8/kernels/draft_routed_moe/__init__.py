@@ -17,8 +17,8 @@
 Entry point registered with ``dispatch``:
 
 * ``routed_output(module, routing_bias, x, router_logits, do_finalize)``:
-  the finalized routed output ``[R, 6144]`` of the BF16 FlashInfer
-  TRT-LLM-Gen leaf, bit-identical to ``trtllm_bf16_moe``, or ``None`` (the
+  the finalized routed output ``[R, 6144]`` of the BF16 TRT-LLM-Gen leaf,
+  bit-identical to ``trtllm::bf16_moe_runner``, or ``None`` (the
   native path; decided before any device work).
 """
 

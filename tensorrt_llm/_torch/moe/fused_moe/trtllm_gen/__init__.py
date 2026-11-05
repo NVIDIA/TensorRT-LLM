@@ -32,8 +32,8 @@ One module per leaf, named ``<provider>_<quant>``. Importing this package is
 what registers them, which is why ``trtllm_gen_leaf`` is defined at the bottom
 of this file: the lookup is only correct once every leaf module has loaded.
 
-Each format has exactly one leaf: every quantized format runs on the native
-``trtllm`` provider, and the unquantized bf16 path on FlashInfer.
+Each format has exactly one leaf, and every leaf runs on the native ``trtllm``
+provider.
 """
 
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -42,13 +42,12 @@ from ..impl_contract import canonical_quant, check_quant_matches_identity, norma
 from ..impl_identity import MOE_IMPL_REGISTRY, MoEImplId
 from .base import TrtllmGenFusedMoEBase
 from .eligibility import (
-    check_flashinfer_shard_alignment,
+    check_intermediate_shard_alignment,
     check_no_activation_constants,
     check_no_expert_bias,
     check_trtllm_gen_capabilities,
     check_trtllm_gen_leaf,
 )
-from .flashinfer_bf16 import FlashinferTrtllmGenBf16Impl
 from .fp4_block_scale import (
     TRTLLMGenFp4BlockScaleBase,
     TRTLLMGenNvfp4Base,
@@ -58,13 +57,13 @@ from .fp4_block_scale import (
 from .fp8_block_scale import TRTLLMGenFp8BlockScalesBase
 from .identity import (
     KERNEL_FUSED_MOE,
-    PROVIDER_FLASHINFER,
     PROVIDER_TRTLLM,
     TECHNIQUE_TRTLLM_GEN,
     TRTLLM_GEN_CAPABILITIES,
     TRTLLM_GEN_INPUT_REQUIREMENT,
     trtllm_gen_descriptor,
 )
+from .trtllm_bf16 import TrtllmTrtllmGenBf16Impl
 from .trtllm_fp8_block_scales import TrtllmTrtllmGenFp8BlockScalesImpl
 from .trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
 from .trtllm_w4a8_mxfp4_fp8 import TrtllmTrtllmGenW4a8Mxfp4Fp8Impl
@@ -102,32 +101,26 @@ def find_trtllm_gen_leaf(quant_algo: QuantAlgo | None) -> type | None:
     """The leaf implementing ``quant_algo``, or ``None`` if none publishes it.
 
     Goes through the registry rather than a table of its own, so a leaf that is
-    renamed or unregistered disappears from here too. The providers publish
-    disjoint formats, so at most one of them answers.
+    renamed or unregistered disappears from here too.
     """
     # The same two steps resolution takes (``moe_resolution`` canonicalizes,
     # ``MoEImplId`` folds case), so a caller naming NVFP4_AWQ or MIXED_PRECISION
     # here reaches the leaf resolution would pick rather than a lookup miss.
     quant = normalize_quant(canonical_quant(quant_algo))
-    for provider in (PROVIDER_TRTLLM, PROVIDER_FLASHINFER):
-        cls = MOE_IMPL_REGISTRY.lookup(
-            MoEImplId(provider, TECHNIQUE_TRTLLM_GEN, KERNEL_FUSED_MOE, quant)
-        )
-        if cls is not None:
-            return cls
-    return None
+    return MOE_IMPL_REGISTRY.lookup(
+        MoEImplId(PROVIDER_TRTLLM, TECHNIQUE_TRTLLM_GEN, KERNEL_FUSED_MOE, quant)
+    )
 
 
 __all__ = [
-    # trtllm provider
+    # leaves
+    "TrtllmTrtllmGenBf16Impl",
     "TrtllmTrtllmGenNvfp4Impl",
     "TrtllmTrtllmGenFp8BlockScalesImpl",
     "TrtllmTrtllmGenW4a16Mxfp4Impl",
     "TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl",
     "TrtllmTrtllmGenW4a8Nvfp4Fp8Impl",
     "TrtllmTrtllmGenW4a8Mxfp4Fp8Impl",
-    # flashinfer provider
-    "FlashinferTrtllmGenBf16Impl",
     # shared layers
     "TrtllmGenFusedMoEBase",
     "TRTLLMGenFp4BlockScaleBase",
@@ -137,7 +130,6 @@ __all__ = [
     "TRTLLMGenFp8BlockScalesBase",
     # identity
     "PROVIDER_TRTLLM",
-    "PROVIDER_FLASHINFER",
     "TECHNIQUE_TRTLLM_GEN",
     "KERNEL_FUSED_MOE",
     "TRTLLM_GEN_CAPABILITIES",
@@ -148,7 +140,7 @@ __all__ = [
     "check_trtllm_gen_leaf",
     "check_trtllm_gen_capabilities",
     "check_quant_matches_identity",
-    "check_flashinfer_shard_alignment",
+    "check_intermediate_shard_alignment",
     "check_no_activation_constants",
     "check_no_expert_bias",
 ]
