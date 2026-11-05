@@ -8,8 +8,9 @@ from tensorrt_llm._torch.model_config import ModelConfig, TConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
     _SPECULATIVE_POSITION_HEADROOM,
     SpecDecOneEngineForCausalLM,
-    _copy_model_config_with_moe_backend,
-    _get_requested_draft_moe_backend,
+    _copy_model_config_with_moe_selection,
+    _draft_loader_moe_kwargs,
+    _draft_moe_selection,
     _replacement_mtp_model_config,
     _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
@@ -52,10 +53,20 @@ class Glm52SpecDecOneEngineForCausalLM(
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
-                requested_draft_moe_backend = _get_requested_draft_moe_backend(
-                    model_config, spec_config
-                )
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
+                    # Of the Eagle3 drafts, only the Mistral one registers into
+                    # the target's load balancer.
+                    shares_load_balancer = spec_config.eagle3_model_arch == "mistral_large3"
+                    draft_moe_selection = _draft_moe_selection(
+                        model_config,
+                        spec_config,
+                        load_balancer=(
+                            model_config.moe_load_balancer if shares_load_balancer else None
+                        ),
+                    )
+                    draft_loader_moe_kwargs = _draft_loader_moe_kwargs(
+                        model_config, draft_moe_selection
+                    )
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import (
                             MistralConfigLoader,
@@ -64,26 +75,28 @@ class Glm52SpecDecOneEngineForCausalLM(
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
                             mapping=model_config.mapping,
-                            moe_backend=requested_draft_moe_backend,
+                            **draft_loader_moe_kwargs,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
-                        if getattr(spec_config, "moe_backend", None) is not None:
+                        if draft_moe_selection is not None:
                             # Unlike ModelConfig.from_pretrained, the Mistral
                             # loader does not resolve AUTO after loading quant
-                            # metadata. Resolve it against the draft config now,
-                            # before constructing any draft modules.
-                            self.draft_config = _copy_model_config_with_moe_backend(
-                                self.draft_config, requested_draft_moe_backend
+                            # metadata. Resolve the selection against the draft
+                            # config now, before constructing any draft modules;
+                            # a tactic resolves to the family the loader
+                            # already derived.
+                            self.draft_config = _copy_model_config_with_moe_selection(
+                                self.draft_config, draft_moe_selection
                             )
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
-                            moe_backend=requested_draft_moe_backend,
+                            **draft_loader_moe_kwargs,
                             mapping=model_config.mapping,
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
@@ -101,7 +114,9 @@ class Glm52SpecDecOneEngineForCausalLM(
                         spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
-                        moe_backend=requested_draft_moe_backend,
+                        **_draft_loader_moe_kwargs(
+                            model_config, _draft_moe_selection(model_config, spec_config)
+                        ),
                         mapping=model_config.mapping,
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
