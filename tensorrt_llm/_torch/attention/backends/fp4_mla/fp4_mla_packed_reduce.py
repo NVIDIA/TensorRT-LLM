@@ -269,6 +269,9 @@ def packed_split_reduce_kernel(
     item_slot = bidx * cutlass.Int32(warps_per_cta) + warp_idx
     item_stride = grid_x * cutlass.Int32(warps_per_cta)
     compact_offset = cutlass.Int32(0)
+    # 128-row stats chunk c of the single-task requests, counted across
+    # requests, belongs to CTA c % grid.
+    stats_chunk_offset = cutlass.Int32(0)
     for request in cutlass.range(0, num_requests, 1, unroll=1):
         task_begin = cutlass.Int32(sBegins[request])
         request_tasks = cutlass.Int32(sBegins[request + cutlass.Int32(1)]) - task_begin
@@ -306,9 +309,12 @@ def packed_split_reduce_kernel(
         else:
             if cutlass.const_expr(write_stats):
                 # Thread-parallel over the request's rows: chunk k of 128 rows
-                # is owned by CTA k % grid.
+                # is owned by CTA (offset + k) % grid, so consecutive requests
+                # use other CTAs.
                 row_chunks = (valid_m + cutlass.Int32(127)) // cutlass.Int32(128)
-                for chunk in cutlass.range(bidx, row_chunks, grid_x, unroll=1):
+                first_chunk = (bidx - stats_chunk_offset % grid_x + grid_x) % grid_x
+                stats_chunk_offset += row_chunks
+                for chunk in cutlass.range(first_chunk, row_chunks, grid_x, unroll=1):
                     local_row = chunk * cutlass.Int32(128) + tidx
                     if local_row < valid_m:
                         row = request * valid_m + local_row

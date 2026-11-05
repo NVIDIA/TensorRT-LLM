@@ -733,6 +733,8 @@ def test_request_kv_tiles_follow_helix_bounds() -> None:
         # requests that end up with one task are stats-only here.
         ([1, 79, 3, 176], 6, 17, 96, 8),
         ([128] * 15 + [1024], 3, 106, 12, 8),
+        # Many single-task requests: their stats chunks spread over the reducer CTAs.
+        ([9] * 40, 2, 17, 96, 8),
     ],
 )
 def test_packed_split_reduce_matches_reference_and_replays(
