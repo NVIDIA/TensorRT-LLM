@@ -193,7 +193,7 @@ def payload_check(payload, spec):
         if not isinstance(payload, str):
             return False, {"reason": "arguments_not_string"}
         try:
-            args = strict_json(payload)
+            args = strict_json(payload) if payload.strip() else {}  # no arguments: as verdict.py
         except ValueError as error:
             return False, {"reason": "arguments_not_strict_json", "error": type(error).__name__}
         if not isinstance(args, dict):

@@ -185,6 +185,18 @@ def test_check_tool_calls_reads_a_name_that_is_not_a_string_as_malformed(name):
     assert check_tool_calls.check_call(dict(call, name="exec"), decl)["class"] == "valid"
 
 
+@pytest.mark.parametrize("payload", ["", "  ", "{}", '{"path": "a"}', "{"])
+@pytest.mark.parametrize("required", [[], ["path"]])
+def test_check_tool_calls_reads_arguments_as_the_verdict_does(payload, required):
+    """Blank function arguments are an empty object in the reference checker too."""
+    import check_tool_calls
+    from turnlib import payload_check
+
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": required}
+    reference = check_tool_calls.payload_check(payload, {"type": "function", "parameters": schema})
+    assert reference[0] == payload_check(payload, Tool(name="read", schema=schema))[0]
+
+
 def test_check_tool_calls_screens_a_closing_dsml_tag(tmp_path):
     """The reference screen reads the verdict's markers: a lone closing DSML tag is markup too."""
     import subprocess
