@@ -180,7 +180,7 @@ def check_trtllm_gen_leaf(
     """Compose one leaf's verdict: identity, shared capability, then its own.
 
     First rejection wins, in a fixed order so that every leaf gives the
-    family-wide reason before its own for a problem neither can serve.
+    family-wide reason before its own for a problem it cannot serve.
     ``leaf_gates`` are already-evaluated verdicts, not callables: the gates
     are pure, so there is nothing to defer.
     """

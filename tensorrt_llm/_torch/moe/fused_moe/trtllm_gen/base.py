@@ -129,8 +129,7 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         one source.
 
         Plain class attributes and not properties, because both are read off
-        the *class* -- at resolution, and by ``fused_shared_expert_count``
-        through ``type(self)`` -- where a property yields the descriptor
+        the *class* at resolution, where a property yields the descriptor
         object rather than its value.
 
         Intermediate bases publish no descriptor of their own, having no one
