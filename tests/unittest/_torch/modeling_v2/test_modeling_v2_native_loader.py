@@ -8,17 +8,20 @@ outcomes are ``NoTarget`` (this installation does not carry the target, so
 installed library is broken, which is never a fallback).
 
 The last is the load smoke test of the installed wheel: every family library in
-``tensorrt_llm/libs`` opens in a fresh process. A library aborts its process from
-a static initializer if two libraries claim one torch namespace, so each one is
-opened in a child process.
+``tensorrt_llm/libs`` opens in a fresh process and defines no op its family's or
+target's fake_ops.py does not fake. A library aborts its process from a static
+initializer if two libraries claim one torch namespace, so each one is opened in
+a child process.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import textwrap
 import types
+from pathlib import Path
 
 import pytest
 
@@ -111,11 +114,14 @@ def test_a_library_opens_once_and_registers_the_family_fakes_first(libs, monkeyp
 
 _LOAD_ONE_FAMILY = textwrap.dedent(
     """
-    import sys
+    import json, sys
+    import torch
     import tensorrt_llm  # noqa: F401 -- loads libth_common.so
     from tensorrt_llm._torch._experimental.modeling_v2 import _native
 
-    _native._load_family_library(sys.argv[1])
+    built = sorted(_native._load_family_library(sys.argv[1]))
+    schemas = sorted(s.name for s in torch._C._jit_get_all_schemas() if s.name.startswith("mv2_"))
+    print(json.dumps({"built": built, "ops": schemas}))
     """
 )
 
@@ -124,6 +130,7 @@ def test_every_installed_family_library_loads():
     libraries = sorted(_native._LIBS_DIR.glob("libth_modeling_v2_*.so"))
     if not libraries:
         pytest.skip("this installation has no modeling_v2 family library")
+    models = Path(_native.__file__).resolve().parent / "models"
     for library in libraries:
         family = library.name[len("libth_modeling_v2_") : -len(".so")]
         result = subprocess.run(
@@ -134,3 +141,13 @@ def test_every_installed_family_library_loads():
         assert result.returncode == 0, (
             f"{library.name} failed to load:\n{result.stdout}\n{result.stderr}"
         )
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        # The family's ops are faked in <family>/fake_ops.py, a target's in <target>/fake_ops.py.
+        fakes = {_native._namespace(family): models / family / "fake_ops.py"}
+        for target in report["built"]:
+            fakes[_native._namespace(family, target)] = models / family / target / "fake_ops.py"
+        for namespace, fake_ops in fakes.items():
+            ops = [op.split("::", 1)[1] for op in report["ops"] if op.startswith(f"{namespace}::")]
+            text = fake_ops.read_text() if fake_ops.is_file() else ""
+            unfaked = [op for op in ops if f'::{op}"' not in text]
+            assert not unfaked, f"{namespace} defines {unfaked} with no fake in {fake_ops}"
