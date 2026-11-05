@@ -17,6 +17,10 @@ client = OpenAI(
 llm_models_root = Path(os.environ.get("LLM_MODELS_ROOT"))
 
 if llm_models_root is not None:
+    # These are paths on the server's own filesystem. trtllm-serve refuses
+    # local paths unless it is started with
+    # TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=$LLM_MODELS_ROOT/multimodals/test_data
+    # (or another directory that contains the files).
     multimodal_test_data_path = llm_models_root / "multimodals" / "test_data"
     image_url1 = str(multimodal_test_data_path / "seashore.png")
     image_url2 = str(multimodal_test_data_path / "inpaint.png")

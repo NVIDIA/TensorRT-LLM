@@ -50,6 +50,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import CpType, Mapping
@@ -386,13 +387,15 @@ def _run_mla_distributed(
         input_ctx, position_ids_ctx, scenario, rank, world_size
     )
 
-    # Context step — populate KV cache only; output is discarded.
-    # We call forward_impl directly instead of mla.forward() because
-    # o_proj is sized for helix-gen (num_heads_tp_cp * v_head_dim) and would
-    # crash on the full-width context attention output.
+    # This decode fixture populates each rank's cache from a different token
+    # chunk. Complete, replicated-input prefill outputs are checked separately.
     activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
+    # This disaggregated decode fixture already supplies rank-local token
+    # shards. Populate them directly; applying the aggregated owner plan
+    # again would shard the fixture's history twice.
+    attn_metadata.helix_context_local_slots = None
     ctx_output = input_ctx_rank.new_empty(
-        [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
+        [input_ctx_rank.shape[0], mla.mha.num_heads * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )
     mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, attn_output=[ctx_output])
 
@@ -415,8 +418,12 @@ def _run_mla_distributed(
         enable_context_mla_with_cached_kv=True,
     )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    with model_extra_attrs(extra_attrs):
-        output = mla(position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen)
+    # The o_proj all-reduce returns NCCL-window tensors, whose leases must be released by a
+    # scope rather than a tensor destructor. The clone outlives the scope for the accuracy check.
+    with model_extra_attrs(extra_attrs), nccl_window_tensor_scope(input_gen):
+        output = mla(
+            position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen
+        ).clone()
     print(f"Rank {rank} {world_size}-GPU: result: {output[0, :8]} / {output[-1, -8:]}")
 
     kv_cache_manager.shutdown()

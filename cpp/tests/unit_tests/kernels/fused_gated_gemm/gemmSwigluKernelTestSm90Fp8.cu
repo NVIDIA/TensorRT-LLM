@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -482,7 +482,7 @@ int main(int argc, char const** argv)
     Result hopperFp8 = run<Gemm>(std::string("Hopper fp8 swiglu"), options, buffers);
 #else  // COMPILE_HOPPER_TMA_GEMMS
     std::cout << "[TensorRT LLM Error][GemmSwigluKernelTestSm90Fp8] Please recompile with support for hopper by "
-                 "passing 90-real as an arch to build_wheel.py."
+                 "passing 90 as an arch to build_wheel.py."
               << std::endl;
 #endif // COMPILE_HOPPER_TMA_GEMMS
     // for (int i = 0; i < options.problem_size_out.m(); i++)

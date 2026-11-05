@@ -16,6 +16,7 @@
 # yapf: disable
 import asyncio
 import json
+import os
 import signal
 import socket
 import traceback
@@ -56,7 +57,9 @@ from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
-from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.kv_hints import KvHintsRoute
+from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
+                                              _server_base_url)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
@@ -290,6 +293,8 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:
             self.app.add_middleware(
@@ -336,7 +341,8 @@ class OpenAIDisaggServer:
             disagg_id_generator=disagg_id_generator,
             request_perf_metrics=self._collect_perf_metrics,
             internal_disagg_auth_key=self._config.internal_request_auth_key,
-            bounded_replay_on_generation=self._config.bounded_replay_on_generation)
+            bounded_replay_on_generation=self._config.bounded_replay_on_generation,
+            frontend_affinity=self._config.ctx_frontend_affinity)
         return client
 
     def register_routes(self):
@@ -713,8 +719,7 @@ class OpenAIDisaggServer:
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
-        server_scheme = "http://" if not server.startswith("http://") else ""
-        server_url = f"{server_scheme}{server}/steady_clock_offset"
+        server_url = f"{_server_base_url(server)}/steady_clock_offset"
 
         try:
             async with aiohttp.ClientSession(

@@ -17,7 +17,7 @@ class KdaPrefill(OpWrapper):
     V-first `[slots, H, V, K]`). Q/K normalization and gate/beta activation are fused. Returns new `o`.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

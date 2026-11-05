@@ -228,24 +228,39 @@ def run_msa_nvfp4_sparse_gqa(
             )
     cu_q = metadata.msa_cu_q_lens[: batch + 1]
     cu_kv = metadata.msa_cu_kv_lens[: batch + 1]
-    q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
-    topk = int(q2k.shape[-1])
+    topk = int(kv_block_indexes.shape[-1])
     page_size = int(k_paged.shape[2])
     if topk != MSA_REQUIRED_TOPK:
         raise ValueError(f"MiniMax-M3 MSA NVFP4 requires topK={MSA_REQUIRED_TOPK}, got {topk}")
 
-    k2q_row_ptr, k2q_q_indices, schedule = sparse.build_k2q_csr(
-        q2k,
-        cu_q,
-        cu_kv,
-        page_size,
-        total_k=total_k,
-        max_seqlen_k=max_kv_len,
-        max_seqlen_q=max_q_len,
-        total_rows=total_k_rows,
-        qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
-        return_schedule=True,
-    )
+    # A short pure-prefill step hands every layer the same identity selection (staged once per step by the
+    # backend), so its k2q CSR worklist is layer-invariant: build it for the first layer and reuse it.
+    identity = metadata._msa_prefill_identity
+    csr_key = (batch, int(kv_block_indexes.shape[0]))
+    cached = metadata._msa_identity_csr
+    if (
+        identity is not None
+        and cached is not None
+        and cached[0] is identity
+        and cached[1] == csr_key
+    ):
+        k2q_row_ptr, k2q_q_indices, schedule = cached[2]
+    else:
+        q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
+        k2q_row_ptr, k2q_q_indices, schedule = sparse.build_k2q_csr(
+            q2k,
+            cu_q,
+            cu_kv,
+            page_size,
+            total_k=total_k,
+            max_seqlen_k=max_kv_len,
+            max_seqlen_q=max_q_len,
+            total_rows=total_k_rows,
+            qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
+            return_schedule=True,
+        )
+        if identity is not None:
+            metadata._msa_identity_csr = (identity, csr_key, (k2q_row_ptr, k2q_q_indices, schedule))
     result = sparse.sparse_atten_nvfp4_kv_func(
         q,
         k_paged.view(torch.uint8),
