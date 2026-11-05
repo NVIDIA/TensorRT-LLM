@@ -46,6 +46,7 @@ class _RequestSender:
     MAX_INFLIGHT_BATCHES = _COMMAND_QUEUE_HWM
     SEND_TIMEOUT = 0.05
     RECOVERY_TIMEOUT = 5.0
+    ACK_RETRY_INTERVAL = 0.25
 
     def __init__(
         self,
@@ -64,6 +65,8 @@ class _RequestSender:
         self._pending = collections.deque()
         self._pending_requests = 0
         self._pending_controls = 0
+        self._enqueued_count = 0
+        self._sent_count = 0
         self._cond = threading.Condition()
         self._closed = False
         self._send_sentinel = False
@@ -111,12 +114,24 @@ class _RequestSender:
             if count >= limit:
                 raise EngineUnavailableError("Executor command queue is full")
             self._pending.append((payload, control))
+            self._enqueued_count += 1
+            ticket = self._enqueued_count
             if control:
                 self._pending_controls += 1
             else:
                 self._pending_requests += 1
             self._start()
             self._cond.notify_all()
+            if not self._batching:
+                # Release the GIL until this command is written or recovery
+                # starts, before the caller resumes Python preprocessing work.
+                self._cond.wait_for(
+                    lambda: self._sent_count >= ticket
+                    or self._recovering
+                    or self._terminal_error is not None
+                )
+                if self._terminal_error is not None:
+                    raise EngineDeadError(self._terminal_error)
 
     def fail(self, error: BaseException) -> None:
         """Stop delivery after an independently confirmed terminal failure."""
@@ -197,7 +212,9 @@ class _RequestSender:
         self._probe_sequence += 1
         token = self._probe_sequence
         probe = _CommandBarrier(token, self._ack_queue.address)
-        self._put_until([pickle.dumps(probe)], deadline)
+        payload = [pickle.dumps(probe)]
+        self._put_until(payload, deadline)
+        retry_at = time.monotonic() + self.ACK_RETRY_INTERVAL
         while True:
             self._check_terminal()
             remaining = min(deadline, self._close_deadline) - time.monotonic()
@@ -209,6 +226,11 @@ class _RequestSender:
                         self._recovering = False
                         self._cond.notify_all()
                     return
+            if time.monotonic() >= retry_at:
+                # A worker can lose its short-lived ACK connection. Retrying
+                # the barrier is safe; generation commands must not be replayed.
+                self._put_until(payload, deadline)
+                retry_at = time.monotonic() + self.ACK_RETRY_INTERVAL
 
     def _take_batch(self) -> list[bytes] | None:
         with self._cond:
@@ -239,7 +261,11 @@ class _RequestSender:
                         time.monotonic() + self._recovery_timeout, self._control_deadline
                     )
                 self._put_until(batch, deadline)
-                if self.recovering:
+                with self._cond:
+                    self._sent_count += len(batch)
+                    recovering = self._recovering
+                    self._cond.notify_all()
+                if recovering:
                     self._confirm_recovery(deadline)
         except Exception as error:
             self._record_failure(error)

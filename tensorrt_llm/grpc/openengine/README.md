@@ -43,6 +43,10 @@ A temporary executor command-connection failure pauses admission and makes `infe
 
 Remote MPI sessions also supervise each running worker through a separate process watch. The helper does not depend on MPI, CUDA or the worker's Python thread making progress. A worker exit, helper exit, or five seconds without a heartbeat makes the engine failure terminal. This detects process loss; it does not detect a live worker stuck in a collective. Supervision starts when the worker function begins, after the MPI launch barrier.
 
+If a recovery acknowledgement is lost, the sender retries only the idempotent barrier within the same recovery deadline. It does not replay generation requests or extend the deadline.
+
+With request batching disabled, submission releases Python's execution lock while the socket owner writes the command or detects a connection outage. This avoids leaving a queued command waiting behind the caller's Python work. Healthy submissions do not wait for a worker acknowledgement. With `TRTLLM_PROXY_BATCH_REQUESTS=1`, submission stays asynchronous and the owner coalesces queued commands.
+
 All MPI workers must be able to reach an authenticated ephemeral TCP listener on the proxy host. The advertised IPv4 address defaults to the proxy's hostname. Set `TRTLLM_WORKER_WATCH_HOST` on the proxy to select an address reachable from every worker, especially in containers or hosts with multiple interfaces. Startup does not admit requests until every worker has reported to that listener. Local `MpiPoolSession` workers keep using process handles and do not start these helpers.
 
 For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
