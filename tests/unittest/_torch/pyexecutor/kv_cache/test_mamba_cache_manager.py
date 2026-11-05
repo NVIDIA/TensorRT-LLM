@@ -2611,7 +2611,9 @@ def _fp4_mla_hybrid_manager_stub(
     mgr.max_seq_len = 128
     mgr.max_num_tokens = 128
     mgr.num_extra_kv_tokens = 0
+    # What KVCacheManagerV2.__init__ derives without a spec config.
     mgr._kv_reserve_draft_tokens = 0
+    mgr._generation_kv_capacity_headroom = 1
     mgr.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
     mgr.kv_factor = 1
     mgr._num_reserved_dummy_slots = 0
