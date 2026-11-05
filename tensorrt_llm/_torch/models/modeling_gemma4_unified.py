@@ -50,6 +50,7 @@ the repo's pinned transformers.
 """
 
 import copy
+import itertools
 import json
 import math
 import os
@@ -85,6 +86,7 @@ from .modeling_gemma4mm import (
     Gemma4InputProcessor,
     Gemma4MultimodalEmbedder,
     Gemma4MultimodalModelBase,
+    _fill_gemma4_implicit_inputs,
     _gemma4_input_partitions,
 )
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -181,6 +183,41 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
         self.multimodal_embedder.load_weights(projector_weights)
 
 
+def _gemma4_unified_item_rows(multimodal_data: dict) -> dict[tuple[str, int], int]:
+    """Count the output rows of each item: the projections keep one row per valid patch or frame.
+
+    A video item spans its ``num_frames`` frames.
+    """
+    item_rows = {}
+    for modality in ("image", "video", "audio"):
+        data = multimodal_data.get(modality)
+        if not isinstance(data, dict):
+            continue
+        features = data.get("audio_features" if modality == "audio" else "pixel_values")
+        if not isinstance(features, torch.Tensor) or features.ndim < 2:
+            continue
+        if modality == "audio":
+            mask = data.get("audio_features_mask")
+            rows = (
+                [int(features.shape[1])] * int(features.shape[0])
+                if mask is None
+                else mask.bool().sum(dim=-1).tolist()
+            )
+        else:
+            positions = data.get("image_position_ids")
+            # The image projection drops the patches whose positions are all -1.
+            frame_rows = (
+                [int(features.shape[1])] * int(features.shape[0])
+                if positions is None
+                else (~(positions == -1).all(dim=-1)).sum(dim=-1).tolist()
+            )
+            counts = data.get("num_frames") or [1] * len(frame_rows)
+            starts = list(itertools.accumulate(counts, initial=0))
+            rows = [sum(frame_rows[start:end]) for start, end in zip(starts, starts[1:])]
+        item_rows.update({(modality, index): count for index, count in enumerate(rows)})
+    return item_rows
+
+
 class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
     """Input processor for Gemma 4 12B Unified.
 
@@ -225,11 +262,27 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
         multimodal_data: dict,
         mm_item_order: list[dict] | None = None,
     ) -> MultimodalItemMetadata | None:
-        """Keep request metadata without the tower-specific encoder costs."""
+        """Return item metadata without encoder costs, filling output rows the request lacks."""
         metadata = BaseMultimodalInputProcessor.get_mm_item_metadata(
             self, prompt_token_ids, multimodal_data, mm_item_order
         )
+        if metadata is None or metadata.output_embedding_lengths is None:
+            item_rows = _gemma4_unified_item_rows(multimodal_data)
+            if item_rows:
+                refs = (
+                    [(entry["modality"], entry["index"]) for entry in mm_item_order]
+                    if mm_item_order
+                    else metadata.item_refs
+                    if metadata is not None
+                    else list(item_rows)
+                )
+                metadata = MultimodalItemMetadata(
+                    refs,
+                    output_embedding_lengths=[item_rows[ref] for ref in refs],
+                    input_partitions=metadata.input_partitions if metadata is not None else None,
+                )
         if metadata is not None:
+            _fill_gemma4_implicit_inputs(multimodal_data, metadata)
             metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
         return metadata
 
