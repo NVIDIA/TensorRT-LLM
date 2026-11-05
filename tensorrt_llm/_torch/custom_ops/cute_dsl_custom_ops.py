@@ -19779,6 +19779,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 token_final_scales, expanded_idx_to_permuted_idx
             ]
             if precomputed_tactic is None:
+                if tuner.is_tuning_mode and reserved_sms:
+                    # This tuning pass profiles the shrunk grid the captured decode
+                    # graphs launch with; without its no-reserve twin the caches'
+                    # full-grid entry stays empty and every eager FC12 launch --
+                    # context/prefill, mixed batches, decode above the captured
+                    # sizes, deployments without CUDA graphs -- would run the
+                    # fallback tactic for the life of the server (prefill is where
+                    # FC12 does most of its work). The twin's cache entry serves
+                    # those; later repeats of this block hit the cache and return.
+                    twin = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
+                        num_experts,
+                        top_k,
+                        num_local_experts,
+                        local_expert_offset,
+                        tile_size,
+                        scaling_vector_size,
+                        swiglu_limit=swiglu_limit,
+                        ep_size=ep_size,
+                        enable_alltoall=enable_alltoall,
+                        activation_type=ActivationType(activation_type),
+                        situ_beta=_canonicalize_situ_beta(situ_beta),
+                        situ_linear_beta=_canonicalize_situ_beta(
+                            situ_linear_beta),
+                        reserved_sms=0,
+                    )
+                    tuner.choose_one(
+                        tuner_key,
+                        [twin],
+                        twin.get_tuning_config(),
+                        inputs,
+                    )
                 _, best_tactic = tuner.choose_one(
                     tuner_key,
                     [runner],
