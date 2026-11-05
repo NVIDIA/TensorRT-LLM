@@ -25,6 +25,7 @@ import yaml
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.blocks import Stage, YAMLIndex, compute_stage_test_counts, write_filtered_test_db
 from cbts.command.main import _load_pr_inputs
+from cbts.coverage.tier import apply_coverage_tier, write_coverage_test_db
 from cbts.rules.base import PRInputs, RuleResult
 from cbts.rules.perf_model_paths import MODEL_PATHS, changed_model_keys
 from cbts.rules.tests_def import TestsDefRule as CbtsTestsDefRule
@@ -137,6 +138,79 @@ def test_removing_or_modifying_an_existing_alias_keeps_its_consumers(tmp_path: P
     _write(tmp_path, MODEL_PATHS, changed)
     modified = _apply(rule, _BEFORE, changed)
     assert modified.affected_stages == {"l0_perf", "l0_old_multi_gpus_perf_sanity"}
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "perf/test_perf.py::test_perf[old-serve-pytorch]",
+            "perf/test_perf.py::test_perf[new-serve-pytorch] TIMEOUT(120)",
+        ),
+        (
+            "perf/test_perf_sanity.py::test_e2e[aggr_upload-old-server]",
+            "perf/test_perf_sanity.py::test_e2e[aggr_upload-new-server] TIMEOUT(120)",
+        ),
+    ],
+)
+def test_model_path_case_survives_coverage_of_another_core_change(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    """Tier 2 must preserve a model-path case even when only another case covers core edits."""
+    rule, stages = _fixture(tmp_path)
+    block = next(block for block in rule.yaml_index.blocks if block.yaml_stem == "l0_perf")
+    other = "other/test_other.py::test_other"
+    block.tests = [old, new, other]
+    result = _apply(rule)
+    _write(
+        tmp_path,
+        "test-db/l0_perf.yml",
+        yaml.safe_dump({"l0_perf": [{"tests": block.tests}]}),
+    )
+    known = {entry.split(" TIMEOUT", 1)[0] for entry in block.tests}
+
+    class CoverageDB:
+        def file_has_touch_rows(self, _path: str) -> bool:
+            return True
+
+        def tests_touching_func(self, _path: str, _qualname: str) -> set[str]:
+            return {f"l0_perf/{other}"}
+
+        def tests_touching_file(self, _path: str) -> set[str]:
+            return {f"l0_perf/{other}"}
+
+        def known_by_family(self) -> dict[str, set[str]]:
+            return {"l0_perf": known}
+
+        def untrusted_tests(self, *_args) -> set[str]:
+            return set()
+
+    core = "tensorrt_llm/example.py"
+    before = "def helper():\n    return 1\n"
+    after = "def helper():\n    return 2\n"
+    _write(tmp_path, core, after)
+    pr = PRInputs(
+        [MODEL_PATHS, core],
+        {MODEL_PATHS: _diff(_BEFORE, _AFTER), core: _diff(before, after)},
+    )
+    tier, note = apply_coverage_tier(
+        pr,
+        [(rule, result)],
+        result.handled_files,
+        {"l0_perf": stages["l0_perf"]},
+        rule.yaml_index,
+        tmp_path,
+        CoverageDB(),
+    )
+
+    assert tier is not None, note
+    assert tier.removed == {("l0_perf", 0): {old}}
+    assert tier.must_run_reasons == {"rule_kept": 1, "impacted": 1}
+    assert "l0_perf" not in tier.dropped
+    output = tmp_path / "coverage-filtered"
+    write_coverage_test_db(tmp_path / "test-db", output, tier.removed)
+    data = yaml.safe_load((output / "l0_perf.yml").read_text())
+    assert data["l0_perf"][0]["tests"] == [new, other]
 
 
 @pytest.mark.parametrize(
