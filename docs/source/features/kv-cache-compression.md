@@ -264,7 +264,6 @@ example below, or the checkpoint's KV type under the default `auto`.
 
 ```yaml
 kv_cache_config:
-  use_kv_cache_manager_v2: true
   dtype: fp8
   host_cache_size: 8589934592
 kv_cache_compression_config:
@@ -281,12 +280,12 @@ first/last tokens are served from that copy, as in the mixed-precision KV cache,
 including its per-step staging cost on dense attention backends.
 
 The option is a prototype and has the limits of the mixed-precision KV cache:
-`use_kv_cache_manager_v2: true` with the TRTLLM or FlashInfer attention backend,
-the standard V2 manager, the hybrid Mamba manager and the DSA and DeepSeek-V4
-sparse backends, single-beam decoding, speculative decoding except dynamic-tree
-drafting, and no KV connector. MTP drafter layers keep their
-first/last tokens like the target layers; a drafter with its own architecture
-keeps a plain cache.
+the TRTLLM or FlashInfer attention backend, the standard KV cache manager, the
+hybrid Mamba manager and the DSA and DeepSeek-V4 sparse backends, single-beam
+decoding, speculative decoding except dynamic-tree drafting, no KV connector,
+and not the `fp8_ds_mla` cache layout. MTP drafter layers keep their first/last
+tokens like the target layers; a drafter with its own architecture keeps a
+plain cache.
 
 ### TriAttention
 
