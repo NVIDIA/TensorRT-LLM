@@ -21,6 +21,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <thread>
@@ -122,6 +123,74 @@ TEST_P(TransferAgentTest, Basic)
     TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
 
     TLLM_CHECK(memory0 == memory1);
+    xferAgent0->invalidateRemoteAgent(agent1);
+}
+
+TEST_P(TransferAgentTest, CheckRemoteDescriptorRanges)
+{
+    if (backend != "nixl")
+    {
+        GTEST_SKIP() << "NIXL metadata validation";
+    }
+    std::string const agent0{"agent0"}, agent1{"agent1"};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
+    auto xferAgent0 = makeTransferAgent(config0);
+    auto xferAgent1 = makeTransferAgent(config1);
+    std::vector<char> source(64, 10);
+    std::vector<char> destination(128, 1);
+    RegisteredHostMemory regSource(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{source}}}, xferAgent0.get());
+    RegisteredHostMemory regDestination(
+        MemoryDescs{MemoryType::kDRAM, {MemoryDesc{destination.data(), source.size(), 0}}}, xferAgent1.get());
+    xferAgent0->loadRemoteAgent(agent1, xferAgent1->getLocalAgentDesc());
+    ASSERT_TRUE(xferAgent0->checkRemoteDescs(agent1, regDestination.getDescs()));
+
+    // The backing allocation is large enough, but the requested range exceeds its registration.
+    MemoryDescs const overrun{MemoryType::kDRAM, {MemoryDesc{destination.data() + 32, source.size(), 0}}};
+    EXPECT_FALSE(xferAgent0->checkRemoteDescs(agent1, overrun));
+    EXPECT_EQ(destination, std::vector<char>(128, 1));
+
+    EXPECT_FALSE(xferAgent0->checkRemoteDescs("unknown-agent", regDestination.getDescs()));
+
+    MemoryDescs const subSource{MemoryType::kDRAM, {MemoryDesc{source.data(), 16, 0}}};
+    MemoryDescs const subDestination{MemoryType::kDRAM, {MemoryDesc{destination.data() + 16, 16, 0}}};
+    EXPECT_TRUE(xferAgent0->checkRemoteDescs(agent1, subDestination));
+    TransferRequest const validWrite{TransferOp::kWRITE, subSource, subDestination, agent1};
+    auto status = xferAgent0->submitTransferRequests(validWrite);
+    ASSERT_EQ(status->wait(), TransferState::kSUCCESS);
+    auto expected = std::vector<char>(128, 1);
+    std::fill(expected.begin() + 16, expected.begin() + 32, 10);
+    EXPECT_EQ(destination, expected);
+    xferAgent0->invalidateRemoteAgent(agent1);
+}
+
+TEST_P(TransferAgentTest, CheckRemoteDescriptorsAcrossVmmChunks)
+{
+    if (backend != "nixl")
+    {
+        GTEST_SKIP() << "NIXL metadata validation";
+    }
+    constexpr size_t kChunkSize = 64;
+    constexpr size_t kTotalSize = 2 * kChunkSize;
+    char* destination = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&destination, kTotalSize));
+    std::unique_ptr<char, decltype(&cudaFree)> allocation{destination, &cudaFree};
+    std::string const agent0{"agent0"}, agent1{"agent1"};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
+    auto xferAgent0 = makeTransferAgent(config0);
+    auto xferAgent1 = makeTransferAgent(config1);
+    RegisteredHostMemory registered(
+        MemoryDescs{MemoryType::kVRAM,
+            {MemoryDesc{destination, kChunkSize, 0}, MemoryDesc{destination + kChunkSize, kChunkSize, 0}}},
+        xferAgent1.get());
+    // Advertise a chunked region over two real registrations without requiring a VMM allocator.
+    auto const metadata = xferAgent1->getLocalAgentDesc();
+    AgentDesc const chunked{
+        metadata.getBackendAgentDesc(), {{reinterpret_cast<uintptr_t>(destination), kTotalSize, kChunkSize}}};
+    xferAgent0->loadRemoteAgent(agent1, chunked);
+    EXPECT_TRUE(
+        xferAgent0->checkRemoteDescs(agent1, MemoryDescs{MemoryType::kVRAM, {MemoryDesc{destination, kTotalSize, 0}}}));
+    EXPECT_FALSE(xferAgent0->checkRemoteDescs(
+        agent1, MemoryDescs{MemoryType::kVRAM, {MemoryDesc{destination, kTotalSize + 1, 0}}}));
     xferAgent0->invalidateRemoteAgent(agent1);
 }
 

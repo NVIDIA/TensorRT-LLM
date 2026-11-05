@@ -12,6 +12,12 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_eagle3_worker_api.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_spec_tail_contracts.py
+  # MiniMax-M3 Rubin target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_drafter_fullctx_cells.py
   # MiniMax-M3 target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_tp4_drift.py
   - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_weight_slice_cache
@@ -38,6 +44,8 @@ l0_cpu:
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   - unittest/others/test_http_utils_fail_fast.py
+  # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
+  - unittest/others/test_perf_sanity_port_reservation.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
   # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a
@@ -94,6 +102,12 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/test_modeling_v2_gpt_oss_default_shards.py
+  # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
+  - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_multimodal_embeds.py
   - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_moe_scalars.py
@@ -135,6 +149,7 @@ l0_cpu:
   # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
+  - unittest/_torch/misc/test_grammar_matcher.py
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -145,6 +160,7 @@ l0_cpu:
   - unittest/_torch/speculative/test_device_window_sampling_layout.py
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/flashinfer/test_flashinfer_cubin_pool.py
   - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
@@ -199,6 +215,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_utils.py
   - unittest/_torch/visual_gen/test_vanilla_key_padding_mask.py
   - unittest/_torch/visual_gen/test_visual_gen_args.py
+  - unittest/_torch/visual_gen/test_vc_smooth_schedule.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
   - unittest/_torch/visual_gen/test_wan_i2v_reference_conditioning.py
@@ -225,6 +242,7 @@ l0_cpu:
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
+  - unittest/executor/test_stop_word_streaming_text.py
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
   - unittest/grpc/openengine/test_coordinator.py
