@@ -30,6 +30,10 @@ from tensorrt_llm.serve.runtime_control_auth import (
     build_runtime_control_auth_headers,
 )
 
+# threadleak is off: the tests create TestClients inside the test body and the
+# fake server's lazy worker-pool threads are alive when the leak check runs; the
+# serve_env fixture closes them in its teardown, which runs after that check
+# (precedent: tests/unittest/serve/api/ops/system/test_system_endpoints.py).
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 CONTROL_PATHS = {"/release_memory", "/resume_memory", "/update_weights", "/memory_status"}

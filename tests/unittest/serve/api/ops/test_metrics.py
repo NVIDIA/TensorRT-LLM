@@ -9,6 +9,7 @@ object shares with the root.
 """
 
 import asyncio
+import dataclasses
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -19,9 +20,14 @@ from test_common.serve.app_factory import AggConfig
 from test_common.serve.routes import effective_routes
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve._base.routing import ROUTERS, RoleGroup, ServerCapabilities
 from tensorrt_llm.serve.api.ops.metrics import api_router
 from tensorrt_llm.serve.api.ops.metrics.serving import MetricsServing
 
+# threadleak is off: the tests create TestClients inside the test body and the
+# fake server's lazy worker-pool threads are alive when the leak check runs; the
+# serve_env fixture closes them in its teardown, which runs after that check
+# (precedent: tests/unittest/serve/api/ops/system/test_system_endpoints.py).
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 REQUIRED = (
@@ -148,3 +154,57 @@ def test_the_collector_loop_feeds_the_serving_objects_buffer(serve_env):
     assert body == [stat]
     # Served from the buffer, which a scrape clears.
     assert client.get("/metrics").json() == []
+
+
+@pytest.mark.parametrize(
+    "config, metrics_routes",
+    [
+        (
+            AggConfig(
+                role=ServerRole.MM_ENCODER,
+                return_perf_metrics=True,
+                env=(("ENABLE_METRICS", "true"),),
+            ),
+            1,
+        ),
+        (AggConfig(role=ServerRole.EMBEDDING, return_perf_metrics=True), 0),
+    ],
+    ids=["mm_encoder_perf_metrics_enable_metrics_env", "embedding_perf_metrics"],
+)
+def test_no_prometheus_mount_on_the_other_roles(config, metrics_routes, serve_env):
+    # Perf metrics on a non-LLM role: the collector and the perf-metrics
+    # middleware exist, but the Prometheus mount is LLM-only today, so
+    # /prometheus/metrics, the second GET /metrics and the instrumentator's
+    # middleware are absent. Adding the mount to a role is a route change:
+    # update the router-table entry of tensorrt_llm.serve.api.ops.metrics.prometheus
+    # in tensorrt_llm/serve/_base/routing.py and perf_metrics in
+    # OpenAIServer._server_capabilities(), regenerate the route snapshot and
+    # change this test on purpose.
+    server = serve_env.build_openai_server(config)
+    paths = [path for path, _ in effective_routes(server.app)]
+    assert "/prometheus/metrics" not in paths, paths
+    assert paths.count("/metrics") == metrics_routes, paths
+    middleware = [middleware.cls.__name__ for middleware in server.app.user_middleware]
+    assert "PrometheusInstrumentatorMiddleware" not in middleware, middleware
+    # The mount is gated twice, and both gates must hold: the capability the
+    # root computes (LLM role group only) and the role set of the router-table
+    # entry (the test below).
+    assert server._server_capabilities().perf_metrics is False, (
+        "perf_metrics is an LLM-role-group capability: OpenAIServer._server_capabilities() "
+        "must leave it False on the other roles"
+    )
+
+
+def test_the_prometheus_mount_is_an_llm_only_entry_and_the_last_one():
+    spec = next(
+        spec for spec in ROUTERS if spec.module == "tensorrt_llm.serve.api.ops.metrics.prometheus"
+    )
+    assert spec.roles == frozenset({RoleGroup.LLM}), (
+        "the Prometheus mount is attached to the LLM role group only today; widening its "
+        "router-table entry is a route change: regenerate the route snapshot and change this "
+        "test on purpose"
+    )
+    assert spec is ROUTERS[-1], JSON_FIRST
+    llm = ServerCapabilities.for_role(None)
+    assert spec.when(llm) is False
+    assert spec.when(dataclasses.replace(llm, perf_metrics=True)) is True

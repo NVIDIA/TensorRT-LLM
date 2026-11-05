@@ -855,7 +855,7 @@ class OpenAIServer:
         logger.info(f"VisualGen media storage path: {self.media_storage_path}")
 
     def _register_launcher_forwarding_routes(self) -> None:
-        """Attached frontends: forward launcher-owned routes (before register_routes())."""
+        """Attached frontends: forward launcher-owned routes (before the router table)."""
         if self._launcher_forwarder is None:
             return
         for method, path in FORWARDED_ROUTES:

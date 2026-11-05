@@ -264,8 +264,9 @@ def test_concurrent_start_profile_admits_exactly_one_caller(tmp_path):
     ``_apply_profile_start_config`` overwrites the trace path and
     activities of the first window.
 
-    This is reachable in production: ``OpenAIServer.start_profile``
-    dispatches through ``asyncio.to_thread``, so two concurrent
+    This is reachable in production: ``ProfileServing.start_profile``
+    (``tensorrt_llm/serve/api/ops/profile/serving.py``) dispatches
+    through ``asyncio.to_thread``, so two concurrent
     ``POST /start_profile`` requests run on two different worker
     threads, and the in-process / Ray paths call
     ``PyExecutor.start_profile`` directly without the single-owner

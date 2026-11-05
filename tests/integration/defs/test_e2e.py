@@ -459,8 +459,8 @@ def test_trtllm_serve_profile_example(llm_root, llm_venv):
     """Wrapper for the CPU-only profile-endpoint smoke tests.
 
     Runs ``tests/unittest/llmapi/apps/_test_trtllm_serve_profile.py``
-    which binds the ``OpenAIServer.start_profile`` / ``stop_profile``
-    handlers to a mock generator (no GPU, no model) and verifies
+    which builds ``ProfileServing`` (``tensorrt_llm/serve/api/ops/profile/
+    serving.py``) over a mock generator (no GPU, no model) and verifies
     request parsing, default values, and the asyncio.to_thread
     event-loop guarantee. Following the existing apps/ wrapper
     pattern so the file is discovered via

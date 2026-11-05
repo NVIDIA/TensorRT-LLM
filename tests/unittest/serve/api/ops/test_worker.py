@@ -22,6 +22,10 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.api.ops.worker import api_router
 from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
 
+# threadleak is off: the tests create TestClients inside the test body and the
+# fake server's lazy worker-pool threads are alive when the leak check runs; the
+# serve_env fixture closes them in its teardown, which runs after that check
+# (precedent: tests/unittest/serve/api/ops/system/test_system_endpoints.py).
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 REQUIRED = (

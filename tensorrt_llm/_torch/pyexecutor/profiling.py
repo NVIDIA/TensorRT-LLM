@@ -390,7 +390,8 @@ class PyExecutorProfileManager:
           HTTP handler the server layer is responsible for tickling
           the executor loop so the stop iteration actually runs even
           when the engine would otherwise be idle (see
-          ``OpenAIServer.stop_profile``).
+          ``ProfileServing.stop_profile`` in
+          ``tensorrt_llm/serve/api/ops/profile/serving.py``).
         """
         executor = self._executor
         # Apply locally so diagnostic state (profile_stop_iters,
