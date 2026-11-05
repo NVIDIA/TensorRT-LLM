@@ -443,3 +443,14 @@ l0_cpu:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_spec_decode_serialization.py
+  # Per-file entries while the `unittest/disaggregated` directory entry is waived (https://nvbugs/7042835).
+  - unittest/disaggregated/test_cache_transceiver_harness_report.py
+  - unittest/disaggregated/test_coordinator_e2e.py
+  - unittest/disaggregated/test_coordinator_worker.py
+  - unittest/disaggregated/test_mamba_transfer.py::test_mamba_policy_rejects_incompatible_replicated_side_state
+  - unittest/disaggregated/test_msgspec_route.py
+  - unittest/disaggregated/test_openai_server_info.py
+  - unittest/disaggregated/test_pool_matching.py
+  - unittest/disaggregated/test_steady_clock_sync.py
+  - unittest/disaggregated/test_sync_transfer_timing.py
+  - unittest/disaggregated/test_transceiver_bounded_polling.py
