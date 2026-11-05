@@ -909,6 +909,7 @@ class MLA(nn.Module):
                 self.aux_stream,
                 self.ln_events,
                 zero_kv_mask=zero_kv_mask,
+                is_cuda_graph=attn_metadata.is_cuda_graph,
             )
         else:
             attn_output = attn_backend.forward(
