@@ -1668,6 +1668,8 @@ class MTPDraftWorker(MTPEagleWorker):
         batch_size,
         num_accepted_tokens,
         original_all_rank_num_tokens,
+        accepted_tokens=None,
+        pre_draft_seq_lens=None,
     ):
         self._drafted_rows = None
         decode = self._drafting_target(
@@ -1690,8 +1692,10 @@ class MTPDraftWorker(MTPEagleWorker):
                 batch_size,
                 num_accepted_tokens,
                 original_all_rank_num_tokens,
+                accepted_tokens,
+                pre_draft_seq_lens,
             )
-        return self._draft_on_target(
+        draft_tokens = self._draft_on_target(
             decode,
             inputs,
             attn_metadata,
@@ -1700,6 +1704,7 @@ class MTPDraftWorker(MTPEagleWorker):
             batch_size,
             num_accepted_tokens,
         )
+        return draft_tokens, None
 
     def _drafting_target(
         self,

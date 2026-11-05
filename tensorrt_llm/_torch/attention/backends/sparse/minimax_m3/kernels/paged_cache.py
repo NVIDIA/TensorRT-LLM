@@ -8,6 +8,42 @@ from typing import Literal
 
 import torch
 
+# E4M3 casts saturate to +-448, the bits the CUDA FP8 writers produce (__NV_SATFINITE / cvt.rn.satfinite); NaN stays
+# NaN. Used by the E4M3 cache writes below and by the targets' transient FP8 query casts. Where torch's own E4M3 cast
+# already saturates (c10's float8_e4m3fn conversion, shared by its CPU and CUDA kernels) the cast alone is used: an
+# explicit clamp would add a kernel per cast for the same bytes. A torch whose cast does not saturate gets the clamp.
+# Kill: False (the plain cast, whatever it does).
+FP8_SATURATE = True
+_E4M3_MAX = 448.0
+
+
+def _cast_saturates() -> bool:
+    """Whether this torch's E4M3 cast maps every out-of-range value, infinities included, to +-448."""
+    # An explicit device: the first import can run under a default-device context (meta while a model is built).
+    probe = torch.tensor(
+        [449.0, 463.0, 464.0, 1e4, float("inf"), -464.0, -float("inf")], device="cpu"
+    )
+    want = torch.tensor([448.0, 448.0, 448.0, 448.0, 448.0, -448.0, -448.0], device="cpu")
+    return torch.equal(probe.to(torch.float8_e4m3fn).float(), want)
+
+
+# Probed once at import on the CPU, so no CUDA work runs here (nor later inside a graph capture).
+_CAST_SATURATES = _cast_saturates()
+
+
+def fp8_e4m3_saturate(values: torch.Tensor) -> torch.Tensor:
+    """``values`` as float8_e4m3fn, saturated to +-448 (bitwise the plain cast for every finite in-range value).
+    Values already in float8_e4m3fn are returned as they are (they are finite by construction or already NaN)."""
+    if values.dtype == torch.float8_e4m3fn:
+        return values
+    if FP8_SATURATE and not _CAST_SATURATES:
+        values = values.clamp(-_E4M3_MAX, _E4M3_MAX)
+    return values.to(torch.float8_e4m3fn)
+
+
+def _to_cache_dtype(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return fp8_e4m3_saturate(values) if dtype == torch.float8_e4m3fn else values.to(dtype)
+
 
 def write_kv_slots(
     cache: torch.Tensor,
@@ -60,11 +96,11 @@ def write_kv_slots(
             if layout == "HND":
                 # Advanced indices on dims 0 and 2 broadcast to [num_tokens] and
                 # move front, giving a [num_tokens, num_heads, channel] target.
-                cache[page, :, within, :] = values.to(cache.dtype)
+                cache[page, :, within, :] = _to_cache_dtype(values, cache.dtype)
             else:
-                cache[page, within] = values.to(cache.dtype)
+                cache[page, within] = _to_cache_dtype(values, cache.dtype)
         else:
-            cache.index_copy_(0, out_cache_loc.to(torch.long), values.to(cache.dtype))
+            cache.index_copy_(0, out_cache_loc.to(torch.long), _to_cache_dtype(values, cache.dtype))
 
 
 __all__ = ["write_kv_slots"]
