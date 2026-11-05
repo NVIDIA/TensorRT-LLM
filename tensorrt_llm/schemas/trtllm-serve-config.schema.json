@@ -6884,7 +6884,7 @@
     },
     "enable_min_latency": {
       "default": false,
-      "description": "If true, enable min-latency mode for Llama4 and Kimi K3. For Kimi K3 it runs lossy decode kernels on generation steps of at most 8 rows: the MoE tail and the shared expert read BF16 activations instead of MXFP8, apply the RMSNorm scale late and use approximate tanh / sigmoid. Leave it unset where accuracy must match the default kernels or batches exceed 8 rows. It also packs a Kimi K3 CUDA-graph decode step's small input uploads into one copy and one scatter launch (lossless).",
+      "description": "If true, enable min-latency mode for Llama4 and Kimi K3. For Kimi K3 it runs lossy decode kernels on generation steps of at most 8 rows: the MoE tail and the shared expert read BF16 activations instead of MXFP8, apply the RMSNorm scale late and use approximate tanh / sigmoid. Leave it unset where accuracy must match the default kernels or batches exceed 8 rows. It also packs a Kimi K3 CUDA-graph decode step's small input uploads into one copy and one scatter launch (lossless), and the executor loop runs with a 200 us Python thread switch interval.",
       "status": "beta",
       "title": "Enable Min Latency",
       "type": "boolean"

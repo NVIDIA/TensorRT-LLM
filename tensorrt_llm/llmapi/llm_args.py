@@ -7081,7 +7081,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "activations instead of MXFP8, apply the RMSNorm scale late and use approximate tanh / sigmoid. "
         "Leave it unset where accuracy must match the default kernels or batches exceed 8 rows. "
         "It also packs a Kimi K3 CUDA-graph decode step's small input uploads into one copy and "
-        "one scatter launch (lossless).",
+        "one scatter launch (lossless), and the executor loop runs with a 200 us Python thread "
+        "switch interval.",
         status="beta")
 
     # TODO: make this a per-request parameter
