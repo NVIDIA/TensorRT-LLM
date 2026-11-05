@@ -255,7 +255,7 @@ The codebase is transitioning between two architectures:
 ConfigurableMoE currently supports these backends (`create_moe.py`):
 - the `CutlassFusedMoEBase` leaves, the `TrtllmGenFusedMoEBase` leaves,
   `DeepgemmCudaFp8BlockScalesImpl`, the `CuteDslFusedMoEBase` leaves, the two
-  B12x leaves, `TrtllmCutedslFusedFc12Nvfp4Impl`,
+  B12x leaves, `TrtllmCutedslFusedFc12Nvfp4Impl`, `TrtllmCutedslFusedFc12Mxfp8Impl`,
   `TrtllmCutedslDenseGemmNvfp4Impl`, `DeepgemmCudaW4a8Mxfp4Mxfp8Impl`,
   `TrtllmCutedslMegaMoeNvfp4Impl`, the `MarlinFusedMoEBase` leaves
 
@@ -299,6 +299,7 @@ Still on old path (standalone, with embedded communication):
 | `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its three leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`), `TrtllmCutedslGroupedGemmNvfp4PlusImpl` (`trtllm.cutedsl.grouped_gemm.nvfp4_plus`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; NVFP4_PLUS and BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; NVFP4_PLUS (MXFP4 checkpoints, UE5M3 scales) and unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xNvfp4FusedMoE` and `CuteDslB12xW4a16Nvfp4FusedMoE` (shared mixin `CuteDslB12xFusedMoEBase`, aliased as `CuteDslB12xFusedMoE`) | SM120/SM121 | NVFP4 (CUTLASS prefill, FlashInfer b12x decode) and W4A16 NVFP4 (b12x for every call), best on RTX PRO 6000 and DGX Spark. They head the `CUTEDSL` family, so they win on SM120/121 when flashinfer is present and yield to the grouped-GEMM leaves otherwise. BF16 activations only (`B12xMoEWrapper` reads and writes bfloat16), so a float16 layer falls back to Cutlass. The NVFP4 leaf also declines `force_dynamic_quantization` (`DYNAMIC_QUANT_UNSUPPORTED`): b12x quantizes decode activations against load-time scales, so such a layer falls back to Cutlass too. Single-GPU-shaped topology only: with no dispatch/combine kernel they reject `ep_size > 1` and attention-DP | `EXTERNAL_COMM` |
 | `cutedsl/fused_fc12/nvfp4.py` (+ the `fused_moe_cute_dsl_fc12.py` alias module) | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares `TrtllmCutedslGroupedGemmNvfp4Impl`'s NVFP4 weight layout and autotune runner; reachable through the `CUTEDSL_FC12` family or a pinned `impl_id`; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
+| `cutedsl/fused_fc12/mxfp8.py` | `TrtllmCutedslFusedFc12Mxfp8Impl` (`trtllm.cutedsl.fused_fc12.mxfp8`) | SM107 (Rubin) | MXFP8 (W8A8 e4m3 + UE8M0 1x32) fused FC1+SwiGLU+requant+FC2+finalize in one persistent kernel (`cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin`); the only CuteDSL leaf serving MXFP8, so `moe_backend: CUTEDSL` reaches it; SwiGLU only, requires `hidden_size % 512 == 0` and `intermediate_size_per_partition % 128 == 0`; needs `MoEDep.CUTEDSL_RUBIN` and `MoEDep.CUTEDSL_MXFP8_FUSED_FC12`, without which the layer degrades to Cutlass; no EPLB (see [Rubin MXFP8 fused FC12](#rubin-mxfp8-fused-fc12-moekernelsrubin)) | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103/SM107 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `TrtllmCutedslMegaMoeNvfp4Impl` (aliased as `MegaMoECuteDsl`) | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects one of its per-architecture kernel variants. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models | `FUSED_COMM` |
 | `marlin/` (+ the `fused_moe_marlin.py` alias module) | the abstract `MarlinFusedMoEBase` and its two leaves, `MarlinCudaNvfp4Impl` and `MarlinCudaW4a16Nvfp4Impl` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, single-launch `marlin_nvfp4_moe_gemm`); attention-DP + EP via external comm (plain BF16 dispatch payload); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass, recorded in the `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
@@ -474,12 +475,13 @@ the package.
 |------|------|
 | `identity.py` | the identity segments (`PROVIDER_TRTLLM`, `TECHNIQUE_CUTEDSL`, `KERNEL_*`), and the grouped-GEMM query and id helper |
 | `kernel_inputs.py` | shared inputs: `NvFp4WeightView`, `finalize_routing_scales`, and `quantize_input_nvfp4`; NVFP4 leaves use the quantizer through a direct binding or a wrapper |
-| `runners.py` | the outer autotune runners: NVFP4, which the fused-FC12 runner narrows to its tiles, and BF16 |
+| `runners.py` | the outer autotune runners: NVFP4, which the fused-FC12 runner narrows to its tiles, BF16, and MXFP8 for the MXFP8 fused-FC12 leaf |
 | `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the grouped-GEMM leaves: construction; takes `CuteDslLocalityDomainMixin` from `locality_domain.py` |
 | `grouped_gemm/eligibility.py` | the checks both grouped-GEMM leaves' `can_implement` compose, as free functions |
 | `grouped_gemm/nvfp4.py` / `grouped_gemm/nvfp4_plus.py` / `grouped_gemm/bf16.py` | one registered leaf each |
 | `locality_domain.py` | `CuteDslLocalityDomainMixin`: the output-memset overlap stream, the locality-domain plan and weight shards, and the lifecycle hooks around them; a mixin rather than a root, so leaves of different kernels take it. It vetoes a plan whose shards are not 128-row multiples (`_adjust_locality_domain_plan`, which a leaf with another split overrides) |
-| `fused_fc12/nvfp4.py` / `dense_gemm.py` | one registered leaf each, with what only that kernel needs |
+| `fused_fc12/nvfp4.py` / `fused_fc12/mxfp8.py` | one registered leaf each: the two formats run separate copies of the fused FC12 kernel, so the leaves share no code |
+| `dense_gemm.py` | one registered leaf, with what only that kernel needs |
 
 | kernel / `quant` | leaf | id |
 |---|---|---|
@@ -487,6 +489,7 @@ the package.
 | `grouped_gemm` / `nvfp4_plus` | `TrtllmCutedslGroupedGemmNvfp4PlusImpl` | `trtllm.cutedsl.grouped_gemm.nvfp4_plus` |
 | `grouped_gemm` / `none` | `TrtllmCutedslGroupedGemmBf16Impl` | `trtllm.cutedsl.grouped_gemm.none` |
 | `fused_fc12` / `nvfp4` | `TrtllmCutedslFusedFc12Nvfp4Impl` | `trtllm.cutedsl.fused_fc12.nvfp4` |
+| `fused_fc12` / `mxfp8` | `TrtllmCutedslFusedFc12Mxfp8Impl` | `trtllm.cutedsl.fused_fc12.mxfp8` |
 | `dense_gemm` / `nvfp4` | `TrtllmCutedslDenseGemmNvfp4Impl` | `trtllm.cutedsl.dense_gemm.nvfp4` |
 
 The grouped-GEMM NVFP4 leaf wraps `quantize_input_nvfp4` to supply an
@@ -527,6 +530,47 @@ points. The runner constructs
 remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase
 kernel when supported, otherwise the generic kernel. During warmup, the
 default multi-rank path primes its adaptive buckets with zero-token launches.
+
+### Rubin MXFP8 fused FC12 (`moe/kernels/rubin/`)
+
+`rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8.py` (+ its
+`manual_mma_128dp_mxfp8.py` helper) is a copy of the dynamic-kernel-generator
+Rubin fused FC12 kernel at a revision that supports MXFP8 operands. It sits
+next to the NVFP4-only `rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py`
+that `TrtllmCutedslFusedFc12Nvfp4Impl` runs; the two are separate copies of one
+kernel and are updated independently. It fuses the token gather, FC1 GEMM,
+SwiGLU, block-scaled requantization of the intermediate, FC2 GEMM and the top-k
+finalize (scatter-add) into one persistent kernel, driven through
+`trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin`
+(`Sm107Mxfp8FusedFc12MoeRunner` in `custom_ops/cute_dsl_custom_ops.py`) from
+`TrtllmCutedslFusedFc12Mxfp8Impl.run_moe`. Kernel ABI facts the adapter relies on:
+
+- Activations: e4m3 `[tokens, hidden]` plus **linear** UE8M0 scales
+  `[tokens, hidden/32]` (`mxfp8_quantize(..., swizzled=False)`); the gather
+  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`.
+- Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
+  swizzled layout produced by `block_scale_interleave` (int32-packed storage,
+  viewed as bytes). FC1 weight and scales are gate/up interleaved at
+  granularity 64 (`MXFP8CuteDslFusedMoEMethod`, applied once per slot after the
+  parent's deferred swizzle, and undone before a partial refit writes one
+  projection of a finalized slot).
+- Per-expert `fc1_alpha` / `fc2_alpha` and the FC1 `norm_const` are 1.0 for
+  MXFP8 (all scaling lives in the block scales).
+- The output is accumulated into, so `moe_output_memset_inplace` must run
+  first; the per-launch readiness/scheduler counters are zero-initialized
+  inside the op runner.
+- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler)` with
+  `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
+  `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
+  `l2_atomic` / `static`. The outer `CuteDslFusedMoEMxfp8Runner` tunes the
+  routing tile and the comb checker pins the inner `mma_tiler_m` to it.
+- **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
+  than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
+  `IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE` (true when `cutlass.memory` and
+  `cutlass.tensor_utils` are importable, i.e. builds like `0.3.0+20260803` and
+  newer), which the op registration and `MoEDep.CUTEDSL_MXFP8_FUSED_FC12` read.
+  An older build (e.g. `0.3.0+20260518`, which compiles the kernel but
+  miscomputes its MXFP8 path) degrades the layer to Cutlass.
 
 ### Design Documents
 
@@ -571,6 +615,8 @@ non-MoE consumers), the MoE files inside mixed directories (`marlin/`,
 | `test_moe_backend.py` | Backend unit tests (`run_moe`, `can_implement`, weight loading, numerics) | Active |
 | `test_moe_impl.py` | Selection and identity: what a resolution can get wrong (see the Identity Tests row under [Canonical Examples](#canonical-examples)) | Active |
 | `test_moe_module.py` | ConfigurableMoE integration tests (Backend × Comm × EPLB) | Active |
+| `test_mxfp8_moe_partial_refit.py` | MXFP8 bucketed-refit contract (swizzle / gate-up interleave applied exactly once) for the Cutlass and CuteDSL methods | Active |
+| `kernels/parallel/test_cute_dsl_moe.py` | CuteDSL MoE op-level tests, including the MXFP8 fused FC12 op against an fp32 reference | Active |
 | `test_fused_moe.py` | Legacy MoE tests | Being replaced, do NOT add new tests here |
 | `test_moe.py` | Legacy TRTLLM backend tests | Being replaced, do NOT add new tests here |
 
@@ -736,7 +782,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 FP8 | Y (SM100/103/107) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 MXFP8 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | N | N | Y (SM100/103/107, requires `hidden_size % 512 == 0`) | N | N | N | N |
-| W8A8 MXFP8 MXFP8 | Y (SM100/103/107) | N | N | N | N | N | N | N | N | N |
+| W8A8 MXFP8 MXFP8 | Y (SM100/103/107) | N | N | N | Y (SM107, fused FC1+FC2 kernel, needs `MoEDep.CUTEDSL_MXFP8_FUSED_FC12`, `hidden_size % 512 == 0`, `intermediate_size_per_partition % 128 == 0`, no EPLB) | N | N | N | N | N |
 | W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |
