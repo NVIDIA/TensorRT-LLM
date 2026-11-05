@@ -402,14 +402,6 @@ class KimiKDALinearAttention(nn.Module):
             return modules
         return None
 
-    def fused_fp8_qkvg_shape(self) -> Optional[Tuple[int, int]]:
-        """``(out, in)`` of the FP8 ``qkvg_proj`` that ``finalize_decode_weights`` builds
-        on CUDA, or None (for ``modules/linear_prebuild.py``)."""
-        modules = self._fp8_qkvg_modules()
-        if modules is None:
-            return None
-        return sum(module.out_features for module in modules), modules[0].in_features
-
     @staticmethod
     def _fuse_checkpoint_projections(modules: tuple[Linear, ...]) -> Linear:
         """Fuse block-aligned checkpoint pairs before backend scale preparation."""

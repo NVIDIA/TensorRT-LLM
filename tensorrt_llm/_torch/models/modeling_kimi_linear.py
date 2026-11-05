@@ -3718,33 +3718,3 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 self.model, include_fused_gate_up=self.model_config.mapping.enable_attention_dp
             )
             logger.info(f"Kimi K3: quantized {converted} BF16 shared/latent MLP projections to FP8")
-
-    def linear_prebuild_fp8_block_scale_shapes(self) -> List[Tuple[int, int]]:
-        """``(out, in)`` of the FP8 block-scale GEMMs on DeepGEMM operands that
-        ``_finalize_weight_load`` leaves: the attention projections it rewraps, the
-        fused KDA ``qkvg_proj`` and the BF16 shared/latent MLP projections it
-        quantizes (for ``modules/linear_prebuild.py``)."""
-        if not is_sm_100f() or _rubin_mxfp8_is_available():
-            return []
-        shapes = []
-        for layer in self.model.layers:
-            if not _has_weights(layer):
-                continue
-            is_kda = getattr(layer, "is_kda", False)
-            attention = layer.linear_attn if is_kda else layer.self_attn.mixer
-            shapes += [
-                tuple(linear.weight.shape)
-                for linear in attention.children()
-                if isinstance(linear, TrtllmLinear) and linear.has_fp8_block_scales
-            ]
-            if is_kda and (fused := attention.fused_fp8_qkvg_shape()) is not None:
-                shapes.append(fused)
-        if self._fp8_weight_read_moe_mlp:
-            shapes += [
-                tuple(getattr(parent, attr).weight.shape)
-                for parent, attr, linear_types in _moe_mlp_fp8_weight_read_targets(
-                    self.model, include_fused_gate_up=self.model_config.mapping.enable_attention_dp
-                )
-                if isinstance(getattr(parent, attr, None), linear_types)
-            ]
-        return shapes

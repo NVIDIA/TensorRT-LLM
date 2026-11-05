@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Warmup kernel builds next to weight loading (pyexecutor/warmup_overlap.py,
-modules/linear_prebuild.py)."""
+"""Kernel builds next to weight loading (pyexecutor/warmup_overlap)."""
 
 from types import SimpleNamespace
 
@@ -9,8 +8,8 @@ import pytest
 import torch
 from torch import nn
 
-import tensorrt_llm._torch.modules.linear_prebuild as lp
 import tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer as sampler_ops
+import tensorrt_llm._torch.pyexecutor.warmup_overlap.linear as overlap_linear
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.pyexecutor.warmup_overlap import warmup_overlap
 from tensorrt_llm._torch.utils import deep_gemm_jit_warmup_buckets
@@ -46,54 +45,93 @@ def _sweep(*token_counts):
     return tuple(sorted({m for t in token_counts for m in (t, *deep_gemm_jit_warmup_buckets(t))}))
 
 
+def _fp8_linear(in_features, out_features):
+    return Linear(in_features, out_features, bias=False, dtype=torch.bfloat16, quant_config=FP8)
+
+
 def test_tuning_token_counts():
     # A context forward of max_num_tokens (capped by the sequence budget) and one
     # generation request, as DecoderWarmup._run_autotuner_warmup tunes them.
-    assert lp._tuning_token_counts(_llm_args(32768, 16, 996672), _Mapping(False)) == (32768, 1)
-    assert lp._tuning_token_counts(_llm_args(8192, 4, 1025, draft=3), _Mapping(False)) == (4096, 4)
+    tuning_token_counts = overlap_linear._tuning_token_counts
+    assert tuning_token_counts(_llm_args(32768, 16, 996672), _Mapping(False)) == (32768, 1)
+    assert tuning_token_counts(_llm_args(8192, 4, 1025, draft=3), _Mapping(False)) == (4096, 4)
     # Helix CP generation workers tune one batch of generation requests.
-    assert lp._tuning_token_counts(_llm_args(14, 2, draft=6), _Mapping(True)) == (14,)
-    assert lp._tuning_token_counts(_llm_args(192, 32, draft=5), _Mapping(True)) == (192,)
-
-
-class _TextModel(nn.Module):
-    """A model that builds an FP8 block-scale GEMM while it loads."""
-
-    def linear_prebuild_fp8_block_scale_shapes(self):
-        return [(4096, 7168)]
-
-
-def _model():
-    with torch.device("meta"):
-        model = nn.Module()
-        model.fp8 = Linear(7168, 2048, bias=False, dtype=torch.bfloat16, quant_config=FP8)
-        model.wide = Linear(
-            NO_LOW_M[1], NO_LOW_M[0], bias=False, dtype=torch.bfloat16, quant_config=FP8
-        )
-        model.bf16 = Linear(1024, 1024, bias=False, dtype=torch.bfloat16)
-        # The hook is found on a wrapped submodule, as on a multimodal model's text model.
-        model.llm = _TextModel()
-    return model
+    assert tuning_token_counts(_llm_args(14, 2, draft=6), _Mapping(True)) == (14,)
+    assert tuning_token_counts(_llm_args(192, 32, draft=5), _Mapping(True)) == (192,)
 
 
 @pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
 def test_collect_plans_the_swept_shapes():
-    model = _model()
-    ctx = lp.collect(model, _llm_args(8192, 8), _Mapping(False))
+    with torch.device("meta"):
+        model = nn.Module()
+        model.fp8 = _fp8_linear(7168, 2048)
+        model.wide = _fp8_linear(NO_LOW_M[1], NO_LOW_M[0])
+        model.bf16 = Linear(1024, 1024, bias=False, dtype=torch.bfloat16)
+    ctx = overlap_linear.collect(model, _llm_args(8192, 8), _Mapping(False))
     shapes = {(n, k): sweep for n, k, sweep in ctx.fp8}
-    assert set(shapes) == {(2048, 7168), NO_LOW_M, (4096, 7168)}
+    assert set(shapes) == {(2048, 7168), NO_LOW_M}
     # The 8192-token forward runs fp8_swap_ab_gemm for every shape; the one-request
     # forward only where the low-M GEMM does not serve one row.
     for (n, k), sweep in shapes.items():
-        expected = _sweep(8192, 1) if lp._low_m_max(n, k) < 1 else _sweep(8192)
+        expected = _sweep(8192, 1) if overlap_linear._low_m_max(n, k) < 1 else _sweep(8192)
         assert sweep == expected, (n, k)
     assert not ctx.flashinfer_mxfp8
 
     # 14-token generation steps: the shapes whose low-M GEMM serves them are not swept.
-    gen = lp.collect(model, _llm_args(14, 2, draft=6), _Mapping(True))
-    assert lp._low_m_max(*NO_LOW_M) < 14
-    swept = {(n, k) for n, k in shapes if lp._low_m_max(n, k) < 14}
+    gen = overlap_linear.collect(model, _llm_args(14, 2, draft=6), _Mapping(True))
+    assert overlap_linear._low_m_max(*NO_LOW_M) < 14
+    swept = {(n, k) for n, k in shapes if overlap_linear._low_m_max(n, k) < 14}
     assert {(n, k): sweep for n, k, sweep in gen.fp8} == {s: _sweep(14) for s in swept}
+
+
+@pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
+def test_kimi_k3_load_time_gemms(monkeypatch):
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+
+    class KdaAttention(nn.Module):
+        """What the fusion rule of KimiKDALinearAttention reads."""
+
+        _fp8_qkvg_modules = KimiKDALinearAttention._fp8_qkvg_modules
+
+        def __init__(self):
+            super().__init__()
+            self._dispatch = SimpleNamespace(decode_kernel_path="optimized")
+            self.use_full_rank_gate = True
+            for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
+                setattr(self, name, _fp8_linear(7168, 4096))
+
+    def kimi_k3(layers):
+        # What the load-time rules read. Calling the class would build the whole model
+        # (PostInitCaller runs __init__, then __post_init__).
+        model = kimi.KimiLinearForCausalLM.__new__(kimi.KimiLinearForCausalLM)
+        nn.Module.__init__(model)
+        model.model = SimpleNamespace(layers=layers)
+        model._fp8_weight_read_moe_mlp = False
+        return model
+
+    monkeypatch.setattr(kimi, "_rubin_mxfp8_is_available", lambda: False)
+    with torch.device("meta"):
+        mla = nn.Module()
+        mla.kv_b_proj = _fp8_linear(512, 24576)
+        mla.o_proj = nn.Linear(16384, 7168, bias=False)
+        layers = [
+            SimpleNamespace(is_kda=False, self_attn=SimpleNamespace(mixer=mla)),
+            SimpleNamespace(is_kda=True, linear_attn=KdaAttention()),
+            # A layer of another pipeline stage.
+            SimpleNamespace(_weights_removed=True),
+        ]
+        # Found on a submodule, as the text model that KimiK25ForConditionalGeneration wraps.
+        model = nn.Module()
+        model.llm = kimi_k3(layers)
+
+    # The FP8 attention projections that _finalize_weight_load rewraps (not the BF16
+    # o_proj), and the qkvg_proj that finalize_decode_weights fuses from q, k, v and g.
+    assert overlap_linear._load_time_fp8_shapes(model) == {
+        (24576, 512),
+        (4096, 7168),
+        (16384, 7168),
+    }
 
 
 @pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
@@ -104,9 +142,7 @@ def test_warmup_overlap_builds_before_the_with_ends(monkeypatch):
     monkeypatch.setattr(sampler_ops, "warmup_sampling_module", lambda: sampled.append(True))
     with torch.device("meta"):
         model = nn.Module()
-        model.wide = Linear(
-            NO_LOW_M[1], NO_LOW_M[0], bias=False, dtype=torch.bfloat16, quant_config=FP8
-        )
+        model.wide = _fp8_linear(NO_LOW_M[1], NO_LOW_M[0])
     model_config = SimpleNamespace(pretrained_config=None)
 
     with warmup_overlap(model, model_config, _llm_args(14, 2, draft=6), _Mapping(True)) as groups:

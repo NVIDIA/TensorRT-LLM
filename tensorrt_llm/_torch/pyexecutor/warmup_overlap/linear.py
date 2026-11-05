@@ -1,37 +1,47 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Build the GEMM kernels of a model's Linear layers without a model forward.
+"""The GEMM kernels of a model's Linear layers, built without a model forward.
 
 The decoder warmup builds them as a side effect of its forwards: DeepGEMM compiles a
 swap-AB kernel for every tile layout its heuristic picks for an FP8 block-scale weight
 over the autotuner's token buckets, and FlashInfer's MXFP8 GEMM its CUTLASS module. Which
 kernels follows from the weight shapes and the token counts the warmup runs, both known
-once the model is constructed, so ``warmup_overlap`` builds them while the weights load,
-by running the same kernels once on dummy operands with the shapes, dtypes and layouts of
-the loaded weights. Nothing is timed: the warmup still runs its sweeps, and finds the
-kernels built.
+once the model is constructed. They are built by running the same kernels once on dummy
+operands with the shapes, dtypes and layouts of the loaded weights. Nothing is timed: the
+warmup still runs its sweeps, and finds the kernels built.
+
+Some models create FP8 GEMMs only while their weights load; ``_load_time_fp8_shapes`` lists
+them from the model's own rules for those transforms.
 
 Only builds that run with the GIL released are done next to the loader: DeepGEMM's nvcc
 and FlashInfer's ninja run in subprocesses. A CuTe DSL or Triton compile holds the GIL for
 most of its time, and the loading thread, which releases and re-acquires it around every
-copy, would then wait a full switch interval each time. Those kernels, like attention and
-fused-MoE kernels, stay with the warmup.
+copy, would then wait a full switch interval each time. Those kernels stay with the warmup.
+``TLLM_OVERLAP_PREWARM_LINEAR=0`` leaves all of them to the warmup.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, List, Tuple
+import os
+import sys
+from types import ModuleType
+from typing import Any, List, Set, Tuple
 
 import torch
 from torch import nn
 
 from tensorrt_llm.logger import logger
 
-#: A model that builds FP8 block-scale GEMMs while it loads (Kimi K3 fuses KDA projections
-#: and quantizes BF16 MLP projections) returns their ``(out, in)`` from this method.
-FP8_BLOCK_SCALE_SHAPES_HOOK = "linear_prebuild_fp8_block_scale_shapes"
+from .group import BuildGroup
+
+_ENV = "TLLM_OVERLAP_PREWARM_LINEAR"
+# nvcc runs with the GIL released, so DeepGEMM compiles in parallel threads.
+_DEEP_GEMM_THREADS_ENV = "TLLM_OVERLAP_PREWARM_DEEP_GEMM_THREADS"
+# Free device memory left to the loader next to the dummy operands.
+_LOADER_RESERVE_BYTES = 8 << 30
+_KIMI_LINEAR_MODULE = "tensorrt_llm._torch.models.modeling_kimi_linear"
 
 
 @dataclasses.dataclass
@@ -43,9 +53,6 @@ class Plan:
     tuning_m: Tuple[int, ...]
     fp8: List[Tuple[int, int, Tuple[int, ...]]]
     flashinfer_mxfp8: bool
-
-    def empty(self) -> bool:
-        return not (self.fp8 or self.flashinfer_mxfp8)
 
     def summary(self) -> str:
         shapes = " ".join(f"{n}x{k}:{len(sweep)}" for n, k, sweep in self.fp8)
@@ -82,7 +89,7 @@ def _tuning_token_counts(llm_args: Any, mapping: Any) -> Tuple[int, ...]:
 
 def _uses_flashinfer_mxfp8(model: nn.Module, llm_args: Any, methods: List[Any]) -> bool:
     """Whether the warmup tunes FlashInfer's MXFP8 GEMM (``_run_autotuner_warmup``)."""
-    from .linear import mxfp8_gemm_backend_override
+    from tensorrt_llm._torch.modules.linear import mxfp8_gemm_backend_override
 
     if not any(method.use_cutlass for method in methods):
         return False
@@ -97,25 +104,67 @@ def _uses_flashinfer_mxfp8(model: nn.Module, llm_args: Any, methods: List[Any]) 
     )
 
 
-def collect(model: nn.Module, llm_args: Any, mapping: Any) -> Plan:
-    """The GEMMs of the constructed (possibly meta) ``model`` that the warmup builds."""
-    from tensorrt_llm._utils import is_sm_100f
+def _kimi_linear_fp8_shapes(kimi: ModuleType, model: nn.Module) -> List[Tuple[int, int]]:
+    """``(out, in)`` of the FP8 block-scale GEMMs on DeepGEMM operands that
+    ``KimiLinearForCausalLM._finalize_weight_load`` creates: the attention projections it
+    rewraps, the KDA ``qkvg_proj`` that ``finalize_decode_weights`` fuses, and the BF16
+    shared/latent MLP projections it quantizes."""
+    if kimi._rubin_mxfp8_is_available():
+        return []
+    shapes = []
+    for layer in model.model.layers:
+        if not kimi._has_weights(layer):
+            continue
+        is_kda = getattr(layer, "is_kda", False)
+        attention = layer.linear_attn if is_kda else layer.self_attn.mixer
+        shapes += [
+            tuple(linear.weight.shape)
+            for linear in attention.children()
+            if isinstance(linear, kimi.TrtllmLinear) and linear.has_fp8_block_scales
+        ]
+        if is_kda and (fused := attention._fp8_qkvg_modules()) is not None:
+            shapes.append((sum(module.out_features for module in fused), fused[0].in_features))
+    if model._fp8_weight_read_moe_mlp:
+        shapes += [
+            tuple(getattr(parent, attr).weight.shape)
+            for parent, attr, linear_types in kimi._moe_mlp_fp8_weight_read_targets(
+                model.model, include_fused_gate_up=model.model_config.mapping.enable_attention_dp
+            )
+            if isinstance(getattr(parent, attr, None), linear_types)
+        ]
+    return shapes
 
-    from .linear import FP8BlockScalesLinearMethod, MXFP8LinearMethod
 
-    sm100f = is_sm_100f()
-    fp8 = set()
-    mxfp8_methods = []
+def _load_time_fp8_shapes(model: nn.Module) -> Set[Tuple[int, int]]:
+    """FP8 block-scale GEMMs on DeepGEMM operands that a model creates while its weights
+    load, which the walk over the constructed model cannot see. Looked up on every
+    submodule: a multimodal model wraps its text model."""
+    shapes = set()
+    # Models are imported on demand: an unimported model module has no instance here.
+    kimi = sys.modules.get(_KIMI_LINEAR_MODULE)
+    if kimi is None:
+        return shapes
     for module in model.modules():
-        # On the text model, which a multimodal model wraps.
-        hook = getattr(module, FP8_BLOCK_SCALE_SHAPES_HOOK, None)
-        if callable(hook) and sm100f:
+        if isinstance(module, kimi.KimiLinearForCausalLM):
             try:
-                fp8.update(tuple(shape) for shape in hook())
+                shapes.update(_kimi_linear_fp8_shapes(kimi, module))
             except Exception as e:  # noqa: BLE001 - the warmup builds those kernels
                 logger.warning(
-                    f"Linear prebuild: {FP8_BLOCK_SCALE_SHAPES_HOOK} failed. {type(e).__name__}: {e}"
+                    f"Overlapped Linear GEMM builds: no load-time shapes of "
+                    f"{type(module).__name__}. {type(e).__name__}: {e}"
                 )
+    return shapes
+
+
+def collect(model: nn.Module, llm_args: Any, mapping: Any) -> Plan:
+    """The GEMMs of the constructed (possibly meta) ``model`` that the warmup builds."""
+    from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod, MXFP8LinearMethod
+    from tensorrt_llm._utils import is_sm_100f
+
+    sm100f = is_sm_100f()
+    fp8 = _load_time_fp8_shapes(model) if sm100f else set()
+    mxfp8_methods = []
+    for module in model.modules():
         method = getattr(module, "quant_method", None)
         weight = getattr(module, "weight", None)
         if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
@@ -154,16 +203,17 @@ def _dummy_fp8_weight(n: int, k: int, device: torch.device):
 def _low_m_max(n: int, k: int) -> int:
     """Rows up to which the forward runs the low-M GEMM instead of ``fp8_swap_ab_gemm``
     (``Fp8BlockScaleLowMGemmRange``, set by ``transform_weights`` except on SM107)."""
+    from tensorrt_llm._torch.modules.linear import Fp8BlockScaleLowMGemmRange
     from tensorrt_llm._utils import get_sm_version
-
-    from .linear import Fp8BlockScaleLowMGemmRange
 
     if get_sm_version() == 107:
         return 0
     try:
         return Fp8BlockScaleLowMGemmRange.for_weight(n, k).max_m
     except Exception as e:  # noqa: BLE001 - sweep every count: more kernels, none missing
-        logger.warning(f"Linear prebuild: no low-M range for {n}x{k}. {type(e).__name__}: {e}")
+        logger.warning(
+            f"Overlapped Linear GEMM builds: no low-M range for {n}x{k}. {type(e).__name__}: {e}"
+        )
         return 0
 
 
@@ -171,7 +221,7 @@ def deep_gemm_sweep(shape: Tuple[int, int], tuning_m: Tuple[int, ...]) -> Tuple[
     """Token counts of ``fp8_swap_ab_gemm``'s sweep for ``shape`` in the autotuner warmup:
     of each forward whose rows the low-M GEMM does not serve, its buckets and its count
     (``DynamicTensorSpec``); none when the low-M GEMM serves them all."""
-    from ..utils import deep_gemm_jit_warmup_buckets
+    from tensorrt_llm._torch.utils import deep_gemm_jit_warmup_buckets
 
     low_m_max = _low_m_max(*shape)
     sweep = set()
@@ -190,10 +240,21 @@ def deep_gemm_footprint(item: Tuple[int, int, Tuple[int, ...]]) -> int:
     return n * k + 4 * n * scale_cols + 3 * m * k + 4 * m * scale_cols + 2 * m * n
 
 
+def _deep_gemm_threads(plan: Plan) -> int:
+    """Threads for the DeepGEMM builds: the requested count, as far as their dummy operands
+    fit next to the loader in free device memory (0: none fit)."""
+    threads = max(1, int(os.environ.get(_DEEP_GEMM_THREADS_ENV, "4")))
+    largest = max((deep_gemm_footprint(item) for item in plan.fp8), default=0)
+    if largest == 0:
+        return threads
+    free_bytes, _ = torch.cuda.mem_get_info()
+    return max(0, min(threads, (free_bytes - _LOADER_RESERVE_BYTES) // largest))
+
+
 def build_deep_gemm(item: Tuple[int, int, Tuple[int, ...]], device: torch.device) -> int:
     """Run ``fp8_swap_ab_gemm``'s runner at every token count of a plan's sweep
     ``(N, K, token counts)``. Returns the GEMM launches."""
-    from ..custom_ops.torch_custom_ops import fp8SwapABGemmRunner
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import fp8SwapABGemmRunner
 
     n, k, sweep = item
     weight, scale = _dummy_fp8_weight(n, k, device)
@@ -206,8 +267,37 @@ def build_deep_gemm(item: Tuple[int, int, Tuple[int, ...]], device: torch.device
     return len(sweep)
 
 
-def build_flashinfer_mxfp8() -> None:
+def build_flashinfer_mxfp8(_item: Any = None) -> int:
     """Build and load FlashInfer's CUTLASS MXFP8 GEMM module (``mm_mxfp8``)."""
     from flashinfer.gemm.gemm_base import get_gemm_sm100_module_cutlass_mxfp8
 
     get_gemm_sm100_module_cutlass_mxfp8()
+    return 1
+
+
+def build_groups(
+    model: nn.Module, model_config: Any, llm_args: Any, mapping: Any
+) -> List[BuildGroup]:
+    """The builds of the GEMM kernels of ``model``'s Linear layers."""
+    if os.environ.get(_ENV, "1") == "0":
+        return []
+    plan = collect(model, llm_args, mapping)
+    device = torch.device("cuda", torch.cuda.current_device())
+    deep_gemm_threads = _deep_gemm_threads(plan)
+    if plan.fp8 and deep_gemm_threads == 0:
+        logger.info("[warmup] overlap: no free memory for DeepGEMM's operands")
+    logger.info(f"[warmup] overlap plan: {plan.summary()}")
+    return [
+        BuildGroup(
+            "deep_gemm",
+            plan.fp8 if deep_gemm_threads else [],
+            lambda item: build_deep_gemm(item, device),
+            deep_gemm_threads,
+        ),
+        BuildGroup(
+            "flashinfer_mxfp8",
+            ["module"] if plan.flashinfer_mxfp8 else [],
+            build_flashinfer_mxfp8,
+            1,
+        ),
+    ]
