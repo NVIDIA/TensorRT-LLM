@@ -1502,7 +1502,7 @@ class DecodeTarget:
             quant_ready = self._quant_ready.cuda_event
         else:
             x_fp4, x_sf = quantized
-            quant_ready = 0
+            quant_ready = None
         routing = extract_routing_params(backend.routing_method)
 
         def routed():
