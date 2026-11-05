@@ -2946,7 +2946,7 @@ def test_v2_hybrid_fp4_hosts_fp8_draft_layers_in_their_own_lifecycle(
         assert mgr.get_kv_cache_dtype(2) == DataType.FP8
         draft_pool = int(mgr.kv_cache_pool_mapping[2][0])
         assert draft_pool not in {int(mgr.kv_cache_pool_mapping[1][0])}
-        assert mgr._draft_manager_layer_ids == [LayerId(2)]
+        assert mgr._draft_manager_layer_ids == (LayerId(2),)
         view = mgr.get_buffers(2, kv_layout="HND")
         assert view.dtype == torch.float8_e4m3fn
         assert tuple(view.shape[1:]) == (1, 1, FP4_MLA_TOKENS_PER_BLOCK, 96)
