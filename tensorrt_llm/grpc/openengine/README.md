@@ -45,6 +45,8 @@ Cancellations retain one pending intent per admitted request, including requests
 
 On terminal failure, the launcher's command sender attempts to stop surviving workers before closing its socket. This decision does not depend on how quickly monitor cleanup runs. An attached frontend never sends the shared worker-stop message.
 
+Worker profiling calls run on a serialized control thread while command ingress continues to accept generation, cancellation, and recovery barriers from every frontend. Profile acknowledgements still follow completion of the operation; stopping profiling waits for trace export or its existing timeout. Only one profile operation can be in progress at a time. The control thread is joined before worker engine teardown.
+
 Remote MPI sessions also supervise each running worker through a separate process watch. The helper does not depend on MPI, CUDA or the worker's Python thread making progress. A worker exit, helper exit, or five seconds without a heartbeat makes the engine failure terminal. This detects process loss; it does not detect a live worker stuck in a collective. Supervision starts when the worker function begins, after the MPI launch barrier.
 
 If a recovery acknowledgement is lost, the sender retries only the idempotent barrier within the same recovery deadline. It does not replay generation requests or extend the deadline.

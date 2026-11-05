@@ -28,9 +28,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import zmq
 
+from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy, _RequestSender
-from tensorrt_llm.executor.request import StartProfileRequest, StopProfileRequest
+from tensorrt_llm.executor.request import (
+    CancellingRequest,
+    GenerationRequest,
+    StartProfileRequest,
+    StopProfileRequest,
+)
+from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.worker import _dispatch_requests
+from tensorrt_llm.sampling_params import SamplingParams
 
 # These tests deliberately keep a real single-thread
 # ``_profile_control_executor`` alive for the whole test body -- pinning
@@ -39,7 +49,94 @@ from tensorrt_llm.executor.request import StartProfileRequest, StopProfileReques
 # function-scoped fixture finalizer necessarily runs too late to satisfy
 # it. The ``bare_proxy`` teardown below still drains the executor, so the
 # owner threads are reclaimed and do not accumulate across the module.
-pytestmark = pytest.mark.threadleak(enabled=False)
+pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
+
+
+@pytest.mark.threadleak(enabled=True)
+@pytest.mark.timeout(15, method="thread")
+@pytest.mark.parametrize("outcome", ["success", "rejected", "fatal"])
+def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
+    address = (f"ipc://{tmp_path}/commands", b"k" * 32)
+    entered = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    ready = threading.Event()
+    errors = queue.Queue()
+    received = []
+
+    class Worker:
+        def stop_profile(self):
+            entered.set()
+            assert release.wait(5)
+            if outcome == "rejected":
+                raise RequestError("profile rejected")
+            if outcome == "fatal":
+                raise RuntimeError("profile failed")
+
+        def submit(self, request):
+            received.append(request.id)
+
+        def abort_request(self, request_id):
+            assert request_id == 7
+            cancelled.set()
+
+    def dispatch():
+        ingress = IpcQueue(address, is_server=True, socket_type=zmq.PULL, receive_hwm=16)
+        try:
+            ingress.setup_lazily()
+            ready.set()
+            _dispatch_requests(Worker(), ingress)
+        except BaseException as error:
+            errors.put(error)
+        finally:
+            ingress.close()
+
+    thread = threading.Thread(target=dispatch)
+    thread.start()
+    ack = IpcQueue(is_server=True)
+    senders = [
+        _RequestSender(
+            IpcQueue(address, is_server=False, socket_type=zmq.PUSH),
+            errors,
+            batching=False,
+            recovery_timeout=0.5,
+        )
+        for _ in range(2)
+    ]
+    try:
+        assert ready.wait(3)
+        ack.setup_lazily()
+        senders[0].send(pickle.dumps(StopProfileRequest(ack_addr=ack.address)), control=True)
+        assert entered.wait(3)
+        # Exceed the production transport's finite buffers while export is
+        # held. The other frontend must keep making progress, not time out.
+        for request_id in range(64):
+            request = GenerationRequest([1] * (512 * 1024), SamplingParams())
+            request.set_id(request_id)
+            senders[1].send(pickle.dumps(request))
+        senders[1].send(pickle.dumps(CancellingRequest(7)), control=True)
+        assert cancelled.wait(2)
+        assert received == list(range(64))
+        assert errors.empty()
+        assert not ack.poll(0.01), "profile acknowledged before trace export completed"
+        release.set()
+        if outcome == "fatal":
+            error = errors.get(timeout=3)
+            assert isinstance(error, RuntimeError)
+            assert str(error) == "profile failed"
+        else:
+            assert ack.get(timeout=3) == (
+                "stop",
+                "profile rejected" if outcome == "rejected" else None,
+            )
+    finally:
+        release.set()
+        senders[0].close(timeout=3, send_sentinel=outcome != "fatal")
+        senders[1].close(timeout=3)
+        thread.join(timeout=3)
+        ack.close()
+    assert not thread.is_alive()
+    assert errors.empty()
 
 
 @pytest.fixture
