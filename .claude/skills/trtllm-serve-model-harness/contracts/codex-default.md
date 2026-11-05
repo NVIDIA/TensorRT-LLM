@@ -21,6 +21,9 @@ codex exec --json --skip-git-repo-check -C <workdir> -s workspace-write -m <mode
   -o last_message.txt "<task prompt>"
 ```
 
+From a script, give `codex exec` its input with `< /dev/null`: with a standard input that is not
+a terminal, it waits to read more of the prompt from it (`scripts/run_codex_sessions.sh` does this).
+
 | Setting | Notes |
 |---|---|
 | `wire_api="responses"` | Codex then POSTs `/v1/responses` with `stream: true` |

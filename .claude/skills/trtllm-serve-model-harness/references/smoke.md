@@ -75,9 +75,10 @@ S5) run inside the sandbox.
 
 The same four parts for every harness: a fake server of the harness's protocol, the recorder in
 forward mode in front of it, the harness's session runner, and a verdict over the recorded trace.
-Work in a run directory outside the repository and pass every path absolute. Each example uses a
-fresh run directory and stops the servers it started, so the next one can take the same ports.
-Codex over Responses:
+Work in a run directory outside the repository and pass every path absolute: a harness started
+inside a checkout reads the repository's agent instructions (`AGENTS.md`, `CLAUDE.md`) from the
+parent directories into its prompt. Each example uses a fresh run directory and stops the servers
+it started, so the next one can take the same ports. Codex over Responses:
 
 ```bash
 SKILL=$PWD/.claude/skills/trtllm-serve-model-harness     # from the repository root

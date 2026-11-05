@@ -63,6 +63,8 @@
 # <out_dir>/sessions.tsv (index, exit code, seconds). Judge the run from the trace of the recorder
 # BASE_URL points at (record_requests.py) with scripts/validate/verdict.py --population smoke.
 # <out_dir> must be new or empty, or the runner exits 2 before it starts a session.
+# Exit status: 0 when every session exited 0, 1 otherwise. pi -p exits 0 even when a run ends
+# on an error, so read its events too.
 set -u
 TASKS=${1:?tasks.tsv}
 OUT=${2:?out_dir}
@@ -143,3 +145,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$TASKS"
 wait
 echo "sessions: $index; exit codes: $(cut -f2 "$OUT/sessions.tsv" | sort | uniq -c | tr '\n' ' ')"
+failed=$(awk -F'\t' '$2 != 0' "$OUT/sessions.tsv" | wc -l)
+if [ "$failed" -gt 0 ]; then
+  echo "$failed session(s) exited non-zero: see sessions.tsv and their stderr.log" >&2
+  exit 1
+fi

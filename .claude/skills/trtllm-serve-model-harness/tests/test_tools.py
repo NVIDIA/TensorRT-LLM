@@ -515,7 +515,7 @@ def test_a_case_without_a_final_message_is_summarized(tmp_path, monkeypatch):
 # A stand-in harness: it records its arguments, working directory and environment as exec passed
 # them (from /proc: Python adds variables of its own), then prints one event. A prompt with
 # "no-namespaces" adds the event Codex writes when its sandbox cannot start a command; one with
-# "panic" exits as Codex does when it panics.
+# "panic" exits as Codex does when it panics; one with "exit-42" exits 42.
 STUB = """#!{python}
 import json, os, sys
 with open("/proc/self/environ", "rb") as fh:
@@ -523,11 +523,14 @@ with open("/proc/self/environ", "rb") as fh:
 with open(os.path.join({records!r}, "%d.json" % os.getpid()), "w") as fh:
     json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "env": env}}, fh)
 print(json.dumps({{"type": "stub"}}))
-if "no-namespaces" in sys.argv[-1]:
+prompt = " ".join(sys.argv[1:])
+if "no-namespaces" in prompt:
     print(json.dumps({{"type": "item.completed", "item": {{"type": "command_execution", "exit_code": 1,
                      "aggregated_output": "bwrap: No permissions to create a new namespace"}}}}))
-if "panic" in sys.argv[-1]:
+if "panic" in prompt:
     sys.exit(101)
+if "exit-42" in prompt:
+    sys.exit(42)
 """
 # runner: (script, the variable naming the harness executable, required settings)
 RUNNERS = {
@@ -661,6 +664,18 @@ def test_a_tasks_file_starts_exactly_its_tasks(tmp_path, runner):
     rows = (tmp_path / "out" / "sessions.tsv").read_text().splitlines()
     assert sorted(row.split("\t")[:2] for row in rows) == [["1", "0"], ["2", "0"]]
     assert sorted(_prompt(runner, r["argv"]) for r in records) == ["first task", "second task"]
+
+
+@needs_proc
+@pytest.mark.parametrize("runner", sorted(RUNNERS))
+def test_a_runner_fails_when_a_session_fails(tmp_path, runner):
+    """A session that exits non-zero fails the run; every session still runs and is recorded."""
+    result, records = _run_sessions(tmp_path, runner, tasks="src\tsay hi\nsrc\texit-42 now\n")
+
+    rows = (tmp_path / "out" / "sessions.tsv").read_text().splitlines()
+    assert sorted(row.split("\t")[:2] for row in rows) == [["1", "0"], ["2", "42"]]
+    assert len(records) == 2
+    assert result.returncode == 1 and "1 session(s) exited non-zero" in result.stderr
 
 
 @needs_proc

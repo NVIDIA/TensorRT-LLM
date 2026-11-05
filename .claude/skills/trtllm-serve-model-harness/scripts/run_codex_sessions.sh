@@ -53,6 +53,7 @@
 # <out_dir>/sessions.tsv (index, exit code, seconds, sandbox failures: the lines of events.jsonl
 # with "bwrap: " in them, i.e. commands Codex's sandbox could not start). A session that exited 101
 # or has sandbox failures ran none of its commands: the runner then warns and exits 3.
+# Otherwise the exit status is 0 when every session exited 0, and 1 when one did not.
 # Judge the run from the trace of the recorder BASE_URL points at (references/smoke.md section 1).
 # <out_dir> must be new or empty, or the runner exits 2 before it starts a session.
 set -u
@@ -125,4 +126,9 @@ if [ "$broken" -gt 0 ]; then
   echo "WARNING: Codex's sandbox did not start in $broken session(s) (exit 101, or 'bwrap: ' in" \
     "events.jsonl), so their commands never ran. See SANDBOX above and references/smoke.md section 0." >&2
   exit 3
+fi
+failed=$(awk -F'\t' '$2 != 0' "$OUT/sessions.tsv" | wc -l)
+if [ "$failed" -gt 0 ]; then
+  echo "$failed session(s) exited non-zero: see sessions.tsv and their stderr.log" >&2
+  exit 1
 fi

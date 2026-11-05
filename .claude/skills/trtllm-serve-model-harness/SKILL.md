@@ -89,6 +89,12 @@ inputs and the right checks. That is what this skill provides:
   - who runs the full tier.
 
   Until the thresholds are set, every rate reads BLOCKED, by design.
+- **Any agent can run it.** The procedure needs a shell and Python, nothing of Claude Code's own.
+  - Codex 0.155.1 finds skills in `~/.codex/skills` and in the repository's `.codex/skills`, not
+    in `.claude/skills`: point it at this file.
+  - Where the text names a Claude Code feature (`/loop`), use your agent's own way to wait for
+    a job.
+  - The validator agent can be a sub-agent, ideally of another vendor's model.
 - **The validator should be a different session, ideally a different vendor's model.** It
   catches what the operator cannot see, e.g.:
   - a test count that came from a filtered subset;
@@ -138,7 +144,7 @@ what stands in for each skipped stage, and what nothing covers:
 
 | Stage | Stands in | Not covered |
 |---|---|---|
-| S1 | The full tier's raw view of every reply: C-13 compares what was delivered with what the model wrote, read in its own format by a reader qualified on the served checkpoint encoder's renders (`scripts/validate/native_goldens.py --check`, CPU only). USG-07: the billed input equals the server's own prompt count | Prompt fidelity: no check compares the served prompt render with the encoder's (S3's render-level A/B does). Shapes the traffic did not produce: the parser fault matrix, stop rules on rare tokens |
+| S1 | The full tier's raw view of every reply: C-13 compares what was delivered with what the model wrote, read in its own format by a reader qualified on the served checkpoint encoder's renders (`scripts/validate/native_goldens.py --<model> <checkpoint> --check`, CPU only). USG-07: the billed input equals the server's own prompt count | Prompt fidelity: no check compares the served prompt render with the encoder's (S3's render-level A/B does). Shapes the traffic did not produce: the parser fault matrix, stop rules on rare tokens |
 | S2 | Each PR's own tests and CI | The other models a shared layer serves (a parser base class, the chat route, a shared serializer). When a PR changes such a layer, run S2 for them |
 | S3 | Nothing: the first real traffic is S4 or S5 | A render-level A/B on identical requests, one turn at a time |
 
@@ -197,8 +203,9 @@ what stands in for each skipped stage, and what nothing covers:
 
 The loop above fixes what one stage's verdict finds. The outer loop keeps a cell moving through
 deploy, test, real-harness and large runs, validation and fixes, until the cell passes. Drive it
-with `/loop`, self-paced, or from a session that a background watcher on each job wakes. Either
-way, a deploy or a run wakes it when its job ends, not a timer. Take one step per iteration.
+with whatever your agent has for waiting on a job: a self-paced loop (Claude Code's `/loop`), or
+a session that a background watcher on each job wakes. Either way, a deploy or a run wakes it
+when its job ends, not a timer. Take one step per iteration.
 
 - **State.** The run's `matrix.yaml`; the evidence under `cells/<cell>/<stage>/<iteration>/`; and
   `cells/<cell>/log.md`, one line per iteration: the step, its evidence and its verdict. A cell's
@@ -299,9 +306,13 @@ way, a deploy or a run wakes it when its job ends, not a timer. Take one step pe
 | `scripts/probe_recall.py` | S4, S5 | Long-context recall at chosen sizes and depths, before any agent run (`references/smoke.md` section 3c) |
 | `scripts/validate/protocol_diff.py` | S4 | One harness and task over several wires, compared turn by turn; attributes each difference to the harness or to the server's protocol path |
 
+- **The environment.** Creating it needs the package index (PyPI or a mirror) once; the tests,
+  the controls and the verdicts then run offline.
 - **Tests.** `tests/` holds CPU-only tests of the skill's own tools. Run them from a scratch
   directory, so nothing is written into the checkout:
   `PYTHONDONTWRITEBYTECODE=1 <venv>/bin/python -m pytest -q -p no:cacheprovider --basetemp=<scratch> <skill>/tests`.
+  The trial-build tests make throwaway git repositories under `--basetemp`; no test touches a
+  checkout.
 - **The controls receipt** that a full tier needs:
   `<venv>/bin/python scripts/validate/controls.py --out-dir <dir>` writes `<dir>/controls.json`,
   bound to the validator tree it ran on (`MH_RUN_CONTROLS=1` runs the same matrix inside pytest,
@@ -309,6 +320,7 @@ way, a deploy or a run wakes it when its job ends, not a timer. Take one step pe
 - **The mutation gate** (`scripts/mutate.py`) writes each planted bug into the real file and
   restores it. Give it no short time limit (tens of minutes for the validator's 62 bugs), and
   check that every `find` still matches once after any run that did not print its `SUMMARY`.
+  When another agent may work in the same checkout, run it on a copy of the skill.
 - **Run the validator in its own environment** (`scripts/validate/requirements.txt`). The SDK
   versions are part of what a verdict means: without an SDK, C-12 is BLOCKED for its protocols,
   and a control receipt qualifies only the SDK versions it was produced with.
