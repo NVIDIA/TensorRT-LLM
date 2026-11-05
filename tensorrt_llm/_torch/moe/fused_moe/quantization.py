@@ -3988,15 +3988,14 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     NVFP4 GroupGEMM layout via the inherited ``TrtllmCutlassNvfp4Impl.run_moe``.
 
     On top of that base layout, ``transform_weights`` materialises the
-    b12x-specific weight tensors: SF un-normalization (multiply per-block
-    FP8 scales by ``weight_scale_2 = fc_alpha * fc_input_scale``),
-    ``convert_sf_to_mma_layout`` reshape, per-expert ``w*_alpha = 1 /
-    fc_input_scale`` vectors, and a ``B12xMoEWrapper`` instance with a
-    shared cross-layer output buffer. The wrapper and the bundled
-    weight dict are attached to the MoE module as ``module.b12x_wrapper``
-    / ``module._b12x_weights`` so the backend's ``run_moe`` can dispatch
-    to them on decode-shape inputs without holding any kernel-prep logic
-    of its own.
+    b12x-specific weight tensors: the checkpoint's normalized FP8 block
+    scales in ``convert_sf_to_mma_layout`` order, per-expert ``w*_alpha``
+    weight scales, the decoupled FC1 ``input_global_scale``, and a
+    ``B12xMoEWrapper`` instance with a shared cross-layer output buffer.
+    The wrapper and the bundled weight dict are attached to the MoE module
+    as ``module.b12x_wrapper`` / ``module._b12x_weights`` so the backend's
+    ``run_moe`` can dispatch to them on decode-shape inputs without holding
+    any kernel-prep logic of its own.
     """
 
     # b12x exposes two activation strings today: ``relu2`` (Nemotron-style
@@ -4040,39 +4039,24 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         w3w1_in_dim = module.hidden_size
         w2_in_dim = w2_in_packed * 16
 
-        # b12x reuses the per-expert ``w1_alpha`` tensor as both (a) the
-        # online activation-quant ``global_scale`` and (b) the FC1 epilogue
-        # output-dequant multiplier. That dual use is only self-consistent
-        # when the FP4 weight block scales are stored in their *unnormalized*
-        # form (raw ``max_block / FP4_MAX``), not divided out by the
-        # per-tensor ``weight_scale_2``. HF / ModelOpt NVFP4 checkpoints
-        # store the normalized variant so the FP8 block scales fit in range,
-        # and TRT-LLM's NVFP4 loader preserves that form. To match b12x's
-        # convention we recover ``weight_scale_2 = fc_alpha * fc_input_scale``
-        # and multiply each expert's FP8 block scales by it before handing
-        # them to ``convert_sf_to_mma_layout``. With the un-normalized scales
-        # in place we pass ``w1_alpha = w2_alpha = 1 / fc_input_scale``
-        # (== ``s_in``) so the kernel's dual-use cancels algebraically and
-        # the stored input-side block scales remain FP8-representable.
+        # ``w1_alpha`` is both the FC1 epilogue output-dequant multiplier and,
+        # unless ``input_global_scale`` is supplied, the online activation
+        # quantizer's global scale. Keep the checkpoint's normalized FP8 block
+        # scales and carry ``weight_scale_2 = fc_alpha * fc_input_scale`` in
+        # ``w1_alpha`` instead of multiplying it into the E4M3 block scales:
+        # a ~2e-5 ``weight_scale_2`` drives the product below E4M3's normal
+        # range. The FC1 input scale is passed separately as
+        # ``input_global_scale``, so the wrapper folds it into the output
+        # multiplier while the kernel keeps using it as the quantizer grid.
+        # FC2 has no such dual use: ``fc2_input_scale`` stays separate and
+        # ``w2_alpha`` carries ``weight_scale_2 * fc2_input_scale``.
         w1_w_scale_2 = (module.fc31_alpha * module.fc31_input_scale).to(
             torch.float32)
         w2_w_scale_2 = (module.fc2_alpha * module.fc2_input_scale).to(
             torch.float32)
 
-        w1_sf_fp8_src = module.w3_w1_weight_scale.view(torch.float8_e4m3fn)
-        w2_sf_fp8_src = module.w2_weight_scale.view(torch.float8_e4m3fn)
-        w1_sf_fp8_norm = w1_sf_fp8_src.float()
-        w2_sf_fp8_norm = w2_sf_fp8_src.float()
-
-        if is_w4a16_nvfp4:
-            w1_sf_fp8 = w1_sf_fp8_src
-            w2_sf_fp8 = w2_sf_fp8_src
-        else:
-            # Broadcast per-expert scalar over the trailing dims (E, *).
-            bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
-            bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
-            w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
-            w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
+        w1_sf_fp8 = module.w3_w1_weight_scale.view(torch.float8_e4m3fn)
+        w2_sf_fp8 = module.w2_weight_scale.view(torch.float8_e4m3fn)
 
         w1_sf_b12x = convert_sf_to_mma_layout(w1_sf_fp8,
                                               m=w3w1_out_dim,
@@ -4090,19 +4074,25 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
             w2_alpha_b12x = w2_w_scale_2.to(torch.float32).contiguous()
             fc2_input_scale_b12x = None
+            input_global_scale_b12x = None
         else:
-            w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(
-                module.num_experts).to(torch.float32).contiguous())
-            w2_alpha_b12x = ((1.0 / module.fc2_input_scale).expand(
-                module.num_experts).to(torch.float32).contiguous())
             fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(
                 torch.float32)
+            input_global_scale_b12x = (1.0 / module.fc31_input_scale).to(
+                torch.float32)
+            # The wrapper folds ``input_global_scale`` into ``w1_alpha`` and
+            # the kernel uses it as the FC1 activation grid, so the net weight
+            # multiplier is ``w1_alpha`` alone. FC2 folds ``fc2_input_scale``
+            # into ``w2_alpha`` itself.
+            w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
+            w2_alpha_b12x = (w2_w_scale_2 * fc2_input_scale_b12x).to(
+                torch.float32).contiguous()
 
         # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
         # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
         # (stride[-1] == 1 in bytes); a uint8 view of the int64 tensor
         # provides that without copying.
-        module._b12x_weights = dict(
+        b12x_weights = dict(
             w1_weight=module.w3_w1_weight.view(torch.uint8),
             w1_weight_sf=w1_sf_b12x,
             w1_alpha=w1_alpha_b12x,
@@ -4111,6 +4101,9 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             w2_alpha=w2_alpha_b12x,
             fc2_input_scale=fc2_input_scale_b12x,
         )
+        if input_global_scale_b12x is not None:
+            b12x_weights["input_global_scale"] = input_global_scale_b12x
+        module._b12x_weights = b12x_weights
 
         if module.activation_type not in self._ACTIVATION_MAP:
             supported = ", ".join(a.name for a in self._ACTIVATION_MAP)
