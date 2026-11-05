@@ -45,9 +45,6 @@ _CONFIG_DIR = Path(__file__).parent / "configs"
 # Add a new entry here to wire an additional YAML into the suite.
 _MARATHON_CONFIGS: list[str] = [
     "marathon_python_v2_deepseek.yaml",
-    # Attaches to an externally launched 1P1D cluster (one TP4 instance per
-    # 4-GPU node); skipped unless the cluster's environment variables are set.
-    "marathon_python_v2_musespark_open_attach.yaml",
 ]
 
 # ``trtllm-llmapi-launch`` exports these so an LLM created in the pytest process

@@ -5,7 +5,6 @@ Per-marathon YAML files consumed by ``test_disagg_cancel_stress.py``.
 | File | Model | KV cache | Transceiver |
 |------|-------|----------|-------------|
 | `marathon_python_v2_deepseek.yaml` | `DeepSeek-V3-Lite/bf16` (MLA) | V2 | Python |
-| `marathon_python_v2_musespark_open_attach.yaml` | `musespark_open` (served name; attaches to an externally launched 1P1D cluster) | V2 | Python |
 
 Only configurations listed in `_MARATHON_CONFIGS` in
 `test_disagg_cancel_stress.py` are actually parametrized; the other
@@ -65,7 +64,7 @@ stress_config:
       - role: gen
         path: ${TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR}/gen1/server.log
     worker_health_urls: []  # optional; each is GET-checked once at setup()
-    model_name: musespark_open # optional; falls back to top-level `model`
+    model_name: my-model    # optional; falls back to top-level `model`
 ```
 
 When the block is present, `harness.setup()` skips the local launcher
@@ -84,11 +83,15 @@ the harness at `setup()` time. An unset variable is a hard error at
 setup, but parse/validation is env-independent, so checked-in attach
 YAMLs pass `test_all_marathon_yamls_parse_and_validate` (and pytest
 collection) with nothing exported; the parametrized marathon test
-**skips** when a referenced variable is unset. The conventional
-variables used by the shipped attach YAML are
-`TRTLLM_TEST_EXTERNAL_CLUSTER_URL` (orchestrator base URL) and
-`TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR` (serve directory containing the
-worker/orchestrator logs).
+**skips** when a referenced variable is unset. By convention, attach
+YAMLs use `TRTLLM_TEST_EXTERNAL_CLUSTER_URL` (orchestrator base URL)
+and `TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR` (serve directory containing
+the worker/orchestrator logs).
+
+No attach YAML is wired into `_MARATHON_CONFIGS`: nothing in the
+repository launches such a cluster or exports these variables, so a
+wired attach marathon would only skip in CI and QA runs. Attach mode
+is for runs against a cluster launched outside the test suite.
 
 Attach mode supports `mode: log_only` only. `full_cancel_poison` is
 rejected by `StressConfig.validate()` because fault injection signals
