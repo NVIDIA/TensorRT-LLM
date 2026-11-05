@@ -974,7 +974,8 @@ def _on_single_request(what: str) -> RuleFn:
     return rule
 
 
-#: The accuracy gate of the megakernel's numerics-budget levers.
+#: The accuracy gate of the single-request lossless-numeric levers: the megakernel's
+#: numerics-budget levers and the distributed head sampler.
 _SINGLE_REQUEST_GATE = Gate(_single_request_tep8, _SINGLE_REQUEST)
 
 #: The megakernel's numerics-budget levers: the served build carries all three, and no build
@@ -1296,10 +1297,13 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "context_kv_fork_last_layer": Rule(
             "LL", Kind.BITWISE, _on_single_request("forked side-chain steps")
         ),
+        # Its LM-head GEMM runs at one fixed split-K tactic on every rank, which can differ from
+        # the autotuner's per-rank choice for the stock 8-row head it replaces.
         "distributed_head_sampler": Rule(
             "LL",
-            Kind.BITWISE,
+            Kind.NUMERIC,
             _on_single_request("8-row verify heads"),
+            gates=(_SINGLE_REQUEST_GATE,),
             requires=("step_loop_on_execution_stream",),
             conflicts=("lm_head_inbox",),
         ),

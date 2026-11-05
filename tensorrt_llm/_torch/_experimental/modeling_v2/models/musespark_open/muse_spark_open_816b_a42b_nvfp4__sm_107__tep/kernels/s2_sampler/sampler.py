@@ -27,14 +27,19 @@ The pieces:
   also reserves the candidate-slot and digest areas (``_layout``); ``fold_publish_rs`` + ``rs_draw``
   (``S2Head.sample_rejection``) run the verify rows' chain test and residual / plain race against the slot's q record.
 * ``S2Head``: the target head's 8-row decode calls (``split_sampler.target_head.TargetHead`` hands them
-  over once ``S2Head`` is armed): the LM-head GEMM on the copy with the dispatcher's own runner and tactic, the
-  context-K/V head fork point where the stock call fires it, ``sample`` (fold + draw) for the fused sampler, and
-  ``full_row`` (the one-shot gather + the inverse permutation) for every other consumer. Armed only when every rank's
-  M = 8 LM-head choice is in ``BIT_EQUIVALENT_TACTICS``; otherwise the stock head runs.
+  over once ``S2Head`` is armed): the LM-head GEMM on the copy with the low-M dispatcher's split-K runner at
+  ``PINNED_TACTIC`` (not the autotuner's choice for the shape), the context-K/V head fork point where the stock call
+  fires it, ``sample`` (fold + draw) for the fused sampler, and ``full_row`` (the one-shot gather + the inverse
+  permutation) for every other consumer. Armed at the first 8-row call outside autotuning when every rank can run that
+  GEMM; otherwise the stock head runs (logged as an error when the ``rejection_sampler`` areas are reserved, since its
+  fused path then falls back too).
 
-Every token, state and logit is the served one bit for bit (value-identical by construction; the 1-GPU and 8-rank
-tests check it). Nothing imports this module's kernels outside the ``distributed_head_sampler`` install
-(``install``).
+Every token, state and logit is the one the stock head gives with its LM-head GEMM at ``PINNED_TACTIC`` on every rank,
+bit for bit (by construction; ``test_modeling_v2_s2_head_gemm.py`` checks the GEMM on one GPU). The stock head runs the
+autotuner's choice for the shape instead, so where that choice gives other bits than ``PINNED_TACTIC`` (a tactic
+outside ``BIT_EQUIVALENT_TACTICS``, another split-K factor, cuBLAS) the logits differ from its logits in rounding:
+the ``distributed_head_sampler`` lever is lossless-numeric (``levers.RULES``). Nothing imports this module's kernels
+outside the ``distributed_head_sampler`` install (``install``).
 """
 
 from __future__ import annotations
@@ -765,18 +770,24 @@ class S2States:
 
 # ---- the head -------------------------------------------------------------------------------------------------------
 
-#: The LM head's M = 8 split-K tactics ``(mma_m, mma_n, split_k, ab_stages)`` shown to give every logit identical bits
-#: whatever the row's position in the shard (a 1-GPU test and an 8-rank end-to-end run). The interleaved head computes
-#: logit ``g`` on rank ``(g / 4) % world`` instead of ``g / shard``, so it is value-identical only when every rank's
-#: choice is in this set.
+#: The LM head's M = 8 split-K tactics ``(mma_m, mma_n, split_k, ab_stages)`` shown on GPU at the served shape to give
+#: every logit identical bits whatever the row's position in the shard, and the same bits as each other. The
+#: interleaved head computes logit ``g`` on rank ``(g / 4) % world`` instead of ``g / shard``; with every rank's GEMM
+#: at one of these tactics, each logit has the bits the contiguous shard's GEMM at any of them gives it.
 BIT_EQUIVALENT_TACTICS = frozenset({(128, 16, 1, 5), (128, 16, 1, 6), (128, 32, 1, 5)})
+#: The split-K tactic of the interleaved GEMM on every rank (one of ``BIT_EQUIVALENT_TACTICS``). Fixed rather than
+#: the autotuner's choice for the stock M = 8 call, which can differ from boot to boot and from rank to rank and fall
+#: outside the set: whether the s2 head arms, and the bits it computes, do not depend on that choice.
+PINNED_TACTIC = (128, 16, 1, 5)
 
 
-def _gemm_choice(lm_head, weight: torch.Tensor, x: torch.Tensor):
-    """``(dispatcher, runner, tactic, weight_t)``: the low-M dispatcher's runner and tactic for ``x @ weight.T`` --
-    ``split_sampler.target_head.lm_head_gemm_into``'s statements (``LowMGemmDispatcher.apply``'s query and its
-    fallback of an incompatible cached direct tactic) with ``weight`` given."""
-    from tensorrt_llm._torch.autotuner import AutoTuner
+def _pinned_gemm(lm_head, weight: torch.Tensor, x: torch.Tensor):
+    """``(runner, weight_t)``: the low-M dispatcher's split-K runner for ``x @ weight.T`` (run at ``PINNED_TACTIC``),
+    after the checks ``split_sampler.target_head.lm_head_gemm_into`` makes that the call takes that dispatcher.
+
+    Raises:
+        RuntimeError: if the LM-head call does not take the low-M dispatcher on this rank.
+    """
     from tensorrt_llm._torch.modules import low_m_gemm as _low_m
 
     dispatcher = getattr(lm_head, "_low_m_gemm_dispatcher", _low_m._DISPATCHER)
@@ -791,42 +802,33 @@ def _gemm_choice(lm_head, weight: torch.Tensor, x: torch.Tensor):
         raise RuntimeError(
             "[musespark_open] s2 sampler: the LM-head call does not take the low-M dispatcher on this rank"
         )
-    x2d = x.view(-1, x.shape[-1])
-    weight_t = weight.detach().t()
-    cublas = dispatcher._cublas_no_bias
-    runners = [cublas, dispatcher._runner_no_bias, dispatcher._direct]
-    runner, tactic = AutoTuner.get().choose_one(
-        _low_m._AUTOTUNER_OP_NAME, runners, dispatcher._tuning_config, [x2d, weight_t], bias=None
-    )
-    if runner is dispatcher._direct and not dispatcher._direct.is_tactic_compatible(
-        [x2d, weight_t], tactic
-    ):
-        runner, tactic = cublas, -1
-    return dispatcher, runner, tactic, weight_t
+    return dispatcher._runner_no_bias, weight.detach().t()
 
 
 def _choice_state(lm_head, x: torch.Tensor) -> str:
-    """This rank's verdict on the stock LM-head choice for ``x``: ``ok``, ``wait`` (autotuner tuning, or no cached
-    entry yet) or a refusal reason."""
-    from tensorrt_llm._torch.autotuner import AutoTuner
-    from tensorrt_llm._torch.modules import low_m_gemm as _low_m
+    """This rank's verdict on the s2 head's GEMM for ``x``: ``ok``, ``wait`` (the autotuner is tuning, so the call
+    belongs to its warmup) or a refusal reason. The autotuner's choice for the shape is not consulted.
 
-    tuner = AutoTuner.get()
-    if tuner.is_tuning_mode:
+    ``PINNED_TACTIC`` is checked with ``validate_tactic`` of the split-K module the runner launches through: the runner
+    imports it by flashinfer's module path at each call, which ``ops/gemm/splitk_gemm.serve_flashinfer_path`` points at
+    this target's copy in a served process. That is the check the launch itself makes, under that module's settings
+    (its shared-memory capacity and stage cap). Membership in the runner's autotune list is not required: the list
+    keeps only a window of stage counts near the cap, which moves with the capacity, and the stage count changes
+    the pipelining only, not the arithmetic."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    if AutoTuner.get().is_tuning_mode:
         return "wait"
-    dispatcher, runner, tactic, weight_t = _gemm_choice(lm_head, lm_head.weight, x)
-    runners = [dispatcher._cublas_no_bias, dispatcher._runner_no_bias, dispatcher._direct]
-    hit = tuner.profiling_cache.search_cache(
-        _low_m._AUTOTUNER_OP_NAME,
-        runners,
-        tuple(tuner._get_input_sizes([x.view(-1, x.shape[-1]), weight_t])),
-        dispatcher._tuning_config,
-        apply_map_to_tuning_buckets=True,
-    )[0]
-    if not hit:
-        return "wait"
-    if runner is not dispatcher._runner_no_bias or tuple(tactic) not in BIT_EQUIVALENT_TACTICS:
-        return f"M = {x.shape[0]} LM-head choice {type(runner).__name__} {tactic} is outside the bit-equivalent set"
+    _, weight_t = _pinned_gemm(lm_head, lm_head.weight, x)
+    # The statement ``_SplitKGemmRunner.forward`` launches with, so the module it resolves to.
+    from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic, validate_tactic
+
+    x2d = x.view(-1, x.shape[-1])
+    m, k, n = int(x2d.shape[0]), int(x2d.shape[1]), int(weight_t.shape[1])
+    try:
+        validate_tactic(SplitKTactic(*PINNED_TACTIC), m, n, k)
+    except ValueError as exc:
+        return f"split-K tactic {PINNED_TACTIC} cannot run at the M = {m} LM-head shape: {exc}"
     return "ok"
 
 
@@ -835,7 +837,7 @@ class S2Head:
     GEMM output, the state / token exchange (``S2States``) and the scratch row the step's pending ``logits`` object is.
 
     ``TargetHead`` (``split_sampler.target_head``) hands it the 8-row decode calls once ``takes`` says so: ``produce``
-    runs the LM-head GEMM on the copy (the dispatcher's own runner and tactic, as the stock call) and fires
+    runs the LM-head GEMM on the copy (the low-M dispatcher's split-K runner at ``PINNED_TACTIC``) and fires
     ``context_kv_fork``'s head fork point where the stock call fires it; ``sample`` replaces the one-shot gather + the
     split sampler (fold + publish, then the every-rank draw); ``full_row`` gives the step's ``[8, vocab]`` row in
     vocabulary order for every other consumer (the one-shot gather of the interleaved shards + the inverse
@@ -857,14 +859,14 @@ class S2Head:
             ROWS, self.world * self.shard, dtype=torch.bfloat16, device=device
         )
         self.index = unpermute_index(self.world, self.shard, device)
-        #: None until every rank agreed on the stock M = 8 choice (``_decide``); then whether the interleaved path runs.
+        #: None until every rank agreed whether it can run the pinned GEMM (``_decide``); then whether the interleaved
+        #: path runs.
         self.armed: Optional[bool] = None
-        self._tactic = None
         self.calls = 0
 
     def _decide(self, lm_head, x: torch.Tensor) -> bool:
-        """Whether this 8-row call takes the interleaved path; decided once, collectively, when every rank's autotuner
-        has a cached choice (until then the call runs the stock path). Every rank reaches this at the same call."""
+        """Whether this 8-row call takes the interleaved path; decided once, collectively, at the first 8-row call
+        outside autotuning (until then the call runs the stock path). Every rank reaches this at the same call."""
         from tensorrt_llm.logger import logger
 
         from ... import dispatch as _dispatch
@@ -873,8 +875,9 @@ class S2Head:
             return self.armed
         try:
             local = _choice_state(lm_head, x)
-        except RuntimeError as exc:
-            local = str(exc)
+        except (ImportError, RuntimeError, ValueError) as exc:
+            # A rank-local failure becomes this rank's refusal, so every rank still reaches the all-gather.
+            local = f"{type(exc).__name__}: {exc}"
         if self.world > 1:
             everyone = _dispatch.Distributed.get(self.mapping).tp_allgather(
                 local, small_payload=True
@@ -886,17 +889,18 @@ class S2Head:
         refused = [(r, v) for r, v in enumerate(everyone) if v != "ok"]
         self.armed = not refused
         if self.armed:
-            _, runner, tactic, _ = _gemm_choice(lm_head, self.weight, x)
-            self._tactic = (runner, tuple(tactic))
             logger.info(
-                f"[musespark_open] s2 sampler armed: LM-head tactic {tuple(tactic)} on this rank; 8-row decode steps "
-                "run the interleaved GEMM + fold + every-rank draw"
+                f"[musespark_open] s2 sampler armed: split-K LM-head tactic {PINNED_TACTIC} on every rank; 8-row "
+                "decode steps run the interleaved GEMM + fold + every-rank draw"
+            )
+        elif self.states.rs_areas:
+            logger.error(
+                f"[musespark_open] s2 sampler not armed (the stock head runs): {refused} -- rejection_sampler is on "
+                "but its fused rejection sampling needs the s2 head, so every step takes the stock rejection path"
             )
         else:
             logger.warning(
-                f"[musespark_open] s2 sampler not armed (the stock head runs): {refused} -- "
-                "the s2 sampler is value-identical only when every rank's M = 8 LM-head choice is in "
-                f"{sorted(BIT_EQUIVALENT_TACTICS)}"
+                f"[musespark_open] s2 sampler not armed (the stock head runs): {refused}"
             )
         return self.armed
 
@@ -919,19 +923,10 @@ class S2Head:
                 "other than context_kv_fork's head fork point; the s2 head runs the LM-head GEMM itself and would "
                 "bypass it"
             )
-        _, runner, tactic, weight_t = _gemm_choice(lm_head, self.weight, hidden_states)
-        if (
-            runner is not self._tactic[0]
-            or isinstance(tactic, int)
-            or tuple(tactic) != self._tactic[1]
-        ):
-            raise RuntimeError(
-                f"[musespark_open] s2 sampler: the LM-head choice changed after arming ({self._tactic} -> "
-                f"{(runner, tactic)})"
-            )
+        runner, weight_t = _pinned_gemm(lm_head, self.weight, hidden_states)
         runner(
             [hidden_states.view(-1, hidden_states.shape[-1]), weight_t],
-            tactic=tactic,
+            tactic=PINNED_TACTIC,
             bias=None,
             out=self.local,
         )

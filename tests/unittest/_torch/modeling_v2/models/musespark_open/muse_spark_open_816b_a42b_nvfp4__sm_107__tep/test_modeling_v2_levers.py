@@ -276,7 +276,7 @@ SERVED_AT = {
     "edge_bf16_moe_front": ({(107, 8)}, "lossless-bitwise", "LL"),
     "last_layer_boundary": ({(107, 8)}, "lossless-bitwise", "LL"),
     "context_kv_fork_last_layer": ({(107, 8)}, "lossless-bitwise", "LL"),
-    "distributed_head_sampler": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "distributed_head_sampler": ({(107, 8)}, "lossless-numeric", "LL"),
     "drafter_preamble_late_join": ({(107, 8)}, "lossless-bitwise", "LL"),
     "drafter_folds": ({(107, 8)}, "lossless-bitwise", "LL"),
     "draft_head_tail": ({(107, 8)}, "lossless-bitwise", "LL"),
