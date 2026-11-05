@@ -1122,14 +1122,32 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         "[Note] The weather in Paris is sunny today.",
         "{greeting} Hello there, how can I help?",
         "[not JSON </tool_",
+        "Hello <",
+        "Hello <tool_",
+        "[not JSON </tool_<",
     ])
     def test_streaming_plain_answer_opening_with_bracket_is_content(
             self, sample_tools, parser, text):
-        """Plain answers that open with `[` or `{` stream as content."""
+        """Plain answers, including token-like suffixes, stream as content."""
         content, calls = self._stream_in_chunks(parser, text, sample_tools)
 
         assert calls == []
         assert content == text
+
+        repeated = parser.finish(sample_tools)
+        assert repeated.normal_text == ""
+        assert repeated.calls == []
+
+    @pytest.mark.parametrize("text", ["<tool_call>\n", '<tool_call>\n{"na'])
+    def test_finish_does_not_flush_incomplete_wrapped_call(
+            self, sample_tools, parser, text):
+        """An opened tool call is not flushed as normal content."""
+        parser.parse_streaming_increment(text, sample_tools)
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == ""
+        assert result.calls == []
 
     def test_detect_and_parse_wrapped_oversized_integer_has_no_calls(
             self, sample_tools, parser):
@@ -1210,6 +1228,10 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
             ',"arguments":{"location":"SF"}}\n</tool_call>', sample_tools)
         assert len(r_args.calls) == 1
         assert json.loads(r_args.calls[0].parameters) == {"location": "SF"}
+
+        result = parser.finish(sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
 
     @pytest.mark.parametrize(
         "arguments_chunk",

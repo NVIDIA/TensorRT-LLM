@@ -254,13 +254,18 @@ class Qwen3ToolParser(BaseToolParser):
         Bare JSON is classified as a tool call only after a complete value
         decodes. An incomplete value, including a truncated tool-call-shaped
         object, remains content. Wrapped calls use the base incremental path;
-        only a held normal-text suffix is flushed here.
+        only held normal text is flushed here, including a possible opening
+        token prefix when no wrapped call has started.
         """
         if self._stream_mode != self._STREAM_MODE_UNDECIDED:
             result = super().finish(tools)
             if self._normal_text_buffer:
                 result.normal_text = self._normal_text_buffer + result.normal_text
                 self._normal_text_buffer = ""
+            if (self.current_tool_id == -1
+                    and self.bot_token not in self._buffer):
+                result.normal_text += self._buffer
+                self._buffer = ""
             return result
         remaining = self._bare_json_buffer
         self._bare_json_buffer = ""
