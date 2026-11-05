@@ -432,6 +432,7 @@
         "indexer_max_chunk_size": {
           "anyOf": [
             {
+              "exclusiveMinimum": 0,
               "type": "integer"
             },
             {

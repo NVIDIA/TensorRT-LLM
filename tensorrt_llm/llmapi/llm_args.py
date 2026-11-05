@@ -1830,7 +1830,7 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
         "kv_cache_config.dtype, and no packed sparse attention. Set True to "
         "require it, which rejects a configuration that cannot serve it instead "
         "of falling back, or False to pin BF16 staging.")
-    indexer_max_chunk_size: Optional[int] = Field(
+    indexer_max_chunk_size: Optional[PositiveInt] = Field(
         default=None,
         status="prototype",
         description=
@@ -1932,7 +1932,8 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
 
         return CSA2MetadataParams(
             layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
-            indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
+            indexer_max_chunk_size=(32768 if self.indexer_max_chunk_size is None
+                                    else self.indexer_max_chunk_size),
             q_split_threshold=self.q_split_threshold,
         )
 

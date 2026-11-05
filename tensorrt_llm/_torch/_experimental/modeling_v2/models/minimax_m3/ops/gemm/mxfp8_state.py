@@ -36,7 +36,7 @@ class MxMode:
     decode_graph: bool  # inside a decode CUDA-graph warmup or capture
     autotune: bool  # inside the engine's FlashInfer MXFP8 tuning pass
     tuned_quantize_gemm: (
-        bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_decode_graph_backends)
+        bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_mxfp8_backends)
     )
     flashinfer: bool  # FlashInfer's MXFP8 GEMM on the quantized activation
     native_tuning: (
@@ -51,7 +51,7 @@ def _mx_mode(state: _Mxfp8GemmState) -> MxMode:
     return MxMode(
         decode_graph=decode_graph,
         autotune=autotune,
-        tuned_quantize_gemm=method.tune_decode_graph_backends and decode_graph,
+        tuned_quantize_gemm=method.tune_mxfp8_backends and decode_graph,
         flashinfer=method.backend == "flashinfer"
         or (
             method.backend == "auto"
