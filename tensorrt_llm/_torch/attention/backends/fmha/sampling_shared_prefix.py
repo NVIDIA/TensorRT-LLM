@@ -756,11 +756,17 @@ def _sampling_q_len(metadata: "TrtllmAttentionMetadata", rows: int) -> int:
 def _sampling_table_rows(
     state: _SamplingState, metadata: "TrtllmAttentionMetadata", rows: int
 ) -> np.ndarray:
-    """``_table_rows`` cached while the batch keeps the same requests."""
+    """``_table_rows`` cached while the batch keeps the same requests.
+
+    A change of requests also drops the grouping: slots are recycled, so new requests can sit in
+    the old rows with block-table entries that still compare equal.
+    """
     request_ids = metadata.request_ids
     cache_key = tuple(request_ids[:rows]) if request_ids is not None else None
     if cache_key is None or cache_key != state.table_rows_key:
         state.table_rows = _table_rows(metadata, rows).numpy()
+        if cache_key != state.table_rows_key:
+            state.grouping = None
         state.table_rows_key = cache_key
     assert state.table_rows is not None
     return state.table_rows
