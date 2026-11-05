@@ -4708,12 +4708,14 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False),
             kv_cache_compression_config=cold_window)
-    with pytest.raises(ValueError, match="attention backends"):
-        TorchLlmArgs(
-            model="/tmp/dummy_model",
-            attn_backend="VANILLA",
-            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            kv_cache_compression_config=cold_window)
+    # Dense attention reads the high rows through TRTLLM's block offsets.
+    for backend in ("VANILLA", "FLASHINFER"):
+        with pytest.raises(ValueError, match="TRTLLM attention backend;"):
+            TorchLlmArgs(
+                model="/tmp/dummy_model",
+                attn_backend=backend,
+                kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+                kv_cache_compression_config=cold_window)
     with pytest.raises(ValueError, match="cold-page compression"):
         TorchLlmArgs(model="/tmp/dummy_model",
                      kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,

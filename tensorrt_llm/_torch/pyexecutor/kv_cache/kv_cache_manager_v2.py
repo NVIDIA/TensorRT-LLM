@@ -2681,6 +2681,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._pending_preemption: Dict[int, LlmRequest] = {}
         self._use_per_layer_page_tables = False
         self._prepare_page_table_tensor(index_mapper_capacity)
+        self._init_mixed_precision_high_layer_offsets()
         self._sparse_layer_group_ids = tuple(
             sorted(
                 {
@@ -4128,6 +4129,44 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             * (self.kv_factor if data_role == Role.ALL else 1)
         )
+
+    def _init_mixed_precision_high_layer_offsets(self) -> None:
+        """Record where each cold-page mixed-precision high layer sits in the slot of the page it copies.
+
+        The high layer shares its layer's pool with the same page scale, so a held token's high row is
+        its layer's row a fixed number of blocks further into the slot: the sparse backends redirect
+        selected rows with it and dense attention redirects block offsets by the per-pool difference.
+        """
+        # Local layer -> page offset of its mixed-precision high layer inside the shared slot.
+        self.mixed_precision_high_layer_offsets: dict[int, int] = {}
+        # Pool -> block offset from a layer's block to its high layer's block; None where the pool's
+        # layers disagree, which only dense attention needs.
+        self.mixed_precision_high_block_deltas: dict[int, int | None] = {}
+        if self.mixed_precision_low_dtype != self.mixed_precision_high_dtype:
+            return
+        for local, high_layer in self.mixed_precision_high_layers.items():
+            source, role = self._mixed_precision_layer_page(local)
+            converter = self.impl.get_page_index_converter(source, role)
+            high_converter = self.impl.get_page_index_converter(high_layer, Role.KEY)
+            stride = int(self.impl.get_page_stride(source, role))
+            pool_base = int(self.impl.get_mem_pool_base_address(source, role, PageIndexMode.SHARED))
+            pool_base -= int(converter.layer_offset) * stride
+            address = int(
+                self.impl.get_mem_pool_base_address(high_layer, Role.KEY, PageIndexMode.SHARED)
+            )
+            if (
+                int(high_converter.scale) != int(converter.scale)
+                or int(high_converter.expansion) != 1
+                or address != pool_base + int(high_converter.layer_offset) * stride
+            ):
+                raise ValueError(
+                    f"mixed-precision high layer {high_layer} must share the pool of layer {source}"
+                )
+            self.mixed_precision_high_layer_offsets[local] = int(high_converter.layer_offset)
+            delta = int(high_converter.layer_offset) - int(converter.layer_offset)
+            pool_id = int(self.impl.get_layer_group_id(source))
+            if self.mixed_precision_high_block_deltas.setdefault(pool_id, delta) != delta:
+                self.mixed_precision_high_block_deltas[pool_id] = None
 
     def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
         """Rows per mixed-precision high layer page; a page covers tokens_per_block tokens."""
@@ -7547,10 +7586,12 @@ class KVCacheManagerV2(BaseResourceManager):
             return layer.bytes_per_token(data_role)
 
         # Size a mixed-precision layer's pool for the mixed-precision low format, unless the
-        # manager's own pool already holds that format.
+        # manager's own pool already holds that format or the cold-page window keeps the
+        # history at the model's KV dtype.
         if (
             self._is_mixed_precision_layer(local_layer_idx)
             and not self._own_pool_is_mixed_precision_low
+            and self.mixed_precision_low_dtype != self.mixed_precision_high_dtype
         ):
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
         if self.dtype not in (
