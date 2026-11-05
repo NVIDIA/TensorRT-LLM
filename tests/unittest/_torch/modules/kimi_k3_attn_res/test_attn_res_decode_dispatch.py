@@ -110,14 +110,15 @@ def test_attn_res_topology_switch(monkeypatch, raw: str, persistent: bool):
 def test_fused_max_tokens_env(monkeypatch):
     """``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``: a positive integer, default 64 (the decode
     kernel's range); anything else fails loudly."""
-    monkeypatch.delenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False)
-    assert mkl._read_fused_attn_res_max_tokens() == 64 == _max_tokens()
-    monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "1")
-    assert mkl._read_fused_attn_res_max_tokens() == 1
+    env = mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV
+    monkeypatch.delenv(env, raising=False)
+    assert mkl._read_token_limit(env, 64) == 64 == _max_tokens()
+    monkeypatch.setenv(env, "1")
+    assert mkl._read_token_limit(env, 64) == 1
     for bad in ("0", "-3", "1.5", "all"):
-        monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, bad)
+        monkeypatch.setenv(env, bad)
         with pytest.raises(ValueError):
-            mkl._read_fused_attn_res_max_tokens()
+            mkl._read_token_limit(env, 64)
 
 
 def _kernel_for(m: int, num_candidates: int = 5):

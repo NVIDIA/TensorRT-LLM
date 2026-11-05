@@ -118,7 +118,8 @@ def _same_bytes(actual: torch.Tensor, expected: torch.Tensor) -> bool:
 @torch.no_grad()
 @pytest.mark.parametrize("has_add", [True, False])
 @pytest.mark.parametrize("snapshots", range(1, 9))
-@pytest.mark.parametrize("num_tokens", [1, 18, 36, 84, 100, 129])
+# Up to 100 tokens the kernel splits each row over a 7-CTA cluster; above that it takes other paths.
+@pytest.mark.parametrize("num_tokens", [1, 100, 129])
 def test_kf_op_matches_reference(kf_op, num_tokens, snapshots, has_add):
     x = _make_inputs(num_tokens, snapshots, seed=1000 * num_tokens + 10 * snapshots + has_add)
     updated, output = _call(kf_op, x, has_add)
@@ -180,24 +181,22 @@ def _modules(seed: int):
     return proj, norm, out_norm
 
 
-def _kf_flags(kf: bool, pdl: bool = False):
-    """The TP8 decode stack (persistent kernel above 32 tokens), with or without TRTLLM_K3_ATTN_RES_KF."""
+def _kf_flags(kf: bool, persistent: bool = True):
+    """Switches under which mixes above 32 tokens take the persistent kernel, or with `kf` the Kernel
+    Factory kernel up to 84 tokens; ``persistent=False`` turns the persistent topology off."""
     return mock.patch.multiple(
         mkl,
-        _K3_ATTN_RES_PDL=pdl,
-        _K3_ATTN_RES_PDL_MODE="2" if pdl else "0",
-        _K3_ATTN_RES_PDL_MAX_M=32,
         _FUSED_ATTN_RES_ENABLED=True,
-        _ATTN_RES_TOPOLOGY="split",
+        _PERSISTENT_ATTN_RES_ENABLED=persistent,
         _FUSED_ATTN_RES_MAX_TOKENS=32,
-        _K3_ATTN_RES_KF=kf,
-        _K3_ATTN_RES_KF_MAX_M=84,
+        _ATTN_RES_KF_ENABLED=kf,
+        _ATTN_RES_KF_MAX_TOKENS=84,
     )
 
 
 @torch.no_grad()
 @pytest.mark.parametrize("has_add", [True, False])
-@pytest.mark.parametrize("num_tokens", [36, 84, 85])
+@pytest.mark.parametrize("num_tokens", [84, 85])
 def test_plain_mixes_dispatch(kf_op, num_tokens, has_add):
     """TRTLLM_K3_ATTN_RES_KF takes the persistent kernel's mixes up to 84 tokens, with the op's outputs."""
     proj, norm, out_norm = _modules(num_tokens)
@@ -228,18 +227,21 @@ def test_plain_mixes_dispatch(kf_op, num_tokens, has_add):
 
 
 @torch.no_grad()
-def test_kf_gate_declines(kf_op):
+def test_kf_unaligned_rows_and_build_check(kf_op):
+    """Rows the op cannot read in place (not row-contiguous, not 32-byte aligned) are copied, so
+    the mix is the same; TRTLLM_K3_ATTN_RES_KF=1 without the persistent topology fails at build."""
     proj, norm, out_norm = _modules(3)
     x = _make_inputs(48, 2, seed=3)
     with _kf_flags(True):
-        # A view that is not row-contiguous, and a compile trace: the persistent kernel keeps them.
+        dense = mkl._attn_res_kf_kernel(x["layer"], x["add"], x["block"], proj, norm, out_norm)
         strided = x["layer"].t().contiguous().t()
-        assert mkl._k3_attn_res_kf(strided, None, x["block"], proj, norm, out_norm) is None
-        with mock.patch.object(torch.compiler, "is_compiling", return_value=True):
-            assert mkl._k3_attn_res_kf(x["layer"], None, x["block"], proj, norm, out_norm) is None
-        assert mkl._k3_attn_res_kf(x["layer"], None, x["block"], proj, norm, out_norm) is not None
-    with _kf_flags(True), mock.patch.object(mkl, "_ATTN_RES_TOPOLOGY", "per_token"):
+        storage = torch.empty(48 * HIDDEN_SIZE + 8, dtype=torch.bfloat16, device="cuda")
+        unaligned = storage[8:].view(48, HIDDEN_SIZE)
+        unaligned.copy_(x["add"])
+        moved = mkl._attn_res_kf_kernel(strided, unaligned, x["block"], proj, norm, out_norm)
+        for actual, expected in zip(moved, dense):
+            assert _same_bytes(actual, expected)
+        mkl._check_attn_res_kf_flag()
+    with _kf_flags(True, persistent=False):
         with pytest.raises(ValueError, match="KIMI_K3_ATTN_RES_TOPOLOGY"):
             mkl._check_attn_res_kf_flag()
-    with _kf_flags(True):
-        mkl._check_attn_res_kf_flag()

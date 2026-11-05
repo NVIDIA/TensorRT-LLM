@@ -300,6 +300,17 @@ def _register_fake():
         return torch.empty_like(layer_residual), torch.empty_like(
             layer_residual)
 
+    @torch.library.register_fake("trtllm::attn_res_kf_fwd")
+    def _(layer_residual: torch.Tensor, addend: Optional[torch.Tensor],
+          block_residual: torch.Tensor, res_weight: torch.Tensor,
+          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
+          rms_eps: float,
+          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Returns (updated_layer_residual, output), both [T, H] like the
+        # layer residual.
+        return torch.empty_like(layer_residual), torch.empty_like(
+            layer_residual)
+
     @torch.library.register_fake("trtllm::fused_inv_rope_fp8_quant_vllm_port")
     def _(o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor,
           n_groups: int, heads_per_group: int, nope_dim: int, rope_dim: int,

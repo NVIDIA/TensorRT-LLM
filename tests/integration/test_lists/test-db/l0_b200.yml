@@ -184,6 +184,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_kf_op.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
   # KDA runtime state-pool and mixed-batch core coverage.
