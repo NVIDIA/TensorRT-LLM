@@ -223,7 +223,9 @@ models, see `encoder_cuda_graph_config` in
 The same `cuda_graph_config=EncodeCudaGraphConfig(...)` also enables encoder CUDA
 graphs for encoder-only models served without `encode_only=True`, such as through
 `llm.generate()`. These models ignore `prefill_cuda_graph_backend`, and
-`extra_model_inputs` applies only to `llm.encode()`.
+`extra_model_inputs` applies only to `llm.encode()`. Models whose output is a nested
+tensor, such as `Qwen2ForProcessRewardModel`, cannot be captured; they run eagerly with
+a warning.
 
 ### Extra model inputs
 

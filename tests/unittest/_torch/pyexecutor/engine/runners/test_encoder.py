@@ -535,7 +535,7 @@ def _warmup_runner(*, world_size: int) -> EncoderRunner:
 
 def test_encoder_warmup_recovers_from_oom_when_not_distributed() -> None:
     runner = _warmup_runner(world_size=1)
-    runner._execute_prepared = Mock(side_effect=[torch.OutOfMemoryError("OOM"), None])
+    runner._execute_prepared = Mock(side_effect=[torch.OutOfMemoryError("OOM"), {}])
 
     with patch("torch.cuda.empty_cache") as empty_cache, patch("torch.cuda.synchronize"):
         runner._run_warmup_shapes([(2, 16, 8), (1, 8, 8)])
@@ -555,6 +555,29 @@ def test_encoder_warmup_oom_is_fatal_when_distributed() -> None:
 
     assert raised.value is error
     runner._execute_prepared.assert_called_once_with(runner._prepare_encoder_batch.return_value)
+
+
+@pytest.mark.parametrize("nested", [True, False])
+def test_encoder_warmup_runs_nested_output_models_eagerly(nested: bool) -> None:
+    runner = _warmup_runner(world_size=1)
+    runner._model = SimpleNamespace(extra_attrs={})
+    runner._config = SimpleNamespace(max_batch_size=2, max_num_tokens=8, max_seq_len=4)
+    logits = torch.ones(5, 2)
+    if nested:
+        logits = torch.nested.nested_tensor([logits[:2], logits[2:]])
+    runner._execute_prepared = Mock(return_value={"logits": logits})
+    runner._run_autotuner_warmup = Mock()
+    runner._capture_encoder_cuda_graphs = Mock()
+
+    with (
+        patch("torch.cuda.empty_cache"),
+        patch("torch.cuda.synchronize"),
+        patch.object(encoder_module.logger, "warning") as warning,
+    ):
+        runner.warmup()
+
+    assert runner._encoder_cuda_graph_runner.enabled is not nested
+    assert warning.called is nested
 
 
 def _capture_input_runner(extra_input_specs: list[EncodeExtraInputSpec]) -> EncoderRunner:

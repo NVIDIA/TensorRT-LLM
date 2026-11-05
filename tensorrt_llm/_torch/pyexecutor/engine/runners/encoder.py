@@ -978,7 +978,14 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
                 ]
             )
         )
-        self._run_warmup_shapes(warmup_shapes)
+        nested_outputs = self._run_warmup_shapes(warmup_shapes)
+        graph_runner = self._encoder_cuda_graph_runner
+        if nested_outputs and graph_runner.enabled:
+            logger.warning(
+                f"{type(self._model).__name__} returns nested tensor outputs, which encoder "
+                "CUDA graphs cannot capture; running it eagerly."
+            )
+            graph_runner.enabled = False
         gc.collect()
         torch.cuda.empty_cache()
         self._run_autotuner_warmup()
@@ -1014,7 +1021,9 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
             model_inputs=model_inputs or None,
         )
 
-    def _run_warmup_shapes(self, shapes: list[tuple[int, int, int]]) -> None:
+    def _run_warmup_shapes(self, shapes: list[tuple[int, int, int]]) -> bool:
+        """Run eager forwards at ``shapes``; return whether any output was a nested tensor."""
+        nested_outputs = False
         with cuda_graph_disabled(self._encoder_cuda_graph_runner):
             for batch_size, num_tokens, max_seq_len in shapes:
                 sequence_lengths = self._encoder_cuda_graph_runner.build_capture_sequence_lengths(
@@ -1031,8 +1040,12 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
                     with discard_nccl_window_tensor_outputs(
                         (self._buffers.input_ids_cuda, prepared.kwargs)
                     ):
-                        self._execute_prepared(prepared)
+                        outputs = self._execute_prepared(prepared)
                     torch.cuda.synchronize()
+                    nested_outputs |= any(
+                        isinstance(value, torch.Tensor) and value.is_nested
+                        for value in outputs.values()
+                    )
                 except torch.OutOfMemoryError:
                     if self._is_distributed_forward():
                         raise
@@ -1042,6 +1055,7 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
                         "Skipping."
                     )
                     torch.cuda.empty_cache()
+        return nested_outputs
 
     def _run_autotuner_warmup(self) -> None:
         if not self._encoder_config.enable_autotuner:
