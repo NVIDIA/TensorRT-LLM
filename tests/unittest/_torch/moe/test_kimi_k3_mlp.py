@@ -217,6 +217,8 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
         (False, 8, 7, 8, 7, "TRTLLM", "EXTERNAL_COMM"),
         (True, 8, 7, 1, 0, "MEGAMOE_CUTEDSL", "FUSED_COMM"),
         (False, 8, 7, 8, 7, "MEGAMOE_CUTEDSL", "FUSED_COMM"),
+        (False, 1, 0, 1, 0, "CUTEDSL", "EXTERNAL_COMM"),
+        (False, 1, 0, 1, 0, "CUTEDSL_FC12", "EXTERNAL_COMM"),
     ],
     ids=[
         "attention_dp",
@@ -224,6 +226,8 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
         "direct_tp",
         "megamoe_attention_dp",
         "megamoe_direct_tp",
+        "cutedsl_sm_reserve",
+        "fc12_sm_reserve",
     ],
 )
 def test_kimi_k3_shared_expert_parallel_construction(
@@ -250,20 +254,23 @@ def test_kimi_k3_shared_expert_parallel_construction(
             super().__init__()
 
     class _FakeMoE(ConfigurableMoE):
-        def __init__(self):
+        def __init__(self, sm_reserve_ceiling: int = 0):
             nn.Module.__init__(self)
             # ``scheduler_kind`` is a class attribute on the ``MoE`` interface
             # (default ``EXTERNAL_COMM``), so every real backend carries it and
             # the runtime reads it unguarded; the stand-in must too.
+            # ``sm_reserve_ceiling`` mirrors the side-effect-free capability the
+            # real backends declare (16 on the fused-FC12 leaf, 0 everywhere else).
             self.backend = SimpleNamespace(
                 initial_local_expert_ids=[0, 1, 2, 3],
                 scheduler_kind=MoESchedulerKind[scheduler_kind],
+                sm_reserve_ceiling=lambda: sm_reserve_ceiling,
             )
             self.comm = None
             self.layer_load_balancer = None
             self.all_reduce = _FakeAllReduce()
 
-    fake_moe = _FakeMoE()
+    fake_moe = _FakeMoE(sm_reserve_ceiling=16 if moe_backend == "CUTEDSL_FC12" else 0)
 
     create_moe_kwargs = {}
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
@@ -326,6 +333,23 @@ def test_kimi_k3_shared_expert_parallel_construction(
     )
     assert shared.gate_up_proj.weight.shape == (2 * local_intermediate, config.hidden_size)
     assert shared.down_proj.weight.shape == (config.hidden_size, local_intermediate)
+    # The SMs the routed grid offers beside itself are a backend capability: only the
+    # fused-FC12 leaf sizes a persistent grid it can shrink, and the deferred-all-reduce
+    # case never reserves SMs. Everything else keeps the full grid -- in particular the
+    # ``_cublas_sm_limit`` pairing can never confine a shared expert whose routed grid
+    # holds every SM, and ``shared_first`` remains reachable for the grouped GEMM.
+    expected_shared_sms = (
+        0 if runtime._defer_shared_allreduce else fake_moe.backend.sm_reserve_ceiling()
+    )
+    assert runtime._shared_sms == expected_shared_sms
+    if moe_backend in ("CUTEDSL", "CUTEDSL_FC12"):
+        # With the NVFP4 / sort-table gates stubbed open, the lead order is decided by
+        # the reserve alone: a full-SM grouped GEMM leads from enough routed rows, the
+        # reserving FC12 never asks its shared expert to lead the grid.
+        fake_moe.nvfp4_input_scale = lambda num_tokens: torch.tensor(1.0)
+        fake_moe.routes_with_sort_tables = lambda num_tokens: True
+        plan = runtime._front_plan(64)
+        assert plan.shared_first is (expected_shared_sms == 0)
 
 
 @pytest.mark.cpu_only

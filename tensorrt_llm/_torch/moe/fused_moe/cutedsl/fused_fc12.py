@@ -82,6 +82,12 @@ class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
         return [128, 256]
 
 
+# The most SMs the fused FC12 grid keeps free beside it (the measured R200
+# split); the model's per-forward ``reserve_sms_for_concurrent_kernels``
+# request, bounded by this ceiling, is applied at every launch.
+_SM_RESERVE_CEILING = 16
+
+
 @register_moe_impl
 class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     """``trtllm.cutedsl.fused_fc12.nvfp4``: FC1+FC2-fused CuteDSL NVFP4 MoE (Rubin/SM107).
@@ -254,6 +260,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # The fused op finalizes straight into moe_output, which may be the
         # all-to-all combine workspace.
         return True
+
+    def sm_reserve_ceiling(self) -> int:
+        """Whole clusters fewer, at least one launched (one CTA holds an SM's
+        register file): the 16-SM split measured on a VR200. Per-launch the model
+        hands the reserve of ``reserve_sms_for_concurrent_kernels`` over, bounded
+        by this ceiling."""
+        return _SM_RESERVE_CEILING
 
     def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
         """The fused kernel's persistent grid launches enough whole clusters fewer to leave

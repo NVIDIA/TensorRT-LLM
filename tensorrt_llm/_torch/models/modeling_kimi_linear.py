@@ -1839,19 +1839,18 @@ class KimiK3MoERuntime(nn.Module):
             and not self._defer_shared_allreduce
             and not (isinstance(shared_down, TrtllmLinear) and shared_down.use_fused_gemm_allreduce)
         )
-        # A persistent routed grid that leaves SMs free (CUTEDSL_FC12) can run beside the
-        # shared expert, whose GEMMs keep to those SMs while they go through torch's cuBLAS
-        # (``F.linear``); a CuTe DSL shared GEMM (``use_cute_dsl_bf16_gemm`` /
-        # ``use_custom_cublas_mm``) ignores the carveout, and reserving SMs for it only shrinks
-        # the routed grid. The backend is asked per forward (_routed_output): an in-order
-        # launch has nothing beside its grid and keeps every SM.
+        # The routed grid can run SM-short only where the backend sizes a persistent
+        # grid it can shrink (``MoEImplBase.sm_reserve_ceiling``; the fused FC12 leaf
+        # offers 16). This is the construction-time capability; the per-launch reserve
+        # and its carveout pairing are decided per forward (_shared_sms_now), because
+        # multi-stream is a per-forward state and the FP8 weight-read swap can move the
+        # shared projections onto a CuTe DSL GEMM after construction.
         self._shared_sms = (
-            _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID
-            if not self._defer_shared_allreduce
-            and not (
-                getattr(shared_down, "use_cute_dsl_bf16_gemm", False)
-                or getattr(shared_down, "use_custom_cublas_mm", False)
+            min(
+                _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID,
+                self.routed_experts.backend.sm_reserve_ceiling(),
             )
+            if not self._defer_shared_allreduce
             else 0
         )
         self.routed_expert_down_proj = nn.Linear(
@@ -2136,6 +2135,29 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _shared_sms_now(self) -> int:
+        """SMs the shared expert's GEMMs keep to beside the routed grid this forward,
+        the per-launch reserve's pairing (the torch SM carveout).
+
+        Zero unless this forward runs the shared expert on a side stream --
+        ``do_multi_stream``, or an AutoTuner pass, which must profile the shrunk
+        FC12 grid the captured graphs go on to launch -- or when the shared
+        projections no longer go through torch's cuBLAS (``F.linear``): the FP8
+        weight-read swap can have replaced them with a CuTe DSL GEMM after
+        construction, and those kernels ignore the carveout."""
+        from ..autotuner import AutoTuner
+
+        if not (do_multi_stream() or AutoTuner.get().is_tuning_mode):
+            return 0
+        down = self.shared_experts.down_proj
+        if (
+            isinstance(down, _Fp8BlockScaleWeightReadLinear)
+            or getattr(down, "use_cute_dsl_bf16_gemm", False)
+            or getattr(down, "use_custom_cublas_mm", False)
+        ):
+            return 0
+        return self._shared_sms
+
     def _front_plan(self, num_tokens: int) -> _MoEFrontPlan:
         """Issue order of a decode MoE front with the latent stream (multi-stream, i.e. CUDA
         graphs), decided in this one place from what the routed experts and latent_down declare.
@@ -2307,12 +2329,14 @@ class KimiK3MoERuntime(nn.Module):
                 routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             if isinstance(routed_in, Fp4QuantizedTensor):
                 moe_kwargs["output_dtype"] = hidden_states.dtype
-            # Only a launch with the shared expert beside it (multi-stream) gives up SMs;
-            # an in-order launch keeps the full grid. Re-asked per forward: eager forwards
-            # launch here, a captured graph bakes the launch's reserve in.
+            # Only a launch with the shared expert beside it gives up SMs (an in-order
+            # launch keeps the full grid); the AutoTuner pass requests the reserve the
+            # captured graphs launch with, so tuning and capture share a cache key.
+            # Re-asked per forward: eager forwards launch here, a captured graph bakes
+            # the launch's reserve in.
             if not torch.compiler.is_compiling():
                 self.routed_experts.backend.reserve_sms_for_concurrent_kernels(
-                    self._shared_sms if do_multi_stream() else 0
+                    self._shared_sms_now()
                 )
             y = self.routed_experts(
                 routed_in,
@@ -2329,8 +2353,10 @@ class KimiK3MoERuntime(nn.Module):
             return self._routed_projection(y, self.routed_expert_up_proj)
 
         def _shared_output():
-            # Beside the routed grid (multi-stream) the shared GEMMs keep to the SMs it leaves.
-            with _cublas_sm_limit(self._shared_sms if do_multi_stream() else 0):
+            # Beside the routed grid (multi-stream / the AutoTuner pass) the shared GEMMs
+            # keep to the SMs it leaves -- one per-forward source of truth with the
+            # reserve the routed launch asked for.
+            with _cublas_sm_limit(self._shared_sms_now()):
                 shared_out = self.shared_experts(
                     identity,
                     final_all_reduce_params=(
