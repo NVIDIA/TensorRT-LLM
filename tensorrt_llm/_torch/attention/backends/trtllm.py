@@ -771,15 +771,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             num_tokens = len(helix_position_offsets)
             self.helix_position_offsets_cpu[:num_tokens].copy_(
                 torch.tensor(helix_position_offsets, dtype=torch.int))
-            self.helix_position_offsets[:num_tokens].copy_(
-                self.helix_position_offsets_cpu[:num_tokens], non_blocking=True)
+            step_inputs.copy_(self.helix_position_offsets[:num_tokens],
+                              self.helix_position_offsets_cpu[:num_tokens])
 
         if helix_is_inactive_rank is not None and self.helix_is_inactive_rank is not None:
             batch_size = len(helix_is_inactive_rank)
             self.helix_is_inactive_rank_cpu[:batch_size].copy_(
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
-            self.helix_is_inactive_rank[:batch_size].copy_(
-                self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+            step_inputs.copy_(self.helix_is_inactive_rank[:batch_size],
+                              self.helix_is_inactive_rank_cpu[:batch_size])
 
         self._helix_spec_tokens_valid = False
         if helix_owned_new_tokens is not None:
@@ -1082,7 +1082,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
         copy_h2d_if_changed(self.prompt_lens_cuda[:self.num_seqs],
-                            self.prompt_lens_cpu[:self.num_seqs])
+                            self.prompt_lens_cpu[:self.num_seqs],
+                            pack=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(

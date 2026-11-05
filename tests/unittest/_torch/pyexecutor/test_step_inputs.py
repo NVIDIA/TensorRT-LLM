@@ -508,6 +508,65 @@ def test_skip_cache_copies_join_the_active_pack(pack):
     assert dst.tolist() == [4, 5, 6]
 
 
+@pytest.mark.parametrize("pack_copy", [True, False])
+def test_copy_h2d_if_changed_without_a_cache_follows_pack(pack, pack_copy):
+    dst = _zeros(3)
+
+    step_inputs.begin()
+    assert copy_h2d_if_changed(dst, _host([4, 5, 6]), pack=pack_copy) is True
+    torch.cuda.synchronize()
+    assert dst.tolist() == ([0, 0, 0] if pack_copy else [4, 5, 6])
+    step_inputs.flush()
+    torch.cuda.synchronize()
+
+    assert dst.tolist() == [4, 5, 6]
+
+
+def test_helix_params_join_the_active_pack(pack):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    metadata = SimpleNamespace(
+        helix_position_offsets=_zeros(4),
+        helix_position_offsets_cpu=torch.zeros(4, dtype=torch.int32).pin_memory(),
+        helix_is_inactive_rank=torch.zeros(4, dtype=torch.bool, device="cuda"),
+        helix_is_inactive_rank_cpu=torch.zeros(4, dtype=torch.bool).pin_memory(),
+    )
+
+    step_inputs.begin()
+    TrtllmAttentionMetadata.update_helix_param(metadata, [5, 6, 7], [True, False, True])
+    torch.cuda.synchronize()
+    assert metadata.helix_position_offsets.tolist() == [0, 0, 0, 0]
+    assert not metadata.helix_is_inactive_rank.any()
+    # The next step refills the pinned host buffers before this step's pack is issued.
+    metadata.helix_position_offsets_cpu.fill_(9)
+    metadata.helix_is_inactive_rank_cpu.fill_(False)
+    step_inputs.flush()
+    torch.cuda.synchronize()
+
+    assert metadata.helix_position_offsets.tolist() == [5, 6, 7, 0]
+    assert metadata.helix_is_inactive_rank.tolist() == [True, False, True, False]
+
+
+def test_spec_sampling_uploads_join_the_active_pack(pack):
+    from tensorrt_llm._torch.speculative.interface import _upload_host_values
+
+    seeds = torch.zeros(4, dtype=torch.int64, device="cuda")
+    temperatures = torch.zeros(4, dtype=torch.float32, device="cuda")
+
+    step_inputs.begin()
+    _upload_host_values(seeds, [11, 12, 13], torch.int64)
+    _upload_host_values(temperatures, [0.5, 1.0], torch.float32)
+    torch.cuda.synchronize()
+    assert seeds.tolist() == [0, 0, 0, 0] and temperatures.tolist() == [0.0] * 4
+    step_inputs.flush()
+    torch.cuda.synchronize()
+
+    assert seeds.tolist() == [11, 12, 13, 0]
+    assert temperatures.tolist() == [0.5, 1.0, 0.0, 0.0]
+
+
 # ---------------------------------------------------------------------------
 # Isolation between packs
 # ---------------------------------------------------------------------------

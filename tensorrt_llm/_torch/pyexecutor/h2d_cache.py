@@ -117,7 +117,10 @@ def copy_h2d_if_changed(dst: torch.Tensor, src: torch.Tensor, pack: bool = False
     """
     cache = _active.get()
     if cache is None:
-        dst.copy_(src, non_blocking=True)
+        if pack:
+            step_inputs.copy_(dst, src)
+        else:
+            dst.copy_(src, non_blocking=True)
         return True
     return cache.copy(dst, src, pack)
 
