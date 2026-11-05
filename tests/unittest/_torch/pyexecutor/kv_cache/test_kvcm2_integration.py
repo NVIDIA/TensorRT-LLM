@@ -421,6 +421,7 @@ def _make_manager_for_cache_tier_test(
     layer_specs: list[KVCacheLayerSpec] | None = None,
     available_tokens: int = MAX_SEQ_LEN,
 ) -> tuple[KVCacheManagerV2, Mock]:
+    """Construct a manager with mocked cache tiers and available token capacity."""
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
         mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -496,6 +497,7 @@ def _make_manager_for_cache_tier_test(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("available_tokens", [TOKENS_PER_BLOCK, MAX_SEQ_LEN])
 def test_page_index_capacity_covers_configured_sequence_length(available_tokens: int) -> None:
+    """Keep aligned page indices large enough even when pool capacity clamps the sequence."""
     manager, _ = _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=0),
         [Mock()],
@@ -4050,6 +4052,7 @@ def _try_run_context(manager: KVCacheManagerV2, request: _ContextRequest) -> boo
 
 
 def test_context_larger_than_kv_pool_returns_false_and_can_retry() -> None:
+    """Reject an oversized allocation without mutating cache state and allow a smaller retry."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     torch.cuda.init()
