@@ -1471,20 +1471,19 @@ class OpenAIServer(_VideoRoutesMixin):
             # returns one EncoderOutput per item, in input order.
             return self.generator.encode(token_ids_batch)
 
-        # Source the batch limits from the resolved encoder engine — the same
-        # attributes encode() validates against (llm.py: engine.max_seq_len /
-        # max_num_tokens / batch_size). LlmArgs.max_seq_len/max_num_tokens default
+        # Source the batch limits from the encoder executor's resolved limits —
+        # the same attributes encode() validates against. LlmArgs.max_seq_len/max_num_tokens default
         # to None and are not written back to args, so reading them from args
         # would leave the batcher's seq-len/token-budget guards inert (typed 400s
         # would never fire) and could let it form a batch encode() then rejects.
-        engine = self.generator._encoder_executor.model_engine
+        encoder_executor = self.generator._encoder_executor
         self.embedding_batcher = EncodeBatcher(
             encode_fn,
-            max_batch_size=engine.batch_size,
+            max_batch_size=encoder_executor.max_batch_size,
             max_queue_delay=self._embedding_max_queue_delay,
             max_queue_size=self._embedding_max_queue_size,
-            max_num_tokens=engine.max_num_tokens,
-            max_seq_len=engine.max_seq_len,
+            max_num_tokens=encoder_executor.max_num_tokens,
+            max_seq_len=encoder_executor.max_seq_len,
         )
 
     def register_embedding_routes(self):
