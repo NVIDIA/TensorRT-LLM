@@ -2095,7 +2095,9 @@ def test_parallel_split_deals_pairs_across_runners(monkeypatch):
     Each rank of the group profiles only its share of a profile's pairs.
     Splitting each runner's tactics on its own would put the first tactic of
     every runner on group rank 0, so ranks with low indices would build and
-    time most of the candidates while the others wait at the merge.
+    time most of the candidates while the others wait at the merge. With fewer
+    pairs than ranks, a rank dealt none logs no warning: the merge brings it
+    the winner.
     """
 
     class ListedTacticsRunner(TunableRunner):
@@ -2119,29 +2121,37 @@ def test_parallel_split_deals_pairs_across_runners(monkeypatch):
             (runner.name, tactic))
         return 1.0
 
+    warnings = []
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    monkeypatch.setattr(autotuner.logger, "warning_once",
+                        lambda *args, **kwargs: warnings.append(args))
     group_size = 4
-    runners = [
-        ListedTacticsRunner("cublas", 1),
-        ListedTacticsRunner("direct", 7),
-        ListedTacticsRunner("splitk", 3)
-    ]
     op = "autotuner_test::parallel_deal"
     config = TuningConfig(
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
     profile = OptimizationProfile([[StaticDim(8), StaticDim(64)]])
     x = torch.zeros(8, 64)
-    for rank in range(group_size):
-        tuner = autotuner.AutoTuner()
-        tuner.setup_distributed_state(Mapping(world_size=group_size,
-                                              rank=rank,
-                                              tp_size=group_size),
-                                      dist=object())
-        # choose_one sets these up before it profiles.
-        tuner.stats.tuned_op_profiled_configs[op] = 0
-        tuner.stats.failed_profiling_count[op] = set()
-        tuner._profile_runners_impl(op, runners, [x], profile, config)
-    shares = [timed.get(rank, []) for rank in range(group_size)]
+
+    def deal(runners):
+        timed.clear()
+        for rank in range(group_size):
+            tuner = autotuner.AutoTuner()
+            tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                                  rank=rank,
+                                                  tp_size=group_size),
+                                          dist=object())
+            # choose_one sets these up before it profiles.
+            tuner.stats.tuned_op_profiled_configs[op] = 0
+            tuner.stats.failed_profiling_count[op] = set()
+            tuner._profile_runners_impl(op, runners, [x], profile, config)
+        return tuner, [timed.get(rank, []) for rank in range(group_size)]
+
+    runners = [
+        ListedTacticsRunner("cublas", 1),
+        ListedTacticsRunner("direct", 7),
+        ListedTacticsRunner("splitk", 3)
+    ]
+    tuner, shares = deal(runners)
     # Every pair is timed on exactly one rank, and the shares differ by at most one.
     assert sorted(pair for share in shares for pair in share) == sorted(
         (r.name, t) for r in runners for t in range(r.num_tactics))
@@ -2150,6 +2160,10 @@ def test_parallel_split_deals_pairs_across_runners(monkeypatch):
     start = tuner._parallel_deal_start(op, profile,
                                        DistributedTuningStrategy.PARALLEL)
     assert shares[start][0] == ("cublas", 0), (start, shares)
+    # Two pairs on four ranks: two ranks are dealt none and do not warn.
+    _, shares = deal([ListedTacticsRunner("direct", 2)])
+    assert sorted(map(len, shares)) == [0, 0, 1, 1], shares
+    assert warnings == [], warnings
 
 
 def test_parallel_search_cache_picks_fastest_runner():

@@ -1378,6 +1378,9 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
+        # (runner, tactic) pairs this rank profiles: all of them, or under
+        # PARALLEL its share of the deal, which can be empty.
+        local_pairs = 0
         # Pre-walk the runners so we know the total candidate (runner, tactic)
         # pair count before deciding whether to short-circuit profiling. The
         # count is taken BEFORE distributed-strategy splitting; the PARALLEL
@@ -1415,6 +1418,7 @@ class AutoTuner:
             runner_id, runner, runner_arg_names, valid_tactics = next(
                 c for c in candidates if len(c[3]) == 1)
             tac = valid_tactics[0]
+            local_pairs = 1
             if "do_preparation" in runner_arg_names:
                 runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
             try:
@@ -1466,6 +1470,7 @@ class AutoTuner:
                     tuning_config.distributed_tuning_strategy,
                     offset=pair_offset)
                 pair_offset += len(all_valid_tactics)
+                local_pairs += len(valid_tactics)
                 if "do_preparation" in runner_arg_names and len(
                         valid_tactics) > 0:
                     runner(
@@ -1548,6 +1553,12 @@ class AutoTuner:
                                                min_time)
 
             self.stats.tuned_op_profiled_configs[custom_op] += 1
+        elif local_pairs == 0 and total_pairs > 0:
+            # The PARALLEL deal left this rank no pair to profile; the merge
+            # brings in the winner the other ranks of the group find.
+            self._debug_logger(
+                f"[Autotuner] No (runner, tactic) pair dealt to this rank for custom_op={custom_op}, "
+                f"input_shapes={profile.get_opt_shapes()}.")
         else:
             logger.warning_once(
                 f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={profile.get_opt_shapes()}. "
