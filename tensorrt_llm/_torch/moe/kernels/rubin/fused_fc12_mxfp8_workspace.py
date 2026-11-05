@@ -35,6 +35,12 @@ MXFP8 quantization (E4M3 values and linear UE8M0 scales per 32 elements).
 This removes the separate input-quantization launch without changing GEMM
 register pressure, gather scheduling, or FC1 scale reuse. Quantized inputs
 and scales remain global scratch buffers, consumed after the GEMM's PDL wait.
+
+The locality-domain split runs two shard kernels concurrently on their own
+streams. ``ready_1`` / ``fc1_counter_1`` / ``fc2_counter_1`` let one parent
+launch on the caller's stream clear the second partition's workspace too, so
+the split pays one reset (with the same output clear and input quantization
+as the full-GPU op) instead of one per shard.
 """
 
 from typing import Optional
@@ -84,6 +90,9 @@ def _reset_fc12_sync_workspace_kernel(
     input_quant: Optional[cute.Tensor],
     input_scale: Optional[cute.Tensor],
     block_threads: cutlass.Constexpr,
+    ready_1: Optional[cute.Tensor],
+    fc1_counter_1: Optional[cute.Tensor],
+    fc2_counter_1: Optional[cute.Tensor],
 ) -> None:
     values_per_lane = _QUANT_VALUES_PER_LANE
     tidx, _, _ = cute.arch.thread_idx()
@@ -116,6 +125,13 @@ def _reset_fc12_sync_workspace_kernel(
     if idx == 0:
         fc1_counter[0] = cutlass.Int32(0)
         fc2_counter[0] = cutlass.Int32(0)
+    if cutlass.const_expr(ready_1 is not None):
+        # Second locality-domain partition: same extents as the first.
+        if idx < cute.size(ready_1):
+            ready_1[idx] = cutlass.Int32(0)
+        if idx == 0:
+            fc1_counter_1[0] = cutlass.Int32(0)
+            fc2_counter_1[0] = cutlass.Int32(0)
     if cutlass.const_expr(zero_output):
         if idx * (128 // cutlass.BFloat16.width) < cute.size(output):
             # Explicit vector width avoids the eight scalar stores an
@@ -138,6 +154,9 @@ def reset_fc12_sync_workspace(
     input_quant_ptr: Optional[cute.Pointer] = None,
     input_scale_ptr: Optional[cute.Pointer] = None,
     input_numel: cutlass.Int32 = 0,
+    ready_1_ptr: Optional[cute.Pointer] = None,
+    fc1_counter_1_ptr: Optional[cute.Pointer] = None,
+    fc2_counter_1_ptr: Optional[cute.Pointer] = None,
 ) -> None:
     """Clear the sync workspace and optional BF16 output, and quantize raw input.
 
@@ -157,6 +176,9 @@ def reset_fc12_sync_workspace(
     Each quantizing lane handles ``_QUANT_VALUES_PER_LANE`` values, so four
     lanes share one scale; a quantizing launch uses ``_QUANT_BLOCK_THREADS``
     threads per block and a reset-only launch ``_RESET_BLOCK_THREADS``.
+    ``ready_1_ptr`` with its two counter pointers names a second workspace of
+    the same ``num_ready`` extent (the other locality-domain partition); all
+    three must be given together.
     """
     block_threads = (
         _QUANT_BLOCK_THREADS
@@ -173,6 +195,13 @@ def reset_fc12_sync_workspace(
             grid,
             cute.ceil_div(output_numel, block_threads * (128 // cutlass.BFloat16.width)),
         )
+    ready_1 = None
+    fc1_counter_1 = None
+    fc2_counter_1 = None
+    if cutlass.const_expr(ready_1_ptr is not None):
+        ready_1 = cute.make_tensor(ready_1_ptr, layout=cute.make_layout((num_ready,)))
+        fc1_counter_1 = cute.make_tensor(fc1_counter_1_ptr, layout=cute.make_layout((1,)))
+        fc2_counter_1 = cute.make_tensor(fc2_counter_1_ptr, layout=cute.make_layout((1,)))
     input_raw = None
     input_quant = None
     input_scale = None
@@ -194,6 +223,9 @@ def reset_fc12_sync_workspace(
         input_quant,
         input_scale,
         block_threads,
+        ready_1,
+        fc1_counter_1,
+        fc2_counter_1,
     ).launch(
         grid=(grid, 1, 1),
         block=(block_threads, 1, 1),
