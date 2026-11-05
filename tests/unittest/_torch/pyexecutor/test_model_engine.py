@@ -134,7 +134,7 @@ def test_init_from_args_forwards_vision_gpu_normalize(
         trust_remote_code=False,
     )
     create_input_processor = Mock()
-    monkeypatch.setattr(model_engine_module, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
     monkeypatch.setattr(model_engine_module, "create_input_processor", create_input_processor)
     engine = SimpleNamespace()
 
