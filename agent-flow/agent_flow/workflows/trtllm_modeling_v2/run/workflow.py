@@ -58,6 +58,7 @@ from ..agents.turns import InProcessTurnExecutor, TurnRequest, TurnTimeout
 from ..checks import boot as boot_checks
 from ..checks import check_runtime
 from ..checks import verdict as check_result
+from ..infra.compute import waits
 from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
 from ..infra.compute.rebuild import LIBRARY_PATTERNS
@@ -547,8 +548,9 @@ class TrtllmModelingV2Workflow:
         self._role_agents()
 
         try:
-            # A substrate gate that fails while the first turns run stops them.
-            with orchestrator_mod.stoppable(self.workspace) as stop:
+            # A substrate gate that fails while the first turns run stops them; a quiet wait on
+            # spool jobs is journaled.
+            with orchestrator_mod.stoppable(self.workspace) as stop, waits.journaled(self.journal):
                 self._run_stages(state, log, stop)
             bootstrap._await_substrate(self)
         except KeyboardInterrupt:

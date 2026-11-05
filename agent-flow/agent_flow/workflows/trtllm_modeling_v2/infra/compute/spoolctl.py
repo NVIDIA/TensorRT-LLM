@@ -28,7 +28,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 try:
     from .. import files as _files
@@ -144,13 +144,14 @@ def wait_for_job(
     grace_s: float = 300.0,
     unwatched_s: float | None = None,
     submitted_at: float | None = None,
+    on_poll: Callable[[], None] | None = None,
 ) -> dict:
     """Block until ``name`` has a receipt (matching ``token`` when given) and return its record.
 
     ``timeout_s`` counts from the job's START, and ``grace_s`` past it is the session's to stop the
     job and write the receipt. A spool no watcher ever heart-beat on fails at once, or
     ``unwatched_s`` after submission (a session still starting). A job re-run after a lost
-    allocation is waited for through its re-run.
+    allocation is waited for through its re-run. ``on_poll`` is called before each sleep.
 
     Raises :class:`SpoolError`, with :data:`EXIT_NO_SESSION` when the session, not the job, ended
     the wait: the watchers stopped heart-beating for ``stale_s``, or none ever watched.
@@ -188,6 +189,8 @@ def wait_for_job(
                 f"the session watching {paths.root} stopped heart-beating {age:.0f}s ago",
                 EXIT_NO_SESSION,
             )
+        if on_poll is not None:
+            on_poll()
         time.sleep(poll_s)
 
 

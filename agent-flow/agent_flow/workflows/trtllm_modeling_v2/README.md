@@ -91,7 +91,10 @@ a container runtime, a shell). The run needs:
   directory, checkout and checkpoints at the same paths as every session.
 
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
-hand-over with no newer session on its spool.
+hand-over with no newer session on its spool. A run that has waited on spool jobs for 15 minutes
+with nothing else journaled writes a `waiting` event: each job by spool, queued or running and since
+when, why the session holds a queued one, and when the session ends; then one every 15 minutes
+while the wait lasts.
 
 **While it runs**, you or the launching agent keep the sessions alive and leave the work to the run. Never cancel
 a job the run submitted (a gate, a worker's test) or run a replacement check beside it: a cancelled

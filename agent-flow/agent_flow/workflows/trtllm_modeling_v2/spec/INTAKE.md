@@ -166,6 +166,9 @@ benchmark you start by hand runs captured too.
   NVRTC checks.
 - A `session_spool` environment's spools exist once their sessions run. Until then lint with
   `--sessions-planned`; start the sessions before launch.
+- Gate jobs go to `environment.spool` and the `role: gates` sessions only. Give every other
+  session a role that says so: `gates` for one that shares the gates, `work` for one kept for the
+  workers' own jobs. An `any` session on another spool never gets a gate (`session-no-gates`).
 
 ## 7. Agents: yours
 

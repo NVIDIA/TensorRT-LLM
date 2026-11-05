@@ -25,7 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
-from ..infra.compute import placement, spoolctl
+from ..infra.compute import placement, spoolctl, waits
 from ..infra.compute.executor import PERF
 from ..infra.compute.scheduler import (
     RC_LAUNCH_FAILED,
@@ -434,7 +434,9 @@ class SpoolRunner:
 
     A whole-node measurement goes to a session with nothing of ours in flight, an idle node first
     (:meth:`free_spools`); the keep gate's jobs share sessions by device count (:meth:`place`).
-    ``earlier`` names the prefixes earlier attempts of the same work queued under.
+    ``earlier`` names the prefixes earlier attempts of the same work queued under. Each
+    :meth:`poll` tells ``infra/compute/waits.py`` which jobs it still awaits, so a quiet wait on
+    them is journaled.
     """
 
     def __init__(
@@ -591,6 +593,7 @@ class SpoolRunner:
             if job_label == label:
                 del self.inflight[name]
                 self.held.pop(name, None)
+                waits.stopped_waiting(spool, name)
                 spoolctl.cancel_job(spool, name)
                 return True
         return False
@@ -625,6 +628,7 @@ class SpoolRunner:
                         script.rename(script.with_name(f"{script.name}.lost-{int(time.time())}"))
                 del self.inflight[name]
                 self.held.pop(name, None)
+                waits.stopped_waiting(spool, name)
                 done.append((label, spool, RC_ORPHANED))
                 continue
             if receipt.exists():
@@ -634,8 +638,10 @@ class SpoolRunner:
                     continue
                 del self.inflight[name]
                 self.held.pop(name, None)
+                waits.stopped_waiting(spool, name)
                 self.finished[label] = (spool, name)
                 done.append((label, spool, rc))
+        waits.still_waiting((spool, name) for name, (spool, _) in self.inflight.items())
         return done
 
 

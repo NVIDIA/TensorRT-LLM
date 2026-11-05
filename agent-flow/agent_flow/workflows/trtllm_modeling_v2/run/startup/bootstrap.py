@@ -10,7 +10,6 @@ failure stops the run, which stays open for the same command to resume.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import threading
 import time
@@ -78,26 +77,41 @@ SUBSTRATE_FRESH_S = 12 * 3600.0
 def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) -> dict[str, str]:
     """What a substrate pass proves something about, one digest per part.
 
-    - ``environment``: the launch environment as preflight resolved it, and
-      ``spec_environment``, the block it was resolved from, which also names
-      the proxy checkpoint;
+    - ``environment``: what the boot runs under -- the kind of launch, the
+      interpreter, the container image and the mounts it sees, the
+      environment variables, the devices and world size, the proxy
+      checkpoint, and the env and setup lines the sessions start their
+      processes with, as a set (a session added like the others adds nothing);
     - ``engine``: what the boot's command line is built from -- the
       checkpoint, the parallel segment and the runtime block -- and
       ``options``, the options file it reads, by content;
     - ``checkout``: the checkout it ran in, by path.
 
-    Not by the checkout's content: the tree changes with every integration,
-    and every gate of the run measures it on this same substrate under the
-    tree's own marker.
+    Not by which sessions there are, their spools, sizes and time limits, or
+    the spools the perf block names: where a job queues changes nothing the
+    boot runs. Not by the checkout's content: the tree changes with every
+    integration, and every gate of the run measures it on this same substrate
+    under the tree's own marker.
     """
     accuracy = task_data.get("accuracy") or {}
     options = check_config.resolve_llm_api_options(accuracy, None)
     options_text = None
     if options and Path(str(options)).is_file():
         options_text = Path(str(options)).read_text(encoding="utf-8", errors="replace")
+    block = task_data.get("environment") or {}
+    runtimes = {(tuple(sorted(s.env.items())), tuple(s.setup)) for s in environment.sessions}
     parts: dict[str, Any] = {
-        "environment": dataclasses.asdict(environment),
-        "spec_environment": task_data.get("environment"),
+        "environment": {
+            "kind": environment.kind,
+            "python": environment.python,
+            "container_image": environment.container_image,
+            "mounts": block.get("mounts"),
+            "env": environment.env,
+            "devices": list(environment.devices),
+            "world_size": environment.world_size,
+            "substrate_checkpoint": block.get("substrate_checkpoint"),
+            "sessions": sorted(runtimes),
+        },
         "engine": {
             "checkpoint_path": task_data.get("checkpoint_path"),
             "parallel": task_data.get("parallel"),
@@ -305,6 +319,9 @@ def _prove_substrate(workflow, result, log) -> bool:
         workflow.journal.event("substrate gate not run", f"{why}; `{record_path}`")
         print_message(f"[bold green]✔ substrate gate[/bold green] not run: {why}", log)
         return True
+    # The boot takes minutes to an hour on a large checkpoint: say why it runs now, not only after.
+    workflow.journal.event("substrate gate running", f"{why}; `{record_path}`")
+    print_message(f"→ substrate gate running: {why}", log)
     before = len(result.notes)
     try:
         substrate_gate(

@@ -17,6 +17,8 @@ the gates' policy over the spool:
   :meth:`SpoolCommandExecutor.wait_for_session` waits for one to come back before a re-run.
 - **Nor is a cancelled job**: its ``infrastructure`` begins with :data:`CANCELLED`; the gate it
   ran for has no verdict, and is not re-run at once against whoever cancelled it.
+- **A long wait says what it waits on**: each poll tells :mod:`.waits`, which journals the jobs a
+  quiet run waits on, why the session holds them, and when it ends.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-from . import placement, spoolctl
+from . import placement, spoolctl, waits
 from .commands import (
     TIMEOUT_RETURNCODE,
     CommandExecutor,
@@ -230,16 +232,18 @@ class SpoolCommandExecutor(CommandExecutor):
                 infrastructure=reason,
             )
         try:
-            record = spoolctl.wait_for_job(
-                root,
-                name,
-                token=token,
-                poll_s=self.poll_s,
-                timeout_s=spec.timeout_s,
-                grace_s=self.grace_s,
-                unwatched_s=spec.timeout_s,
-                submitted_at=submitted,
-            )
+            with waits.waiting_on(root, name):
+                record = spoolctl.wait_for_job(
+                    root,
+                    name,
+                    token=token,
+                    poll_s=self.poll_s,
+                    timeout_s=spec.timeout_s,
+                    grace_s=self.grace_s,
+                    unwatched_s=spec.timeout_s,
+                    submitted_at=submitted,
+                    on_poll=waits.still_waiting,
+                )
         except spoolctl.SpoolError as exc:
             reason = str(exc) + self._withdraw(root, name)
             lost = exc.exit_code == spoolctl.EXIT_NO_SESSION

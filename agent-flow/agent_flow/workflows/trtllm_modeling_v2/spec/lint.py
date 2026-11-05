@@ -11,8 +11,9 @@ axis, a member too narrow for one engine, a disaggregated member wider than a
 session), accuracy that
 cannot judge anything (a placeholder anchor, a chat-template protocol cut off
 early), boot probes that fail on near ties, a launch the environment cannot
-start, and notes that tell the roles what not to read but nothing about the
-model. Each finding names its rule, why it costs time and the usual fix.
+start, a compute session no gate reaches, and notes that tell the roles what
+not to read but nothing about the model. Each finding names its rule, why it
+costs time and the usual fix.
 
 Every rule reads the spec and the checkpoint's ``config.json``, never a model
 name: a :data:`RULES` entry is a function of a :class:`LintContext` yielding
@@ -831,6 +832,37 @@ def environment_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
+def session_rules(ctx: LintContext) -> Iterator[Finding]:
+    """No session that reads as sharing the gates is one no gate ever reaches.
+
+    Gate jobs go to ``environment.spool`` and the ``role: gates`` sessions only
+    (``executor.select_command_executor``); ``role: work`` says a session is kept for
+    the workers' own jobs.
+    """
+    env = ctx.environment
+    if env.get("kind") != "session_spool":
+        return
+    spool = Path(str(env.get("spool") or ""))
+    idle = [
+        str(session.get("name"))
+        for session in env.get("sessions") or ()
+        if isinstance(session, Mapping)
+        and session.get("role", "any") == "any"
+        and Path(str(session.get("spool") or "")) != spool
+    ]
+    if idle:
+        yield Finding(
+            "session-no-gates",
+            WARN,
+            f"session(s) {', '.join(idle)} have role `any` on a spool other than "
+            "environment.spool: gate jobs go only to environment.spool and `role: gates` "
+            "sessions, so no gate ever runs there, and every gate queues on the others "
+            "while these hold only what a worker submits to them",
+            "set `role: gates` on a session that should share the gates, or `role: work` on "
+            "one kept for the workers' own jobs",
+        )
+
+
 def agents_rules(ctx: LintContext) -> Iterator[Finding]:
     """Every role's model is stated: the run inherits none and stops before its first worker."""
     from ..agents.roles import AgentConfigError, resolve_role_agents
@@ -963,6 +995,7 @@ RULES: tuple[Rule, ...] = (
     boot_rules,
     disagg_rules,
     environment_rules,
+    session_rules,
     agents_rules,
     notes_rules,
     engine_rules,
