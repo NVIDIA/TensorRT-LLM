@@ -122,26 +122,26 @@ def _running_pool(
     """A master and a segment provider: the stack that stops them, and the master."""
     from test_common.mooncake_utils import running_master_on_free_ports, running_segment_provider
 
-    stack = contextlib.ExitStack()
-    # Ratio 0: the master evicts only above its high watermark, never just because a put failed.
-    master = stack.enter_context(
-        running_master_on_free_ports(
-            run_dir,
-            protocol=PROTOCOL,
-            eviction_ratio=0.0,
-            binary=_master_binary(run_dir, master_flags),
+    with contextlib.ExitStack() as stack:
+        # Ratio 0: the master evicts only above its high watermark, never just because a put failed.
+        master = stack.enter_context(
+            running_master_on_free_ports(
+                run_dir,
+                protocol=PROTOCOL,
+                eviction_ratio=0.0,
+                binary=_master_binary(run_dir, master_flags),
+            )
         )
-    )
-    stack.enter_context(
-        running_segment_provider(
-            master.address,
-            run_dir,
-            segment_size=segment_size,
-            protocol=PROTOCOL,
-            device_name=DEVICES,
+        stack.enter_context(
+            running_segment_provider(
+                master.address,
+                run_dir,
+                segment_size=segment_size,
+                protocol=PROTOCOL,
+                device_name=DEVICES,
+            )
         )
-    )
-    return stack, master
+        return stack.pop_all(), master
 
 
 @pytest.fixture(scope="module")
@@ -298,6 +298,10 @@ class TestRealMooncakeConformance(DriverConformance):
             open_sdk(client_config(self.master)), "batch_put_from_multi_buffer_ranges", key
         )
         return MooncakeDriver(sdk), key, sdk.entered, sdk.release.set
+
+    def make_put_still_reading_the_source(self):
+        """The blocked put's gate stands before the scatter, the call that reads the source."""
+        return self.make_blocked_put()
 
 
 class DataCallsInFlight:
@@ -464,6 +468,9 @@ def test_real_put_stuck_past_the_discard_timeout_keeps_its_keys(tmp_path, reques
 
 
 RPC_TIMEOUT_MS = 1000  # the writer's MC_RPC_TIMEOUT_MS in the test below; 30 s by default
+# The master's put_start_discard_timeout_sec in the test below: long enough that the observer's
+# start, after the master resumes and the fetches find the unwritten objects, still lands within it.
+LATE_START_DISCARD_S = 5
 
 
 @contextlib.contextmanager
@@ -496,7 +503,7 @@ def test_real_keys_whose_put_start_timed_out_are_never_started_again(
     # again: its later puts only ask whether the object exists, DECLINED until another client
     # wrote it whole and READY after.
     _require_mooncake()
-    flags = [f"--put_start_discard_timeout_sec={DISCARD_S}"]
+    flags = [f"--put_start_discard_timeout_sec={LATE_START_DISCARD_S}"]
     stack, master = _running_pool(str(tmp_path), 64 << 20, master_flags=flags)
     clients = Clients(master.address)
     with stack:
@@ -522,7 +529,8 @@ def test_real_keys_whose_put_start_timed_out_are_never_started_again(
         assert declined.fault is None and masks(declined) == [[False] * 4]
         assert writer.driver.inner.stats()["rows_declined_left_open_by_own_put"] == 4
 
-        time.sleep(DISCARD_S + 1)  # then another client's start discards the unwritten objects
+        # Then another client's start discards the unwritten objects.
+        time.sleep(LATE_START_DISCARD_S + 1)
         other = clients.endpoint(names)
         rows = write_random_rows(other, seed=13)
         assert masks(finish(other, other.backend.publish, *names)) == [[True] * 4]

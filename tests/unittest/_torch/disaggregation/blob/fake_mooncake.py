@@ -16,6 +16,8 @@ Unscripted calls follow SDK 0.3.13:
 - ``batch_get_into`` answers each object's size after copying it (-704 absent, -703 reserved only,
   -600 when the object is longer than its buffer).
 - A buffer outside every registration fails with TRANSFER_FAIL, as RDMA does.
+- After ``close`` the session calls answer no key at all, while ``batch_get_into`` and
+  ``batch_is_exist``, where the real SDK crashes the process, raise ``ClientCrash``.
 
 ``KeyGatedClient`` stops one method's calls naming a key at a gate, in front of any SDK client,
 this fake or a real one.
@@ -55,6 +57,11 @@ class SdkCall:
     args: tuple
     kwargs: dict
     answers: list = field(default_factory=list)  # filled in once the call answers
+
+
+class ClientCrash(BaseException):
+    """Raised where the real SDK crashes the process. Not an ``Exception``, so no handler of the
+    driver's turns it into an answer."""
 
 
 class Gate:
@@ -283,8 +290,12 @@ class FakeMooncakeStore:
 
     def _answer(self, method, args, kwargs, count, real: Callable[[int], int]) -> list[int]:
         call = self._record(method, args, kwargs)
+        # The 0.3.13 binding checks for a closed client in the session calls only, and the others
+        # dereference it (store_py.cpp:2385-2394, 2844-2861, 3074-3131).
+        if self.closed and method in ("batch_get_into", "batch_is_exist"):
+            raise ClientCrash(f"{method} on a closed client crashes the process")
         if self.closed and method.startswith("batch_"):
-            return []  # a closed 0.3.13 client answers every batch call with no answer at all
+            return []
         with self._lock:
             gate = self._gates[method].popleft() if self._gates[method] else None
             step = self._steps[method].popleft() if self._steps[method] else None

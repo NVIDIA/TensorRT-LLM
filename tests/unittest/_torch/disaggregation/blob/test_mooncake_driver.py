@@ -19,7 +19,7 @@ import math
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
 import numpy as np
@@ -108,11 +108,19 @@ def key(name: str) -> str:
 
 class Bench:
     """A ``MooncakeDriver`` over a fake SDK, with ``slots`` registered host slots; ``tuning`` goes
-    to the driver."""
+    to the driver. ``wrap_client``, given the fake, builds ``client``, the SDK client the driver
+    calls; by default it is the fake itself."""
 
-    def __init__(self, slots: int = 4, pool: FakePool | None = None, **tuning: int) -> None:
+    def __init__(
+        self,
+        slots: int = 4,
+        pool: FakePool | None = None,
+        wrap_client: Callable[[FakeMooncakeStore], object] | None = None,
+        **tuning: int,
+    ) -> None:
         self.fake = FakeMooncakeStore(pool)
-        self.driver = MooncakeDriver(self.fake, **tuning)
+        self.client = self.fake if wrap_client is None else wrap_client(self.fake)
+        self.driver = MooncakeDriver(self.client, **tuning)
         self.buffer = HostBuffer(SLOT * slots, fill=0x2D)
         layout = RegionLayout(SLOT, slots)
         self.handle = self.driver.register(self.buffer.address, self.buffer.nbytes, layout)
@@ -207,6 +215,10 @@ class TestMooncakeDriverConformance(DriverConformance):
     def make_blocked_put(self):
         sdk = KeyGatedClient(FakeMooncakeStore(), PUT_RANGES, key("blocked"))
         return MooncakeDriver(sdk), key("blocked"), sdk.entered, sdk.release.set
+
+    def make_put_still_reading_the_source(self):
+        """The blocked put's gate stands before the scatter, the call that reads the source."""
+        return self.make_blocked_put()
 
     def make_held_key(self):
         pool = FakePool()
@@ -426,16 +438,20 @@ def test_a_put_holds_its_slot_until_its_scatter_returns() -> None:
 def test_drain_cancels_the_rows_no_worker_took() -> None:
     bench = Bench(workers=1, bytes_per_call=SLOT)
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
+    bench.write(2, b"pppppppp")
     gate = bench.fake.block(GET)
-    op = bench.driver.get(bench.rows("A", "B"))
+    rows = bench.rows("A", "B", "P")
+    op = bench.driver.get(rows[:2])
     try:
         assert gate.entered.wait(WAIT_S)
+        put = bench.driver.put(rows[2:])
         assert bench.driver.drain(0.0) is False  # A's part is still in the SDK
     finally:
         gate.release.set()
     results, access_ended = bench.settle(op)
     assert summary(results) == [("ready", None), ("cancelled", None)] and access_ended
-    assert bench.keys_of(GET) == [key("A")]
+    assert summary(bench.settle(put)[0]) == [("cancelled", None)]
+    assert bench.keys_of(GET) == [key("A")] and bench.fake.calls_to(PUT_START) == []
     assert bench.driver.drain(WAIT_S) is True
 
 
@@ -634,16 +650,25 @@ def wait_for_an_escape(escapes: list[BaseException]) -> None:
 def test_a_part_whose_worker_thread_stops_faults_and_the_other_workers_go_on(
     thread_escapes: list[BaseException],
 ) -> None:
-    bench = Bench(workers=2, bytes_per_call=SLOT)  # a part per row
+    # A part per row; B's call waits in front of the fake, so A's call is the one scripted.
+    bench = Bench(
+        workers=2,
+        bytes_per_call=SLOT,
+        wrap_client=lambda fake: KeyGatedClient(fake, GET, key("B")),
+    )
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
     bench.fake.script(GET, SystemExit())  # escapes every handler: A's worker thread ends
-    results, access_ended = bench.run("get", "A", "B")
+    op = bench.driver.get(bench.rows("A", "B"))
+    try:
+        wait_for_an_escape(thread_escapes)
+    finally:
+        bench.client.release.set()
+    results, access_ended = bench.settle(op)
     assert summary(results) == [
         ("fault", "the worker stopped before the row was decided"),
         ("ready", None),  # on the other worker
     ]
-    assert not access_ended and bench.driver.access_unprovable(bench.last)
-    wait_for_an_escape(thread_escapes)
+    assert not access_ended and bench.driver.access_unprovable(op)
 
 
 def test_once_no_worker_is_left_queued_rows_fault_and_operations_are_rejected(
@@ -825,6 +850,15 @@ def test_only_rows_that_already_exist_are_checked_for_existence(case: str) -> No
     assert summary(results) == [("ready", None), *expected, ("declined", None)]
     assert bench.keys_of("batch_is_exist") == [key("B"), key("C")]
     assert access_ended
+
+
+def test_a_row_that_started_behind_one_that_did_not_is_written_from_its_own_slot() -> None:
+    bench = Bench()
+    bench.fill_sources("put", "A", "B")
+    bench.store(A=b"A" * SLOT)  # A's start answers OBJECT_ALREADY_EXISTS; B's starts
+    results, access_ended = bench.run("put", "A", "B")
+    assert summary(results) == [("ready", None)] * 2 and access_ended
+    assert bench.fake.pool.objects == {key("A"): b"A" * SLOT, key("B"): b"B" * SLOT}
 
 
 # Session bookkeeping.
@@ -1127,6 +1161,17 @@ def test_an_unprovable_put_leaves_its_session_to_the_master() -> None:
     assert bench.driver.stats()["put_keys_left_to_master"] == 1
 
 
+def test_a_put_runs_after_an_unprovable_put() -> None:
+    bench = Bench(workers=2)  # puts occupy at most one worker
+    bench.fill_sources("put", "A", "B")
+    bench.fake.script(PUT_RANGES, RuntimeError("bad pointer"))
+    rows = bench.rows("A", "B")
+    _, access_ended = bench.settle(bench.driver.put(rows[:1]))
+    assert not access_ended
+    results, access_ended = bench.settle(bench.driver.put(rows[1:]))
+    assert summary(results) == [("ready", None)] and access_ended
+
+
 LEASE_EXPIRED_CASES = {
     # the first read's answers, the reread's, the results, whether access ended
     "reread_ready": ([None, -707, None], [None], "RRR", True),
@@ -1151,6 +1196,9 @@ def test_rows_whose_lease_expired_are_reread_once_and_both_reads_must_end_access
     assert "".join(r.status.value[0].upper() for r in results) == statuses
     expired = [key(name) for name, answer in zip("ABC", first) if answer == -707]
     assert [call.args[0] for call in bench.fake.calls_to(GET)] == [[key(n) for n in "ABC"], expired]
+    for slot, (name, result) in enumerate(zip("ABC", results)):
+        if result.status is RowStatus.READY:  # a reread lands in its own row's slot too
+            assert bench.read(slot) == name.encode() * SLOT
     assert access_ended is ended
     assert bench.driver.drain(WAIT_S) is ended  # False at once when unprovable
 
