@@ -349,7 +349,7 @@ def _build_pool_views_for_variant(
     return pool_views
 
 
-def _build_page_table_v2(manager) -> KVCachePageTable:
+def _build_page_table_v2(manager: KVCacheManagerV2) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
     Uses KVCacheManagerV2's public ``pool_group_descs`` layout API and

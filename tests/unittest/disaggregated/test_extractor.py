@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -262,7 +263,13 @@ def test_layer_group_meta_serialization():
     assert KVCachePageTable.from_dict(d).layer_groups[0].pool_views[0].num_kv_heads is None
 
 
-def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_list=(640,)):
+def _make_fake_v2_manager(
+    attrs: dict[tuple[int, Role], SimpleNamespace],
+    role_mapper_kinds: dict[Role, MapperKind],
+    *,
+    num_pools: int = 1,
+    slot_bytes_list: tuple[int, ...] = (640,),
+) -> Mock:
     """Build a minimal duck-typed KVCacheManagerV2 for _build_page_table_v2.
 
     ``attrs`` keeps the storage-layer shape ``{(layer_id, role):
@@ -271,8 +278,6 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
     coalesced buffer follows ascending offset, mirroring how the real
     storage config assigns offsets in ``buffer_ids`` order.
     """
-    from types import SimpleNamespace
-
     base = 0x1000
 
     per_pool: dict[int, list] = {}
