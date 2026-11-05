@@ -332,6 +332,7 @@ class TestSplitGpuBudgetForDraft:
         # covered in test_kv_cache_estimation.py; this test is about the windows.
         target_kv_config = KvCacheConfig(enable_block_reuse=False)
         mode = Mock()
+        mode.is_dflash.return_value = False
         mode.is_external_drafter.return_value = False
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
         # one-engine arm; this test's config is a drafter outside the engine.

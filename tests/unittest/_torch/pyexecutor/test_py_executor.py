@@ -761,6 +761,30 @@ def test_model_validation_fails_only_the_request_it_rejects() -> None:
     assert executor._validate_request_budget.call_count == 2
 
 
+def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
+    requests = [_make_admission_request(i) for i in range(3)]
+    for request, encoder_output_len in zip(requests, (16, 17, None)):
+        request.try_get_encoder_output_len = lambda length=encoder_output_len: length
+    executor = _make_admission_executor(None, requests)
+    executor.model_engine.max_num_tokens = 16
+    executor.model_engine.encoder_max_num_tokens = 16
+    executor.resource_manager = Mock(
+        get_request_kv_block_budgets=Mock(return_value=[]),
+        get_resource_manager=Mock(return_value=None),
+    )
+    for name in ("_validate_request_budget", "_validate_encoder_output_len"):
+        setattr(executor, name, types.MethodType(getattr(PyExecutor, name), executor))
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [requests[0], requests[2]]
+    assert executor.active_requests == [requests[0], requests[2]]
+    executor._handle_errors.assert_called_once()
+    (error_msg,), kwargs = executor._handle_errors.call_args
+    assert "The number of encoder tokens (17) exceeds the limit value (16)" in error_msg
+    assert kwargs == {"requests": [requests[1]], "charge_budget": False}
+
+
 def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None:
     order = []
     model = types.SimpleNamespace(validate_request=lambda request: order.append("model"))
@@ -2781,6 +2805,8 @@ def _make_adp_request(
 
 
 class _StubADPExecutor:
+    _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
+
     def __init__(
         self,
         *,
@@ -2823,7 +2849,11 @@ class _StubADPExecutor:
             else enable_non_overlap_adp_forward_intent
         )
         self.add_dummy_calls = []
-        self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
+        self.model_engine = Mock(
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            _dspark_confidence_enabled=False,
+        )
 
         self.dist = Mock()
         # Peers are modeled through peer_forward_intent; tp_size only tells the
@@ -3207,6 +3237,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         enable_attention_dp=False,
         adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
         max_num_active_requests=max_num_active_requests,
+        canceled_req_ids=[],
         enable_iter_perf_stats=False,
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
@@ -3216,6 +3247,9 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         _kv_cache_capacity={},
     )
     seen = {}
+    stub._cancel_queued_context_requests = types.MethodType(
+        PyExecutor._cancel_queued_context_requests, stub
+    )
     stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
 
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
@@ -3293,6 +3327,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
         max_num_active_requests=4,
         is_benchmark_disagg=False,
+        canceled_req_ids=[],
         enable_iter_perf_stats=False,
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
@@ -3301,7 +3336,11 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
     )
-    for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
+    for name in (
+        "_get_request_admission_capacity",
+        "_pop_from_waiting_queue",
+        "_cancel_queued_context_requests",
+    ):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
     live = []
     stub._fetch_and_enqueue_requests = lambda queue, num_live: live.append(num_live)
@@ -4761,6 +4800,7 @@ def _make_stream_executor(requests):
     executor.perf_manager = MagicMock()
     executor.iter_counter = 1
     executor.stream_interval = 20
+    executor.first_content_emit_iters = 1
     executor.disable_overlap_scheduler = False
     executor.dist = types.SimpleNamespace(rank=0, world_size=1)
     executor.kv_cache_transceiver = None
