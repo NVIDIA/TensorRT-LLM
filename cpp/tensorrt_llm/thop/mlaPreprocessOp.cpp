@@ -122,10 +122,15 @@ void mlaContextPreprocess(torch::Tensor q, torch::Tensor k, torch::Tensor const&
     CHECK_INPUT(q, q.scalar_type());
     CHECK_INPUT(k, q.scalar_type());
     TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && v.dim() == 2 && num_heads > 0);
-    TORCH_CHECK(q.size(1) == num_heads * 192 && k.size(1) == num_heads * 192);
+    TORCH_CHECK(q.size(1) % num_heads == 0 && k.size(1) == q.size(1) && v.size(1) % num_heads == 0);
+    auto const qkHeadDim = q.size(1) / num_heads;
+    auto const vHeadDim = v.size(1) / num_heads;
+    TORCH_CHECK((qkHeadDim == 128 && vHeadDim == 128) || (qkHeadDim == 192 && vHeadDim == 128)
+            || (qkHeadDim == 256 && vHeadDim == 256),
+        "MLA context preprocessing supports QK/V=(128,128), (192,128) or (256,256)");
     TORCH_CHECK(v.device() == q.device() && k.device() == q.device());
     TORCH_CHECK(v.scalar_type() == q.scalar_type() && v.size(0) == k.size(0));
-    TORCH_CHECK(v.size(1) == num_heads * 128 && v.stride(1) == 1);
+    TORCH_CHECK(v.stride(1) == 1 && v.stride(0) >= v.size(1));
     CHECK_INPUT(cu_q_seqlens, torch::kInt32);
     CHECK_INPUT(sequence_lengths, torch::kInt32);
     CHECK_INPUT(cos_sin_cache, torch::kFloat32);
@@ -151,8 +156,11 @@ void mlaContextPreprocess(torch::Tensor q, torch::Tensor k, torch::Tensor const&
     TORCH_CHECK(bmm1_scale.device() == q.device() && bmm2_scale.device() == q.device());
     if (fp8)
     {
-        // The shared quantizer consumes the kv_b_proj split view of V.
-        TORCH_CHECK(v.stride(0) == num_heads * 256);
+        constexpr int64_t kVectorAlignmentBytes = 16;
+        TORCH_CHECK(v.stride(0) * v.element_size() % kVectorAlignmentBytes == 0,
+            "FP8 MLA context requires a 16-byte-aligned V token stride");
+        TORCH_CHECK(reinterpret_cast<std::uintptr_t>(v.data_ptr()) % kVectorAlignmentBytes == 0,
+            "FP8 MLA context requires a 16-byte-aligned V pointer");
     }
     else
     {
@@ -194,9 +202,10 @@ void mlaContextPreprocess(torch::Tensor q, torch::Tensor k, torch::Tensor const&
         params.head_num = num_heads;
         params.max_input_seq_len = max_input_seq_len;
         params.meta.kv_lora_rank = 512;
-        params.meta.qk_nope_head_dim = 128;
+        params.meta.qk_nope_head_dim = qkHeadDim - 64;
         params.meta.qk_rope_head_dim = 64;
-        params.meta.v_head_dim = 128;
+        params.meta.v_head_dim = vHeadDim;
+        params.v_token_stride_elements = v.stride(0);
         params.cache_type = tk::cacheTypeFromQuantMode(mode);
         params.quant_scale_kv = kv_scale_orig_quant ? kv_scale_orig_quant->data_ptr<float>() : nullptr;
         if (latent_cache)

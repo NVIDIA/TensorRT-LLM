@@ -1839,17 +1839,18 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 template <typename T>
 void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(total_kv_len >= 0, "MLA Context: total_kv_len must be nonnegative");
     TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8 || params.cache_type == KvCacheDataType::NVFP4,
         "MLA Context: cache_type must be FP8 or NVFP4");
     TLLM_CHECK_WITH_INFO(params.q_buf != nullptr, "MLA Context: q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.k_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.k_buf != nullptr,
         "MLA Context: k_buf must be non-null in non-absorption mode");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.v_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.v_buf != nullptr,
         "MLA Context: v_buf must be non-null in non-absorption mode");
     TLLM_CHECK_WITH_INFO(params.quant_q_buf != nullptr, "MLA Context: quant_q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_k_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.quant_k_buf != nullptr,
         "MLA Context: quant_k_buf must be non-null in non-absorption mode");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_v_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.quant_v_buf != nullptr,
         "MLA Context: quant_v_buf must be non-null in non-absorption mode");
     TLLM_CHECK_WITH_INFO(params.absorption_mode || params.v_token_stride_elements >= 0,
         "MLA Context: V token stride must be nonnegative");
@@ -1929,25 +1930,48 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         }
         else
         {
-            // The Q or K tensor has layout of [num_tokens, head_num, 192] in the non-absorption mode.
-            // The V tensor has layout of [num_tokens, head_num, 128] in the non-absorption mode.
-            // Convert Q, K, V to FP8 in non-absorption mode.
-
-            constexpr int threads_per_block = 384;
-            constexpr int num_tokens_per_block = threads_per_block * 16 / 192 * sizeof(T);
-            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
-
-            TLLM_LOG_DEBUG(
-                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
-
-            quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
-                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, srcVTokenStride,
-                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            // Expanded Q/K and V can have different widths. Keep the D192/V128
+            // launch geometry while admitting the equal-width context kernels.
+            auto launch = [&](auto nopeDimTag, auto valueDimTag, auto blockSizeTag)
+            {
+                constexpr int kNopeDim = decltype(nopeDimTag)::value;
+                constexpr int kValueDim = decltype(valueDimTag)::value;
+                constexpr int kRopeDim = 64;
+                constexpr int kQkDim = kNopeDim + kRopeDim;
+                constexpr int kThreadsPerBlock = decltype(blockSizeTag)::value;
+                constexpr int kTokensPerBlock = kThreadsPerBlock * 16 / kQkDim * sizeof(T);
+                // Empty cached partitions still need the Q quantization and scales.
+                int const tokens = std::max(params.acc_q_len, total_kv_len);
+                dim3 grid(int(tensorrt_llm::common::divUp(tokens, kTokensPerBlock)), 1, params.head_num);
+                quantizeCopyInputToFp8Kernel<T, kThreadsPerBlock, kNopeDim, kRopeDim, kValueDim, false>
+                    <<<grid, kThreadsPerBlock, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                        params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            };
+            TLLM_CHECK_WITH_INFO(
+                params.meta.qk_rope_head_dim == 64, "Expanded MLA FP8 quantization requires RoPE dimension 64");
+            if (params.meta.qk_nope_head_dim == 64 && params.meta.v_head_dim == 128)
+            {
+                launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{},
+                    std::integral_constant<int, 256>{});
+            }
+            else if (params.meta.qk_nope_head_dim == 128 && params.meta.v_head_dim == 128)
+            {
+                launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{},
+                    std::integral_constant<int, 384>{});
+            }
+            else if (params.meta.qk_nope_head_dim == 192 && params.meta.v_head_dim == 256)
+            {
+                launch(std::integral_constant<int, 192>{}, std::integral_constant<int, 256>{},
+                    std::integral_constant<int, 256>{});
+            }
+            else
+            {
+                TLLM_THROW("Expanded MLA FP8 quantization supports QK/V=(128,128), (192,128) or (256,256)");
+            }
         }
     }
     else

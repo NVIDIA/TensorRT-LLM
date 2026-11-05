@@ -207,6 +207,7 @@ class PrimsTSFmha(PhasedFmha):
     SUPPORTED_MLA_SMS = frozenset({100, 103, 107})
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
+    SUPPORTED_MLA_CONTEXT_HEAD_DIMS = {(128, 128), (192, 128), (256, 256)}
     SUPPORTED_DECODE_HEAD_DIMS = {64, 128, 256}
     SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
     MAX_DECODE_GQA_RATIO = 32
@@ -449,25 +450,29 @@ class PrimsTSFmha(PhasedFmha):
         if is_mla and has_context:
             if input_type != AttentionInputType.context_only:
                 return False, "MLA context must be dispatched separately from generation."
-            if (
-                attn.head_dim,
-                attn.qk_nope_head_dim,
-                attn.qk_rope_head_dim,
-                attn.v_head_dim,
-                attn.kv_lora_rank,
-            ) != (192, 128, 64, 128, 512):
-                return False, "MLA context requires QK=192, V=128 and latent=512."
+            if (attn.head_dim, attn.v_head_dim) not in self.SUPPORTED_MLA_CONTEXT_HEAD_DIMS:
+                return False, "MLA context supports QK/V=(128,128), (192,128) or (256,256)."
+            if attn.kv_lora_rank != 512 or attn.qk_rope_head_dim != 64:
+                return (
+                    False,
+                    "native MLA context cache preparation requires latent=512 and RoPE=64.",
+                )
+            if attn.qk_nope_head_dim != attn.head_dim - attn.qk_rope_head_dim:
+                return (
+                    False,
+                    "MLA context QK dimension must equal its non-RoPE plus RoPE dimensions.",
+                )
             if attn.num_kv_heads != attn.num_heads:
                 return False, "MLA context requires expanded K/V for every query head."
             if k is None or v is None or fwd.is_fused_qkv:
                 return False, "MLA context requires separate Q/K/V."
-            if q.shape[1] != attn.num_heads * 192:
+            if q.shape[1] != attn.num_heads * attn.head_dim:
                 return False, "MLA context query has an incompatible extent."
             if (
                 k.ndim != 2
-                or k.shape[1] != attn.num_heads * 192
+                or k.shape[1] != attn.num_heads * attn.head_dim
                 or v.ndim != 2
-                or v.shape != (k.shape[0], attn.num_heads * 128)
+                or v.shape != (k.shape[0], attn.num_heads * attn.v_head_dim)
             ):
                 return False, "MLA context K/V have incompatible extents."
             if (
@@ -478,9 +483,11 @@ class PrimsTSFmha(PhasedFmha):
                 or not k.is_contiguous()
             ):
                 return False, "MLA context requires contiguous K and matching Q/K/V dtype/device."
-            if v.stride(1) != 1 or (is_fp8_mla and v.stride(0) != attn.num_heads * 256):
-                return False, "FP8 MLA context requires the strided kv_b_proj V view."
-            if output.numel() != q.shape[0] * attn.num_heads * 128:
+            if v.stride(1) != 1 or v.stride(0) < attn.num_heads * attn.v_head_dim:
+                return False, "MLA context requires nonoverlapping V rows with unit feature stride."
+            if is_fp8_mla and v.stride(0) * v.element_size() % 16:
+                return False, "FP8 MLA context requires a 16-byte-aligned V token stride."
+            if output.numel() != q.shape[0] * attn.num_heads * attn.v_head_dim:
                 return False, "MLA context output has an incompatible extent."
         elif is_mla:
             if has_context or input_type != AttentionInputType.generation_only:
@@ -1331,7 +1338,11 @@ class PrimsTSFmha(PhasedFmha):
             ("kv_indptr", (batch_size + 1,), torch.int32),
             ("bmm1_scale", (2,), torch.float32),
             ("bmm2_scale", (1,), torch.float32),
-            ("v", (k.shape[0], self.attn.num_heads * 128), torch.float8_e4m3fn if fp8 else q.dtype),
+            (
+                "v",
+                (k.shape[0], self.attn.num_heads * self.attn.v_head_dim),
+                torch.float8_e4m3fn if fp8 else q.dtype,
+            ),
         ]
         if fp8:
             tensors.extend(
@@ -1404,8 +1415,8 @@ class PrimsTSFmha(PhasedFmha):
         q_capacity, kv_capacity = _mla_context_capacities(
             params.input_seq_length,
             params.max_past_kv_length,
-            head_dim=192,
-            head_dim_vo=128,
+            head_dim=attn.head_dim,
+            head_dim_vo=attn.v_head_dim,
             qk_dtype=q_processed.dtype,
             pv_dtype=v_processed.dtype,
             output_dtype=params.output.dtype,
@@ -1431,8 +1442,8 @@ class PrimsTSFmha(PhasedFmha):
                 max_kv_len=kv_capacity,
                 num_qo_heads=attn.num_heads,
                 num_kv_heads=attn.num_heads,
-                head_dim=192,
-                head_dim_vo=128,
+                head_dim=attn.head_dim,
+                head_dim_vo=attn.v_head_dim,
                 q_dtype=q_processed.dtype,
                 k_dtype=k_processed.dtype,
                 v_dtype=v_processed.dtype,
@@ -1444,9 +1455,9 @@ class PrimsTSFmha(PhasedFmha):
             )
             self._mla_context_wrappers[key] = wrapper
         wrapper.run(
-            q_processed.view(-1, attn.num_heads, 192),
-            k_processed.view(-1, attn.num_heads, 192),
-            v_processed.view(-1, attn.num_heads, 128),
+            q_processed.view(-1, attn.num_heads, attn.head_dim),
+            k_processed.view(-1, attn.num_heads, attn.head_dim),
+            v_processed.view(-1, attn.num_heads, attn.v_head_dim),
             qo_indptr,
             kv_indptr,
             out=params.output,

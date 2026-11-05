@@ -69,6 +69,9 @@ class _TensorSpec:
     def numel(self) -> int:
         return math.prod(self.shape)
 
+    def element_size(self) -> int:
+        return self.dtype.itemsize
+
     def stride(self, dim: int) -> int:
         if dim == 1:
             return 1
@@ -163,6 +166,8 @@ def _support_result(
     position_embedding_type: int = 0,
     kv_lora_rank: int | None = None,
     qk_rope_head_dim: int | None = None,
+    qk_nope_head_dim: int | None = None,
+    v_head_dim: int | None = None,
     mla_kv_cache_residual_dim: int = 0,
     has_output: bool = True,
     attention_window_size: int = 128,
@@ -191,6 +196,10 @@ def _support_result(
         attn.kv_lora_rank = kv_lora_rank
     if qk_rope_head_dim is not None:
         attn.qk_rope_head_dim = qk_rope_head_dim
+    if qk_nope_head_dim is not None:
+        attn.qk_nope_head_dim = qk_nope_head_dim
+    if v_head_dim is not None:
+        attn.v_head_dim = v_head_dim
 
     output_dtype = dtype if output_dtype is None else output_dtype
     if kv_dtype is None:
@@ -201,7 +210,9 @@ def _support_result(
     num_tokens = 4 * query_width
     q = _TensorSpec((num_tokens, q_width), dtype)
     mla_context = is_mla and attention_input_type == AttentionInputType.context_only
-    output_width = attn.num_heads * (128 if mla_context else 512 if is_mla else head_dim)
+    output_width = attn.num_heads * (
+        attn.v_head_dim if mla_context else 512 if is_mla else head_dim
+    )
     forward_args = AttentionForwardArgs(
         output=_TensorSpec((num_tokens, output_width), output_dtype) if has_output else None,
         attention_input_type=attention_input_type,
@@ -300,7 +311,7 @@ def _support_result(
     k = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     v = (
         _TensorSpec(
-            (4, attn.num_kv_heads * (128 if mla_context else head_dim)),
+            (4, attn.num_kv_heads * (attn.v_head_dim if mla_context else head_dim)),
             dtype,
             contiguous=not mla_context,
         )
@@ -320,10 +331,13 @@ def _support_result(
 
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_supports_mla_context(num_heads: int, fp8: bool) -> None:
+@pytest.mark.parametrize("head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
+def test_supports_mla_context(num_heads: int, fp8: bool, head_dim: int, v_head_dim: int) -> None:
     supported, reason = _support_result(
         attention_input_type=AttentionInputType.context_only,
-        head_dim=192,
+        head_dim=head_dim,
+        qk_nope_head_dim=head_dim - 64,
+        v_head_dim=v_head_dim,
         is_mla=True,
         num_heads=num_heads,
         num_kv_heads=num_heads,
@@ -333,6 +347,33 @@ def test_supports_mla_context(num_heads: int, fp8: bool) -> None:
         quant_mode=QuantMode.from_description(use_fp8_kv_cache=fp8),
     )
     assert supported, reason
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_reason",
+    [
+        ({"head_dim": 192, "v_head_dim": 256}, "supports QK/V"),
+        ({"head_dim": 256, "v_head_dim": 128}, "supports QK/V"),
+        ({"head_dim": 64, "v_head_dim": 64}, "supports QK/V"),
+        ({"qk_nope_head_dim": 64}, "non-RoPE plus RoPE"),
+        ({"kv_lora_rank": 256}, "cache preparation requires"),
+        ({"qk_rope_head_dim": 32}, "cache preparation requires"),
+    ],
+)
+def test_mla_context_rejects_unsupported_geometry(overrides: dict, expected_reason: str) -> None:
+    args = dict(
+        attention_input_type=AttentionInputType.context_only,
+        head_dim=192,
+        is_mla=True,
+        num_heads=6,
+        num_kv_heads=6,
+        has_separate_kv=True,
+        is_fused_qkv=False,
+    )
+    args.update(overrides)
+    supported, reason = _support_result(**args)
+    assert not supported
+    assert expected_reason in reason
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -612,7 +653,7 @@ def test_fp8_mla_supported(
         ({"output_dtype": torch.float8_e4m3fn}, "output dtype must match"),
         ({"has_separate_kv": True}, "MLA decode requires query-only input"),
         ({"is_fused_qkv": True}, "MLA decode requires query-only input"),
-        ({"attention_input_type": AttentionInputType.context_only}, "MLA context requires QK=192"),
+        ({"attention_input_type": AttentionInputType.context_only}, "MLA context supports QK/V"),
         ({"attention_input_type": AttentionInputType.mixed}, "dispatched separately"),
         ({"is_spec_dec_tree": True}, "tree speculative decoding"),
         ({"has_sparse_attention": True}, "sparse attention"),
@@ -839,7 +880,7 @@ def test_is_supported_accepts_and_forwards_phase_keyword(
                 "head_dim": 576,
                 "is_mla": True,
             },
-            "MLA context requires QK=192",
+            "MLA context supports QK/V",
         ),
         (
             {
@@ -1177,25 +1218,31 @@ def test_sequence_lengths_are_live_source_view() -> None:
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("mask", [PredefinedAttentionMask.CAUSAL, PredefinedAttentionMask.FULL])
 @pytest.mark.parametrize("store_softmax_stats", [False, True])
+@pytest.mark.parametrize("head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
 def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     monkeypatch: pytest.MonkeyPatch,
     num_heads: int,
     fp8: bool,
     mask: PredefinedAttentionMask,
     store_softmax_stats: bool,
+    head_dim: int,
+    v_head_dim: int,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    attn = _Attention(head_dim=192, is_mla=True, num_heads=num_heads, num_kv_heads=num_heads)
+    attn = _Attention(head_dim=head_dim, is_mla=True, num_heads=num_heads, num_kv_heads=num_heads)
+    attn.qk_nope_head_dim = head_dim - 64
+    attn.v_head_dim = v_head_dim
     attn.quant_mode = QuantMode.from_description(use_fp8_kv_cache=fp8)
     attn._ensure_rope_table_size = Mock()
     attn.get_local_layer_idx = lambda _meta: 0
     attn.rotary_cos_sin = torch.empty(1)
     fmha = PrimsTSFmha(attn)
-    q = torch.empty(5, num_heads * 192, dtype=torch.bfloat16)
-    k = torch.empty(9, num_heads * 192, dtype=q.dtype)
-    v = torch.empty(9, num_heads * 256, dtype=q.dtype)[:, num_heads * 128 :]
+    q = torch.empty(5, num_heads * head_dim, dtype=torch.bfloat16)
+    k = torch.empty(9, num_heads * head_dim, dtype=q.dtype)
+    kv_width = num_heads * (attn.qk_nope_head_dim + v_head_dim)
+    v = torch.empty(9, kv_width, dtype=q.dtype)[:, num_heads * attn.qk_nope_head_dim :]
     qo_indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
-    output = torch.empty(5, num_heads, 128, dtype=q.dtype)
+    output = torch.empty(5, num_heads, v_head_dim, dtype=q.dtype)
     stats = torch.empty(5, num_heads, 2) if store_softmax_stats else None
     meta = SimpleNamespace(
         mla_prepare_ctx_cu_seqlens=lambda: qo_indptr,
@@ -1247,10 +1294,13 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.run.call_args.args[3] is qo_indptr
     assert wrapper.run.call_args.kwargs["softmax_stats"] is stats
     assert wrapper.run.call_args.kwargs["out"] is output
-    assert wrapper.run.call_args.args[1].shape == (9, num_heads, 192)
+    assert wrapper.run.call_args.args[1].shape == (9, num_heads, head_dim)
+    assert wrapper.run.call_args.args[2].shape == (9, num_heads, v_head_dim)
+    assert wrapper.plan.call_args.kwargs["head_dim"] == head_dim
+    assert wrapper.plan.call_args.kwargs["head_dim_vo"] == v_head_dim
     assert wrapper.plan.call_args.kwargs["store_softmax_stats"] is store_softmax_stats
-    assert wrapper.plan.call_args.kwargs["max_seq_len_q"] == 256
-    assert wrapper.plan.call_args.kwargs["max_kv_len"] == 128
+    assert wrapper.plan.call_args.kwargs["max_seq_len_q"] == (256 if head_dim == 192 else 4)
+    assert wrapper.plan.call_args.kwargs["max_kv_len"] == (128 if head_dim == 192 else 8)
     processed_dtype = torch.float8_e4m3fn if fp8 else q.dtype
     for name in ("q_dtype", "k_dtype", "v_dtype"):
         assert wrapper.plan.call_args.kwargs[name] == processed_dtype
