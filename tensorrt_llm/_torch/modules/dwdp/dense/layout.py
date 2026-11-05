@@ -161,7 +161,7 @@ def collect_dense_layout(
 
     Args:
         layers: ``(layer index, decoder layer)`` for every decoder layer, ascending; layers whose
-            roots are [] (layer 0 of Kimi-K3) are not covered.
+            roots are [] (for example, layer 0 of Kimi-K3) are not covered.
         config: Dense switches; ``segments``, ``min_bytes``, ``store_chunk_mb`` and ``strict``
             are used.
         num_ranks: DWDP group size ``N``.
@@ -389,7 +389,7 @@ def write_blob(segment: SegmentLayout, out: torch.Tensor, *, num_ranks: int) -> 
 
     ``out[:N * S]`` receives each anchor's ``source`` at its ``blob_offset`` and zeros elsewhere,
     which is exactly what a gather of ``L(layer)`` leaves in a slot; ``out[N * S:]`` is not
-    touched.  Used by the loopback store, Phase V references and unit tests.
+    touched.  Unit tests use it as the reference of a gathered blob.
 
     Args:
         segment: A segment of a collected layout (anchors with ``source``).

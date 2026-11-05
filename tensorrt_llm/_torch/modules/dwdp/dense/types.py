@@ -131,8 +131,8 @@ def ring_slot(segment: SegmentKind, position: int) -> int:
 
     Args:
         segment: Segment kind.
-        position: Index of the layer among the covered layers (ascending).  For Kimi-K3 the
-            covered layers are 1..92, so ``position = l - 1``: layer ``l`` takes slot
+        position: Index of the layer among the covered layers (ascending).  For example, the
+            covered layers of Kimi-K3 are 1..92, so ``position = l - 1``: layer ``l`` takes slot
             ``(l - 1) % 2`` of the attention ring and slot ``(l - 1) % 3`` of the MoE-dense ring.
 
     Returns:
@@ -1070,6 +1070,20 @@ class DenseRootsProvider(Protocol):
     """A decoder layer that names its dense roots.
 
     ``modules/dwdp`` does not import model code; a layer opts in by implementing this method.
+    The method is only part of a model's opt-in.  The model also:
+
+    * gives every decoder layer the same tables ``dense_dwdp_attr_allow`` (plain attribute names
+      that may anchor a storage) and ``dense_dwdp_exclude`` (parameters that stay replicated),
+      which default to empty;
+    * captures the dense DWDP manager when its layers are built, so the manager must be registered
+      before the model is built;
+    * calls the hooks of every covered layer in its forward: H0 (``ensure_primed``) before the
+      first layer, H1 (``wait_layer``) before the layer reads any of its weights, H2
+      (``attention_done``) after its last read of an attention weight and H3 (``layer_done``)
+      after its last read of a MoE-dense weight.
+
+    Setup verifies none of the last two: a hook that is missing or misplaced lets a layer read a
+    slot that another layer's weights have refilled.
     """
 
     def dense_dwdp_roots(self, segment: str) -> list[tuple[str, nn.Module]]:

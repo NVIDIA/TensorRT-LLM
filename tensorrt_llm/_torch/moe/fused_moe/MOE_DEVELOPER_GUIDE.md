@@ -760,7 +760,8 @@ constraints the other SMs do not:
 - **Locality domain excludes EPLB and DWDP.** Localized weight shards are built
   once from the loaded weights, so they cannot follow expert migration
   (`EPLB_UNSUPPORTED`) or parameter rebinding. DWDP is not an error: with
-  `uses_locality_domain` true, `_should_enable_dwdp` simply returns False.
+  `uses_locality_domain` true, `_dwdp_ineligibility` names the reason and DWDP
+  leaves the layer unmanaged.
   Both locality-domain kernels also fuse SwiGLU, so `plan_moe` declines any other
   activation: an NVFP4 Relu2 layer runs unpartitioned rather than being rejected.
 

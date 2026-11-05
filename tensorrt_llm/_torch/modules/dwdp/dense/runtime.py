@@ -36,15 +36,19 @@ holding a layer whose read window has closed.  Within a forward that is ``L(l + 
 
 With expert DWDP (``prefetch_next_pass``) the fill goes on into the first two layers of the next
 forward as the last layers free their slots, so a completed forward leaves the next one primed, as
-the expert prefetch does.  For Kimi-K3 (92 layers) the MoE-dense slots of layers 1 and 2 are those
-of layers 91 and 92, read until H3, so H3 of layers 91 and 92 enqueue them (H2 does with the
-attention segment alone).  The copies run on the expert DWDP copy stream, one FIFO.  Within a
-forward, with two expert prefetch slots, ``L(l)`` is enqueued right before ``E(l)`` (``... E(l+1),
-L(l+2), E(l+2), L(l+3) ...``): H2 of ``l - 2`` runs before the MoE of ``l - 2`` finishes and issues
-``E(l)``.  The next forward's first two layers follow their expert copies when their MoE-dense
-slots free only at H3 (``E(1), L(1), E(2), L(2)`` for Kimi-K3); the next forward reads them only
-after the gap between executor steps.  With more expert prefetch slots each expert copy is issued
-earlier, ahead of its layer's dense copy.
+the expert prefetch does.  Each of those layers is enqueued at the first hook after which both of
+its slots are free: its attention slot frees at H2 of the last position holding the same slot
+(``ring_slot``), its MoE-dense slot at H3 of the last position holding that one.  Which hooks those
+are follows from the number of covered layers and the ring depths: for Kimi-K3 (92 covered layers)
+the MoE-dense slots of layers 1 and 2 are those of layers 91 and 92, so H3 of layers 91 and 92
+enqueue them (H2 does with the attention segment alone); with 90 covered layers, H2 of the last two
+would.  The copies run on the expert DWDP copy stream, one FIFO.  Within a forward, with two expert
+prefetch slots, ``L(l)`` is enqueued right before ``E(l)`` (``... E(l+1), L(l+2), E(l+2), L(l+3)
+...``): H2 of ``l - 2`` runs before the MoE of ``l - 2`` finishes and issues ``E(l)``.  The next
+forward's first two layers follow their expert copies when their MoE-dense slots free only at H3
+(``E(1), L(1), E(2), L(2)`` for Kimi-K3); the next forward reads them only after the gap between
+executor steps.  With more expert prefetch slots each expert copy is issued earlier, ahead of its
+layer's dense copy.
 
 Standalone, the copies run on the dense manager's own stream, ``... L(l+2), L(l+3) ...``, and the
 fill stops at the last layer: the next forward starts from the dense manager's priming.
@@ -137,9 +141,11 @@ class DenseDWDP:
 
     Layers are addressed by position ``p`` among the covered layers: the slot is
     ``ring_slot(seg, p)`` in every forward, and the fill reaches ``layers[p + 2]`` at H2 of
-    position ``p``.  For Kimi-K3 (layers 1..92) that is ``(l - 1) % 2``, ``(l - 1) % 3`` and
-    ``l + 2``; with ``prefetch_next_pass``, H3 of layers 91 and 92 enqueue layers 1 and 2 of the
-    next forward (H2 of them with the attention segment alone).
+    position ``p``.  With ``prefetch_next_pass``, the first two positions of the next forward are
+    enqueued once their slots free at the end of this one (see the module docstring).  For example,
+    for Kimi-K3 (covered layers 1..92) the slots are ``(l - 1) % 2`` and ``(l - 1) % 3``, the fill
+    reaches ``l + 2``, and H3 of layers 91 and 92 enqueue layers 1 and 2 of the next forward (H2 of
+    them with the attention segment alone).
 
     Lifecycle: constructed in setup P2 (records every consume event once on the current stream),
     :meth:`set_launcher` in P3, :meth:`fetch_blocking` in P4 and P5, :meth:`commit` in P6.  The

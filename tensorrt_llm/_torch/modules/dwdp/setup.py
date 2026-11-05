@@ -94,11 +94,13 @@ _EXPERT_WEIGHT_NAMES = (
 # the transport instead.
 _SCALE_KEYWORDS = ("scale", "scaling_factor", "dequant", "alpha")
 
-# Small parameters named ``*_act_scale`` are per-layer activation pre-quant scales
-# (``fc31_act_scale``, ``[1, hidden_size]``): the NVFP4 AWQ loader keeps one vector for every
-# expert of a layer, from the first expert it loads, and records the dtype the checkpoint stores
-# it in as ``<name>_checkpoint_dtype``.  They are classified by name, before the shape tests,
-# because with one expert per rank a ``[1, ...]`` parameter has a per-expert shape.
+# Under NVFP4, the only quantization of the MoE layers DWDP manages, small parameters named
+# ``*_act_scale`` are per-layer activation pre-quant scales (``fc31_act_scale``,
+# ``[1, hidden_size]``): the NVFP4 AWQ loader keeps one vector for every expert of a layer, from
+# the first expert it loads, and records the dtype the checkpoint stores it in as
+# ``<name>_checkpoint_dtype``.  They are classified by name, before the shape tests, because with
+# one expert per rank a ``[1, ...]`` parameter has a per-expert shape.  The rule does not hold for
+# a method whose activation scales are per expert (``[E_local, hidden_size]``).
 _ACT_SCALE_SUFFIX = "_act_scale"
 _CHECKPOINT_DTYPE_SUFFIX = "_checkpoint_dtype"
 
@@ -266,8 +268,8 @@ def setup_dwdp(
     free_mem, total_mem = torch.cuda.mem_get_info(device_id)
     logger.info(
         f"[DWDP Setup] GPU {device_id} memory before setup: "
-        f"free={free_mem/(1024**3):.2f}GB / total={total_mem/(1024**3):.2f}GB "
-        f"(used={((total_mem-free_mem)/(1024**3)):.2f}GB)"
+        f"free={free_mem/(1024**3):.2f}GiB / total={total_mem/(1024**3):.2f}GiB "
+        f"(used={((total_mem-free_mem)/(1024**3)):.2f}GiB)"
     )
     logger.info(
         f"[DWDP Setup] Starting DWDP setup: dwdp_rank={mapping.dwdp_rank}, "
@@ -354,8 +356,8 @@ def setup_dwdp(
         free_mem, total_mem = torch.cuda.mem_get_info(device_id)
         logger.info(
             f"[DWDP Setup] GPU {device_id} memory after transport: "
-            f"free={free_mem / (1024**3):.2f}GB / total={total_mem / (1024**3):.2f}GB "
-            f"(used={((total_mem - free_mem) / (1024**3)):.2f}GB)"
+            f"free={free_mem / (1024**3):.2f}GiB / total={total_mem / (1024**3):.2f}GiB "
+            f"(used={((total_mem - free_mem) / (1024**3)):.2f}GiB)"
         )
         peer_ranges = partition.peer_ranges
 
@@ -377,8 +379,8 @@ def setup_dwdp(
         free_mem, total_mem = torch.cuda.mem_get_info(device_id)
         logger.info(
             f"[DWDP Setup] GPU {device_id} memory after weight buffer: "
-            f"free={free_mem / (1024**3):.2f}GB / total={total_mem / (1024**3):.2f}GB "
-            f"(used={((total_mem - free_mem) / (1024**3)):.2f}GB)"
+            f"free={free_mem / (1024**3):.2f}GiB / total={total_mem / (1024**3):.2f}GiB "
+            f"(used={((total_mem - free_mem) / (1024**3)):.2f}GiB)"
         )
 
         # 6. Fill edge bytes

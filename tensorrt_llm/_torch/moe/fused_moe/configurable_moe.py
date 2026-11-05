@@ -240,14 +240,9 @@ class ConfigurableMoE(MoE):
             **kwargs,
         )
 
-        # ========== Optional DWDP integration ==========
-        # _create_and_sync_backend decided whether DWDP manages this layer, and
-        # sized and registered it (_decide_dwdp), before
-        # _create_comm_strategy_auto, so the factory can skip alltoall
-        # strategies for DWDP (VA path swaps param.data; the backend reads from
-        # its own weight attrs, no comm strategy needed).
-
         # ========== Create Communication Strategy ==========
+        # No layer of a DWDP mapping gets one, whether DWDP manages it or not
+        # (``_runs_under_dwdp``): every rank computes only its own tokens.
         self.comm = self._create_comm_strategy_auto()
 
         # ========== Model-owned finalize for do_finalize=False ==========
@@ -363,6 +358,10 @@ class ConfigurableMoE(MoE):
           depend on ``layer_load_balancer`` / ``initial_local_expert_ids``
           / etc., which only become known after the sync. Defer weight
           creation to the explicit ``backend.create_weights()`` call below.
+
+        Before the sync it also decides DWDP (``_decide_dwdp``), which sets
+        ``dwdp_manager`` and ``enable_dwdp`` and, for a layer DWDP manages,
+        this rank's expert layout.
         """
         from tensorrt_llm._torch.moe.fused_moe.create_moe import (
             create_moe_backend,
@@ -530,7 +529,7 @@ class ConfigurableMoE(MoE):
         """Decide whether DWDP manages this layer, and size a layer it manages.
 
         Without a registered ``DwdpManager`` nothing changes.  With one, an
-        eligible layer (``_should_enable_dwdp``) stores only this rank's range
+        eligible layer (``_dwdp_ineligibility`` is None) stores only this rank's range
         of the expert partition (``MoE._init_dwdp_expert_layout``) and is
         registered with the manager (``add_layer``).  An ineligible layer
         keeps all ``num_experts`` experts on every rank (a DWDP mapping has

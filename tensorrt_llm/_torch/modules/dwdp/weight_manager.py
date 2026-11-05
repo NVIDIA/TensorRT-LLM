@@ -331,12 +331,14 @@ class DWDPWeightManager:
 
     @property
     def use_gather(self) -> bool:
-        """Whether prefetches use the SM fabric gather (``TRTLLM_DWDP_PREFETCH_GATHER``)."""
+        """Whether prefetches use the SM fabric gather (``copy_mode: gather``; while ``copy_mode``
+        is unset, the deprecated ``TRTLLM_DWDP_PREFETCH_GATHER``)."""
         return self._use_gather
 
     @property
     def use_batched_prefetch(self) -> bool:
-        """Whether prefetches use one batched copy-engine copy per layer (``contention_opt``)."""
+        """Whether prefetches use one batched copy-engine copy per layer (``copy_mode: batched``;
+        while ``copy_mode`` is unset, ``contention_opt``)."""
         return self._use_batched_prefetch
 
     @property
@@ -365,11 +367,13 @@ class DWDPWeightManager:
         remote slices. Finally, records a prefetch_event so the compute stream
         can wait for the copy to complete.
 
-        Three transports share the per-peer plan: the default per-slice path
-        (one ``torch.Tensor.copy_`` per chunk), ``DwdpConfig.contention_opt``
+        Three transports share the per-peer plan, and ``DwdpConfig.copy_mode``
+        picks one: ``per_slice`` (one ``torch.Tensor.copy_`` per chunk), ``batched``
         (one ``cudaMemcpyBatchAsync`` per layer, 2 MiB sub-slices interleaved
-        across peers to limit single-link contention) and
-        ``TRTLLM_DWDP_PREFETCH_GATHER`` (one SM kernel per layer; see ``fabric_gather``).
+        across peers to limit single-link contention) and ``gather`` (one SM
+        kernel per layer; see ``fabric_gather``).  While ``copy_mode`` is unset,
+        the deprecated ``TRTLLM_DWDP_PREFETCH_GATHER`` selects the gather and
+        ``contention_opt`` the batched copy.
 
         This method returns immediately — all GPU work is enqueued on
         copy_stream and does not block the CPU.

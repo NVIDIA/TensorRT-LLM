@@ -432,6 +432,8 @@ the server waits at most `N` seconds for running request handlers (uvicorn's
 applies to the LLM, embedding and multimodal-encoder servers of `trtllm-serve`,
 in every frontend process; the disaggregated router keeps its own
 `--request_timeout` for the requests it forwards. It is off by default.
+[Bounding the Graceful Stop](../commands/trtllm-serve/trtllm-serve.rst#bounding-the-graceful-stop)
+in the `trtllm-serve` reference describes it for every server.
 
 ```yaml
 serve_graceful_shutdown_timeout_s: 30

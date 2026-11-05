@@ -206,7 +206,11 @@ def _check_segment(layout: DenseLayout, segment: SegmentLayout) -> None:
 def _layer_plan(
     layout: DenseLayout, layer: int, rank: int, tables: _AddressTables
 ) -> LayerCopyPlan:
-    """:func:`build_layer_plan` of a covered layer over tables :func:`_check_tables` accepted."""
+    """The gather of a covered layer on ``rank``, over tables :func:`_check_tables` accepted.
+
+    The row layout is the one :func:`build_layer_plan` describes; :func:`build_copy_plans` builds
+    the plans setup uses with it.
+    """
     peers = tuple(peer for peer in range(layout.num_ranks) if peer != rank)
     # Per enabled segment: its layout, the base of the slot holding ``layer`` and the local slices.
     targets = []
@@ -297,10 +301,14 @@ def build_copy_plans(
     chunk_bases: Sequence[Sequence[int]],
     slot_bases: Mapping[SegmentKind, Sequence[int]],
 ) -> dict[int, LayerCopyPlan]:
-    """:func:`build_layer_plan` for every covered layer, keyed by layer.
+    """The gather plan (:func:`_layer_plan`) of every covered layer on ``rank``, keyed by layer.
+
+    The address tables are checked once, as :func:`build_layer_plan` checks them for one layer.
 
     Raises:
-        ValueError: As :func:`build_layer_plan`, for any covered layer.
+        ValueError: ``rank`` outside ``[0, N)``; address tables of the wrong shape or alignment,
+            or with overlapping slots; or a segment of a covered layer that does not fit its
+            chunk or slot (see :func:`build_layer_plan`).
     """
     tables = _check_tables(layout, rank, chunk_bases, slot_bases)
     return {layer: _layer_plan(layout, layer, rank, tables) for layer in layout.layers}

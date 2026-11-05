@@ -101,10 +101,7 @@ class MappingBase:
         # MoE layer DWDP manages is installed by ``_init_dwdp_expert_layout``,
         # which ``ConfigurableMoE`` calls once its backend exists, from this
         # rank's range of the DWDP group's ``ExpertPartition``
-        # (``DwdpManager.expert_partition``): the balanced
-        # partition of any dwdp_size (e.g. 8 x 75 + 4 x 74 experts over
-        # dwdp_size = 12), a strided one with a capped last range, or a
-        # redundant one whose adjacent ranges overlap.
+        # (``DwdpManager.expert_partition``), which defines the partition kinds.
         # Record whether the caller explicitly requested a MoE TP/EP split
         # (the -1 sentinels mean "auto"). Model code (e.g. Kimi K3) uses this
         # to distinguish an explicit ``moe_tensor_parallel_size`` /
