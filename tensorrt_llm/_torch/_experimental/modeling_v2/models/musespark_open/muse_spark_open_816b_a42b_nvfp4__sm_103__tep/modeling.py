@@ -135,6 +135,10 @@ Dense projections and prefetch:
   kernel per shape on every rank. The other fast paths' GEMM calls on those
   modules (the built-in attention's, the pool GEMM, the unpool GEMM handed to
   the boundary) go through the same dispatchers.
+* ``wide_dense_gemms`` (tep8) gives those dispatchers a kernel for their calls of
+  9..32 rows as well, at the sites the TP size's table names (``kernels/dense_gemms``'
+  ``WIDE_KERNELS_BY_SM_TP``): the QKV projection. Each is flashinfer's split-K with the
+  ``split_k`` of the site's 8-row kernel, so every row gets its one-request bits.
 * ``dense_gemm_prefetch`` has those dispatchers also prefetch the next
   projection's weight into L2 on a side stream, a fork that both targets join
   by the end of their forward.
@@ -182,8 +186,9 @@ Hops and boundaries:
   steps of 9..1024 rows (two to 128 requests at K = 7) with ``ops/allreduce/post_attn_hop_wide``:
   the o_proj partial skips the built-in MNNVL all-reduce and one kernel reduces it, joins
   it into the residual and applies the pre-FFN norm on the cluster boundary's 9..32-row
-  split, on its own transport sized for 512 rows (one-shot below ``TWO_SHOT_ROWS`` rows,
-  two-shot with a per-row owner from there, unicast publication) -- a step of 513..1024 rows
+  split, on its own transport sized for 512 rows (one-shot below the group's cut
+  ``TWO_SHOT_ROWS_BY_RANKS`` -- 32 rows at tep4, 16 at tep8 -- two-shot with a per-row
+  owner from there, the same bits either way, unicast publication) -- a step of 513..1024 rows
   (a generation worker's) on a second, two-shot transport of 1024 rows built on the first such
   step -- launched after the
   o_proj GEMM rather than as its programmatic dependent. Bitwise the built-in
@@ -252,11 +257,12 @@ MoE:
   rows) and the TF32 ``Linear`` (above 128 rows). Steps with context rows and
   decode steps of at most 8 or more than 512 rows keep the class behind it. Not
   bitwise the built-in logits: its error is the FP32 accumulation's alone.
-* ``wide_moe_allreduce`` (tep4 on sm_103 only) puts a ``WideMoeAllReduce`` in
-  every MoE layer's ``all_reduce``: ``DecodeTarget`` arms them for a decode
-  forward of 129..1024 rows (above the fused finalize's 128), whose unfused MoE
-  output is then all-reduced on the MNNVL two-shot instead of the built-in NCCL
-  ring (``kernels/wide_moe_allreduce``); every other call, and every call of a
+* ``wide_moe_allreduce`` (tep4 and tep8 on sm_103) puts a
+  ``WideMoeAllReduce`` in every MoE layer's ``all_reduce``: ``DecodeTarget`` arms
+  them for a decode forward of 129..1024 rows (above the fused finalize's 128),
+  whose unfused MoE output is then all-reduced on the MNNVL two-shot (at tep8 over
+  the two trays' fabric) instead of the built-in NCCL ring
+  (``kernels/wide_moe_allreduce``); every other call, and every call of a
   prefill or mixed step, runs the built-in NCCL module.
 * ``finalize_two_shot`` (tep4 on sm_103 only) puts a ``FinalizeTwoShotWorkspace`` in
   front of the finalize transport in every MoE layer's fused finalize attribute:
@@ -299,7 +305,10 @@ installed by the shell's ``load_weights`` after the built-in loader
 
 * ``replicated_experts`` replicates each rank's ring predecessor's experts and
   patches every layer's experts module and routing method, whatever class the
-  MoE module itself has.
+  MoE module itself has. Its balanced placement takes the decode steps of up to 16
+  rows, and at tep8 up to 32 (three and four requests at K = 7;
+  ``ring_buddy.MAX_ROWS_BY_SM_TP``, keyed by the device's capability like the
+  composition).
 * ``persistent_experts`` routes the NVFP4 layers' stacked calls of at most 8
   rows to the persistent expert kernel. Without ``replicated_experts`` (tp 4)
   the stacked calls run over the rank's own expert block (the owner-only window,
@@ -894,24 +903,30 @@ _SM103_TEP4_ONLY_PATHS = frozenset(
         "wide_drafter_hops",
     }
 )
-#: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones.
+#: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones. Among
+#: them, ``wide_dense_gemms`` is TEP8's alone: its table (``dense_gemms.WIDE_KERNELS_BY_SM_TP``)
+#: has a TP8 row only, the QKV projection of 9..32-row decode steps on flashinfer's split-K 4
+#: (the 8-row cell's ``split_k``) in place of the built-in low-M dispatch's cuBLAS split-K and
+#: reduce; the attention output, pooler and unpooler projections keep the built-in dispatch.
 _TEP8_PATHS = _dispatch.BASE_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS
 #: The paths of ``_SM103_TEP4_ONLY_PATHS`` that sm103 TEP8 serves on top of ``_TEP8_PATHS``:
 #: those whose kernels take a TP8 rank -- any head count (the multi-request decode prep
 #: append), 2 KV heads of 8 query heads each (``multi_request_split_kv.RANK_KV_HEADS``), no
 #: rank shape (the router GEMM over the replicated router, the drafter arena compaction,
 #: the split sampler on the gathered row) or eight ranks over two trays' fabric
-#: (``post_attn_hop_wide``, ``head_sampler.VocabParallelWorkspace``). They act on decode
-#: steps of two or more requests (16 rows and up at K = 7), which every other TEP8 decode
-#: path leaves to the built-in modules: the decode prep append of every layer and the
-#: decode FMHA of the full-attention layers, the router logits of 9..512-row calls, the
-#: post-attention hop of 9..1024-row steps on its own transports, the verify head on
-#: each rank's vocabulary shard from 16 rows and the split verify sampler on
-#: 129..1024-row steps. The windowed drafter arena's compaction keeps the context-K/V
-#: fork and the verify fold in the plan over the windowed arena (``dispatch.compose``).
+#: (``post_attn_hop_wide``, ``head_sampler.VocabParallelWorkspace``, the MNNVL two-shot
+#: all-reduce ``wide_moe_allreduce`` arms). They act on decode steps of two or more
+#: requests (16 rows and up at K = 7), which every other TEP8 decode path leaves to the
+#: built-in modules: the decode prep append of every layer and the decode FMHA of the
+#: full-attention layers, the router logits of 9..512-row calls, the post-attention hop of
+#: 9..1024-row steps on its own transports, the verify head on each rank's vocabulary
+#: shard from 16 rows, the split verify sampler on 129..1024-row steps and the unfused MoE
+#: output all-reduce of 129..1024-row steps (above the fabric finalize's 128 rows; NCCL in
+#: the built-in). The windowed drafter arena's compaction keeps the context-K/V fork and
+#: the verify fold in the plan over the windowed arena (``dispatch.compose``).
 #: Left out: ``decode_kv_splits`` (its split acts only on the decode FMHA calls
-#: ``multi_request_split_kv`` declines and on mixed steps), ``wide_persistent_experts``
-#: (no sm103 composition serves its wide build yet) and the paths written for one tray.
+#: ``multi_request_split_kv`` declines and on mixed steps) and the paths written for one
+#: tray.
 _SM103_TEP8_MULTI_REQUEST_PATHS = frozenset(
     {
         "multi_request_prep_append",
@@ -921,6 +936,7 @@ _SM103_TEP8_MULTI_REQUEST_PATHS = frozenset(
         "vocab_parallel_head",
         "wide_split_sampler",
         "drafter_window_compact",
+        "wide_moe_allreduce",
     }
 )
 #: The fast paths written for any rank count whose output is bitwise the built-in

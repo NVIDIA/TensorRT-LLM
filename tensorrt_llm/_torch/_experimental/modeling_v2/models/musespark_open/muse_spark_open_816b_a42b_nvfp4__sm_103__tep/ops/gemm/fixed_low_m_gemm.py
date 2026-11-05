@@ -19,6 +19,8 @@ elements -- the same distance from the fp64 product as cuBLAS.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
@@ -29,7 +31,19 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 
 #: The split-K tactic ``(mma_m, mma_n, split_k, ab_stages)`` per ``(M, K, N)`` of a
 #: tep8 drafter (two trays) on sm103, chosen on GB300 with cold weights and PDL on;
-#: each one beats cuBLAS at its shape. Shapes not listed are not taken by this op's callers.
+#: each 8-row one beats cuBLAS at its shape. Shapes not listed are not taken by this op's
+#: callers. The blocks of 2..4 requests (16, 24 and 32 rows) are listed for the three shapes
+#: whose cuBLAS pick there is a split-K GEMM plus a reduce kernel (the convolution coefficient,
+#: qkv / context K/V and gate_up projections); o_proj and down_proj stay on cuBLAS's single-pass
+#: GEMM, so ``drafter_pdl_chain``'s entry triggers, which need all four successors listed at a
+#: width (``entry_rows``), keep acting on the one-request block only. The convolution
+#: coefficient rows are the tep4 table's, measured on GB300 at the same replicated shape; the
+#: qkv rows keep the 8-row ``split_k`` 4 (80 CTAs; ``mma_n`` 16 holds two requests' rows, 32
+#: three or four, at the 8 stages ``split_k`` 4 leaves it); the gate_up rows keep the 8-row
+#: grid (``mma_m`` 128, ``split_k`` 2, 112 CTAs) at the deepest pipeline the wider ``mma_n``
+#: leaves. Chosen from the shapes, not from a per-call sweep at tep8, so the table is in
+#: ``INSTALL_CHECKED``: a row flashinfer refuses stops the drafter's install instead of raising
+#: in the engine's warmup.
 SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     # DFlash 2 convolution coefficient projection (replicated).
     (8, 8192, 2048): (64, 8, 4, 10),
@@ -43,6 +57,16 @@ SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (8, 8192, 7168): (128, 8, 2, 6),
     # DFlash fc, one TP8 column shard (``drafter_fc_shard``).
     (8, 40960, 1024): (64, 8, 4, 12),
+    # Blocks of 2..4 requests (see above).
+    (16, 8192, 2048): (64, 16, 4, 8),
+    (24, 8192, 2048): (64, 16, 2, 11),
+    (32, 8192, 2048): (64, 16, 2, 11),
+    (16, 8192, 1280): (64, 16, 4, 9),
+    (24, 8192, 1280): (64, 32, 4, 8),
+    (32, 8192, 1280): (64, 32, 4, 8),
+    (16, 8192, 7168): (128, 16, 2, 6),
+    (24, 8192, 7168): (128, 32, 2, 5),
+    (32, 8192, 7168): (128, 32, 2, 5),
 }
 
 #: The same for a tep4 drafter (one tray) on sm103: every TP-sharded projection is
@@ -90,6 +114,13 @@ SPLITK_TACTICS_BY_SM_TP: dict[
     ((10, 3), 4): SPLITK_TACTICS_TP4,
 }
 
+#: The ``(compute capability, drafter TP size)`` tables whose every row ``spec_worker.install``
+#: checks with flashinfer's own validation before the drafter serves (``refused_rows``), as
+#: ``dense_gemms.install`` checks its cells: sm103 TP8, whose 16..32-row rows were chosen from
+#: the shapes, not from a sweep. Every row of the
+#: other tables ran in the sweep that chose it; their installs are unchanged.
+INSTALL_CHECKED: frozenset[tuple[tuple[int, int], int]] = frozenset({((10, 3), 8)})
+
 #: The kernel's row limit (the dispatcher's ``_MAX_M``).
 #: Shapes no table lists still run the built-in GEMM.
 MAX_M = 32
@@ -135,6 +166,47 @@ def tactic_for(m: int, k: int, n: int, tactics: dict | None = None):
     """The fixed tactic for this shape in ``tactics`` (a ``splitk_tactics`` table; the
     device's TP8 one when None), or None when the shape is not covered."""
     return (splitk_tactics() if tactics is None else tactics).get((m, k, n))
+
+
+@functools.lru_cache(maxsize=None)
+def tactic_error(m: int, k: int, n: int, tactic: tuple[int, int, int, int]) -> str | None:
+    """Why the split-K kernel cannot run ``tactic`` on ``x [m, k] @ weight [n, k].T``, or None.
+
+    flashinfer's own validation (``validate_tactic``: shared memory, K divisibility, tile
+    limits), the check ``dense_gemm.kernel_error`` makes for the target's cells; no launch.
+    """
+    try:
+        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+            SplitKTactic,
+            validate_tactic,
+        )
+    except ImportError as error:
+        return f"flashinfer's split-K kernel is not importable ({error})"
+    try:
+        validate_tactic(SplitKTactic(*tactic), m, n, k)
+    except Exception as error:  # noqa: BLE001 - ValueError by contract; any error refuses the row
+        return f"{type(error).__name__}: {error}"
+    return None
+
+
+def refused_rows(tp_size: int = 8, capability: tuple[int, int] | None = None) -> list[str]:
+    """The rows of the ``splitk_tactics(tp_size, capability)`` table the kernel refuses
+    (``tactic_error``), one ``"(M, K, N) tactic: reason"`` each; empty when every row
+    validates, and for a table outside ``INSTALL_CHECKED``, whose rows are not checked.
+
+    Raises:
+        ValueError: as ``splitk_tactics``, for a pair without a table.
+    """
+    key = (tuple(device_capability() if capability is None else capability), tp_size)
+    table = splitk_tactics(tp_size, key[0])
+    if key not in INSTALL_CHECKED:
+        return []
+    refused = []
+    for (m, k, n), tactic in sorted(table.items()):
+        error = tactic_error(m, k, n, tuple(tactic))
+        if error is not None:
+            refused.append(f"({m}, {k}, {n}) {tuple(tactic)}: {error}")
+    return refused
 
 
 def takes(x: torch.Tensor, weight: torch.Tensor) -> bool:

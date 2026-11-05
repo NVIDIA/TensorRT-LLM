@@ -53,7 +53,10 @@ def install_loaded_features(
     ``three_window_placement`` it stacks a third ring window on those
     layers (``windows=3``, likewise passed only then), and with
     ``bf16_routed_experts`` the BF16 layers' stacked calls take unpacked
-    routing (``bf16_unpacked=True``; likewise passed only then).
+    routing (``bf16_unpacked=True``; likewise passed only then). On a device and TP
+    size with a row cap of their own (``ring_buddy.max_rows_for`` of
+    ``compute_capability``: sm103 at tp 8) the stacked path also takes the decode calls
+    up to that cap (``max_rows``, passed only then); elsewhere up to ``ring_buddy.MAX_ROWS``.
 
     Without ``replicated_experts``, ``persistent_experts`` and ``bf16_routed_experts``
     are installed on the owner-only window (``_install_owner_window``: no
@@ -71,7 +74,7 @@ def install_loaded_features(
     whichever expert call the paths above installed).
     """
     if plan.enabled("replicated_experts"):
-        _install_ring_buddy(text_model, mapping, plan)
+        _install_ring_buddy(text_model, mapping, plan, compute_capability)
     elif plan.enabled("persistent_experts") or plan.enabled("bf16_routed_experts"):
         _install_owner_window(text_model, mapping, plan)
     if plan.enabled("hot_replicas"):
@@ -95,7 +98,12 @@ def install_loaded_features(
         _qkv_prefetch.wrap_expert_forwards(text_model)
 
 
-def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:
+def _install_ring_buddy(
+    text_model,
+    mapping,
+    plan: "_dispatch.Plan",
+    compute_capability: Optional[Tuple[int, int]] = None,
+) -> None:
     """``install_loaded_features``'s ``replicated_experts`` install."""
     from .kernels.replicated_experts import ring_buddy as _ring_buddy
 
@@ -104,6 +112,11 @@ def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:
         extra["windows"] = 3
     if plan.enabled("bf16_routed_experts"):
         extra["bf16_unpacked"] = True
+    max_rows = _ring_buddy.max_rows_for(compute_capability, getattr(mapping, "tp_size", None))
+    if max_rows != _ring_buddy.MAX_ROWS:
+        # sm103 tep8: the balanced placement also takes the 17..32-row decode steps
+        # (three and four requests), one ring_buddy_assign program of 256 slots.
+        extra["max_rows"] = max_rows
     _ring_buddy.install(
         text_model,
         mapping,

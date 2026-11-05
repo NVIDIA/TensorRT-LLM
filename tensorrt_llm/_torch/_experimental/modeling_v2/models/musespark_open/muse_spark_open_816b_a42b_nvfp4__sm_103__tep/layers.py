@@ -736,6 +736,7 @@ def _build_wide_hop(
     )
     # The 8-row hop's call keeps every row count it takes.
     min_rows = _hop.MAX_ROWS + 1
+    # The line names the served cut (two_shot_rows=32 at TP4, 16 at TP8).
     _wide.log_once_enabled(
         len(model.layers),
         workspace.multicast,
@@ -745,6 +746,7 @@ def _build_wide_hop(
         r2=workspace.r2,
         r2_wide=workspace.r2_wide,
         smem_pad=workspace.smem_pad,
+        ranks=workspace.ranks,
     )
 
     def wide_factory() -> "_wide.WideHopWorkspace":
@@ -986,6 +988,7 @@ def adopt_model(
         dense_gemm_plan = dense_gemms.install(
             model,
             prefetch=plan.enabled("dense_gemm_prefetch"),
+            wide=plan.enabled("wide_dense_gemms"),
         )
     norm_gate_trigger = None
     early_release_on = plan.enabled("boundary_early_release")
