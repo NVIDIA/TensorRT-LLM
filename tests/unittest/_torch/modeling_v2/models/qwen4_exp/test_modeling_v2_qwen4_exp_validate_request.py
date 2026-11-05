@@ -56,9 +56,11 @@ def _media(modality, grids):
     }
 
 
-def _request(image=None, video=None, order=None, **overrides):
+def _request(image=None, video=None, order=None, manifest=True, **overrides):
     """A request whose prompt is `TEXT_TOKENS` text tokens around the placeholders the
-    media produce, with the position ids and placeholder cumsum the processor emits."""
+    media produce, with the position ids, placeholder cumsum and item metadata the
+    processor emits. `order` lists the items in prompt order (default: images, then
+    videos); `manifest=False` leaves the item metadata out."""
     rows = sum(t * h * w for t, h, w in (image or []) + (video or [])) // (MERGE * MERGE)
     prompt_len = rows + TEXT_TOKENS
     data = {
@@ -71,11 +73,27 @@ def _request(image=None, video=None, order=None, **overrides):
         data["image"] = _media("image", image)
     if video is not None:
         data["video"] = _media("video", video)
-    if order is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    grids = {"image": image or [], "video": video or []}
+    if manifest:
+        if order is None:
+            order = [(modality, i) for modality, grid in grids.items() for i in range(len(grid))]
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+            item_refs=order,
+            output_embedding_lengths=[_item_rows(grids, ref) for ref in order],
+        )
     fields = {"py_multimodal_data": data, "prompt_len": prompt_len}
     fields.update(overrides)
     return SimpleNamespace(**fields)
+
+
+def _item_rows(grids, ref):
+    """The embedding rows of item `ref`, or 1 for a ref that names no item."""
+    try:
+        modality, index = ref
+        t, h, w = grids[modality][index]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 1
+    return t * h * w // (MERGE * MERGE)
 
 
 def _admit(request):
@@ -92,7 +110,6 @@ MIXED_ORDER = [_item("video", 0), _item("image", 0), _item("video", 1), _item("i
 
 
 def test_clean_requests_are_admitted():
-    # A single-modality request needs no manifest.
     _admit(_request(image=IMAGES))
     _admit(_request(video=VIDEOS))
     _admit(_request(image=IMAGES, video=VIDEOS, order=MIXED_ORDER))
@@ -178,11 +195,25 @@ def test_missing_or_mis_sized_position_ids_fail_the_request():
         _admit(request)
 
 
-def test_a_mixed_request_needs_its_manifest():
+@pytest.mark.parametrize(
+    "media",
+    [{"image": IMAGES}, {"video": VIDEOS}, {"image": IMAGES, "video": VIDEOS}],
+    ids=["image", "video", "mixed"],
+)
+def test_a_media_request_needs_its_manifest(media):
+    # The tower encodes a step's items together; each request's rows go back to it in
+    # prompt order by its item metadata.
     with pytest.raises(ValueError, match="needs item metadata"):
-        _admit(_request(image=IMAGES, video=VIDEOS))
+        _admit(_request(**media, manifest=False))
     with pytest.raises(ValueError, match="needs item metadata"):
-        _admit(_request(image=IMAGES, video=VIDEOS, order=[]))
+        _admit(_request(**media, order=[]))
+    request = _request(**media)
+    metadata = request.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    request.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        item_refs=metadata.item_refs
+    )
+    with pytest.raises(ValueError, match="carries no output_embedding_lengths"):
+        _admit(request)
 
 
 def test_a_manifest_that_disagrees_with_the_payload_is_refused():

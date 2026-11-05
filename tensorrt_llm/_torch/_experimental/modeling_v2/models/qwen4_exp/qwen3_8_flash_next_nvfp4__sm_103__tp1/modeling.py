@@ -138,6 +138,10 @@ from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
+    encode_multimodal_by_groups,
+)
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
@@ -6938,9 +6942,9 @@ def _frame_calls(
 
 
 class VisionTower:
-    """One request's images or videos through the 27-block ViT and its patch merger.
+    """A step's images and videos through the 27-block ViT and its patch merger.
 
-    Not a target: runs only for a context request carrying media, from the shell's
+    Not a target: runs only for context requests carrying media, from the shell's
     splice. Attention is bidirectional per frame (a video's frame group is a frame),
     expressed to `thop_attention` as one context "sequence" per frame; running the
     rows as one sequence is 315x-582x outside tolerance. The position-embedding
@@ -7753,9 +7757,9 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
 
         Refused: a frame past `_VISION_CALL_MAX_PATCHES` patches (the one bound the
         tower keeps), a malformed grid or pixel payload, media whose rows disagree with
-        the prompt's placeholder count, missing or mis-sized `mrope_position_ids`, and a
-        request with both images and videos whose item metadata is missing or does not
-        list its items."""
+        the prompt's placeholder count, missing or mis-sized `mrope_position_ids`, and
+        item metadata that is missing, does not list the request's items or carries no
+        output lengths."""
         data = request.py_multimodal_data
         if not data:
             return
@@ -7781,9 +7785,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
                 f"{None if mrope_ids is None else tuple(mrope_ids.shape)}"
             )
 
-        if len(grids) > 1:
-            metadata = get_multimodal_item_metadata(data)
-            self._check_item_order(grids, metadata.item_refs if metadata is not None else None)
+        self._check_item_order(grids, get_multimodal_item_metadata(data))
 
         cumsum = data.get("multimodal_embed_mask_cumsum")
         if cumsum is not None:
@@ -7833,8 +7835,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         return grid
 
     @staticmethod
-    def _check_item_order(grids, order) -> None:
-        """A request with several modalities lists its items in prompt order."""
+    def _check_item_order(grids, metadata) -> None:
+        """A media request lists its items in prompt order, with their embedding rows: the
+        tower encodes a step's items together and the rows go back to each request by them."""
+        order = metadata.item_refs if metadata is not None else None
         if not order:
             raise ValueError(
                 f"a request carrying {sorted(grids)} needs item metadata to splice them in "
@@ -7856,6 +7860,39 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
                     f"item_refs lists {modality} items {listed[modality]}; the payload "
                     f"carries {len(grid)}"
                 )
+        if metadata.output_embedding_lengths is None:
+            raise ValueError(
+                "the item metadata carries no output_embedding_lengths; the tower's rows "
+                "go back to each request and item by them"
+            )
+
+    @property
+    def mm_encoder_groups(self) -> tuple[EncoderGroup, ...]:
+        """The tower takes images and videos alike (a grid row is one item either way), so
+        one call carries both: image rows first, then video rows, request by request."""
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self._vision_rows,
+                input_fields={
+                    "pixel_values": {
+                        modality: pixel_key for modality, (pixel_key, _) in _MEDIA_KEYS.items()
+                    },
+                    "grid_thw": {
+                        modality: grid_key for modality, (_, grid_key) in _MEDIA_KEYS.items()
+                    },
+                },
+            ),
+        )
+
+    def _vision_rows(self, pixel_values, grid_thw):
+        """The tower over a step's joined patch rows: one row per placeholder, item by item
+        in the order of `grid_thw`."""
+        assert not grid_thw.is_cuda, (
+            "image_grid_thw and video_grid_thw must stay on the host; see "
+            "multimodal_data_device_paths"
+        )
+        return self.model.vision_tower(pixel_values, grid_thw)
 
     def _multimodal_embeds(self, kwargs):
         """Run the vision tower for this batch; returns `(rows, mm_token_indices)` (the
@@ -7871,19 +7908,19 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         in-chunk row counts over the request's images and videos together, in prompt
         order; `mm_token_indices` names every placeholder row.
 
-        The tower runs once per modality a request carries, and `_in_prompt_order`
-        merges the two outputs. Positions are not derived here: every coordinate of
-        a vision span, a video's temporal one included, is in the payload's
-        `mrope_config.mrope_position_ids`, which the engine slices into
-        `position_ids`."""
+        The tower runs once over every request's images and videos (`mm_encoder_groups`),
+        and the shared encode puts the rows back in request order, then each request's
+        prompt order, from its item metadata (`item_refs` and `output_embedding_lengths`).
+        Positions are not derived here: every coordinate of a vision span, a video's
+        temporal one included, is in the payload's `mrope_config.mrope_position_ids`,
+        which the engine slices into `position_ids`."""
         mm_params = kwargs.get("multimodal_params") or []
         if not mm_params:
             return None
-        rows = []
+        encoded = []
         for params in mm_params:
             data = getattr(params, "multimodal_data", None) or {}
-            image, video = data.get("image"), data.get("video")
-            if image is None and video is None:
+            if data.get("image") is None and data.get("video") is None:
                 continue
             mrope_ids = (data.get("mrope_config") or {}).get("mrope_position_ids")
             assert (
@@ -7899,29 +7936,33 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             if runtime is not None and int(runtime.num_mm_tokens_in_chunk) == 0:
                 # Every placeholder row of this request lies in another chunk.
                 continue
-            towers = {}
-            if image is not None:
-                towers["image"] = self._run_tower(image, *_MEDIA_KEYS["image"])
-            if video is not None:
-                towers["video"] = self._run_tower(video, *_MEDIA_KEYS["video"])
-            embeds = self._in_prompt_order(params, towers)
+            encoded.append(params)
+        if not encoded:
+            return None
+        vision = encode_multimodal_by_groups(self.mm_encoder_groups, encoded)
+        rows = []
+        start = 0
+        for params in encoded:
+            total = sum(params.item_metadata.output_embedding_lengths)
+            embeds = vision[start : start + total]
+            start += total
+            runtime = getattr(params, "multimodal_runtime", None)
             if runtime is not None:
                 # Chunked prefill or reused prefix: splice only this chunk's slice.
-                start = int(runtime.num_cached_mm_tokens)
+                cached = int(runtime.num_cached_mm_tokens)
                 count = int(runtime.num_mm_tokens_in_chunk)
-                total = embeds.shape[0]
                 assert int(runtime.total_embeds_in_request) == total, (
                     f"the executor counted {runtime.total_embeds_in_request} "
-                    f"placeholder rows for this request and the tower produced "
-                    f"{total} over its {sorted(towers)}; the two are derived from the "
-                    "same grids and a disagreement means the merger's row count is wrong"
+                    f"placeholder rows for this request and its item metadata lists "
+                    f"{total}; the two are derived from the same grids and a "
+                    "disagreement means the merger's row count is wrong"
                 )
-                assert 0 <= start <= start + count <= total, (start, count, total)
-                embeds = embeds[start : start + count]
+                assert 0 <= cached <= cached + count <= total, (cached, count, total)
+                embeds = embeds[cached : cached + count]
             rows.append(embeds)
-        if not rows:
-            return None
-        vision = rows[0] if len(rows) == 1 else torch.cat(rows, 0)
+        if sum(request_rows.shape[0] for request_rows in rows) != vision.shape[0]:
+            # Some request splices only part of its rows this step.
+            vision = rows[0] if len(rows) == 1 else torch.cat(rows, 0)
         mm_token_indices = kwargs.get("mm_token_indices")
         assert mm_token_indices is not None, (
             "the executor shipped multimodal params but no mm_token_indices; "
@@ -7933,58 +7974,6 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             f"tower produced {vision.shape[0]} embedding rows"
         )
         return vision, mm_token_indices
-
-    def _run_tower(self, media, pixel_key, grid_key):
-        """The tower over one modality's payload: `(rows, grid_thw)`, the rows one per
-        placeholder, item by item in the order the processor emitted them."""
-        pixel_values, grid_thw = media.get(pixel_key), media.get(grid_key)
-        assert pixel_values is not None and grid_thw is not None, (
-            f"the multimodal payload carries {sorted(media)}; this target "
-            f"reads {pixel_key!r} and {grid_key!r} from it"
-        )
-        assert not grid_thw.is_cuda, (
-            f"{grid_key} must stay on the host; see multimodal_data_device_paths"
-        )
-        return self.model.vision_tower(pixel_values, grid_thw), grid_thw
-
-    def _in_prompt_order(self, params, towers):
-        """One request's tower rows in the order its placeholders appear.
-
-        `towers` maps each modality the request carries to `(rows, grid_thw)`; each
-        grid row is one item of `t*h*w / merge**2` rows. One modality is already in
-        prompt order. Two are reassembled item by item from `item_metadata.item_refs`
-        (`(modality, index)` per item in prompt order, `index` counting that
-        modality's items); without it there is no host-side way to tell which
-        placeholder run is an image and which a video."""
-        if len(towers) == 1:
-            return next(iter(towers.values()))[0]
-        metadata = params.item_metadata
-        order = metadata.item_refs if metadata is not None else None
-        assert order, (
-            f"a request carrying {sorted(towers)} needs item metadata to splice them "
-            "in prompt order; the payload holds each modality's rows apart"
-        )
-        merge_unit = self.model.v_merge * self.model.v_merge
-        items = {}
-        for modality, (embeds, grid_thw) in towers.items():
-            counts = [t * h * w // merge_unit for t, h, w in grid_thw.tolist()]
-            assert sum(counts) == embeds.shape[0], (
-                f"the {modality} grid describes {sum(counts)} rows and the tower "
-                f"produced {embeds.shape[0]}"
-            )
-            items[modality] = torch.split(embeds, counts, 0)
-        listed = {modality: [] for modality in items}
-        for modality, index in order:
-            assert modality in items, (
-                f"item_refs lists a {modality!r} item; this request carries {sorted(items)}"
-            )
-            listed[modality].append(int(index))
-        for modality, parts in items.items():
-            assert sorted(listed[modality]) == list(range(len(parts))), (
-                f"item_refs lists {modality} items {listed[modality]}; the "
-                f"payload carries {len(parts)}"
-            )
-        return torch.cat([items[modality][int(index)] for modality, index in order], 0)
 
     def forward(
         self,
