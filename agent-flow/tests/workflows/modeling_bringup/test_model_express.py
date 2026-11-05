@@ -60,4 +60,5 @@ def test_documented_mx_criterion_parses_and_names_the_doc():
 
     assert example == readme
     assert MX_DOC in example
-    assert "l0_model_express.yml" in example
+    assert "passing real donor/receiver test" in example
+    assert "pending" in example

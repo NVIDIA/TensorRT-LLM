@@ -274,17 +274,19 @@ steps:
 completion_criteria:
   - "If the model fits the ModelExpress constraints in
      docs/source/features/model-express.md, MX checkpoint loading is qualified
-     as that doc describes, with the donor/receiver test passing or added to
-     l0_model_express.yml; otherwise final-report.md names the constraint that
-     rules it out. Existing MX profiles and constraints are not changed."
+     as that doc describes, which includes a passing real donor/receiver test.
+     If that test cannot run here, final-report.md reports MX as pending until
+     the ModelExpress CI stages pass it. If the model does not fit,
+     final-report.md names the constraint that rules it out. Existing MX
+     profiles and constraints are not changed."
 ```
 
 The PlanDrafter then plans the MX work from the start, and QA checks it like
 any other criterion. The donor/receiver test needs a ModelExpress server and at
-least two GPUs; without them, adding the case to `l0_model_express.yml` leaves
-that run to the ModelExpress CI stages. Every bring-up already keeps post-load
-work in the staged hooks MX relies on, so a model stays ready for MX even
-without this criterion.
+least two GPUs. Without them, the run is left to the ModelExpress CI stages, and
+MX stays pending in `final-report.md` until those stages pass it. Every bring-up
+already keeps post-load work in the staged hooks MX relies on, so a model stays
+ready for MX even without this criterion.
 
 ## Environment
 
