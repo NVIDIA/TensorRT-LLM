@@ -6,13 +6,15 @@
   K/V at the unit scale, so a magnitude past the e4m3 maximum saturates. The probe reports the
   largest magnitude of the first eager forward's attention layers, once, and never reads a
   tensor under CUDA graph capture.
-* **The context pass over an NVFP4 pool, a group of requests at a time** (one rank). The
+* **The context pass over an NVFP4 pool, a group of requests at a time**, at one rank (24 / 2
+  heads, the family's row-tile pass) and at a tp4 / tep4 rank (6 / 1 heads, the target's). The
   context rows read a bf16 scratch of their requests' pages (`_nvfp4_context_plan`), filled and
   attended one group of consecutive requests at a time, so it holds the largest group's pages
   rather than the step's. Under a budget of a few pages, with one request longer than the
   budget, a prefill step's rows match one group over the whole step bitwise: its requests'
-  rows come in multiples of the row-tile pass's 10-row groups, so a launch per group splits
-  none of them and every row takes the same pass as in the one launch.
+  rows come in multiples of the row-tile pass's groups (10 rows at 24 / 2 heads, 20 at 6 / 1),
+  so a launch per group splits none of them and every row takes the same pass as in the one
+  launch. At 6 / 1 heads the pass agrees with the NVFP4 per-row prefill kernel.
 * **MTP IndexShare.** The draft selection (`_selection`) in its fused and its two-launch form,
   the capture of each request's draft-extend row into the shared buffers (decode and
   mixed-batch forms), and the reuse entry's order over canonical captures. The targets are
@@ -122,47 +124,56 @@ def test_observing_under_capture_reads_nothing(monkeypatch):
 
 # ---- the context pass over an NVFP4 pool ---------------------------------------------------
 
-TPB, HKV, D, QH, RATIO, TOPK = 32, 2, 256, 24, 4, 2048
-# (cached, new) tokens a context request: 10, 30, 1, 47 and 4 pages.
+TPB, D, RATIO, TOPK = 32, 256, 4, 2048
+# (cached, new) tokens a context request: 10, 30, 1 (2 at tp4), 47 and 4 pages. Each request's
+# rows are a multiple of the row-tile pass's groups: 10 rows at 24 / 2 heads, 20 at 6 / 1.
 SEGMENTS = ((0, 300), (900, 40), (20, 10), (1400, 100), (64, 60))
+TP4_SEGMENTS = ((0, 300), (900, 40), (20, 20), (1400, 100), (64, 60))
+# (one rank, query heads, KV heads, segments, the whole step's pages)
+GEOMETRIES = {
+    "tp1": (True, 24, 2, SEGMENTS, 92),
+    "tp4": (False, 6, 1, TP4_SEGMENTS, 93),
+}
 BUDGET_PAGES = 32  # request 3's 47 pages form a group of their own
 
 
-def _context_step(seed: int = 5):
+def _context_step(geometry: str, seed: int = 5):
+    one_rank, qh, hkv, segments, _ = GEOMETRIES[geometry]
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    kv_lens = [s + n for s, n in SEGMENTS]
+    kv_lens = [s + n for s, n in segments]
     pages = [math.ceil(k / TPB) for k in kv_lens]
     pool_pages = sum(pages) + 3
-    shape = (pool_pages, 2, HKV, TPB)
+    shape = (pool_pages, 2, hkv, TPB)
     data = torch.randint(0, 256, (*shape, D // 2), generator=gen, device=DEV).to(torch.uint8)
     scales = torch.randint(0x08, 0x31, (*shape, D // 16), generator=gen, device=DEV)
     scales = scales.to(torch.uint8)
-    slots = 2 * len(SEGMENTS)
+    slots = 2 * len(segments)
     slot_of = torch.randperm(slots, generator=torch.Generator().manual_seed(seed))
-    slot_of = slot_of[: len(SEGMENTS)].to(DEV, torch.int32)
+    slot_of = slot_of[: len(segments)].to(DEV, torch.int32)
     page_ids = torch.randperm(pool_pages, generator=gen, device=DEV).to(torch.int32)
     block_table = torch.full((slots, max(pages)), -1, dtype=torch.int32, device=DEV)
     cursor = 0
     for slot, count in zip(slot_of.tolist(), pages):
         block_table[slot, :count] = page_ids[cursor : cursor + count]
         cursor += count
-    new = torch.tensor([n for _, n in SEGMENTS], dtype=torch.int32)
+    new = torch.tensor([n for _, n in segments], dtype=torch.int32)
     md = SimpleNamespace(
-        num_contexts=len(SEGMENTS),
+        num_contexts=len(segments),
         kv_lens_runtime=torch.tensor(kv_lens, dtype=torch.int32),
         kv_lens_cuda_runtime=torch.tensor(kv_lens, dtype=torch.int32, device=DEV),
         seq_lens=new,
         seq_lens_cuda=new.to(DEV),
     )
-    logical = torch.cat([torch.arange(s, s + n, device=DEV) for s, n in SEGMENTS])
+    logical = torch.cat([torch.arange(s, s + n, device=DEV) for s, n in segments])
     rows = logical.numel()
     # Every visible token, as the expansion lays out a selection under its top-k.
     column = torch.arange(TOPK + RATIO - 1, device=DEV)[None, :]
     selected = torch.where(column <= logical[:, None], column, -1).to(torch.int32)
     core = SimpleNamespace(
-        heads_kv=HKV,
+        one_rank=one_rank,
+        heads_kv=hkv,
         head_dim=D,
-        q_width=QH * D,
+        q_width=qh * D,
         kv_scale_quant_orig=torch.ones(3, dtype=torch.float32, device=DEV),
         softmax_scale=D**-0.5,
         compress_ratio=RATIO,
@@ -174,7 +185,7 @@ def _context_step(seed: int = 5):
         md=md,
         block_table=block_table,
         req_idx=slot_of.repeat_interleave(new.to(DEV).long()),
-        q=torch.randn(rows, QH, D, generator=gen, device=DEV).to(torch.bfloat16),
+        q=torch.randn(rows, qh, D, generator=gen, device=DEV).to(torch.bfloat16),
         selected=selected,
         logical=logical.to(torch.int32),
         rows=rows,
@@ -185,7 +196,7 @@ def _context_pass(step):
     plan = M._nvfp4_context_plan(
         step["core"], step["md"], step["req_idx"], step["block_table"], TPB
     )
-    out = torch.empty(step["rows"], QH * D, dtype=torch.bfloat16, device=DEV)
+    out = torch.empty(step["rows"], step["core"].q_width, dtype=torch.bfloat16, device=DEV)
     M._sparse_gqa_nvfp4_context(
         step["core"],
         step["kv"],
@@ -204,18 +215,43 @@ def _context_pass(step):
 
 
 @_cuda
-def test_grouped_context_pass_equals_one_group(monkeypatch) -> None:
-    step = _context_step()
+@pytest.mark.parametrize("geometry", sorted(GEOMETRIES))
+def test_grouped_context_pass_equals_one_group(monkeypatch, geometry) -> None:
+    step = _context_step(geometry)
     whole, want = _context_pass(step)
-    assert len(whole[0]) == 1 and whole[2].shape[0] == 92
+    assert len(whole[0]) == 1 and whole[2].shape[0] == GEOMETRIES[geometry][4]
 
-    page_bytes = 2 * HKV * TPB * D * 2
+    page_bytes = 2 * step["core"].heads_kv * TPB * D * 2
     monkeypatch.setattr(M, "_NVFP4_CONTEXT_SCRATCH_BYTES", BUDGET_PAGES * page_bytes)
     (groups, _, k_scratch, _), got = _context_pass(step)
     # Requests [0], [1, 2], [3] (over the budget, alone), [4].
-    assert [(g[0], g[1]) for g in groups] == [(0, 300), (300, 350), (350, 450), (450, 510)]
+    ends = [0, 300]
+    for _, n in GEOMETRIES[geometry][3][1:]:
+        ends.append(ends[-1] + n)
+    del ends[2]  # requests 1 and 2 share a group
+    assert [(g[0], g[1]) for g in groups] == list(zip(ends, ends[1:]))
     assert k_scratch.shape[0] == 47
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+@_cuda
+def test_the_tp4_context_pass_matches_the_per_row_kernel() -> None:
+    """At a tp4 / tep4 rank (6 / 1 heads) the context rows take the target's row-tile pass over
+    the dequantized scratch, and agree with the NVFP4 per-row prefill kernel over the pool."""
+    step = _context_step("tp4")
+    _, got = _context_pass(step)
+    want = M._sparse_gqa(
+        step["core"],
+        step["kv"],
+        step["q"],
+        step["block_table"],
+        step["selected"],
+        step["req_idx"],
+        TPB,
+        step["logical"],
+    ).reshape(got.shape)
+    err = (got.float() - want.float()).norm() / want.float().norm()
+    assert err < 1e-2, err
 
 
 # ---- MTP IndexShare -----------------------------------------------------------------------

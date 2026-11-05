@@ -46,12 +46,13 @@ _TEXT_SETTINGS = {
     "norm_topk_prob": True,
     "num_experts_per_tok": 10,
     "hidden_act": "silu",
-    # Attention: two KV heads of 256, no projection bias, a sigmoid output gate, and an output
-    # head of its own.
+    # Attention: two KV heads of 256, no projection bias, a sigmoid output gate on every head
+    # (absent `attn_output_gate` reads as gated), and an output head of its own.
     "num_key_value_heads": 2,
     "head_dim": 256,
     "attention_bias": False,
     "output_gate_type": "sigmoid",
+    "attn_output_gate": True,
     "tie_word_embeddings": False,
     # Rope: a quarter of the head (64 dims), theta 1e7, interleaved mRoPE over sections
     # 11 / 11 / 10, unscaled.
@@ -60,6 +61,15 @@ _TEXT_SETTINGS = {
     "mrope_section": (11, 11, 10),
     "mrope_interleaved": True,
     "rope_factor": None,
+    # The MTP module: one full-attention layer on the trunk's embedding that reads the end of
+    # the stack (`mtp_use_hidden_state_from_layer: null`). The `mtp.` fields are the `mtp`
+    # block's, a mapping or a config object; a field it omits reads as the value here. (Its
+    # own rope theta the target reads.)
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": False,
+    "mtp.num_hidden_layers": 1,
+    "mtp.layer_types": ("full_attention",),
+    "mtp.mtp_use_hidden_state_from_layer": None,
 }
 
 # (depth, hidden, heads, merge, out_hidden, num_pos, deepstack_indexes, act).
@@ -135,6 +145,13 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
     )
 
 
+def _field(block, name: str, default=None):
+    """`block`'s `name` -- a mapping's entry or an object's attribute -- or `default` where it
+    is absent or null."""
+    value = block.get(name) if isinstance(block, dict) else getattr(block, name, None)
+    return default if value is None else value
+
+
 def _text_settings(text) -> dict:
     """`_TEXT_SETTINGS`' entries as `text` declares them. The rope fields are the target's
     reading: the `rope_parameters` dict, or the flattened `rope_scaling` with the theta and
@@ -149,6 +166,17 @@ def _text_settings(text) -> dict:
         mrope_section=tuple(rope.get("mrope_section") or ()),
         mrope_interleaved=rope.get("mrope_interleaved"),
         rope_factor=rope.get("factor"),
+        attn_output_gate=_field(text, "attn_output_gate", True),
+        mtp_num_hidden_layers=_field(text, "mtp_num_hidden_layers", 1),
+        mtp_use_dedicated_embeddings=_field(text, "mtp_use_dedicated_embeddings", False),
+    )
+    mtp = getattr(text, "mtp", None)
+    settings.update(
+        {
+            "mtp.num_hidden_layers": _field(mtp, "num_hidden_layers", 1),
+            "mtp.layer_types": tuple(_field(mtp, "layer_types", ("full_attention",))),
+            "mtp.mtp_use_hidden_state_from_layer": _field(mtp, "mtp_use_hidden_state_from_layer"),
+        }
     )
     return settings
 

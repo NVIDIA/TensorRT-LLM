@@ -57,8 +57,8 @@ decode MoE whose finalize the next site folds in (`moe_fold`); the CuteDSL copy 
 routed experts for prefill steps past `_CUTE_DSL_MOE_MIN_ROWS` (`moe_prefill_copy`), or the
 CuteDSL pipeline for every step (`moe_config.backend: CUTEDSL`, `_cute_dsl_routed`); an fp32
 recurrent state, whose captured single-token decode runs `gdn_decode_gated_norm_pdl`; the
-decode draft layer and its FP8 head; the NVFP4 pool's context rows attended a group of
-requests at a time (`_nvfp4_context_plan`); and the opt-in FP8 / NVFP4 copies of the dense
+decode draft layer and its FP8 head; the family's row-tile pass for the NVFP4 pool's context
+rows (`_sparse_gqa_nvfp4_context`); and the opt-in FP8 / NVFP4 copies of the dense
 projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP4_ENV`,
 `_TARGET_HEAD_NVFP4_ENV`, `_MTP_HEAD_NVFP4_ENV`, `_MTP_MOE_NVFP4_ENV`, `_MTP_DENSE_FP8_ENV`).
 
@@ -629,9 +629,9 @@ _ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer 
 # Over an fp8 pool the launch reads its requests' pages widened into a bf16 scratch; a launch
 # whose scratch would pass this many bytes stays on the per-row kernel.
 _FP8_ROWTILE_MAX_SCRATCH = 1 << 30  # capacity: fixed: bounds a per-call scratch allocation
-# At one rank a step with more context rows than this over an NVFP4 pool attends them on the
-# row-tile pass over a bf16 scratch of their requests' pages (`_sparse_gqa_nvfp4_context`):
-# 16384 context rows 1.36 ms a layer there against 77-948 ms for the NVFP4 per-row kernel.
+# A step with more context rows than this over an NVFP4 pool attends them on the row-tile pass
+# over a bf16 scratch of their requests' pages (`_sparse_gqa_nvfp4_context`): at one rank 16384
+# context rows 1.36 ms a layer there against 77-948 ms for the NVFP4 per-row kernel.
 _NVFP4_ROWTILE_MIN_ROWS = 256  # capacity: fixed: a dispatch threshold, not a buffer size
 # The bf16 K/V scratch those context rows read holds every page of each context request's KV
 # history. Consecutive context requests are dequantized and attended in groups whose pages fit
@@ -1098,14 +1098,16 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
 
         # ---- the MTP module ------------------------------------------------
         # Global layer index of the draft layer (the KV managers map it there, and the
-        # weight table keys it there); its rope base is its own block's, else the trunk's.
+        # weight table keys it there); its rope base is its own block's (a mapping or a config
+        # object), else the trunk's. Routing pins the block's other settings.
         self.mtp_layer_idx = self.num_layers
         mtp_block = getattr(cfg, "mtp", None)
-        self.mtp_theta = (
-            float(mtp_block.get("rope_theta", self.theta))
+        mtp_theta = (
+            mtp_block.get("rope_theta")
             if isinstance(mtp_block, dict)
-            else self.theta
+            else getattr(mtp_block, "rope_theta", None)
         )
+        self.mtp_theta = self.theta if mtp_theta is None else float(mtp_theta)
 
         # ---- gated deltanet ----------------------------------------------
         self.head_k_dim = cfg.linear_key_head_dim
@@ -2808,10 +2810,19 @@ def _hc_moe_mixer_rstd(core, hc, rstd, L: _LayerWeights):
     return mixed, inject, (xq, xsf)
 
 
-def _decode_router_mid(core, L: _LayerWeights):
+def _decode_router_mid(core, L: _LayerWeights, captured: bool):
     """A decode step's router projection for layer `L`: `mid_rows_mm` over its view in the
     dense FP8 mode's rows (`_MID_MM_ROWS["router"]`), else at tp1 the step's projection entry
-    (`core.decode_mm`) and at the other layouts `_decode_router`."""
+    (`core.decode_mm`) and under attention TP `_decode_router`.
+
+    Under attention DP every rank routes all the rows its group gathers, so every rank must
+    compute their logits with one kernel: two kernels can differ in the last bit and flip a
+    near-tie in the top-k, and the ranks would then disagree on which window serves a slot. A
+    `captured` step is a decode step on every rank (the engine captures only when every rank
+    can) and takes `_decode_router`; an eager one can meet another rank's prefill step and takes
+    the prefill router, `cublas_mm`."""
+    if core.dp_size > 1:
+        return _decode_router if captured else cublas_mm
     fallback = core.decode_mm if core.one_rank else _decode_router
     if L.router_m is None:
         return fallback
@@ -3341,17 +3352,20 @@ def _nvfp4_context_plan(core, md, req_idx, block_table, tpb: int) -> tuple:
 def _sparse_gqa_nvfp4_context(
     core, kv, plan, q, block_table, selected, req_idx, logical, tpb, num_ctx, out, rows_per_request
 ) -> torch.Tensor:
-    """Sparse GQA of a step with context rows over an NVFP4 pool at one rank, into `out` `[rows,
-    q_width]`. With a plan (`_nvfp4_context_plan`) the first `num_ctx` rows, the context rows,
-    take the row-tile pass over the plan's scratch, filled here from this layer's pool a group of
-    requests at a time; the other rows, and every row without a plan, go split-K over the pool
-    itself. The generation rows after the context rows come `rows_per_request` a request: more
-    than one (a verify step's) takes the request-grouped entry for them on their own."""
+    """Sparse GQA of a step with context rows over an NVFP4 pool, into `out` `[rows, q_width]`.
+    With a plan (`_nvfp4_context_plan`) the first `num_ctx` rows, the context rows, take the
+    row-tile pass over the plan's scratch, filled here from this layer's pool a group of
+    requests at a time: at one rank the family's pass, elsewhere the target's, which also serves
+    a tp4 / tep4 rank's 6 / 1 heads. The other rows, and every row without a plan, go split-K
+    over the pool itself. The generation rows after the context rows come `rows_per_request` a
+    request: more than one (a verify step's) takes the request-grouped entry for them on their
+    own."""
     rows = q.shape[0]
     head = 0
     if plan is not None:
         groups, table, k_scratch, v_scratch = plan
         assert groups[-1][1] == num_ctx, (groups[-1][1], num_ctx)
+        rowtile = one_rank_sparse_gqa_rowtile if core.one_rank else qsa_sparse_gqa_rowtile
         for first_row, end_row, slots, counts, offsets in groups:
             qsa_nvfp4_pages_to_bf16(
                 kv.k,
@@ -3367,7 +3381,7 @@ def _sparse_gqa_nvfp4_context(
                 k_scratch,
                 v_scratch,
             )
-            context = one_rank_sparse_gqa_rowtile(
+            context = rowtile(
                 q=q[first_row:end_row],
                 k_cache=k_scratch,
                 v_cache=v_scratch,
@@ -3682,7 +3696,7 @@ class _PrefillStep(NamedTuple):
     vision: tuple | None
     # A verify step: the generation rows' side-cache writes are staged for the rollback.
     stage: bool = False
-    # At one rank over an NVFP4 pool, `_nvfp4_context_plan`'s row-tile plan or None.
+    # Over an NVFP4 pool, `_nvfp4_context_plan`'s row-tile plan or None.
     nvfp4_context: tuple | None = None
     # Over an fp8 pool, the context requests' pages the row-tile pass widens
     # (`_fp8_context_pages`); None otherwise.
@@ -3822,8 +3836,9 @@ class PrefillTarget:
                 step.live_cols,
             )
             # Context rows with the prefill pair (a bound on a row's scan), generation rows
-            # without.
-            if core.one_rank and kv.k_scale is not None:
+            # without. Over an NVFP4 pool at one rank, or with the row-tile plan, the rows go
+            # through `_sparse_gqa_nvfp4_context`.
+            if kv.k_scale is not None and (core.one_rank or step.nvfp4_context is not None):
                 _sparse_gqa_nvfp4_context(
                     core,
                     kv,
@@ -4294,8 +4309,7 @@ class PrefillTarget:
             fp8_pages = _fp8_context_pages(md, md.tokens_per_block)
         nvfp4_context = None
         if (
-            core.one_rank
-            and sparse
+            sparse
             and core.quant_mode == QM_NVFP4_KV_CACHE
             and num_prefill_tokens > _NVFP4_ROWTILE_MIN_ROWS
         ):
@@ -5560,14 +5574,15 @@ class DecodeTarget:
         mixed, inject, fp4 = _hc_moe_mixer(core, normed, L)
         return hc, mixed, inject, fp4
 
-    def _moe(self, x, L: _LayerWeights, pad_rows: int, fp4, fold: bool) -> tuple:
+    def _moe(self, x, L: _LayerWeights, pad_rows: int, fp4, fold: bool, captured: bool) -> tuple:
         """One decode MoE block, left uncombined for the next site: `(routed, (gate_logits,
         shared, topk_weights, topk_rows))`. With `fold` (one rank, where the window is the whole
         layer and needs no sum) the runner skips its finalize: `routed` is its permuted FC2 rows
         and the top-k pair its routing weights and index map, which the next site's first kernel
-        gathers; otherwise the pair is None and `routed` the finalized rows (`_moe_block`)."""
+        gathers; otherwise the pair is None and `routed` the finalized rows (`_moe_block`).
+        `captured` is the step's CUDA-graph state, which picks the router (`_decode_router_mid`)."""
         core = self.core
-        router_mm = _decode_router_mid(core, L)
+        router_mm = _decode_router_mid(core, L, captured)
         if not fold:
             routed, gate_logits, shared = _moe_block(
                 core, x, L, pad_rows, fp4, router_mm, core.decode_mm
@@ -5976,7 +5991,12 @@ class DecodeTarget:
                 block_out = self._gdn_block(mixed, i, L, si_all, verify, gen_p, md.is_cuda_graph)
             hc, mixed, inject, fp4 = self._hc_moe_site(hc, block_out, inject, L)
             block_out, moe = self._moe(
-                mixed, L, pad_rows, fp4, core.moe_fold and i + 1 != core.ple_layer
+                mixed,
+                L,
+                pad_rows,
+                fp4,
+                core.moe_fold and i + 1 != core.ple_layer,
+                md.is_cuda_graph,
             )
         # The stack-final site with no injection weight: its mix *is* the final norm.
         hc, final, _ = self._hc_site(

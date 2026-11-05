@@ -8,7 +8,8 @@ every rank of a tp4, tep4, dep4 or dep2 mapping, so nothing here touches a devic
 what the forward addresses: the fused attention row and the split the norm + rope reads it
 through, the Gated-DeltaNet projection's column split, the routed experts a rank holds (an
 expert window, or tp4's padded intermediate slice of every expert) and the per-expert scalars
-cut to them, and the attention-DP round trip's padding and slicing. Under attention DP the
+cut to them, the attention-DP round trip's padding and slicing, and the one router kernel every
+attention-DP rank runs over the gathered rows whatever its own step. Under attention DP the
 draft layer holds every attention head and runs its FP8 expert window over the rows the group
 gathers, padded by the row counts the spec worker hands each draft step.
 """
@@ -129,11 +130,11 @@ _DEP2 = dict(enable_attention_dp=True, moe_tp_size=1, moe_ep_size=2)
 _TP4 = dict(enable_attention_dp=False, moe_tp_size=4, moe_ep_size=1)
 
 
-def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD, **config):
+def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD, text=None, **config):
     """The core of rank `rank` of a `world`-rank engine at `layout`, every parameter on meta;
-    `config` sets further `ModelConfig` fields."""
+    `text` overrides text config fields and `config` sets further `ModelConfig` fields."""
     model_config = ModelConfig(
-        pretrained_config=Qwen4ExpTextConfig(**_TEXT),
+        pretrained_config=Qwen4ExpTextConfig(**{**_TEXT, **(text or {})}),
         mapping=Mapping(world_size=world, tp_size=world, rank=rank, **layout),
         quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
         moe_backend="TRTLLM",
@@ -379,6 +380,24 @@ def test_the_attention_dp_round_trip_returns_this_ranks_rows_through_every_windo
     assert tuple(out.shape) == (counts[rank], hidden)
 
 
+@pytest.mark.parametrize("captured", [False, True])
+def test_every_attention_dp_rank_routes_the_gathered_rows_with_one_kernel(captured) -> None:
+    """Each attention-DP rank computes the router logits of every row its group gathers, so the
+    kernel cannot depend on whether this rank's step is a prefill or a decode: an eager decode
+    step takes the prefill router (`_moe_block`'s default), a captured one -- a decode step on
+    every rank -- `_decode_router` on every rank. Under attention TP every rank runs the same
+    step, and a decode step keeps `_decode_router`."""
+    prefill_router = inspect.signature(M._moe_block).parameters["router_mm"].default
+    assert prefill_router is M.cublas_mm
+    layer = SimpleNamespace(router_m=None)
+    for dp_size in (4, 2):
+        core = SimpleNamespace(dp_size=dp_size, one_rank=False, decode_mm=None)
+        want = M._decode_router if captured else prefill_router
+        assert M._decode_router_mid(core, layer, captured) is want
+    core = SimpleNamespace(dp_size=1, one_rank=False, decode_mm=None)
+    assert M._decode_router_mid(core, layer, captured) is M._decode_router
+
+
 def nn_pad(x: torch.Tensor, rows: int) -> torch.Tensor:
     """`x` with zero rows appended up to `rows`."""
     return torch.cat([x, x.new_zeros(rows - x.shape[0], x.shape[1])], 0)
@@ -400,6 +419,17 @@ def test_mtp_widens_the_verify_step_and_keys_the_draft_layer_after_the_trunk(
     plain = _core(0, _TEP4)
     assert not plain.mtp_enabled and plain.max_verify_rows == 1 and plain.spec_rollback is None
     assert not any("_mtp_" in k for k in plain.w)
+
+
+@pytest.mark.parametrize("form", ["mapping", "object"])
+def test_the_draft_layer_ropes_at_its_own_blocks_theta(form) -> None:
+    """The `mtp` block's own rope theta sets the draft layer's base, whether the block is a
+    mapping or a config object."""
+    block = dict(_TEXT["mtp"], rope_theta=5e6)
+    if form == "object":
+        block = SimpleNamespace(**block)
+    core = _core(0, _TEP4, MTPDecodingConfig(max_draft_len=3), text=dict(mtp=block))
+    assert (core.mtp_theta, core.theta) == (5e6, 1e7)
 
 
 @pytest.mark.parametrize("rank", range(WORLD))

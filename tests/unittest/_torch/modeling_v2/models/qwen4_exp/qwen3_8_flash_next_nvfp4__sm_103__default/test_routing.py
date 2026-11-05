@@ -80,6 +80,16 @@ def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
     return TorchLlmArgs(model=_DUMMY_MODEL, modeling_v2=mode, **kwargs)
 
 
+# The checkpoint's `mtp` block.
+_MTP = dict(
+    hybrid=True,
+    layer_types=["full_attention"],
+    mtp_use_hidden_state_from_layer=None,
+    num_hidden_layers=1,
+    rope_theta=10000000,
+)
+
+
 def _qwen4_exp_config(text_overrides=None, **vision_overrides):
     """The shape Qwen3.8-Flash-Next-NVFP4's normalized composite config declares."""
     text = dict(
@@ -102,6 +112,9 @@ def _qwen4_exp_config(text_overrides=None, **vision_overrides):
         rope_theta=10000000,
         partial_rotary_factor=0.25,
         rope_scaling=dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True),
+        mtp=dict(_MTP),
+        mtp_num_hidden_layers=1,
+        mtp_use_dedicated_embeddings=False,
     )
     text.update(text_overrides or {})
     vision = dict(
@@ -351,14 +364,39 @@ _ROPE = dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True)
         (dict(rope_scaling=dict(_ROPE, mrope_interleaved=False)), "mrope_interleaved"),
         (dict(rope_scaling=dict(_ROPE, mrope_section=[16, 8, 8])), "mrope_section"),
         (dict(rope_scaling=dict(_ROPE, factor=4.0)), "rope_factor"),
+        (dict(attn_output_gate=False), "attn_output_gate"),
+        (dict(mtp_num_hidden_layers=2), "mtp_num_hidden_layers"),
+        (dict(mtp_use_dedicated_embeddings=True), "mtp_use_dedicated_embeddings"),
+        (dict(mtp=dict(_MTP, num_hidden_layers=2)), "mtp.num_hidden_layers"),
+        (dict(mtp=dict(_MTP, layer_types=["linear_attention"])), "mtp.layer_types"),
+        (
+            dict(mtp=dict(_MTP, mtp_use_hidden_state_from_layer=40)),
+            "mtp.mtp_use_hidden_state_from_layer",
+        ),
     ],
     ids=lambda v: v if isinstance(v, str) else None,
 )
 def test_a_same_shape_checkpoint_with_other_settings_declines(override, field):
     """A fine-tune with the checkpoint's shape that changes what it computes, which the target
-    would run with wrong logits and no error: `auto` keeps the built-in model."""
+    would run with wrong logits (or wrong drafts) and no error: `auto` keeps the built-in
+    model."""
     config = _model_config(pretrained_config=_qwen4_exp_config(override), **_LAYOUTS["tep4"])
     _declined(config, match=f"'{field}'")
+
+
+def test_the_mtp_block_is_read_as_a_mapping_or_a_config_object():
+    """An `mtp` block that is a config object is read field by field as a mapping is, and
+    one that omits the block's fields (or the whole block) takes the checkpoint's values."""
+    as_object = PretrainedConfig(**_MTP)
+    tep4 = _LAYOUTS["tep4"]
+    _claimed(_model_config(pretrained_config=_qwen4_exp_config(dict(mtp=as_object)), **tep4))
+    as_object.mtp_use_hidden_state_from_layer = 40
+    _declined(
+        _model_config(pretrained_config=_qwen4_exp_config(dict(mtp=as_object)), **tep4),
+        match="'mtp.mtp_use_hidden_state_from_layer'",
+    )
+    bare = dict(mtp=None, mtp_num_hidden_layers=None, mtp_use_dedicated_embeddings=None)
+    _claimed(_model_config(pretrained_config=_qwen4_exp_config(bare), **tep4))
 
 
 def test_the_settings_read_off_the_rope_parameters_dict():

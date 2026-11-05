@@ -245,7 +245,7 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_fp8_kv:
   min_al: 3.34
 # Read by test_mtp3_gsm8k_quantized_kv's pass keys (3k-6k tokens, the sparse attention path):
 # the NVFP4 cases at tp4 and tep4 (6 query heads a KV head) and the FP8 cases at dep4 and tep4.
-# modeling_v2's own readings on GB300 (NVFP4 3.951-3.968, FP8 3.960-3.975 over the cases and
+# modeling_v2's own readings on GB300 (NVFP4 3.949-3.968, FP8 3.960-3.975 over the cases and
 # repeats); min_al 2.5% below, as for tp1_mtp3_long_context.
 ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_nvfp4_kv_long_context:
   ref_al: 3.962

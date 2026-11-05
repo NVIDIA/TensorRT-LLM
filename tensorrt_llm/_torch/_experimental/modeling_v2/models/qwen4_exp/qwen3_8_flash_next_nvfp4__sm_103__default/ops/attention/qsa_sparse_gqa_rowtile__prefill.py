@@ -663,6 +663,9 @@ _TP4 = dict(q_heads=6, kv_heads=1, slots=128, **_TRUNK)
 #: (`qsa_fp8_pages_to_bf16`) addressed through its own table.
 _DEP4 = dict(q_heads=24, kv_heads=2, slots=32, **_TRUNK)
 _DEP4_SCRATCH = dict(q_heads=24, kv_heads=2, slots=32, cache_layout="scratch")
+#: A tp4 / tep4 rank's quantized pool: an fp8 pool widened, or an NVFP4 pool dequantized
+#: (`qsa_nvfp4_pages_to_bf16`), into a contiguous `[pages, 1, 32, 256]` bf16 scratch.
+_TP4_SCRATCH = dict(q_heads=6, kv_heads=1, slots=128, cache_layout="scratch")
 
 
 def _spec(segments, member, **overrides) -> dict:
@@ -731,6 +734,11 @@ class QsaSparseGqaRowtile(OpWrapper):
         Cell(
             why="tp4/tep4 2049 rows from 9000: a last group of 9 rows, 6 q / 1 kv heads",
             spec=_spec([(9000, 2049)], _TP4),
+        ),
+        Cell(
+            why="tp4/tep4 kv_fp8 / kv_nvfp4 chunk: 8192 rows from 16384 over the bf16 scratch, "
+            "6 q / 1 kv heads (20-row groups), [128, 8196] table",
+            spec=_spec([(16384, 8192)], _TP4_SCRATCH),
         ),
         Cell(
             why="dep4 kv_fp8 deep chunk: 8160 rows from 188416 over the widened bf16 "
