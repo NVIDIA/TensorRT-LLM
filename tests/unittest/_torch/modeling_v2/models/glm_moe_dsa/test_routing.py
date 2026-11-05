@@ -80,6 +80,7 @@ def _glm52_config(**overrides):
         hidden_size=6144,
         n_routed_experts=256,
         q_lora_rank=2048,
+        index_n_heads=32,
     )
     fields.update(overrides)
     return PretrainedConfig(**fields)
@@ -109,13 +110,14 @@ def test_glm52_supported_tp_matches(_on_sm107, spec_config, mode, tp):
     "config_kwargs, mapping_kwargs, spec_config, missed",
     [
         (dict(num_hidden_layers=92), _TP16, None, r"shape \(92, 6144, 256, 2048\)"),
+        (dict(index_n_heads=64), _TP16, None, "index_n_heads=64"),
         (dict(), dict(_TP16, enable_attention_dp=True), None, "attention_dp=True"),
         (dict(), dict(_TP16, moe_ep_size=16, moe_tp_size=1), None, "moe_ep=16"),
         (dict(), dict(world_size=2, tp_size=2, moe_tp_size=2), None, "world_size=2"),
         (dict(), _TP16, MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True), "MTP"),
         (dict(), _TP16, _NGRAM, "NGRAM"),
     ],
-    ids=["other-shape", "attention-dp", "expert-parallel", "tp2", "vanilla-mtp", "ngram"],
+    ids=["other-shape", "heads", "attention-dp", "expert-parallel", "tp2", "vanilla-mtp", "ngram"],
 )
 def test_glm52_near_misses_do_not_match(
     _on_sm107, config_kwargs, mapping_kwargs, spec_config, missed

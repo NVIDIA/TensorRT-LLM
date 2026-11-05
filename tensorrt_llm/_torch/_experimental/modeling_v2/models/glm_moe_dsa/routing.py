@@ -159,6 +159,7 @@ def route(
     if (
         compute_capability == (10, 7)
         and shape == _SHAPE
+        and index_n_heads == 32
         and pure_tp
         and mtp_eagle_or_none
         and kv_cache_quant_algo == QuantAlgo.FP8
