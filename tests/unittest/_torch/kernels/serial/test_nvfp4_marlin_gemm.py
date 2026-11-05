@@ -24,7 +24,7 @@ from itertools import product
 
 import torch
 from parameterized import parameterized
-from utils.util import getSMVersion, unittest_name_func
+from utils.util import getSMVersion, isSM120Family, unittest_name_func
 
 import tensorrt_llm  # noqa: F401  # registers torch.ops.tensorrt_llm / torch.ops.trtllm ops
 
@@ -66,7 +66,7 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
         name_func=unittest_name_func,
     )
     @unittest.skipUnless(
-        89 <= getSMVersion() < 100 or getSMVersion() in (120, 121),
+        89 <= getSMVersion() < 100 or isSM120Family(),
         "Marlin NVFP4 GEMM requires SM89-99 or SM120/121",
     )
     def test_nvfp4_marlin_gemm(

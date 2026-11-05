@@ -35,6 +35,9 @@ All published functionality in the Release Notes has been fully tested and verif
   Grouped encoders must also include item metadata with exact output row counts
   in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
+- **[DEPRECATION]** KV cache manager V1 (`kv_cache_config.use_kv_cache_manager_v2=False`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. KV cache manager V2 is the default (`use_kv_cache_manager_v2=True`). During the migration period V1 keeps working and logs a one-time warning when it is constructed, including when `use_kv_cache_manager_v2="auto"` resolves to it and when sleep mode (`sleep_config`), which V2 does not support yet, falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+- **[DEPRECATION]** The C++ cache transceiver (`cache_transceiver_config.transceiver_runtime="CPP"`, or `None`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. The Python transceiver is the default (`transceiver_runtime="PYTHON"`); it runs on the NIXL backend with KV cache manager V2, so deployments on the UCX, MPI or MOONCAKE backend must move to NIXL. The C++ NIXL transfer agent that the Python transceiver uses is not affected. During the migration period the C++ transceiver keeps working and logs a one-time warning when it is constructed, including when `transceiver_runtime="auto"` resolves or falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+- **Migration prerequisites:** Sleep mode, RocketKV, and skip-softmax still require KV cache manager V1. Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep those implementations for these features during migration.
 
 ### Fixed Issues
 
@@ -1086,7 +1089,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Supported phi 3 vision multimodal.
 
 ### Fixed Issues
-- Fixed brokens outputs for the cases when batch size is larger than 1. (#1539)
+- Fixed broken outputs for the cases when batch size is larger than 1. (#1539)
 - Fixed `top_k` type in `executor.py`, thanks to the contribution from @vonjackustc in #1329.
 - Fixed stop and bad word list pointer offset in Python runtime, thanks to the contribution from @fjosw in #1486.
 - Fixed some typos for Whisper model, thanks to the contribution from @Pzzzzz5142 in #1328.

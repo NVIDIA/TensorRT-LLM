@@ -174,9 +174,9 @@ private:
 //==============================================================================
 
 // Returns true if NCCL window buffers (ncclMemAlloc / ncclCommWindowRegister)
-// are supported for the given real SM version, integrated-device flag, and runtime NCCL version.
+// are supported for the given SM version, integrated-device flag, and runtime NCCL version.
 // Exposed for focused unit testing of platform/version gates.
-bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion);
+bool isNcclWindowSupportedForPlatform(int smVersion, bool isIntegrated, int ncclRuntimeVersion);
 
 // Returns true if the compile-time and runtime NCCL versions support window buffers
 // and the current CUDA device is not in a known-unsupported platform/version set.
@@ -246,6 +246,11 @@ public:
     // therefore must be called at the same explicit lifecycle boundary on every rank. Buffers
     // still in use are returned when their deterministic tensor scope ends.
     void releaseGraphPoolOwner(int64_t owner);
+
+    // While set on this host thread, requestBuffer returns an invalid buffer without touching the
+    // pool, so callers fall back to plain memory. Used where ranks are not SPMD, such as PARALLEL
+    // autotuning. Returns the previous setting.
+    bool setWindowAllocationSuppressed(bool suppressed);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
