@@ -102,6 +102,18 @@ class Spark2_5Config(PretrainedConfig):
                 f"layer_types length ({len(layer_types)}) must match "
                 f"num_hidden_layers ({num_hidden_layers})"
             )
+        # Without this, sliding layers would silently run as full attention:
+        # both the model (attention_window_size=None) and the KV-cache window
+        # derivation treat a missing sliding_window as "no window".
+        if any("sliding" in str(lt) for lt in layer_types) and (
+            not isinstance(sliding_window, int)
+            or isinstance(sliding_window, bool)
+            or sliding_window <= 0
+        ):
+            raise ValueError(
+                f"layer_types contains sliding attention layers, which require "
+                f"a positive integer sliding_window, got {sliding_window!r}"
+            )
         self.layer_types = layer_types
 
         super().__init__(

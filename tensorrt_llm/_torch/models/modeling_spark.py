@@ -31,13 +31,9 @@ from torch import nn
 from tensorrt_llm._torch.configs.spark import Spark2_5Config
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
-from ..attention.attention import Attention, _helix_cp_allgather_input, _helix_cp_output_projection
+from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
-from ..attention.backends.interface import (
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-    RopeParams,
-)
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -126,8 +122,16 @@ def gelu_erf(gate_x: torch.Tensor) -> torch.Tensor:
 
 class Spark2_5Attention(Attention):
     """Spark attention: per-layer-type RoPE, optional sliding window, and a
-    headwise sigmoid gate (``g_proj``) applied to the attention output before
-    ``o_proj``."""
+    headwise gate (``g_proj``) applied to the attention output before
+    ``o_proj``.
+
+    The gate rides the base class's output-gate hooks -- ``preprocess_qkv``
+    returns it alongside q/k/v and ``forward_impl`` applies it through the
+    overridden ``apply_output_gate`` -- so the full ``Attention.forward``
+    feature set (LoRA on QKV, dynamic-tree spec-dec position adjustment,
+    attention sinks, relative attention bias, sparse hooks, the GQA-decode
+    KV-append plan, helix context parallelism) is preserved.
+    """
 
     def __init__(
         self,
@@ -142,6 +146,11 @@ class Spark2_5Attention(Attention):
             config.sliding_window if layer_type == "sliding_attention" else None
         )
 
+        # RoPE is per layer type (theta and partial rotary factor differ
+        # between sliding and full layers). Attention backends read the rope
+        # parameters from this layer's own PositionalEmbeddingParams, so the
+        # fusion decision is left to the backend (same approach as Gemma3's
+        # per-layer theta).
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=_build_rope_params(config, layer_type),
@@ -149,10 +158,8 @@ class Spark2_5Attention(Attention):
 
         self.gate_act_mode = config.gate_attn_act_mode
         self.use_headwise_gate = bool(config.headwise_attn_output_gate)
+        self._pending_gate = None
 
-        # Per-layer-type RoPE (theta and partial factor differ between sliding
-        # and full layers), so the fused RoPE path -- which only reads
-        # config-level rope settings -- cannot be used.
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -160,7 +167,6 @@ class Spark2_5Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            rope_fusion=False,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
@@ -187,62 +193,43 @@ class Spark2_5Attention(Attention):
                 quant_config=model_config.get_quant_config(),
             )
 
-    def forward(
+    def forward(self, position_ids, hidden_states, *args, **kwargs):
+        # Capture the gate from the same (post-input_layernorm) hidden_states
+        # that feed the QKV projection, then delegate to the base forward.
+        # preprocess_qkv picks the stashed gate up and forward_impl applies it
+        # via apply_output_gate before the output projection.
+        if self.use_headwise_gate:
+            self._pending_gate = self.g_proj(hidden_states)
+        if kwargs.get("attention_window_size") is None and self.attention_window_size is not None:
+            kwargs["attention_window_size"] = self.attention_window_size
+        try:
+            return super().forward(position_ids, hidden_states, *args, **kwargs)
+        finally:
+            self._pending_gate = None
+
+    def preprocess_qkv(
         self,
-        position_ids: Optional[torch.IntTensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        attention_mask=PredefinedAttentionMask.CAUSAL,
-        all_reduce_params=None,
-        lora_params=None,
-        attention_window_size: Optional[int] = None,
-        attention_mask_data: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        # Override Attention.forward to insert the g_proj gate between the
-        # attention kernel output and o_proj (the HF reference position).
-        # The gate consumes the same (post-input_layernorm) hidden_states as
-        # the QKV projection.
-        gate_input = hidden_states if self.use_headwise_gate else None
+        qkv: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: Optional[AttentionMetadata] = None,
+    ):
+        q, k, v, gate, kv_append = super().preprocess_qkv(qkv, position_ids, attn_metadata)
+        if gate is None:
+            gate = self._pending_gate
+        return q, k, v, gate, kv_append
 
-        hidden_states = _helix_cp_allgather_input(
-            hidden_states, attn_metadata, self.mapping, self.layer_idx
+    def apply_output_gate(self, attention_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        return _apply_output_gate(
+            attention_output, gate, self.num_heads, self.head_dim, self.gate_act_mode
         )
 
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = self.apply_rope(qkv, None, None, position_ids)
-        q, k, v = self.convert_qkv(q, k, v)
-
-        window = attention_window_size or self.attention_window_size
-        attn_output = self.forward_impl(
-            q,
-            k,
-            v,
-            attn_metadata,
-            attention_mask,
-            window,
-            attention_mask_data,
-            mrope_config=None,
-            has_lora=bool(lora_params),
-        )
-
-        if gate_input is not None:
-            gate = self.g_proj(gate_input)
-            attn_output = _apply_output_gate(
-                attn_output, gate, self.num_heads, self.head_dim, self.gate_act_mode
-            )
-
-        attn_output = _helix_cp_output_projection(
-            self.o_proj,
-            attn_output,
-            attn_metadata,
-            all_reduce_params,
-            self.mapping,
-            self.mapping_o,
-            self.layer_idx,
-            lora_params,
-        )
-        return attn_output
+    def _use_quantize_output(self):
+        # A pre-quantized attention output (fp8, or an Fp4QuantizedTensor)
+        # cannot carry the headwise gate math; opt out the same way the base
+        # class does for attn_output_gate.
+        if self.use_headwise_gate:
+            return False
+        return super()._use_quantize_output()
 
 
 class Spark2_5DecoderLayer(DecoderLayer):
