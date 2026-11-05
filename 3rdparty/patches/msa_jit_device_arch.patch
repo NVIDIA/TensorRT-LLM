@@ -1,7 +1,7 @@
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
-@@ -209,6 +209,62 @@
+@@ -209,6 +209,69 @@
  
  _ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
  
@@ -17,8 +17,9 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +    three). MINFER_FMHA_CUDA_ARCH (e.g. ``103a``) overrides it; with no CUDA
 +    device, devices outside the family, or visible devices of different
 +    architectures, it is None and the build keeps the portable three-target
-+    image. Resolved on the first build, not at import, so importing
-+    initializes no CUDA context.
++    image. A resolved target is exported to MINFER_FMHA_CUDA_ARCH, so child
++    processes build for, and look in, the same target. Resolved on the first
++    build, not at import, so importing initializes no CUDA context.
 +    """
 +    global _jit_target_value
 +    if _jit_target_value is not _JIT_TARGET_UNSET:
@@ -37,6 +38,8 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +                    target = f"{major}{minor}a"
 +        except (ImportError, RuntimeError):  # keep the portable image
 +            target = None
++        if target is not None:
++            os.environ.setdefault("MINFER_FMHA_CUDA_ARCH", target)
 +    _jit_target_value = target
 +    return target
 +
@@ -48,13 +51,17 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +    return CACHE_BASE / f"sm_{target}" if target else CACHE_BASE
 +
 +
-+def _select_gencode(nvcc_flags):
++def _select_gencode(nvcc_flags, cache_dir):
 +    """nvcc_flags with its -gencode targets replaced, in place, by the one of
-+    _resolve_jit_target(); unchanged when that is None."""
++    _resolve_jit_target(), for a build in that target's directory
++    (_jit_base()). Builds elsewhere, such as scripts/warmup_fmha_sm100.py
++    writing to the shared CACHE_BASE, keep every target, so any GPU can load
++    what they write."""
 +    target = _resolve_jit_target()
 +    first = next((i for i, flag in enumerate(nvcc_flags)
 +                  if flag.startswith("-gencode=")), None)
-+    if not target or first is None:
++    if (not target or first is None
++            or not Path(cache_dir).is_relative_to(_jit_base())):
 +        return nvcc_flags
 +    rest = [flag for flag in nvcc_flags if not flag.startswith("-gencode=")]
 +    return (rest[:first] + [f"-gencode=arch=compute_{target},code=sm_{target}"]
@@ -64,16 +71,16 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  def _get_nvcc_flags(cache_dir, fmha=True):
      tvm_include = _get_tvm_ffi_include()
      fmha_include = str(_FMHA_VARLEN_DIR / "include")
-@@ -248,7 +304,7 @@
+@@ -248,7 +311,7 @@
          nvcc_flags.append("-DSM_TIMING_ENABLED")
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          nvcc_flags.append("-DFMHA_GMEM_BOUNDS_CHECK")
 -    return " ".join(nvcc_flags)
-+    return " ".join(_select_gencode(nvcc_flags))
++    return " ".join(_select_gencode(nvcc_flags, cache_dir))
  
  class _VariantWrapper:
      """Wraps a TVM-FFI function to look like a module with .run()."""
-@@ -312,7 +368,7 @@
+@@ -312,7 +375,7 @@
                      pass
  
              # Try per-variant .so
@@ -82,7 +89,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
              so_path = cache_dir / f"{variant_name}.so"
              lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
              try:
-@@ -329,7 +385,7 @@
+@@ -329,7 +392,7 @@
  
      def _compile_only(self, variant_name, params):
          """Compile a variant without loading. Safe to call from subprocesses."""
@@ -91,7 +98,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
          so_path = cache_dir / f"{variant_name}.so"
  
          if so_path.exists():
-@@ -386,7 +442,7 @@
+@@ -386,7 +449,7 @@
  
      def _run_ninja(self, cache_dir):
          result = subprocess.run(
@@ -100,7 +107,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
              cwd=str(cache_dir),
              capture_output=True,
              text=True,
-@@ -420,7 +476,7 @@
+@@ -420,7 +483,7 @@
  
  def _do_compile_plan():
      """Generate and compile plan kernel. No TVM loading."""
@@ -109,7 +116,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      so_path = cache_dir / "fmha_sm100_plan.so"
  
      if so_path.exists():
-@@ -478,11 +534,11 @@
+@@ -478,11 +541,11 @@
  
  def _compile_plan_module():
      """Compile and load plan kernel."""
@@ -123,7 +130,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
          return tvm_ffi.load_module(str(so_path))
      finally:
          _release_file_lock(lock_fd)
-@@ -510,7 +566,7 @@
+@@ -510,7 +573,7 @@
  
  
  def _do_compile_sparse_topk():
@@ -132,7 +139,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      so_path = cache_dir / "sparse_topk_select.so"
  
      if so_path.exists():
-@@ -576,11 +632,11 @@
+@@ -576,11 +639,11 @@
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
              return _sparse_topk_module
@@ -146,7 +153,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
              _sparse_topk_module = tvm_ffi.load_module(str(so_path))
          finally:
              _release_file_lock(lock_fd)
-@@ -596,7 +652,7 @@
+@@ -596,7 +659,7 @@
  
  
  def _do_compile_reduction():
@@ -155,7 +162,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      so_path = cache_dir / "fmha_sm100_reduction.so"
  
      if so_path.exists():
-@@ -661,11 +717,11 @@
+@@ -661,11 +724,11 @@
      with _reduction_lock:
          if _reduction_module is not None:
              return _reduction_module
