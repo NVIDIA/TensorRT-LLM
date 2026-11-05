@@ -90,6 +90,7 @@ full:B300/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4 
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8] SKIP (https://nvbugs/6770978)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4] SKIP (https://nvbugs/7023197)
 full:B300/unittest/_torch/pyexecutor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_mixed_precision_appends_high_group SKIP (https://nvbugs/7044232)
+full:B300/unittest/_torch/pyexecutor/kv_cache/test_mixed_precision_kv_cache.py::test_deepseek_v4_mixed_disagg_names_every_layer SKIP (https://nvbugs/7043616)
 full:CPU/unittest/_torch/test_connector_adp.py::test_batch_start_combines_readiness_with_status[batch_sizes0] SKIP (https://nvbugs/7044104)
 full:CPU/unittest/_torch/test_connector_adp.py::test_batch_start_combines_readiness_with_status[batch_sizes1] SKIP (https://nvbugs/7044104)
 full:CPU/unittest/_torch/test_connector_adp.py::test_batch_start_combines_readiness_with_status[batch_sizes2] SKIP (https://nvbugs/7044104)
