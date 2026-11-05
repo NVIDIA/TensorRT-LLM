@@ -385,6 +385,21 @@ def test_the_piecewise_prefill_cuda_graph_declines():
     )
 
 
+@pytest.mark.parametrize("mapping_kwargs", [{}, _LAYOUTS["dep4"]], ids=["tp1", "dep4"])
+def test_a_prefill_step_past_the_int32_score_table_declines(mapping_kwargs):
+    """At the checkpoint's max_seq_len 262144 the score table is 65568 columns (8196 pages of
+    32 tokens at compression 4): 32752 context rows stay under 2^31 elements, 32768 do not."""
+    config = _model_config(
+        pretrained_config=_qwen4_exp_config(
+            {"max_position_embeddings": 262144, "indexer_compress_ratio": 4}
+        ),
+        **mapping_kwargs,
+    )
+    _claimed(config, max_num_tokens=32752)
+    _declined(config, match="max_num_tokens=32768 at max_seq_len=262144", max_num_tokens=32768)
+    _claimed(config, max_num_tokens=32768, max_seq_len=131072)
+
+
 @pytest.mark.parametrize("max_draft_len", [1, 3, 7])
 def test_mtp_needs_the_cached_replay(monkeypatch, max_draft_len):
     """The target verifies on the GDN cached replay only; without speculation it is unused."""

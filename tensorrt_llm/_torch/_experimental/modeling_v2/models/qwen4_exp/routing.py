@@ -74,6 +74,15 @@ _LAYOUTS = {
 # The attention-DP layouts MTP is admitted at: those its draft acceptance was measured at.
 _ATTENTION_DP_MTP_LAYOUTS = ("dep4",)
 
+# A prefill step scores and selects its context rows (at most max_num_tokens) in one call,
+# and `qsa_paged_index_scores` (output rows) and `qsa_topk_expand_decode` (row layouts) index
+# the score table in int32: rows x columns must stay below 2^31. The table has
+# `indexer_compress_ratio`-compressed columns over the KV manager's `max_blocks_per_seq`
+# pages: the sequence plus its generation lead (at most twice the widest verify step),
+# padded to a multiple of 4 pages.
+_SCORE_TABLE_ELEMENTS = 2**31
+_GENERATION_LEAD_TOKENS = 2 * (_MAX_DRAFT_LEN + 1)
+
 
 class EngineChoices(NamedTuple):
     """Engine choices that fix which code a target runs but are not in the checkpoint's
@@ -203,6 +212,27 @@ def _check_engine(
         )
 
 
+def _check_score_table(
+    max_num_tokens: int,
+    max_seq_len: Optional[int],
+    tokens_per_block: int,
+    compress_ratio: Optional[int],
+) -> None:
+    """Decline a prefill step whose score table would pass 2^31 elements (see
+    `_SCORE_TABLE_ELEMENTS`); an unknown max_seq_len or compression is not checked."""
+    if max_seq_len is None or compress_ratio is None:
+        return
+    pages = -(-(max_seq_len + _GENERATION_LEAD_TOKENS) // tokens_per_block)
+    columns = -(-pages // 4) * 4 * tokens_per_block // compress_ratio
+    if max_num_tokens * columns >= _SCORE_TABLE_ELEMENTS:
+        raise NoTarget(
+            f"max_num_tokens={max_num_tokens} at max_seq_len={max_seq_len}: a prefill step's "
+            f"context rows score a {columns}-column table, and the target indexes it in int32 "
+            f"up to 2^31 elements; set max_num_tokens to at most "
+            f"{(_SCORE_TABLE_ELEMENTS - 1) // columns}"
+        )
+
+
 def _check_attention_dp(member: str, spec_config: Optional[Any], engine: EngineChoices) -> None:
     """Decline what the target does not run under attention DP (dep4, dep2), where
     each rank serves its own requests and only the routed experts cross ranks.
@@ -295,6 +325,12 @@ def route(
         if mapping.enable_attention_dp:
             _check_attention_dp(member, spec_config, engine)
         _check_engine(spec_config, kv_cache_quant_algo, engine, member)
+        _check_score_table(
+            llm_args.max_num_tokens or model_config.max_num_tokens,
+            llm_args.max_seq_len or getattr(text, "max_position_embeddings", None),
+            llm_args.kv_cache_config.tokens_per_block,
+            getattr(text, "indexer_compress_ratio", None),
+        )
         # One line on purpose: the claims suite reads the routed target off the
         # `from .<target>.modeling import <Class>` line.
         # fmt: off

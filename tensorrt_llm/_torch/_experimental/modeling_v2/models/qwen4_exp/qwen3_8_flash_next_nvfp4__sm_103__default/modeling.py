@@ -1083,6 +1083,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # The draft experts' NVFP4 copy at one rank (`_mtp_moe_nvfp4`), built once: it frees
         # the FP8 experts, and the shell's post-load walk reaches `post_load_weights` again.
         self._mtp_moe_nvfp4 = None
+        # The FP8 draft head at tp1, set by the shell's `post_load_weights` after this core's;
+        # the post-load walk calls this core's `post_load_weights` again, which leaves it.
+        self.draft_head = None
 
         # ---- PLE -----------------------------------------------------------
         # One-based in the config.
@@ -1308,8 +1311,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
-        # The FP8 draft head at tp1, set by the shell's `post_load_weights`.
-        self.draft_head = None
 
     def _build_draft_one_rank(self, device) -> None:
         """At one rank the draft layer's operands for `DecodeTarget._mtp_layer`: the fused
@@ -6621,6 +6622,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
                 **kwargs,
             )
         assert spec_metadata is not None, "the spec worker is built but no spec_metadata came"
+        assert not self.one_rank or self.model.draft_head is not None, (
+            "MTP at tp1 runs its draft steps on the FP8 draft head `_build_heads` makes, but "
+            "the core has none"
+        )
         final, hc = self.model.split_spec_output(
             self.model(
                 attn_metadata=attn_metadata,

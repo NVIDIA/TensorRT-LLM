@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Decode hyper-connection site for 2..16 rows on warp tensor cores: two PDL launches, the
 first emitting the bottleneck `low`, the second the up projection, gate, stream mean and NVFP4.
 
