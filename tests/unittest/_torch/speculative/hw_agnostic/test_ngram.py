@@ -68,7 +68,6 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool, attn
 
 
 class _MockConfig:
-
     def __init__(self, is_keep_all=True, is_use_oldest=True):
         self.tokens_per_gen_step = 6
         self.max_matching_ngram_size = 2
@@ -79,23 +78,27 @@ class _MockConfig:
 
 def _make_manager(**kwargs):
     from tensorrt_llm._torch.speculative.ngram import NGramPoolManager
+
     return NGramPoolManager(_MockConfig(**kwargs), max_num_requests=8)
 
 
 @pytest.mark.cpu_only
 def test_pruning_removes_all_shorter_candidates():
-    """Inserting a longer match must prune every shorter candidate."""
+    """A new match must prune every shorter candidate and keep the rest."""
     mgr = _make_manager(is_keep_all=True, is_use_oldest=True)
-    for rid in range(3):
-        mgr.get_draft_tokens([100, 101, rid + 1], rid, 100)
-    mgr.get_draft_tokens([100, 101, 4, 5, 6, 7], 3, 100)
+    # Seed a longer and an equal-length candidate, then three shorter ones.
+    mgr.get_draft_tokens([100, 101, 20, 21, 22, 23, 24], 0, 100)
+    mgr.get_draft_tokens([100, 101, 8, 9, 10, 11], 1, 100)
+    for rid in range(2, 5):
+        mgr.get_draft_tokens([100, 101, rid], rid, 100)
+    mgr.get_draft_tokens([100, 101, 4, 5, 6, 7], 5, 100)
 
-    pool = mgr.pool if mgr.is_public_pool else mgr.pool[3]
-    candidates = list(pool.get((100, 101), []))
-    for c in candidates:
-        assert len(c) >= len((4, 5, 6, 7)), (
-            f"shorter candidate {c} was not pruned")
-    assert (4, 5, 6, 7) in candidates, "longer candidate was not preserved"
+    pool = mgr.pool if mgr.is_public_pool else mgr.pool[5]
+    assert list(pool[(100, 101)]) == [
+        (20, 21, 22, 23, 24),
+        (8, 9, 10, 11),
+        (4, 5, 6, 7),
+    ]
 
 
 @pytest.mark.cpu_only
@@ -108,8 +111,7 @@ def test_single_match_mode_keeps_one_entry():
 
     pool = mgr.pool if mgr.is_public_pool else mgr.pool[2]
     candidates = list(pool.get((100, 101), []))
-    assert len(candidates) <= 1, (
-        f"is_keep_all=False but {len(candidates)} candidates in pool")
+    assert len(candidates) <= 1, f"is_keep_all=False but {len(candidates)} candidates in pool"
 
 
 @pytest.mark.cpu_only
@@ -120,7 +122,8 @@ def test_draft_returns_longest_after_pruning():
     mgr.get_draft_tokens([100, 101, 4, 5, 6, 7], 1, 100)
     draft = mgr.get_draft_tokens([50, 100, 101], 2, 100)
     assert draft == [4, 5, 6, 7], (
-        f"draft returned {draft}, expected [4, 5, 6, 7] from the longer match")
+        f"draft returned {draft}, expected [4, 5, 6, 7] from the longer match"
+    )
 
 
 if __name__ == "__main__":
