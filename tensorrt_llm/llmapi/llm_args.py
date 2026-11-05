@@ -5315,7 +5315,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Whether to use the KV cache manager v2 (experimental). Defaults to "
         "True. Set False to select V1 for models that support it. 'auto' uses "
         "the model-specific preference and falls back to False when the model "
-        "does not declare one.")
+        "does not declare one. V1 is deprecated as of TensorRT-LLM 1.4 "
+        "(2026-11) and will be removed after the 3-month migration period.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     enable_swa_scratch_reuse: bool = Field(
@@ -5719,7 +5720,9 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "each server and is only logged, not surfaced, so keep context and "
         "generation server configurations consistent. None is equivalent "
         "to 'CPP'. 'auto' is resolved on the PyTorch backend's standard "
-        "model-loading path.")
+        "model-loading path. The C++ transceiver ('CPP' and None) is "
+        "deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed "
+        "after the 3-month migration period.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
