@@ -103,7 +103,7 @@ class ProjectionInbox:
 
     ``max_rows`` is the most rows one call may carry: ``MAX_ROWS`` (8), or
     ``WIDE_MAX_ROWS`` (32) at TP4 for the wide sites of ``wide_prologue`` and
-    ``wide_projection_gathers``.
+    ``wide_projection_gathers``, and at TP8 for ``projection_gathers``' 9..32-row sites.
 
     Attributes read by the fused ops: ``base`` (address of rank 0's segment
     through the fabric mapping), ``stride`` (bytes between ranks' segments),
@@ -118,9 +118,11 @@ class ProjectionInbox:
         if mapping.tp_size not in WORLDS or mapping.enable_attention_dp or mapping.cp_size != 1:
             raise ValueError("ProjectionInbox needs TP4 or TP8 without attention DP or CP")
         world = mapping.tp_size
-        if max_rows not in ROW_CAPACITIES or (max_rows != MAX_ROWS and world != 4):
+        if max_rows not in ROW_CAPACITIES:
+            # A wide inbox at TP8 too: the 9..32-row TP8 pool and unpool gathers of
+            # ``projection_gathers`` (``pool_gather_route`` takes one there as well, routing only).
             raise ValueError(
-                f"max_rows must be {MAX_ROWS}, or {WIDE_MAX_ROWS} at TP4; got {max_rows} at TP{world}"
+                f"max_rows must be {MAX_ROWS} or {WIDE_MAX_ROWS}; got {max_rows} at TP{world}"
             )
         allowed = tuple(row_words_of(width, world) for width in PROJECTION_WIDTHS)
         if row_words not in allowed:

@@ -29,7 +29,8 @@ residual join writes the router's FP32 input next to the pre-FFN norm output
 (``router_input``); both are bitwise. There the attention input of steps of at least
 ``ce_gather.MIN_ROWS`` rows is gathered by the copy engines and the QKV projection runs
 in row blocks behind per-peer flags (``ce_gather``); also bitwise. On sm107 the router
-logits and the attention input are all-gathered.
+logits and the attention input are all-gathered, unless ``configure`` adds sm103's parts
+there.
 
 DFlash taps the residual stream after its capture layers, and that stream is
 sharded here. For the forward the step's capture buffer
@@ -84,6 +85,7 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
+from tensorrt_llm.logger import logger
 
 #: The fewest rows a step captured into the breakable prefill CUDA graph needs to run
 #: sequence-parallel: below it the two collectives' fixed cost per all-reduce replaced
@@ -154,8 +156,37 @@ SHARD_PARTS_BY_SM = {
     103: ("moe", "shard_routing", "router_input", "ce_gather"),
     # sm107: the MoE re-class only; the router logits are gathered and every row of the
     # step is routed, as the built-in arm does, and the attention input is all-gathered.
+    # ``configure``'s ``sm107_extra_parts`` (the ``context_sp_extra_parts`` lever) adds
+    # sm103's parts.
     107: ("moe",),
 }
+
+
+def configure(*, sm107_extra_parts: Tuple[str, ...] = ()) -> None:
+    """Set the parts ``install`` wires on sm107 beside the MoE re-class (``SHARD_PARTS_BY_SM``).
+
+    ``lever_settings.apply`` sets them from the model's plan before any install. With the default
+    sm107 runs the MoE re-class only.
+
+    Args:
+        sm107_extra_parts: sm103's parts to add on sm107 (``shard_routing``, ``router_input``,
+            ``ce_gather``), in any order; they are wired in sm103's order.
+
+    Raises:
+        ValueError: if a name is not one of sm103's parts.
+    """
+    extra = tuple(str(part).strip() for part in sm107_extra_parts if str(part).strip())
+    choices = SHARD_PARTS_BY_SM[103][1:]
+    unknown = sorted(set(extra) - set(choices))
+    if unknown:
+        raise ValueError(
+            f"[musespark_open] context_sequence_parallel: not an sm103 part: {unknown}"
+        )
+    SHARD_PARTS_BY_SM[107] = ("moe",) + tuple(part for part in choices if part in extra)
+    if extra:
+        logger.info(
+            f"[musespark_open] context_sequence_parallel: sm107 parts {SHARD_PARTS_BY_SM[107]}"
+        )
 
 
 def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequenceParallel":

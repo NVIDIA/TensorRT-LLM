@@ -14,7 +14,8 @@ stacked one -- goes through that attribute.
 So ``install`` builds one ``FinalizeTransportWorkspace`` in front of the model's
 built-in workspace (collective: a multicast fabric allocation and the kernel's
 compilation on every rank) and puts it in every layer's attribute. Its
-``finalize`` has the built-in signature: calls of 1..16 tokens run
+``finalize`` has the built-in signature: calls of 1..16 tokens (at TP8,
+1..``TP8_MAX_TOKENS`` of that module) run
 ``ops/moe/finalize_allreduce_transport``, bit for bit the built-in kernel's
 result; larger calls run the built-in kernel. With ``wide_finalize_transport``
 (``install(model, wide=True)``, TP4 only) the workspace also builds a second
@@ -37,9 +38,6 @@ from ...ops.moe import finalize_allreduce_transport as _fin
 
 #: The attribute the built-in MoE reads its fused finalize workspace from.
 ATTRIBUTE = "_finalize_ar_workspace"
-
-#: The fast path that installs the workspace, and the transport it builds.
-FEATURES = {"finalize_transport": _fin.DEFAULT}
 
 
 def refusal(model: MuseSparkOpenModel, wide: bool = False) -> Optional[str]:
@@ -106,11 +104,13 @@ def install(model: MuseSparkOpenModel, wide: bool = False):
     if reason is not None:
         raise ValueError(reason)
     legacy = getattr(model, ATTRIBUTE)
-    transport = FEATURES["finalize_transport"]
+    # The transport it builds: read here, after ``finalize_allreduce_transport.configure``.
+    transport = _fin.DEFAULT
     workspace = _fin.FinalizeTransportWorkspace(legacy, legacy._mapping, transport)
     if wide:
         workspace.serve_wide_calls(legacy._mapping)
     for layer in model.layers:
         setattr(layer.feed_forward, ATTRIBUTE, workspace)
-    _fin.log_once_enabled(len(model.layers), transport, wide)
+    # The installed layout's token range (TP8_MAX_TOKENS on a TP8 workspace).
+    _fin.log_once_enabled(len(model.layers), transport, wide, workspace.max_tokens)
     return workspace

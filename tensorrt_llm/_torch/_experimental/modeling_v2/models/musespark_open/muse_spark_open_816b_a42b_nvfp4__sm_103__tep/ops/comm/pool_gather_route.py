@@ -845,9 +845,11 @@ if _AVAILABLE:
             # placement or an early-id publication.
             self.inbox_rows = inbox_rows
             self.wide = inbox_rows > MAX_ROWS
-            if self.wide and (self.place != PLACE_NONE or publish or not route or world != 4):
+            if self.wide and (
+                self.place != PLACE_NONE or publish or not route or world not in WORLDS
+            ):
                 raise ValueError(
-                    "a wide inbox serves routing only (no placement, no early ids) at TP4"
+                    "a wide inbox serves routing only (no placement, no early ids) at TP4 or TP8"
                 )
 
         def owner(self, v: int) -> int:

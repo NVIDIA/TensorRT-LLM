@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CuTe DSL kernel behind ``full_attention_split_kv``: page-split decode attention partials (tcgen05, sm_103).
 
-Only ``full_attention_split_kv`` imports this module, and only when the op is called, so nothing here
-loads with the target. The op module states the contract, the ownership and progress argument
+``full_attention_split_kv`` imports this module to build its kernels, only when the op is
+called; ``configure`` (``lever_settings.apply``) sets the TMA ring depth they are built with. The
+op module states the contract, the ownership and progress argument
 and the PDL memory-order record; the comments here say what each role does.
 
 Shape per rank (``kv_heads``, one build per tensor-parallel size of the target): 2 KV heads and
@@ -45,6 +46,7 @@ fold-only code sits under ``const_expr`` in the shared roles, so the op's build 
 
 import copy
 import math
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -60,6 +62,32 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 F8 = cutlass.Float8E4M3FN
 BF16 = cutlass.BFloat16
 F16 = cutlass.Float16
+
+#: Pages of the TMA ring every split-KV kernel is built with (the op's build and the prep-fold
+#: builds; ``configure``'s ``stages``, lever ``split_kv_deep_rings``): 16, or another multiple of 4
+#: (20 is the deepest that fits one CTA's shared memory). Buffering only: the same tiles, in the
+#: same order, through the same MMAs, so the same bits. 20 measured -4.15 / -2.60 us per layer at
+#: 524k context with 3 / 2 requests, ~0 at <= 262k. Read when a kernel object is built.
+_FA_STAGES = 16
+
+
+def configure(*, stages: int = 16) -> None:
+    """Set the TMA ring depth (pages) the split-KV kernels are built with.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install. A kernel built
+    afterwards takes it; ``full_attention_split_kv`` keys each compiled build on it, so a build
+    compiled at another depth is never reused for this one.
+
+    Raises:
+        ValueError: for a depth that is not a positive multiple of ``PAGES_PER_TILE``.
+    """
+    global _FA_STAGES
+    if stages <= 0 or stages % PAGES_PER_TILE:
+        raise ValueError(
+            f"split-KV ring depth must be a positive multiple of {PAGES_PER_TILE}, got {stages}"
+        )
+    _FA_STAGES = int(stages)
+
 
 #: Tokens per KV page, head width, KV heads and query heads per KV head of one CTA (one pair
 #: of KV heads: all of one tep8 rank's, half of one tep4 rank's).
@@ -275,7 +303,7 @@ class FullAttnSplitKvKernel:
         prefetch: bool = True,
         evict_first: bool = True,
         k_tile: bool = True,
-        stages: int = 16,
+        stages: Optional[int] = None,
         rescale_log2: float = 4.0,
         p_pre_log2: float = 4.0,
         regs_softmax: int = 208,
@@ -293,6 +321,9 @@ class FullAttnSplitKvKernel:
         self.loader_wait = loader_wait
         self.evict_first = evict_first
         self.k_tile = k_tile
+        if stages is None:
+            # The ring depth ``configure`` set, read when the kernel object is built.
+            stages = _FA_STAGES
         assert stages % PAGES_PER_TILE == 0, stages
         self.stages = stages
         self.tau = rescale_log2
@@ -1629,17 +1660,24 @@ class FullAttnSplitKvFoldKernel(FullAttnSplitKvKernel):
         rescale_log2: float = 4.0,
         kv_heads: int = HKV,
         max_cta_pages: int = MAX_CTA_PAGES,
+        reqs: int = 1,
+        stages: Optional[int] = None,
     ):
+        # ``reqs`` above 1 is the fold of a 2..4-sequence step (the base kernel's multi-sequence
+        # build: ``request_of`` and the per-sequence Q, table and partial bases, which the softmax
+        # threads' Q norm and the side warps' append read). ``stages``: as the base kernel's.
         super().__init__(
             enable_pdl=enable_pdl,
             prefetch=False,
             evict_first=evict_first,
+            stages=stages,
             min_pages=min_pages,
             loader_wait=loader_wait,
             rescale_cols=rescale_cols,
             rescale_log2=rescale_log2,
             kv_heads=kv_heads,
             max_cta_pages=max_cta_pages,
+            reqs=reqs,
         )
         self.fold = (float(eps), float(q_scale), bool(permuted))
         self.app_wait = app_wait

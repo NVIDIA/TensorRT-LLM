@@ -626,6 +626,23 @@ def shared_gather_workspace(mapping: Mapping, shard: int) -> HeadGatherWorkspace
 #: Fewest rows the vocabulary-parallel head takes (two K=7 verify blocks); 8-row steps keep
 #: the ``lm_head_inbox`` gather.
 VP_MIN_ROWS = 16
+
+
+def configure(*, vp_min_rows: int = 16) -> None:
+    """Set the vocabulary-parallel head's row floor (``vocab_parallel_head``'s MIN_ROWS).
+
+    ``lever_settings.apply`` calls it from the model's plan before any install; 8 takes one
+    K=7 verify block (for a composition that serves no ``lm_head_inbox``), 16 two.
+
+    Raises:
+        ValueError: for a floor other than 8 or 16.
+    """
+    global VP_MIN_ROWS
+    if vp_min_rows not in (8, 16):
+        raise ValueError(f"the vocabulary-parallel head's row floor is 8 or 16, got {vp_min_rows}")
+    VP_MIN_ROWS = vp_min_rows
+
+
 #: Claimants of a row whose crossings the ranks exchange (``kVpClaimants``).
 VP_CLAIMANTS = 4
 #: Greedy words per (rank, row): one per ``vp_fold`` CTA of the 1024-thread block.

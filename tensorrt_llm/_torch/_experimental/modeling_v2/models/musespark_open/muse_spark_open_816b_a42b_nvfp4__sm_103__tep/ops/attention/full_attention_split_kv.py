@@ -230,6 +230,7 @@ def _compiled_kernel(
     min_pages: int = MIN_PAGES,
     kv_heads: int = KV_HEADS,
     reqs: int = 1,
+    stages: Optional[int] = None,
 ):
     """The compiled kernel of one build. ``loader_wait=False`` (the loader never waits for the
     predecessor) exists for the PDL tests' negative control; ``k_tile=False`` and
@@ -247,7 +248,9 @@ def _compiled_kernel(
     control. ``min_pages`` other than ``MIN_PAGES`` (fewer pages per split, so that the step's
     two pages can sit in two CTAs) exists for that op's tests too; the ops build neither.
     ``kv_heads`` is the rank's KV heads (``RANK_KV_HEADS``: 2 at tep8, 4 at tep4); ``reqs``
-    above 1 is the multi-sequence build (``full_attention_split_kv_multi``)."""
+    above 1 is the multi-sequence build (``full_attention_split_kv_multi``). ``stages`` is the
+    TMA ring depth (``None``: the kernel module's configured depth); the ops pass
+    ``_ring_stages()`` so that each depth is a build of its own in this cache."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -277,10 +280,13 @@ def _compiled_kernel(
             rescale_log2=rescale_log2,
             kv_heads=kv_heads,
             max_cta_pages=cta_pages(kv_heads) * (MULTI_CTA_PAGES_FACTOR if reqs > 1 else 1),
+            stages=stages,
             **({"reqs": reqs} if reqs > 1 else {}),
         )
     else:
-        assert not prefetch and k_tile and p_split and reqs == 1, (prefetch, k_tile, p_split, reqs)
+        # The fold build of 2..4 sequences (``full_attention_prep_fold_multi``) stages pages like
+        # the multi-sequence build; one sequence is the stock fold build.
+        assert not prefetch and k_tile and p_split, (prefetch, k_tile, p_split)
         eps, q_scale, permuted = fold
         kernel = fk.FullAttnSplitKvFoldKernel(
             enable_pdl=enable_pdl,
@@ -294,7 +300,9 @@ def _compiled_kernel(
             rescale_cols=rescale_cols,
             rescale_log2=rescale_log2,
             kv_heads=kv_heads,
-            max_cta_pages=cta_pages(kv_heads),
+            max_cta_pages=cta_pages(kv_heads) * (MULTI_CTA_PAGES_FACTOR if reqs > 1 else 1),
+            stages=stages,
+            **({"reqs": reqs} if reqs > 1 else {}),
         )
     dtypes = (
         cutlass.BFloat16,  # qkv
@@ -349,6 +357,14 @@ def build_options(key: tuple) -> dict:
     """The keyword options of ``_compiled_kernel`` a key's suffix (past its first four or, for
     the fold, five entries) names."""
     return {name: value for name, value in key if name in ("rescale_cols", "kv_heads", "reqs")}
+
+
+def _ring_stages() -> int:
+    """The TMA ring depth split-KV kernels are built with now
+    (``full_attention_split_kv_kernel.configure``), which each op passes to ``_compiled_kernel``."""
+    from . import full_attention_split_kv_kernel as fk
+
+    return fk._FA_STAGES
 
 
 class FullAttnSplitKv(OpWrapper):
@@ -489,7 +505,7 @@ class FullAttnSplitKv(OpWrapper):
                 "full_attention_split_kv compiles on its first call per device and build; make that call "
                 "before capturing a CUDA graph"
             )
-        compiled = _compiled_kernel(*key[:4], **build_options(key[4:]))
+        compiled = _compiled_kernel(*key[:4], stages=_ring_stages(), **build_options(key[4:]))
         _compiled_keys.add(key)
         import cuda.bindings.driver as cuda
 
@@ -737,7 +753,7 @@ class FullAttnSplitKvMulti(OpWrapper):
                 "full_attention_split_kv_multi compiles on its first call per device and build; "
                 "make that call before capturing a CUDA graph"
             )
-        compiled = _compiled_kernel(*key[:4], **build_options(key[4:]))
+        compiled = _compiled_kernel(*key[:4], stages=_ring_stages(), **build_options(key[4:]))
         _compiled_keys.add(key)
         import cuda.bindings.driver as cuda
 

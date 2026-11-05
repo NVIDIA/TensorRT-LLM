@@ -67,6 +67,21 @@ from ...ops.gemm.dense_gemm import QKV_SHAPE, l2_prefetch, post_wait_columns
 #: The fork's name in the dense GEMM plan and the site whose dispatchers join it.
 FORK_NAME = "qkv_prefetch_qkv"
 JOIN_ROLE = "qkv"
+#: ``skip_rows`` (``configure``) asks for no prefetch on decode steps of at most that many rows (the
+#: fork is not made, so the QKV dispatcher's join has nothing pending and returns). In the
+#: one-request (8-row) step budget QKV posts 5.89 us against its 5.39 us HBM floor with the 72 MiB
+#: prefetch running beside the finalize / unpool / boundary. 0 (the default) skips none.
+#: Scheduling only: bitwise.
+SKIP_ROWS = 0
+
+
+def configure(*, skip_rows: int = 0) -> None:
+    """Set the largest decode step, in rows, that forks no prefetch; 0 skips none.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install.
+    """
+    global SKIP_ROWS
+    SKIP_ROWS = int(skip_rows or 0)
 
 
 class QkvPrefetch:
@@ -90,7 +105,7 @@ class QkvPrefetch:
 
     def ask(self, weight: torch.Tensor, rows: int) -> None:
         """Fork the prefetch of ``weight`` after the current stream's work, at ``rows``."""
-        if rows in self.rows:
+        if rows in self.rows and rows > SKIP_ROWS:
             # The launch is built after the fork made its sink (first eager fork).
             self.fork.fork(lambda: self.launches(weight, rows)(), device=weight.device)
 
@@ -223,5 +238,6 @@ def install(model, plan) -> QkvPrefetch:
         f"stream forked after the expert launch on {len(converted)} of {len(layers) - 1} "
         f"layers, layer 0's at the start of the decode forward; joined at the QKV GEMM; "
         f"rows {sorted(rows)}"
+        + (f"; skip_rows={SKIP_ROWS}: none at <= {SKIP_ROWS} rows" if SKIP_ROWS else "")
     )
     return prefetch

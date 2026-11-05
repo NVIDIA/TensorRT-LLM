@@ -527,6 +527,215 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "the NVFP4 experts of 4096..8192-row calls on the Rubin CuTe DSL GEMMs",
         "load",
     ),
+    # The Vera Rubin low-latency levers (sm107 compositions, ``levers.RULES``).
+    FastPath(
+        "splitk_pool_split8",
+        "the pool GEMM of 9..32-row TP4 decode calls summing K in 8 slices, with the split-K "
+        "kernel's reduce-scatter epilogue",
+        "construct",
+        ("wide_dense_gemms",),
+    ),
+    FastPath(
+        "splitk_frontier_tables",
+        "the TP4 dense projections of 1..32-row decode calls on the low-latency split-K and "
+        "direct tactic tables",
+        "construct",
+        ("wide_dense_gemms",),
+    ),
+    FastPath(
+        "tep8_wide64_splitk",
+        "the TP8 QKV and o_proj of 33..64-row decode calls on split-K",
+        "construct",
+        ("wide_dense_gemms",),
+    ),
+    FastPath(
+        "tep8_publish_splitk",
+        "the TP8 pool and unpool slices of 33..64-row decode calls published from split-K",
+        "construct",
+        ("projection_publish",),
+    ),
+    FastPath(
+        "tep8_drafter_wide_gemms",
+        "the TP8 drafter projections of 2..4-request blocks on split-K",
+        "draft",
+        ("drafter_fixed_gemms",),
+    ),
+    FastPath(
+        "tep8_fc_shard_wide",
+        "the TP8 sharded drafter fc on decode steps of up to 64 rows, its gather on 128 programs",
+        "draft",
+        ("drafter_fc_shard",),
+    ),
+    FastPath(
+        "weight_prefetch_after_join",
+        "dense weight prefetches joined after their consumer, the QKV prefetch dropped",
+        "construct",
+        ("dense_gemm_prefetch",),
+    ),
+    FastPath(
+        "next_qkv_prefetch_skip",
+        "no next-layer QKV prefetch on decode steps of at most 8 rows",
+        "construct",
+        ("next_qkv_prefetch",),
+    ),
+    FastPath(
+        "swa_one_cluster_block",
+        "the sliding-window decode attention block of one to eight requests as one cluster launch",
+        "construct",
+        ("swa_block",),
+    ),
+    FastPath(
+        "swa_prep_split",
+        "the sliding-window block's prep split off steps of two or more requests whose split "
+        "grid spans several waves",
+        "construct",
+        ("swa_block",),
+    ),
+    FastPath(
+        "swa_eight_requests",
+        "the sliding-window block's merged split kernel: TP8 decode steps of up to eight requests, "
+        "and the one-cluster block's fallback",
+        "construct",
+        ("wide_swa_block",),
+    ),
+    FastPath(
+        "full_attention_fold_multi",
+        "the full-attention decode prep folded into the split-KV FMHA on steps of two to four "
+        "requests",
+        "construct",
+        ("full_attention_prep_fold",),
+    ),
+    FastPath(
+        "split_kv_deep_rings",
+        "the split-KV decode FMHA kernels on a 20-stage TMA ring",
+        "construct",
+        ("full_attention_split_kv", "multi_request_split_kv"),
+    ),
+    FastPath(
+        "bf16_half_window",
+        "the BF16 expert layers on the half expert window",
+        "load",
+        ("half_window_experts",),
+    ),
+    FastPath(
+        "prerouted_experts",
+        "the NVFP4 experts on trtllm::fp4_block_scale_moe_prerouted, from the placement "
+        "kernels' routing tables",
+        "load",
+        ("persistent_experts",),
+    ),
+    FastPath(
+        "tep8_ring_buddy_wide",
+        "the TP8 ring-buddy expert placement on decode steps of up to 64 rows",
+        "load",
+        ("replicated_experts",),
+    ),
+    FastPath(
+        "tep8_ring_buddy_pdl",
+        "the TP8 ring-buddy table writer launched with programmatic dependent launch",
+        "load",
+        ("replicated_experts",),
+    ),
+    FastPath(
+        "tep8_tile_placement",
+        "the TP8 replicated experts placed by tile cost on decode steps of 41 or more rows",
+        "load",
+        ("replicated_experts",),
+    ),
+    FastPath(
+        "tep8_router_push",
+        "the TP8 router columns and their all-gather in one kernel, routing folded into its "
+        "epilogue, on 33..128-row steps",
+        "construct",
+        ("router_gemm",),
+    ),
+    FastPath(
+        "tep8_router_prewait",
+        "the TP8 router GEMM loading its weight before its dependency wait",
+        "construct",
+        ("router_gemm",),
+    ),
+    FastPath(
+        "finalize_entry_trigger",
+        "the expert finalize's dependents released at its entry",
+        "construct",
+        ("finalize_transport",),
+    ),
+    FastPath(
+        "tep8_finalize_transport_64",
+        "the TP8 expert finalize of 17..64-token calls on a 64-token transport",
+        "construct",
+        ("finalize_transport",),
+    ),
+    FastPath(
+        "hop_entry_trigger",
+        "the 8-row post-attention hop kernels' dependents released at their entry",
+        "construct",
+        ("post_attention_hop",),
+    ),
+    FastPath(
+        "tep8_early_multicast_hop",
+        "the TP8 post-attention hop of 9..64-row steps launched early, gathered over multicast, "
+        "two rows per CTA from 41 rows",
+        "construct",
+        ("multi_request_post_attention_hop",),
+    ),
+    FastPath(
+        "tep8_direct_hop",
+        "the TP8 o_proj of 33..64-row steps scattering its partial into the owners' hop slots",
+        "construct",
+        ("multi_request_post_attention_hop", "tep8_wide64_splitk"),
+    ),
+    FastPath(
+        "tep8_publish_join",
+        "the TP8 post-FFN join launched with programmatic dependent launch as one cluster",
+        "construct",
+        ("projection_publish",),
+    ),
+    FastPath(
+        "tep8_pool_programmatic_fork",
+        "the TP8 pool slice GEMM forked programmatically from its producer",
+        "construct",
+        ("projection_publish",),
+    ),
+    FastPath(
+        "tep8_wide_projection_gathers",
+        "the TP8 pool and unpool gathers of 9..32-row steps fused into their consumers",
+        "construct",
+        ("projection_gathers",),
+    ),
+    FastPath(
+        "step_commit_v2",
+        "the step commit's descriptors read as 64-byte rows, the host splitting each piece",
+        "executor",
+        ("deferred_input_prep",),
+    ),
+    FastPath(
+        "wide_norm_gate_pdl",
+        "the post-FFN norm-gates of 33..128-row decode steps launched with programmatic dependent "
+        "launch",
+        "construct",
+        ("boundary_early_release",),
+    ),
+    FastPath(
+        "drafter_kv_glue",
+        "the context-K/V side chain's index math and arena stores in two launches (worker-owned "
+        "arena)",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "drafter_kv_fork_before_head",
+        "the context-K/V side chain forked before the LM-head GEMM",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "context_sp_extra_parts",
+        "large context steps' router input and expert all-gather on the row shard too",
+        "construct",
+        ("context_sequence_parallel",),
+    ),
 )
 
 #: The name of every fast path.
@@ -551,6 +760,39 @@ LEVER_NAMES: FrozenSet[str] = frozenset(
         "head_sampler_coop_fold",
         "head_multimem_gather",
         "prefill_cutedsl_experts",
+        "splitk_pool_split8",
+        "splitk_frontier_tables",
+        "tep8_wide64_splitk",
+        "tep8_publish_splitk",
+        "tep8_drafter_wide_gemms",
+        "tep8_fc_shard_wide",
+        "weight_prefetch_after_join",
+        "next_qkv_prefetch_skip",
+        "swa_one_cluster_block",
+        "swa_prep_split",
+        "swa_eight_requests",
+        "full_attention_fold_multi",
+        "split_kv_deep_rings",
+        "bf16_half_window",
+        "prerouted_experts",
+        "tep8_ring_buddy_wide",
+        "tep8_ring_buddy_pdl",
+        "tep8_tile_placement",
+        "tep8_router_push",
+        "tep8_router_prewait",
+        "finalize_entry_trigger",
+        "tep8_finalize_transport_64",
+        "hop_entry_trigger",
+        "tep8_early_multicast_hop",
+        "tep8_direct_hop",
+        "tep8_publish_join",
+        "tep8_pool_programmatic_fork",
+        "tep8_wide_projection_gathers",
+        "step_commit_v2",
+        "wide_norm_gate_pdl",
+        "drafter_kv_glue",
+        "drafter_kv_fork_before_head",
+        "context_sp_extra_parts",
     }
 )
 #: The fast paths a composition is built from; a composition lists its levers explicitly.
@@ -1282,7 +1524,8 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
     * ``windowed_commit_parallel`` runs inside the windowed commit of an architecture of
       ``WINDOWED_COMMIT_SMS``, so it needs a windowed arena there.
     * A paged arena leaves out ``incremental_block_offsets``: the step-input stager
-      declines the block-table copy while a draft KV cache manager is attached.
+      declines the block-table copy while a draft KV cache manager is attached; and
+      ``drafter_kv_glue``, whose store writes a worker-owned arena.
     * ``TRTLLM_KV_DEFER_CLOSE=1`` leaves out ``step_loop_on_execution_stream``, which is
       not validated with the deferred close.
     """
@@ -1319,6 +1562,10 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
             "it needs a windowed drafter context arena on an architecture whose commit "
             f"compacts (sm{', sm'.join(str(sm) for sm in sorted(WINDOWED_COMMIT_SMS))}); this "
             f"is a {arena.value} arena on sm{deployment.sm}"
+        )
+    if arena is _levers.Arena.PAGED and "drafter_kv_glue" in served:
+        exclusions["drafter_kv_glue"] = (
+            "a paged drafter context has no worker-owned arena for its store"
         )
     if arena is _levers.Arena.PAGED and "incremental_block_offsets" in served:
         exclusions["incremental_block_offsets"] = (

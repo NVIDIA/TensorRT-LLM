@@ -243,6 +243,12 @@ class DirectPoolSite:
                 return_gathered=False,
             )
         moe._prologue_record_routing(out, place, state, workspace.world)
+        # The prerouted_experts lever (pool_direct_route's prerouted_meta): the expert op's routing
+        # metadata the wide half-window kernel wrote, after the placement's window (ring_buddy's
+        # expert call reads it).
+        meta = getattr(workspace, "meta", None)
+        if meta is not None and state is not None and place == _pdr.PLACE_HALF:
+            state.placement += (_pdr.meta_view(meta, rows),)
         return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
 
 

@@ -93,6 +93,182 @@ from tensorrt_llm.logger import logger
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
 
+#: ``drafter_kv_glue`` (``ContextKvFork.glue_on``): the side chain's index math and its arena
+#: stores run as two Triton launches instead of ~11 torch kernels: the slots / columns /
+#: positions of the step's rows and the RoPE's int32 positions repeated per layer
+#: (``_glue_prep_kernel``: integer ops, the built-in's values), and the K and V rows copied
+#: into the arena (``_glue_store_kernel``: the built-in's index assignment, element for
+#: element). The fc, the hidden norm, the fused K/V GEMM, the K norm and the RoPE are the
+#: bound methods' own launches; the RoPE is handed the prepared int32 positions instead of
+#: casting and repeating them. Bitwise by construction (integer index math and copies; rows
+#: clamped to one column overwrite it in an unspecified order, as the built-in's index
+#: assignment does). It serves a worker-owned arena, dense or windowed; over a dense arena it
+#: yields to ``drafter_kv_side_chain``, which fuses the same store further.
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _glue_prep_kernel(
+        batch_to_slot,
+        ctx_len,
+        ctx_base,
+        slot_out,
+        col_out,
+        pos_out,
+        pos_rep_out,
+        last,
+        ROWS: tl.constexpr,
+        KP1: tl.constexpr,
+        L: tl.constexpr,
+        WINDOWED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # one lane per (row, layer); row = gen * (K + 1) + r, as the built-in's reshape(-1) orders them
+        idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        live = idx < ROWS * L
+        row = idx // L
+        gen = row // KP1
+        r = row % KP1
+        slot = tl.load(batch_to_slot + gen, mask=live, other=0)
+        length = tl.load(ctx_len + slot, mask=live, other=0)
+        pos = length + r
+        if WINDOWED:
+            base = tl.load(ctx_base + slot, mask=live, other=0)
+            col = length - base + r
+        else:
+            col = pos
+        col = tl.minimum(col, last)
+        first = live & ((idx % L) == 0)
+        tl.store(slot_out + row, slot, mask=first)
+        tl.store(col_out + row, col, mask=first)
+        tl.store(pos_out + row, pos, mask=first)
+        tl.store(pos_rep_out + idx, pos.to(tl.int32), mask=live)
+
+    @triton.jit
+    def _glue_store_kernel(
+        k_src,
+        v_src,
+        k_buf,
+        v_buf,
+        slot_ptr,
+        col_ptr,
+        slot_stride,
+        layer_stride,
+        col_stride,
+        L: tl.constexpr,
+        WIDTH: tl.constexpr,
+        HAS_V: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # one program per (row, layer): its nkv * hd K (and V) values, contiguous at both ends
+        pid = tl.program_id(0)
+        row = pid // L
+        layer = pid % L
+        slot = tl.load(slot_ptr + row)
+        col = tl.load(col_ptr + row)
+        offs = tl.arange(0, BLOCK)
+        live = offs < WIDTH
+        dst = slot * slot_stride + layer * layer_stride + col * col_stride + offs
+        tl.store(k_buf + dst, tl.load(k_src + pid * WIDTH + offs, mask=live), mask=live)
+        if HAS_V:
+            tl.store(v_buf + dst, tl.load(v_src + pid * WIDTH + offs, mask=live), mask=live)
+
+    _GLUE_KERNELS = True
+except ImportError:  # pragma: no cover
+    _GLUE_KERNELS = False
+
+
+def glue_prep(batch_to_slot, ctx_len, ctx_base, num_gens: int, kp1: int, layers: int, last: int):
+    """``(slot_flat, col_flat, pos_flat, pos_rep)`` of the step's rows: the built-in side chain's index tensors (int64)
+    and ``_fused_rope_inplace``'s int32 positions repeated per layer, in one launch."""
+    rows = num_gens * kp1
+    dev = ctx_len.device
+    slot_flat = torch.empty(rows, dtype=torch.int64, device=dev)
+    col_flat = torch.empty(rows, dtype=torch.int64, device=dev)
+    pos_flat = torch.empty(rows, dtype=torch.int64, device=dev)
+    pos_rep = torch.empty(rows * layers, dtype=torch.int32, device=dev)
+    block = 256
+    _glue_prep_kernel[(triton.cdiv(rows * layers, block),)](
+        batch_to_slot,
+        ctx_len,
+        ctx_base if ctx_base is not None else ctx_len,
+        slot_flat,
+        col_flat,
+        pos_flat,
+        pos_rep,
+        last,
+        ROWS=rows,
+        KP1=kp1,
+        L=layers,
+        WINDOWED=ctx_base is not None,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return slot_flat, col_flat, pos_flat, pos_rep
+
+
+def glue_store(k_new, v_new, k_buf, v_buf, slot_flat, col_flat) -> None:
+    """``k_buf[slot, :, col] = k_new`` (and ``v_buf`` / ``v_new``) for every row, in one launch."""
+    rows, layers = k_new.shape[0], k_new.shape[1]
+    width = k_new[0, 0].numel()
+    _glue_store_kernel[(rows * layers,)](
+        k_new,
+        v_new if v_new is not None else k_new,
+        k_buf,
+        v_buf if v_buf is not None else k_buf,
+        slot_flat,
+        col_flat,
+        k_buf.stride(0),
+        k_buf.stride(1),
+        k_buf.stride(2),
+        L=layers,
+        WIDTH=width,
+        HAS_V=v_new is not None,
+        BLOCK=triton.next_power_of_2(width),
+        num_warps=1,
+    )
+
+
+def _glue_fits(worker, k_new_shape=None) -> bool:
+    """Whether the glue launches take this worker's arena: contiguous [slots, L, capacity, nkv, hd] buffers."""
+    buf = worker._ctx_k_buf
+    if not (_GLUE_KERNELS and buf is not None and buf.dim() == 5 and buf.is_contiguous()):
+        return False
+    if worker._ctx_v_buf is not None and (
+        worker._ctx_v_buf.shape != buf.shape or not worker._ctx_v_buf.is_contiguous()
+    ):
+        return False
+    return worker._batch_to_slot.dtype == worker._ctx_len.dtype == torch.int64
+
+
+def _rope_with_positions(drafter, pos_rep, fallback):
+    """``DFlashForCausalLM._fused_rope_inplace`` with its int32 positions already repeated per layer."""
+    from tensorrt_llm._torch.models import modeling_dflash
+
+    rope = getattr(modeling_dflash, "_flashinfer_rope", None)
+
+    def fused_rope_inplace(k_flat, positions, N, L):
+        if rope is None or k_flat.shape[0] != pos_rep.numel():
+            return fallback(k_flat, positions, N, L)
+        need_rows = k_flat.shape[0]
+        dummy_q = drafter._rope_dummy_q
+        if dummy_q is None or dummy_q.dtype != k_flat.dtype or dummy_q.shape[0] < need_rows:
+            dummy_q = k_flat.new_empty(need_rows, drafter._head_dim)
+            drafter._rope_dummy_q = dummy_q
+        rope(
+            pos_rep,
+            dummy_q[:need_rows],
+            k_flat,
+            drafter._head_dim,
+            drafter._get_cos_sin_cache(),
+            drafter._is_neox,
+        )
+
+    return fused_rope_inplace
+
+
 #: Where the side chain forks: right after the LM head's GEMM.
 POINT = "head"
 
@@ -224,6 +400,10 @@ class ContextKvFork:
         self.side_chain_on = False
         #: ``drafter_fc_early_fork``: the fused side chain's local part forks early (``fire_early``).
         self.early_fc_on = False
+        #: ``drafter_kv_glue``: the side chain runs ``_glue_side_chain`` where it applies.
+        self.glue_on = False
+        #: ``drafter_kv_fork_before_head``: the ``head`` fork point fires before the LM-head GEMM.
+        self.fork_before_head = False
         #: ``windowed_commit_parallel``'s MIN_REQUESTS for the windowed commit, or None.
         self.parallel_min_requests: Optional[int] = None
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
@@ -538,6 +718,10 @@ class ContextKvFork:
             return _fused_side_chain(worker, drafter, spec_metadata, num_gens, k, early)
         if refusal is not None:
             self._decline("drafter_kv_side_chain", refusal, num_gens)
+        if self.glue_on and _glue_fits(worker):
+            # A worker-owned arena (dense or windowed, ``_glue_fits``): a paged context has no
+            # ``_ctx_k_buf``.
+            return self._glue_side_chain(spec_metadata, num_gens, k)
         DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_gens)
         slots = worker._batch_to_slot[:num_gens]
         # The built-in's get_hidden_states(num_tokens)[0 : rows]: the same view.
@@ -547,6 +731,47 @@ class ContextKvFork:
         worker._store_step_context(
             self.draft_model, gen_hs, slots, self.rows[:num_gens], worker._ctx_len[slots]
         )
+        return gen_hs
+
+    def _glue_side_chain(self, spec_metadata, num_gens: int, k: int) -> torch.Tensor:
+        """``side_chain`` with its index math and arena stores in two launches (``drafter_kv_glue``)."""
+        worker, drafter = self.worker, self.draft_model
+        rows = num_gens * (k + 1)
+        base, last = arena_columns(worker)
+        layers = worker._ctx_k_buf.shape[1]
+        slot_flat, col_flat, pos_flat, pos_rep = glue_prep(
+            worker._batch_to_slot, worker._ctx_len, base, num_gens, k + 1, layers, last
+        )
+        gen_hs = spec_metadata.captured_hidden_states[
+            :rows, : spec_metadata.hidden_size * spec_metadata.num_capture_layers
+        ]
+        projected = drafter.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+        had = "_fused_rope_inplace" in drafter.__dict__
+        previous = drafter.__dict__.get("_fused_rope_inplace")
+        drafter._fused_rope_inplace = _rope_with_positions(
+            drafter, pos_rep, drafter._fused_rope_inplace
+        )
+        try:
+            k_new, v_new = drafter.precompute_context_kv(
+                projected.to(worker._ctx_k_buf.dtype), pos_flat
+            )
+        finally:
+            if had:
+                drafter._fused_rope_inplace = previous
+            else:
+                del drafter._fused_rope_inplace
+        if (
+            k_new.shape[:2] == (rows, layers)
+            and k_new.is_contiguous()
+            and (v_new is None or (v_new.shape == k_new.shape and v_new.is_contiguous()))
+            and (v_new is None) == (worker._ctx_v_buf is None)
+            and tuple(k_new.shape[2:]) == tuple(worker._ctx_k_buf.shape[3:])
+        ):
+            glue_store(k_new, v_new, worker._ctx_k_buf, worker._ctx_v_buf, slot_flat, col_flat)
+        else:
+            worker._ctx_k_buf[slot_flat, :, col_flat] = k_new
+            if v_new is not None:
+                worker._ctx_v_buf[slot_flat, :, col_flat] = v_new
         return gen_hs
 
 
@@ -1013,11 +1238,25 @@ def head_unsupported_reason(lm_head) -> Optional[str]:
     return None
 
 
+#: ``drafter_kv_fork_before_head`` (``ContextKvFork.fork_before_head``) fires the ``head``
+#: fork point right before the LM-head GEMM instead of right after it, so the side chain
+#: (prep, drafter ``fc``, gather, ``hidden_norm``, context K/V projection, RoPE and store;
+#: none of it reads the LM head's output) runs beside the LM-head GEMM instead of behind it.
+#: The side stream still waits for every kernel the main stream issued before the fork (the
+#: captured target rows are final after the last tapped layer, before the head); the join and
+#: the commit are unchanged. Same ops, operands and order on each stream: bitwise. At TEP8
+#: with eight requests the side chain otherwise binds the join by ~14 us per step.
+
+
 def _head_apply_linear(self, input, bias, lora_params=None, layer_idx=None):
-    """The LM head's GEMM (``Linear.apply_linear``), then the ``context_kv_fork`` fork point."""
-    output = Linear.apply_linear(self, input, bias, lora_params, layer_idx)
+    """The LM head's GEMM (``Linear.apply_linear``), then the ``context_kv_fork`` fork point
+    (before the GEMM under ``drafter_kv_fork_before_head``)."""
     fork: Optional[ContextKvFork] = self.__dict__.get("_context_kv_fork")
-    if fork is not None:
+    early = fork is not None and fork.fork_before_head
+    if early:
+        fork.fire("head")
+    output = Linear.apply_linear(self, input, bias, lora_params, layer_idx)
+    if fork is not None and not early:
         fork.fire("head")
     return output
 
@@ -1049,6 +1288,8 @@ def install(
     *,
     side_chain: bool = False,
     early_fc: bool = False,
+    glue: bool = False,
+    fork_before_head: bool = False,
     parallel_min_requests: Optional[int] = None,
     declined: Optional[Callable[..., None]] = None,
 ) -> None:
@@ -1058,7 +1299,8 @@ def install(
     drafter features, so it composes with the worker class they left. A
     repeated install keeps the fork and its stream and takes the current
     drafter and lever settings: ``side_chain`` (``drafter_kv_side_chain``),
-    ``early_fc`` (``drafter_fc_early_fork``), ``parallel_min_requests``
+    ``early_fc`` (``drafter_fc_early_fork``), ``glue`` (``drafter_kv_glue``),
+    ``fork_before_head`` (``drafter_kv_fork_before_head``), ``parallel_min_requests``
     (``windowed_commit_parallel``'s MIN_REQUESTS, None for off) and ``declined``
     (``dispatch.Plan.declined``).
 
@@ -1084,6 +1326,8 @@ def install(
     fork.draft_model = drafter
     fork.side_chain_on = bool(side_chain)
     fork.early_fc_on = bool(side_chain and early_fc)
+    fork.glue_on = bool(glue)
+    fork.fork_before_head = bool(fork_before_head)
     fork.parallel_min_requests = parallel_min_requests
     fork.declined = declined
     core._context_kv_fork = fork
@@ -1096,4 +1340,5 @@ def install(
         logger.info(
             f"[musespark_open] {name}: DFlash context-K/V store forked at the '{point}' point "
             f"onto a side stream (worker class {type(worker).__name__})"
+            + (" (before the LM-head GEMM)" if fork.fork_before_head else "")
         )

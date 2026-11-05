@@ -99,8 +99,34 @@ NQ = 2
 #: holds next to its Q buffers, 20 pages with a one-term Q (the served E4M3 Q) and 16 with a
 #: two-term Q (24 and 20 do not launch). sm107: 16 pages for either Q.
 RING_STAGES_BY_SM = {103: {1: 20, 2: 16}, 107: {1: 16, 2: 16}}
+#: sm107's depths in the table above, which ``configure`` starts from.
+_SM107_RING_STAGES = dict(RING_STAGES_BY_SM[107])
 #: sm103's ring depths.
 RING_STAGES = RING_STAGES_BY_SM[103]
+
+
+def configure(*, sm107_stages: Optional[int] = None) -> None:
+    """Set sm107's ring depth for the served one-term (E4M3) Q build (``split_kv_deep_rings``).
+
+    ``lever_settings.apply`` sets it from the model's plan before any install. ``None`` keeps
+    the table's depths; ``n`` sets the one-term build's ring to ``n`` pages (the two-term build
+    keeps 16: on sm103 its 20-page ring does not launch). 20 launches on sm107 and is bitwise to
+    16 (outputs and partials at 5-8 requests x 256k / 512k / 1M contexts); per layer at 8 / 5
+    requests: 512k -4.8 / -2.7 %, 1M -6.9 / -4.8 %, 256k ~0. Each compiled build is keyed on the
+    depth it takes (``_compile``), so a build compiled at another depth is never reused.
+
+    Raises:
+        ValueError: for a depth that is not a positive multiple of 4 (pages per 128-key tile).
+    """
+    table = dict(_SM107_RING_STAGES)
+    if sm107_stages is not None:
+        if sm107_stages <= 0 or sm107_stages % 4:
+            raise ValueError(
+                f"multi_request_split_kv: the ring depth is a positive multiple of 4, got "
+                f"{sm107_stages}"
+            )
+        table[1] = int(sm107_stages)
+    RING_STAGES_BY_SM[107] = table
 
 
 def ring_stages(device_index: int, q_terms: int) -> int:
@@ -267,8 +293,11 @@ def compiled_key(
 
 
 def _compile(key: tuple):
+    # The ring depth (``ring_stages``, which ``configure`` sets on sm107) is passed explicitly so
+    # that it is part of the compiled build's cache key.
     return _compiled_kernel(*key[:4], nq=key[4], rescale_cols=key[5], q_fp8=key[6],
-                            device_scale=key[7], max_requests=key[8])  # fmt: skip
+                            device_scale=key[7], stages=ring_stages(key[0], key[4]),
+                            max_requests=key[8])  # fmt: skip
 
 
 def precompile(

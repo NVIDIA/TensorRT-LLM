@@ -100,6 +100,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ... import dispatch as _tp_agreement
+from ...ops.moe import prerouted_experts as _prerouted
 from ...ops.moe.ring_buddy_assign import (
     BLOCK,
     EXPERTS,
@@ -121,6 +122,213 @@ HALF_MAX_ROWS = 32
 #: every step (4 of 32 per block, about the share the balanced placement
 #: moves in a verify step).
 STATIC_FROM = 28
+
+#: The ``prerouted_experts`` lever at TP8 (``configure(tep8_prerouted=True)``; the TP8 form of
+#: ``_PREROUTED``): the NVFP4 layers' 9..64-row decode calls on the tep8 two-window stack
+#: (64 experts) take their routing tables from ``ring_buddy_assign`` (``meta_tile``, the same
+#: one-program kernel that places the step) and run FC1 / FC2 through TRT-LLM's
+#: ``fp4_block_scale_moe_prerouted`` op (the MoE runner without its routing kernel), at the
+#: tactic the stock call would run (the decode table's, else the autotuner's cached choice) when
+#: that tactic has 8-token tiles. Every expert row is bitwise the stock call's; only the order of
+#: an expert's rows in the permuted space differs (the routing kernel orders them by arrival, the
+#: tables by token). Calls the op does not serve keep the stock call. Off: the stock path. The
+#: call is ``ops/moe/prerouted_experts``' backend; on a build without the op, ring_buddy_assign
+#: writes no tables (``prerouted_experts.available``) and every call is the stock call.
+_TEP8_PREROUTED = False
+_PREROUTED_TILE = 8
+_TEP8_PREROUTED_ROWS = range(9, 65)
+#: The ``tep8_ring_buddy_wide`` lever (``configure(tep8_max_rows=64)``): the most decode rows the
+#: balanced tep8 stack serves (``_State.max_rows``); None keeps ``MAX_ROWS``.
+_TEP8_MAX_ROWS: Optional[int] = None
+
+
+def _stock_tactic(
+    x,
+    x_sf,
+    stacks,
+    local_ids,
+    weights_bf16,
+    intermediate,
+    window,
+    routing_method_type,
+    act_type,
+    tune_max_num_tokens,
+):
+    """The ``(tile_n, config)`` the stock ``fp4_block_scale_moe_runner`` call runs on these inputs: the
+    autotuner's cached choice, looked up as that op looks it up, else (cache miss) the op's fallback, the
+    runner's default config. None while tuning, or when that is not an 8-token tile."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
+        FP4BlockScaleMoERunner,
+        prepare_dummy_topk_and_hook,
+    )
+
+    tuner = AutoTuner.get()
+    if tuner.is_tuning_mode:
+        return None
+    key = (
+        x.fp4_tensor.device.index,
+        window,
+        x.fp4_tensor.shape[0],
+        intermediate,
+        act_type,
+        routing_method_type,
+    )
+    cached = _prerouted_state.get(("tactic", key))
+    if cached is not None:
+        return cached
+    runner = FP4BlockScaleMoERunner(
+        EXPERTS,
+        TOP_K,
+        None,
+        None,
+        intermediate,
+        0,
+        window,
+        None,
+        routing_method_type,
+        False,
+        act_type,
+        tune_max_num_tokens=tune_max_num_tokens,
+        use_dp=False,
+    )
+    logits, weights, ids, config = prepare_dummy_topk_and_hook(
+        routing_method_type=routing_method_type,
+        topk_weights=weights_bf16,
+        topk_ids=local_ids,
+        hidden_states=x.fp4_tensor,
+        routing_logits=None,
+        base_tuning_config=runner.tuning_config,
+        top_k=TOP_K,
+        num_experts=EXPERTS,
+        local_num_experts=window,
+        n_group=None,
+        topk_group=None,
+        routed_scaling_factor=None,
+        hidden_states_index=2,
+        local_expert_offset=0,
+        use_dp=False,
+    )
+    inputs = [
+        logits,
+        None,
+        x.fp4_tensor,
+        x_sf,
+        stacks["w3_w1_weight"],
+        stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
+        None,
+        None,
+        None,
+        None,
+        stacks["w2_weight"],
+        stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
+        None,
+        stacks["fc31_scale_c"],
+        stacks["fc31_alpha"],
+        stacks["fc2_alpha"],
+        weights,
+        ids,
+    ]
+    _, tactic = tuner.choose_one("trtllm::fp4_block_scale_moe_runner", [runner], config, inputs)
+    if tactic is None or isinstance(tactic, int) or -1 in tuple(tactic):
+        # No tuned entry (the served TEP8 engine's case: its autotuner never sees these stacked
+        # shapes): the op then runs its fallback, the runner's default config at tile
+        # nextPowerOfTwo(rows * top_k / window), clamped to its smallest tile (8).
+        rows = x.fp4_tensor.shape[0]
+        avg = -(-rows * TOP_K // window)
+        tile = max(8, 1 << max(avg - 1, 0).bit_length())
+        if tile != _PREROUTED_TILE:
+            return None
+        hidden = 2 * x.fp4_tensor.shape[1]
+        ext = _prerouted_ext("tep8")
+        if ext is None:
+            return None
+        tactic = (
+            tile,
+            int(ext.default_config(tile, TOP_K, hidden, intermediate, window, rows, act_type)),
+        )
+    else:
+        tactic = (int(tactic[0]), int(tactic[1]))
+    _prerouted_state[("tactic", key)] = tactic
+    return tactic
+
+
+def _tep8_prerouted_call(
+    stacks,
+    x,
+    x_sf,
+    local_ids,
+    weights_bf16,
+    meta,
+    intermediate,
+    window,
+    act_type,
+    routing_method_type,
+    tune_max_num_tokens,
+    tactic=None,
+):
+    """FC1 / FC2 of a two-window call on ``ring_buddy_assign``'s tables, or None (the stock call)."""
+    rows = x.fp4_tensor.shape[0]
+    if (
+        rows not in _TEP8_PREROUTED_ROWS
+        or meta.get("rows") != rows
+        or window != 2 * BLOCK
+        or meta.get("tile") != _PREROUTED_TILE
+    ):
+        return None
+    if tactic is None:
+        tactic = _stock_tactic(
+            x,
+            x_sf,
+            stacks,
+            local_ids,
+            weights_bf16,
+            intermediate,
+            window,
+            routing_method_type,
+            act_type,
+            tune_max_num_tokens,
+        )
+    if tactic is None or tactic[0] != meta.get("tile"):
+        return None
+    ext = _prerouted_ext("tep8")
+    if ext is None:
+        return None
+    device = x.fp4_tensor.device
+    dummy = _prerouted_state.get(("tep8_indexes", device))
+    if dummy is None:
+        dummy = torch.zeros(_TEP8_PREROUTED_ROWS[-1] * TOP_K, dtype=torch.int32, device=device)
+        _prerouted_state[("tep8_indexes", device)] = dummy
+    return ext.moe(
+        x.fp4_tensor,
+        x_sf,
+        stacks["w3_w1_weight"],
+        stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
+        stacks["w2_weight"],
+        stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
+        stacks["fc31_scale_c"],
+        stacks["fc31_alpha"],
+        stacks["fc2_alpha"],
+        local_ids,
+        weights_bf16,
+        meta["e2p"],
+        meta["p2t"],
+        meta["c2b"],
+        meta["c2m"],
+        meta["nnc"],
+        meta["tnp"],
+        dummy,
+        EXPERTS,
+        TOP_K,
+        intermediate,
+        0,
+        window,
+        tactic[0],
+        tactic[1],
+        act_type,
+        False,
+    )
+
 
 #: Per-expert tensors the expert call reads, per expert format, in the order
 #: the stack is built. Every one is indexed by local expert first. ``nvfp4`` is
@@ -280,6 +488,11 @@ class _State:
         # stack's own block, and the prologue's half-window placement over all of it.
         self.half = half
         self.max_rows = HALF_MAX_ROWS if half else MAX_ROWS
+        if not half and self.block == 32:
+            # tep8 (32-expert blocks), the tep8_ring_buddy_wide lever: serve wider steps on the
+            # balanced stack too (64 rows: up to eight requests); one ring_buddy_assign program
+            # covers M * TOP_K <= MAX_SLOTS. None keeps the stock MAX_ROWS (16).
+            self.max_rows = MAX_ROWS if _TEP8_MAX_ROWS is None else int(_TEP8_MAX_ROWS)
         if half:
             self.default_window = self.block
             self.by_window = {
@@ -405,15 +618,35 @@ def _patch_routing(moe, state: _State) -> None:
             and weights.is_contiguous()
             and not torch.compiler.is_compiling()
         ):
-            local_ids, weights_bf16, stats = ring_buddy_assign(
-                selected,
-                weights,
-                state.rank,
-                state.balance,
-                state.static_from,
-                ranks=state.ranks,
-                half=state.half,
-            )
+            meta = None
+            if (
+                _TEP8_PREROUTED
+                and state.kind == "nvfp4"
+                and not state.half
+                and state.block == 32
+                and router_logits.shape[0] in _TEP8_PREROUTED_ROWS
+                and _prerouted.available()
+            ):
+                local_ids, weights_bf16, stats, meta = ring_buddy_assign(
+                    selected,
+                    weights,
+                    state.rank,
+                    state.balance,
+                    state.static_from,
+                    ranks=state.ranks,
+                    half=state.half,
+                    meta_tile=_PREROUTED_TILE,
+                )
+            else:
+                local_ids, weights_bf16, stats = ring_buddy_assign(
+                    selected,
+                    weights,
+                    state.rank,
+                    state.balance,
+                    state.static_from,
+                    ranks=state.ranks,
+                    half=state.half,
+                )
             state.placement = (
                 router_logits,
                 _version(router_logits),
@@ -423,6 +656,8 @@ def _patch_routing(moe, state: _State) -> None:
             )
             if state.half:
                 state.placement += (HALF_SPAN,)
+            elif meta is not None:
+                state.placement += (state.default_window, meta)
             state.last_stats = stats
         return selected, weights
 
@@ -492,7 +727,7 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
                     ),
                 )
 
-    def call(stacks, x, local_ids, weights_bf16):
+    def call(stacks, x, local_ids, weights_bf16, meta=None):
         if not isinstance(x, Fp4QuantizedTensor) or x.is_sf_swizzled:
             return None
         x_sf = x.scaling_factor.reshape(-1).view(torch.float8_e4m3fn)
@@ -503,6 +738,12 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
             and x.fp4_tensor.shape[0]
             <= (persistent_rows if window <= 64 else persistent_op.MAX_ROWS)
         )
+        if meta is not None and _PREROUTED and not served:
+            outputs = _prerouted_call(
+                stacks, x, x_sf, local_ids, weights_bf16, meta, intermediate, window, act_type
+            )
+            if outputs is not None:
+                return outputs
         if window > two_windows and not served:
             # The three-window placement runs only where the persistent kernel serves the
             # call (the prologue's steps of at most 8 rows); every rank shares this shape.
@@ -535,6 +776,23 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
                 window,
                 x.fp4_tensor.shape[0],
             )
+        if meta is not None and _TEP8_PREROUTED and not AutoTuner.get().is_tuning_mode:
+            outputs = _tep8_prerouted_call(
+                stacks,
+                x,
+                x_sf,
+                local_ids,
+                weights_bf16,
+                meta,
+                intermediate,
+                window,
+                act_type,
+                routing.routing_method_type,
+                tune_max_num_tokens,
+                tactic,
+            )
+            if outputs is not None:
+                return outputs
         if tactic is not None:
             return _decode_tactics.run_fixed(
                 tactic,
@@ -719,7 +977,11 @@ def _patch_experts(
             return builtin_forward(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
         local_ids, weights_bf16 = placement[2], placement[3]
         window = placement[5] if len(placement) > 5 else default_window
-        outputs = stacked_call(by_window[window], x, local_ids, weights_bf16)
+        meta = placement[6] if len(placement) > 6 else None
+        if meta is not None and state.kind == "nvfp4":
+            outputs = stacked_call(by_window[window], x, local_ids, weights_bf16, meta=meta)
+        else:
+            outputs = stacked_call(by_window[window], x, local_ids, weights_bf16)
         if outputs is None:
             return builtin_forward(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
         return outputs
@@ -756,9 +1018,126 @@ def _layer_windows(moe, kind: str, windows: int, persistent: bool) -> int:
     return 2
 
 
+#: The ``bf16_half_window`` lever (``configure(bf16_half_window=True)``): the two BF16 layers
+#: (0 and 61) get the half window too, as the NVFP4 layers have it:
+#: ``[own 64 | the predecessor's experts 32..63]`` (+32 BF16 experts, 3.2 GB per layer and rank)
+#: and ``ring_buddy_assign``'s half flow on every decode call of up to 32 rows, so their
+#: 16..32-row calls leave the built-in path (router, packing launches) for the stacked call.
+#: Off: the owner-only window. Rounding-different from the owner-only window like every balanced
+#: placement (the finalize rounds each rank's partial to BF16); each expert's rows are bitwise
+#: its owner's.
+_BF16_HALF_WINDOW = False
+
+#: The ``prerouted_experts`` lever at TP4 (``configure(tep4_prerouted=True)``, with
+#: ``pool_direct_route.configure(prerouted_meta=True)``, which makes ``pool_direct_route``'s wide
+#: half-window kernel write the expert op's routing metadata): an NVFP4 stacked call whose
+#: placement carries that metadata runs FC1 / FC2 through TRT-LLM's
+#: ``fp4_block_scale_moe_prerouted`` op (the MoE runner without its routing kernel), at the tactic
+#: the stock call deploys for these calls (tile 8, config 152; checked against the runner's valid
+#: configs). Every expert row is bitwise the stock call's; only the order of an expert's rows in
+#: the permuted space may differ (the routing kernel's own order is atomic-arrival order). Off:
+#: the stock call. The call goes through ``ops/moe/prerouted_experts``' backend; on a build
+#: without the op, ``pool_direct_route`` writes no metadata and every call is the stock call.
+_PREROUTED = False
+_PREROUTED_TACTIC = (8, 152)
+_PREROUTED_ROWS = range(9, 33)
+_prerouted_state: Dict[object, object] = {}
+
+
+def configure(
+    *,
+    tep4_prerouted: bool = False,
+    tep8_prerouted: bool = False,
+    bf16_half_window: bool = False,
+    tep8_max_rows: Optional[int] = None,
+) -> None:
+    """Set the settings this module reads at install and on its decode calls.
+
+    ``lever_settings.apply`` sets them from the model's plan before any install; the defaults
+    are the stock path.
+
+    Args:
+        tep4_prerouted: the ``prerouted_experts`` lever at TP4: wide half-window calls whose
+            placement carries ``pool_direct_route``'s routing metadata run the prerouted
+            expert op (``_PREROUTED``).
+        tep8_prerouted: the ``prerouted_experts`` lever at TP8: ``ring_buddy_assign`` writes
+            the routing tables of the 9..64-row two-window calls, which run the prerouted
+            expert op (``_TEP8_PREROUTED``).
+        bf16_half_window: the ``bf16_half_window`` lever: the BF16 layers get the half
+            window too (``_BF16_HALF_WINDOW``).
+        tep8_max_rows: the ``tep8_ring_buddy_wide`` lever: the most decode rows the balanced
+            tep8 stack serves; None keeps ``MAX_ROWS``.
+    """
+    global _PREROUTED, _TEP8_PREROUTED, _BF16_HALF_WINDOW, _TEP8_MAX_ROWS
+    _PREROUTED = bool(tep4_prerouted)
+    _TEP8_PREROUTED = bool(tep8_prerouted)
+    _BF16_HALF_WINDOW = bool(bf16_half_window)
+    _TEP8_MAX_ROWS = None if tep8_max_rows is None else int(tep8_max_rows)
+
+
+def _prerouted_ext(tag: str = "tep4"):
+    """The prerouted backend (``ops/moe/prerouted_experts.backend``: TRT-LLM's op), chosen and logged
+    once; None: the stock call."""
+    return _prerouted.backend(tag)
+
+
+def _prerouted_call(stacks, x, x_sf, local_ids, weights_bf16, meta, intermediate, window, act_type):
+    """FC1 / FC2 of a wide half-window call on the routed kernel's metadata, or None (the stock call)."""
+    from ...ops.moe import decode_expert_tactics as _decode_tactics
+
+    rows = x.fp4_tensor.shape[0]
+    if window != HALF_SPAN or rows not in _PREROUTED_ROWS or meta.get("rows") != rows:
+        return None
+    hidden = 2 * x.fp4_tensor.shape[1]
+    if _PREROUTED_TACTIC not in _decode_tactics._valid(
+        act_type, TOP_K, hidden, intermediate, window, rows
+    ):
+        return None
+    ext = _prerouted_ext()
+    if ext is None:
+        return None
+    device = x.fp4_tensor.device
+    dummy = _prerouted_state.get(("indexes", device))
+    if dummy is None:
+        dummy = torch.zeros(32 * TOP_K, dtype=torch.int32, device=device)
+        _prerouted_state[("indexes", device)] = dummy
+    return ext.moe(
+        x.fp4_tensor,
+        x_sf,
+        stacks["w3_w1_weight"],
+        stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
+        stacks["w2_weight"],
+        stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
+        stacks["fc31_scale_c"],
+        stacks["fc31_alpha"],
+        stacks["fc2_alpha"],
+        local_ids,
+        weights_bf16,
+        meta["e2p"],
+        meta["p2t"],
+        meta["c2b"],
+        meta["c2m"],
+        meta["nnc"],
+        meta["tnp"],
+        dummy,
+        EXPERTS,
+        TOP_K,
+        intermediate,
+        0,
+        window,
+        _PREROUTED_TACTIC[0],
+        _PREROUTED_TACTIC[1],
+        act_type,
+        False,
+    )
+
+
 def _layer_half(moe, kind: str, half: bool, persistent: bool) -> bool:
     """Whether ``install`` gives this layer the half window: an NVFP4 layer the persistent
-    kernel serves, when the install asks for it."""
+    kernel serves, when the install asks for it (and, with ``bf16_half_window``, a BF16
+    layer)."""
+    if half and persistent and kind == "bf16" and _BF16_HALF_WINDOW:
+        return True
     return half and kind == "nvfp4" and persistent and persistent_eligible(_backend(moe))
 
 
@@ -918,6 +1297,13 @@ def install(
         what = f"owner-only {block}-expert window (no replication)"
     else:
         what = "ring-buddy experts"
+    bf16_halved = [i for i in halved if expert_format(text_model.layers[i].feed_forward) == "bf16"]
+    if _BF16_HALF_WINDOW:
+        logger.info(
+            f"[musespark_open] bf16_half_window: BF16 layers {bf16_halved} hold "
+            f"[own {block} | predecessor's {block // 2}..{block - 1}] and place "
+            f"decode calls of up to {HALF_MAX_ROWS} rows with the half flow"
+        )
     logger.info(
         f"[musespark_open] replicated_experts: tep{ranks} {what} on {len(installed)} MoE layers "
         f"{'(persistent NVFP4 expert kernel) ' if persistent else ''}"
@@ -931,6 +1317,21 @@ def install(
         f"communicator buffers); built-in path kept for layers {sorted(skipped)}: "
         f"{sorted(set(skipped.values()))}"
     )
+    if _TEP8_PREROUTED and ranks == 8 and windows >= 2 and balance and _prerouted.available():
+        logger.info(
+            "[musespark_open] prerouted_experts (tep8): ring_buddy_assign writes the expert op's "
+            f"routing tables ({2 * block}-expert two-window stack, {_PREROUTED_TILE}-token tiles) "
+            f"for the NVFP4 layers' {_TEP8_PREROUTED_ROWS[0]}..{_TEP8_PREROUTED_ROWS[-1]}-row "
+            "decode calls, which run FC1 / FC2 on them through the prerouted expert op "
+            f"({_prerouted.describe()}) at the stock call's tactic, without the "
+            f"routing kernel"
+        )
+    elif _TEP8_PREROUTED and ranks == 8 and windows >= 2 and balance:
+        logger.warning(
+            "[musespark_open] prerouted_experts (tep8) off: no prerouted backend (this build "
+            f"registers no trtllm::{_prerouted.OP_NAME}); the 9..64-row "
+            "NVFP4 calls keep the stock expert call"
+        )
     return sorted(installed + refreshed)
 
 

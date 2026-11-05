@@ -43,6 +43,39 @@ from tensorrt_llm.logger import logger
 from ...ops.moe import router_gemm as _op
 from ...ops.moe import router_shard as _shard
 
+#: The router push (``ops/moe/router_push``, the ``tep8_router_push`` lever), imported on the
+#: first served call (``_router_push_module``), never at import. Importing it at module level
+#: changed a TP4 context engine's first tokens (6/256 near-ties, deterministic) although no TP4
+#: call reaches it; here the import sits behind the served call, so a process whose router GEMM
+#: never serves a call (every TP4 context worker, TEP4 decode below 33 rows) never imports it.
+_router_push = None
+#: Step A: the routing memo's version guard, as the routing method reads it (imported on the
+#: routed branch's first call).
+_version_or_none = None
+
+
+def _router_push_module():
+    """The router push module, imported on the first call; its own ``armed()`` decides whether it runs."""
+    global _router_push
+    if _router_push is None:
+        from ...ops.moe import router_push as _push
+
+        _router_push = _push
+    return _router_push
+
+
+def _routing_version_guard():
+    """``modeling_musespark_open._version_or_none``, imported on first use."""
+    global _version_or_none
+    if _version_or_none is None:
+        try:
+            from tensorrt_llm._torch.models.modeling_musespark_open import _version_or_none as _v
+        except ImportError:  # pragma: no cover
+            return None
+        _version_or_none = _v
+    return _version_or_none
+
+
 #: The device capabilities the op and this path are validated on: GB300 (sm_103) and
 #: R200 (sm_107).
 VALIDATED_CAPABILITIES = frozenset({(10, 3), (10, 7)})
@@ -132,6 +165,47 @@ class RouterGemmMoE:
             served = takes(hidden_states, weight)
             call.report(hidden_states, served)
             if served:
+                if _router_push_module() is not None and _router_push.armed():
+                    # This rank's router columns and their multicast all-gather in one kernel
+                    # (ops/moe/router_push.py, TP8 under the tep8_router_push lever); None -> the
+                    # op below.
+                    route_armed = getattr(_router_push, "route_armed", None)
+                    if (
+                        route_armed is not None
+                        and route_armed()
+                        and _routing_version_guard() is not None
+                    ):
+                        # Step A: the push also writes the routing method's selection and weights
+                        # (_full_routing_kernel's bits); the memo then serves this layer's
+                        # routing_method.apply calls, as the 8-row prologue's
+                        # _prologue_record_routing does. (out, None, None): apply computes.
+                        routing = getattr(getattr(self, "experts", None), "routing_method", None)
+                        res = _router_push.logits_routed(
+                            getattr(self, "mapping", None),
+                            hidden_states,
+                            weight,
+                            self.metap_multiplier,
+                            routing,
+                        )
+                        if res is not None:
+                            out, selected, weights = res
+                            if selected is not None:
+                                routing._routing_memo = (
+                                    out,
+                                    _version_or_none(out),
+                                    selected,
+                                    weights,
+                                )
+                            return out
+                    else:
+                        out = _router_push.logits(
+                            getattr(self, "mapping", None),
+                            hidden_states,
+                            weight,
+                            self.metap_multiplier,
+                        )
+                        if out is not None:
+                            return out
                 return _op.router_gemm(hidden_states, weight, self.metap_multiplier)
         return super().router_logits(hidden_states)
 
