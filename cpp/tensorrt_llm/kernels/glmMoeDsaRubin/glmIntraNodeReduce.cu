@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(1024) reduceKernel(IntraNodeReduceParams param
     *reinterpret_cast<float4*>(val) = reinterpret_cast<float4 const*>(params.allreduce_in)[access_id];
     comm.loadFlags();
     comm.arrive();
-    int clear_access = comm.clear_size / 8;
+    int clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
 
 #pragma unroll
     for (int i = 0; i < 4; ++i)
@@ -258,7 +258,7 @@ __global__ void __launch_bounds__(1024) reduceKernel(IntraNodeReduceParams param
     }
     if (rotating && arrivals == static_cast<int>(gridDim.x))
     {
-        comm.rotate(arrivals, params.size * NRanks);
+        comm.rotate(arrivals, static_cast<int64_t>(params.size) * NRanks * sizeof(DType));
         rotating = false;
     }
     float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
@@ -268,7 +268,7 @@ __global__ void __launch_bounds__(1024) reduceKernel(IntraNodeReduceParams param
         = rms_norm<DType, float4, true>(added, gamma, params.rms_eps, params.hidden_dim);
     if (rotating)
     {
-        comm.rotate(arrivals, params.size * NRanks);
+        comm.rotate(arrivals, static_cast<int64_t>(params.size) * NRanks * sizeof(DType));
     }
 
     if constexpr (TriggerCompletionAtEnd)
@@ -376,7 +376,7 @@ __global__ void __launch_bounds__(kFinalizeFastMaxThreads) finalizeKernel(IntraN
         }
     }
     comm.arrive();
-    int clear_access = comm.clear_size / 8;
+    int clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
 
     // The finalize of the default kernel: top-k slots in order, -1 slots skipped, then the shared expert's output, in
     // fp32, rounded to DType once.
@@ -458,7 +458,7 @@ __global__ void __launch_bounds__(kFinalizeFastMaxThreads) finalizeKernel(IntraN
     }
     if (rotating && arrivals == static_cast<int>(gridDim.x))
     {
-        comm.rotate(arrivals, params.size * NRanks);
+        comm.rotate(arrivals, static_cast<int64_t>(params.size) * NRanks * sizeof(DType));
         rotating = false;
     }
     float4 sum_val = vals[0];
@@ -483,7 +483,7 @@ __global__ void __launch_bounds__(kFinalizeFastMaxThreads) finalizeKernel(IntraN
     reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
     if (rotating)
     {
-        comm.rotate(arrivals, params.size * NRanks);
+        comm.rotate(arrivals, static_cast<int64_t>(params.size) * NRanks * sizeof(DType));
     }
 #endif
 }

@@ -114,14 +114,14 @@ def _run_one_rank():
     def check_state(rows, previous):
         torch.cuda.synchronize()
         assert state.flags.cpu().tolist() == [0, 0, (previous + 1) % 3]
-        assert state.layout.cpu().tolist() == [rows * HIDDEN * world, state.buffer_bytes]
+        assert state.layout.cpu().tolist() == [rows * HIDDEN * world * 2, state.buffer_bytes]
 
     # Interleave a large shared oneshot dirty range with small owned kernels, without resets.
     rows_to_test = [cell.spec["rows"] for cell in intra_node_reduce.CELLS] + [1, 18, 3]
     for iteration, rows in enumerate(rows_to_test):
         norm = norm_for(101 + iteration)
         shared_plain(tensor(256, 11 + iteration), tensor(256, 29, 0), norm)
-        assert state.layout[0].item() == 256 * HIDDEN * world
+        assert state.layout[0].item() == 256 * HIDDEN * world * 2
         x, residual = tensor(rows, 31 + iteration), tensor(rows, 73, 0)
         saved_x, saved_residual = x.clone(), residual.clone()
         old_flag = state.flags[2].item()
