@@ -124,15 +124,15 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     for target in built:
         _native.load_target_ops(f"{_native._MODELS_PACKAGE}.{family}.{target}")
     namespaces = {_native._namespace(family)} | {_native._namespace(family, t) for t in built}
-    unfaked = sorted(
-        s.name
+    ops = [
+        s.name + (f".{s.overload_name}" if s.overload_name else "")
         for s in torch._C._jit_get_all_schemas()
         if s.name.split("::")[0] in namespaces
         # built_targets() is the library's own metadata query, not a tensor op.
         and s.name != f"{_native._namespace(family)}::built_targets"
-        and not torch._C._dispatch_has_kernel_for_dispatch_key(s.name, "Meta")
-    )
-    print(json.dumps({"unfaked": unfaked}))
+    ]
+    unfaked = sorted(op for op in ops if not torch._C._dispatch_has_kernel_for_dispatch_key(op, "Meta"))
+    print(json.dumps({"built": built, "unfaked": unfaked}))
     """
 )
 
@@ -151,5 +151,8 @@ def test_every_installed_family_library_loads():
         assert result.returncode == 0, (
             f"{library.name} failed to load:\n{result.stdout}\n{result.stderr}"
         )
-        unfaked = json.loads(result.stdout.strip().splitlines()[-1])["unfaked"]
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        # The build installs a family library only when it compiles one of the family's targets.
+        assert report["built"], f"{library.name} carries no target"
+        unfaked = report["unfaked"]
         assert not unfaked, f"{library.name} defines {unfaked} with no fake in a fake_ops.py"
