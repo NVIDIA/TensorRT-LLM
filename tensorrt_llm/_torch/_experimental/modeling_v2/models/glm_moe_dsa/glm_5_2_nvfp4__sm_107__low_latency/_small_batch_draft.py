@@ -19,6 +19,7 @@ from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.utils import EventType
+from tensorrt_llm.logger import logger
 
 from .ops.comm._mnnvl_workspace import hop_workspace
 from .ops.comm.mnnvl_moe_finalize_hop import mnnvl_moe_finalize_hop
@@ -450,9 +451,9 @@ def build_small_batch_draft(
         eligible = bool(DRAFT_SHAPES.get((decode.mapping.tp_size, draft_len), 0)) and (
             _static_layout_supported(decode, layer, lm_head, weights)
         )
-    except Exception:
+    except Exception as exc:
         # A rank-local layout/inspection failure must still reach the vote.
-        pass
+        logger.warning(f"Small-batch MTP eligibility check failed: {exc!r}")
     if not _all_succeeded(comm, eligible):
         return None
     # The collective workspace completes on all ranks before local allocations.
