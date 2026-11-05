@@ -952,3 +952,301 @@ class TestVisionAttnBackend:
             f"tower resolved backends {sorted(set(seen))}; every tower-side "
             "resolution must see the swapped backend"
         )
+
+
+# ---------------------------------------------------------------------------
+# Grouped encoding through the encoder wrapper
+# ---------------------------------------------------------------------------
+#
+# The wrapper declares one ("image", "video") group for the vision tower and
+# one ("audio",) group for the audio tower, and the shared encode path packs
+# their inputs across requests. The oracle below is the wrapper's encode path
+# before that change, copied verbatim: it reordered each request's items into
+# prompt order and ran one vision tower call and one audio tower call per batch.
+
+
+def _main_per_item_chunks(item, grid_key):
+    values, grid = item["pixel_values"], item[grid_key]
+    chunks = []
+    start = 0
+    for row in grid:
+        patches = int(row[0]) * int(row[1]) * int(row[2])
+        chunks.append((values[start : start + patches], row.reshape(1, -1)))
+        start += patches
+    if start != values.shape[0]:
+        raise ValueError(
+            f"{grid_key} describes {start} patches but pixel_values holds "
+            f"{values.shape[0]}; the input processor and the encoder disagree on geometry"
+        )
+    return chunks
+
+
+def _main_per_audio_chunks(item):
+    waveforms, counts = item["waveforms"], item["sample_counts"]
+    lengths = [int(count) for count in counts]
+    if sum(lengths) != waveforms.shape[0]:
+        raise ValueError(
+            f"audio sample_counts describes {sum(lengths)} samples but waveforms "
+            f"holds {waveforms.shape[0]}; the input processor and the encoder "
+            "disagree on the packing"
+        )
+    return list(torch.split(waveforms, lengths))
+
+
+def _main_items_in_prompt_order(params):
+    from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
+        _VISION_MODALITIES,
+    )
+
+    data = params.multimodal_data or {}
+    per_modality = {
+        modality: _main_per_item_chunks(data[modality], grid_key)
+        for modality, grid_key in _VISION_MODALITIES
+        if data.get(modality)
+    }
+    if data.get("audio"):
+        per_modality["audio"] = _main_per_audio_chunks(data["audio"])
+    if not per_modality:
+        return []
+
+    metadata = params.item_metadata
+    if metadata is None:
+        if len(per_modality) > 1:
+            raise ValueError(
+                f"request carries {sorted(per_modality)} but no prompt-ordered item "
+                "metadata; a mixed-modality request must state its prompt order"
+            )
+        modality, chunks = next(iter(per_modality.items()))
+        return [(modality, chunk) for chunk in chunks]
+
+    ordered = []
+    for modality, index in metadata.item_refs:
+        chunks = per_modality.get(modality)
+        if chunks is None:
+            continue
+        ordered.append((modality, chunks[index]))
+    expected = sum(len(chunks) for chunks in per_modality.values())
+    if len(ordered) != expected:
+        raise ValueError(
+            f"the item metadata names {len(ordered)} of the {expected} media items "
+            "attached to the request; every item must appear exactly once"
+        )
+    return ordered
+
+
+def _main_encode(encoder, multimodal_params, vision_config):
+    from tensorrt_llm._torch.models.musespark_open_vision_processing import (  # noqa: PLC0415
+        num_placeholder_rows,
+    )
+
+    ordered = []
+    for params in multimodal_params:
+        ordered.extend(_main_items_in_prompt_order(params))
+    if not ordered:
+        return torch.empty(0)
+
+    pixel_values, grids, waveforms = [], [], []
+    for modality, payload in ordered:
+        if modality == "audio":
+            waveforms.append(payload)
+        else:
+            values, grid = payload
+            pixel_values.append(values)
+            grids.append(grid)
+
+    vision_rows = None
+    if pixel_values:
+        packed = torch.cat(pixel_values, dim=0).to(dtype=encoder.tower.dtype)
+        vision_rows = encoder.tower(packed, torch.cat(grids, dim=0))
+    if not waveforms:
+        return vision_rows
+
+    if encoder.audio_tower is None:
+        raise ValueError(
+            "audio items reached the encoder but the config does not enable "
+            "the waveform encoder (audio_perception_modality_args.input_mode "
+            "!= 'wav')"
+        )
+    audio_rows = encoder.audio_tower(waveforms)
+    if vision_rows is None:
+        return torch.cat(audio_rows, dim=0)
+
+    rows = []
+    vision_offset, audio_index = 0, 0
+    for modality, payload in ordered:
+        if modality == "audio":
+            rows.append(audio_rows[audio_index])
+            audio_index += 1
+        else:
+            _, grid = payload
+            count = num_placeholder_rows([int(x) for x in grid.reshape(-1)], vision_config)
+            rows.append(vision_rows[vision_offset : vision_offset + count])
+            vision_offset += count
+    if vision_offset != vision_rows.shape[0]:
+        raise ValueError(
+            f"vision tower emitted {vision_rows.shape[0]} rows but the grids "
+            f"describe {vision_offset}; the interleave would misalign audio"
+        )
+    return torch.cat(rows, dim=0)
+
+
+class _CallCounter:
+    """Counts calls through a module's forward while keeping its results."""
+
+    def __init__(self, module):
+        self.calls = []
+        self._forward = module.forward
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(args)
+        return self._forward(*args, **kwargs)
+
+
+@pytest.fixture
+def grouped_encoder(tiny_tower):
+    from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
+        MuseSparkOpenVisionEncoder,
+    )
+    from tensorrt_llm._torch.models.musespark_open_audio import (  # noqa: PLC0415
+        MuseSparkOpenAudioEncoder,
+    )
+
+    torch.manual_seed(1)
+    audio_tower = MuseSparkOpenAudioEncoder(
+        TINY_DECODER_HIDDEN,
+        hidden_sizes=(8, 8, 8, 8),
+        layers_per_stage=(1, 1, 1, 1),
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        for param in audio_tower.parameters():
+            param.normal_(0.0, 0.1)
+    encoder = MuseSparkOpenVisionEncoder.__new__(MuseSparkOpenVisionEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.tower = tiny_tower
+    encoder.audio_tower = audio_tower
+    return encoder
+
+
+def _grouped_request(tower, items, seed):
+    """One request's processed payload and item record, items in prompt order.
+
+    `items` holds `("image", (t, h, w))`, `("video", (t, h, w))` or
+    `("audio", num_samples)`, packed per modality the way the input processor
+    packs them.
+    """
+    from tensorrt_llm._torch.models.musespark_open_audio import num_audio_tokens  # noqa: PLC0415
+    from tensorrt_llm.inputs.multimodal import (  # noqa: PLC0415
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalParams,
+    )
+
+    pixels = {"image": [], "video": []}
+    grids = {"image": [], "video": []}
+    waveforms = []
+    item_refs, rows = [], []
+    for position, (modality, geometry) in enumerate(items):
+        if modality == "audio":
+            torch.manual_seed(seed * 100 + position)
+            waveforms.append(torch.randn(geometry) * 0.1)
+            item_refs.append(("audio", len(waveforms) - 1))
+            rows.append(num_audio_tokens(geometry))
+            continue
+        t, h, w = geometry
+        pixels[modality].append(
+            _make_pixel_values(tower, h, w, clips=t, seed=seed * 100 + position)
+        )
+        grids[modality].append(list(geometry))
+        item_refs.append((modality, len(grids[modality]) - 1))
+        rows.append(vision_rows_for_grid(t, h, w, tower.config))
+    data = {}
+    for modality in ("image", "video"):
+        if grids[modality]:
+            data[modality] = {
+                "pixel_values": torch.cat(pixels[modality]),
+                f"{modality}_grid_thw": torch.tensor(grids[modality], dtype=torch.int32),
+            }
+    if waveforms:
+        data["audio"] = {
+            "waveforms": torch.cat(waveforms),
+            "sample_counts": torch.tensor([w.numel() for w in waveforms], dtype=torch.int64),
+        }
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        item_refs, output_embedding_lengths=rows
+    )
+    return MultimodalParams(multimodal_data=data), sum(rows)
+
+
+GROUPED_BATCHES = {
+    "one_request_two_images": [[("image", (1, 4, 4)), ("image", (1, 2, 6))]],
+    "requests_of_one_modality": [
+        [("image", (1, 4, 4))],
+        [("image", (1, 2, 6)), ("image", (1, 8, 4))],
+    ],
+    "audio_only": [[("audio", 4_000)], [("audio", 1_920), ("audio", 50)]],
+    "mixed_in_and_across_requests": [
+        [("video", (2, 4, 4)), ("image", (1, 4, 4))],
+        [("audio", 4_000), ("image", (1, 2, 6)), ("audio", 1_920)],
+        [("image", (1, 8, 4))],
+        [("audio", 777)],
+    ],
+}
+
+
+class TestGroupedEncoding:
+    @pytest.mark.parametrize("batch", list(GROUPED_BATCHES))
+    def test_groups_match_the_previous_encode_path(self, grouped_encoder, batch):
+        tower = grouped_encoder.tower
+        requests = [
+            _grouped_request(tower, items, seed)
+            for seed, items in enumerate(GROUPED_BATCHES[batch])
+        ]
+        params = [request for request, _ in requests]
+        vision_config = _tiny_model_config().pretrained_config.vision_config
+        expected = _main_encode(grouped_encoder, params, vision_config)
+
+        vision_calls = _CallCounter(grouped_encoder.tower)
+        audio_calls = _CallCounter(grouped_encoder.audio_tower)
+        grouped_encoder.tower.forward = vision_calls
+        grouped_encoder.audio_tower.forward = audio_calls
+        (encoded,) = grouped_encoder.forward(params)
+
+        has = {
+            modality: any(modality == item[0] for items in GROUPED_BATCHES[batch] for item in items)
+            for modality in ("image", "video", "audio")
+        }
+        # One vision tower call for every image and video in the batch, and one
+        # audio tower call over every clip, as before.
+        assert len(vision_calls.calls) == int(has["image"] or has["video"])
+        assert len(audio_calls.calls) == int(has["audio"])
+        # Same towers, same packed inputs: the rows are identical, in request
+        # order and prompt order within each request.
+        assert encoded.shape == (sum(rows for _, rows in requests), TINY_DECODER_HIDDEN)
+        assert torch.equal(encoded, expected)
+
+    def test_batched_rows_equal_per_request_rows(self, grouped_encoder):
+        """Each request's rows match encoding it alone, up to GEMM row blocking."""
+        tower = grouped_encoder.tower
+        requests = [
+            _grouped_request(tower, items, seed)
+            for seed, items in enumerate(GROUPED_BATCHES["mixed_in_and_across_requests"])
+        ]
+        (batched,) = grouped_encoder.forward([request for request, _ in requests])
+        alone = torch.cat([grouped_encoder.forward([request])[0] for request, _ in requests])
+        torch.testing.assert_close(batched, alone, rtol=1e-5, atol=1e-5)
+
+    def test_the_mixin_entry_runs_the_same_groups(self, grouped_encoder):
+        from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
+            MuseSparkForConditionalGeneration,
+        )
+
+        tower = grouped_encoder.tower
+        requests = [
+            _grouped_request(tower, items, seed)
+            for seed, items in enumerate(GROUPED_BATCHES["mixed_in_and_across_requests"])
+        ]
+        params = [request for request, _ in requests]
+        model = SimpleNamespace(mm_encoder=grouped_encoder)
+        encoded = MuseSparkForConditionalGeneration.encode_multimodal_inputs(model, params)
+        assert torch.equal(encoded, grouped_encoder.forward(params)[0])
