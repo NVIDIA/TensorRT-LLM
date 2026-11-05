@@ -2593,8 +2593,11 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len = int(max_num_tokens)
 
         # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
+        # Cover the configured sequence length even when the pool's allocatable
+        # length is smaller. resize() checks this buffer before trying to obtain
+        # pages, so a smaller table would turn pool exhaustion into a ValueError.
         # Include the same maximum generation lead used by allocation and sizing.
-        max_seq_capacity = self.max_seq_len + self._generation_kv_capacity_headroom
+        max_seq_capacity = max_seq_len + self._generation_kv_capacity_headroom
         self.max_blocks_per_seq = (
             max_seq_capacity + self._ledger_tokens_per_block - 1
         ) // self._ledger_tokens_per_block
