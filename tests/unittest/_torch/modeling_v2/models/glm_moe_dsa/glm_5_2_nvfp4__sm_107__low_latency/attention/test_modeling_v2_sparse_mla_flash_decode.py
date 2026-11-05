@@ -628,11 +628,14 @@ def test_latent_cuda_graph_replay(tokens) -> None:
     case = _latent_case(cell.spec, 9100 + tokens)
     output = latent_op(**case.kwargs)
     torch.cuda.synchronize()
-    eager = output[:tokens].clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         latent_op(**case.kwargs)
+    gen = torch.Generator(device="cuda").manual_seed(9200 + tokens)
     for _ in range(3):
+        _fill_e4m3_(case.kwargs["q"].view(torch.uint8), gen, _Q_STD)
+        _fill_e4m3_(case.kwargs["kv_pool"].view(torch.uint8), gen)
+        eager = latent_op(**case.kwargs)[:tokens].clone()
         output.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
