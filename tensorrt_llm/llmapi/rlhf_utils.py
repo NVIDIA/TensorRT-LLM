@@ -3,16 +3,19 @@
 
 import base64
 import gc
-import os
 from typing import Optional
 
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import serialization
 from tensorrt_llm.logger import logger
+
+# Read once at import, so a bad value fails the worker start instead of a refit.
+_REFIT_DEDUP_MODULES = get_env_flag("TLLM_REFIT_DEDUP_MODULES", True)
 
 
 class WorkerExtension:
@@ -61,7 +64,7 @@ class WorkerExtension:
         """
         # Opt-out so the dedup can be isolated from the other refit fixes when
         # bisecting; the dedup is correct regardless, so it defaults on.
-        if os.environ.get("TLLM_REFIT_DEDUP_MODULES", "1") == "0":
+        if not _REFIT_DEDUP_MODULES:
             yield from model.modules()
             return
         seen = set()

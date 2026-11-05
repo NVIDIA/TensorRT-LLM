@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from ..dsa.metadata import DSAtrtllmAttentionMetadata
     from .metadata import DeepseekV4TrtllmAttentionMetadata
 
+# Read once at import; the indexer checks it on every step.
+_FUSED_INDEXER_Q_DISABLED = get_env_flag("TRTLLM_DISABLE_DSA_FUSED_INDEXER_Q", False)
+
 
 class DeepseekV4Indexer(Indexer):
     def __init__(
@@ -130,7 +133,7 @@ class DeepseekV4Indexer(Indexer):
         return q
 
     def _is_fused_project_mxfp4_enabled(self, input_dtype: torch.dtype) -> bool:
-        if get_env_flag("TRTLLM_DISABLE_DSA_FUSED_INDEXER_Q", False):
+        if _FUSED_INDEXER_Q_DISABLED:
             return False
         return (
             self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE

@@ -24,6 +24,7 @@ from tensorrt_llm._torch.distributed.initialization import init_torch_distribute
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -337,19 +338,12 @@ def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
     return None
 
 
-def _cuda_memory_logging_enabled() -> bool:
-    """Whether per-request CUDA peak-memory logging is enabled.
-
-    This is a development-only knob exposed as an environment variable
-    (rather than a public ``VisualGenArgs`` field) to keep the engine
-    config surface clean, mirroring the nsys trace knob
-    ``TLLM_PROFILE_VISUAL_GEN_START_STOP``.
-    """
-    return os.environ.get("TLLM_VISUAL_GEN_LOG_CUDA_MEMORY", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+# Per-request CUDA peak-memory logging. This is a development-only knob
+# exposed as an environment variable (rather than a public ``VisualGenArgs``
+# field) to keep the engine config surface clean, mirroring the nsys trace knob
+# ``TLLM_PROFILE_VISUAL_GEN_START_STOP``. Read once at import, so a bad value
+# fails the worker start instead of the first request.
+_LOG_CUDA_MEMORY = get_env_flag("TLLM_VISUAL_GEN_LOG_CUDA_MEMORY", False)
 
 
 @dataclass
@@ -663,7 +657,7 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
-        log_cuda_memory = _cuda_memory_logging_enabled()
+        log_cuda_memory = _LOG_CUDA_MEMORY
         if log_cuda_memory:
             self._reset_cuda_peak_memory_stats()
         try:

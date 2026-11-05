@@ -327,6 +327,10 @@ def _init(log_level: object = None) -> None:
         from ._torch.custom_ops import _register_fake
 
         _register_fake()
+    except ValueError:
+        # get_env_flag raises ValueError for a bad switch value while the custom
+        # ops import. Re-raise it as is: the rebuild hint below does not apply.
+        raise
     except Exception as e:
         msg = (
             "\nFATAL: Decoding operators failed to load. This may be caused by an incompatibility "
