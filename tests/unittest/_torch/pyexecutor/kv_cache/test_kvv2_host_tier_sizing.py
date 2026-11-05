@@ -20,6 +20,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
+pytestmark = pytest.mark.cpu_only
+
 GiB = 1 << 30
 
 
@@ -214,7 +216,6 @@ class TestSyncHostTierQuota:
         quota = 173 * GiB
         assert _sync_host_tier_quota(quota, _FakeMapping()) == quota
 
-    @pytest.mark.cpu_only
     @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
     def test_multi_rank_syncs_to_fleet_min(self):
         """Every rank must end up with the same host-tier quota after the sync.

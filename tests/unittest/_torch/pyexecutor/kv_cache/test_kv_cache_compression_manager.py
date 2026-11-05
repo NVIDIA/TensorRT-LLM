@@ -25,6 +25,8 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.quantization import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------- #
 # Mock infra: in-memory managers / requests (avoid touching V2 / model).  #
 # ---------------------------------------------------------------------- #
@@ -372,7 +374,6 @@ class TestFactory:
         )
 
 
-@pytest.mark.cpu_only
 class TestKvCacheCreatorLifecycle:
     def test_estimation_still_creates_triattention_manager(self) -> None:
         config = SimpleNamespace(algorithm="triattention")
@@ -424,7 +425,6 @@ class TestKvCacheCreatorLifecycle:
         assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
 
 
-@pytest.mark.cpu_only
 def test_executor_binds_iteration_manager_after_extra_resource_registration() -> None:
     class _StopAfterBind(Exception):
         pass
@@ -467,7 +467,6 @@ def test_executor_binds_iteration_manager_after_extra_resource_registration() ->
     )
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "provides_cold_page_codec",
     (True, False),
@@ -576,7 +575,6 @@ class TestCanonicalImports:
 
 
 class TestCompressionCompatibility:
-    @pytest.mark.cpu_only
     @pytest.mark.parametrize(
         "config",
         (
@@ -600,7 +598,6 @@ class TestCompressionCompatibility:
                 kv_cache_config=SimpleNamespace(enable_block_reuse=False),
             )
 
-    @pytest.mark.cpu_only
     def test_helix_is_rejected_before_redundant_cold_quantization(self) -> None:
         model_engine = SimpleNamespace(
             mapping=SimpleNamespace(has_cp_helix=lambda: True),
