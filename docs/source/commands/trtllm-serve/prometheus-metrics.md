@@ -5,9 +5,15 @@ SPDX-License-Identifier: Apache-2.0
 
 # Prometheus performance metrics
 
-The HTTP server and OpenEngine gRPC server use the shared `MetricsCollector`
-and expose engine metrics with the `trtllm_` prefix. Enable request metrics and
-iteration statistics in your serving configuration:
+TensorRT-LLM exposes request and engine performance metrics at
+`/prometheus/metrics`. Use them to monitor latency, token throughput, queue
+pressure, batching, KV-cache capacity and reuse, memory, and speculative
+decoding. The HTTP server and OpenEngine gRPC server share the `trtllm_`
+metric families described below.
+
+## Enable collection
+
+Save the following configuration as `metrics.yaml`:
 
 ```yaml
 return_perf_metrics: true
@@ -15,97 +21,384 @@ enable_iter_perf_stats: true
 iter_perf_stats_interval: 1
 ```
 
+Start an HTTP server and inspect its metrics:
+
 ```bash
 trtllm-serve /path/to/model --config metrics.yaml --port 8000
 curl --fail http://localhost:8000/prometheus/metrics
 ```
 
-For OpenEngine, use its separate HTTP metrics port (8001 by default), as
-described in the [OpenEngine metrics guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/grpc/openengine/README.md#prometheus-metrics).
-When using Dynamo with an OpenEngine worker, scrape this engine endpoint as a
-separate Prometheus target.
+For OpenEngine, the metrics endpoint is a separate HTTP listener:
 
-## Existing coverage
+```bash
+trtllm-serve /path/to/model --config metrics.yaml \
+  --grpc --grpc-protocol openengine --port 50051
+curl --fail http://localhost:8001/prometheus/metrics
+```
 
-These are the main performance metric families. All names below have the
-`trtllm_` prefix.
+The OpenEngine listener uses port `8001` and inherits the serving host by
+default. Set `--openengine-metrics-host` and `--openengine-metrics-port` to
+change its address; the metrics and gRPC ports must differ. See the
+[OpenEngine serving guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/grpc/openengine/README.md#prometheus-metrics)
+for its deployment and multiprocess settings.
 
-| Area | Metrics |
+| Setting | Effect |
 | --- | --- |
-| Request latency | `e2e_request_latency_seconds`, `time_to_first_token_seconds`, `time_per_output_token_seconds`, `request_queue_time_seconds`, `request_prefill_time_seconds`, `request_decode_time_seconds`, `request_inference_time_seconds` histograms |
-| Request outcomes and tokens | `request_success_total`, `request_error_total`, `prompt_tokens_total`, `generation_tokens_total`, cached-prompt counters and histograms |
-| Scheduler load | `num_requests_running`, `num_requests_waiting`, `num_requests_completed_total`, `max_num_active_requests`, and batch/token limits |
-| Local batching | `num_context_requests`, `num_generation_requests`, `num_paused_requests`, `num_scheduled_requests`, `total_context_tokens`, `prefill_batch_occupancy`, `prefill_batch_tokens` |
-| KV cache | Cache utilization, hit/reuse rates, free/used/max blocks, reused/missed blocks, and per-iteration allocation/transfer counters; additional lifecycle and storage-tier views when provided by the engine |
-| Memory | `gpu_memory_usage_bytes`, `cpu_memory_usage_bytes`, `pinned_memory_usage_bytes` |
-| Speculative decoding | Drafted/accepted tokens, acceptance length, draft overhead, and bounded per-position counters |
-| Configuration | Model, parallelism, speculative-decoding, and KV-cache configuration info |
+| `return_perf_metrics: true` | Enables request performance collection and the Prometheus endpoint. Defaults to `false`. |
+| `enable_iter_perf_stats: true` | Adds engine iteration statistics to collection. Defaults to `false`; it does not enable the Prometheus endpoint by itself. |
+| `iter_perf_stats_interval` | Builds an engine statistics record every N iterations; defaults to 1. Larger values reduce collection work and change the meaning of sampled metrics, as described below. |
+| `kv_cache_config.iteration_stats_interval` | Controls how often KV iteration statistics are fetched. Larger values delay KV updates; align this interval with the iteration-performance interval. |
+| `perf_metrics_output_dir` | Also enables performance collection and the endpoint. HTTP serving can write per-request JSONL; OpenEngine does not write those HTTP JSONL files. |
+| `prometheus_metrics_config` | Customizes request-latency histogram buckets. Bucket values are seconds and must be nonempty and strictly increasing. |
 
-Queue, memory, legacy iteration latency, and speculative-decoding iteration
-metrics are rank-0 measurements. Local KV and scheduling metrics carry
-`dp_rank`. They should not all be interpreted as deployment-wide totals.
+The configurable bucket fields are `e2e_request_latency_buckets`,
+`time_to_first_token_buckets`, `time_per_output_token_buckets`,
+`request_queue_time_buckets`, `request_prefill_time_buckets`,
+`request_decode_time_buckets`, and `request_inference_time_buckets`. For example:
 
-## Iteration-log timings
+```yaml
+prometheus_metrics_config:
+  time_to_first_token_buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+```
 
-The following metrics expose timing fields already present in the engine's
-structured iteration statistics. `print_iter_log` does not need to be enabled.
-Values are converted from milliseconds to seconds.
+`print_iter_log` is independent of Prometheus collection and need not be
+enabled. The HTTP `/metrics` endpoint returns structured iteration statistics;
+use `/prometheus/metrics` for Prometheus exposition.
 
-| Metric | Type | Engine field and meaning |
+## Configure scraping
+
+Configure each serving worker as a target. For a Dynamo frontend backed by
+OpenEngine, scrape the engine's HTTP metrics endpoint separately from the
+Dynamo frontend. For disaggregated serving, keep prefill and decode targets
+distinguishable, since their latency metrics describe different phases.
+
+```yaml
+scrape_configs:
+  - job_name: trtllm-http
+    scrape_interval: 15s
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ["http-worker:8000"]
+  - job_name: trtllm-openengine
+    scrape_interval: 15s
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ["grpc-worker:8001"]
+```
+
+Replace these example targets with reachable addresses for your deployment.
+A scrape reads collected samples; it does not run inference. Restrict access
+to the metrics listener to the intended monitoring network.
+
+## Types, labels, and scope
+
+- **Counters** accumulate events, tokens, blocks, or bytes. Use `rate()` for
+  per-second rates and `increase()` for interval totals. A process restart can
+  reset a counter; Prometheus rate functions account for resets.
+- **Gauges** show the latest available measurement. They can decrease and can
+  retain an old value while the engine is idle or a field is absent. Do not
+  use `rate()` on load, utilization, or latency gauges.
+- **Histograms** expose `_bucket`, `_sum`, and `_count` samples. Use
+  `histogram_quantile()` on bucket rates for percentiles, or divide the sum
+  rate by the count rate for a mean. Merge buckets before calculating a
+  percentile; do not average percentiles across workers.
+
+The normal serving labels are `model_name` and `engine_type`. Additional
+labels depend on the metric family:
+
+| Label | Applies to | Meaning |
 | --- | --- | --- |
-| `trtllm_host_step_time_seconds` | Gauge | `hostStepTimeMS`: latest executor-loop wall time, corresponding to the log's `host_step_time` |
-| `trtllm_prev_device_step_time_seconds` | Gauge | `prevDeviceStepTimeMS`: latest device-step timing from the ping-pong CUDA events, corresponding to `prev_device_step_time` |
-| `trtllm_gpu_forward_time_seconds` | Gauge | `gpuForwardTimeMS`: GPU-forward timing matched to the exported batch |
-| `trtllm_host_step_duration_seconds` | Histogram | Distribution of exported `hostStepTimeMS` samples |
-| `trtllm_gpu_forward_duration_seconds` | Histogram | Distribution of exported `gpuForwardTimeMS` samples |
+| `finished_reason` | Request success counter | Completion finish reason. |
+| `http_code` | HTTP request error counter | HTTP status code. |
+| `dp_rank` | Local KV-cache and batching metrics, tiered cache-hit tokens | Attention-DP rank; unranked records use 0. |
+| `cache_level`, `cache_tier` | Tiered prompt cache-hit tokens | Configured level index and backing tier. Connector loads use an empty level and `connector` tier. |
+| `token_position` | Per-position speculative counters | Draft position, starting at 0; at most 16 positions are exported. |
+| `scheduler_mode` | Host-loop/device/GPU-forward timings | `overlap`, `non_overlap`, or `unknown` for missing or unrecognized modes. |
+| `phase`, `outcome` | OpenEngine RPC outcomes | Execution phase and terminal RPC outcome. |
 
-These metrics use the model labels plus `scheduler_mode`, restricted to
-`overlap`, `non_overlap`, or `unknown` for older or unrecognized records. They
-are updated only from rank 0: attention-DP fanout currently copies rank-0
-timings to other rank rows, so counting each row would duplicate observations.
-They do not measure rank imbalance or aggregate GPU time across workers.
+Configuration info gauges add configuration values as labels and have a
+sample value of 1. HTTP multiprocess gauge exposition can include `pid`;
+OpenEngine engine gauges use the latest live value without a `pid` label.
+Prometheus also attaches target labels such as `job` and `instance`. Retain
+`instance` when diagnosing one worker and avoid summing multiple frontend
+copies of the same engine measurement.
 
-`trtllm_iteration_latency_seconds` remains available with its existing labels
-and semantics. With overlap scheduling (including pipeline parallelism), its
-`iterLatencyMS` source spans the batch lifecycle, roughly two executor loops.
-Use `host_step_time_seconds` for single-loop wall time. The lagged
-`prev_device_step_time_seconds` describes an older loop than the host timing
-beside it; subtracting these gauges does not produce a valid CPU overhead
-measurement. Even the batch-matched GPU timing does not have the same scope
-as the host-loop timer.
+Iteration queue, memory, limits, timing, and speculative-decoding metrics are
+rank-0-owned measurements. They are not automatic sums across ranks or GPUs.
+Local KV-cache and batching metrics use `dp_rank`; aggregate them only when
+the units and ownership make that meaningful. In particular, sum used and
+maximum blocks before computing aggregate utilization instead of summing
+utilization ratios.
 
-Missing, null, negative, or non-finite timing fields do not create observations.
-Zero is a valid measurement. Gauges retain their previous sample when no new
-measurement is available, including while the engine is idle.
+## Metric reference
 
-Histograms observe every valid timing record delivered to the collector,
-rather than just the last value before a scrape. With
-`iter_perf_stats_interval > 1`, they describe sampled iterations. Their counts
-do not count skipped iterations, and their sums must not be treated as exact
-engine busy time. Records lost through a bounded engine stats buffer also
-cannot contribute to these distributions. Buckets span 0.1 ms through 10 s,
-with the standard `+Inf` bucket for longer samples.
+All metric names in the tables below omit the common **`trtllm_` prefix**.
+For example, `generation_tokens_total` is exposed as
+`trtllm_generation_tokens_total`. Types refer to the metric family, before
+histogram suffixes such as `_bucket` are added.
 
-For example, plot the p99 host-loop time over five minutes:
+### Request latency, outcomes, and tokens
+
+Request timings use seconds and are recorded when completion metrics become
+available. They measure the worker's execution phase. In a disaggregated
+deployment, a worker's timing is not the client's full end-to-end latency.
+Requests rejected before execution or interrupted before completion may have
+no latency observation.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `e2e_request_latency_seconds` | Histogram | Arrival to last output token. |
+| `time_to_first_token_seconds` | Histogram | Arrival to first output token. |
+| `time_per_output_token_seconds` | Histogram | First-to-last-token duration divided by output tokens minus one; requires at least two output tokens. |
+| `request_queue_time_seconds` | Histogram | Arrival to first scheduling; zero is valid for immediate scheduling. |
+| `request_prefill_time_seconds` | Histogram | First scheduling to first output token. |
+| `request_decode_time_seconds` | Histogram | First to last output token. |
+| `request_inference_time_seconds` | Histogram | First scheduling to last output token. |
+| `request_success_total` | Counter | Completed output candidates by `finished_reason`; multiple outputs can contribute more than one completion per request. |
+| `request_error_total` | Counter | HTTP request errors by `http_code`; use OpenEngine RPC outcomes for gRPC failures. |
+| `prompt_tokens_total` | Counter | Input tokens recorded by request performance collection. |
+| `generation_tokens_total` | Counter | Output tokens recorded by request performance collection. |
+| `prompt_cached_tokens_total` | Counter | Prompt tokens served from KV cache, recorded at request completion. |
+| `prompt_cached_tokens_per_request` | Histogram | Cached prompt tokens per recorded request sample, including zero. |
+| `prefill_perplexity` | Histogram | Finite prefill perplexity values, when supplied. |
+| `generation_perplexity` | Histogram | Finite generation perplexity values, when supplied. |
+
+Prompt-cache counters are process-lifetime totals, not current cache contents;
+eviction or a cache flush does not clear them. Perplexity families only gain
+observations when the engine supplies the corresponding measurements.
+
+### Queue load, batching, and limits
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `num_requests_running` | Gauge | Active requests reported by rank 0. |
+| `num_requests_waiting` | Gauge | Queued requests reported by rank 0. |
+| `num_requests_completed_total` | Counter | Engine-reported request completions accumulated from iteration records. |
+| `max_num_active_requests` | Gauge | Maximum active-request capacity reported by the engine. |
+| `max_batch_size_static` | Gauge | Static maximum batch size. |
+| `max_batch_size_runtime` | Gauge | Runtime maximum batch size. |
+| `max_num_tokens_runtime` | Gauge | Runtime maximum token budget. |
+| `num_context_requests` | Gauge | Context/prefill requests in the local batch, by `dp_rank`. |
+| `num_generation_requests` | Gauge | Generation/decode requests in the local batch, by `dp_rank`. |
+| `num_paused_requests` | Gauge | Paused requests, by `dp_rank`. |
+| `num_scheduled_requests` | Gauge | Scheduled requests, by `dp_rank`. |
+| `total_context_tokens` | Gauge | Context tokens in the latest local batch; despite its name, this is not a counter. |
+| `avg_decoded_tokens_per_iter` | Gauge | Engine-reported average decoded tokens per iteration. |
+| `prefill_batch_occupancy` | Gauge | Local context-request count divided by reported maximum active-request capacity. |
+| `prefill_batch_tokens` | Histogram | Positive context-token counts in exported local iteration records. |
+
+The request success counter and iteration completion counter have different
+sources and counting scopes. Use the former for completed output candidates
+and the latter for engine request completions; do not add them together.
+
+### KV-cache capacity, reuse, and transfers
+
+KV-cache gauges and counters below carry `dp_rank`. Cache hit and reuse rates
+are ratios, while block and byte counters have different units and should
+not be combined in a single rate calculation.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `kv_cache_utilization` | Gauge | Used primary/GPU blocks divided by maximum blocks. |
+| `kv_cache_host_utilization` | Gauge | Used secondary-pool blocks divided by its capacity, when reported. |
+| `kv_cache_max_blocks` | Gauge | Maximum primary KV blocks. |
+| `kv_cache_free_blocks` | Gauge | Free primary KV blocks. |
+| `kv_cache_used_blocks` | Gauge | Used primary KV blocks. |
+| `kv_cache_tokens_per_block` | Gauge | Tokens represented by one KV block. |
+| `kv_cache_hit_rate` | Gauge | Hit rate reported in the engine's cumulative cache snapshot. |
+| `kv_cache_reused_blocks_total` | Counter | Positive deltas of cumulative reused blocks, tracked independently by rank. |
+| `kv_cache_missed_blocks_total` | Counter | Positive deltas of cumulative missed blocks, tracked independently by rank. |
+| `kv_cache_iter_reuse_rate` | Gauge | Reused blocks divided by reused plus missed blocks in the reported iteration delta. |
+| `kv_cache_iter_reused_blocks_total` | Counter | Accumulated full and partial block reuse from iteration deltas. |
+| `kv_cache_iter_full_reused_blocks_total` | Counter | Fully reused blocks from iteration deltas. |
+| `kv_cache_iter_partial_reused_blocks_total` | Counter | Partially reused blocks from iteration deltas. |
+| `kv_cache_iter_missed_blocks_total` | Counter | Context-phase block misses from iteration deltas. |
+| `kv_cache_iter_connector_reused_blocks_total` | Counter | Connector-loaded reused blocks, a subset of reused blocks; counted when a load is accepted. |
+| `kv_cache_gen_alloc_blocks_total` | Counter | KV blocks allocated during generation. |
+| `kv_cache_onboard_bytes_total` | Counter | Bytes transferred from host to GPU. |
+| `kv_cache_offload_bytes_total` | Counter | Bytes transferred from GPU to host. |
+| `kv_cache_disk_prefetch_blocks_total` | Counter | V2 blocks prefetched from disk to host. |
+| `kv_cache_intra_device_copy_bytes_total` | Counter | Bytes copied within the GPU for block copies. |
+| `prompt_cache_hit_tokens_total` | Counter | Prompt cache-hit tokens by `dp_rank`, `cache_level`, and `cache_tier`, accumulated from engine iteration records. |
+
+The cumulative-snapshot counters and iteration-delta counters are separate
+views of reuse and misses; do not add the two views. A decrease in a rank's
+cumulative reused/missed snapshot updates the collector's baseline without
+adding a negative counter increment. Records must arrive in producer order
+within each rank.
+
+Tiered prompt-cache token accounting distinguishes configured levels even
+when two levels use the same backing tier. Disk pages already prefetched to
+host count as host hits. Connector hits are recorded when the load is
+accepted, before asynchronous transfer completion. This iteration-sourced
+family and the request-sourced `prompt_cached_tokens_total` can update at
+different times; they are not independent token totals to add together.
+
+### Memory
+
+These rank-0 measurements are bytes, not GPU utilization percentages or a
+sum of memory across all devices.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `gpu_memory_usage_bytes` | Gauge | Engine-reported GPU memory usage. |
+| `cpu_memory_usage_bytes` | Gauge | Engine-reported CPU memory usage. |
+| `pinned_memory_usage_bytes` | Gauge | Engine-reported pinned host memory usage. |
+
+### Speculative decoding
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `spec_decode_num_draft_tokens_total` | Counter | Draft tokens accumulated from rank-0 iteration records. |
+| `spec_decode_num_accepted_tokens_total` | Counter | Accepted tokens accumulated from rank-0 iteration records. |
+| `spec_decode_acceptance_length` | Gauge | Acceptance length from the latest rank-0 speculative statistics. |
+| `spec_decode_draft_overhead` | Gauge | Draft latency divided by iteration latency, as reported by the engine. |
+| `spec_decode_drafted_tokens_total` | Counter | Drafted tokens from completed-request metrics, by `token_position`. |
+| `spec_decode_accepted_tokens_total` | Counter | Accepted tokens from completed-request metrics, by `token_position`. |
+
+Per-position counters require those arrays in request performance metrics
+and export at most positions 0 through 15. Iteration counters and
+request-completion counters describe different observation streams; do not
+sum them together. Use matching accepted and drafted families when
+calculating an acceptance ratio.
+
+### Iteration and forward timings
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `iteration_latency_seconds` | Gauge | Latest `iterLatencyMS`, converted to seconds; the batch lifecycle timing depends on scheduler mode. |
+| `host_step_time_seconds` | Gauge | Latest single executor-loop wall time from `hostStepTimeMS`, matching the log's `host_step_time`. |
+| `prev_device_step_time_seconds` | Gauge | Latest lagged device-step timing from `prevDeviceStepTimeMS`, matching the log's `prev_device_step_time`. |
+| `gpu_forward_time_seconds` | Gauge | Latest batch-matched GPU-forward timing from `gpuForwardTimeMS`. |
+| `host_step_duration_seconds` | Histogram | Exported rank-0 host-loop wall-time samples. |
+| `gpu_forward_duration_seconds` | Histogram | Exported rank-0 batch-matched GPU-forward samples. |
+
+The loop/device/forward families add `scheduler_mode`. They are rank-0
+measurements: attention-DP fanout copies these timing values to other rank
+rows, so counting every row would duplicate observations.
+
+With overlap scheduling, including pipeline parallelism, `iterLatencyMS`
+spans the batch lifecycle, roughly two executor loops. Use host-step timing
+for single-loop wall time. The lagged device-step value describes an older
+loop than the host timing beside it; subtracting the gauges does not measure
+CPU overhead. Batch-matched GPU-forward time also has a different scope
+from host-loop wall time. Missing, null, negative, and non-finite loop/device/
+forward timings do not create observations; zero is valid. Their histogram
+buckets span 0.1 ms through 10 s plus the standard `+Inf` bucket.
+
+### Configuration and OpenEngine RPCs
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `model_config_info` | Gauge | Value 1 with model, dtype, quantization, and available model/device metadata labels. |
+| `parallel_config_info` | Gauge | Value 1 with tensor, pipeline, context, and available expert parallelism plus GPU-count labels. |
+| `speculative_config_info` | Gauge | Value 1 with available speculative method, draft length, and draft-model labels. |
+| `kv_cache_config_info` | Gauge | Value 1 with available KV page size, reuse, memory fraction, and dtype labels. |
+| `openengine_rpc_outcomes_total` | Counter | OpenEngine-only: one terminal outcome per Generate RPC, labeled by `phase` and `outcome`. |
+| `openengine_metrics_errors_total` | Counter | OpenEngine-only: collection failures labeled by `source`. |
+
+A successful RPC can complete multiple output candidates; the RPC outcome
+counter and request success counter therefore need not match. An RPC's
+completion means the server consumed its result stream, not that the client
+acknowledged receipt. Health probes are excluded from request metrics, but
+their engine work can appear in iteration statistics. A successful metrics
+scrape checks the exporter; use inference health endpoints for engine health.
+
+## Dashboard queries
+
+Retain `instance` to compare workers. Remove it only when deliberately
+aggregating across targets with compatible roles and labels.
+
+### Output token throughput
+
+```promql
+sum by (instance, model_name) (
+  rate(trtllm_generation_tokens_total[5m])
+)
+```
+
+### p99 time to first token
 
 ```promql
 histogram_quantile(
   0.99,
-  sum by (le, model_name, scheduler_mode) (
+  sum by (le, instance, model_name) (
+    rate(trtllm_time_to_first_token_seconds_bucket[5m])
+  )
+)
+```
+
+### Mean queue delay
+
+```promql
+sum by (instance, model_name) (rate(trtllm_request_queue_time_seconds_sum[5m]))
+/
+sum by (instance, model_name) (rate(trtllm_request_queue_time_seconds_count[5m]))
+```
+
+For current queue pressure, graph `trtllm_num_requests_waiting` alongside
+`trtllm_num_requests_running` and latency; queue length alone does not show
+how long requests wait.
+
+### KV capacity across local ranks
+
+```promql
+sum by (instance, model_name) (trtllm_kv_cache_used_blocks)
+/
+sum by (instance, model_name) (trtllm_kv_cache_max_blocks)
+```
+
+This ratio assumes compatible block sizes across the ranks being combined.
+Keep `dp_rank` to identify local capacity imbalance. For reuse over a time
+window, divide the rate of `kv_cache_iter_reused_blocks_total` by the sum of
+reused and missed block rates, using the same labels and counter view.
+
+### Speculative token acceptance
+
+```promql
+sum by (instance, model_name) (rate(trtllm_spec_decode_num_accepted_tokens_total[5m]))
+/
+sum by (instance, model_name) (rate(trtllm_spec_decode_num_draft_tokens_total[5m]))
+```
+
+A ratio is undefined when its denominator is zero. Use the per-position
+families instead when investigating which draft positions are being rejected.
+
+### p99 host-loop time
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le, instance, model_name, scheduler_mode) (
     rate(trtllm_host_step_duration_seconds_bucket[5m])
   )
 )
 ```
 
-For diagnosis of one worker, retain the scrape target's `instance` label in
-the aggregation as well.
+## Sampling and availability
 
-## Fields that remain in iteration logs
+Collection and scraping have separate cadences. The servers drain available
+iteration records in the background, and OpenEngine polls approximately once
+per second. A histogram can retain multiple observations between scrapes;
+a gauge retains only the latest available value. Metric families can have
+no sample until their source data arrives, and gauges need not become zero
+when a worker becomes idle.
 
-The log also includes routing fetch counts, dummy and unscheduled request
-counts, dummy context/generation tokens, and model state details. These are
-not all present in the structured iteration-statistics records, so the shared
-collector cannot expose them directly. Adding them requires capturing
-iteration-matched rank-local snapshots in the executor and attention-DP
-fanout. Iteration IDs, timestamps, and free-form model states should not be
-used as Prometheus labels.
+With `iter_perf_stats_interval > 1`, iteration gauges and timing/batch
+histograms describe sampled iterations. The producer carries completion,
+new-active-request, and KV iteration deltas from skipped iterations into a
+later record; other iteration counters, including speculative draft and
+accepted tokens, can undercount. Keep the interval at 1 when complete
+iteration counters are required. Larger KV-fetch intervals can delay KV
+updates further. Bounded statistics buffers can also drop records if they
+are not drained quickly enough.
+
+Histogram counts do not count skipped iterations, and timing sums are not
+exact engine busy time. Request-completion metrics have their own collection
+path and should not be rescaled by the iteration sampling interval.
+
+The iteration log also includes routing fetch counts, dummy/unscheduled
+request counts, dummy token counts, and model state details that are not all
+in the structured statistics. Exposing these requires iteration-matched,
+rank-local producer data. Iteration IDs, timestamps, and free-form model
+states should not be Prometheus labels.
