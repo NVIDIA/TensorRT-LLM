@@ -1171,9 +1171,16 @@ class AutoTuner:
         excluded_key = None
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
+            # A list of buckets is accepted but unhashable; key it as a tuple.
+            dynamic_specs = tuple(
+                (s.input_idx, s.dim_idx,
+                 tuple(s.gen_tuning_buckets) if isinstance(
+                     s.gen_tuning_buckets, list) else s.gen_tuning_buckets,
+                 s.map_to_tuning_buckets)
+                for s in tuning_config.dynamic_tensor_specs)
             excluded_key = (custom_op,
                             tuple(str(r.unique_id()) for r in runners),
-                            input_shapes, tuning_config.dynamic_tensor_specs,
+                            input_shapes, dynamic_specs,
                             tuning_config.constraint_specs,
                             tuning_config.tune_max_num_tokens)
         if (excluded_key is not None and self.is_tuning_mode
