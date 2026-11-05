@@ -81,7 +81,9 @@ def flatten_generation_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return dict(flat)
 
 
-def resolve_generation_config(manifest: Mapping[str, Any]) -> tuple[QwenImage21PipelineConfig, QwenImage21CheckpointSource]:
+def resolve_generation_config(
+    manifest: Mapping[str, Any],
+) -> tuple[QwenImage21PipelineConfig, QwenImage21CheckpointSource]:
     """Resolve pipeline and checkpoint config from a frozen run manifest."""
 
     flat = flatten_generation_manifest(manifest)

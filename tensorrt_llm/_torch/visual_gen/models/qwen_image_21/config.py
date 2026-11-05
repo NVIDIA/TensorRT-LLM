@@ -9,8 +9,8 @@ transformer, UNet/DiT, attention, or VAE implementations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import os
+from dataclasses import dataclass, field
 from typing import Mapping, MutableMapping, Sequence
 
 DEFAULT_HF_MODEL_ID = "Qwen/Qwen-Image-2.1"
@@ -56,10 +56,16 @@ class QwenImage21TransformerConfig:
     text_seq_length: int = 4096
     vae_scale_factor: int = DEFAULT_VAE_SCALE_FACTOR
 
-    def latent_shape(self, height: int = DEFAULT_HEIGHT, width: int = DEFAULT_WIDTH) -> tuple[int, int, int]:
+    def latent_shape(
+        self, height: int = DEFAULT_HEIGHT, width: int = DEFAULT_WIDTH
+    ) -> tuple[int, int, int]:
         """Return ``(channels, latent_h, latent_w)`` for the 2.1 VAE scale."""
 
-        return (self.latent_channels, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        return (
+            self.latent_channels,
+            height // self.vae_scale_factor,
+            width // self.vae_scale_factor,
+        )
 
 
 @dataclass(frozen=True)
