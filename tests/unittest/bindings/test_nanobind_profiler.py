@@ -138,6 +138,27 @@ def test_nanobind_results_errors_and_selection(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_nanobind_property_stubs_are_valid_python() -> None:
+    """Generate callable property accessors instead of aliases beneath decorators."""
+    import ast
+
+    from nanobind.stubgen import StubGen
+
+    from tensorrt_llm.bindings import executor
+
+    generator = StubGen(executor, include_docstrings=False)
+    generator.put_type(executor.SamplingConfig, "SamplingConfig")
+    module = ast.parse(generator.output)
+    config = next(node for node in module.body if isinstance(node, ast.ClassDef))
+    accessors = [
+        node for node in config.body if isinstance(node, ast.FunctionDef) and node.name == "top_k"
+    ]
+    assert [ast.unparse(node.decorator_list[0]) for node in accessors] == [
+        "property",
+        "top_k.setter",
+    ]
+
+
 @pytest.mark.parametrize(
     "selector,option",
     [
