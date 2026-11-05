@@ -122,6 +122,28 @@ def test_declarations_reject_empty_and_repeated_storage():
         Region("r", FULL_HISTORY, (RegionLayer(0, (Plane(KEY, 8),)),) * 2)
 
 
+def test_attention_declarations_do_not_change_the_layout_yet():
+    plain = Region("latent", FULL_HISTORY, (RegionLayer(0, (Plane(KEY, 128),)),))
+    assert plain.layers[0].bytes_per_token == 0
+    assert not plain.resumes_at_block_boundaries
+    assert not plain.positioned_by_history
+    declared = Region(
+        "latent",
+        FULL_HISTORY,
+        (RegionLayer(0, (Plane(KEY, 128),), bytes_per_token=256),),
+        resumes_at_block_boundaries=True,
+        positioned_by_history=True,
+    )
+
+    plain_layers, plain_layout = lay_out_regions([plain], _base_layers(1))
+    declared_layers, declared_layout = lay_out_regions([declared], _base_layers(1))
+
+    assert [_layer_summary(layer) for layer in declared_layers] == [
+        _layer_summary(layer) for layer in plain_layers
+    ]
+    assert declared_layout.owners == plain_layout.owners
+
+
 def test_no_regions_keeps_the_manager_layers():
     base = _base_layers(3)
 

@@ -16,7 +16,7 @@ linear-attention state of the hybrid managers is the user of regions today.
 | Term | Meaning | Type |
 |---|---|---|
 | Plane | One kind of data a region stores per model layer, under one buffer role | `Plane` |
-| Region layer | The planes a region stores for one rank-local model layer | `RegionLayer` |
+| Region layer | The planes a region stores for one rank-local model layer, plus its per-token cost | `RegionLayer` |
 | Life cycle | When the region's memory is allocated, released early and handed off to the prefix index | `RegionLifeCycle` |
 | Transfer | How the region's planes move between disaggregated workers | `RegionTransfer` |
 | Region | Planes over a set of model layers with one life cycle | `Region` |
@@ -118,8 +118,9 @@ the region-level lookups above.
 
 - **Attention regions.** A token-block region would replace the manager's own attention-layer
   config, and regions with different windows cannot share a layer until V2 supports per-buffer
-  windows. Attention costing (`bytes_per_token`), block-aligned resume points and history-placed
-  windows are therefore not declarable; FP4 MLA keeps its layout policy.
+  windows. The declarations attention regions need already exist (`RegionLayer.bytes_per_token`,
+  `Region.resumes_at_block_boundaries`, `Region.positioned_by_history`), but the manager does not
+  read them yet; FP4 MLA keeps its layout policy.
 - **Class-level cost estimates.** `get_cache_size_per_token` runs before any manager exists and
   still uses the per-class estimators (`_estimate_private_replay_bytes_per_slot`,
   `_extra_state_bytes_per_rank`).

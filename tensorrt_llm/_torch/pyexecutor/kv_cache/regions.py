@@ -168,10 +168,14 @@ class RegionLayer:
         model_layer: Rank-local model layer index, as used by the manager's
             per-layer views.
         planes: The planes stored for this layer, in declaration order.
+        bytes_per_token: What one token costs in this layer when the manager
+            converts a memory budget into token capacity. Declared by
+            token-block regions; the manager does not read it yet.
     """
 
     model_layer: int
     planes: Tuple[Plane, ...]
+    bytes_per_token: int = 0
 
     def __post_init__(self) -> None:
         if not self.planes:
@@ -207,12 +211,22 @@ class Region:
         life_cycle: When the region's memory is allocated, released and handed off.
         layers: The model layers the region covers, each with its planes.
         transfer: How the region's planes move between disaggregated workers.
+        resumes_at_block_boundaries: Another request can resume from this
+            region's committed memory only at a token-block boundary, so every
+            declared hand-off point of the manager is moved onto one.
+            Declared by token-block regions; the manager does not read it yet.
+        positioned_by_history: The region's live window is placed by the
+            request's history length, so the history length must follow every
+            completed context chunk. Declared by token-block regions; the
+            manager does not read it yet.
     """
 
     name: str
     life_cycle: RegionLifeCycle
     layers: Tuple[RegionLayer, ...]
     transfer: RegionTransfer = field(default_factory=RegionTransfer)
+    resumes_at_block_boundaries: bool = False
+    positioned_by_history: bool = False
 
     def __post_init__(self) -> None:
         model_layers = [layer.model_layer for layer in self.layers]
