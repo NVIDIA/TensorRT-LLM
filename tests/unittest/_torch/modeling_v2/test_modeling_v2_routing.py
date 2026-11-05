@@ -481,8 +481,8 @@ def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
         _llm_args("yes")
 
 
-def test_the_default_mode_is_off():
-    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "off"
+def test_the_default_mode_is_auto():
+    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "auto"
 
 
 def test_no_target_is_a_value_error():
