@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Transitions of the encoder-to-decoder handoff described above PyExecutor's encoder methods."""
 
+import gc
 import types
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import EncoderStepResult, PyExecutor
@@ -244,3 +246,29 @@ def test_recompute_projects_cross_kv_once_per_cycle(encoder_input, pause, record
         assert request.state == LlmRequestState.ENCODER_INIT
         assert request.py_encoder_output is None
         assert split_encoder_from_decoder_context_requests([request]) == ([request], [])
+
+
+def test_request_terminated_before_first_context_releases_packed_output(recorded_streams):
+    cancelled, sibling = _make_request(1, "token", 3), _make_request(2, "token", 5)
+    executor = _make_executor()
+    executor.sampler = Mock()
+    executor.resource_manager = Mock()
+    executor._prefetched_request_ids = set()
+    executor._disagg_coordinator = Mock()
+    executor.model_engine = None
+    executor.draft_model_engine = None
+    executor.gather_all_responses = False
+    executor.result_wait_queues = {}
+    packed = StorageWeakRef(
+        _run_encoder(executor, [cancelled, sibling]).hidden_states.untyped_storage()
+    )
+
+    _cancel(executor, [cancelled])
+    _forward_context(executor, [sibling])
+    gc.collect()
+    assert not packed.expired()
+
+    executor._do_terminate_request(cancelled)
+    gc.collect()
+
+    assert packed.expired()

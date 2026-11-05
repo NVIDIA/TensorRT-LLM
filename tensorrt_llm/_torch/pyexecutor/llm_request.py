@@ -811,7 +811,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Encoder-decoder handoff, set by PyExecutor._scatter_encoder_output
         # when the encoder output is published:
         # * py_encoder_output: this request's view of the packed encoder
-        #   output, dropped once the first context step has projected cross-KV.
+        #   output, dropped once the first context step has projected cross-KV
+        #   or when the request terminates.
         # * py_encoder_output_ready_event: completes when the output is ready;
         #   schedulers hold the context step until then, and the executor
         #   drops it when it attaches the output to the execution stream.
