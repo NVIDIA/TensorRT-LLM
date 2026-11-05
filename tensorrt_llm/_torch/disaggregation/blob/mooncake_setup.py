@@ -5,10 +5,12 @@
 A store config has two sections: ``blob``, read by the caller's reader, and ``mooncake``, read
 here; both are checked before the SDK is opened. Mooncake reads its own environment variables, some
 once per process (``MOONCAKE_STORE_CHECKSUM``), some per client (``MC_STORE_MEMCPY``,
-``MC_USE_TENT``) and ``MC_TCP_PROTO`` on every transfer; this module logs them before setup and
+``MC_FORCE_TCP``) and ``MC_TCP_PROTO`` on every transfer; this module logs them before setup and
 never sets them. ``open_sdk`` refuses the settings the driver's rules do not cover: TCP's legacy
 framing (``MC_TCP_PROTO=1``), the local hot cache (``MC_STORE_LOCAL_HOT_CACHE_SIZE``), the newer
-transfer engine (``MC_USE_TENT``, ``MC_USE_TEV1``) and any SDK build other than the pinned ones.
+transfer engine (``MC_USE_TENT``, ``MC_USE_TEV1``), the SDK picking the transport itself
+(``MC_MS_AUTO_DISC``, or RDMA with no device named or found) and any SDK build other than the
+pinned ones.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
@@ -51,6 +53,12 @@ PINNED_SDK_DISTRIBUTIONS = (
 )
 PINNED_SDK_VERSION = "0.3.13"
 IB_SYSFS_ROOT = "/sys/class/infiniband"
+# The smallest segment the SDK's default allocation path mounts: one allocator slab, cachelib's
+# Slab::kSize (real_client.cpp:1014-1016, client_buffer_allocation.cpp:60-65). Its hugepage and
+# multi-NUMA RDMA paths skip that check.
+MIN_SEGMENT_BYTES = 16 << 20
+# host:port, an IPv6 host in brackets.
+_MASTER_ADDRESS = re.compile(r"(?P<host>[^\s:\[\]]+|\[[^\s\[\]]+\]):(?P<port>[0-9]{1,5})")
 MASTER_WAIT_S = 60.0
 MASTER_RETRY_S = 0.5
 SECTIONS = ("blob", "mooncake")
@@ -62,8 +70,8 @@ _LOGGED_ENVIRONMENT = (
     "MC_TCP_SLICE_SIZE",
     "MC_TCP_PROTO",
     "MC_STORE_LOCAL_HOT_CACHE_SIZE",
-    "MC_USE_TENT",
-    "MC_USE_TEV1",
+    "MC_FORCE_TCP",
+    "MC_MS_AUTO_DISC",
 )
 BlobSectionT = TypeVar("BlobSectionT")
 # Reserved for documentation (RFC 5737): a datagram socket connected to it reveals the route off
@@ -76,15 +84,16 @@ class MooncakeConfig:
     """The ``mooncake`` section of a store config.
 
     Attributes:
-        master_server_address: The master's ``host:port``.
+        master_server_address: The master's ``host:port``, an IPv6 host in brackets.
         global_segment_size: Bytes of this process's memory that hold pool objects (its
-            segment). Required: the objects in it go when the process does; 0 leaves holding
-            objects to other processes.
+            segment): 0, which leaves holding objects to other processes, or at least
+            ``MIN_SEGMENT_BYTES``. Required: the objects in it go when the process does.
         protocol: ``"rdma"`` or ``"tcp"``.
         device_name: Comma-separated RDMA devices; empty picks every active InfiniBand device at
-            the highest rate.
+            the highest rate and fails without one, so a RoCE-only host names its devices.
+            ``"auto-discovery"``, which leaves the transport to the SDK, is refused.
         local_hostname: The address peers reach this process at; empty takes the address the
-            route to the master leaves from.
+            IPv4 route to the master leaves from, so an IPv6-only network sets it.
         metadata_server: Where segments are described; ``P2PHANDSHAKE`` needs no server.
         local_buffer_size: Bytes for the SDK's copying calls, which the driver never makes; 0 is
             allowed, and the default is the SDK's.
@@ -118,10 +127,15 @@ class MooncakeConfig:
         for name in ("master_server_address", "device_name", "local_hostname", "metadata_server"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"{name} must be a str, got {getattr(self, name)!r}")
-        if "://" in self.master_server_address:  # the waits below need one host:port
+        if "://" in self.master_server_address:
             raise ValueError(
                 "master_server_address must be one master's host:port; an HA master list "
                 f"is not supported, got {self.master_server_address!r}"
+            )
+        _split_address(self.master_server_address)
+        if self.device_name == "auto-discovery":
+            raise ValueError(
+                "device_name 'auto-discovery' lets the SDK pick the transport; name the devices"
             )
         if self.protocol not in ("rdma", "tcp"):
             raise ValueError(f"protocol must be rdma or tcp, got {self.protocol!r}")
@@ -135,6 +149,11 @@ class MooncakeConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < least:
                 raise ValueError(f"{name} must be an int of at least {least}, got {value!r}")
+        if 0 < self.global_segment_size < MIN_SEGMENT_BYTES:
+            raise ValueError(
+                f"global_segment_size must be 0 or at least {MIN_SEGMENT_BYTES}, the SDK's "
+                f"smallest segment, got {self.global_segment_size}"
+            )
 
 
 def load_store_config(
@@ -178,15 +197,19 @@ def open_sdk(config: MooncakeConfig) -> Any:
     mounts any segment of this process.
 
     Raises:
-        ValueError: TCP would use its legacy framing, the local hot cache is on, or the newer
-            transfer engine is selected.
+        ValueError: TCP would use its legacy framing, the local hot cache is on, the newer
+            transfer engine is selected, or the SDK would pick the transport itself:
+            ``MC_MS_AUTO_DISC`` is on, or ``protocol`` is rdma with no ``device_name`` and no
+            active InfiniBand device.
         ImportError: ``mooncake.store`` does not import, or is not SDK 0.3.13.
         TimeoutError: The master does not accept connections.
         RuntimeError: ``setup`` failed; the half-open client is closed.
     """
-    _refuse_legacy_tcp_framing(config.protocol)
+    _refuse_legacy_tcp_framing()
     _refuse_hot_cache()
     _refuse_tent()
+    _refuse_transport_discovery()
+    rdma_devices = _rdma_devices(config)
     _log_environment()
     try:
         import mooncake.store as sdk
@@ -201,7 +224,7 @@ def open_sdk(config: MooncakeConfig) -> Any:
         global_segment_size=config.global_segment_size,
         local_buffer_size=config.local_buffer_size,
         protocol=config.protocol,
-        rdma_devices=_rdma_devices(config),
+        rdma_devices=rdma_devices,
         master_server_addr=config.master_server_address,
     )
     if code != 0:
@@ -251,14 +274,16 @@ def open_mooncake_driver(
     return driver, blob
 
 
-def _refuse_legacy_tcp_framing(protocol: str) -> None:
+def _refuse_legacy_tcp_framing() -> None:
     """Under ``MC_TCP_PROTO=1`` a TCP write completes once its last chunk is in the local socket
-    buffer, so a put could be READY before its bytes landed. The SDK reads the variable on every
-    transfer: setting it after this check goes unnoticed. The same legacy framing is used toward a
-    segment whose process runs an SDK older than 0.3.12, which this process cannot check, so every
-    process of the pool must run 0.3.12 or later (``tcp_transport.cpp:720``,
-    ``transfer_metadata.cpp:644-646``)."""
-    if protocol == "tcp" and os.environ.get("MC_TCP_PROTO") == "1":
+    buffer, so a put could be READY before its bytes landed. Refused whatever the protocol: under
+    ``MC_FORCE_TCP`` an rdma client also gets TCP, which it uses toward a segment served over TCP
+    (``transfer_engine_impl.cpp:206-224``). The SDK reads the variable on every transfer: setting
+    it after this check goes unnoticed. The same legacy framing is used toward a segment whose
+    process runs an SDK older than 0.3.12, which this process cannot check, so every process of
+    the pool must run 0.3.12 or later (``tcp_transport.cpp:720``,
+    ``transfer_metadata.cpp:813-815``)."""
+    if os.environ.get("MC_TCP_PROTO") == "1":
         raise ValueError("MC_TCP_PROTO=1 selects TCP framing that reports writes before they land")
 
 
@@ -281,6 +306,19 @@ def _refuse_tent() -> None:
         raise ValueError(
             f"{', '.join(selected)} selects a transfer engine the driver does not cover"
         )
+
+
+def _refuse_transport_discovery() -> None:
+    """The driver's rules were read for RDMA and TCP, so its client names its transport: with
+    discovery on, the SDK picks one itself, NVLink where the build or ``MC_INTRANODE_NVLINK`` or
+    ``MC_FORCE_MNNVL`` leads it there (``transfer_engine_impl.cpp:258-438``). Discovery turns on
+    when ``MC_MS_AUTO_DISC`` reads as 1 (``client_service.cpp:542-564``) or ``rdma_devices`` is
+    empty or ``"auto-discovery"`` (``real_client.cpp:786-789``, ``client_service.cpp:805-811``).
+    ``MooncakeConfig`` refuses ``"auto-discovery"`` and ``_rdma_devices`` never leaves RDMA's
+    devices empty; this refuses every ``MC_MS_AUTO_DISC`` but empty or "0", as the SDK reads it
+    with ``stoi``, which also takes " 1" or "1x"."""
+    if os.environ.get("MC_MS_AUTO_DISC", "0").strip() not in ("", "0"):
+        raise ValueError("MC_MS_AUTO_DISC lets the SDK pick the transport the driver runs on")
 
 
 def _log_environment() -> None:
@@ -332,18 +370,24 @@ def _builds_listing_file(module: Any) -> list[tuple[str, str]]:
     return builds
 
 
-# Three deployment helpers, with the same rules as the Mooncake connector's
-# (pyexecutor/connectors/mooncake_store: master.py and config.py), which this package cannot import.
+# Three deployment helpers, with the rules of the Mooncake connector's (pyexecutor/connectors/
+# mooncake_store: master.py and config.py), which this package cannot import, but stricter: with
+# no InfiniBand device found _rdma_devices refuses RDMA, and _split_address refuses an address
+# that is not host:port, where the connector leaves the first to the SDK and skips the second.
 
 
 def _rdma_devices(config: MooncakeConfig) -> str:
     """``device_name``, or for RDMA left empty every active InfiniBand device at the highest rate:
-    the compute fabric, without the Ethernet ports that share an HCA."""
+    the compute fabric, without the Ethernet ports that share an HCA. Never empty for RDMA, which
+    would let the SDK pick the transport (``_refuse_transport_discovery``)."""
     if config.device_name or config.protocol != "rdma":
         return config.device_name
     detected = _fastest_active_ib_devices(IB_SYSFS_ROOT)
     if not detected:
-        logger.warning(f"mooncake: no active InfiniBand device under {IB_SYSFS_ROOT}")
+        raise ValueError(
+            f"protocol rdma found no active InfiniBand device under {IB_SYSFS_ROOT}; set "
+            "device_name to the RDMA devices to use"
+        )
     return ",".join(detected)
 
 
@@ -375,8 +419,6 @@ def _local_address(master: str) -> str:
     """The address the route to the master leaves from. Not ``gethostbyname(gethostname())``,
     which answers 127.0.1.1 where /etc/hosts maps the host's name to loopback."""
     for endpoint in (_split_address(master), _ROUTE_PROBE_ENDPOINT):
-        if endpoint is None:
-            continue
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
                 probe.connect(endpoint)
@@ -394,9 +436,6 @@ def _local_address(master: str) -> str:
 def _wait_for_master(address: str) -> None:
     """Turns an unreachable master into one line naming it, instead of a bare code from setup."""
     endpoint = _split_address(address)
-    if endpoint is None:
-        logger.warning(f"mooncake: cannot check master_server_address {address!r}: not host:port")
-        return
     deadline = time.monotonic() + MASTER_WAIT_S
     while True:
         try:
@@ -411,6 +450,17 @@ def _wait_for_master(address: str) -> None:
         time.sleep(MASTER_RETRY_S)
 
 
-def _split_address(address: str) -> tuple[str, int] | None:
-    host, _, port = address.rpartition(":")
-    return (host.strip("[]"), int(port)) if host and port.isdigit() else None
+def _split_address(address: str) -> tuple[str, int]:
+    """The host, without brackets, and the port of a master's ``host:port``.
+
+    Raises:
+        ValueError: ``address`` is not ``host:port``, with an IPv6 host in brackets and the port in
+            1..65535.
+    """
+    parts = _MASTER_ADDRESS.fullmatch(address)
+    if parts is None or not 1 <= int(parts["port"]) <= 65535:
+        raise ValueError(
+            "master_server_address must be host:port, an IPv6 host in brackets and the port in "
+            f"1..65535, got {address!r}"
+        )
+    return parts["host"].strip("[]"), int(parts["port"])

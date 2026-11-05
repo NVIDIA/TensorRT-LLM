@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 import socket
 import sys
 import threading
@@ -42,6 +43,14 @@ pytestmark = [
 MASTER = "10.0.0.1:50051"
 DRAIN_S = 5.0  # a drained driver's worker threads have exited
 ROUTED_ADDRESS = "10.0.0.7"
+# Every variable open_sdk refuses some value of.
+REFUSED_ENVIRONMENT = (
+    "MC_TCP_PROTO",
+    "MC_STORE_LOCAL_HOT_CACHE_SIZE",
+    "MC_USE_TENT",
+    "MC_USE_TEV1",
+    "MC_MS_AUTO_DISC",
+)
 
 
 def store_config(protocol: str = "tcp", **mooncake) -> dict:
@@ -95,7 +104,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Sdk:
     monkeypatch.setattr(mooncake_setup, "_wait_for_master", sdk.masters.append)
     monkeypatch.setattr(mooncake_setup, "_local_address", lambda master: ROUTED_ADDRESS)
     monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(tmp_path / "no-infiniband"))
-    for name in ("MC_TCP_PROTO", "MC_STORE_LOCAL_HOT_CACHE_SIZE", "MC_USE_TENT", "MC_USE_TEV1"):
+    for name in REFUSED_ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
     return sdk
 
@@ -145,17 +154,50 @@ BAD_VALUES = {
         "master_server_address",
         "etcd://10.0.0.1:2379;10.0.0.2:2379",
     ),
+    # Setup crashes the process on an empty address, and on one without a host or a port holds
+    # the GIL for about 90 s before it fails.
+    "mooncake.master_server_address=": ("mooncake", "master_server_address", ""),
+    "mooncake.master_server_address=:50051": ("mooncake", "master_server_address", ":50051"),
+    "mooncake.master_server_address=127.0.0.1": ("mooncake", "master_server_address", "127.0.0.1"),
+    "mooncake.master_server_address=h:0": ("mooncake", "master_server_address", "h:0"),
+    "mooncake.master_server_address=h:65536": ("mooncake", "master_server_address", "h:65536"),
+    "mooncake.master_server_address=h:abc": ("mooncake", "master_server_address", "h:abc"),
+    "mooncake.master_server_address=::1:50051": ("mooncake", "master_server_address", "::1:50051"),
+    # Setup refuses a smaller segment only once it reached the master.
+    "mooncake.global_segment_size=16MiB-1": ("mooncake", "global_segment_size", (16 << 20) - 1),
+    # The SDK's word for picking the devices, and so the transport, itself.
+    "mooncake.device_name=auto-discovery": ("mooncake", "device_name", "auto-discovery"),
 }
 
 
 @pytest.mark.parametrize("case", BAD_VALUES)
-def test_unknown_keys_and_values_of_the_wrong_type_are_rejected(sdk: Sdk, case: str) -> None:
+def test_unknown_keys_and_bad_values_are_rejected(sdk: Sdk, case: str) -> None:
     section, name, value = BAD_VALUES[case]
     config = store_config()
     config[section][name] = value
     with pytest.raises(ValueError, match=f"section '{section}'.*{name}"):
         open_mooncake_driver(config, read_blob)
     assert sdk.stores == [] and sdk.masters == []  # refused before the SDK was opened
+
+
+MASTER_ADDRESSES = {
+    # address: the endpoint the wait for the master connects to
+    "10.0.0.1:50051": ("10.0.0.1", 50051),
+    "master-0:1": ("master-0", 1),
+    "master-0:65535": ("master-0", 65535),
+    "[::1]:50051": ("::1", 50051),
+}
+
+
+@pytest.mark.parametrize("address", MASTER_ADDRESSES)
+def test_a_master_host_and_port_are_accepted_and_split(address: str) -> None:
+    config = MooncakeConfig(address, 0)
+    assert mooncake_setup._split_address(config.master_server_address) == MASTER_ADDRESSES[address]
+
+
+@pytest.mark.parametrize("size", [0, mooncake_setup.MIN_SEGMENT_BYTES])
+def test_a_segment_of_0_or_at_least_the_smallest_size_is_accepted(size: int) -> None:
+    assert MooncakeConfig(MASTER, size).global_segment_size == size
 
 
 def test_an_empty_blob_section_is_empty_and_anything_but_a_mapping_is_refused() -> None:
@@ -251,6 +293,22 @@ def test_device_detection_picks_the_fastest_active_ib_ports(tmp_path: pathlib.Pa
     assert mooncake_setup._fastest_active_ib_devices(str(tmp_path / "missing")) == []
 
 
+@pytest.mark.parametrize("roce_port", [False, True], ids=["no_device", "roce_port_only"])
+def test_rdma_with_no_device_named_or_found_is_refused_before_the_sdk_is_touched(
+    sdk: Sdk, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, roce_port: bool
+) -> None:
+    sysfs = tmp_path / "infiniband"
+    sysfs.mkdir()
+    if roce_port:
+        ib_device(sysfs, "mlx5_0", "Ethernet", "4: ACTIVE", "400 Gb/sec (4X NDR)")
+    monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(sysfs))
+    monkeypatch.setitem(sys.modules, "mooncake.store", None)  # importing the SDK raises
+    with pytest.raises(
+        ValueError, match=f"InfiniBand device under {re.escape(str(sysfs))}.*device_name"
+    ):
+        open_mooncake_driver(store_config("rdma"), read_blob)
+
+
 def test_a_configured_device_is_used_as_given(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -274,12 +332,17 @@ def test_missing_sdk_reports_install_and_shadow_hint(sdk: Sdk, monkeypatch) -> N
         open_mooncake_driver(store_config(), read_blob)
 
 
-def test_tcp_legacy_framing_is_refused(sdk: Sdk, monkeypatch: pytest.MonkeyPatch) -> None:
+# An rdma client may run over TCP too, under MC_FORCE_TCP.
+@pytest.mark.parametrize("protocol", ["tcp", "rdma"])
+def test_tcp_legacy_framing_is_refused(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch, protocol: str
+) -> None:
     monkeypatch.setenv("MC_TCP_PROTO", "1")
     with pytest.raises(ValueError, match="MC_TCP_PROTO"):
-        open_mooncake_driver(store_config("tcp"), read_blob)
+        open_mooncake_driver(store_config(protocol, device_name="mlx5_0"), read_blob)
     assert sdk.stores == []
-    open_sdk(MooncakeConfig(MASTER, 0, "rdma", device_name="mlx5_0"))  # RDMA does not frame
+    monkeypatch.setenv("MC_TCP_PROTO", "2")  # the SDK takes "1" alone for the legacy framing
+    open_sdk(MooncakeConfig(MASTER, 0, protocol, device_name="mlx5_0"))
     assert len(sdk.stores) == 1
 
 
@@ -309,6 +372,37 @@ def test_the_newer_transfer_engine_is_refused(
     with pytest.raises(ValueError, match=f"{variable} selects a transfer engine"):
         open_mooncake_driver(store_config(), read_blob)
     assert sdk.stores == []
+
+
+# The SDK reads it with stoi, which takes leading spaces and stops at the first non-digit.
+@pytest.mark.parametrize("value", ["1", " 1", "1x", "01"])
+def test_transport_discovery_is_refused(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("MC_MS_AUTO_DISC", value)
+    with pytest.raises(ValueError, match="MC_MS_AUTO_DISC"):  # though the devices are named
+        open_mooncake_driver(store_config("rdma", device_name="mlx5_0"), read_blob)
+    assert sdk.stores == []
+
+
+@pytest.mark.parametrize("value", [None, "", "0", " 0"])
+def test_transport_discovery_off_is_accepted(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is not None:  # None leaves it unset
+        monkeypatch.setenv("MC_MS_AUTO_DISC", value)
+    open_sdk(MooncakeConfig(MASTER, 0, "rdma", device_name="mlx5_0"))
+    assert len(sdk.stores) == 1
+
+
+# The SDK reads them only with discovery on; another engine of the process may need them.
+@pytest.mark.parametrize("variable", ["MC_INTRANODE_NVLINK", "MC_FORCE_MNNVL"])
+def test_the_nvlink_variables_are_accepted(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    monkeypatch.setenv(variable, "1")
+    open_sdk(MooncakeConfig(MASTER, 0, "rdma", device_name="mlx5_0"))
+    assert len(sdk.stores) == 1
 
 
 CUDA13 = "mooncake-transfer-engine-cuda13"

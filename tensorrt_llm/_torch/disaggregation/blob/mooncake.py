@@ -30,7 +30,8 @@ When access ends. The rules below were read in the Mooncake sources at tag v0.3.
 that tree), for a wheel built without ``USE_TENT``, as the release wheels are
 (``mooncake-common/common.cmake:174``, ``.github/workflows/_build-wheel.yaml:67-107``). They hold
 only if whoever opens the SDK refuses ``MC_USE_TENT`` and ``MC_USE_TEV1``, which switch to the
-newer engine at run time (``mooncake-transfer-engine/src/transfer_engine.cpp:393-410``); the SDK's
+newer engine at run time (``mooncake-transfer-engine/src/transfer_engine.cpp:393-410``);
+transport discovery, with which the SDK picks the transport itself, NVLink included; the SDK's
 local hot cache, which could serve a torn read later; and TCP's legacy framing, which reports a
 write before it lands and is also used toward a process of the pool that runs an SDK older than
 0.3.12. The default replicate config is assumed: one memory replica, no NoF or SSD replica.
