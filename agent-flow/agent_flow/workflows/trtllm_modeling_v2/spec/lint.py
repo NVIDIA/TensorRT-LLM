@@ -971,15 +971,25 @@ def tree_rules(ctx: LintContext) -> Iterator[Finding]:
 
 #: Every rule, in report order. A new feature, scope or launch check adds its function here.
 def perf_rules(ctx: LintContext) -> Iterator[Finding]:
-    """A ``perf`` key the campaign no longer reads: it runs without it."""
+    """A ``perf`` key the campaign no longer reads, and a perf config whose decode runs eager.
+
+    A config with CUDA graphs off, or whose largest captured batch is below the live requests a
+    rank holds (``tune.spec.capture_shortfalls``), measures eager steps for the whole campaign.
+    """
+    from ..tune.spec import capture_shortfalls, serving_options
+
     perf = ctx.task.get("perf")
-    for key in sorted(set(perf) & set(REMOVED_PERF_KEYS)) if isinstance(perf, Mapping) else ():
+    if not isinstance(perf, Mapping):
+        return
+    for key in sorted(set(perf) & set(REMOVED_PERF_KEYS)):
         yield Finding(
             "perf-removed-key",
             WARN,
             f"`perf.{key}` is ignored: {REMOVED_PERF_KEYS[key]}",
             f"drop `perf.{key}`",
         )
+    for why, fix in capture_shortfalls(serving_options(ctx.task)):
+        yield Finding("perf-cuda-graph-coverage", WARN, why, fix)
 
 
 RULES: tuple[Rule, ...] = (

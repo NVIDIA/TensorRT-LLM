@@ -4,19 +4,25 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
-from ..checks.check_config import checkpoint_remote_code
+import yaml
+
+from ..checks.check_config import checkpoint_remote_code, options_capture
 from ..spec.task_schema import DEFAULT_PERF_CONCURRENCY
-from .harness.bench import AGENTX_DATASET, AGENTX_DURATION_S
+from .harness.bench import AGENTX_DATASET, AGENTX_DURATION_S, resolve_config
 from .measure import BenchPart, BenchSpec
 from .schema import AGENTX_WORKLOAD_KEYS
 from .serving_config import derive_serving_config, write_serving_config
 
 PACKAGE = Path(__file__).resolve().parent.parent
 TARGET_SELECTION = {"modeling_v2": "require"}
+#: How far above its average share of the concurrency one attention-DP rank's live requests
+#: run: requests finish unevenly, so a rank holds more than its share for whole stretches.
+CAPTURE_HEADROOM = 1.5
 
 
 @dataclass
@@ -49,6 +55,9 @@ class TuneSpec:
     goal_pct_of_sol: float | None = None
     #: The task the campaign serves: the contract its keep gate is (``keep_gate.py``).
     task: dict = field(default_factory=dict)
+    #: ``perf.source_workspace``: the workspace whose core verdicts establish the tested source the
+    #: campaign imports (an onboarding beside a standalone tune); None for the campaign's own.
+    source_workspace: Path | None = None
 
     @classmethod
     def from_task(cls, task: Mapping[str, Any], workspace: Path, *, target: str = "") -> "TuneSpec":
@@ -98,6 +107,9 @@ class TuneSpec:
             sol={"enabled": True, **dict(perf.get("sol") or {})},
             goal_pct_of_sol=float(goal["pct_of_sol"]) if "pct_of_sol" in goal else None,
             task=dict(task),
+            source_workspace=(
+                Path(perf["source_workspace"]).resolve() if perf.get("source_workspace") else None
+            ),
         )
 
     def describe_workload(self) -> str:
@@ -125,6 +137,15 @@ class TuneSpec:
             parts=tuple(self.parts),
         )  # fmt: skip
 
+    def serving_options(self) -> list[tuple[str, list[int], dict]]:
+        """Each perf config's name, concurrencies and the LLM-API options its server reads."""
+        return [
+            (name, list(concurrencies), resolve_config(list(paths), []))
+            for name, (_, _, concurrencies, paths) in self.bench()
+            .workloads(self.identity_configs)
+            .items()
+        ]
+
 
 def _draft_len(task: Mapping[str, Any]) -> int:
     """The draft length a speculative target verifies, or 0 without one."""
@@ -137,6 +158,23 @@ def _draft_len(task: Mapping[str, Any]) -> int:
     return resolve_max_draft_len(task.get("accuracy") or {}, speculators[-1])
 
 
+def _derived_options(task: Mapping[str, Any], entry: Mapping[str, Any]) -> dict:
+    """The serving config a ``perf.configs`` entry that names no configs runs with."""
+    workload = entry.get("workload") or {}
+    isl, osl = int(workload.get("isl", 1024)), int(workload.get("osl", 1024))
+    concurrency = [int(c) for c in workload.get("concurrency", [1])]
+    config = {
+        **TARGET_SELECTION,
+        **derive_serving_config(
+            isl=isl, osl=osl, concurrency=concurrency, draft_len=_draft_len(task)
+        ),
+    }
+    if checkpoint_remote_code(task.get("checkpoint_path")):
+        config["trust_remote_code"] = True
+    config.update(entry.get("llm_api_options") or {})
+    return config
+
+
 def _part(task: Mapping[str, Any], workdir: Path, entry: Mapping[str, Any]) -> BenchPart:
     """One ``perf.configs`` entry: its workload, and its configs (derived when it names none)."""
     name = str(entry["name"])
@@ -145,15 +183,7 @@ def _part(task: Mapping[str, Any], workdir: Path, entry: Mapping[str, Any]) -> B
     concurrency = [int(c) for c in workload.get("concurrency", [1])]
     configs = [Path(p).resolve() for p in entry.get("identity_configs") or []]
     if not configs:
-        config = {
-            **TARGET_SELECTION,
-            **derive_serving_config(
-                isl=isl, osl=osl, concurrency=concurrency, draft_len=_draft_len(task)
-            ),
-        }
-        if checkpoint_remote_code(task.get("checkpoint_path")):
-            config["trust_remote_code"] = True
-        config.update(entry.get("llm_api_options") or {})
+        config = _derived_options(task, entry)
         configs = [write_serving_config(workdir / "configs" / f"serving-{name}.yaml", config)]
     client = str(workload.get("client", "random"))
     agentx = {}
@@ -175,3 +205,90 @@ def _part(task: Mapping[str, Any], workdir: Path, entry: Mapping[str, Any]) -> B
         client=client,
         agentx=agentx,
     )
+
+
+def serving_options(task: Mapping[str, Any]) -> list[tuple[str, list[int], dict]]:
+    """:meth:`TuneSpec.serving_options` read from ``task`` alone, writing nothing.
+
+    A config whose files do not read is left out: the campaign's own start says why.
+    """
+    perf = task.get("perf") or {}
+    entries = perf.get("configs")
+    if not entries:
+        workload = perf.get("workload") or {}
+        concurrency = workload.get("concurrency", list(DEFAULT_PERF_CONCURRENCY))
+        entries = [
+            {
+                "name": "",
+                "workload": {**workload, "concurrency": concurrency},
+                "identity_configs": perf.get("identity_configs"),
+            }
+        ]
+    found = []
+    for entry in entries:
+        concurrency = [int(c) for c in (entry.get("workload") or {}).get("concurrency", [1])]
+        files = [Path(p).resolve() for p in entry.get("identity_configs") or []]
+        try:
+            options = resolve_config(files, []) if files else _derived_options(task, entry)
+        except (OSError, yaml.YAMLError):
+            continue
+        found.append((str(entry.get("name") or ""), concurrency, options))
+    return found
+
+
+def capture_shortfalls(
+    configs: Iterable[tuple[str, Sequence[int], Mapping[str, Any]]],
+) -> list[tuple[str, str]]:
+    """Each perf config whose decode runs eager for part of its load: ``(why, fix)``.
+
+    CUDA graphs off, or a largest captured batch below the live requests one rank holds: the
+    config's concurrency over its attention-DP ranks, times :data:`CAPTURE_HEADROOM` (never
+    above the concurrency or the engine's ``max_batch_size``). A step past the largest batch
+    runs eager, and the campaign measures that instead of the captured path.
+    """
+    found = []
+    for name, concurrency, options in configs:
+        where = f"perf config `{name}`" if name else "the perf config"
+        try:
+            capture = options_capture(options)
+        except ValueError:
+            continue  # the LLM API refuses it; the server's boot says so
+        if capture is None:
+            found.append(
+                (
+                    f"{where} turns CUDA graphs off (`cuda_graph_config: null`): every decode "
+                    "step runs eager, a path no deployment serves",
+                    "drop `cuda_graph_config: null` and capture up to the concurrency",
+                )
+            )
+            continue
+        top = max(int(c) for c in concurrency)
+        ranks = (
+            max(1, int(options.get("tensor_parallel_size") or 1))
+            if options.get("enable_attention_dp")
+            else 1
+        )
+        share = -(-top // ranks)
+        live = min(top, math.ceil(share * CAPTURE_HEADROOM))
+        if options.get("max_batch_size"):
+            live = min(live, int(options["max_batch_size"]))
+        largest = capture.batch_sizes[-1]
+        if largest >= live:
+            continue
+        load = (
+            f"concurrency {top} over {ranks} attention-DP ranks is {share} live requests per "
+            f"rank on average, and a rank holds up to {live} as requests finish unevenly"
+            if ranks > 1
+            else f"concurrency {top} keeps up to {live} requests live"
+        )
+        default = "" if "cuda_graph_config" in options else " (the LLM API default: it sets none)"
+        found.append(
+            (
+                f"{where} captures CUDA graphs up to batch {largest}{default}, but {load}: "
+                f"every decode step above {largest} runs eager",
+                f"capture every batch up to at least {live}, e.g. `cuda_graph_config: "
+                f"{{enable_padding: true, max_batch_size: {live}}}`, with the engine's "
+                "`max_batch_size` at least as large",
+            )
+        )
+    return found

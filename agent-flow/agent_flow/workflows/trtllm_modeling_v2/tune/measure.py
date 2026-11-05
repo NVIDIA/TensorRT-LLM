@@ -121,10 +121,46 @@ def evidence_key(bench: "BenchSpec", configs: Sequence[Path]) -> str:
     ]
 
 
+def part_keys(bench: "BenchSpec", configs: Sequence[Path]) -> dict[str, str]:
+    """:func:`evidence_key` per perf config: what that config's runs of a measurement measured.
+
+    Keyed by the config's name (``""`` for a campaign of one workload).
+    """
+    keys = {}
+    for name, (isl, osl, con, paths) in bench.workloads(configs).items():
+        part = next((p for p in bench.parts if p.name == name), None)
+        payload = {
+            "model": bench.model,
+            "environment": bench.env_script,
+            "extra_args": list(bench.extra_args),
+            "workload": [isl, osl, list(con), resolve_config(list(paths), [])],
+            "constraint": dict(part.constraint) if part else {},
+            "client": bench.client(name),
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode())
+        keys[name] = digest.hexdigest()[:16]
+    return keys
+
+
 def archive_evidence(path: Path) -> None:
     """Preserve stale results without leaving their deterministic label reusable."""
     if path.exists():
         path.rename(path.with_name(f"{path.name}.stale-{time.time_ns()}"))
+
+
+def archive_parts(path: Path, parts: Sequence[str]) -> None:
+    """Set aside ``parts`` of the measurement under ``path`` and its join; keep its other runs.
+
+    The next measurement of the label runs only what is missing, reusing each run left that
+    still matches (:meth:`MeasurementRunner._run_reusable`), and joins them again.
+    """
+    if not path.is_dir():
+        return
+    # meta.json first: it marks the joined measurement complete.
+    for name in ("meta.json", PARTS_FILE, "summary.json"):
+        (path / name).unlink(missing_ok=True)
+    for part in parts:
+        archive_evidence(path / part)
 
 
 def measurement_hosts(m: Measurement) -> dict[str, str]:
@@ -146,7 +182,17 @@ UNMEASURED_RCS = INFRA_RCS | {RC_REFUSED, RC_MIXED_CHECKOUT, RC_WALL_LIMIT}
 
 
 class MeasurementUnavailable(RuntimeError):
-    """Measurement infrastructure stopped; the campaign checkpoint remains resumable."""
+    """Measurement infrastructure stopped; the campaign checkpoint remains resumable.
+
+    ``transient``: waiting can bring it back (a job to finish, a session to come back, a run
+    that ended without a verdict), so the stage waits it out in process. Each such cause says so
+    where it is raised; any other (the tested source conflicts with the keeps, a baseline that
+    failed, a cause no one has judged yet) ends the stage without a verdict at once.
+    """
+
+    def __init__(self, *args: object, transient: bool = False) -> None:
+        super().__init__(*args)
+        self.transient = transient
 
 
 def unmeasured(rc: int, record: Mapping[str, Any]) -> bool:
@@ -800,7 +846,7 @@ class MeasurementRunner:
             self._note_queued(queued)
             if waiting and not queued and not any(self.perf.alive(sp) for sp in self.perf.spools):
                 raise MeasurementUnavailable(
-                    "no live measurement session; resume after replacement"
+                    "no live measurement session; resume after replacement", transient=True
                 )
             unavailable = []
             for job, spool, rc in self.perf.poll():
@@ -832,7 +878,7 @@ class MeasurementRunner:
                 todo = [run for run in todo if run not in runs or run in missing]
             if unavailable:
                 self._note_queued(queued)
-                raise MeasurementUnavailable("; ".join(unavailable))
+                raise MeasurementUnavailable("; ".join(unavailable), transient=True)
             if todo:
                 time.sleep(self.poll_s)
         self._note_queued({})
@@ -998,9 +1044,11 @@ __all__ = [
     "Run",
     "client_identity",
     "SpoolRunner",
+    "archive_parts",
     "host_controls",
     "load_measurement",
     "node_busy",
+    "part_keys",
     "receipt_rc",
     "spool_host",
     "validate_measurement",

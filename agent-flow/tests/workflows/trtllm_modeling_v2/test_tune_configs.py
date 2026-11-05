@@ -85,6 +85,54 @@ def test_the_perf_block_runs_without_a_stock_reference_or_repeats_and_says_so():
     ]
 
 
+def test_a_perf_config_whose_cuda_graphs_stop_short_of_its_load_is_a_warning(tmp_path):
+    """128 requests over 4 attention-DP ranks: 32 per rank on average, up to 48 as they finish."""
+    from agent_flow.workflows.trtllm_modeling_v2.spec.lint import WARN, perf_rules
+
+    from .test_tune_stage import FakeRunner, _effect, _repo
+
+    adp = {"modeling_v2": "require", "tensor_parallel_size": 4, "enable_attention_dp": True}
+    configs = {
+        "short": {**adp, "cuda_graph_config": {"enable_padding": True, "max_batch_size": 32}},
+        "covered": {**adp, "cuda_graph_config": {"enable_padding": True, "max_batch_size": 48}},
+        "eager": {**adp, "cuda_graph_config": None},
+        "bounded": {**adp, "max_batch_size": 16, "cuda_graph_config": {"max_batch_size": 16}},
+    }
+    entries = []
+    for name, options in configs.items():
+        (tmp_path / f"{name}.yaml").write_text(yaml.safe_dump(options))
+        entries.append(
+            {
+                "name": name,
+                "workload": {"isl": 1024, "osl": 128, "concurrency": [1, 128]},
+                "identity_configs": [str(tmp_path / f"{name}.yaml")],
+            }
+        )
+    perf = {"configs": entries, "spools": ["s1", "s2", "s3", "s4"], "env_script": "/env.sh"}
+    task = {"trtllm_repo_path": str(_repo(tmp_path)), "checkpoint_path": "/ckpt", "perf": perf}
+    found = list(perf_rules(SimpleNamespace(task=task)))
+    assert [(f.rule, f.severity) for f in found] == [("perf-cuda-graph-coverage", WARN)] * 2
+    short, eager = (f.message for f in found)
+    assert short.startswith("perf config `short` captures CUDA graphs up to batch 32")
+    assert "32 live requests per rank on average, and a rank holds up to 48" in short
+    # Capture what one rank holds, not the whole concurrency.
+    assert "max_batch_size: 48}`, with the engine's `max_batch_size`" in found[0].fix
+    assert eager.startswith("perf config `eager` turns CUDA graphs off")
+    # The campaign journals it when it starts, and measures as the spec says.
+    perf["campaign"] = {"enabled": False}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+    logs = []
+    stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None,
+                      runner_factory=lambda s, p: FakeRunner(s, p, _effect), poll_s=0,
+                      log=logs.append)  # fmt: skip
+    assert stage.run() == "tuned"
+    warned = [m for m in logs if m.startswith("[tune] warning: ")]
+    assert [m.removeprefix("[tune] warning: ").split(". Fix: ")[0] for m in warned] == [
+        short,
+        eager,
+    ]
+
+
 AGENTX = {"client": "agentx", "isl": 8192, "osl": 1024, "concurrency": [1], "duration_s": 600}
 
 

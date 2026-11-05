@@ -385,6 +385,9 @@ accuracy:
 #   env_script: <sourced by every perf job>   # default <workspace>/tune/env.sh
 #   wall: 2h                       # default; one perf job's wall limit
 #   model: /path/to/checkpoint     # default checkpoint_path (and `target`: the run's target)
+#   source_workspace: <onboarding workspace>   # a standalone tune beside an onboarding of the
+#                                  # same checkout imports the commits the core's verdicts there
+#                                  # validate; default the tune's own workspace
 #   campaign:                      # every value shown is the default but max_hours (none)
 #     enabled: true                # false: the baseline only
 #     min_gain: 0.01               # an e2e win = max(min_gain, noise_factor x spread)
@@ -403,6 +406,9 @@ accuracy:
 #     max_roadmaps: 2              # a spent roadmap with budget left is refreshed on the best tree
 #     max_hours: 24                # the campaign's wall budget
 #     idle_settle_s: 120           # a measurement starts on a node idle this long
+#     retry_wait_s: 600            # a transient no-verdict (a job to finish, a session to come
+#     max_retries: 24              # back) is waited out in process this long, this many times;
+#                                  # past them the process ends and the next one resumes
 #     gate_tests: true             # the target's and the contract's tests, at each checkpoint
 #     kernel_ledger: require       # or off: no kernel ledger asked of a roadmap
 #     kernel_coverage_pct: 80      # the GPU time a roadmap's kernel ledger must cover

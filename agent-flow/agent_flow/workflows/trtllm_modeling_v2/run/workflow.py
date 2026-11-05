@@ -768,7 +768,7 @@ class TrtllmModelingV2Workflow:
         marker = self._commit_marker(commits.pop(), reads)
         return (ident, marker) if marker else ("", "")
 
-    def _verdict_holds(self, verdict: contract_mod.Verdict) -> bool:
+    def _verdict_holds(self, verdict: contract_mod.Verdict, workspace: Path | None = None) -> bool:
         """Whether ``verdict`` holds on the target as it is, where its marker alone cannot say.
 
         That is a verdict recorded on another state of the target, and one of a gate that
@@ -780,8 +780,11 @@ class TrtllmModelingV2Workflow:
         what no gate runs (the tree's tests and examples where its gate runs none of them),
         the flow's own source, the Python files its processes did not import
         (:attr:`~.contract.Verdict.reads`). A verdict naming no commit holds on its own
-        marker alone, and a void one nowhere else. A verdict carried to a head is journaled
-        once, with what the change touched. Asked once per head, commit and check.
+        marker alone (a tree-test gate's nowhere), and a void one nowhere else. A verdict
+        carried to a head is journaled once, with what the change touched. Asked once per head,
+        commit and check. ``workspace`` holds the verdict's list of what it read: this run's, or
+        the run that recorded it (a list's id is its content's digest, so one answer serves
+        both).
         """
         head = self._head()
         repo = str(self.task_data.get("trtllm_repo_path") or "")
@@ -806,7 +809,7 @@ class TrtllmModelingV2Workflow:
                     commit,
                     head,
                     runs_tests=verdict.gate in contract_mod.TREE_TEST_GATES,
-                    reads=self._read_list(verdict.reads),
+                    reads=self._read_list(verdict.reads, workspace),
                 )
             if len(cache) > 256:
                 cache.clear()
@@ -873,14 +876,16 @@ class TrtllmModelingV2Workflow:
             kinds[kind] = kinds.get(kind, 0) + 1
         return kinds
 
-    def _read_list(self, ident: str) -> frozenset[str] | None:
-        """The Python files of the tree a verdict's processes imported; ``None`` when not known."""
+    def _read_list(self, ident: str, workspace: Path | None = None) -> frozenset[str] | None:
+        """The Python files of the tree a verdict's processes imported; ``None`` when not known.
+
+        Read from ``workspace``'s lists, this run's by default.
+        """
         if not ident:
             return None
+        listed_path = (workspace or self.workspace) / READS_DIRNAME / f"{ident}.json"
         try:
-            listed = json.loads(
-                (self.workspace / READS_DIRNAME / f"{ident}.json").read_text(encoding="utf-8")
-            )
+            listed = json.loads(listed_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         return frozenset(str(p) for p in listed) if isinstance(listed, list) else None

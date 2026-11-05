@@ -30,7 +30,8 @@ The agent prepares the spec and launches the workflow; missing inputs must be re
 
 **The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
 derive` writes a starting spec (no `site.yaml` needed), and `trtllm-modeling-v2 intake lint` checks
-it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a member too
+it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a perf
+config whose CUDA graphs stop below the live requests a rank holds, a member too
 narrow for one engine, disaggregation wider than a session, variant cross products, variants that
 boot at every member, a feature proven
 at several members or again under another axis, unusable accuracy anchors, open-ended boot probes) and blocks an accuracy check that runs without CUDA graphs and
@@ -138,9 +139,12 @@ must change before that.
    (`trtllm-modeling-v2 tune`): one baseline, parallel candidates kept one at a time, a checkpoint
    every few keeps that rolls them back on a loss, and the accuracy benchmark once on the final
    tree. Results stay on a separate best branch with `tune/summary.md`; nothing merges into
-   delivery, and the outcome is `state.tune["verdict"]`. A campaign deferred before delivery
-   resumes on the next ordinary invocation. Config or judgment-policy changes isolate stale
-   evidence; validated source changes invalidate profile shares and revalidate the kept stack.
+   delivery, and the outcome is `state.tune["verdict"]`. A deferral waiting can fix (a job to
+   finish, a session to come back) is waited out in process; a campaign still deferred before
+   delivery resumes on the next ordinary invocation. Config or judgment-policy changes isolate
+   stale evidence (a changed perf config's baseline alone is measured again, and the roadmap
+   stays without its step shares); validated source changes invalidate profile shares and
+   revalidate the kept stack.
    Micro checks require comparable finite outputs, with exact discrete results. Final performance
    validation uses a same-host control; cross-host summary deltas are descriptive.
    `tune/stage.py` and `tune/campaign.py` describe the policy.

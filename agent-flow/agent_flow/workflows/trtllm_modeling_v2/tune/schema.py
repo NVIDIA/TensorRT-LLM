@@ -12,6 +12,7 @@ from .sol_consensus import METHODS
 PERF_KEYS = {
     "enabled", "model", "target", "identity_configs", "workload", "spools", "dev_spools",
     "env_script", "campaign", "sister_engines", "wall", "configs", "goal", "sol",
+    "source_workspace",
 }  # fmt: skip
 #: Keys the campaign no longer reads: it starts once the core holds and measures one baseline,
 #: with no stock reference beside it and no repeat of it. A spec that still has one is run
@@ -50,6 +51,12 @@ def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
     for key in ("identity_configs", "spools"):
         if key in perf and not isinstance(perf[key], list):
             errors.append(f"perf.{key}: a list")
+    source = perf.get("source_workspace")
+    if source is not None and not (isinstance(source, str) and source.strip()):
+        errors.append(
+            "perf.source_workspace: the path of the workspace whose core verdicts establish the "
+            "tested source, e.g. the onboarding's"
+        )
     errors += _validate_configs(perf.get("configs"))
     errors += _validate_goal(perf)
     sol = perf.get("sol")
@@ -81,6 +88,17 @@ def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
         errors += validate_campaign_accuracy(campaign.get("accuracy"))
         errors += _validate_max_hours(campaign.get("max_hours"))
         errors += _validate_checkpoints(campaign)
+        if not _fraction(campaign.get("retry_wait_s", 0)):
+            errors.append(
+                "perf.campaign.retry_wait_s: seconds the stage waits out a transient deferral "
+                "before it resumes in process, >= 0"
+            )
+        retries = campaign.get("max_retries", 0)
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            errors.append(
+                "perf.campaign.max_retries: how many transient deferrals one process waits out, "
+                "an integer >= 0 (0 ends the process at the first)"
+            )
         tolerance = campaign.get("ttft_tolerance", 0.1)
         if tolerance is not None and (
             isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or tolerance < 0
