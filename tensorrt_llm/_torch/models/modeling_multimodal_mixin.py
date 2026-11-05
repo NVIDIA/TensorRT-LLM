@@ -1285,9 +1285,8 @@ class MultimodalModelMixin:
             # `pixel_values` was padded to the request-wide max H/W by the input
             # processor. After keeping only the miss subset, crop the trailing H/W back
             # down to that subset's own max true size -- otherwise a downstream re-batch
-            # step (e.g. Mistral 3's `batch_pixel_values`) that pads to
-            # `max(residual.image_sizes)` would compute a negative pad amount whenever
-            # the omitted items were the largest in the original request.
+            # step that pads to `max(residual.image_sizes)` would compute a negative pad
+            # amount whenever the omitted items were the largest in the original request.
             if miss_sizes and miss_pixel.dim() >= 4:
                 max_h = max(int(s[0]) for s in miss_sizes)
                 max_w = max(int(s[1]) for s in miss_sizes)

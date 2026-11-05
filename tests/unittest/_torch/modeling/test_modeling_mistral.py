@@ -5,11 +5,12 @@ import contextlib
 import os
 import re
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, List
 from unittest import mock
 
 import pytest
 import torch
+import torchvision
 import transformers
 import transformers.models.mistral3
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -30,7 +31,11 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemPartition,
+    MultimodalParams,
+)
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -899,30 +904,38 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
     Nothing rebuilds these tensors through the input processor any more, so the
     processor now restates the encoder's input layout on its own. A drift
     between the two would surface only as a crash during startup memory
-    estimation. Drive the encoder's real batching step instead of restating its
-    expectations here, so a change on either side fails this test.
+    estimation. Drive the encoder's real batching step (its encoder group, which
+    also checks the output rows against the item metadata) instead of restating
+    its expectations here, so a change on either side fails this test.
     """
     proc = _make_dummy_processor()
     budget = 8192
     tokens_per_image = proc.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["image"]
     num_images = min(8, budget // tokens_per_image)
-    image = proc.get_dummy_mm_data(
+    data = proc.get_dummy_mm_data(
         max_num_encoder_tokens=budget,
         mm_counts={"image": num_images},
         dtype=torch.float16,
-    )["image"]
-
-    # `_vision_forward` collects one entry per request and converts the sizes to
-    # tensors before batching; mirror that, then run the real batching step.
-    batched_pixel_values, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
-        pixel_values=[image["pixel_values"]],
-        image_sizes=[torch.tensor(image["image_sizes"])],
     )
 
-    num_images = image["pixel_values"].shape[0]
-    assert batched_pixel_values.shape[0] == num_images
-    assert batched_sizes.shape == (num_images, 2)
-    assert batched_pixel_values.dtype == torch.float16
+    encoder = _MistralCpuEncoder()
+
+    def tower(pixel_values, image_sizes):
+        encoder.calls.append((pixel_values, image_sizes))
+        # One row per 14x14 patch of each image, as the Pixtral tower returns them.
+        patches = sum((int(height) // 14) * (int(width) // 14) for height, width in image_sizes)
+        return pixel_values.new_zeros(1, patches, 1)
+
+    encoder._vision_tower = tower
+    # The projector merges each 2x2 block of patches into one row.
+    encoder._multi_modal_projector = lambda features, sizes: features.view(-1, 4, 1).sum(dim=1)
+    rows = encoder.encode_multimodal_inputs([MultimodalParams(multimodal_data=data)])
+
+    ((pixel_values, image_sizes),) = encoder.calls
+    assert pixel_values.shape[0] == num_images
+    assert pixel_values.dtype == torch.float16
+    assert image_sizes.shape == (num_images, 2)
+    assert rows.shape[0] == sum(data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY].output_embedding_lengths)
 
 
 # ---------------------------------------------------------------------------
@@ -998,3 +1011,181 @@ def test_text_only_native_checkpoint_reports_no_encoder_geometry() -> None:
     # The memory profiler treats `NotImplementedError` as "skip MM profiling".
     with pytest.raises(NotImplementedError):
         proc.get_dummy_mm_data(max_num_encoder_tokens=8192, mm_counts={"image": 1})
+
+
+def _legacy_mistral_batch_pixel_values(
+    pixel_values: List[torch.Tensor],
+    image_sizes: List[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy of `Mistral3VLM.batch_pixel_values`, the packing the removed `_vision_forward` used."""
+    # NOTES:
+    # * `pixel_values` is a list of `[B_idx, C, H_idx, W_idx]` tensors, i.e. a batch of images as
+    #   padded + batched by the input processor.
+    #   The height (H_idx) and width (W_idx) of each element need not coincide.
+    # * Similarly, each element in `image_sizes` describes the original image sizes prior to
+    #   padding for the corresponding element in `pixel_values`.
+
+    # The below creates a single `[sum(B_idx), 2]` tensor describing all image sizes, and then
+    # calculates the maximum height / width across all of them.
+    batched_image_sizes = torch.cat(image_sizes)
+    max_shape = batched_image_sizes.max(dim=0).values
+
+    # This next step then pads the pixel values potentially a second time by using the `max_shape`
+    # computed above. Note that as far as this function is concerned, the original sizes for
+    # batching purposes can be deduced from looking at the tensors in `pixel_values`, NOT in
+    # `image_sizes`.
+    pixel_values = [
+        torchvision.transforms.v2.functional.pad(
+            image,
+            # Per torchvision docs, this should be in LTRB order if it's a sequence of 4 numbers.
+            padding=[0, 0, max_shape[1] - image.shape[-1], max_shape[0] - image.shape[-2]],
+            # Values extracted from HF implementation.
+            fill=0.0,
+            padding_mode="constant",
+        )
+        for image in pixel_values
+    ]
+    return torch.cat(pixel_values), batched_image_sizes
+
+
+class _MistralCpuEncoder:
+    mm_encoder_groups = modeling_mistral.Mistral3VLM.mm_encoder_groups
+    encode_multimodal_inputs = modeling_mistral.Mistral3VLM.encode_multimodal_inputs
+    _get_image_features = modeling_mistral.Mistral3VLM._get_image_features
+    build_multimodal_encoder_input = modeling_mistral.Mistral3VLM.build_multimodal_encoder_input
+    get_multimodal_item_partitions = modeling_mistral.Mistral3VLM.get_multimodal_item_partitions
+
+    def __init__(self):
+        self.calls = []
+        self._vision_tower = self._tower
+        self._multi_modal_projector = lambda features, sizes: features * 2
+
+    def _tower(self, pixel_values, image_sizes):
+        self.calls.append((pixel_values.clone(), image_sizes.clone()))
+        return torch.cat(
+            [
+                image[:, :height, :width].flatten(1).T
+                for image, (height, width) in zip(pixel_values, image_sizes)
+            ]
+        ).unsqueeze(0)
+
+
+def _mistral_cpu_param(sizes, offset=0, sizes_as_tensor=False, dtype=torch.float32):
+    processor = _make_dummy_processor(patch_size=1, spatial_merge_size=1, image_size=4)
+    height, width = max(h for h, _ in sizes), max(w for _, w in sizes)
+    pixels = torch.arange(len(sizes) * 3 * height * width, dtype=torch.float32)
+    data = {
+        "image": {
+            "pixel_values": (pixels.reshape(len(sizes), 3, height, width) + offset).to(dtype),
+            "image_sizes": torch.tensor(sizes)
+            if sizes_as_tensor
+            else [list(size) for size in sizes],
+            "unused": "not an encoder input",
+        }
+    }
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata([], data)
+    return MultimodalParams(multimodal_data=data)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sizes_as_tensor", [False, True])
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        [[(2, 3)]],
+        [[(2, 3), (4, 2)], [(3, 4)]],
+        [[(2, 2)], [(4, 2)], [(2, 4)]],
+    ],
+)
+def test_mistral_encoder_group_matches_legacy_packing(sizes, sizes_as_tensor):
+    params = [
+        _mistral_cpu_param(shape, index * 1000, sizes_as_tensor)
+        for index, shape in enumerate(sizes)
+    ]
+    encoder = _MistralCpuEncoder()
+    actual = encoder.encode_multimodal_inputs(params)
+    pixels, image_sizes = _legacy_mistral_batch_pixel_values(
+        [param.multimodal_data["image"]["pixel_values"] for param in params],
+        [torch.tensor(param.multimodal_data["image"]["image_sizes"]) for param in params],
+    )
+    oracle = _MistralCpuEncoder()
+    expected = oracle._get_image_features(pixels, image_sizes)
+    assert len(encoder.calls) == 1
+    for batched, original in zip(encoder.calls[0], (pixels, image_sizes)):
+        assert torch.equal(batched, original)
+        assert batched.dtype == original.dtype
+        assert batched.device == original.device
+    assert torch.equal(actual, expected)
+    per_request = []
+    for param in params:
+        data = param.multimodal_data["image"]
+        per_request.append(oracle._get_image_features(data["pixel_values"], data["image_sizes"]))
+    assert torch.equal(actual, torch.cat(per_request))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("indices", [[0], [1], [1, 0]])
+@pytest.mark.parametrize("sizes_as_tensor", [False, True])
+def test_mistral_encoder_group_selected_items(indices, sizes_as_tensor):
+    param = _mistral_cpu_param([(2, 3), (4, 4)], sizes_as_tensor=sizes_as_tensor)
+    encoder = _MistralCpuEncoder()
+    selected = encoder.build_multimodal_encoder_input(param, indices, "image")
+    modeling_mistral.Mistral3VLM._apply_metadata_slice(selected, param, indices)
+    # The legacy selector crops request-wide padding before re-batching.
+    original = param.multimodal_data["image"]
+    miss_sizes = [list(map(int, original["image_sizes"][i])) for i in indices]
+    miss_pixel = original["pixel_values"][indices]
+    max_h = max(int(s[0]) for s in miss_sizes)
+    max_w = max(int(s[1]) for s in miss_sizes)
+    miss_pixel = miss_pixel[..., :max_h, :max_w]
+    pixels, sizes = _legacy_mistral_batch_pixel_values([miss_pixel], [torch.tensor(miss_sizes)])
+    expected = _MistralCpuEncoder()._get_image_features(pixels, sizes)
+    assert torch.equal(encoder.encode_multimodal_inputs([selected]), expected)
+    assert torch.equal(encoder.calls[0][0], pixels)
+    assert selected.item_metadata.output_embedding_lengths == tuple(
+        param.item_metadata.output_embedding_lengths[index] for index in indices
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("processor_cls", [MistralHFInputProcessor, MistralNativeInputProcessor])
+def test_mistral_dummy_has_group_metadata_and_encodes(processor_cls):
+    processor = _make_dummy_processor(
+        processor_cls=processor_cls, patch_size=1, spatial_merge_size=1, image_size=4
+    )
+    data = processor.get_dummy_mm_data(max_num_encoder_tokens=16, mm_counts={"image": 1})
+    metadata = data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    metadata.validate()
+    assert metadata.output_embedding_lengths == (16,)
+    assert metadata.input_partitions == {
+        "image": {
+            "pixel_values": MultimodalItemPartition(),
+            "image_sizes": MultimodalItemPartition(),
+        }
+    }
+    encoder = _MistralCpuEncoder()
+    actual = encoder.encode_multimodal_inputs([MultimodalParams(multimodal_data=data)])
+    assert actual.shape == (16, 3)
+    assert len(encoder.calls) == 1
+    assert encoder.calls[0][1].device.type == "cpu"
+    assert modeling_mistral.Mistral3VLM.multimodal_data_device_paths.fget(None) == [
+        "image.pixel_values",
+        "multimodal_embedding",
+    ]
+
+
+@pytest.mark.cpu_only
+def test_mistral_encoder_splits_dtypes_and_keeps_request_order():
+    params = [
+        _mistral_cpu_param([(2, 2)], 1000, dtype=torch.float64),
+        _mistral_cpu_param([(2, 3)], 2000),
+        _mistral_cpu_param([(3, 2)], 3000, dtype=torch.float64),
+    ]
+    encoder = _MistralCpuEncoder()
+    actual = encoder.encode_multimodal_inputs(params)
+    assert len(encoder.calls) == 2
+    assert [pixels.dtype for pixels, _ in encoder.calls] == [torch.float64, torch.float32]
+    expected = torch.cat(
+        [_MistralCpuEncoder().encode_multimodal_inputs([param]) for param in params]
+    )
+    assert torch.equal(actual, expected)
