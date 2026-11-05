@@ -71,13 +71,14 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
+from .modeling_multimodal_utils import VisionNormalization
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, _prepare_qwen_vl_vision_attn_metadata
 from .modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModelBase,
     Qwen3VLVisionMLP,
     Qwen3VLVisionPatchMerger,
-    _qwen3vl_build_batched_input,
+    _qwen3vl_vision_input,
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
@@ -455,7 +456,19 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
         _load_weights_impl(self, combined, allow_partial_loading=allow_partial_loading)
 
     @torch.inference_mode()
-    def encode_batched(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def encode_batched(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        vision_normalization: Optional[VisionNormalization] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode the batched Qwen3-VL payload keys; see `Qwen3VisionModelBase.encode_batched`."""
+        pixel_values, grid_thw = _qwen3vl_vision_input(
+            pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw, vision_normalization
+        )
         grid_cpu = _cpu_int_rows(grid_thw)
         hidden = self.visual(pixel_values, grid_thw, grid_cpu=grid_cpu)
         merged = merge_spatial_patches(hidden, grid_cpu, merge_size=self.spatial_merge_size)
@@ -464,13 +477,7 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
-        return (
-            EncoderGroup(
-                modalities=("image", "video"),
-                encoder_fn=self.encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
-            ),
-        )
+        return (EncoderGroup(modalities=("image", "video"), encoder_fn=self.encode_batched),)
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]

@@ -2274,6 +2274,7 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
 
 _QWEN_VISION_BATCHED_FIELD = MultimodalItemPartition()
+_QWEN_VISION_SHARED_FIELD = MultimodalItemPartition(item_axis=None)
 
 
 def _qwen_vision_item_partitions(
@@ -2313,7 +2314,30 @@ def _qwen_vision_input_partitions(
         pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
         grid_key: _QWEN_VISION_BATCHED_FIELD,
         "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+        # Raw uint8 pixels carry the processor's normalization record.
+        "vision_normalization": _QWEN_VISION_SHARED_FIELD,
     }
+
+
+def _concat_qwen_vision_inputs(
+    pixel_values: Optional[torch.Tensor],
+    image_grid_thw: Optional[torch.Tensor],
+    pixel_values_videos: Optional[torch.Tensor],
+    video_grid_thw: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate one call's image and video patch rows, image rows first.
+
+    The ViT tells items apart only by their grid rows, so image and video
+    items share one call. The encoder group has already batched each payload
+    key across requests.
+    """
+    pixels = [p for p in (pixel_values, pixel_values_videos) if p is not None]
+    grids = [g for g in (image_grid_thw, video_grid_thw) if g is not None]
+    if not pixels or len(pixels) != len(grids):
+        raise ValueError("Qwen vision inputs need patch rows and their grids")
+    if len(pixels) == 1:
+        return pixels[0], grids[0]
+    return torch.cat(pixels), torch.cat(grids)
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
