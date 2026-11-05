@@ -16,9 +16,10 @@ def scale_and_soft_cap_logits(logits: torch.Tensor, multiplier: float,
                               soft_cap: Optional[float]) -> torch.Tensor:
     """Return `soft_cap * tanh(logits * multiplier / soft_cap)` in FP32.
 
-    The logit epilogue of models that scale and soft-cap their LM head output.
-    Works in place when `logits` is already FP32, so pass a tensor the caller
-    owns; a `soft_cap` of None skips the cap.
+    The logit epilogue of models that scale and soft-cap their LM head output,
+    shared with the DFlash drafters trained on it. Works in place when `logits`
+    is already FP32, so pass a tensor the caller owns; a `soft_cap` of None
+    skips the cap.
     """
     logits = logits.float()
     if multiplier != 1.0:

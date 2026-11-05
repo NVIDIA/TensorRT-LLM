@@ -2338,12 +2338,15 @@ class K3DecodeKDA(KimiKDALinearAttention):
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
         replay_slot_indices: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'.
 
         ``replay_slot_indices`` are the requests' slots in the replay caches (``slot_indices`` when ``None``). The
         decode kernels address the replay caches by the state slot, so the cache manager keeps the per-token states
-        in the recurrent-state slot (see ``KDAReplayState.replay_shares_state_slot``)."""
+        in the recurrent-state slot (see ``KDAReplayState.replay_shares_state_slot``). ``prequantized_input`` (the
+        MXFP8 form of ``x2d``) goes to the built-in verify; the decode kernels read ``x2d``.
+        """
         if not (self._has_kda_replay_caches(layer_cache) and layer_cache.kda_state_tok is not None):
             return super().forward_verify(
                 x2d,
@@ -2354,6 +2357,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
                 slot_indices,
                 output=output,
                 replay_slot_indices=replay_slot_indices,
+                prequantized_input=prequantized_input,
             )
         assert self.takes_k3_kernels and self.k3_buffers is not None, (
             f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "

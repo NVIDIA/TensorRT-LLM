@@ -37,7 +37,11 @@ REPLAY_WORK_ITEM_WIDTH = 5
 _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
 
 
-@triton.jit
+# Neither the decode count nor the alignment of the decode slice (it starts
+# after the step's context requests) is specialized: a mixed step would
+# otherwise reach a new variant, and compile it, while serving.
+@triton.jit(do_not_specialize=["num_decodes"],
+            do_not_specialize_on_alignment=["state_indices"])
 def _prepare_gdn_replay_work_items_kernel(
     state_indices,
     replay_indices,
@@ -96,14 +100,19 @@ def _build_replay_work_items_triton(state_indices,
                                     replay_indices=None):
     """Single-launch build of the write-first replay partition.
 
-    Interchangeable with :func:`_build_replay_work_items_torch`; the caller
-    picks between them. Kept to one CTA because the write-first offsets come
-    from an in-block ``tl.cumsum``. PNAT and the active buffer are read at
-    ``replay_indices``, which default to ``state_indices``.
+    Interchangeable with :func:`_build_replay_work_items_torch` for up to
+    ``_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE`` decodes; the caller picks
+    between them. Kept to one CTA because the write-first offsets come from an
+    in-block ``tl.cumsum``. The block always spans the largest batch and the
+    kernel specializes neither on the decode count nor on the alignment of
+    ``state_indices``, so one compiled kernel serves every batch and offset.
+    PNAT and the active buffer are read at ``replay_indices``, which default
+    to ``state_indices``.
     """
     if replay_indices is None:
         replay_indices = state_indices
     num_decodes = state_indices.shape[0]
+    assert num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
     _prepare_gdn_replay_work_items_kernel[(1, )](
         state_indices,
         replay_indices,
@@ -122,7 +131,7 @@ def _build_replay_work_items_triton(state_indices,
         pnat_field=REPLAY_WORK_PNAT,
         cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
         replay_slot_field=REPLAY_WORK_REPLAY_SLOT,
-        BLOCK_SIZE=triton.next_power_of_2(num_decodes),
+        BLOCK_SIZE=_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE,
         num_warps=4,
     )
 
@@ -524,8 +533,9 @@ class Mamba2Metadata:
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
 
-        if (use_gdn_all_layer_commit
-                and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):
+        if (num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
+                and prev_num_accepted_tokens.is_contiguous()
+                and cache_buf_idx.is_contiguous()):
             build_work_items = _build_replay_work_items_triton
         else:
             build_work_items = _build_replay_work_items_torch

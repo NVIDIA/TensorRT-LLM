@@ -116,6 +116,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         output: torch.Tensor | None = None,
         allow_prequantized_output: bool = False,
         replay_slot_indices: torch.Tensor | None = None,
+        prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
         captured["replay_slot_indices"] = replay_slot_indices
