@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.agent_team import workflow as _agent_team_workflow_module
+from agent_flow.workflows.agent_team.state import STATE_FILENAME
 from agent_flow.workflows.modeling_bringup import cli as _modeling_bringup_cli_module
 from agent_flow.workflows.modeling_bringup import task_schema as _task_schema
 
@@ -921,6 +922,101 @@ def test_modeling_bringup_cli_includes_slurm_prompts_with_slurm_environment(tmp_
     assert "Slurm container bootstrap" in captured["prompts"].coder
     assert "test_command.md" in captured["prompts"].coder
     assert "slurm_partition" in captured["prompts"].plan_drafter
+
+
+def _resumable_workspace(tmp_path, checkpointed_payload) -> Path:
+    """Return a workspace that holds a checkpoint and a different task copy."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    (workspace / STATE_FILENAME).write_text("{}", encoding="utf-8")
+    (workspace / "task.yaml").write_text(
+        yaml.safe_dump(checkpointed_payload, sort_keys=False), encoding="utf-8"
+    )
+    return workspace
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_modeling_bringup_cli_resumes_from_the_checkpointed_task(tmp_path, monkeypatch, clean):
+    """A resumed run takes its prompt switches from the checkpointed task.
+
+    agent_team keeps reading `<workspace>/task.yaml` on resume and ignores a
+    different `--task`; only `--clean`, which starts over, follows `--task`.
+    """
+    from agent_flow.git_worktree import GitWorktreeIsolation
+
+    payload = _valid_task_payload(tmp_path)
+    task_path = _write_task_yaml(tmp_path, payload)
+    slurm_environment = {"slurm_partition": "gb200", "docker_image": "/containers/trtllm.sqsh"}
+    workspace = _resumable_workspace(tmp_path, {**payload, "slurm-environment": slurm_environment})
+    argv = ["--task", str(task_path), "--workspace", str(workspace)]
+    if clean:
+        argv.append("--clean")
+    captured = {}
+
+    async def fake_clean(self):
+        pass
+
+    def fake_team_main(forwarded_argv, *, prompts):
+        captured["argv"] = forwarded_argv
+        captured["prompts"] = prompts
+
+    monkeypatch.setattr(GitWorktreeIsolation, "clean", fake_clean)
+    monkeypatch.setattr(_modeling_bringup_cli_module, "_team_main", fake_team_main)
+
+    _modeling_bringup_cli_module.main(argv)
+
+    assert captured["argv"] == argv
+    assert ("Slurm container bootstrap" in captured["prompts"].coder) is (not clean)
+
+
+def test_modeling_bringup_cli_isolates_the_checkpointed_repo_on_resume(tmp_path, monkeypatch):
+    """A resumed `--concurrent` run builds node worktrees from the checkpointed task's repo."""
+    from agent_flow.git_worktree import GitWorktreeIsolation
+
+    payload = _valid_task_payload(tmp_path)
+    task_path = _write_task_yaml(tmp_path, payload)
+    checkpointed_repo = tmp_path / "checkpointed-repo"
+    checkpointed_repo.mkdir()
+    workspace = _resumable_workspace(
+        tmp_path, {**payload, "trtllm_repo_path": str(checkpointed_repo)}
+    )
+    captured = {}
+    monkeypatch.setattr(
+        _modeling_bringup_cli_module, "_team_main", lambda argv, **kwargs: captured.update(kwargs)
+    )
+
+    _modeling_bringup_cli_module.main(
+        ["--task", str(task_path), "--workspace", str(workspace), "--concurrent"]
+    )
+
+    assert isinstance(captured["isolation"], GitWorktreeIsolation)
+    assert captured["isolation"].repo_path == checkpointed_repo
+
+
+def test_modeling_bringup_cli_clean_resets_the_repo_named_by_task_flag(tmp_path, monkeypatch):
+    """`--clean` starts over from `--task`, so it resets that task's repo."""
+    from agent_flow.git_worktree import GitWorktreeIsolation
+
+    payload = _valid_task_payload(tmp_path)
+    task_path = _write_task_yaml(tmp_path, payload)
+    checkpointed_repo = tmp_path / "checkpointed-repo"
+    checkpointed_repo.mkdir()
+    workspace = _resumable_workspace(
+        tmp_path, {**payload, "trtllm_repo_path": str(checkpointed_repo)}
+    )
+    cleaned = []
+
+    async def fake_clean(self):
+        cleaned.append(self.repo_path)
+
+    monkeypatch.setattr(GitWorktreeIsolation, "clean", fake_clean)
+    monkeypatch.setattr(_modeling_bringup_cli_module, "_team_main", lambda argv, **kwargs: None)
+
+    _modeling_bringup_cli_module.main(
+        ["--task", str(task_path), "--workspace", str(workspace), "--clean"]
+    )
+
+    assert cleaned == [Path(payload["trtllm_repo_path"])]
 
 
 def test_task_schema_accepts_valid_payload(tmp_path):
