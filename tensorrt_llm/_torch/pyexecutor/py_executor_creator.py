@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.dwdp.dense.manager import (
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -377,7 +377,7 @@ def _enforce_overlap_spec_kv_correction(attn_backend: str,
         f"speculation. Setting {ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR}=1 "
         "downgrades this refusal to a warning, for experimentation only: the "
         "outputs are known to be corrupted.")
-    if os.environ.get(ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR, "0") == "1":
+    if get_env_flag(ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR, False):
         logger.warning_once(message, key="uncorrected_overlap_spec")
         return
     raise ValueError(message)
@@ -637,7 +637,7 @@ def _create_py_executor(
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
-    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    skip_est = get_env_flag("TRTLLM_SKIP_KV_CACHE_ESTIMATION", False)
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
                        creation_metrics):
         llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
@@ -793,7 +793,7 @@ def _create_py_executor(
     # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
     if (mapping.has_cp_helix()
             and not is_disagg_enabled(cache_transceiver_config)
-            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
+            and not get_env_flag("TRTLLM_HELIX_AGG_EXPERIMENTAL", False)):
         raise NotImplementedError(
             "Helix context parallelism is supported only on disaggregated "
             "generation servers; aggregated serving with Helix is not "
@@ -1284,7 +1284,7 @@ def _create_py_executor(
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
             # no effect in disagg. The disagg manager choice is driven by
             # get_kv_cache_manager_cls and cache_transceiver_config.
-            if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
+            if get_env_flag("TRTLLM_USE_PY_MAMBA", False):
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
                     "configure transceiver_runtime='PYTHON' with backend='NIXL' "

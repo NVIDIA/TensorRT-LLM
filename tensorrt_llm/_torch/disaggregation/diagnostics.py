@@ -42,6 +42,8 @@ import uuid
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator, Optional, TypeAlias
 
+from tensorrt_llm._utils import get_env_flag
+
 if TYPE_CHECKING:
     from tensorrt_llm import DisaggregatedParams
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -59,7 +61,7 @@ _DIAGNOSTIC_SHUTDOWN_TIMEOUT_S = 1.0
 
 # Read once so the disabled path is a single caller-side branch. Tests may
 # monkeypatch this module attribute without reloading importers.
-DISAGG_TRANSFER_DIAGNOSTICS_ENABLED = os.getenv(_DIAGNOSTICS_ENV) == "1"
+DISAGG_TRANSFER_DIAGNOSTICS_ENABLED = get_env_flag(_DIAGNOSTICS_ENV, False)
 
 DiagnosticValue: TypeAlias = str | int | float | bool | None
 DiagnosticRecord: TypeAlias = dict[str, DiagnosticValue]

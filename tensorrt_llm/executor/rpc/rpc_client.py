@@ -3,7 +3,6 @@
 
 import asyncio
 import concurrent.futures
-import os
 import threading
 import time
 import uuid
@@ -12,8 +11,8 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 import zmq
 
-from tensorrt_llm._utils import (customized_gc_thresholds, nvtx_mark_debug,
-                                 nvtx_range_debug)
+from tensorrt_llm._utils import (customized_gc_thresholds, get_env_flag,
+                                 nvtx_mark_debug, nvtx_range_debug)
 
 from ...llmapi.utils import (AsyncQueue, _SyncQueue, enable_llmapi_debug,
                              logger_debug)
@@ -103,7 +102,7 @@ class RPCClient:
         self._timeout = timeout
 
         # Check if PAIR mode is enabled via environment variable
-        use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
+        use_pair_mode = get_env_flag('TLLM_LLMAPI_ZMQ_PAIR', False)
         socket_type = zmq.PAIR if use_pair_mode else zmq.DEALER
 
         if use_pair_mode:

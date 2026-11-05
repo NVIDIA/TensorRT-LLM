@@ -13,12 +13,12 @@ kernels only), whose warmup and persistence fix is tracked with that kernel libr
 on-disk AOT cache, whose post-warmup "[aot_cache] Saved" lines are its own signal.
 """
 
-import os
 from typing import Any
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
-_ENABLED = os.environ.get("TRTLLM_LATE_COMPILE_DETECT", "1") != "0"
+_ENABLED = get_env_flag("TRTLLM_LATE_COMPILE_DETECT", True)
 _ready = [False]
 
 

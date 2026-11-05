@@ -37,7 +37,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm._utils import EnergyMonitor, get_env_flag
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -886,8 +886,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                                   cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
-                                                  "0") == "1"
+        self.app.state.trust_kv_hints = get_env_flag("TRTLLM_TRUST_KV_HINTS",
+                                                     False)
         self.app.router.route_class = _MsgspecRoute
 
         @self.app.exception_handler(RequestValidationError)
@@ -1015,7 +1015,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
-        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
+        disable_harmony = get_env_flag("DISABLE_HARMONY_ADAPTER", False)
         if disable_harmony or self.model_config is None:
             self.use_harmony = False
         else:

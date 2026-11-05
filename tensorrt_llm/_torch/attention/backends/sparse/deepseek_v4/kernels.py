@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._utils import get_env_flag
 
 ########################################################
 # Index gather kernel
@@ -345,7 +345,7 @@ def deepseek_v4_local_to_global_indices(
     swa_indices_stride0, swa_indices_stride1 = swa_local_indices_c.stride()
     compressed_indices_stride0, compressed_indices_stride1 = compressed_local_indices_c.stride()
     out_stride0, out_stride1 = out.stride()
-    launch_with_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    launch_with_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
 
     # The tile counter and the bmm scales are written together or not at all; a
     # partial set would leave FMHA reading uninitialized scales.

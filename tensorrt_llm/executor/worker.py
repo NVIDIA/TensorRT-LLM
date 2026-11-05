@@ -28,7 +28,7 @@ import zmq
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from .._utils import get_env_flag, mpi_comm, mpi_rank, print_all_stacks
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -617,7 +617,7 @@ def worker_main(
         return
 
     # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
+    if get_env_flag("TRTLLM_WORKER_DISABLE_GC", False):
         gc.disable()
         # With automatic GC off, dynamo's post-compile gc.collect(1) walks every
         # object allocated since the previous compile (seconds per recompile).

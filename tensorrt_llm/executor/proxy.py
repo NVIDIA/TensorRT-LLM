@@ -34,7 +34,8 @@ import zmq.asyncio
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm.logger import logger
 
-from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from .._utils import (customized_gc_thresholds, get_env_flag, mpi_rank,
+                      nvtx_range_debug)
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient,
                                   validate_session_world_size)
@@ -218,7 +219,7 @@ class _RequestSender:
 def _create_request_sender(request_queue: IpcQueue,
                            error_queue: Queue) -> Optional[_RequestSender]:
     """Return a batching request sender if TRTLLM_PROXY_BATCH_REQUESTS=1."""
-    if os.getenv("TRTLLM_PROXY_BATCH_REQUESTS", "0") != "1":
+    if not get_env_flag("TRTLLM_PROXY_BATCH_REQUESTS", False):
         return None
     return _RequestSender(request_queue, error_queue)
 

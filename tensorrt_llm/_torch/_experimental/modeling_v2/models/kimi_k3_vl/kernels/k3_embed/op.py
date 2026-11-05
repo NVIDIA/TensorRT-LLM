@@ -19,11 +19,12 @@ Compiled on the first call for its shape, which must happen outside CUDA-graph c
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Dict
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 MAX_TOKENS = 64
 
@@ -73,7 +74,7 @@ def k3_embed(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
         _arg(table.view(-1).view(torch.int32)),
         _arg(out.view(-1).view(torch.int32)),
     )
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    use_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(ids.device).cuda_stream)
     key = (n, hidden // 8, ids.dtype, use_pdl)
     fn = _compiled.get(key)
@@ -155,7 +156,7 @@ def k3_embed_norm(
     args = (_plain_arg(ids, ids.element_size()),) + tuple(
         _plain_arg(t) for t in (table, weight, raw, out)
     )
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    use_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(ids.device).cuda_stream)
     key = ("norm", n, vocab, hidden, ids.dtype, use_pdl)
     fn = _compiled.get(key)

@@ -31,6 +31,7 @@ from huggingface_hub import snapshot_download
 from pydantic import BaseModel
 from tqdm.auto import tqdm
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import Singleton, logger
 
 
@@ -365,7 +366,7 @@ def enable_llm_debug() -> bool:
     ''' Tell whether to enable the debug mode for LLM class.  '''
     global _enable_llm_debug_
     if _enable_llm_debug_ is None:
-        _enable_llm_debug_ = os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
+        _enable_llm_debug_ = get_env_flag("TLLM_LLM_ENABLE_DEBUG", False)
     return _enable_llm_debug_
 
 
@@ -375,15 +376,14 @@ _enable_llmapi_debug_ = None
 def enable_llmapi_debug() -> bool:
     global _enable_llmapi_debug_
     if _enable_llmapi_debug_ is None:
-        _enable_llmapi_debug_ = os.environ.get("TLLM_LLMAPI_ENABLE_DEBUG",
-                                               "0") == "1"
+        _enable_llmapi_debug_ = get_env_flag("TLLM_LLMAPI_ENABLE_DEBUG", False)
     return _enable_llmapi_debug_
 
 
 def enable_worker_single_process_for_tp1() -> bool:
     ''' Tell whether to make worker use single process for TP1.
     This is helpful for return-logits performance and debugging. '''
-    return os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS", "0") == "1"
+    return get_env_flag("TLLM_WORKER_USE_SINGLE_PROCESS", False)
 
 
 class AsyncQueue:

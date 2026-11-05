@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import math
-import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields, replace
@@ -38,7 +37,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     get_pp_layers,
 )
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_env_flag, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -250,7 +249,7 @@ def use_py_mamba_cache_manager() -> bool:
     Disagg mode is unaffected — its compatibility routing selects Mixed or
     Cpp based on the transceiver configuration.
     """
-    return os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1"
+    return get_env_flag("TRTLLM_USE_PY_MAMBA", False)
 
 
 class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):

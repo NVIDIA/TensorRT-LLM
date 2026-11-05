@@ -27,7 +27,7 @@ import torch
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
-from tensorrt_llm._utils import is_sm_120f
+from tensorrt_llm._utils import get_env_flag, is_sm_120f
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -90,9 +90,7 @@ class DeepEPLowLatency(Communication):
             use_low_precision_combine and self.supports_low_precision_combine()
         )
         # Read from environment variable, same as wideEP
-        self.enable_postquant_alltoall = (
-            os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
-        )
+        self.enable_postquant_alltoall = get_env_flag("TRTLLM_MOE_POST_QUANT_ALLTOALLV", True)
 
         # Calculate deep_ep_max_num_tokens
         assert moe_max_num_tokens is not None

@@ -3,13 +3,14 @@
 """Validate caller controls against the active Jinja chat template."""
 
 import hashlib
-import os
 from collections.abc import Collection
 from functools import lru_cache
 
 import jinja2
 import jinja2.ext
 import jinja2.nodes
+
+from tensorrt_llm._utils import get_env_flag
 
 from ..logger import logger
 
@@ -157,7 +158,7 @@ def validate_chat_template_kwargs(
     if not unknown:
         return
     if strict is None:
-        strict = os.getenv(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, "0") != "1"
+        strict = not get_env_flag(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, False)
     if strict:
         raise UnusedChatTemplateKwargsError(
             f"chat_template_kwargs {unknown} are not referenced by the active chat template. "

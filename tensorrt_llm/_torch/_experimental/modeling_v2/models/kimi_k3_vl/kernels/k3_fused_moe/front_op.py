@@ -24,11 +24,12 @@ must happen outside CUDA-graph capture.
 from __future__ import annotations
 
 import functools
-import os
 import threading
 from typing import Dict, Optional, Tuple
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 TOP_K = 16
 HIDDEN_SIZE = 3584
@@ -189,7 +190,7 @@ def k3_moe_front(
     head_half = half is not None
     ht, st, clusters = half if head_half else kernel.geometry(ag_world, shared_cols, capacity)
     publish = ag_ready is not None
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    use_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (
         device.index if device.index is not None else torch.cuda.current_device(),
