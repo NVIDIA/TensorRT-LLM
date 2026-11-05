@@ -436,3 +436,9 @@ l0_cpu:
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
+  # TRTLLM-15161 CPU migration: files outside the directory entries above.
+  - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py
+  - unittest/_torch/modeling_v2/models/gpt_oss/test_modeling_v2_weight_table.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_drift.py
+  - unittest/_torch/models/test_qwen3next_moe_allreduce_guard.py
+  - unittest/_torch/visual_gen/test_cosmos3_example_prompts.py

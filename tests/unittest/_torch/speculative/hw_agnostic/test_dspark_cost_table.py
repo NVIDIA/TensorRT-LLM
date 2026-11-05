@@ -19,6 +19,8 @@ from tensorrt_llm._torch.speculative.dspark_planner import (
 )
 from tensorrt_llm._torch.speculative.dspark_schedule import compute_survival
 
+pytestmark = pytest.mark.cpu_only
+
 SETUP = CostTableSetup(
     gpu="NVIDIA B300",
     world_size=8,

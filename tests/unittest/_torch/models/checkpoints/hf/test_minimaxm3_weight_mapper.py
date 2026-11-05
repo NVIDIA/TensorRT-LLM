@@ -34,6 +34,8 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+pytestmark = pytest.mark.cpu_only
+
 _NUM_KV_HEADS = 4
 _ROWS_PER_HEAD = 2
 
