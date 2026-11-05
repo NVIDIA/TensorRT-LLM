@@ -35,11 +35,12 @@ mkdir -p "$OUT"
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null' EXIT
 sleep 3
-# mode : the check that must fail (stream checks or call checks)
+# mode : the checks that must fail, exactly: the fault's check and its declared consequences
+# (references/acceptance-cases.md sections 0 and 1); nothing else may fail
 EXPECT="ok:-
 drop_part_done:unpaired_content_part
 snapshot_text_differs:item_content_differs
-delta_differs:delta_done_mismatch
+delta_differs:delta_done_mismatch,done_item_mismatch
 no_terminal:no_terminal_event
 custom_as_function:type_mismatch
 two_calls:ptc_violation
@@ -59,8 +60,8 @@ failed = set()
 for kind in ("stream", "calls"):
     report = json.load(open(f"{out}/{mode}.{kind}.json"))
     failed |= {k for k, v in report["verdicts"].items() if v == "FAIL"}
-expected = set() if want == "-" else {want}
-ok = expected <= failed and (want != "-" or not failed)
+expected = set() if want == "-" else set(want.split(","))
+ok = failed == expected
 print(f"{'OK ' if ok else 'BAD'} {mode:22s} expected={sorted(expected)} failed={sorted(failed)}")
 sys.exit(0 if ok else 1)
 PY
