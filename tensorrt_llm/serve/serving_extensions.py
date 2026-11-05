@@ -30,11 +30,37 @@ the registry is populated wherever it is consulted (``openai_protocol`` reaches
 it from ``to_sampling_params`` without going through ``openai_server``). The
 import is deferred to call time because the built-ins import
 ``openai_protocol``, which imports this module.
+
+Two token-level hooks, :meth:`ServingExtension.extra_stop_token_ids` and
+:meth:`ServingExtension.unsupported_features`, let a model whose output is
+consumed as raw tokens (gpt-oss) declare the stop tokens every request needs
+and the request features its serving path does not provide. The chat handler
+reads them, together with ``render_prompt`` and ``output_mode``, through
+``RenderResources.harmony_hooks``, which answers with the generic defaults when
+the harmony switch is off.
+
+``cli_aliases`` only extend the ``--tool_parser`` / ``--reasoning_parser``
+choices of ``trtllm-serve`` and the startup checks of those options. An alias
+stands for the model types it is registered with and never selects an
+extension: lookups stay keyed by model type.
 """
 
 import enum
 import importlib
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
+from types import MappingProxyType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
@@ -50,6 +76,55 @@ class OutputMode(enum.Enum):
     TEXT = "text"
     # Raw token ids go through the Harmony adapter (gpt-oss).
     HARMONY_TOKENS = "harmony_tokens"
+
+
+class UnsupportedFeature(str, enum.Enum):
+    """Request features a model's serving path does not provide.
+
+    Returned by :meth:`ServingExtension.unsupported_features`; the chat handler
+    checks the rejected ones in the order of :data:`UNSUPPORTED_FEATURE_ORDER`.
+    The members are strings, so a declared set matches whether it holds members
+    or their values.
+    """
+
+    # ``tool_choice={"type": "function", ...}``: rejected.
+    NAMED_TOOL_CHOICE = "named_tool_choice"
+    # ``thinking_token_budget`` set: rejected.
+    THINKING_TOKEN_BUDGET = "thinking_token_budget"
+    # ``logprobs`` with ``top_logprobs > 0``: rejected; ``logprobs`` alone is
+    # accepted and not requested from the engine.
+    TOP_LOGPROBS = "top_logprobs"
+    # Per-request speculative-decoding stats: not opted in, never rejected.
+    SPEC_DECODE_STATS = "spec_decode_stats"
+
+
+# The order the harmony chat path has always rejected them in: the named
+# tool_choice before rendering, top_logprobs while the sampling parameters are
+# built, the thinking budget right after them.
+UNSUPPORTED_FEATURE_ORDER: Tuple[UnsupportedFeature, ...] = (
+    UnsupportedFeature.NAMED_TOOL_CHOICE,
+    UnsupportedFeature.TOP_LOGPROBS,
+    UnsupportedFeature.THINKING_TOKEN_BUDGET,
+)
+
+# One rejection message per rejected feature, as the harmony chat path has
+# always worded them. They name gpt-oss because it is the only model that
+# declares these features; a second model that declares one generalizes them.
+UNSUPPORTED_FEATURE_MESSAGES: Mapping[str, str] = MappingProxyType(
+    {
+        UnsupportedFeature.NAMED_TOOL_CHOICE: (
+            "tool_choice with a named function is not yet supported for harmony / GPT-OSS "
+            "models. Tracking follow-up: harmony sub-task of TRTLLM-12758."
+        ),
+        UnsupportedFeature.THINKING_TOKEN_BUDGET: (
+            "thinking_token_budget is not supported by the Harmony GPT-OSS serving path; "
+            "use reasoning_effort instead"
+        ),
+        UnsupportedFeature.TOP_LOGPROBS: (
+            "`gather_generation_logits` must be `True` to use `top_logprobs`"
+        ),
+    }
+)
 
 
 class ServingExtension:
@@ -139,9 +214,26 @@ class ServingExtension:
         """
         return None
 
+    def extra_stop_token_ids(self) -> List[int]:
+        """Stop token ids this model needs on every request.
+
+        The chat handler appends them to ``request.stop_token_ids``. Default:
+        none, as on the generic path.
+        """
+        return []
+
+    def unsupported_features(self) -> FrozenSet[str]:
+        """:class:`UnsupportedFeature` values this model's serving path does not provide.
+
+        Default: none, as on the generic path.
+        """
+        return frozenset()
+
 
 _BY_MODEL_TYPE: Dict[str, ServingExtension] = {}
 _BY_REASONING_PARSER: Dict[str, ServingExtension] = {}
+# CLI alias -> the model types it stands for. Aliases never select an extension.
+_CLI_ALIASES: Dict[str, Tuple[str, ...]] = {}
 _BUILTINS_PACKAGE = "tensorrt_llm.serve.extensions"
 _builtins_loaded = False
 
@@ -163,9 +255,16 @@ _load_builtin_extensions = load_builtin_extensions
 
 
 def register_serving_extension(
-    *, model_types: Iterable[str] = (), reasoning_parsers: Iterable[str] = ()
+    *,
+    model_types: Iterable[str] = (),
+    reasoning_parsers: Iterable[str] = (),
+    cli_aliases: Iterable[str] = (),
 ):
     """Class decorator registering one instance under the given keys.
+
+    ``cli_aliases`` are accepted as ``--tool_parser`` / ``--reasoning_parser``
+    values of ``trtllm-serve`` for the model types of this extension; they do
+    not register the extension under another lookup key.
 
     Example::
 
@@ -179,6 +278,8 @@ def register_serving_extension(
             _BY_MODEL_TYPE[key] = instance
         for key in reasoning_parsers:
             _BY_REASONING_PARSER[key] = instance
+        for alias in cli_aliases:
+            _CLI_ALIASES[alias] = tuple(model_types)
         return cls
 
     return decorator
@@ -220,3 +321,34 @@ def required_tool_choice_mode(model_type: Optional[str]) -> Optional[RequiredToo
     _load_builtin_extensions()
     extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
     return None if extension is None else extension.required_tool_choice_mode()
+
+
+def serving_extension_cli_aliases() -> List[str]:
+    """Sorted CLI aliases of the registered extensions.
+
+    ``trtllm-serve`` adds them to the ``--tool_parser`` and ``--reasoning_parser``
+    choices. Loads the built-in extensions.
+    """
+    _load_builtin_extensions()
+    return sorted(_CLI_ALIASES)
+
+
+def cli_alias_model_types(alias: str) -> Tuple[str, ...]:
+    """Model types ``alias`` stands for; ``()`` for a name that is not an alias."""
+    _load_builtin_extensions()
+    return _CLI_ALIASES.get(alias, ())
+
+
+def split_cli_parser_alias(name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Split a ``--tool_parser`` / ``--reasoning_parser`` value into (parser name, alias).
+
+    ``("qwen3", None)`` for a parser name, ``(None, "gpt_oss")`` for an alias
+    and ``(None, None)`` for ``None``. The alias must not reach the parser
+    registries or ``LlmArgs.reasoning_parser``, which would treat it as a
+    parser name.
+    """
+    if name is None:
+        return None, None
+    if cli_alias_model_types(name):
+        return None, name
+    return name, None
