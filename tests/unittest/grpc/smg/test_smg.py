@@ -129,7 +129,10 @@ class TestSamplingParamsConversion:
         assert params.top_p == 0.9
 
     def test_omitted_max_tokens_defers_to_engine_default(self) -> None:
-        """An omitted max_tokens maps to None, the engine's unset sentinel."""
+        """An omitted max_tokens maps to None, the engine's unset sentinel.
+
+        An explicit positive max_tokens is passed through unchanged.
+        """
         request = pb2.GenerateRequest(
             request_id="test-no-max-tokens",
             tokenized=pb2.TokenizedInput(input_token_ids=[1, 2, 3]),
@@ -148,6 +151,14 @@ class TestSamplingParamsConversion:
             output_config=request.output_config,
         )
         assert params.max_tokens is None
+
+        request.max_tokens = 16
+        params = create_sampling_params_from_proto(
+            proto_config=request.sampling_config,
+            output_config=request.output_config,
+            max_tokens=request.max_tokens,
+        )
+        assert params.max_tokens == 16
 
     def test_beam_search_config(self):
         """Test beam search configuration."""
