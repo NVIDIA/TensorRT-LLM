@@ -38,7 +38,7 @@ from tensorrt_llm.executor.request import (
     StartProfileRequest,
     StopProfileRequest,
 )
-from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.utils import EngineDeadError, RequestError
 from tensorrt_llm.executor.worker import _dispatch_requests
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -156,18 +156,14 @@ def bare_proxy():
     # handlers reject control once ``pre_shutdown()`` flips it.
     proxy.doing_shutdown = False
     proxy.workers_started = False
+    proxy._engine_dead = False
+    proxy._fatal_error = None
     proxy.request_queue = MagicMock()
     # The fix introduces a ``profile_ack_queue`` attribute. Pre-fix this
     # attribute does not exist; we stub it as MagicMock so old code paths
     # accessing it via getattr() see a sentinel.
     proxy.profile_ack_queue = MagicMock()
     proxy.profile_ack_queue.address = ("unused-profile-ack", b"k" * 32)
-    delivered = queue.Queue()
-
-    class AckGet(MagicMock):
-        def _execute_mock_call(self, *args, **kwargs):
-            delivered.get(timeout=5)
-            return super()._execute_mock_call(*args, **kwargs)
 
     class Commands:
         socket = SimpleNamespace(setsockopt=lambda *args: None)
@@ -176,12 +172,10 @@ def bare_proxy():
             if message is not None:
                 for payload in message:
                     proxy.request_queue.put(pickle.loads(payload))
-                delivered.put(True)
 
         def close(self):
             pass
 
-    proxy.profile_ack_queue.get = AckGet()
     proxy._request_sender = _RequestSender(Commands(), queue.Queue(), batching=False)
     proxy._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="proxy_profile_control"
@@ -234,7 +228,7 @@ def test_stop_profile_blocks_until_worker_acks(bare_proxy):
     def blocking_get(timeout=None):
         # Wait for the worker thread to finish, then return the ack.
         if not ack_event.wait(timeout=timeout):
-            raise TimeoutError("ack not received within timeout")
+            raise queue.Empty()
         return ("stop", None)
 
     proxy.profile_ack_queue.get.side_effect = blocking_get
@@ -276,7 +270,7 @@ def test_start_profile_blocks_until_worker_acks(bare_proxy, tmp_path):
 
     def blocking_get(timeout=None):
         if not ack_event.wait(timeout=timeout):
-            raise TimeoutError("ack not received within timeout")
+            raise queue.Empty()
         return ("start", None)  # ("status", optional_error_message)
 
     proxy.profile_ack_queue.get.side_effect = blocking_get
@@ -367,7 +361,7 @@ def test_profile_control_during_pre_shutdown_raises_runtime_error(bare_proxy, ki
     proxy.profile_ack_queue.get.assert_not_called()
 
 
-def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
+def test_stop_profile_timeout_warns_does_not_hang(bare_proxy, monkeypatch):
     """Timeout produces a warning rather than wedging the event loop.
 
     If the worker is stuck (no ack within the timeout), the proxy
@@ -379,8 +373,10 @@ def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
     real ``except Empty`` branch in ``_wait_profile_ack``.
     """
     proxy = bare_proxy
+    monkeypatch.setattr(proxy, "_STOP_PROFILE_ACK_TIMEOUT_S", 0.05)
 
     def never_ack(timeout=None):
+        time.sleep(timeout)
         raise queue.Empty()
 
     proxy.profile_ack_queue.get.side_effect = never_ack
@@ -391,6 +387,51 @@ def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
     elapsed = time.monotonic() - t0
     # The TimeoutError path returns promptly.
     assert elapsed < 1.0
+
+
+@pytest.mark.threadleak(enabled=True)
+def test_profile_ack_wait_fails_promptly_after_worker_death():
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy.doing_shutdown = False
+    proxy._engine_dead = False
+    proxy._fatal_error = None
+    proxy._results = {}
+    proxy._request_sender = None
+    entered = threading.Event()
+    outcomes = queue.Queue()
+
+    def wait_for_ack():
+        ack = IpcQueue(is_server=True)
+        original_get = ack.get
+
+        def observed_get(*args, **kwargs):
+            entered.set()
+            return original_get(*args, **kwargs)
+
+        ack.get = observed_get
+        proxy.profile_ack_queue = ack
+        try:
+            proxy._wait_profile_ack("stop", 1.5)
+            outcomes.put(None)
+        except BaseException as error:
+            outcomes.put(error)
+        finally:
+            ack.close()
+
+    owner = threading.Thread(target=wait_for_ack)
+    owner.start()
+    try:
+        assert entered.wait(3)
+        proxy._set_fatal_error(RuntimeError("worker died during profile"))
+        owner.join(0.5)
+        assert not owner.is_alive(), "fatal profiling wait kept HTTP shutdown blocked"
+        error = outcomes.get_nowait()
+        assert isinstance(error, EngineDeadError)
+        assert "worker died during profile" in str(error)
+    finally:
+        owner.join(3)
+    assert not owner.is_alive()
 
 
 def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):

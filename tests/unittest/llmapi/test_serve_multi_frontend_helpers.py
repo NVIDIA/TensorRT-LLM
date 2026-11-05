@@ -365,11 +365,16 @@ def test_launcher_logs_an_attached_frontend_that_dies(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("doing_shutdown", [False, True])
-def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, doing_shutdown: bool) -> None:
+@pytest.mark.parametrize("server_exiting", [False, True])
+def test_on_launcher_lost_fails_fast_then_shuts_down(
+    monkeypatch, doing_shutdown, server_exiting
+) -> None:
     fatal_errors = []
     executor = SimpleNamespace(doing_shutdown=doing_shutdown, _set_fatal_error=fatal_errors.append)
     server = object.__new__(OpenAIServer)
     server.generator = SimpleNamespace(_executor=executor)
+    server._uvicorn_server = SimpleNamespace(should_exit=server_exiting)
+    server._http_shutdown_requested = False
     signals, terminations = [], []
     monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
     monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
@@ -378,9 +383,35 @@ def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, doing_shutdown
     server._on_launcher_lost(error)
 
     assert fatal_errors == [error]
-    # A shutdown already under way gets no second SIGINT (which would force-quit it).
-    assert signals == ([] if doing_shutdown else [signal.SIGINT])
-    assert terminations == ([] if doing_shutdown else [server.generator])
+    # Only HTTP shutdown prevents another signal; executor cleanup is separate.
+    assert signals == ([] if server_exiting else [signal.SIGINT])
+    assert terminations == ([] if server_exiting else [server.generator])
+
+
+@pytest.mark.parametrize("server_exiting", [False, True])
+def test_fatal_health_requests_http_shutdown_after_executor_cleanup(
+    monkeypatch, server_exiting
+) -> None:
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy.doing_shutdown = True
+    proxy._fatal_error = RuntimeError("worker died")
+    server = object.__new__(OpenAIServer)
+    server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
+    server.embedding_batcher = None
+    server._uvicorn_server = SimpleNamespace(should_exit=server_exiting)
+    server._http_shutdown_requested = False
+    signals, terminations = [], []
+    monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
+    monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
+
+    async def probe() -> None:
+        assert (await server.health()).status_code == 503
+        assert (await server.health()).status_code == 503
+
+    asyncio.run(probe())
+    assert signals == ([] if server_exiting else [signal.SIGINT])
+    assert terminations == ([] if server_exiting else [server.generator])
 
 
 def test_shared_clock_offset_publish_and_poll(tmp_path) -> None:
