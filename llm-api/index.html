@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/index';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">LLM API Introduction</span></li>
@@ -711,7 +715,7 @@
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/llm-api/README.md">README</a>.</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/llm-api/README.md">README</a>.</p>
 </section>
 <section id="model-input">
 <h2>Model Input<a class="headerlink" href="#model-input" title="Link to this heading">#</a></h2>
@@ -858,7 +862,7 @@ if the prefill CUDA graphs are not enabled, its related metrics “…ctx_cuda_g
 </tbody>
 </table>
 </div>
-<p>The two model-engine properties contain times for various <code class="docutils literal notranslate"><span class="pre">PyTorchModelEngine</span></code> warmup stages.
+<p>The two model-engine properties contain times for various <code class="docutils literal notranslate"><span class="pre">ModelEngine</span></code> warmup stages.
 <code class="docutils literal notranslate"><span class="pre">initial_model_engine</span></code> measures the timings for the initial model engine creation as part of the
 <code class="docutils literal notranslate"><span class="pre">py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation</span></code> timing.
 Likewise, <code class="docutils literal notranslate"><span class="pre">final_model_engine</span></code> measures the timings for the final model engine creation as part of
@@ -1046,7 +1050,7 @@ configured values are forwarded to dynamically spawned MPI workers.</p>
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code>, also defaults <code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_JIT_DUMP_CUBIN</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code> so its
 NVRTC-generated cubins are persisted. An explicitly configured dump setting
 still takes precedence. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/models/core/deepseek_v3/README.md">DeepGEMM environment variables</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/core/deepseek_v3/README.md">DeepGEMM environment variables</a>
 for details.</p>
 <p>Note that, when <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> is set, the FlashInfer workspace isolation
 mechanism described below still applies. This will prevent race conditions
@@ -1102,8 +1106,9 @@ reclaim its workload.</p>
 </div>
 <p>The server shutdown grace starts when it receives the stop request; an earlier
 worker-failure deadline can shorten the remaining grace. The launcher also waits
-for the stop helper’s Python startup and <code class="docutils literal notranslate"><span class="pre">tensorrt_llm</span></code> imports before that request
-can be sent. Set the launcher stop timeout above the server grace by enough to
+for the stop helper’s Python startup and <code class="docutils literal notranslate"><span class="pre">pyzmq</span></code> import before that request
+can be sent. If the standalone helper is unavailable, the fallback imports
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm</span></code> instead. Set the launcher stop timeout above the server grace by enough to
 cover measured cold startup/import time, connection/send and queue cleanup, and
 scheduling margin. The defaults leave 60 seconds of allowance; raising only the
 server grace does not raise the launcher timeout.</p>
@@ -1127,11 +1132,11 @@ nonzero task status still takes precedence.</p>
 <section id="remote-mpi-batch-ordering">
 <h3>Remote MPI batch ordering<a class="headerlink" href="#remote-mpi-batch-ordering" title="Link to this heading">#</a></h3>
 <p>The remote MPI server dispatches the next batch only after every future in the
-previous batch has completed. The task wrapper retains its entry barrier to
-place one task on each rank, but has no trailing barrier: an individual rank can
-finish or report an error while its peers are still running. Cross-batch ordering
-is enforced by the server; directly invoking the wrapper does not provide a
-collective completion barrier.</p>
+previous batch has completed. Each batch runs exactly once on every rank, but
+the task wrapper has no trailing barrier: an individual rank can finish or report
+an error while its peers are still running. Cross-batch ordering is enforced by
+the server; directly invoking the wrapper does not provide a collective
+completion barrier.</p>
 </section>
 <section id="disaggregated-mpi-leader-failures">
 <h3>Disaggregated MPI leader failures<a class="headerlink" href="#disaggregated-mpi-leader-failures" title="Link to this heading">#</a></h3>
@@ -1200,6 +1205,30 @@ instead of being downloaded concurrently into the shared directory.</p>
 <li><p>Use LLM as a context manager, with the following code: <code class="docutils literal notranslate"><span class="pre">with</span> <span class="pre">LLM(...)</span> <span class="pre">as</span> <span class="pre">llm:</span> <span class="pre">...</span></code>, the shutdown method will be invoked automatically once it goes out of the <code class="docutils literal notranslate"><span class="pre">with</span></code>-statement block.</p></li>
 </ol>
 </section>
+<section id="remote-mpi-shutdown">
+<h3>Remote MPI shutdown<a class="headerlink" href="#remote-mpi-shutdown" title="Link to this heading">#</a></h3>
+<p>After the task exits, <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> sends the authenticated stop request
+with a standalone helper. The helper imports <code class="docutils literal notranslate"><span class="pre">pyzmq</span></code>, but does not import
+TensorRT-LLM or initialize MPI. It waits for an authenticated acknowledgment and
+retries on a fresh connection if the server has not accepted the request. Each
+of up to 300 attempts waits one second for the acknowledgment; socket close
+discards unsent messages without waiting. The acknowledgment confirms receipt,
+not completion of worker shutdown. The launcher supervises the helper and server
+using the shutdown budgets described above, including helper startup. Its
+120-second default stop timeout can end the helper before all 300 attempts run.</p>
+<p>The launcher resolves symlinks before locating the helper beside the launcher
+file. If resolution fails or the helper is missing or unreadable, it logs a
+warning and uses
+<code class="docutils literal notranslate"><span class="pre">python3</span> <span class="pre">-m</span> <span class="pre">tensorrt_llm.llmapi.mgmn_leader_node</span> <span class="pre">--action</span> <span class="pre">stop</span></code>. This fallback
+imports TensorRT-LLM and can take longer to start. A failure after the helper
+starts is reported directly and does not trigger the fallback.</p>
+<p>After a task-first exit, a nonzero task status takes precedence over stop or
+server failures. The helper returns <code class="docutils literal notranslate"><span class="pre">1</span></code> if its attempts finish without an ACK;
+the launcher reports that failure and cleans up its owned processes. It skips
+the stop helper if the server has already exited. Server-first failures and
+shutdown timeouts retain the supervisor behavior described above. The module
+stop command uses the same acknowledged protocol and unacknowledged exit code.</p>
+</section>
 <section id="single-node-hanging-when-using-docker-run-net-host">
 <h3>Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code><a class="headerlink" href="#single-node-hanging-when-using-docker-run-net-host" title="Link to this heading">#</a></h3>
 <p>The root cause may be related to <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>. There is a <a class="reference external" href="https://github.com/mpi4py/mpi4py/discussions/491#discussioncomment-12660609">workaround</a> suggesting a change from <code class="docutils literal notranslate"><span class="pre">--net=host</span></code> to <code class="docutils literal notranslate"><span class="pre">--ipc=host</span></code>, or setting the following environment variables:</p>
@@ -1253,7 +1282,7 @@ instead of being downloaded concurrently into the shared directory.</p>
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -1285,6 +1314,7 @@ instead of being downloaded concurrently into the shared directory.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hang-issue-on-slurm-node">Hang issue on Slurm Node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cannot-quit-after-generation">Cannot quit after generation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#remote-mpi-shutdown">Remote MPI shutdown</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#single-node-hanging-when-using-docker-run-net-host">Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code></a></li>
 </ul>
 </li>
@@ -1306,8 +1336,8 @@ instead of being downloaded concurrently into the shared directory.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -1379,9 +1409,9 @@ instead of being downloaded concurrently into the shared directory.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

@@ -10,22 +10,10 @@ ___________________
 .. doxygenfile:: cacheCommunicator.h
    :project: TensorRT-LLM
 
-serialization.h
-_______________
+types.h
+_______
 
-.. doxygenfile:: serialization.h
-   :project: TensorRT-LLM
-
-dataTransceiverState.h
-______________________
-
-.. doxygenfile:: dataTransceiverState.h
-   :project: TensorRT-LLM
-
-tensor.h
-________
-
-.. doxygenfile:: tensor.h
+.. doxygenfile:: types.h
    :project: TensorRT-LLM
 
 transferAgent.h
@@ -34,15 +22,27 @@ _______________
 .. doxygenfile:: transferAgent.h
    :project: TensorRT-LLM
 
+serialization.h
+_______________
+
+.. doxygenfile:: serialization.h
+   :project: TensorRT-LLM
+
+tensor.h
+________
+
+.. doxygenfile:: tensor.h
+   :project: TensorRT-LLM
+
 executor.h
 __________
 
 .. doxygenfile:: executor.h
    :project: TensorRT-LLM
 
-types.h
-_______
+dataTransceiverState.h
+______________________
 
-.. doxygenfile:: types.h
+.. doxygenfile:: dataTransceiverState.h
    :project: TensorRT-LLM
 

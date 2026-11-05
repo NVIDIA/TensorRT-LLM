@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'models/supported-models';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Supported Models</span></li>
@@ -707,7 +711,7 @@
 <td><p>DeepSeek-V3.2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V3.2</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV4ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id24" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>11<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV4ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id25" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>11<span class="fn-bracket">]</span></a></p></td>
 <td><p>DeepSeek-V4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V4-Pro</span></code></p></td>
 </tr>
@@ -724,168 +728,204 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/EXAONE-4.0-32B</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ExaoneMoeForCausalLM</span></code></p></td>
-<td><p>K-EXAONE</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/K-EXAONE-236B-A23B</span></code></p></td>
+<td><p>K-EXAONE, K-EXAONE 2.0</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/K-EXAONE-236B-A23B</span></code>, <code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/K-EXAONE-2.0-750B-A37B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ExaoneMoeForCausalLM</span></code></p></td>
-<td><p>K-EXAONE 2.0</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/K-EXAONE-2.0-750B-A37B</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForCausalLM</span></code></p></td>
 <td><p>Gemma 3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-3-1b-it</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4ForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4ForConditionalGeneration</span></code></p></td>
 <td><p>Gemma 4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-4-E2B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-E4B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-26B-A4B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-31B-it</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4UnifiedForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4UnifiedForConditionalGeneration</span></code></p></td>
 <td><p>Gemma 4 12B Unified (encoder-free)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-4-12B</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-12B-it</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4AssistantForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4AssistantForCausalLM</span></code></p></td>
 <td><p>Gemma 4 MTP assistant</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-4-E2B-it-assistant</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-E4B-it-assistant</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-26B-A4B-it-assistant</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-31B-it-assistant</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code></p></td>
 <td><p>GLM-4.5, GLM-4.6, GLM-4.7</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">THUDM/GLM-4-100B-A10B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GlmMoeDsaForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GlmMoeDsaForCausalLM</span></code></p></td>
 <td><p>GLM-5, GLM-5.2, GLM-5.3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5</span></code>, <code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5.2</span></code>, <code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5.3</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Glm5NextForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id33" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>20<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Glm5NextForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id34" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>20<span class="fn-bracket">]</span></a></p></td>
 <td><p>GLM-5.3-Flash</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5.3-Flash</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
 <td><p>GPT-OSS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/gpt-oss-20b</span></code>, <code class="docutils literal notranslate"><span class="pre">openai/gpt-oss-120b</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KimiK25ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KimiK25ForConditionalGeneration</span></code></p></td>
 <td><p>Kimi-K2.5</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">moonshotai/Kimi-K2.5</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KimiK3ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id28" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>15<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KimiK3ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id29" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>15<span class="fn-bracket">]</span></a></p></td>
 <td><p>Kimi-K3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">moonshotai/Kimi-K3</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KimiLinearForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>15<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KimiLinearForCausalLM</span></code> <a class="footnote-reference brackets" href="#id29" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>15<span class="fn-bracket">]</span></a></p></td>
 <td><p>Kimi-K3 (text decoder)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">moonshotai/Kimi-K3</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LagunaForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LagunaForCausalLM</span></code></p></td>
 <td><p>Laguna-XS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">poolside/laguna-XS.2</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LiLiCorrDraftModel</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LiLiCorrDraftModel</span></code></p></td>
 <td><p><a class="reference internal" href="../features/speculative-decoding.html#dflash"><span class="std std-ref">LiLiCorr draft model</span></a></p></td>
 <td><p>Compatible checkpoint via <code class="docutils literal notranslate"><span class="pre">DFlashDecodingConfig.speculative_model</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
 <td><p>Llama 3.1, Llama 3, Llama 2, LLaMA</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Meta-Llama-3.1-70B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
 <td><p>Llama 4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-4-Scout-17B-16E-Instruct</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MBartForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MBartForConditionalGeneration</span></code></p></td>
 <td><p>mBART</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/mbart-large-50-many-to-one-mmt</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id27" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id28" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></a></p></td>
 <td><p>MiniCPM-V 4.6</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openbmb/MiniCPM-V-4.6</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id25" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id26" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
 <td><p>MiniMax-M3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-M3</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
 <td><p>Mistral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mistral-7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
 <td><p>Mixtral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mixtral-8x7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
 <td><p>Llama 3.2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.2-11B-Vision</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
 <td><p>Nemotron-3, Nemotron-4, Minitron</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Minitron-8B-Base</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronHForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronHForCausalLM</span></code></p></td>
 <td><p>Nemotron-3-Nano, Nemotron-3-Super, Nemotron-3-Ultra</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/nvidia-nemotron-v3</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
 <td><p>NemotronNAS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3_3-Nemotron-Super-49B-v1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
 <td><p>Phi-4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">microsoft/Phi-4</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
 <td><p>QwQ, Qwen2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2-7B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-PRM-7B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-RM-72B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
 <td><p>Qwen3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForTextEmbedding</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForTextEmbedding</span></code></p></td>
 <td><p>Qwen3-Embedding</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Embedding-8B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
 <td><p>Qwen3MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-30B-A3B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
 <td><p>Qwen3Next</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Next-80B-A3B-Thinking</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code></p></td>
 <td><p>Qwen3.8-MoE, Qwen3.5-MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-2.4T-A95B</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.5-397B-A17B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForCausalLM</span></code></p></td>
 <td><p>Qwen3.8-Flash-Next (text)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-Flash-Next</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForConditionalGeneration</span></code></p></td>
 <td><p>Qwen3.8-Flash-Next</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-Flash-Next</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Step3p7ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id21" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>8<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Step3p7ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id22" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>8<span class="fn-bracket">]</span></a></p></td>
 <td><p>Step-3.7-Flash</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">stepfun-ai/Step-3.7-Flash</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">T5ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">T5ForConditionalGeneration</span></code></p></td>
 <td><p>T5, Flan-T5, ByT5</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/flan-t5-small</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">WhisperForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WhisperForConditionalGeneration</span></code></p></td>
 <td><p>Whisper</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<section id="models-supported-outside-main-branch">
+<h2>Models Supported outside main branch<a class="headerlink" href="#models-supported-outside-main-branch" title="Link to this heading">#</a></h2>
+<p>Some newly released models are first supported on a dedicated feature branch, with release
+containers published from that branch, before the support is merged into <code class="docutils literal notranslate"><span class="pre">main</span></code>. The entries
+below are temporary: each entry is removed once the model’s support, including its deployment
+guide, is fully merged into <code class="docutils literal notranslate"><span class="pre">main</span></code> and available in a regular release. Until then, use the
+linked branch and container rather than <code class="docutils literal notranslate"><span class="pre">main</span></code>.</p>
+<p>The linked containers are preview releases published from the side branch and are retained on
+NGC for roughly two months. If a tag is no longer available, check the
+<a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">release tags page</a>
+for a newer tag published from the same branch, or build the container from the branch sources
+following its <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/README.md">Docker guide</a>.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model</p></th>
+<th class="head"><p>Side branch</p></th>
+<th class="head"><p>Deployment guide</p></th>
+<th class="head"><p>Release container</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Muse Spark Open</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/feat/musespark-open"><code class="docutils literal notranslate"><span class="pre">feat/musespark-open</span></code></a></p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/docs/source/deployment-guide/deployment-guide-for-musespark-open-on-trtllm.md">Muse Spark Open deployment guide</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/docs/source/deployment-guide/deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md">speculative decoding guide</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:1.4.0a0.dev202610171236</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>MiniMax-M3.1-Flash</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/feat/minimax-m3.1-flash"><code class="docutils literal notranslate"><span class="pre">feat/minimax-m3.1-flash</span></code></a></p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/feat/minimax-m3.1-flash/docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md#serving-minimax-m31-flash">Serving MiniMax-M3.1-Flash</a> in the MiniMax-M3 deployment guide</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:1.4.0a0.dev202610230958</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Beam (Reflection AI)</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/feat/reflection-beam"><code class="docutils literal notranslate"><span class="pre">feat/reflection-beam</span></code></a></p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/feat/reflection-beam/docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md">Beam deployment guide</a></p></td>
+<td><p>No container published yet — build from the branch sources per the guide</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
 <section id="model-feature-support-matrix-key-models">
 <h2>Model-Feature Support Matrix (Key Models)<a class="headerlink" href="#model-feature-support-matrix-key-models" title="Link to this heading">#</a></h2>
 <p>Note: Support for other models may vary. Features marked “N/A” are not applicable to the model architecture.
@@ -900,7 +940,7 @@ statuses for the same architecture in the two matrices.</p>
 <th class="head"><p>Attention Data Parallelism</p></th>
 <th class="head"><p>Disaggregated Serving</p></th>
 <th class="head"><p>Chunked Prefill</p></th>
-<th class="head"><p>Speculative Decoding <a class="footnote-reference brackets" href="#id31" id="id8" role="doc-noteref"><span class="fn-bracket">[</span>18<span class="fn-bracket">]</span></a></p></th>
+<th class="head"><p>Speculative Decoding <a class="footnote-reference brackets" href="#id32" id="id8" role="doc-noteref"><span class="fn-bracket">[</span>18<span class="fn-bracket">]</span></a></p></th>
 <th class="head"><p>Torch Sampler</p></th>
 <th class="head"><p>KV Cache Reuse</p></th>
 <th class="head"><p>Sliding Window Attention</p></th>
@@ -914,10 +954,10 @@ statuses for the same architecture in the two matrices.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id18" id="id9" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id19" id="id9" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>MTP</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id19" id="id10" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id20" id="id10" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
 <td><p>N/A</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -948,7 +988,7 @@ statuses for the same architecture in the two matrices.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV4ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id24" id="id11" role="doc-noteref"><span class="fn-bracket">[</span>11<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV4ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id25" id="id11" role="doc-noteref"><span class="fn-bracket">[</span>11<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -972,7 +1012,7 @@ statuses for the same architecture in the two matrices.</p>
 <td><p>Yes</p></td>
 <td><p>N/A</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id29" id="id12" role="doc-noteref"><span class="fn-bracket">[</span>16<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id30" id="id12" role="doc-noteref"><span class="fn-bracket">[</span>16<span class="fn-bracket">]</span></a></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
 <td><p>Yes</p></td>
@@ -987,7 +1027,7 @@ statuses for the same architecture in the two matrices.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code> <a class="footnote-reference brackets" href="#id20" id="id13" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code> <a class="footnote-reference brackets" href="#id21" id="id13" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -995,7 +1035,7 @@ statuses for the same architecture in the two matrices.</p>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id32" id="id14" role="doc-noteref"><span class="fn-bracket">[</span>19<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id33" id="id14" role="doc-noteref"><span class="fn-bracket">[</span>19<span class="fn-bracket">]</span></a></p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1052,7 +1092,7 @@ statuses for the same architecture in the two matrices.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KimiK3ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id28" id="id15" role="doc-noteref"><span class="fn-bracket">[</span>15<span class="fn-bracket">]</span></a> <a class="footnote-reference brackets" href="#id30" id="id16" role="doc-noteref"><span class="fn-bracket">[</span>17<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KimiK3ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id29" id="id15" role="doc-noteref"><span class="fn-bracket">[</span>15<span class="fn-bracket">]</span></a> <a class="footnote-reference brackets" href="#id31" id="id16" role="doc-noteref"><span class="fn-bracket">[</span>17<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1117,13 +1157,13 @@ statuses for the same architecture in the two matrices.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id25" id="id17" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id26" id="id17" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
-<td><p>EAGLE-3 (Linear)</p></td>
+<td><p>EAGLE-3 (Linear), DSpark <a class="footnote-reference brackets" href="#id35" id="id18" role="doc-noteref"><span class="fn-bracket">[</span>21<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>N/A</p></td>
@@ -1253,7 +1293,7 @@ not used to mark a feature as supported here.</p>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
-<td><p>L + I + V + A <a class="footnote-reference brackets" href="#id22" id="id34" role="doc-noteref"><span class="fn-bracket">[</span>9<span class="fn-bracket">]</span></a></p></td>
+<td><p>L + I + V + A <a class="footnote-reference brackets" href="#id23" id="id36" role="doc-noteref"><span class="fn-bracket">[</span>9<span class="fn-bracket">]</span></a></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4UnifiedForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
@@ -1305,7 +1345,7 @@ not used to mark a feature as supported here.</p>
 <td><p>No</p></td>
 <td><p>L + I</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id27" id="id35" role="doc-noteref"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id28" id="id37" role="doc-noteref"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
@@ -1333,7 +1373,7 @@ not used to mark a feature as supported here.</p>
 <td><p>N/A</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>L + I + V + A <a class="footnote-reference brackets" href="#id23" id="id36" role="doc-noteref"><span class="fn-bracket">[</span>10<span class="fn-bracket">]</span></a></p></td>
+<td><p>L + I + V + A <a class="footnote-reference brackets" href="#id24" id="id38" role="doc-noteref"><span class="fn-bracket">[</span>10<span class="fn-bracket">]</span></a></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Phi4MMForCausalLM</span></code></p></td>
 <td><p>Yes</p></td>
@@ -1395,7 +1435,7 @@ not used to mark a feature as supported here.</p>
 <td><p>Untested</p></td>
 <td><p>L + I</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id25" id="id37" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id26" id="id39" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
@@ -1405,7 +1445,7 @@ not used to mark a feature as supported here.</p>
 <td><p>Untested</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Cosmos3ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id26" id="id38" role="doc-noteref"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Cosmos3ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id27" id="id40" role="doc-noteref"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1415,7 +1455,7 @@ not used to mark a feature as supported here.</p>
 <td><p>Untested</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id26" id="id39" role="doc-noteref"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id27" id="id41" role="doc-noteref"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
@@ -1589,8 +1629,8 @@ the <code class="docutils literal notranslate"><span class="pre">EAGER</span></c
 <h1>Visual Generation Models<a class="headerlink" href="#visual-generation-models" title="Link to this heading">#</a></h1>
 <p>TensorRT-LLM provides beta support for diffusion-based image and video generation.
 For full documentation, see the <a class="reference internal" href="visual-generation.html"><span class="std std-doc">Visual Generation</span></a> page.</p>
-<section id="id40">
-<h2>Supported Models<a class="headerlink" href="#id40" title="Link to this heading">#</a></h2>
+<section id="id42">
+<h2>Supported Models<a class="headerlink" href="#id42" title="Link to this heading">#</a></h2>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>HuggingFace Model ID</p></th>
@@ -1628,34 +1668,37 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2</span></code></p></td>
 <td><p>Text-to-Video (with Audio), Image-to-Video (with Audio)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-H3</span></code></p></td>
-<td><p>Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio)</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2.3</span></code></p></td>
+<td><p>Text-to-Video (with Audio), Video-to-Video (with Audio)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-H3</span></code></p></td>
+<td><p>Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image</span></code></p></td>
 <td><p>Text-to-Image</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-2512</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-2512</span></code></p></td>
 <td><p>Text-to-Image</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-Layered</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-Layered</span></code></p></td>
 <td><p>Image-to-Image</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-Edit-2511</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-Edit-2511</span></code></p></td>
 <td><p>Image Editing (text+images-to-image)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano</span></code></p></td>
 <td><p>Text-to-Image, Text-to-Video, Image-to-Video</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super</span></code></p></td>
 <td><p>Text-to-Image, Text-to-Video, Image-to-Video</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super-Text2Image-4Step</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super-Text2Image-4Step</span></code></p></td>
 <td><p>Text-to-Image (DMD2-distilled, fixed 4-step schedule)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super-Image2Video-4Step</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super-Image2Video-4Step</span></code></p></td>
 <td><p>Image-to-Video (DMD2-distilled, fixed 4-step schedule)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Edge</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Edge</span></code></p></td>
 <td><p>Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native)</p></td>
 </tr>
 </tbody>
@@ -1678,6 +1721,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <th class="head"><p>Attention2D</p></th>
 <th class="head"><p>Ring Attention</p></th>
 <th class="head"><p>Tensor Parallelism</p></th>
+<th class="head"><p>Text Encoder TP</p></th>
 </tr>
 </thead>
 <tbody>
@@ -1694,6 +1738,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>FLUX.2</strong></p></td>
 <td><p>Yes</p></td>
@@ -1708,6 +1753,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 <tr class="row-even"><td><p><strong>Wan 2.1</strong></p></td>
 <td><p>Yes</p></td>
@@ -1722,55 +1768,42 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>Wan 2.2</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
 </tr>
 <tr class="row-even"><td><p><strong>LTX-2</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
-</tr>
-<tr class="row-odd"><td><p><strong>MiniMax-H3</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-even"><td><p><strong>Qwen-Image</strong></p></td>
+<tr class="row-odd"><td><p><strong>LTX-2.3</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1778,36 +1811,71 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
-</tr>
-<tr class="row-odd"><td><p><strong>Qwen-Image-Layered</strong> <a href="#id43"><span class="problematic" id="id41">[^vg2]</span></a></p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-even"><td><p><strong>Qwen-Image-Edit-2511</strong></p></td>
+<tr class="row-even"><td><p><strong>MiniMax-H3</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Qwen-Image</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Qwen-Image-Layered</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>Cosmos3</strong></p></td>
+<tr class="row-odd"><td><p><strong>Qwen-Image-Edit-2511</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Cosmos3</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -1820,6 +1888,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 </tbody>
 </table>
@@ -1829,74 +1898,78 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 </section>
 <hr class="footnotes docutils" />
 <aside class="footnote-list brackets">
-<aside class="footnote brackets" id="id18" role="doc-footnote">
+<aside class="footnote brackets" id="id19" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id9">1</a><span class="fn-bracket">]</span></span>
 <p>Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120.</p>
 </aside>
-<aside class="footnote brackets" id="id19" role="doc-footnote">
+<aside class="footnote brackets" id="id20" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id10">2</a><span class="fn-bracket">]</span></span>
 <p>KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120/SM121 and in BF16/FP8 KV cache dtype.</p>
 </aside>
-<aside class="footnote brackets" id="id20" role="doc-footnote">
+<aside class="footnote brackets" id="id21" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id13">3</a><span class="fn-bracket">]</span></span>
 <p>Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.</p>
 </aside>
-<aside class="footnote brackets" id="id21" role="doc-footnote">
+<aside class="footnote brackets" id="id22" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id7">8</a><span class="fn-bracket">]</span></span>
 <p>Supports text and image inputs. The vision tower runs in BF16 even when the text decoder is quantized (FP8 block-scale or NVFP4). The text decoder is also usable standalone (text-only) via the <code class="docutils literal notranslate"><span class="pre">Step3p5ForCausalLM</span></code> architecture.</p>
 </aside>
-<aside class="footnote brackets" id="id22" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id34">9</a><span class="fn-bracket">]</span></span>
+<aside class="footnote brackets" id="id23" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id36">9</a><span class="fn-bracket">]</span></span>
 <p>Audio modality only supported on E2B/E4B variants.</p>
 </aside>
-<aside class="footnote brackets" id="id23" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id36">10</a><span class="fn-bracket">]</span></span>
+<aside class="footnote brackets" id="id24" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id38">10</a><span class="fn-bracket">]</span></span>
 <p>Audio requires a checkpoint with a <code class="docutils literal notranslate"><span class="pre">sound_config</span></code> and is supported only on the full (non-disaggregated) model path, not the EPD disaggregated path.</p>
 </aside>
-<aside class="footnote brackets" id="id24" role="doc-footnote">
+<aside class="footnote brackets" id="id25" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>11<span class="fn-bracket">]</span></span>
 <span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id11">2</a>)</span>
-<p>DeepSeek-V4 is only supported on Blackwell GPUs (<code class="docutils literal notranslate"><span class="pre">SM100+</span></code>). See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example README</a> for setup and parallelism.</p>
-</aside>
-<aside class="footnote brackets" id="id25" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></span>
-<span class="backrefs">(<a role="doc-backlink" href="#id6">1</a>,<a role="doc-backlink" href="#id17">2</a>,<a role="doc-backlink" href="#id37">3</a>)</span>
-<p>Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForCausalLM</span></code> architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.</p>
+<p>DeepSeek-V4 is only supported on Blackwell GPUs (<code class="docutils literal notranslate"><span class="pre">SM100+</span></code>). See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example README</a> for setup and parallelism.</p>
 </aside>
 <aside class="footnote brackets" id="id26" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></span>
-<span class="backrefs">(<a role="doc-backlink" href="#id38">1</a>,<a role="doc-backlink" href="#id39">2</a>)</span>
-<p>Cosmos3-Nano and Cosmos3-Super Reasoner checkpoints use <code class="docutils literal notranslate"><span class="pre">Cosmos3ForConditionalGeneration</span></code>. Cosmos3-Edge Reasoner uses <code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeForConditionalGeneration</span></code> (SigLIP2 vision encoder, 4608-11520-2048 projector, dense ReLU-squared decoder, interleaved mRoPE) and is BF16. The same Cosmos 3 checkpoints also support visual generation through the VisualGen API. See <a class="reference internal" href="#visual-generation-models">Visual Generation Models</a>.</p>
+<span class="label"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></span>
+<span class="backrefs">(<a role="doc-backlink" href="#id6">1</a>,<a role="doc-backlink" href="#id17">2</a>,<a role="doc-backlink" href="#id39">3</a>)</span>
+<p>Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForCausalLM</span></code> architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.</p>
 </aside>
 <aside class="footnote brackets" id="id27" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></span>
-<span class="backrefs">(<a role="doc-backlink" href="#id5">1</a>,<a role="doc-backlink" href="#id35">2</a>)</span>
-<p>Requires <code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.7.0</span></code>: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (<code class="docutils literal notranslate"><span class="pre">minicpmv4_6</span></code>) and the checkpoint ships no remote code (<code class="docutils literal notranslate"><span class="pre">auto_map</span></code>) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via <code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6InputProcessor</span></code>).</p>
+<span class="label"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></span>
+<span class="backrefs">(<a role="doc-backlink" href="#id40">1</a>,<a role="doc-backlink" href="#id41">2</a>)</span>
+<p>Cosmos3-Nano and Cosmos3-Super Reasoner checkpoints use <code class="docutils literal notranslate"><span class="pre">Cosmos3ForConditionalGeneration</span></code>. Cosmos3-Edge Reasoner uses <code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeForConditionalGeneration</span></code> (SigLIP2 vision encoder, 4608-11520-2048 projector, dense ReLU-squared decoder, interleaved mRoPE) and is BF16. The same Cosmos 3 checkpoints also support visual generation through the VisualGen API. See <a class="reference internal" href="#visual-generation-models">Visual Generation Models</a>.</p>
 </aside>
 <aside class="footnote brackets" id="id28" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></span>
+<span class="backrefs">(<a role="doc-backlink" href="#id5">1</a>,<a role="doc-backlink" href="#id37">2</a>)</span>
+<p>Requires <code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.7.0</span></code>: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (<code class="docutils literal notranslate"><span class="pre">minicpmv4_6</span></code>) and the checkpoint ships no remote code (<code class="docutils literal notranslate"><span class="pre">auto_map</span></code>) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via <code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6InputProcessor</span></code>).</p>
+</aside>
+<aside class="footnote brackets" id="id29" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>15<span class="fn-bracket">]</span></span>
 <span class="backrefs">(<a role="doc-backlink" href="#id3">1</a>,<a role="doc-backlink" href="#id4">2</a>,<a role="doc-backlink" href="#id15">3</a>)</span>
 <p>Kimi K3 is only supported on NVIDIA Blackwell GPUs (<code class="docutils literal notranslate"><span class="pre">SM100</span></code> family); see the <a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html"><span class="std std-doc">Kimi K3 deployment guide</span></a>. Which recipes fit is set by the attention layout rather than by the GPU count: DEP16 (<code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">true</span></code>) replicates the BF16 non-expert weights on every rank (114 GB) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB), needing 210 GB per rank, so it requires GB300-class per-GPU memory. TEP16 (<code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">false</span></code>) shards those non-expert weights instead and needs 115 GB per rank; it is validated end-to-end on GB200 (<code class="docutils literal notranslate"><span class="pre">SM100</span></code>) at 16 GPUs. On B200 (<code class="docutils literal notranslate"><span class="pre">SM100</span></code>), kernel and module support is functional and covered by CI. Note that the FP8 weight-read path (TRTLLM-14765) does not relax the DEP16 requirement: the conversion runs after the weights are already resident in BF16, so it lowers the steady-state footprint but not the load-time peak.</p>
 </aside>
-<aside class="footnote brackets" id="id29" role="doc-footnote">
+<aside class="footnote brackets" id="id30" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id12">16</a><span class="fn-bracket">]</span></span>
 <p>Guided decoding for <code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code> is currently supported only with the <code class="docutils literal notranslate"><span class="pre">xgrammar</span></code> backend; <code class="docutils literal notranslate"><span class="pre">llguidance</span></code> is not working.</p>
 </aside>
-<aside class="footnote brackets" id="id30" role="doc-footnote">
+<aside class="footnote brackets" id="id31" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id16">17</a><span class="fn-bracket">]</span></span>
 <p>Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain <code class="docutils literal notranslate"><span class="pre">DFlash</span></code>. Speculators-format DSpark checkpoints require <code class="docutils literal notranslate"><span class="pre">aux_hidden_state_layer_ids</span></code> to be a nonempty list of positive integers; booleans, floats and strings are rejected rather than coerced.</p>
 </aside>
-<aside class="footnote brackets" id="id31" role="doc-footnote">
+<aside class="footnote brackets" id="id32" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id8">18</a><span class="fn-bracket">]</span></span>
 <p>NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model’s multi-token verification and cache-management paths and may be untested or explicitly restricted.</p>
 </aside>
-<aside class="footnote brackets" id="id32" role="doc-footnote">
+<aside class="footnote brackets" id="id33" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id14">19</a><span class="fn-bracket">]</span></span>
 <p>KV cache reuse for hybrid recurrent-attention models requires an explicit recurrent-state snapshot policy, such as <code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_state_config.periodic_snapshot_interval</span></code>; the model default disables reuse when no snapshot policy is configured.</p>
 </aside>
-<aside class="footnote brackets" id="id33" role="doc-footnote">
+<aside class="footnote brackets" id="id34" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id2">20</a><span class="fn-bracket">]</span></span>
 <p>Supports text, image, and video inputs, MTP (including with attention data parallelism), and FP8 KV cache. Image and video inputs require <code class="docutils literal notranslate"><span class="pre">transformers==5.17.0</span></code>. Beam search is not supported. See the <a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html"><span class="std std-doc">GLM-5.3-Flash deployment guide</span></a> for setup and feature-specific requirements.</p>
+</aside>
+<aside class="footnote brackets" id="id35" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id18">21</a><span class="fn-bracket">]</span></span>
+<p>MiniMax-M3.1-Flash ships a standalone DSpark drafter in its <code class="docutils literal notranslate"><span class="pre">dspark/</span></code> directory (architecture <code class="docutils literal notranslate"><span class="pre">DSparkMiniMaxDraftModel</span></code>). Load it with <code class="docutils literal notranslate"><span class="pre">speculative_config:</span> <span class="pre">{decoding_type:</span> <span class="pre">DSpark,</span> <span class="pre">speculative_model:</span> <span class="pre">&lt;checkpoint&gt;/dspark,</span> <span class="pre">max_draft_len:</span> <span class="pre">7}</span></code> (the drafter’s block size is 7 and <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> must match it). Keep KV cache block reuse enabled (the default): with <code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse:</span> <span class="pre">false</span></code>, or on a disaggregated generation server, prompts of about 131k tokens or more fail with <code class="docutils literal notranslate"><span class="pre">Draft</span> <span class="pre">KV</span> <span class="pre">cache</span> <span class="pre">context</span> <span class="pre">resize</span> <span class="pre">failed</span></code>.</p>
 </aside>
 </aside>
 
@@ -1937,7 +2010,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -1950,6 +2023,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Supported Models</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models-supported-outside-main-branch">Models Supported outside main branch</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-feature-support-matrix-key-models">Model-Feature Support Matrix (Key Models)</a></li>
 </ul>
 </li>
@@ -1963,7 +2037,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 </ul>
 </li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation-models">Visual Generation Models</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id40">Supported Models</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id42">Supported Models</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-matrix">Feature Matrix</a></li>
 </ul>
 </li>
@@ -1988,8 +2062,8 @@ For full documentation, see the <a class="reference internal" href="visual-gener
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -2061,9 +2135,9 @@ For full documentation, see the <a class="reference internal" href="visual-gener
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

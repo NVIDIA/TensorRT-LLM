@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/LLM';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     
@@ -742,6 +746,7 @@
 <li><p><strong>num_postprocess_workers</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of processes used for postprocessing the generated tokens, including detokenization. Defaults to 0.</p></li>
 <li><p><strong>postprocess_tokenizer_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The path to the tokenizer directory for postprocessing. Defaults to None.</p></li>
 <li><p><strong>num_serve_frontends</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of HTTP or OpenEngine frontend processes serving one executor. Used by trtllm-serve: values &gt; 1 run additional attached frontend processes that share the serving port via SO_REUSEPORT (classic IPC executor path only). Defaults to 1.</p></li>
+<li><p><strong>serve_frontend_affinity_port_stride</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> With num_serve_frontends=K &gt; 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride. Defaults to None.</p></li>
 <li><p><strong>reasoning_parser</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The parser to separate reasoning content from output. Defaults to None.</p></li>
 <li><p><strong>otlp_traces_endpoint</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Target URL to which OpenTelemetry traces will be sent. Defaults to None.</p></li>
 <li><p><strong>return_perf_metrics</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Allow serving responses to include per-request performance metrics when the request sets X-TRTLLM-return-metrics: 1. Defaults to False.</p></li>
@@ -794,6 +799,8 @@
 <li><p><strong>stream_interval</strong> (<em>int</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The iteration interval to create responses under the streaming mode. Set this to a larger value when the batch size is large, which helps reduce the streaming overhead. Defaults to 1.</p></li>
 <li><p><strong>force_dynamic_quantization</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, force dynamic quantization. Defaults to False. Defaults to False.</p></li>
 <li><p><strong>allreduce_strategy</strong> (<em>Optional</em><em>[</em><em>Literal</em><em>[</em><em>'AUTO'</em><em>, </em><em>'NCCL'</em><em>, </em><em>'UB'</em><em>, </em><em>'MINLATENCY'</em><em>, </em><em>'ONESHOT'</em><em>, </em><em>'TWOSHOT'</em><em>, </em><em>'LOWPRECISION'</em><em>, </em><em>'MNNVL'</em><em>, </em><em>'NCCL_SYMMETRIC'</em><em>]</em><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Allreduce strategy to use. Defaults to AUTO.</p></li>
+<li><p><strong>mnnvl_allreduce_fp8_payload</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages. Defaults to False.</p></li>
+<li><p><strong>replicate_embedding</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP. Defaults to False.</p></li>
 <li><p><strong>checkpoint_loader</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The checkpoint loader to use for this LLM instance. You may use a custom checkpoint loader by subclassing <cite>BaseCheckpointLoader</cite> and providing an instance of the subclass here to load weights from a custom checkpoint format.
 If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.
 If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored. Defaults to None.</p></li>
@@ -950,6 +957,7 @@ input, or a list of EncoderOutput objects for batched inputs.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">conversation_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><span class="pre">ConversationParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><span class="pre">ConversationParams</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cache_salt</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">priority</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.5</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_hints</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="KvHintsEnvelope.html#tensorrt_llm.llmapi.KvHintsEnvelope" title="tensorrt_llm.kv_hints.protocol.KvHintsEnvelope"><span class="pre">KvHintsEnvelope</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">JsonValue</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="KvHintsEnvelope.html#tensorrt_llm.llmapi.KvHintsEnvelope" title="tensorrt_llm.kv_hints.protocol.KvHintsEnvelope"><span class="pre">KvHintsEnvelope</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">JsonValue</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate" title="Link to this definition">#</a></dt>
@@ -964,13 +972,14 @@ It can be single prompt or batched prompts.</p></li>
 A default one will be used if not provided.</p></li>
 <li><p><strong>use_tqdm</strong> (<em>bool</em>) – Whether to use tqdm to display the progress bar. Defaults to True.</p></li>
 <li><p><strong>lora_request</strong> (<a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><em>tensorrt_llm.executor.request.LoRARequest</em></a><em>, </em><em>Sequence</em><em>[</em><a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><em>tensorrt_llm.executor.request.LoRARequest</em></a><em>]</em><em>, </em><em>optional</em>) – LoRA request to use for generation, if any. Defaults to None.</p></li>
-<li><p><strong>prompt_adapter_request</strong> (<em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>, </em><em>Sequence</em><em>[</em><em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>]</em><em>, </em><em>optional</em>) – Prompt Adapter request to use for generation, if any. Defaults to None.</p></li>
+<li><p><strong>prompt_adapter_request</strong> (<em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>, </em><em>Sequence</em><em>[</em><em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>]</em><em>, </em><em>optional</em>) – Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.</p></li>
 <li><p><strong>kv_cache_retention_config</strong> (<a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><em>tensorrt_llm.bindings.executor.KvCacheRetentionConfig</em></a><em>, </em><em>Sequence</em><em>[</em><a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><em>tensorrt_llm.bindings.executor.KvCacheRetentionConfig</em></a><em>]</em><em>, </em><em>optional</em>) – Configuration for the request’s retention in the KV Cache. Defaults to None.</p></li>
 <li><p><strong>disaggregated_params</strong> (<a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>, </em><em>Sequence</em><em>[</em><a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>]</em><em>, </em><em>optional</em>) – Disaggregated parameters. Defaults to None.</p></li>
 <li><p><strong>scheduling_params</strong> (<a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><em>tensorrt_llm.scheduling_params.SchedulingParams</em></a><em>, </em><em>List</em><em>[</em><a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><em>tensorrt_llm.scheduling_params.SchedulingParams</em></a><em>]</em><em>, </em><em>optional</em>) – Scheduling parameters. Defaults to None.</p></li>
 <li><p><strong>conversation_params</strong> (<a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><em>tensorrt_llm.conversation_params.ConversationParams</em></a><em>, </em><em>List</em><em>[</em><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><em>tensorrt_llm.conversation_params.ConversationParams</em></a><em>]</em><em>, </em><em>optional</em>) – Conversation parameters. Defaults to None.</p></li>
 <li><p><strong>cache_salt</strong> (<em>str</em><em>, </em><em>Sequence</em><em>[</em><em>str</em><em>]</em><em>, </em><em>optional</em>) – If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</p></li>
 <li><p><strong>priority</strong> (<em>float</em><em>, </em><em>List</em><em>[</em><em>float</em><em>]</em>) – The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</p></li>
+<li><p><strong>kv_hints</strong> (<em>tensorrt_llm.kv_hints.protocol.KvHintsInput</em><em>, </em><em>List</em><em>[</em><em>Optional</em><em>[</em><em>tensorrt_llm.kv_hints.protocol.KvHintsInput</em><em>]</em><em>]</em><em>, </em><em>optional</em>) – Prototype typed or raw JSON KV hint metadata. A scalar repeats the same envelope and message_id for every prompt; an aligned list supplies per-prompt hints. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Transporting hints does not execute actions. Defaults to None.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -1000,6 +1009,7 @@ A default one will be used if not provided.</p></li>
 <dd><em class="sig-param"><span class="n"><span class="pre">conversation_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><span class="pre">ConversationParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cache_salt</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">priority</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.5</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_hints</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="KvHintsEnvelope.html#tensorrt_llm.llmapi.KvHintsEnvelope" title="tensorrt_llm.kv_hints.protocol.KvHintsEnvelope"><span class="pre">KvHintsEnvelope</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">JsonValue</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate_async" title="Link to this definition">#</a></dt>
@@ -1012,7 +1022,7 @@ Asynchronous generation accepts single prompt only.</p>
 <li><p><strong>sampling_params</strong> (<a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><em>tensorrt_llm.sampling_params.SamplingParams</em></a><em>, </em><em>optional</em>) – The sampling params for the generation. Defaults to None.
 A default one will be used if not provided.</p></li>
 <li><p><strong>lora_request</strong> (<a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><em>tensorrt_llm.executor.request.LoRARequest</em></a><em>, </em><em>optional</em>) – LoRA request to use for generation, if any. Defaults to None.</p></li>
-<li><p><strong>prompt_adapter_request</strong> (<em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>, </em><em>optional</em>) – Prompt Adapter request to use for generation, if any. Defaults to None.</p></li>
+<li><p><strong>prompt_adapter_request</strong> (<em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>, </em><em>optional</em>) – Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.</p></li>
 <li><p><strong>streaming</strong> (<em>bool</em>) – Whether to use the streaming mode for the generation. Defaults to False.</p></li>
 <li><p><strong>kv_cache_retention_config</strong> (<a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><em>tensorrt_llm.bindings.executor.KvCacheRetentionConfig</em></a><em>, </em><em>optional</em>) – Configuration for the request’s retention in the KV Cache. Defaults to None.</p></li>
 <li><p><strong>disaggregated_params</strong> (<a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>, </em><em>optional</em>) – Disaggregated parameters. Defaults to None.</p></li>
@@ -1021,6 +1031,7 @@ A default one will be used if not provided.</p></li>
 <li><p><strong>conversation_params</strong> (<a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><em>tensorrt_llm.conversation_params.ConversationParams</em></a><em>, </em><em>optional</em>) – Conversation parameters. Defaults to None.</p></li>
 <li><p><strong>cache_salt</strong> (<em>str</em><em>, </em><em>optional</em>) – If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</p></li>
 <li><p><strong>priority</strong> (<em>float</em>) – The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</p></li>
+<li><p><strong>kv_hints</strong> (<em>tensorrt_llm.kv_hints.protocol.KvHintsInput</em><em>, </em><em>optional</em>) – Prototype typed or raw JSON KV hint metadata from a trusted caller. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Payloads are transported without executing actions or selecting a source. Defaults to None.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -1413,7 +1424,7 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -1471,8 +1482,8 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -1544,9 +1555,9 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

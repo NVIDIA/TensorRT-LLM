@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/kv-cache-connector';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KV Cache Connector</span></li>
@@ -685,7 +689,7 @@
 <h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h2>
 <p>The connector architecture is split into two main components:</p>
 <ul class="simple">
-<li><p><strong>Scheduler (Leader)</strong>: Responsible for orchestration. It decides <em>what</em> needs to be loaded or saved and builds metadata instructions. It runs only on the leader rank (rank 0).</p></li>
+<li><p><strong>Scheduler (Leader)</strong>: Responsible for orchestration. It decides <em>what</em> needs to be loaded or saved and builds metadata instructions. Without attention DP, it runs only on the leader rank (rank 0). With attention DP, each owner rank runs its own scheduler; see <a class="reference internal" href="#attention-data-parallelism">Attention data parallelism</a>.</p></li>
 <li><p><strong>Worker</strong>: Responsible for execution. It receives metadata from the scheduler and performs the actual data transfers (loading/saving) on the KV cache tensors. It runs on all ranks.</p></li>
 </ul>
 <section id="api-reference">
@@ -693,13 +697,14 @@
 <p>To implement a custom connector, you must subclass <code class="docutils literal notranslate"><span class="pre">KvCacheConnectorScheduler</span></code> and <code class="docutils literal notranslate"><span class="pre">KvCacheConnectorWorker</span></code>.</p>
 <section id="scheduler-leader-interface-kvcacheconnectorscheduler">
 <h4>1. Scheduler (Leader) Interface (<code class="docutils literal notranslate"><span class="pre">KvCacheConnectorScheduler</span></code>)<a class="headerlink" href="#scheduler-leader-interface-kvcacheconnectorscheduler" title="Link to this heading">#</a></h4>
-<p>These methods run on the leader process and drive the connector’s behavior.</p>
+<p>These methods drive the connector’s behavior. Without attention DP, they run
+on the leader process; with attention DP, they run on each owning rank.</p>
 <ul>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">build_connector_meta(self,</span> <span class="pre">scheduler_output:</span> <span class="pre">SchedulerOutput)</span> <span class="pre">-&gt;</span> <span class="pre">object</span></code></strong></p>
 <ul class="simple">
 <li><p><strong>Description</strong>: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.</p></li>
-<li><p><strong>Arguments</strong>: <code class="docutils literal notranslate"><span class="pre">scheduler_output</span></code> contains information about new requests, blocks allocated, current request states, and the cumulative <code class="docutils literal notranslate"><span class="pre">RequestData.block_hashes</span></code> chain. <code class="docutils literal notranslate"><span class="pre">block_hashes</span></code> is read directly from each KV cache block’s stored hash, which the KV cache manager commits as soon as a block becomes full, so the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects <code class="docutils literal notranslate"><span class="pre">kv_connector_config</span></code> at startup when <code class="docutils literal notranslate"><span class="pre">max_beam_width</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, so connectors may assume beam-width-1 inputs.</p></li>
-<li><p><strong>Returns</strong>: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.</p></li>
+<li><p><strong>Arguments</strong>: <code class="docutils literal notranslate"><span class="pre">scheduler_output</span></code> contains information about new requests, blocks allocated, current request states, and the cumulative <code class="docutils literal notranslate"><span class="pre">RequestData.block_hashes</span></code> chain. <code class="docutils literal notranslate"><span class="pre">block_hashes</span></code> is read directly from each KV cache block’s stored hash, which the KV cache manager commits as soon as a block becomes full so the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects <code class="docutils literal notranslate"><span class="pre">kv_connector_config</span></code> at startup when <code class="docutils literal notranslate"><span class="pre">max_beam_width</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, so connectors may assume beam-width-1 inputs.</p></li>
+<li><p><strong>Returns</strong>: An arbitrary metadata object (picklable) that describes the tasks for the workers. Without attention DP, this object is broadcast to all workers. With attention DP, metadata stays local to the owning rank.</p></li>
 </ul>
 </li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">num_computed_tokens:</span> <span class="pre">int)</span> <span class="pre">-&gt;</span> <span class="pre">tuple[int,</span> <span class="pre">bool]</span></code></strong></p>
@@ -1179,6 +1184,125 @@ request in the same iteration. With chunked prefill, allocation growth can limit
 <li><p><strong>Compatibility</strong>: Legacy request-ID load and save completions continue through <code class="docutils literal notranslate"><span class="pre">get_finished</span></code>.</p></li>
 </ul>
 </li>
+</ul>
+</section>
+</section>
+</section>
+<section id="attention-data-parallelism">
+<h2>Attention data parallelism<a class="headerlink" href="#attention-data-parallelism" title="Link to this heading">#</a></h2>
+<p>Set <code class="docutils literal notranslate"><span class="pre">enable_attention_dp=True</span></code> and
+<code class="docutils literal notranslate"><span class="pre">kv_cache_config.use_kv_cache_manager_v2=True</span></code> with a connector whose <strong>scheduler and worker
+classes both declare <code class="docutils literal notranslate"><span class="pre">supports_attention_dp</span> <span class="pre">=</span> <span class="pre">True</span></code></strong>. Existing connectors that
+have not opted in are rejected before construction. No extra scheduler adapter
+configuration is required: the executor creates a scheduler and worker on each
+ADP rank, including rank 0.</p>
+<p>Each adapter owns its request lookup, allocation feedback and worker metadata.
+Connector callbacks and completion polling do not perform collectives between
+ADP owners. The current ADP mapping has one attention worker per owner (model TP
+ranks still cooperate for the non-attention computation). TP without ADP keeps
+the rank-0 scheduler and waits for all attention shards to finish a transfer.</p>
+<p>Adapters can use <strong>one shared logical storage pool</strong>. They must use distinct
+worker endpoints and owner-scoped request/transfer IDs, while using common,
+representation-compatible content keys for reusable KV. A local block ID is a
+page slot scoped to the registered local layer group, not a global address.
+Do not partition the content namespace by ADP rank: distinguish model revision,
+KV layout/dtype, block size, complete preceding prefix and cache salt instead.
+Pool capacity and placement remain the backend’s responsibility; enabling ADP
+does not turn unused peer HBM into directly usable local attention memory.</p>
+<p>The capability flag commits an implementation to these requirements:</p>
+<ul class="simple">
+<li><p>Scheduler constructors and callbacks work on nonzero ranks and never require
+all ADP owners to issue the same requests or call sequence.</p></li>
+<li><p>Workers consume only local metadata. Dummy requests do not appear in storage
+lookup, allocation feedback, metadata or request-finished callbacks. Empty
+metadata is valid, including during a dummy-only forward.</p></li>
+<li><p>Recovery can bind metadata and call <code class="docutils literal notranslate"><span class="pre">start_load_kv</span></code> multiple times in one
+iteration. Each call starts only newly bound work; prior transfers keep their
+identity and must not be launched again.</p></li>
+<li><p>Completion polling (<code class="docutils literal notranslate"><span class="pre">get_finished</span></code> and <code class="docutils literal notranslate"><span class="pre">get_finished_prefix_loads</span></code>) must be
+cheap and nonblocking: every owner is polled in recovery, as often as every
+millisecond, including owners with a ready compute batch.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_finished</span></code> reports only IDs previously provided to that worker and only
+after all transfers touching the corresponding local blocks have completed.
+Cancellation is deferred until those DMA users drain; the generic API does
+not provide a transport abort operation.</p></li>
+<li><p>Prefix reservations and their completion IDs are owner-local. The runtime
+applies <code class="docutils literal notranslate"><span class="pre">get_finished_prefix_loads</span></code> locally, without a rank-zero broadcast,
+and includes accepted loads in cancellation, deadline and idle accounting.</p></li>
+<li><p>Independently arriving writers/readers share content safely, with complete
+publication, compatible representations and backend pinning during reads.</p></li>
+</ul>
+<p>Async loading may remove every real request from an owner’s scheduled batch.
+The executor attempts to add a compute dummy so other owners can advance while
+the transfer proceeds. If the owner has no dummy capacity or sequence slot,
+it polls local transfer completion until at least one request is ready, then
+runs the already-prepared batch. Owners exchange readiness and failure status
+at an executor gate during this fallback; their V2 allocations and connector
+plans are preserved. Each outstanding asynchronous load or save has a persistent
+deadline (<code class="docutils literal notranslate"><span class="pre">kv_connector_config.transfer_timeout_sec</span></code>, default 600 seconds),
+checked during normal iterations as well as this recovery
+loop. Dummy or unrelated compute does not reset that deadline. Shutdown or
+cancellation shortens the remaining wait to at most
+<code class="docutils literal notranslate"><span class="pre">kv_connector_config.control_grace_sec</span></code> (default 60 seconds), allowing a
+healthy transfer to drain normally. These checks run at the next polling gate;
+they cannot interrupt a running forward pass or blocking callback. Both settings
+must be positive and finite, apply only to ADP, and can be increased for slower
+backends. Control grace never extends an existing transfer deadline.</p>
+<p>Shutdown continues polling outstanding saves after the last compute request
+finishes. All ADP owners participate until transfers drain, then the executor
+joins its worker and performs normal resource teardown. Cancellation likewise
+waits for transfer completion before releasing a request’s KV memory. If the
+transfer exceeds the control grace, even a single canceled request can require
+an executor restart; configure the grace for the backend’s expected drain time.</p>
+<p>Pending transfers keep fleet-wide polling active even after the last response,
+without requiring new traffic or a shutdown request. When no owner has pending
+work, the existing routing exchange avoids an additional transfer-status vote.</p>
+<p>A timeout or polling exception fails all owners through a rank-synchronized
+gate. Exceptions inside forward/layer hooks fail through the executor’s crash
+supervisor (<code class="docutils literal notranslate"><span class="pre">start_rank_crash_kill_watchdog</span></code> / <code class="docutils literal notranslate"><span class="pre">hard_kill_on_rank_crash</span></code>),
+which propagates MPI abort or process kills to unblock peers in collectives. Ordinary error
+cleanup cannot release a request with pending connector transfers. Pending
+transfer memory has a process-wide strong owner, surviving worker shutdown and
+garbage collection. Thread/listener cleanup still runs; unsafe device/resource
+teardown is skipped. Restarting the process is required because the generic connector API cannot abort DMA safely. Request-only
+recovery would retain an unbounded number of KV pages and sequence slots after
+repeated stalls, and a backend error does not establish which transfers remain
+reliable. The conservative policy therefore stops the fleet at a bounded
+deadline instead of admitting further requests into a potentially damaged
+worker. The larger defaults allow slow storage and cancellation drains; tune
+them for the backend. Non-ADP behavior has no new transfer deadline. Workers
+must keep asynchronous start/poll callbacks nonblocking; a callback that itself
+hangs remains subject to the executor’s hang detector.</p>
+<p>ADP requires <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code>; an explicit V1 selection is rejected before
+connector construction, and an automatic selection that resolves to V1 is
+rejected after the manager is built. V1 connector behavior remains unchanged.
+PP=1, CP=1 and beam width 1 are required. V2 layer-group layout and callbacks
+are used directly. A backend must implement both grouped callbacks for multiple
+layer groups; the existing layout validation remains in place. Internal host
+or disk tiers, speculative decoding and Mamba/hybrid state remain unsupported.
+This change adds no Mooncake backend, deployment configuration or capacity tuning.</p>
+<p>Select a connector through <code class="docutils literal notranslate"><span class="pre">connector_module</span></code>, <code class="docutils literal notranslate"><span class="pre">connector_scheduler_class</span></code>,
+and <code class="docutils literal notranslate"><span class="pre">connector_worker_class</span></code> as usual. Both classes must opt in; enabling ADP
+does not make an existing third-party connector owner-local automatically.
+<code class="docutils literal notranslate"><span class="pre">examples/llm-api/llm_kv_cache_connector_adp.py</span></code> provides an opted-in filesystem
+example, with stable SHA-256 keys covering the complete prefix and cache salt,
+and atomic publication of completed files. It inherits the existing example
+without changing it. Point every owner at the same <code class="docutils literal notranslate"><span class="pre">CONNECTOR_CACHE_FOLDER</span></code>,
+using a dedicated directory per model revision and KV representation.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">use_kv_cache_manager_v2</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">kv_connector_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">connector_module</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">llm_kv_cache_connector_adp</span>
+<span class="w">  </span><span class="nt">connector_scheduler_class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PersistentKvCacheConnectorLeader</span>
+<span class="w">  </span><span class="nt">connector_worker_class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PersistentKvCacheConnectorWorker</span>
+</pre></div>
+</div>
+<p>Add <code class="docutils literal notranslate"><span class="pre">examples/llm-api</span></code> to <code class="docutils literal notranslate"><span class="pre">PYTHONPATH</span></code>. The example supports one full-attention
+layer group and no chunked prefill; it demonstrates shared storage, not
+production transfer performance.</p>
+<ul class="simple">
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">shutdown(self)</span></code></strong></p>
 <ul>
 <li><p><strong>Description</strong>: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor’s worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker’s resources live as long as the process, so engines built back to back in one session accumulate them.</p></li>
@@ -1190,8 +1314,6 @@ request in the same iteration. With chunked prefill, allocation growth can limit
 </ul>
 </li>
 </ul>
-</section>
-</section>
 </section>
 <section id="example-implementation">
 <h2>Example Implementation<a class="headerlink" href="#example-implementation" title="Link to this heading">#</a></h2>
@@ -1473,7 +1595,7 @@ needs neither, since it registers no pages.</p>
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -1507,6 +1629,7 @@ needs neither, since it registers no pages.</p>
 </li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-data-parallelism">Attention data parallelism</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example-implementation">Example Implementation</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implementation-details">Implementation Details</a></li>
@@ -1542,8 +1665,8 @@ needs neither, since it registers no pages.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -1615,9 +1738,9 @@ needs neither, since it registers no pages.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'installation/build-from-source';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     
@@ -694,7 +698,7 @@ git<span class="w"> </span>lfs<span class="w"> </span>pull
 <section id="step-2-pull-the-development-container">
 <h2>Step 2: Pull the Development Container<a class="headerlink" href="#step-2-pull-the-development-container" title="Link to this heading">#</a></h2>
 <p>Pull the pre-built TensorRT LLM <code class="docutils literal notranslate"><span class="pre">devel</span></code> container from NGC. Replace <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> with the desired version. Browse the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags">available tags on NGC</a> to find the latest release.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc2
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc3
 </pre></div>
 </div>
 </section>
@@ -707,7 +711,7 @@ git<span class="w"> </span>lfs<span class="w"> </span>pull
 <span class="w">        </span>--gpus<span class="o">=</span>all<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--volume<span class="w"> </span>&lt;path_to_tensorrt_llm_on_host&gt;:&lt;path_to_tensorrt_llm_in_container&gt;<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--workdir<span class="w"> </span>&lt;path_to_tensorrt_llm_in_container&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc2
+<span class="w">        </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc3
 </pre></div>
 </div>
 <div class="dropdown note admonition">
@@ -725,7 +729,7 @@ git<span class="w"> </span>lfs<span class="w"> </span>pull
 <section id="typical-development-build">
 <h3>Typical development build<a class="headerlink" href="#typical-development-build" title="Link to this heading">#</a></h3>
 <p>Build the C++ code, skip wheel packaging, and use symlinks so that changes are reflected immediately. Then install in editable mode for Python development.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/build_wheel.py<span class="w"> </span>--use_ccache<span class="w"> </span>-a<span class="w"> </span><span class="s2">"90-real"</span><span class="w"> </span>--skip_building_wheel<span class="w"> </span>--linking_install_binary
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/build_wheel.py<span class="w"> </span>--use_ccache<span class="w"> </span>-a<span class="w"> </span><span class="s2">"90"</span><span class="w"> </span>--skip_building_wheel<span class="w"> </span>--linking_install_binary
 pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
 </pre></div>
 </div>
@@ -740,7 +744,7 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--use_ccache</span></code></p></td>
 <td><p>Use ccache for faster incremental rebuilds</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">-a</span> <span class="pre">&quot;90-real&quot;</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">-a</span> <span class="pre">&quot;90&quot;</span></code></p></td>
 <td><p>Build only for a specific GPU architecture (e.g. Hopper). Reduces compile time significantly. See <a class="reference internal" href="../supported-hardware.html"><span class="std std-doc">Supported Hardware</span></a> for values.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--skip_building_wheel</span></code></p></td>
@@ -755,6 +759,13 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
 </tbody>
 </table>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">-a</span></code> (<code class="docutils literal notranslate"><span class="pre">--cuda_architectures</span></code>) lists the <strong>exact</strong> GPU architectures the build supports, as plain
+SM numbers separated by <code class="docutils literal notranslate"><span class="pre">;</span></code> (for example <code class="docutils literal notranslate"><span class="pre">&quot;90;100&quot;</span></code>). Each listed architecture is built with its
+fully optimized kernels; an architecture that is not listed is not supported by the build, even if
+it could run some kernels through family compatibility (for example, an SM 100 only build does not
+support SM 107). Do not add <code class="docutils literal notranslate"><span class="pre">-real</span></code>, <code class="docutils literal notranslate"><span class="pre">a</span></code> or <code class="docutils literal notranslate"><span class="pre">f</span></code> suffixes: the build picks the right variant for
+every architecture and warns about suffixed entries. Without <code class="docutils literal notranslate"><span class="pre">-a</span></code>, all supported architectures are
+built.</p>
 </section>
 <section id="other-common-options">
 <h3>Other common options<a class="headerlink" href="#other-common-options" title="Link to this heading">#</a></h3>
@@ -785,7 +796,7 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
 <h3>Building from a checkout on a network filesystem<a class="headerlink" href="#building-from-a-checkout-on-a-network-filesystem" title="Link to this heading">#</a></h3>
 <p>Network filesystems (Lustre, NFS, GPFS) handle large streaming I/O well but are slow for metadata-heavy workloads. A full build creates a very large number of small files (CMake state, object files, downloaded dependencies, the build virtual environment, wheel staging), so keeping that state in the checkout makes builds on such filesystems far slower than necessary.</p>
 <p>Pass <code class="docutils literal notranslate"><span class="pre">--build_root</span></code> (or set the <code class="docutils literal notranslate"><span class="pre">TRTLLM_BUILD_ROOT</span></code> environment variable) to keep all high-churn build state on fast local storage while the checkout stays on shared storage:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/build_wheel.py<span class="w"> </span>--build_root<span class="w"> </span>/tmp/trtllm-build<span class="w"> </span>--use_ccache<span class="w"> </span>-a<span class="w"> </span><span class="s2">"90-real"</span><span class="w"> </span>--skip_building_wheel<span class="w"> </span>--linking_install_binary
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/build_wheel.py<span class="w"> </span>--build_root<span class="w"> </span>/tmp/trtllm-build<span class="w"> </span>--use_ccache<span class="w"> </span>-a<span class="w"> </span><span class="s2">"90"</span><span class="w"> </span>--skip_building_wheel<span class="w"> </span>--linking_install_binary
 </pre></div>
 </div>
 <p>With <code class="docutils literal notranslate"><span class="pre">--build_root</span> <span class="pre">&lt;dir&gt;</span></code> set, the following default under <code class="docutils literal notranslate"><span class="pre">&lt;dir&gt;</span></code> instead of the checkout:</p>
@@ -827,7 +838,7 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
 <section id="out-of-tree-wheel-builds-read-only-checkout">
 <h4>Out-of-tree wheel builds (read-only checkout)<a class="headerlink" href="#out-of-tree-wheel-builds-read-only-checkout" title="Link to this heading">#</a></h4>
 <p>For CI or ephemeral-node workflows that only need a wheel, add <code class="docutils literal notranslate"><span class="pre">--out-of-tree</span></code> to guarantee the checkout is never written — it can even be mounted read-only:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/build_wheel.py<span class="w"> </span>--build_root<span class="w"> </span>/tmp/trtllm-build<span class="w"> </span>--out-of-tree<span class="w"> </span>--use_ccache<span class="w"> </span>-a<span class="w"> </span><span class="s2">"90-real"</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/build_wheel.py<span class="w"> </span>--build_root<span class="w"> </span>/tmp/trtllm-build<span class="w"> </span>--out-of-tree<span class="w"> </span>--use_ccache<span class="w"> </span>-a<span class="w"> </span><span class="s2">"90"</span>
 </pre></div>
 </div>
 <p>In this mode the generated FMHA kernel sources and the configured <code class="docutils literal notranslate"><span class="pre">version.h</span></code> go to the build tree (via the <code class="docutils literal notranslate"><span class="pre">TRTLLM_FMHA_GEN_DIR</span></code> and <code class="docutils literal notranslate"><span class="pre">TRTLLM_VERSION_H_INCLUDE_DIR</span></code> CMake variables), and the wheel is assembled from a staging copy of the Python package under <code class="docutils literal notranslate"><span class="pre">&lt;build_root&gt;/package</span></code>, landing in <code class="docutils literal notranslate"><span class="pre">&lt;build_root&gt;/dist</span></code> by default. Submodules and git-lfs content must be materialized before the build (the usual <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">submodule</span> <span class="pre">update</span> <span class="pre">--init</span> <span class="pre">--recursive</span></code>), since the build will not modify the checkout. Editable-install workflows (<code class="docutils literal notranslate"><span class="pre">--skip_building_wheel</span></code>, <code class="docutils literal notranslate"><span class="pre">--linking_install_binary</span></code>, <code class="docutils literal notranslate"><span class="pre">--install</span></code>) are incompatible with <code class="docutils literal notranslate"><span class="pre">--out-of-tree</span></code>: they import compiled artifacts from the checkout by design. <code class="docutils literal notranslate"><span class="pre">--version-override</span></code> is also incompatible, since it edits <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/version.py</span></code> in the checkout.</p>
@@ -889,7 +900,7 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -936,8 +947,8 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -1009,9 +1020,9 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

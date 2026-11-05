@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/model-express';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">ModelExpress (MX) Checkpoint Loading</span></li>
@@ -741,14 +745,31 @@ profiles:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm-phi3-dense-target-layout-v1</span></code></p></td>
 <td><p>Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_5-for-conditional-generation-bf16-complete-v1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5VLModel</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3_5</span></code></p></td>
+<td><p>Complete model</p></td>
+<td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-qwen3_5-dense-vl-complete-layout-v1</span></code></p></td>
+<td><p>Single-node dense BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
+</tr>
 </tbody>
 </table>
 </div>
 <p>The registry matches the exact root class, the architecture/model type captured
-from the resolved config before model construction, and any runtime constraints
+from the resolved config before model construction, the transfer scope that
+<code class="docutils literal notranslate"><span class="pre">ModelLoader</span></code> derives from the constructed root, and any runtime constraints
 declared by the profile. An unregistered subclass, config alias, or undeclared
 runtime variant does not inherit support. It falls back to the standard Hugging
 Face checkpoint path before any P2P transfer starts.</p>
+<p>The Scope column names the part of the model that one transfer carries. A
+text-only root transfers the target model. A multimodal root transfers the
+complete model when it owns its multimodal encoder, which is the aggregated
+serving case. With <code class="docutils literal notranslate"><span class="pre">disable_mm_encoder</span></code>, or in multimodal encoder/prefill
+disaggregation (<code class="docutils literal notranslate"><span class="pre">TLLM_MULTIMODAL_DISAGGREGATED=1</span></code>), the root holds only its
+language model; that scope is not qualified, so those workers fall back.
+Encoder-only workers (<code class="docutils literal notranslate"><span class="pre">mm_encoder_only</span></code>) build the vision-encoder root, which is
+not registered, and fall back too.</p>
 <p>The Qwen2 identity includes Qwen2 and Qwen2.5 dense checkpoints that resolve to
 the exact <code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen2</span></code> pair and satisfy the constraints above.
 Other Qwen roots and variants, including checkpoints with tied embeddings, do
@@ -788,6 +809,20 @@ values therefore get different model fingerprints: the receiver logs a
 even though no transferred weight of a default-RoPE checkpoint depends on the
 value. Until the model code stops recording it, run both sides with the same
 <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>.</p>
+<p>The Qwen3.5 dense vision-language identity covers Hugging Face-format
+checkpoints that resolve to the exact <code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code> /
+<code class="docutils literal notranslate"><span class="pre">qwen3_5</span></code> pair, served with the vision encoder in the same instance.
+Qwen3.5-9B is the qualified canary and the only checkpoint that the
+donor/receiver rows cover. Checkpoints with tied embeddings, such as
+Qwen3.5-0.8B, 2B, and 4B, quantized checkpoints such as the FP8 and NVFP4
+variants, the Qwen3.5 MoE vision-language root, the text-only
+<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForCausalLM</span></code> root, and the Qwen3-VL roots do not match this profile.
+The root sizes its M-RoPE buffers by <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> (and the PP size), and
+<code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> hashes every realized buffer shape, so a donor and a receiver
+must use the same <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> to share weights. The vision configuration
+is bound by the checkpoint artifact identity and the realized vision parameter
+shapes rather than by the model fingerprint, which hashes the text
+configuration.</p>
 <p>TensorRT LLM applies two independent compatibility gates:</p>
 <ul class="simple">
 <li><p>The qualification profile records that a model/config/lifecycle combination
@@ -819,6 +854,12 @@ sliding-window checkpoints such as Ministral fall back to the Hugging Face path
 until they are qualified separately. The profiles do not constrain MoE-only
 backend and mapping settings because these dense roots do not consume them.
 <code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> still requires donor and receiver configurations to match.</p>
+<p>The Qwen3.5 dense vision-language profile carries the vision encoder together
+with the language model and realizes interleaved M-RoPE (<code class="docutils literal notranslate"><span class="pre">rope_type=mrope</span></code>),
+applied by the fused QK-norm/RoPE kernel (<code class="docutils literal notranslate"><span class="pre">rope_fusion=False</span></code>). A YaRN
+<code class="docutils literal notranslate"><span class="pre">rope_parameters</span></code> entry also realizes <code class="docutils literal notranslate"><span class="pre">mrope</span></code>, so the RoPE constraint alone does
+not exclude it; the transferred tensor layout is the same, and <code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code>
+still requires donor and receiver configurations to match.</p>
 <section id="adding-a-model-family">
 <h3>Adding a Model Family<a class="headerlink" href="#adding-a-model-family" title="Link to this heading">#</a></h3>
 <p>Support for another model family requires a focused qualification change:</p>
@@ -833,7 +874,11 @@ changing aliases, derived state, tensor layout, or outputs.</p></li>
 <li><p>Add an exact qualification profile only after the reusable harness in
 <code class="docutils literal notranslate"><span class="pre">tests/unittest/utils/post_transform_qualification.py</span></code> proves tensor,
 alias, transform-guard, derived-state, and deterministic output
-equivalence. Include an unregistered-root negative control.</p></li>
+equivalence. Include an unregistered-root negative control. Set the
+case’s <code class="docutils literal notranslate"><span class="pre">prepare_producer</span></code> so the producer runs the family’s real
+<code class="docutils literal notranslate"><span class="pre">load_weights()</span></code>; without it the harness cannot see state that only the
+load path or the weight mapper sets, which a staged receiver never
+computes.</p></li>
 <li><p>Cover compatible transfer, source-identity mismatch, unsupported layout or
 protocol/ABI, no-disk staged reception, and unqualified-profile fallback.
 Keep target-plus-draft loading disabled unless that combination has its own
@@ -843,6 +888,10 @@ being claimed, including the supported quantization and TP/PP/EP layouts.
 Compare deterministic output token IDs with the standard Hugging Face load
 path, and require the per-rank weight manifests to match (see the
 qualification test below), before documenting the family as supported.</p></li>
+<li><p>For a multimodal root, audit the encoder’s hooks and load path as well, and
+register the scope that was qualified. <code class="docutils literal notranslate"><span class="pre">ModelLoader</span></code> derives the scope from
+parameter ownership: the complete model when the root owns parameters
+outside its language model, and the language model otherwise.</p></li>
 </ol>
 </section>
 <section id="qualification-test">
@@ -855,7 +904,12 @@ weight shards. A positive result therefore requires direct transfer; disk
 fallback cannot accidentally satisfy the test.</p>
 <p>Each role generates eight fixed prompts for exactly 32 greedy tokens
 (<code class="docutils literal notranslate"><span class="pre">end_id=-1</span></code>, so no sequence stops early), and the test requires exact
-token-ID equality of the donor and the receiver against the HF baseline.</p>
+token-ID equality of the donor and the receiver against the HF baseline.
+Vision-language rows use an image probe instead of token-ID prompts: each of
+<code class="docutils literal notranslate"><span class="pre">seashore.png</span></code> and <code class="docutils literal notranslate"><span class="pre">inpaint.png</span></code> from <code class="docutils literal notranslate"><span class="pre">LLM_MODELS_ROOT/multimodals/test_data</span></code>
+is asked the same four questions, so every role also runs the vision encoder
+and M-RoPE positions, with the same 32-token greedy equality and the same
+engine limits for all roles.</p>
 <p><strong>Weight manifests.</strong> Every rank also writes a SHA-256 manifest of all
 registered parameters and buffers
 (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/weight_sharing/weight_manifest.py</span></code>) when
@@ -897,12 +951,13 @@ results archive even when the test fails. The test also prints one
 durations.</p>
 <p>Run the TP=2 rank-mapping qualification on four GPUs by selecting
 <code class="docutils literal notranslate"><span class="pre">llama-bf16-tp2</span></code>. <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_LLAMA_MODEL</span></code> can override the default TinyLlama
-checkpoint path. The Qwen2, Qwen3, Mistral, and Phi3 profile rows use
+checkpoint path. The Qwen2, Qwen3, Mistral, Phi3, and Qwen3.5 profile rows use
 <code class="docutils literal notranslate"><span class="pre">qwen2-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen2-bf16-tp2</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3-bf16-tp2</span></code>,
-<code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp2</span></code>, and <code class="docutils literal notranslate"><span class="pre">phi3-bf16-tp1</span></code> /
-<code class="docutils literal notranslate"><span class="pre">phi3-bf16-tp2</span></code>, with optional model path overrides in
-<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN2_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_MISTRAL_MODEL</span></code>,
-and <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_PHI3_MODEL</span></code>.
+<code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp2</span></code>, <code class="docutils literal notranslate"><span class="pre">phi3-bf16-tp1</span></code> /
+<code class="docutils literal notranslate"><span class="pre">phi3-bf16-tp2</span></code>, and <code class="docutils literal notranslate"><span class="pre">qwen3_5-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3_5-bf16-tp2</span></code>, with optional
+model path overrides in <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN2_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_MODEL</span></code>,
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_MISTRAL_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_PHI3_MODEL</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_5_MODEL</span></code>.
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_REQUIRED=1</span></code> converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
@@ -991,8 +1046,10 @@ HF baseline evaluation because the reference value is that baseline.</p>
 PyTorch backend. The Qwen3 GSM8K entry is the one gated by
 <code class="docutils literal notranslate"><span class="pre">tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B</span></code>,
 so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
-Qwen2, or Mistral checkpoint has such a reference today, so those families are
-covered by their smoke rows until one is added.</p>
+Qwen2, Mistral, Phi3, or Qwen3.5 checkpoint has such a reference today, so
+those families are covered by their smoke rows until one is added. A Qwen3.5
+canary must also size its donor exactly like its receiver, because
+<code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> binds <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> for that root.</p>
 <p>The rows are registered as <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> entries in
 <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/l0_model_express.yml</span></code>, so they run in
 <code class="docutils literal notranslate"><span class="pre">DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1</span></code> on every main commit and
@@ -1144,10 +1201,10 @@ path.</p>
 <h2>Notes and Limitations<a class="headerlink" href="#notes-and-limitations" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p>Post-transform MX reception is currently limited to the exact Llama,
-Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, and Phi3 dense profiles
-above. Other roots and variants that do not match the documented identity and
-runtime envelope safely fall back to Hugging Face loading until explicitly
-qualified.</p></li>
+Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, Phi3 dense, and Qwen3.5
+dense vision-language profiles above. Other roots and variants that do not
+match the documented identity and runtime envelope safely fall back to
+Hugging Face loading until explicitly qualified.</p></li>
 <li><p>Mistral checkpoints served through the native <code class="docutils literal notranslate"><span class="pre">mistral</span></code> checkpoint format
 (<code class="docutils literal notranslate"><span class="pre">mistral_common</span></code> model type), sliding-window or Ministral <code class="docutils literal notranslate"><span class="pre">layer_types</span></code>
 variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
@@ -1155,6 +1212,10 @@ are not qualified and use the Hugging Face fallback.</p></li>
 <li><p>Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and Phi-4-mini),
 tied-embedding variants, and the Phi-3-small, vision, MoE, and Phi4MM
 multimodal roots are not qualified and use the Hugging Face fallback.</p></li>
+<li><p>Qwen3.5 vision-language checkpoints fall back when they run with speculative
+decoding (MTP or DFlash), without a local vision encoder (<code class="docutils literal notranslate"><span class="pre">disable_mm_encoder</span></code>
+or multimodal encoder/prefill disaggregation), as encoder-only workers, with
+tied embeddings, or with quantized weights.</p></li>
 <li><p>The MX server and Redis lifecycle is external to TensorRT LLM. Every
 TensorRT LLM instance must be able to reach the configured MX server URL.</p></li>
 <li><p>The MX server coordinates source discovery but does not store model weights.
@@ -1205,7 +1266,7 @@ is already registered.</p></li>
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -1247,8 +1308,8 @@ is already registered.</p></li>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -1320,9 +1381,9 @@ is already registered.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       
