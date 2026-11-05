@@ -40,6 +40,30 @@ def mod():
     return module
 
 
+def test_collect_multinode_yaml_entries(mod, tmp_path):
+    path = tmp_path / "multinode.yml"
+    path.write_text(
+        "tests:\n"
+        "  - case: accuracy/test_model.py::TestModel::test_accuracy[baseline]\n"
+        "    launch:\n"
+        "      mode: mpi\n"
+        "      world_size: 16\n"
+        "  - case: test_e2e.py::test_disagg\n"
+        "    launch:\n"
+        "      mode: per_node\n"
+        "      nodes: 2\n"
+        "      tasks_per_node: 1\n"
+        "      gpus_per_node: 4\n",
+        encoding="utf-8",
+    )
+    entries, malformed = mod.collect_entries(str(tmp_path))
+    assert not malformed
+    assert dict(entries) == {
+        ("accuracy/test_model.py", "TestModel", "test_accuracy", "baseline"): [f"{path}:2"],
+        ("test_e2e.py", None, "test_disagg", None): [f"{path}:6"],
+    }
+
+
 def _index(mod, tmp_path, src: str, name: str = "mod_under_test.py"):
     """Write ``src`` to a temp file and return build_ast_index's result."""
     p = tmp_path / name
