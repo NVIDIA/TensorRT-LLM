@@ -6215,7 +6215,8 @@ class PyExecutor:
         non-ADP TP, PP > 1, CP, aggregated ADP (no transceiver, so no
         loop-head vote exists), in-flight cancel (world poison all-reduce), KV
         connectors (second _can_queue), benchmark disagg, speculative decoding
-        / drafters, enable_early_first_token_response, conditional attention DP and
+        / drafters, enable_early_first_token_response, iteration stats (their
+        payload is variable-width and holds a float), conditional attention DP and
         KV-load routing telemetry.
         """
         attention_dp_config = self.llm_args.attention_dp_config
@@ -6248,6 +6249,8 @@ class PyExecutor:
             inactive_reasons.append("speculative decoding")
         if self.enable_early_first_token_response:
             inactive_reasons.append("enable_early_first_token_response")
+        if self.enable_iter_perf_stats:
+            inactive_reasons.append("enable_iter_perf_stats")
         if not hasattr(self.model_engine, "make_graph_batch"):
             inactive_reasons.append("engine without make_graph_batch")
         if not hasattr(getattr(self, "adp_router", None),
@@ -7017,12 +7020,15 @@ class PyExecutor:
         if pending.control_requires_drain:
             drained = self._control_drain_ready(transfers_in_flight,
                                                 connector_pending)
-            if self.enable_attention_dp and self.dist.world_size != 1:
+            if (self.enable_attention_dp and self.dist.world_size != 1
+                    or self._dist_size(self.dist, "tp_size") > 1):
                 # Attention-DP ranks drain independently (per-rank queues). A
                 # rank that fires alone parks its loop while its peers still
                 # need it for the per-iteration ADP exchanges, so vote and fire
-                # only when every rank is drained. All ranks reach this point
-                # in every iteration while the control request is pending.
+                # only when every rank is drained. Replicated TP ranks vote too:
+                # the KV-transfer deadline is wall-clock, so they could cross it
+                # in different iterations. All ranks reach this point in every
+                # iteration while the control request is pending.
                 drained = all(self.dist.tp_allgather(int(drained)))
             if not drained:
                 return
@@ -8777,7 +8783,8 @@ class PyExecutor:
                     forward_work=(len(context_ids), len(generation_ids))
                     if remote_tail_adp else None,
                     num_pending_new_requests=num_pending_new_requests,
-                    include_kv_cache_load=self._kv_load_tracker.enabled)
+                    include_kv_cache_load=self._kv_load_tracker.enabled,
+                    iter_stats_enabled=self.enable_iter_perf_stats)
                 if remote_tail_adp:
                     self._select_remote_tail_phase(all_rank_states, context_ids,
                                                    generation_ids)

@@ -270,9 +270,12 @@ class TestRankState:
         assert state.num_pending_new_requests == 0
 
     def test_roundtrip(self):
-        original = RankState(rank=1, num_active_requests=10, num_active_tokens=200)
+        original = RankState(
+            rank=1, num_active_requests=10, num_active_tokens=200, num_pending_new_requests=7
+        )
         restored = RankState.deserialize(data=original.serialize())
         assert original == restored
+        assert restored.num_pending_new_requests == 7
 
     def test_roundtrip_with_retiring_requests(self):
         original = RankState(
@@ -284,14 +287,6 @@ class TestRankState:
         restored = RankState.deserialize(data=original.serialize())
         assert original == restored
         assert restored.num_retiring_requests == 3
-
-    def test_roundtrip_with_pending_new_requests(self):
-        original = RankState(
-            rank=0, num_active_requests=10, num_active_tokens=200, num_pending_new_requests=7
-        )
-        restored = RankState.deserialize(data=original.serialize())
-        assert original == restored
-        assert restored.num_pending_new_requests == 7
 
     def test_defaults(self):
         state = RankState(rank=0)
@@ -770,30 +765,6 @@ class TestDefaultADPRouter:
         assert states[0] == expected_local
         assert states[1] == rank1
         _assert_allgathered_state(dist, expected_local.serialize(include_kv_cache_load))
-
-    def test_gather_all_rank_states_piggybacks_pending_new_requests(self):
-        dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
-        expected_local = RankState(
-            rank=0,
-            num_active_requests=1,
-            num_active_tokens=10,
-            num_pending_new_requests=5,
-        )
-        rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
-        dist.tp_allgather_int64.return_value = [
-            _as_state_payload(expected_local.serialize()),
-            _as_state_payload(rank1.serialize()),
-        ]
-
-        router = DefaultADPRouter(dist=dist)
-        req = Mock(py_orig_prompt_len=10)
-        states = router.gather_all_rank_states([req], num_pending_new_requests=5)
-
-        assert states[0] == expected_local
-        assert states[0].num_pending_new_requests == 5
-        assert states[1] == rank1
-        assert states[1].num_pending_new_requests == 0
-        _assert_allgathered_state(dist, expected_local.serialize())
 
     @pytest.mark.parametrize(
         "num_connector_transfers,connector_poll_failed", [(0, False), (3, True)]

@@ -81,46 +81,71 @@ def test_all_layer_reset_matches_per_layer_loop(ssm_dtype):
             assert torch.equal(pool[layer, slot], original[layer, slot])
 
 
-class _Meta:
-    prefill_needs_state_reset = False
-    state_reset_done = False
+@needs_cuda
+def test_reset_prefill_states_runs_once_per_iteration_on_the_real_pool():
+    """The first GDN layer clears every layer's slots; later layers and gated-off iterations leave the pool alone."""
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 
-
-def test_reset_prefill_states_gate_and_hoist(monkeypatch):
-    """No launch when nothing needs a reset; one all-layer launch per iteration otherwise."""
-    from tensorrt_llm._torch.modules.mamba import gdn_mixer as gm
-
-    calls = []
-    monkeypatch.setattr(gm, "_reset_gdn_states_all_layers", lambda *a: calls.append("all"))
-    monkeypatch.setattr(gm, "reset_recurrent_state_rows", lambda *a: calls.append("layer"))
-    ssm = torch.zeros(2, 3, 4, 8, 8)
-    conv = torch.zeros(2, 3, 16, 3)
+    reset = Qwen3NextGatedDeltaNet._reset_prefill_states
+    dev = "cuda"
+    torch.manual_seed(0)
+    L, S = 3, 6
+    pool, ssm, conv = _cpp_style_pool(L, S, 4, 32, 32, 96, 4, torch.bfloat16, dev)
+    original = pool.clone()
+    slots = torch.tensor([1, 4], dtype=torch.int32, device=dev)
+    fresh = torch.tensor([False, False], dtype=torch.bool, device=dev)
     attn = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(all_ssm_states=ssm, all_conv_states=conv)
     )
-    layer = SimpleNamespace(_reset_prefill_states=gm.Qwen3NextGatedDeltaNet._reset_prefill_states)
-    args = (
-        attn,
-        None,
-        ssm[0],
-        conv[0],
-        torch.zeros(1, dtype=torch.int32),
-        torch.zeros(1, dtype=torch.bool),
-    )
 
-    meta = _Meta()
-    layer._reset_prefill_states(layer, attn, meta, *args[2:])
-    assert calls == []  # gated off: nothing to reset
-    meta.prefill_needs_state_reset = True
-    layer._reset_prefill_states(layer, attn, meta, *args[2:])
-    layer._reset_prefill_states(layer, attn, meta, *args[2:])
-    assert (
-        calls == ["all"] and meta.state_reset_done
-    )  # first layer resets every layer, the next skips
+    def run_layer(meta, layer):
+        reset(None, attn, meta, ssm[layer], conv[layer], slots, fresh)
+        torch.cuda.synchronize()
+
+    # Nothing to reset this iteration: no layer touches the pool.
+    quiet = SimpleNamespace(prefill_needs_state_reset=False, state_reset_done=False)
+    for layer in range(L):
+        run_layer(quiet, layer)
+    assert torch.equal(pool, original)
+
+    meta = SimpleNamespace(prefill_needs_state_reset=True, state_reset_done=False)
+    run_layer(meta, 0)
+    assert meta.state_reset_done
+    for layer in range(L):  # layer 0 cleared the slots of every layer
+        for slot in (1, 4):
+            assert not ssm[layer, slot].any() and not conv[layer, slot].any()
+        for slot in (0, 2, 3, 5):
+            assert torch.equal(pool[layer, slot], original[layer, slot])
+
+    # The remaining layers skip: state written after the reset survives them.
+    ssm[1, 1].fill_(3)
+    run_layer(meta, 1)
+    run_layer(meta, 2)
+    assert (ssm[1, 1] == 3).all()
+
+    # The next iteration clears again.
     meta.state_reset_done = False
-    attn_no_pool = SimpleNamespace(kv_cache_manager=SimpleNamespace())
-    layer._reset_prefill_states(layer, attn_no_pool, meta, *args[2:])
-    layer._reset_prefill_states(layer, attn_no_pool, meta, *args[2:])
-    assert (
-        calls == ["all", "layer", "layer"] and not meta.state_reset_done
-    )  # no all-layer pool: per-layer fallback
+    run_layer(meta, 1)
+    assert not ssm[1, 1].any()
+
+
+@needs_cuda
+def test_reset_prefill_states_falls_back_to_the_layer_without_an_all_layer_pool():
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+
+    dev = "cuda"
+    torch.manual_seed(1)
+    L, S = 2, 4
+    pool, ssm, conv = _cpp_style_pool(L, S, 4, 32, 32, 96, 4, torch.bfloat16, dev)
+    original = pool.clone()
+    slots = torch.tensor([2], dtype=torch.int32, device=dev)
+    fresh = torch.tensor([False], dtype=torch.bool, device=dev)
+    attn = SimpleNamespace(kv_cache_manager=SimpleNamespace())  # exposes no all-layer pool
+    meta = SimpleNamespace(prefill_needs_state_reset=True, state_reset_done=False)
+
+    Qwen3NextGatedDeltaNet._reset_prefill_states(None, attn, meta, ssm[0], conv[0], slots, fresh)
+    torch.cuda.synchronize()
+
+    assert not meta.state_reset_done
+    assert not ssm[0, 2].any() and not conv[0, 2].any()
+    assert torch.equal(pool[1], original[1])  # only this layer's rows were cleared

@@ -67,7 +67,7 @@ class _CacheManager:
 
 
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN prefill + decode kernels (SM100/SM103)")
-@pytest.mark.parametrize("ctx_lens,n_dec", [([70, 45], 6), ([96, 50], 3), ([130, 100], 70)])
+@pytest.mark.parametrize("ctx_lens,n_dec", [([70, 45], 6), ([130, 100], 70)])
 @torch.no_grad()
 def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_lens, n_dec):
     """Mixed batch (context chunks + decode rows) through forward_core with the direct

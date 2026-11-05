@@ -1842,6 +1842,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 # Prefill rows only; the decode rows go through the recurrent
                 # kernel after the scan (see _mixed_decode_recurrent), so a bounded
                 # prefill state workspace holds prefill requests only.
+                assert num_decode_tokens == num_decodes, "mixed decode rows are one token each"
                 decode_recurrent = (mixed_qkv_d, a[num_prefill_tokens:], b[num_prefill_tokens:])
                 query, key, value, g, beta, packed = self._post_conv(
                     mixed_qkv_p_t, None, a[:num_prefill_tokens], b[:num_prefill_tokens], g_linear

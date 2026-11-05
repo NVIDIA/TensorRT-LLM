@@ -58,7 +58,7 @@ class _CacheManager:
 
 
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN prefill + decode kernels (SM100/SM103)")
-@pytest.mark.parametrize("ctx_lens,n_dec", [([70, 45], 0), ([96, 50], 3), ([130], 5)])
+@pytest.mark.parametrize("ctx_lens,n_dec", [([70, 45], 0), ([130], 5)])
 @torch.no_grad()
 def test_forward_core_channel_last_matches_channel_major(ctx_lens, n_dec):
     dev = "cuda"

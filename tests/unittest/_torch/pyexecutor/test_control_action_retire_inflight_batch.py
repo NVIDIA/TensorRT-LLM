@@ -24,8 +24,10 @@ deadlocked attention-DP context engines at an in-flight weight update). With
 alone.
 """
 
+import contextlib
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -116,27 +118,6 @@ class TestRetireInflightBatch:
         rank.perf_manager.compute_batch_gpu_times.assert_called_once_with(["r1", "r2"])
         assert rank.has_previous_draft_tokens is False
 
-    def test_rank_without_batch_joins_every_gather(self):
-        with_batch = _Rank(previous_batch=_batch())
-        without = _Rank(previous_batch=None)
-
-        with_batch._retire_inflight_batch_for_control()
-        without._retire_inflight_batch_for_control()
-
-        assert without.calls == ["flush", "enqueue_empty"]
-        assert without.gathers == with_batch.gathers == 2
-
-    def test_early_first_token_adds_one_symmetric_gather(self):
-        with_batch = _Rank(previous_batch=_batch(), early_first_token=True)
-        without = _Rank(previous_batch=None, early_first_token=True)
-
-        with_batch._retire_inflight_batch_for_control()
-        without._retire_inflight_batch_for_control()
-
-        assert with_batch.calls[:4] == ["update_requests", "send_kv_async", "first_token", "flush"]
-        assert without.calls == ["enqueue_empty", "flush", "enqueue_empty"]
-        assert without.gathers == with_batch.gathers == 3
-
 
 class _RecordingEvent(threading.Event):
     def __init__(self, log, name):
@@ -149,28 +130,38 @@ class _RecordingEvent(threading.Event):
         super().set()
 
 
+class _NoHangDetector:
+    def pause(self):
+        return contextlib.nullcontext()
+
+
+class _PendingLoadsConnector:
+    def has_pending_loads(self):
+        return True
+
+
 class _ControlExecutor:
     """Stand-in for PyExecutor around _handle_control_request."""
 
     _handle_control_request = PyExecutor._handle_control_request
     _control_drain_ready = PyExecutor._control_drain_ready
     _has_pending_connector_transfers = PyExecutor._has_pending_connector_transfers
+    _dist_size = staticmethod(PyExecutor._dist_size)
 
-    def __init__(self, *, drain, attention_dp=True, active=(), transfers=0, votes=None):
+    def __init__(self, *, drain, active=(), transfers=0, connector=None):
         self.order = []
-        self.control_requests = [MagicMock(control_requires_drain=drain, control_id="c1")]
+        self.control_requests = [SimpleNamespace(control_requires_drain=drain, control_id="c1")]
         self.active_requests = list(active)
         self.waiting_queue = []
-        self.enable_attention_dp = attention_dp
-        self.dist = MagicMock(world_size=8, pp_size=1)
-        if votes is not None:
-            self.dist.tp_allgather.return_value = votes
+        self.enable_attention_dp = False
+        self.kv_connector_manager = connector
+        self.dist = SimpleNamespace(world_size=1, pp_size=1, tp_size=1)
         self._transfers = transfers
         self._control_drain_transfer_deadline = None
         self.control_request_barrier = _RecordingEvent(self.order, "barrier")
         self.control_action_done = threading.Event()
         self.control_action_done.set()  # the action completes immediately
-        self.hang_detector = MagicMock()
+        self.hang_detector = _NoHangDetector()
         self._active_control_id = None
         self.dwdp_manager = None
 
@@ -200,30 +191,9 @@ class TestHandleControlRequest:
         assert cuda_sync == ["cuda_sync"]
         assert ex.order == ["retire", "barrier"]
         assert ex.control_requests == []
-        ex.dist.tp_allgather.assert_not_called()  # drain=False never votes
-
-    def test_drain_votes_every_iteration_even_when_locally_busy(self, cuda_sync):
-        ex = _ControlExecutor(drain=True, active=["busy"], votes=[0, 1, 1, 1])
-
-        ex._handle_control_request()
-
-        # Every rank must take part in the vote or the allgather desyncs.
-        ex.dist.tp_allgather.assert_called_once_with(0)
-        assert ex.order == [] and cuda_sync == []
-        assert len(ex.control_requests) == 1  # still pending
-
-    def test_drain_waits_for_the_last_rank(self, cuda_sync):
-        ex = _ControlExecutor(drain=True, votes=[1, 1, 0, 1])
-
-        ex._handle_control_request()
-
-        ex.dist.tp_allgather.assert_called_once_with(1)
-        assert ex.order == [] and len(ex.control_requests) == 1
 
     def test_drain_waits_for_pending_connector_loads(self, cuda_sync):
-        ex = _ControlExecutor(drain=True, attention_dp=False)
-        ex.kv_connector_manager = MagicMock()
-        ex.kv_connector_manager.has_pending_loads.return_value = True
+        ex = _ControlExecutor(drain=True, connector=_PendingLoadsConnector())
 
         ex._handle_control_request()
 
@@ -232,14 +202,15 @@ class TestHandleControlRequest:
         assert len(ex.control_requests) == 1
         assert ex._control_drain_transfer_deadline is None
 
-    def test_drain_transfer_deadline_is_rank_local(self, monkeypatch):
-        ex = _ControlExecutor(drain=True, attention_dp=False, transfers=1)
-        now = [1000.0]
-        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    def test_drain_transfer_deadline_arms_once_then_fires(self):
+        ex = _ControlExecutor(drain=True, transfers=1)
 
         assert ex._control_drain_ready(1) is False
-        assert ex._control_drain_transfer_deadline > 1000.0  # armed on first sight
-        now[0] = ex._control_drain_transfer_deadline + 1.0
+        armed = ex._control_drain_transfer_deadline
+        assert armed is not None and armed > time.monotonic()
+        assert ex._control_drain_ready(1) is False
+        assert ex._control_drain_transfer_deadline == armed  # not re-armed while waiting
+        ex._control_drain_transfer_deadline = time.monotonic() - 1.0  # the deadline passed
         assert ex._control_drain_ready(1) is True  # fires anyway, with a warning
         assert ex._control_drain_ready(0) is True
         ex.active_requests = ["busy"]

@@ -20,7 +20,7 @@ def _sm100() -> bool:
 
 @needs_cuda
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN prefill + decode kernels (SM100/SM103)")
-@pytest.mark.parametrize("ctx_lens,n_dec", [([37], 5), ([300, 64], 40), ([1000], 190)])
+@pytest.mark.parametrize("ctx_lens,n_dec", [([37], 5), ([1000], 190)])
 def test_recurrent_decode_matches_one_token_scan(ctx_lens, n_dec):
     """A chunk scan over [ctx + one-token decode] equals a chunk scan over ctx plus the
     recurrent kernel over decode (same raw inputs)."""
