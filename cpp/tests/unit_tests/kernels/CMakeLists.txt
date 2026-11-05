@@ -121,7 +121,7 @@ add_tllm_gtest(
   cudaCoreGemm/cudaCoreGemmKernelTest.cpp
   LINK_LIBRARIES
   tllm::kernel_cuda_core_gemm
-  CUDA::cublasLt
+  ${CUBLASLT_LIB}
   LABELS
   "unit;kernels;cuda-core-gemm;gpu")
 
