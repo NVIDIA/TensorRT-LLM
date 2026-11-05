@@ -20,19 +20,28 @@ import pytest
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_server(*, max_batch_size=None, kv_cache_config=None):
-    server = object.__new__(OpenAIServer)
-    server.generator = SimpleNamespace(
-        disaggregated_params=None,
-        args=SimpleNamespace(
-            max_batch_size=max_batch_size,
-            kv_cache_config=kv_cache_config,
+    # /server_info reads the generator and the render resources' fingerprint;
+    # the other collaborators are placeholders it never touches.
+    return WorkerServing(
+        model="m",
+        generator=SimpleNamespace(
+            disaggregated_params=None,
+            args=SimpleNamespace(
+                max_batch_size=max_batch_size,
+                kv_cache_config=kv_cache_config,
+            ),
         ),
+        adjusted_steady_clock=None,
+        shared_clock_offset=None,
+        chat_serving=None,
+        render_resources=SimpleNamespace(fingerprint=lambda: {"digest": "d"}),
     )
-    return server
 
 
 @pytest.mark.asyncio

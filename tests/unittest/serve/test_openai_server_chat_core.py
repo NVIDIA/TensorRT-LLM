@@ -225,13 +225,15 @@ def test_unencodable_response_is_still_a_400(serve_env, error_records):
 def test_health_generate_still_fails_with_500_on_engine_failure(serve_env, engine_failure_recorder):
     server = _build(serve_env)
 
+    # /health_generate lives on the worker serving object, which calls the
+    # same ChatServing the stubs below are put on.
     server.generator.script(ScriptedOutput(raise_on_call=CppExecutorError("dead")))
-    response = asyncio.run(server.health_generate(_raw_request()))
+    response = asyncio.run(server._worker_serving.health_generate(_raw_request()))
     assert response.status_code == 500, f"/health_generate on an engine failure: {KEEP}"
     assert engine_failure_recorder.signals == [signal.SIGINT]
 
     server._chat_serving._create_chat_response = AsyncMock(return_value=_chat_response())
-    response = asyncio.run(server.health_generate(_raw_request()))
+    response = asyncio.run(server._worker_serving.health_generate(_raw_request()))
     assert response.status_code == 200, f"/health_generate on a success: {KEEP}"
     assert response.body == b"Generation health check OK"
 

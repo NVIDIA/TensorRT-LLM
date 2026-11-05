@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Smoke tests for trtllm-serve /start_profile and /stop_profile endpoints.
 
-These tests bind the unbound handler methods from ``OpenAIServer`` to a
-lightweight mock instance so they can run without GPUs or model weights.
-They verify that (a) the endpoints parse their request bodies correctly,
-(b) default values are applied, and (c) the underlying ``generator``
-object receives the expected ``start_profile`` / ``stop_profile`` calls
-with the right arguments.
+These tests build the ``ProfileServing`` object around a mock generator so
+they can run without GPUs or model weights. They verify that (a) the
+endpoints parse their request bodies correctly, (b) default values are
+applied, and (c) the underlying ``generator`` object receives the expected
+``start_profile`` / ``stop_profile`` calls with the right arguments.
 """
 
 import asyncio
@@ -26,16 +25,12 @@ def _extract_json(response) -> dict:
 
 @pytest.fixture
 def server_with_mock_generator():
-    """Build a minimal mock ``OpenAIServer`` instance with only the bits
-    needed for the profile handlers. Avoids the heavy real __init__.
-    """
-    # Importing here so a missing optional dep in the server module only
+    """The profile serving object over a mock generator, as the composition root builds it."""
+    # Importing here so a missing optional dep in the serving module only
     # fails the test, not collection of the whole test file.
-    from tensorrt_llm.serve.openai_server import OpenAIServer
+    from tensorrt_llm.serve.api.ops.profile.serving import ProfileServing
 
-    server = OpenAIServer.__new__(OpenAIServer)
-    server.generator = MagicMock()
-    return server
+    return ProfileServing(model="m", generator=MagicMock())
 
 
 def test_start_profile_defaults(server_with_mock_generator):

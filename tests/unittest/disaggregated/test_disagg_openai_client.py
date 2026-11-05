@@ -83,17 +83,25 @@ def test_adjusted_steady_clock_uses_reference_domain():
 
 @pytest.mark.asyncio
 async def test_worker_clock_calibration_uses_global_clock():
-    from tensorrt_llm.serve.openai_server import OpenAIServer
+    from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
 
-    server = object.__new__(OpenAIServer)
+    # get_steady_clock_offset reads none of the collaborators: placeholders.
+    server = WorkerServing(
+        model="m",
+        generator=None,
+        adjusted_steady_clock=None,
+        shared_clock_offset=None,
+        chat_serving=None,
+        render_resources=None,
+    )
     global_clock = Mock(side_effect=[10.0, 10.2])
     delay = AsyncMock()
     with (
         patch(
-            "tensorrt_llm.serve.openai_server.get_global_steady_clock_now_in_seconds",
+            "tensorrt_llm.serve.api.ops.worker.serving.get_global_steady_clock_now_in_seconds",
             global_clock,
         ),
-        patch("tensorrt_llm.serve.openai_server.asyncio.sleep", delay),
+        patch("tensorrt_llm.serve.api.ops.worker.serving.asyncio.sleep", delay),
     ):
         response = await server.get_steady_clock_offset()
 

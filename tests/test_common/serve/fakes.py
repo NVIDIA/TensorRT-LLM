@@ -441,6 +441,19 @@ class _FakeGeneratorMixin:
     def get_data_transceiver_state(self) -> None:
         return None
 
+    # /server_info reads these; a fake has no executor to ask.
+    @property
+    def disaggregated_params(self) -> dict:
+        return {}
+
+    @property
+    def startup_metrics(self) -> dict:
+        return {}
+
+    def get_kv_cache_capacity(self) -> dict:
+        # /server_info prefers the live block size; a fake reports none.
+        return {}
+
     def shutdown(self) -> None:
         # Overrides BaseLLM.shutdown, which BaseLLM.__del__ calls.
         for name in ("_executor", "_encoder_executor"):

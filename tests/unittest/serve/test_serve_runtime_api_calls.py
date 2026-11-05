@@ -4,14 +4,16 @@
 
 Each test calls a production ``OpenAIServer`` or serving-class method on a
 stand-in object (not ``object.__new__(OpenAIServer)``) whose generator double
-defines exactly the public members the method reads, so a server method
-reaching for a private engine member again fails loudly here.
+defines exactly the public members the method reads, or builds the server
+through the test factory, so a server method reaching for a private engine
+member again fails loudly here.
 """
 
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from test_common.serve.app_factory import AggConfig
+from test_common.serve.routes import effective_routes
 
 from tensorrt_llm.llmapi.llm import EncodeLimits
 from tensorrt_llm.serve import openai_server
@@ -26,9 +28,8 @@ pytestmark = pytest.mark.cpu_only
 class _ServerStub(SimpleNamespace):
     """A SimpleNamespace whose unknown attributes are inert handlers.
 
-    ``register_routes`` touches about thirty handler attributes; the routes
-    under test here are only the resource-governor ones, so every other
-    handler read resolves to a placeholder callable FastAPI can register.
+    A production method under test may touch attributes the test does not
+    care about; every unknown read resolves to a placeholder callable.
     """
 
     def __getattr__(self, name):
@@ -64,7 +65,7 @@ def test_embedding_batcher_takes_the_limits_encode_checks():
 
 
 # ---------------------------------------------------------------------------
-# register_routes reads generator.resource_governor_queue
+# The composition root reads generator.resource_governor_queue
 # ---------------------------------------------------------------------------
 class _RecordingGovernor:
     def __init__(self, **kwargs):
@@ -75,39 +76,30 @@ class _RecordingGovernor:
         self.registered_app = app
 
 
-def _register_routes_stub(resource_governor_queue):
-    return _ServerStub(
-        app=FastAPI(),
-        generator=_generator(resource_governor_queue=resource_governor_queue),
-        tokenizer=object(),
-        model_config=None,
-        processor=None,
-        allow_request_chat_template=False,
-        use_harmony=False,
-        chat_template=None,
+def test_the_root_builds_the_governor_from_the_public_queue(monkeypatch, serve_env):
+    monkeypatch.setattr("tensorrt_llm.serve.resource_governor.ResourceGovernor", _RecordingGovernor)
+
+    server = serve_env.build_openai_server(AggConfig(governor_queue=True))
+
+    assert isinstance(server.resource_governor, _RecordingGovernor)
+    assert server.resource_governor.kwargs["resource_governor_queue"] is (
+        server.generator.resource_governor_queue
     )
+    # The control router hands the governor the app to register its routes on.
+    assert server.resource_governor.registered_app is server.app
+    assert server.app.state.ops_serving_control is server.resource_governor
 
 
-def test_register_routes_builds_the_governor_from_the_public_queue(monkeypatch):
-    queue = object()
-    stub = _register_routes_stub(resource_governor_queue=queue)
+def test_the_root_skips_the_governor_without_a_queue(monkeypatch, serve_env):
     monkeypatch.setattr("tensorrt_llm.serve.resource_governor.ResourceGovernor", _RecordingGovernor)
 
-    OpenAIServer.register_routes(stub)
+    server = serve_env.build_openai_server(AggConfig(governor_queue=False))
 
-    assert isinstance(stub.resource_governor, _RecordingGovernor)
-    assert stub.resource_governor.kwargs["resource_governor_queue"] is queue
-    assert stub.resource_governor.registered_app is stub.app
-
-
-def test_register_routes_skips_the_governor_without_a_queue(monkeypatch):
-    stub = _register_routes_stub(resource_governor_queue=None)
-    monkeypatch.setattr("tensorrt_llm.serve.resource_governor.ResourceGovernor", _RecordingGovernor)
-
-    OpenAIServer.register_routes(stub)
-
-    assert stub.resource_governor is None
-    assert not any(route.path.startswith("/_resource_governor") for route in stub.app.routes)
+    assert server.resource_governor is None
+    assert not hasattr(server.app.state, "ops_serving_control")
+    assert not any(
+        path.startswith("/_resource_governor") for path, _ in effective_routes(server.app)
+    )
 
 
 # ---------------------------------------------------------------------------

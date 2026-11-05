@@ -645,7 +645,7 @@ def _http_enablement() -> None:
             finally:
                 server._input_proc_executor.shutdown(wait=True)
                 server._media_load_executor.shutdown(wait=True)
-                server._metrics_stats_executor.shutdown(wait=True)
+                server._metrics_serving._metrics_stats_executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

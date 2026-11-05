@@ -26,6 +26,8 @@ from fastapi.testclient import TestClient
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm.llmapi import RuntimeMemoryStatus, SleepConfig
+from tensorrt_llm.serve.api.ops.runtime_control import api_router as runtime_control_api_router
+from tensorrt_llm.serve.api.ops.runtime_control.serving import RuntimeControlServing
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.runtime_control_auth import (
     RUNTIME_CONTROL_NONCE_HEADER,
@@ -38,23 +40,29 @@ from tensorrt_llm.serve.runtime_control_auth import (
 pytestmark = pytest.mark.cpu_only
 
 
-def _make_server(*, asynchronous: bool = False, replay_cache_capacity: int = 4096) -> OpenAIServer:
-    server = object.__new__(OpenAIServer)
-    server.app = FastAPI()
+def _make_server(
+    *, asynchronous: bool = False, replay_cache_capacity: int = 4096
+) -> SimpleNamespace:
+    """An app with the runtime-control router attached, as the composition root attaches it."""
+    app = FastAPI()
     generator_cls = AsyncLLM if asynchronous else LLM
-    server.generator = object.__new__(generator_cls)
-    server.generator.args = SimpleNamespace(sleep_config=SleepConfig())
+    generator = object.__new__(generator_cls)
+    generator.args = SimpleNamespace(sleep_config=SleepConfig())
     method_factory = AsyncMock if asynchronous else MagicMock
-    server.generator.release = method_factory()
-    server.generator.resume = method_factory()
-    server.generator.get_memory_status = method_factory(
+    generator.release = method_factory()
+    generator.resume = method_factory()
+    generator.get_memory_status = method_factory(
         return_value=RuntimeMemoryStatus(state="running", parked_tags=[])
     )
-    server._enable_runtime_control_endpoints = True
-    server._runtime_control_api_key = "secret"
-    server._runtime_control_replay_cache = RuntimeControlReplayCache(replay_cache_capacity)
-    server._register_runtime_control_routes()
-    return server
+    serving = RuntimeControlServing(
+        model="model",
+        generator=generator,
+        runtime_control_api_key="secret",
+        runtime_control_replay_cache=RuntimeControlReplayCache(replay_cache_capacity),
+    )
+    setattr(app.state, runtime_control_api_router.APP_STATE_KEY, serving)
+    runtime_control_api_router.attach_router(app)
+    return SimpleNamespace(app=app, generator=generator, serving=serving)
 
 
 def _signed_headers(
@@ -154,7 +162,7 @@ def test_explicit_tags_are_forwarded_to_sync_llm():
 async def test_async_generator_is_awaited_directly():
     server = _make_server(asynchronous=True)
 
-    response = await server.runtime_release_memory(None)
+    response = await server.serving.runtime_release_memory(None)
 
     assert response.status_code == 200
     server.generator.release.assert_awaited_once_with(None)

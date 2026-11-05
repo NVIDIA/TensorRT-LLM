@@ -40,11 +40,12 @@ from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
 from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
+from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
-from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor,
                                                      select_postproc_strategy)
+from tensorrt_llm.serve.render import RenderResources
 
 # isort: off
 from gc_utils import assert_resource_freed
@@ -1456,8 +1457,15 @@ def test_startup_metrics_by_server_info() -> None:
     generator._startup_metrics = None
     generator._disaggregated_params = {}
 
-    server = object.__new__(OpenAIServer)
-    server.generator = generator
+    # /server_info lives on the worker serving object; the render resources
+    # are the composition root's, built once (here without a tokenizer, as a
+    # server that has none would).
+    server = WorkerServing(model="m",
+                           generator=generator,
+                           adjusted_steady_clock=None,
+                           shared_clock_offset=None,
+                           chat_serving=None,
+                           render_resources=RenderResources(tokenizer=None))
     first_response = asyncio.run(server.get_server_info())
     second_response = asyncio.run(server.get_server_info())
     third_response = asyncio.run(server.get_server_info())

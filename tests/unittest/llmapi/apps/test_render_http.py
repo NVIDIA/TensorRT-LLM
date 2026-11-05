@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -351,10 +349,9 @@ class TestEmbeddedMounting:
             monkeypatch.setenv("TRTLLM_ENABLE_RENDER_ENDPOINTS", "1")
         else:
             monkeypatch.delenv("TRTLLM_ENABLE_RENDER_ENDPOINTS", raising=False)
-        server = SimpleNamespace(tokenizer=tokenizer, model_config=None, generator=None)
         app = FastAPI()
 
-        mounted = mount_render_endpoints(app, server)
+        mounted = mount_render_endpoints(app, resources(tokenizer))
 
         paths = {route.path for route in app.routes}
         assert mounted is enabled
@@ -362,10 +359,9 @@ class TestEmbeddedMounting:
         assert ("/v1/completions/render" in paths) is enabled
 
     def test_the_decision_can_be_forced(self, tokenizer) -> None:
-        server = SimpleNamespace(tokenizer=tokenizer, model_config=None, generator=None)
         app = FastAPI()
 
-        assert mount_render_endpoints(app, server, enabled=True) is True
+        assert mount_render_endpoints(app, resources(tokenizer), enabled=True) is True
         paths = {route.path for route in app.routes}
         assert "/v1/chat/completions/render" in paths
         # Executing ids uses the worker's existing token-in routes; only the two render

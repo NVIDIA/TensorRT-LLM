@@ -25,7 +25,8 @@ import pytest
 from fastapi import FastAPI
 
 from tensorrt_llm.executor.rpc import RPCCancelled
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.api.ops.metrics import api_router as metrics_api_router
+from tensorrt_llm.serve.api.ops.metrics.serving import MetricsServing
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'; without the marker every
 # test here is deselected.
@@ -97,27 +98,30 @@ def _make_server(
     enable_iter_perf_stats: bool = True,
     stats_gate: threading.Event | None = None,
     stats_error: Exception | None = None,
-) -> OpenAIServer:
-    server = object.__new__(OpenAIServer)
-    server.generator = _FakeGenerator(
-        stat_batches,
-        iter_stats_max_iterations,
-        enable_iter_perf_stats,
-        stats_gate,
-        stats_error,
+) -> MetricsServing:
+    """The metrics serving object over a fake generator, in the state the lifespan leaves it."""
+    server = MetricsServing(
+        model="m",
+        generator=_FakeGenerator(
+            stat_batches,
+            iter_stats_max_iterations,
+            enable_iter_perf_stats,
+            stats_gate,
+            stats_error,
+        ),
+        is_visual_gen=is_visual_gen,
+        metrics_collector=_FakeMetricsCollector(),
+        iteration_stats_wakeup_event=asyncio.Event(),
+        iteration_stats_poll_interval=None,
     )
-    server.metrics_collector = _FakeMetricsCollector()
-    server._is_visual_gen = is_visual_gen
-    max_buffer_size = OpenAIServer._iteration_stats_buffer_maxlen(
+    max_buffer_size = MetricsServing._iteration_stats_buffer_maxlen(
         server.generator.args.iter_stats_max_iterations
     )
     server._iteration_stats_buffer = deque(maxlen=max_buffer_size) if with_stats_buffer else None
     # The loop's default executor; a test that checks the dedicated metrics
     # thread installs (and shuts down) its own.
+    server._metrics_stats_executor.shutdown(wait=False)
     server._metrics_stats_executor = None
-    server._metrics_stats_read = None
-    server._metrics_stats_read_waiting = False
-    server._metrics_stats_read_consumed = True
     return server
 
 
@@ -334,14 +338,13 @@ async def test_metrics_route_does_not_poll_iteration_stats_queue(
         with_stats_buffer=with_stats_buffer,
         enable_iter_perf_stats=enable_iter_perf_stats,
     )
-    server.app = FastAPI()
-    server.use_harmony = False
-    # The optional control routes are off by default, as in OpenAIServer.__init__.
-    server._enable_runtime_control_endpoints = False
-    server._enable_rl_control_endpoints = False
-    server.register_routes()
+    # The metrics router over the serving object, as the composition root
+    # attaches it.
+    app = FastAPI()
+    setattr(app.state, metrics_api_router.APP_STATE_KEY, server)
+    metrics_api_router.attach_router(app)
 
-    transport = httpx.ASGITransport(app=server.app)
+    transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.get("/metrics")
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,21 +21,24 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm.serve.api.ops.rl import api_router as rl_api_router
+from tensorrt_llm.serve.api.ops.rl.serving import RLServing
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.rl_control_auth import RL_CONTROL_AUTH_HEADER, build_rl_control_auth_headers
 
 pytestmark = pytest.mark.cpu_only
 
 
-def _make_server(enabled: bool) -> OpenAIServer:
-    server = object.__new__(OpenAIServer)
-    server.app = FastAPI()
-    server.generator = object.__new__(AsyncLLM)
-    server.generator.collective_rpc = AsyncMock()
-    server._enable_rl_control_endpoints = enabled
-    server._rl_control_api_key = "secret"
-    server._register_rl_control_routes()
-    return server
+def _make_server(enabled: bool) -> SimpleNamespace:
+    """An app with the RL control router attached, as the composition root attaches it when enabled."""
+    app = FastAPI()
+    generator = object.__new__(AsyncLLM)
+    generator.collective_rpc = AsyncMock()
+    if enabled:
+        serving = RLServing(model="model", generator=generator, rl_control_api_key="secret")
+        setattr(app.state, rl_api_router.APP_STATE_KEY, serving)
+        rl_api_router.attach_router(app)
+    return SimpleNamespace(app=app, generator=generator)
 
 
 def _post_signed(client: TestClient, endpoint: str, payload: dict, key: str = "secret"):

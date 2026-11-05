@@ -315,14 +315,14 @@ class ServeTestEnv:
         self._entered_clients.clear()
         self._plain_clients.clear()
         for server in self._servers:
-            for pool_name in (
-                "_input_proc_executor",
-                "_media_load_executor",
-                "_metrics_stats_executor",
-            ):
+            for pool_name in ("_input_proc_executor", "_media_load_executor"):
                 pool = getattr(server, pool_name, None)
                 if pool is not None:
                     pool.shutdown(wait=False, cancel_futures=True)
+            # The metrics serving object owns the thread the stats reads run on.
+            metrics_serving = getattr(server, "_metrics_serving", None)
+            if metrics_serving is not None:
+                metrics_serving._metrics_stats_executor.shutdown(wait=False, cancel_futures=True)
         self._servers.clear()
 
 

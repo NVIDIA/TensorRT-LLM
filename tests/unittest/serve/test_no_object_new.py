@@ -50,9 +50,6 @@ BASELINE = {
         "test_coordinator_keep_alive_timeout_is_passed_to_uvicorn CoordinatorServer",
         "test_coordinator_tcp_listener_uses_the_prebound_socket CoordinatorServer",
     ],
-    "tests/unittest/disaggregated/test_disagg_openai_client.py": [
-        "test_worker_clock_calibration_uses_global_clock OpenAIServer",
-    ],
     "tests/unittest/disaggregated/test_disagg_responses_api.py": [
         "test_a_context_worker_with_postprocessing_workers_returns_the_prompt OpenAIServer",
         "test_a_models_failure_is_an_error_response OpenAIDisaggServer",
@@ -62,27 +59,15 @@ BASELINE = {
         "test_http_cluster_storage_request_is_proxied_to_coordinator OpenAIDisaggServer",
         "test_server_keep_alive_timeout_is_passed_to_uvicorn OpenAIDisaggServer",
     ],
-    "tests/unittest/disaggregated/test_openai_server_info.py": [
-        "_make_server OpenAIServer",
-    ],
     "tests/unittest/disaggregated/test_paired_request_cancellation.py": [
         "test_http_failure_reaches_paired_worker_abort OpenAIDisaggServer",
         "test_http_failure_reaches_paired_worker_abort OpenAIServer",
-    ],
-    "tests/unittest/llmapi/apps/_test_trtllm_serve_profile.py": [
-        "server_with_mock_generator OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_anthropic_routes.py": [
         "_handle OpenAIDisaggServer",
     ],
     "tests/unittest/llmapi/apps/test_context_length_error.py": [
         "_disagg_server OpenAIDisaggServer",
-    ],
-    "tests/unittest/llmapi/apps/test_openai_server_iteration_stats.py": [
-        "_make_server OpenAIServer",
-    ],
-    "tests/unittest/llmapi/apps/test_render_callers.py": [
-        "TestServerInfoFingerprint.test_the_first_call_hashes_off_the_event_loop OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_responses_store_replay.py": [
         "_server_up_to_preprocess OpenAIServer",
@@ -96,20 +81,10 @@ BASELINE = {
     "tests/unittest/llmapi/test_kv_hints.py": [
         "test_http_handlers_forward_hints OpenAIServer",
     ],
-    "tests/unittest/llmapi/test_llm.py": [
-        "test_startup_metrics_by_server_info OpenAIServer",
-    ],
-    "tests/unittest/llmapi/test_rl_control_auth.py": [
-        "_make_server OpenAIServer",
-    ],
-    "tests/unittest/llmapi/test_runtime_control.py": [
-        "_make_server OpenAIServer",
-    ],
     "tests/unittest/llmapi/test_serve_multi_frontend_helpers.py": [
         "_attached_server OpenAIServer",
         "test_on_launcher_lost_fails_fast_then_shuts_down OpenAIServer",
         "test_only_the_launcher_registers_the_server OpenAIServer",
-        "test_set_steady_clock_offset OpenAIServer",
     ],
     "tests/unittest/llmapi/test_serve_multi_frontend_route_gate.py": [
         "_llm_server_routes OpenAIServer",

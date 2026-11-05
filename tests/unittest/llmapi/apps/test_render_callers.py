@@ -624,11 +624,11 @@ class TestCoordinatorFrontendWriteBack:
 
 class TestServerInfoFingerprint:
     @pytest.mark.asyncio
-    async def test_the_first_call_hashes_off_the_event_loop(self, monkeypatch) -> None:
+    async def test_the_first_call_hashes_off_the_event_loop(self) -> None:
         import asyncio
         import json
 
-        from tensorrt_llm.serve.openai_server import OpenAIServer
+        from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
 
         where = []
 
@@ -641,9 +641,16 @@ class TestServerInfoFingerprint:
                     where.append("worker thread")
                 return {"digest": "d"}
 
-        monkeypatch.setattr(RenderResources, "from_server", classmethod(lambda cls, s: Resources()))
-        server = object.__new__(OpenAIServer)
-        server.generator = SimpleNamespace(disaggregated_params=None, args=None)
+        # The resources the composition root built once, injected; the other
+        # collaborators are placeholders /server_info never touches.
+        server = WorkerServing(
+            model="m",
+            generator=SimpleNamespace(disaggregated_params=None, args=None),
+            adjusted_steady_clock=None,
+            shared_clock_offset=None,
+            chat_serving=None,
+            render_resources=Resources(),
+        )
 
         first = json.loads((await server.get_server_info()).body)
         second = json.loads((await server.get_server_info()).body)

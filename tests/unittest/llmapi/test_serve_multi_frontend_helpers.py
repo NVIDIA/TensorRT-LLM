@@ -48,7 +48,13 @@ from tensorrt_llm.serve.api.openai.completions import api_router as completions_
 from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
 from tensorrt_llm.serve.api.openai.tokenize.serving import TokenizeServing
+from tensorrt_llm.serve.api.ops.metrics import api_router as metrics_router
+from tensorrt_llm.serve.api.ops.metrics.serving import MetricsServing
+from tensorrt_llm.serve.api.ops.profile import api_router as profile_router
+from tensorrt_llm.serve.api.ops.profile.serving import ProfileServing
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
+from tensorrt_llm.serve.api.ops.worker import api_router as worker_router
+from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
 from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
     AttachedFrontendWatchdog,
@@ -125,13 +131,41 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server._enable_runtime_control_endpoints = False
     server.resource_governor = None
     server._launcher_forwarder = forwarder
-    # The order OpenAIServer.__init__ registers them in: the launcher forwarding
+    # The order the composition root registers them in: the launcher forwarding
     # routes, then the local table, then the routers of the role (the system
-    # router with /health, /version and /v1/models, the tokenize router, the
-    # completions router, the chat router and the Anthropic router), which read their serving
-    # objects from app.state. The routes are enumerated and forwarded, never
-    # served locally, so the serving objects get placeholder collaborators.
+    # router with /health, /version and /v1/models, the worker, metrics,
+    # tokenize, completions, chat, Anthropic and profile routers), which read
+    # their serving objects from app.state. The routes are enumerated and
+    # forwarded, never served locally, so the serving objects get placeholder
+    # collaborators.
     server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
+    setattr(
+        server.app.state,
+        worker_router.APP_STATE_KEY,
+        WorkerServing(
+            model="m",
+            generator=None,
+            adjusted_steady_clock=None,
+            shared_clock_offset=None,
+            chat_serving=None,
+            render_resources=None,
+        ),
+    )
+    setattr(
+        server.app.state,
+        metrics_router.APP_STATE_KEY,
+        MetricsServing(
+            model="m",
+            generator=None,
+            is_visual_gen=False,
+            metrics_collector=None,
+            iteration_stats_wakeup_event=None,
+            iteration_stats_poll_interval=None,
+        ),
+    )
+    setattr(
+        server.app.state, profile_router.APP_STATE_KEY, ProfileServing(model="m", generator=None)
+    )
     setattr(
         server.app.state,
         tokenize_router.APP_STATE_KEY,
@@ -369,15 +403,22 @@ def test_set_steady_clock_offset(tmp_path, role: str, status: int) -> None:
         "launcher_without_ipc_dir": SharedClockOffset(str(tmp_path / "gone")),
         "single_frontend": None,
     }[role]
-    server = object.__new__(OpenAIServer)
-    server._adjusted_steady_clock = AdjustedSteadyClock(time_source=lambda: 100.0)
-    server._shared_clock_offset = shared
+    # The worker serving object gets the clock and the shared offset the
+    # composition root owns; the other collaborators are placeholders.
+    serving = WorkerServing(
+        model="m",
+        generator=None,
+        adjusted_steady_clock=AdjustedSteadyClock(time_source=lambda: 100.0),
+        shared_clock_offset=shared,
+        chat_serving=None,
+        render_resources=None,
+    )
 
-    response = asyncio.run(server.set_steady_clock_offset(offset=-7.25))
+    response = asyncio.run(serving.set_steady_clock_offset(offset=-7.25))
 
     # A non-200 makes the disaggregated server warn about misaligned timestamps.
     assert response.status_code == status
-    assert server._adjusted_steady_clock.now() == 92.75
+    assert serving._adjusted_steady_clock.now() == 92.75
     if role == "launcher":
         assert SharedClockOffset(str(tmp_path)).poll() == -7.25
 

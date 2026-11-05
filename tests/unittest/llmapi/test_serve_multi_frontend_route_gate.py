@@ -20,6 +20,7 @@ connection (``PER_FRONTEND_SAFE`` below, with the reason). A new route in
 neither set fails here, so its author has to decide.
 """
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +40,17 @@ from tensorrt_llm.serve.api.openai.completions import api_router as completions_
 from tensorrt_llm.serve.api.openai.completions.serving import CompletionServing
 from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
 from tensorrt_llm.serve.api.openai.tokenize.serving import TokenizeServing
+from tensorrt_llm.serve.api.ops.metrics import api_router as metrics_router
+from tensorrt_llm.serve.api.ops.metrics.serving import MetricsServing
+from tensorrt_llm.serve.api.ops.profile import api_router as profile_router
+from tensorrt_llm.serve.api.ops.profile.serving import ProfileServing
+from tensorrt_llm.serve.api.ops.rl import api_router as rl_router
+from tensorrt_llm.serve.api.ops.rl.serving import RLServing
+from tensorrt_llm.serve.api.ops.runtime_control import api_router as runtime_control_router
+from tensorrt_llm.serve.api.ops.runtime_control.serving import RuntimeControlServing
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
+from tensorrt_llm.serve.api.ops.worker import api_router as worker_router
+from tensorrt_llm.serve.api.ops.worker.serving import WorkerServing
 from tensorrt_llm.serve.multi_frontend import FORWARDED_ROUTES
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import select_postproc_strategy
@@ -105,18 +116,57 @@ def _llm_server_routes() -> list[tuple[str, str]]:
         args=SimpleNamespace(return_perf_metrics=False),
     )
     server.use_harmony = False
-    # Mutually exclusive in practice; both on to enumerate every route.
-    server._enable_rl_control_endpoints = True
-    server._enable_runtime_control_endpoints = True
     server.resource_governor = None
-    # As OpenAIServer.__init__ does: the serving objects the routers read go on
+    # As the composition root does: the serving objects the routers read go on
     # app.state, the role's own table is registered, then the routers of the role
-    # (the system router with /health, /version and /v1/models, the tokenize
-    # router, the completions router, the chat router and the Anthropic router)
-    # are attached.
+    # (the system router with /health, /version and /v1/models, the worker,
+    # metrics, tokenize, completions, chat, Anthropic, profile, runtime-control
+    # and RL control routers) are attached.
     # The routes are enumerated, never called, so the serving objects get
     # collaborators that are never used.
     server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
+    setattr(
+        server.app.state,
+        worker_router.APP_STATE_KEY,
+        WorkerServing(
+            model="m",
+            generator=None,
+            adjusted_steady_clock=None,
+            shared_clock_offset=None,
+            chat_serving=None,
+            render_resources=None,
+        ),
+    )
+    setattr(
+        server.app.state,
+        metrics_router.APP_STATE_KEY,
+        MetricsServing(
+            model="m",
+            generator=None,
+            is_visual_gen=False,
+            metrics_collector=None,
+            iteration_stats_wakeup_event=None,
+            iteration_stats_poll_interval=None,
+        ),
+    )
+    setattr(
+        server.app.state, profile_router.APP_STATE_KEY, ProfileServing(model="m", generator=None)
+    )
+    setattr(
+        server.app.state,
+        runtime_control_router.APP_STATE_KEY,
+        RuntimeControlServing(
+            model="m",
+            generator=None,
+            runtime_control_api_key=None,
+            runtime_control_replay_cache=None,
+        ),
+    )
+    setattr(
+        server.app.state,
+        rl_router.APP_STATE_KEY,
+        RLServing(model="m", generator=None, rl_control_api_key=None),
+    )
     setattr(
         server.app.state,
         tokenize_router.APP_STATE_KEY,
@@ -130,7 +180,13 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     )
     server.app.state.anthropic_serving_batches = AnthropicBatchesServing(runner=None)
     server.register_routes()
-    attach_routers(server.app, ServerCapabilities.for_role(None))
+    # Mutually exclusive in practice; both on to enumerate every route.
+    attach_routers(
+        server.app,
+        dataclasses.replace(
+            ServerCapabilities.for_role(None), rl_control=True, runtime_control=True
+        ),
+    )
     # effective_routes walks included routers, which FastAPI 0.139 keeps as
     # objects without .path or .methods in app.routes.
     return sorted(

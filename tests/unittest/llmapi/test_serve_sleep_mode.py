@@ -139,7 +139,9 @@ def test_runtime_control_rejects_embedding_server() -> None:
         num_serve_frontends=1,
     )
 
-    with mock.patch.object(OpenAIServer, "_register_runtime_control_routes") as register_routes:
+    # The routers (the runtime-control one among them) attach from the role
+    # switch, which the constructor's check must come before.
+    with mock.patch("tensorrt_llm.serve.openai_server.attach_routers") as attach_routers:
         with pytest.raises(ValueError, match="not supported for embedding servers"):
             OpenAIServer(
                 generator=generator,
@@ -151,4 +153,4 @@ def test_runtime_control_rejects_embedding_server() -> None:
                 runtime_control_api_key="secret",
             )
 
-    register_routes.assert_not_called()
+    attach_routers.assert_not_called()
