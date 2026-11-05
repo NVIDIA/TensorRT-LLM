@@ -8,6 +8,7 @@ import pytest
 
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.pyexecutor import model_engine
+from tensorrt_llm._torch.pyexecutor.engine import model_setup
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.mapping import Mapping
 
@@ -16,7 +17,7 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture
 def initialize_engine_args(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
-    monkeypatch.setattr(model_engine, "_DEEP_GEMM_PDL_CONFIGURED", False)
+    monkeypatch.setattr(model_setup, "_DEEP_GEMM_PDL_CONFIGURED", False)
     processor = object()
     # Tokenizer/checkpoint IO is outside this argument-initialization contract.
     monkeypatch.setattr(model_engine, "create_input_processor", lambda *args, **kwargs: processor)

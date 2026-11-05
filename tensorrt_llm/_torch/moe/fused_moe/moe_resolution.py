@@ -34,6 +34,7 @@ from .cutedsl import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
 from .cutlass import CUTLASS_LEAVES
 from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
@@ -103,8 +104,9 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xW4a16Nvfp4FusedMoE,
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     TrtllmCutedslMegaMoeNvfp4Impl,
-    # Disjoint ``quant`` segments, so the order between the two does not matter.
+    # Disjoint ``quant`` segments, so the order between them does not matter.
     TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmNvfp4PlusImpl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
@@ -148,6 +150,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
             CuteDslB12xNvfp4FusedMoE,
             CuteDslB12xW4a16Nvfp4FusedMoE,
             TrtllmCutedslGroupedGemmNvfp4Impl,
+            TrtllmCutedslGroupedGemmNvfp4PlusImpl,
             TrtllmCutedslGroupedGemmBf16Impl,
         }
     ),
