@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/lora';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">LoRA (Low-Rank Adaptation)</span></li>
@@ -807,7 +811,7 @@
 </div>
 <section id="native-fp8-adapter-support">
 <h4>Native FP8 adapter support<a class="headerlink" href="#native-fp8-adapter-support" title="Link to this heading">#</a></h4>
-<p>The base model’s quantization and the LoRA adapter’s data type are independent. Dense LoRA modules can keep
+<p>The base model’s quantization and the LoRA adapter’s data type are independent. Dense and routed-expert MoE LoRA modules can keep
 FP8 E4M3 adapter weights and execute them with native FP8 grouped GEMM kernels on the following architectures:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -832,8 +836,24 @@ FP8 E4M3 adapter weights and execute them with native FP8 grouped GEMM kernels o
 </table>
 </div>
 <p>If native FP8 LoRA kernels are unavailable for the current device or were excluded from the TensorRT-LLM build,
-the adapter weights are converted to the model compute data type. Native FP8 adapter weights are not supported
-for routed-expert MoE LoRA modules; see <a class="reference internal" href="#routed-expert-moe-lora">Routed-Expert MoE LoRA</a>.</p>
+the adapter weights are converted to the model compute data type. Routed-expert modules require the CUTLASS
+backend; see <a class="reference internal" href="#routed-expert-moe-lora">Routed-Expert MoE LoRA</a>.</p>
+<p>For routed-expert adapters, native FP8 is selected from the checkpoint’s <code class="docutils literal notranslate"><span class="pre">float8_e4m3fn</span></code> dtype.
+All adapter matrices must have one dtype, and the rank, input dimension, and output dimension must be
+multiples of 16. DoRA is unsupported. Save the adapter matrices as BF16 or FP16 to use the compute-dtype
+path instead.</p>
+<p>Native FP8 reduces adapter tensor storage from two bytes per element (BF16/FP16) to one byte. This
+halves the weight payload in the PEFT cache, not total engine memory or necessarily allocated cache capacity.
+This storage reduction does not imply a latency or throughput improvement: each routed-expert FC1/FC2 LoRA stage casts its
+input to FP8, adding a full input read/write pass. These casts reuse existing LoRA result buffers;
+they do not add full-size workspace allocations. The final grouped-GEMM epilogue writes directly to
+BF16/FP16, so no result-conversion pass is needed.</p>
+<p>This execution path is lossy. Activations and the low-rank intermediate are rounded to E4M3 with
+unit scale and saturation at magnitude 448. The final LoRA delta is accumulated in FP32 and stored
+in the model’s BF16/FP16 compute dtype; it is not rounded or saturated to FP8. There is no dynamic
+activation scaling. Check application accuracy before deploying an FP8 adapter, especially when
+activations or low-rank intermediates approach the saturation limit. Accuracy depends on the adapter
+and workload; there is no universal error bound.</p>
 </section>
 </section>
 <section id="nemo-lora-format">
@@ -870,7 +890,7 @@ for routed-expert MoE LoRA modules; see <a class="reference internal" href="#rou
 <td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> only (other backends raise an error at construction).</p></td>
 </tr>
 <tr class="row-odd"><td><p>Base-weight dtype</p></td>
-<td><p>bf16 / fp16. Quantized base weights (FP8, NVFP4, INT4, INT8) are not yet supported.</p></td>
+<td><p>bf16 / fp16 or per-tensor FP8 (QDQ). FP8 block-scale, NVFP4, MXFP8, INT4, and INT8 are not supported.</p></td>
 </tr>
 <tr class="row-even"><td><p>Adapter modules</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">moe_h_to_4h</span></code> (gate side of SwiGLU), <code class="docutils literal notranslate"><span class="pre">moe_gate</span></code> (up side), <code class="docutils literal notranslate"><span class="pre">moe_4h_to_h</span></code> (down). <code class="docutils literal notranslate"><span class="pre">moe_h_to_4h</span></code> and <code class="docutils literal notranslate"><span class="pre">moe_4h_to_h</span></code> must both be present; <code class="docutils literal notranslate"><span class="pre">moe_gate</span></code> is optional (gated activations only).</p></td>
@@ -954,7 +974,7 @@ for routed-expert MoE LoRA modules; see <a class="reference internal" href="#rou
 </section>
 <section id="what-is-rejected-and-where">
 <h4>What is rejected, and where<a class="headerlink" href="#what-is-rejected-and-where" title="Link to this heading">#</a></h4>
-<p>If you supply MoE LoRA on a non-Cutlass backend or with quantization, <code class="docutils literal notranslate"><span class="pre">create_moe</span></code> raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and per-request (eager-schema) inputs under CUDA-graph capture (use the slot-indexed schema for capture).</p>
+<p>If you supply MoE LoRA on a non-Cutlass backend or with unsupported base quantization, <code class="docutils literal notranslate"><span class="pre">create_moe</span></code> raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and per-request (eager-schema) inputs under CUDA-graph capture (use the slot-indexed schema for capture).</p>
 </section>
 </section>
 <section id="cache-management">
@@ -1110,7 +1130,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -1176,8 +1196,8 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -1249,9 +1269,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

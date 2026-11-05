@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'commands/trtllm-serve/trtllm-serve';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     
@@ -734,6 +738,20 @@ Ultra (<code class="docutils literal notranslate"><span class="pre">nemotron_h</
 shared format. <code class="docutils literal notranslate"><span class="pre">--reasoning_parser</span></code> separately controls reasoning extraction;
 <code class="docutils literal notranslate"><span class="pre">nemotron-v3</span></code> and <code class="docutils literal notranslate"><span class="pre">nano-v3</span></code> are aliases for the same Nemotron reasoning parser.</p>
 </section>
+</section>
+<section id="multiple-http-frontends">
+<h2>Multiple HTTP Frontends<a class="headerlink" href="#multiple-http-frontends" title="Link to this heading">#</a></h2>
+<p>At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> therefore runs <strong>8 HTTP frontend processes</strong> against one executor by default (<code class="docutils literal notranslate"><span class="pre">--num_serve_frontends</span></code>, beta). The launcher process owns the engine; the other frontends attach to it and share the serving port via <code class="docutils literal notranslate"><span class="pre">SO_REUSEPORT</span></code>, so clients still see a single URL.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<ul class="simple">
+<li><p>Pass <code class="docutils literal notranslate"><span class="pre">--num_serve_frontends</span> <span class="pre">1</span></code> (or set <code class="docutils literal notranslate"><span class="pre">num_serve_frontends:</span> <span class="pre">1</span></code> in the <code class="docutils literal notranslate"><span class="pre">--config</span></code> YAML) to run a single frontend.</p></li>
+<li><p>The default applies to the OpenAI HTTP server on the default executor path on a fixed port. With <code class="docutils literal notranslate"><span class="pre">--port</span> <span class="pre">0</span></code> / <code class="docutils literal notranslate"><span class="pre">--report_addr</span></code>, <code class="docutils literal notranslate"><span class="pre">orchestrator_type</span></code> (<code class="docutils literal notranslate"><span class="pre">rpc</span></code> / <code class="docutils literal notranslate"><span class="pre">ray</span></code>), <code class="docutils literal notranslate"><span class="pre">enable_resource_governor</span></code> or <code class="docutils literal notranslate"><span class="pre">--enable_sleep_mode</span></code> it falls back to one frontend and logs why; an explicit <code class="docutils literal notranslate"><span class="pre">--num_serve_frontends</span></code> greater than 1 fails instead. <code class="docutils literal notranslate"><span class="pre">--grpc</span></code> also keeps one frontend unless <code class="docutils literal notranslate"><span class="pre">--num_serve_frontends</span></code> is given (only <code class="docutils literal notranslate"><span class="pre">--grpc-protocol</span> <span class="pre">openengine</span></code> supports more).</p></li>
+<li><p>Each request is handled entirely by the frontend that accepted its connection. Server-wide state lives in the launcher: the other frontends forward <code class="docutils literal notranslate"><span class="pre">/metrics</span></code>, <code class="docutils literal notranslate"><span class="pre">/kv_cache_events</span></code>, profiling and the Anthropic batches API to it, and <code class="docutils literal notranslate"><span class="pre">/prometheus/metrics</span></code> covers every frontend. Per-process state is not shared: the stateful Responses API store (<code class="docutils literal notranslate"><span class="pre">store</span></code> / <code class="docutils literal notranslate"><span class="pre">previous_response_id</span></code>) is disabled, <code class="docutils literal notranslate"><span class="pre">/health</span></code> describes the frontend that answered, and each frontend writes its own per-request perf metrics file.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">SO_REUSEPORT</span></code> would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.</p></li>
+<li><p>Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.</p></li>
+</ul>
+</div>
 </section>
 <section id="inference-endpoints">
 <h2>Inference Endpoints<a class="headerlink" href="#inference-endpoints" title="Link to this heading">#</a></h2>
@@ -870,7 +888,142 @@ shared format. <code class="docutils literal notranslate"><span class="pre">--re
 </section>
 <section id="multimodal-chat-api">
 <h3>Multimodal Chat API<a class="headerlink" href="#multimodal-chat-api" title="Link to this heading">#</a></h3>
-<p>You can query Completions API with any http clients, a typical example is OpenAI Python client:</p>
+<p>You can query the Chat Completions API with any HTTP client. A typical example uses the OpenAI Python client:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="c1">### :title OpenAI Chat Client for Multimodal</span>
+<span class="linenos">  2</span>
+<span class="linenos">  3</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos">  4</span><span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos">  5</span>
+<span class="linenos">  6</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos">  7</span><span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span>
+<span class="linenos">  8</span>
+<span class="linenos">  9</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">encode_base64_content_from_url</span><span class="p">,</span>
+<span class="linenos"> 10</span>                                 <span class="n">encode_base64_image</span><span class="p">)</span>
+<span class="linenos"> 11</span>
+<span class="linenos"> 12</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 13</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">"http://localhost:8000/v1"</span><span class="p">,</span>
+<span class="linenos"> 14</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">"tensorrt_llm"</span><span class="p">,</span>
+<span class="linenos"> 15</span><span class="p">)</span>
+<span class="linenos"> 16</span>
+<span class="linenos"> 17</span><span class="n">llm_models_root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"LLM_MODELS_ROOT"</span><span class="p">))</span>
+<span class="linenos"> 18</span>
+<span class="linenos"> 19</span><span class="k">if</span> <span class="n">llm_models_root</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 20</span>    <span class="c1"># These are paths on the server's own filesystem. trtllm-serve refuses</span>
+<span class="linenos"> 21</span>    <span class="c1"># local paths unless it is started with</span>
+<span class="linenos"> 22</span>    <span class="c1"># TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=$LLM_MODELS_ROOT/multimodals/test_data</span>
+<span class="linenos"> 23</span>    <span class="c1"># (or another directory that contains the files).</span>
+<span class="linenos"> 24</span>    <span class="n">multimodal_test_data_path</span> <span class="o">=</span> <span class="n">llm_models_root</span> <span class="o">/</span> <span class="s2">"multimodals"</span> <span class="o">/</span> <span class="s2">"test_data"</span>
+<span class="linenos"> 25</span>    <span class="n">image_url1</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">"seashore.png"</span><span class="p">)</span>
+<span class="linenos"> 26</span>    <span class="n">image_url2</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">"inpaint.png"</span><span class="p">)</span>
+<span class="linenos"> 27</span>    <span class="n">video_url</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">"OAI-sora-tokyo-walk.mp4"</span><span class="p">)</span>
+<span class="linenos"> 28</span>    <span class="n">image64</span> <span class="o">=</span> <span class="n">encode_base64_image</span><span class="p">(</span>
+<span class="linenos"> 29</span>        <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">"seashore.png"</span><span class="p">))</span>
+<span class="linenos"> 30</span><span class="k">else</span><span class="p">:</span>
+<span class="linenos"> 31</span>    <span class="n">image_url1</span> <span class="o">=</span> <span class="s2">"https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"</span>
+<span class="linenos"> 32</span>    <span class="n">image_url2</span> <span class="o">=</span> <span class="s2">"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png"</span>
+<span class="linenos"> 33</span>    <span class="n">video_url</span> <span class="o">=</span> <span class="s2">"https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4"</span>
+<span class="linenos"> 34</span>    <span class="n">image64</span> <span class="o">=</span> <span class="n">encode_base64_content_from_url</span><span class="p">(</span>
+<span class="linenos"> 35</span>        <span class="s2">"https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"</span>
+<span class="linenos"> 36</span>    <span class="p">)</span>
+<span class="linenos"> 37</span>
+<span class="linenos"> 38</span><span class="c1"># SINGLE IMAGE INFERENCE</span>
+<span class="linenos"> 39</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos"> 40</span>    <span class="n">model</span><span class="o">=</span><span class="s2">"Qwen2.5-VL-3B-Instruct"</span><span class="p">,</span>
+<span class="linenos"> 41</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos"> 42</span>        <span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span>
+<span class="linenos"> 43</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"you are a helpful assistant"</span>
+<span class="linenos"> 44</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 45</span>        <span class="s2">"role"</span><span class="p">:</span>
+<span class="linenos"> 46</span>        <span class="s2">"user"</span><span class="p">,</span>
+<span class="linenos"> 47</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos"> 48</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span>
+<span class="linenos"> 49</span>            <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Describe the natural environment in the image."</span>
+<span class="linenos"> 50</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 51</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"image_url"</span><span class="p">,</span>
+<span class="linenos"> 52</span>            <span class="s2">"image_url"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos"> 53</span>                <span class="s2">"url"</span><span class="p">:</span> <span class="n">image_url1</span>
+<span class="linenos"> 54</span>            <span class="p">}</span>
+<span class="linenos"> 55</span>        <span class="p">}]</span>
+<span class="linenos"> 56</span>    <span class="p">}],</span>
+<span class="linenos"> 57</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos"> 58</span><span class="p">)</span>
+<span class="linenos"> 59</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="linenos"> 60</span>
+<span class="linenos"> 61</span><span class="c1"># MULTI IMAGE INFERENCE</span>
+<span class="linenos"> 62</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos"> 63</span>    <span class="n">model</span><span class="o">=</span><span class="s2">"Qwen2.5-VL-3B-Instruct"</span><span class="p">,</span>
+<span class="linenos"> 64</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos"> 65</span>        <span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span>
+<span class="linenos"> 66</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"you are a helpful assistant"</span>
+<span class="linenos"> 67</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 68</span>        <span class="s2">"role"</span><span class="p">:</span>
+<span class="linenos"> 69</span>        <span class="s2">"user"</span><span class="p">,</span>
+<span class="linenos"> 70</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos"> 71</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span>
+<span class="linenos"> 72</span>            <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Tell me the difference between two images"</span>
+<span class="linenos"> 73</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 74</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"image_url"</span><span class="p">,</span>
+<span class="linenos"> 75</span>            <span class="s2">"image_url"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos"> 76</span>                <span class="s2">"url"</span><span class="p">:</span> <span class="n">image_url2</span>
+<span class="linenos"> 77</span>            <span class="p">}</span>
+<span class="linenos"> 78</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 79</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"image_url"</span><span class="p">,</span>
+<span class="linenos"> 80</span>            <span class="s2">"image_url"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos"> 81</span>                <span class="s2">"url"</span><span class="p">:</span> <span class="n">image_url1</span>
+<span class="linenos"> 82</span>            <span class="p">}</span>
+<span class="linenos"> 83</span>        <span class="p">}]</span>
+<span class="linenos"> 84</span>    <span class="p">}],</span>
+<span class="linenos"> 85</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos"> 86</span><span class="p">)</span>
+<span class="linenos"> 87</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="linenos"> 88</span>
+<span class="linenos"> 89</span><span class="c1"># SINGLE VIDEO INFERENCE</span>
+<span class="linenos"> 90</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos"> 91</span>    <span class="n">model</span><span class="o">=</span><span class="s2">"Qwen2.5-VL-3B-Instruct"</span><span class="p">,</span>
+<span class="linenos"> 92</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos"> 93</span>        <span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span>
+<span class="linenos"> 94</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"you are a helpful assistant"</span>
+<span class="linenos"> 95</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 96</span>        <span class="s2">"role"</span><span class="p">:</span>
+<span class="linenos"> 97</span>        <span class="s2">"user"</span><span class="p">,</span>
+<span class="linenos"> 98</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos"> 99</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span>
+<span class="linenos">100</span>            <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Tell me what you see in the video briefly."</span>
+<span class="linenos">101</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">102</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"video_url"</span><span class="p">,</span>
+<span class="linenos">103</span>            <span class="s2">"video_url"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">104</span>                <span class="s2">"url"</span><span class="p">:</span> <span class="n">video_url</span>
+<span class="linenos">105</span>            <span class="p">}</span>
+<span class="linenos">106</span>        <span class="p">}]</span>
+<span class="linenos">107</span>    <span class="p">}],</span>
+<span class="linenos">108</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos">109</span><span class="p">)</span>
+<span class="linenos">110</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="linenos">111</span>
+<span class="linenos">112</span><span class="c1"># IMAGE EMBED INFERENCE</span>
+<span class="linenos">113</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">114</span>    <span class="n">model</span><span class="o">=</span><span class="s2">"Qwen2.5-VL-3B-Instruct"</span><span class="p">,</span>
+<span class="linenos">115</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos">116</span>        <span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span>
+<span class="linenos">117</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"you are a helpful assistant"</span>
+<span class="linenos">118</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">119</span>        <span class="s2">"role"</span><span class="p">:</span>
+<span class="linenos">120</span>        <span class="s2">"user"</span><span class="p">,</span>
+<span class="linenos">121</span>        <span class="s2">"content"</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos">122</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span>
+<span class="linenos">123</span>            <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Describe the natural environment in the image."</span>
+<span class="linenos">124</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">125</span>            <span class="s2">"type"</span><span class="p">:</span> <span class="s2">"image_url"</span><span class="p">,</span>
+<span class="linenos">126</span>            <span class="s2">"image_url"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">127</span>                <span class="s2">"url"</span><span class="p">:</span> <span class="s2">"data:image/png;base64,"</span> <span class="o">+</span> <span class="n">image64</span>
+<span class="linenos">128</span>            <span class="p">}</span>
+<span class="linenos">129</span>        <span class="p">}]</span>
+<span class="linenos">130</span>    <span class="p">}],</span>
+<span class="linenos">131</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos">132</span><span class="p">)</span>
+<span class="linenos">133</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+</pre></div>
+</div>
 <p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
 <span class="linenos"> 2</span>
@@ -1009,6 +1162,17 @@ shared format. <code class="docutils literal notranslate"><span class="pre">--re
 </div>
 </li>
 </ul>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Media URLs may be <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> URLs or base64 <code class="docutils literal notranslate"><span class="pre">data:</span></code> URLs. A <code class="docutils literal notranslate"><span class="pre">file://</span></code>
+URI or a bare filesystem path is read from the server’s own filesystem, so it
+is refused unless the server is started with
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=&lt;directory&gt;</span></code>; then only regular files whose
+resolved path is inside that directory are read. This applies to
+<code class="docutils literal notranslate"><span class="pre">image_url</span></code>, <code class="docutils literal notranslate"><span class="pre">video_url</span></code> and <code class="docutils literal notranslate"><span class="pre">audio_url</span></code> parts. A deployment whose
+clients send local paths today must set the variable to the directory
+that holds those files.</p>
+</div>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>To convert images to base64-encoded format, use the utility function
@@ -1163,6 +1327,42 @@ Each statistic is returned to only one caller, so poll the endpoint from a singl
 <span class="p">]</span>
 </pre></div>
 </div>
+<section id="attention-dp-statistics">
+<h3>Attention-DP statistics<a class="headerlink" href="#attention-dp-statistics" title="Link to this heading">#</a></h3>
+<p>With attention data parallelism enabled, <code class="docutils literal notranslate"><span class="pre">attentionDpRank</span></code> identifies the rank
+that produced each row’s scheduled-work and KV-cache measurements. KV snapshots
+are captured with the corresponding iteration and include that rank’s capacity,
+occupancy, allocation and reuse counters, and cache hit rate. An idle rank can
+retain cached blocks even when it schedules no requests. If a rank did not
+measure KV statistics for an iteration, its JSON row has <code class="docutils literal notranslate"><span class="pre">kvCacheStats:</span> <span class="pre">null</span></code>;
+absence does not mean an empty cache. <code class="docutils literal notranslate"><span class="pre">TLLM_METRICS_ALL_RANKS</span></code> is not required for this
+attention-DP fanout.</p>
+<p>The shared Prometheus collector uses <code class="docutils literal notranslate"><span class="pre">dp_rank</span></code> on KV-cache and rank-local
+inflight-batching metrics. It takes the rank from <code class="docutils literal notranslate"><span class="pre">attentionDpRank</span></code>, falls back
+to <code class="docutils literal notranslate"><span class="pre">rank</span></code> for all-rank statistics, and uses <code class="docutils literal notranslate"><span class="pre">&quot;0&quot;</span></code> for rows without either
+field. These metric families also have <code class="docutils literal notranslate"><span class="pre">dp_rank=&quot;0&quot;</span></code> in single-rank serving.
+Request metrics and configuration-info metrics retain their existing labels.</p>
+<p>KV gauges retain each rank’s last measurement until another measured snapshot
+arrives. Used-block counts, utilization, and cache-hit rate can remain stale
+throughout periods without fresh snapshots, including idle periods. Zero
+scheduled requests alone does not imply a missing KV measurement.</p>
+<p>Cumulative reused/missed-block counters keep independent baselines per rank
+across absent snapshots. Rows must arrive in producer order for each rank; interleaving
+different ranks is supported. A decrease in a rank’s cumulative counter emits a
+warning and updates the baseline without incrementing the counter. This does not
+make stale or reordered rows safe. Repeated cumulative values add no work.
+Per-iteration delta counters are incremented directly and must be delivered once
+per iteration.</p>
+<p>Top-level request counts, queue, memory, iteration latency, batch configuration,
+average decoded tokens, and speculative-decoding measurements remain owned by
+rank 0 in the collector. They are not sums of rank-local measurements. The
+separate <code class="docutils literal notranslate"><span class="pre">kvCacheIterationStats</span></code> deltas retain their producer ownership and
+are attached only to rank 0 by attention-DP fanout.</p>
+<p>When updating dashboards, retain <code class="docutils literal notranslate"><span class="pre">dp_rank</span></code> to inspect individual ranks or
+aggregate it explicitly. Used/free block counts can be summed across ranks;
+the maximum utilization identifies the fullest rank. Do not sum utilization or
+cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.</p>
+</section>
 </section>
 <section id="runtime-profiling-endpoints">
 <span id="id1"></span><h2>Runtime Profiling Endpoints<a class="headerlink" href="#runtime-profiling-endpoints" title="Link to this heading">#</a></h2>
@@ -1988,7 +2188,7 @@ wrote them.</p>
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-num_serve_frontends">
 <span class="sig-name descname"><span class="pre">--num_serve_frontends</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_serve_frontends&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-num_serve_frontends" title="Link to this definition">#</a></dt>
-<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Number of HTTP or OpenEngine frontend processes serving one executor; values &gt; 1 share the serving port via SO_REUSEPORT (classic IPC executor path only).</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Number of HTTP or OpenEngine frontend processes serving one executor; values &gt; 1 share the serving port via SO_REUSEPORT (classic IPC executor path only). Without an explicit value, –grpc and configurations that support a single frontend only use 1 and log why.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -2145,6 +2345,18 @@ wrote them.</p>
 </dd></dl>
 
 <dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-openengine-metrics-port">
+<span class="sig-name descname"><span class="pre">--openengine-metrics-port</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;openengine_metrics_port&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-openengine-metrics-port" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> OpenEngine Prometheus HTTP port (default: 8001). Enabled by return_perf_metrics or perf_metrics_output_dir in the engine configuration.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-openengine-metrics-host">
+<span class="sig-name descname"><span class="pre">--openengine-metrics-host</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;openengine_metrics_host&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-openengine-metrics-host" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Bind address for OpenEngine Prometheus (default: –host).</p>
+</dd></dl>
+
+<dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-openengine-enable-load-metrics">
 <span class="sig-name descname"><span class="pre">--openengine-enable-load-metrics</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-openengine-enable-load-metrics" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Expose per-rank KV occupancy for OpenEngine routing, independently of KV events.</p>
@@ -2243,7 +2455,7 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -2260,6 +2472,7 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tool-call-parser-selection">Tool-call Parser Selection</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multiple-http-frontends">Multiple HTTP Frontends</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#inference-endpoints">Inference Endpoints</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#chat-api">Chat API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#completions-api">Completions API</a></li>
@@ -2273,7 +2486,10 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#render-endpoints">Render Endpoints</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-serving-with-slurm">Multi-node Serving with Slurm</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics-endpoint">Metrics Endpoint</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics-endpoint">Metrics Endpoint</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-dp-statistics">Attention-DP statistics</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-profiling-endpoints">Runtime Profiling Endpoints</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#post-start-profile">POST /start_profile</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#post-stop-profile">POST /stop_profile</a></li>
@@ -2313,8 +2529,8 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -2386,9 +2602,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

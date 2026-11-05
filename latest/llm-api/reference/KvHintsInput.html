@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>ExtendedRuntimePerfKnobConfig &#8212; TensorRT LLM</title>
+    <title>KvHintsInput &#8212; TensorRT LLM</title>
   
   
   
@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -58,11 +58,11 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/ExtendedRuntimePerfKnobConfig';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/KvHintsInput';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -72,14 +72,14 @@
 
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="BatchingType" href="BatchingType.html" />
-    <link rel="prev" title="MpiCommSession" href="MpiCommSession.html" />
+    <link rel="next" title="DisaggregatedParams" href="DisaggregatedParams.html" />
+    <link rel="prev" title="KvHintsEnvelope" href="KvHintsEnvelope.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2 current active"><a aria-current="page" class="current reference internal" href="#">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2 current active"><a aria-current="page" class="current reference internal" href="#">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,13 +652,13 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     
     <li class="breadcrumb-item"><a href="../reference.html" class="nav-link">API Reference</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">ExtendedRuntimePerfKnobConfig</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KvHintsInput</span></li>
   </ul>
 </nav>
 </div>
@@ -671,132 +675,12 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="extendedruntimeperfknobconfig">
-<h1>ExtendedRuntimePerfKnobConfig<a class="headerlink" href="#extendedruntimeperfknobconfig" title="Link to this heading">#</a></h1>
-<dl class="py class">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">ExtendedRuntimePerfKnobConfig</span></span><span class="sig-paren">(</span>
-
-<dl>
-<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">multi_block_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">enable_context_fmha_fp32_acc</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_cache_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
-</dl>
-
-<span class="sig-paren">)</span><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#ExtendedRuntimePerfKnobConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">StrictBaseModel</span></code>, <code class="xref py py-class docutils literal notranslate"><span class="pre">PybindMirror</span></code></p>
-<p>Configuration for extended runtime performance knobs.</p>
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.cuda_graph_cache_size">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_cache_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.cuda_graph_cache_size" title="Link to this definition">#</a></dt>
-<dd><p>Number of cuda graphs to be cached in the runtime. The larger the cache, the better the perf, but more GPU memory is consumed.</p>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.cuda_graph_mode">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.cuda_graph_mode" title="Link to this definition">#</a></dt>
-<dd><p>Whether to use CUDA graph mode.</p>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.enable_context_fmha_fp32_acc">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_context_fmha_fp32_acc</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.enable_context_fmha_fp32_acc" title="Link to this definition">#</a></dt>
-<dd><p>Whether to enable context FMHA FP32 accumulation.</p>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.multi_block_mode">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">multi_block_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.multi_block_mode" title="Link to this definition">#</a></dt>
-<dd><p>Whether to use multi-block mode.</p>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.__init__">
-<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">data</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.__init__" title="Link to this definition">#</a></dt>
-<dd><p>Create a new model by parsing and validating input data from keyword arguments.</p>
-<p>Raises [<cite>ValidationError</cite>][pydantic_core.ValidationError] if the input data cannot be
-validated to form a valid model.</p>
-<p><cite>self</cite> is explicitly positional-only to allow <cite>self</cite> as a field name.</p>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.from_pybind">
-<em class="property"><span class="pre">classmethod</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">from_pybind</span></span><span class="sig-paren">(</span>
-
-<dl>
-<dd><em class="sig-param"><span class="n"><span class="pre">pybind_instance</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">PybindMirror</span></span></em>,</dd>
-</dl>
-
-<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">T</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.from_pybind" title="Link to this definition">#</a></dt>
-<dd><p>Construct an instance of the given class from the fields in the given
-pybind class instance.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>cls</strong> – Type of the class to construct, must be a subclass of pydantic
-BaseModel</p></li>
-<li><p><strong>pybind_instance</strong> – Instance of the pybind class to construct from its
-fields</p></li>
-</ul>
-</dd>
-</dl>
-<p class="rubric">Notes</p>
-<p>When a field value is None in the pybind class, but it’s not
-optional and has a default value in the BaseModel class, it would
-get the default value defined in the BaseModel class.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Returns<span class="colon">:</span></dt>
-<dd class="field-odd"><p>Instance of the given class, populated with the fields of the given
-pybind instance</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.get_pybind_enum_fields">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">get_pybind_enum_fields</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pybind_class</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.get_pybind_enum_fields" title="Link to this definition">#</a></dt>
-<dd><p>Get all the enum fields from the pybind class.</p>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.get_pybind_variable_fields">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">get_pybind_variable_fields</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config_cls</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.get_pybind_variable_fields" title="Link to this definition">#</a></dt>
-<dd><p>Get all the variable fields from the pybind class.</p>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.maybe_to_pybind">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">maybe_to_pybind</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ins</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.maybe_to_pybind" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.mirror_pybind_enum">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">mirror_pybind_enum</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pybind_class</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.mirror_pybind_enum" title="Link to this definition">#</a></dt>
-<dd><p>Mirror the enum fields from the pybind class to the Python class.</p>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.mirror_pybind_fields">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">mirror_pybind_fields</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pybind_class</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.mirror_pybind_fields" title="Link to this definition">#</a></dt>
-<dd><p>Class decorator that ensures Python class fields mirror those of a C++ class.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>pybind_class</strong> – The C++ class whose fields should be mirrored</p>
-</dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>A decorator function that validates field mirroring</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.pybind_equals">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">pybind_equals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">obj0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">obj1</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.pybind_equals" title="Link to this definition">#</a></dt>
-<dd><p>Check if two pybind objects are equal.</p>
-</dd></dl>
-
+  <section id="kvhintsinput">
+<h1>KvHintsInput<a class="headerlink" href="#kvhintsinput" title="Link to this heading">#</a></h1>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvHintsInput">
+<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">KvHintsInput</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.KvHintsInput" title="Link to this definition">#</a></dt>
+<dd><p>alias of <a class="reference internal" href="KvHintsEnvelope.html#tensorrt_llm.llmapi.KvHintsEnvelope" title="tensorrt_llm.kv_hints.protocol.KvHintsEnvelope"><code class="xref py py-class docutils literal notranslate"><span class="pre">KvHintsEnvelope</span></code></a> | <code class="xref py py-class docutils literal notranslate"><span class="pre">dict</span></code>[<code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code>, <code class="xref py py-obj docutils literal notranslate"><span class="pre">JsonValue</span></code>]</p>
 </dd></dl>
 
 </section>
@@ -812,20 +696,20 @@ pybind instance</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="MpiCommSession.html"
+       href="KvHintsEnvelope.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">MpiCommSession</p>
+        <p class="prev-next-title">KvHintsEnvelope</p>
       </div>
     </a>
     <a class="right-next"
-       href="BatchingType.html"
+       href="DisaggregatedParams.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">BatchingType</p>
+        <p class="prev-next-title">DisaggregatedParams</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -838,7 +722,7 @@ pybind instance</p>
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -850,21 +734,7 @@ pybind instance</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig"><code class="docutils literal notranslate"><span class="pre">ExtendedRuntimePerfKnobConfig</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.cuda_graph_cache_size"><code class="docutils literal notranslate"><span class="pre">cuda_graph_cache_size</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.cuda_graph_mode"><code class="docutils literal notranslate"><span class="pre">cuda_graph_mode</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.enable_context_fmha_fp32_acc"><code class="docutils literal notranslate"><span class="pre">enable_context_fmha_fp32_acc</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.multi_block_mode"><code class="docutils literal notranslate"><span class="pre">multi_block_mode</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.from_pybind"><code class="docutils literal notranslate"><span class="pre">from_pybind()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.get_pybind_enum_fields"><code class="docutils literal notranslate"><span class="pre">get_pybind_enum_fields()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.get_pybind_variable_fields"><code class="docutils literal notranslate"><span class="pre">get_pybind_variable_fields()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.maybe_to_pybind"><code class="docutils literal notranslate"><span class="pre">maybe_to_pybind()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.mirror_pybind_enum"><code class="docutils literal notranslate"><span class="pre">mirror_pybind_enum()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.mirror_pybind_fields"><code class="docutils literal notranslate"><span class="pre">mirror_pybind_fields()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.pybind_equals"><code class="docutils literal notranslate"><span class="pre">pybind_equals()</span></code></a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvHintsInput"><code class="docutils literal notranslate"><span class="pre">KvHintsInput</span></code></a></li>
 </ul>
   </nav></div>
 
@@ -883,8 +753,8 @@ pybind instance</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -956,9 +826,9 @@ pybind instance</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

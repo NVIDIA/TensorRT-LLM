@@ -45,6 +45,9 @@ API Reference
     reference/RequestOutput
     reference/GuidedDecodingParams
     reference/SamplingParams
+    reference/KvHintAction
+    reference/KvHintsEnvelope
+    reference/KvHintsInput
     reference/DisaggregatedParams
     reference/ConversationParams
     reference/DisaggScheduleStyle
@@ -68,8 +71,6 @@ API Reference
     reference/CalibConfig
     reference/RequestError
     reference/MpiCommSession
-    reference/ExtendedRuntimePerfKnobConfig
-    reference/BatchingType
     reference/ContextChunkingPolicy
     reference/DynamicBatchConfig
     reference/CacheTransceiverConfig
@@ -155,6 +156,21 @@ This page provides a searchable index of API names and parameters. Open an entry
     :no-index:
 
     :doc:`View the full SamplingParams reference <reference/SamplingParams>`
+
+.. autoclass:: tensorrt_llm.llmapi.KvHintAction
+    :no-index:
+
+    :doc:`View the full KvHintAction reference <reference/KvHintAction>`
+
+.. autoclass:: tensorrt_llm.llmapi.KvHintsEnvelope
+    :no-index:
+
+    :doc:`View the full KvHintsEnvelope reference <reference/KvHintsEnvelope>`
+
+.. autoclass:: tensorrt_llm.llmapi.KvHintsInput
+    :no-index:
+
+    :doc:`View the full KvHintsInput reference <reference/KvHintsInput>`
 
 .. autoclass:: tensorrt_llm.llmapi.DisaggregatedParams
     :no-index:
@@ -270,16 +286,6 @@ This page provides a searchable index of API names and parameters. Open an entry
     :no-index:
 
     :doc:`View the full MpiCommSession reference <reference/MpiCommSession>`
-
-.. autoclass:: tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig
-    :no-index:
-
-    :doc:`View the full ExtendedRuntimePerfKnobConfig reference <reference/ExtendedRuntimePerfKnobConfig>`
-
-.. autoclass:: tensorrt_llm.llmapi.BatchingType
-    :no-index:
-
-    :doc:`View the full BatchingType reference <reference/BatchingType>`
 
 .. autoclass:: tensorrt_llm.llmapi.ContextChunkingPolicy
     :no-index:

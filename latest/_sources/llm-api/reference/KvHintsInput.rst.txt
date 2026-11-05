@@ -1,7 +1,7 @@
-BatchingType
+KvHintsInput
 ============
 
-.. autoclass:: tensorrt_llm.llmapi.BatchingType
+.. autoclass:: tensorrt_llm.llmapi.KvHintsInput
     :members:
     :undoc-members:
     :show-inheritance:

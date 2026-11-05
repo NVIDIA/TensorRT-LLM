@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/kvcache';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -72,14 +72,14 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="KV Cache Compression" href="kv-cache-compression.html" />
+    <link rel="next" title="KV hint request metadata" href="kv-hints.html" />
     <link rel="prev" title="Embeddings (Encoder-Only Models)" href="embeddings.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KV Cache System</span></li>
@@ -685,7 +689,7 @@
 <p>One caveat in the current code is that only leaf blocks can be evicted (leaves are blocks with no descendants in the radix tree). This design works well for full attention layers, but not for limited attention layers. This will be fixed in a future version.</p>
 <section id="retention-policy">
 <h3>Retention Policy<a class="headerlink" href="#retention-policy" title="Link to this heading">#</a></h3>
-<p>Blocks are assigned priority in line with the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig">retention policy</a> of the request. Blocks with lower priority scores will be freed preferentially to blocks with higher priority. The retention policy is a list of <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig">TokenRangeRetentionConfig</a> objects, each specifying priority for a given range of tokens, such as “assign priority X to tokens 10 through 61”. You can also assign a duration in milliseconds for this to remain in effect. Priority reverts to the default of 35 after a period of <code class="docutils literal notranslate"><span class="pre">duration_ms</span></code> has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property <code class="docutils literal notranslate"><span class="pre">decode_retention_policy</span></code> specifies what priority to assign to blocks with generated (decoded) tokens and <code class="docutils literal notranslate"><span class="pre">decode_duration_ms</span></code> specifies how long this should remain in effect. Priority reverts to the default after expiration. Any property that expects a duration can be set to None. This indicates that particular part of the retention policy never expires.</p>
+<p>Blocks are assigned priority in line with the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig">retention policy</a> of the request. Blocks with lower priority scores will be freed preferentially to blocks with higher priority. The retention policy is a list of <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig">TokenRangeRetentionConfig</a> objects, each specifying priority for a given range of tokens, such as “assign priority X to tokens 10 through 61”. You can also assign a duration in milliseconds for this to remain in effect. Priority reverts to the default of 35 after a period of <code class="docutils literal notranslate"><span class="pre">duration_ms</span></code> has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property <code class="docutils literal notranslate"><span class="pre">decode_retention_priority</span></code> specifies what priority to assign to blocks with generated (decoded) tokens and <code class="docutils literal notranslate"><span class="pre">decode_duration_ms</span></code> specifies how long this should remain in effect. Priority reverts to the default after expiration. Any property that expects a duration can be set to None. This indicates that particular part of the retention policy never expires.</p>
 <p>Not in use: <code class="docutils literal notranslate"><span class="pre">transfer_mode</span></code> is a debug option and should not be used.</p>
 <p>See <a class="reference internal" href="../examples/kvcacheretentionconfig.html"><span class="std std-doc">this example</span></a> for an example of how to change block priorities of specific requests by altering their retention policy.</p>
 </section>
@@ -734,10 +738,13 @@ credit:</p>
 <section id="selecting-the-kv-cache-manager">
 <h3>Selecting the KV Cache Manager<a class="headerlink" href="#selecting-the-kv-cache-manager" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM ships two KV cache manager implementations. <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2</span></code>
-selects between them and defaults to <code class="docutils literal notranslate"><span class="pre">auto</span></code>, which adopts the model’s own
-preference and falls back to the V1 C++ manager for models that do not declare
-one. Set it to <code class="docutils literal notranslate"><span class="pre">true</span></code> or <code class="docutils literal notranslate"><span class="pre">false</span></code> to override the model default.</p>
-<p>Models that select the V2 manager by default:</p>
+selects between them and defaults to <code class="docutils literal notranslate"><span class="pre">true</span></code>, which selects the V2 manager. Set it
+to <code class="docutils literal notranslate"><span class="pre">false</span></code> to select the V1 C++ manager for models that support it. Set it to
+<code class="docutils literal notranslate"><span class="pre">auto</span></code> to adopt the model’s own preference instead; <code class="docutils literal notranslate"><span class="pre">auto</span></code> falls back to the V1
+C++ manager for models that do not declare one. With <code class="docutils literal notranslate"><span class="pre">auto</span></code>, disaggregated
+serving keeps a V2 preference only with the Python NIXL transceiver
+(<code class="docutils literal notranslate"><span class="pre">transceiver_runtime:</span> <span class="pre">PYTHON</span></code>, <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">NIXL</span></code>) and otherwise falls back to V1.</p>
+<p>Models whose preference selects the V2 manager when the setting is <code class="docutils literal notranslate"><span class="pre">auto</span></code>:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Model</p></th>
@@ -942,7 +949,7 @@ snapshots the recurrent state at the fork. The deprecated
 <section id="multimodal-uuid-support-for-cache-identification">
 <h3>Multimodal UUID Support for Cache Identification<a class="headerlink" href="#multimodal-uuid-support-for-cache-identification" title="Link to this heading">#</a></h3>
 <p>When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.</p>
-<p>You can provide custom UUID strings for your multimodal data using the <code class="docutils literal notranslate"><span class="pre">multi_modal_uuids</span></code> parameter when creating requests. Both cache managers compute the item digest from <strong>both</strong> the UUID and content together for correctness. V1 returns the original UUID in the KV cache event’s <code class="docutils literal notranslate"><span class="pre">mm_keys[].hash</span></code> field when one is supplied. V2 returns the item digest as a hexadecimal string, including for items with UUIDs.</p>
+<p>You can provide custom UUID strings for your multimodal data using the <code class="docutils literal notranslate"><span class="pre">multi_modal_uuids</span></code> parameter when creating requests. Both cache managers compute the item digest from <strong>both</strong> the UUID and content together for correctness. V1 returns the original UUID in the KV cache event’s <code class="docutils literal notranslate"><span class="pre">mm_keys[].hash</span></code> field when one is supplied. V2 always returns the derived digest in <code class="docutils literal notranslate"><span class="pre">mm_keys[].hash</span></code> and adds the original identity in the optional <code class="docutils literal notranslate"><span class="pre">mm_keys[].uuid</span></code> field.</p>
 <p><strong>Usage Example:</strong></p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
 
@@ -958,16 +965,22 @@ snapshots the recurrent state at the fork. The deprecated
 <ul class="simple">
 <li><p><strong>Cache Correctness</strong>: When a UUID is provided, the cache key is computed from both the UUID and content together using <code class="docutils literal notranslate"><span class="pre">BLAKE3(UUID</span> <span class="pre">||</span> <span class="pre">Content)</span></code>. This ensures different content always produces different cache entries, even with the same UUID.</p></li>
 <li><p><strong>User Isolation</strong>: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.</p></li>
-<li><p><strong>Stable Event Identifiers</strong>: <code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code> returns the original UUID for V1, or the item digest for V2. V2 consumers can use the same digest that appears in its cache-key token sequence.</p></li>
+<li><p><strong>Stable Event Identifiers</strong>: <code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code> returns the original UUID in V1’s <code class="docutils literal notranslate"><span class="pre">hash</span></code> field. V2 returns the item digest in <code class="docutils literal notranslate"><span class="pre">hash</span></code> and the original UUID in the optional <code class="docutils literal notranslate"><span class="pre">uuid</span></code> field.</p></li>
 <li><p><strong>Partial UUID Support</strong>: You can provide UUIDs for some items and use <code class="docutils literal notranslate"><span class="pre">None</span></code> for others to fall back to content-only hashing.</p></li>
 <li><p><strong>Cross-Modality Support</strong>: Different modalities (images, videos) can each have their own UUIDs.</p></li>
 </ul>
 <p><strong>UUID Format:</strong></p>
 <ul class="simple">
 <li><p>Can be any string (e.g., “image-123”, “user-session-img-a”, database keys)</p></li>
-<li><p>Original UUID strings are preserved in request metadata and returned in V1 KV cache events</p></li>
+<li><p>Original UUID strings are preserved in request metadata and returned in KV cache events</p></li>
 </ul>
-<p>V2 derives <code class="docutils literal notranslate"><span class="pre">mm_keys</span></code> directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: <code class="docutils literal notranslate"><span class="pre">hash</span></code> is the item’s digest, and <code class="docutils literal notranslate"><span class="pre">start_offset</span></code> is the segment’s first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from <code class="docutils literal notranslate"><span class="pre">block_hash</span></code>, which also depends on the preceding token sequence.</p>
+<p>V2 derives <code class="docutils literal notranslate"><span class="pre">mm_keys</span></code> directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: <code class="docutils literal notranslate"><span class="pre">hash</span></code> is the item’s digest, optional <code class="docutils literal notranslate"><span class="pre">uuid</span></code> is the externally supplied identity, and <code class="docutils literal notranslate"><span class="pre">start_offset</span></code> is the segment’s first token offset within the item. An item spanning multiple blocks retains the same digest and UUID with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from <code class="docutils literal notranslate"><span class="pre">block_hash</span></code>, which also depends on the preceding token sequence. Clients that require the externally supplied identity must read <code class="docutils literal notranslate"><span class="pre">uuid</span></code>; truncating or otherwise deriving an identity from <code class="docutils literal notranslate"><span class="pre">hash</span></code> does not recover the UUID.</p>
+<p>For multimodal blocks, the optional <code class="docutils literal notranslate"><span class="pre">BlockStored.trtllm_image_routing</span></code> extension
+provides the routing format version and token-ID offset. The extension can accompany
+video and audio keys as well as image keys; the OpenEngine capability flag advertises
+only the currently validated image-routing support. See the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/tensorrt_llm/grpc/openengine/README.md">OpenEngine image routing contract</a>
+for capability requirements and consumer handling.</p>
 </section>
 <section id="enable-offloading-to-host-memory">
 <h3>Enable Offloading to Host Memory<a class="headerlink" href="#enable-offloading-to-host-memory" title="Link to this heading">#</a></h3>
@@ -1039,15 +1052,16 @@ router-facing contract described below.</p>
 Events are buffered per rank, gathered onto rank 0 under attention data parallelism, and
 exposed through <code class="docutils literal notranslate"><span class="pre">LLM.get_kv_cache_events()</span></code> / <code class="docutils literal notranslate"><span class="pre">LLM.get_kv_cache_events_async()</span></code>, or over the
 <code class="docutils literal notranslate"><span class="pre">/kv_cache_events</span></code> endpoint of <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>.</p>
+<p>Reset does not flush buffered events; they are published at a subsequent iteration boundary.</p>
 </section>
 <section id="streaming-path-prototype">
 <h4>Streaming path (prototype)<a class="headerlink" href="#streaming-path-prototype" title="Link to this heading">#</a></h4>
 <p>Configured with <code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_events_config</span></code>. Streaming is intended to reduce event
 publishing overhead under attention data parallelism: each emitting rank publishes its own
 events over a ZeroMQ <code class="docutils literal notranslate"><span class="pre">PUB</span></code> socket, removing the rank-0 gather and the consumer pull through the
-LLM API. Each emitting rank still drains its local native event source, converts the events to
-wire structs and enqueues one batch at the iteration boundary. A background thread performs
-msgpack encoding and socket I/O.</p>
+LLM API. Each emitting rank drains its local native event source, converts the events to wire
+structs and attempts to enqueue a batch at iteration boundaries and when a prefix-cache reset
+completes. A background thread performs msgpack encoding and socket I/O.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">KVEventsConfig</span>
 
 <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span>
@@ -1063,17 +1077,29 @@ msgpack encoding and socket I/O.</p>
 <p><strong>Limitations.</strong> Pipeline and context parallelism are unsupported. Buffered polling returns
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
 events. Use buffered mode for cache-tier, priority, and other lifecycle updates.</p>
+<p>A successful prefix-cache reset emits ordered <code class="docutils literal notranslate"><span class="pre">AllBlocksCleared</span></code> after preceding stored or
+removed events. A populated reset also emits <code class="docutils literal notranslate"><span class="pre">BlockRemoved</span></code> for previously published resident
+blocks before <code class="docutils literal notranslate"><span class="pre">AllBlocksCleared</span></code>; consumers should accept both even though the reset marker
+already invalidates the whole index. Each rank attempts to enqueue its reset events without
+waiting for another inference iteration, including while inference is idle or paused, and
+without a cross-rank event gather. Publishing happens asynchronously. A successfully
+published marker is retained in bounded replay history and does not change the engine
+lifetime ID.
+Orderly engine shutdown also clears the reuse tree and queues a final <code class="docutils literal notranslate"><span class="pre">AllBlocksCleared</span></code>
+before publisher teardown.
+The best-effort delivery guarantees below apply to reset and shutdown events too.</p>
 <p>Streaming exposes only the full-block residency information external routers need, using the
-attention lifecycle with the largest window. Conversion to <code class="docutils literal notranslate"><span class="pre">BlockStored</span></code>/<code class="docutils literal notranslate"><span class="pre">BlockRemoved</span></code> is
-centralized at the once-per-iteration publisher boundary, keeping internal lifecycle details
-contained and avoiding Python callbacks from native cache operations.</p>
+attention lifecycle with the largest window. Conversion to <code class="docutils literal notranslate"><span class="pre">BlockStored</span></code>, <code class="docutils literal notranslate"><span class="pre">BlockRemoved</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">AllBlocksCleared</span></code> is centralized at iteration and reset publication boundaries, keeping
+internal lifecycle details contained and avoiding Python callbacks from native cache operations.</p>
 <p><strong>Multimodal payloads.</strong> <code class="docutils literal notranslate"><span class="pre">token_ids</span></code> can contain integers and hexadecimal digest strings;
 integer-only consumers are incompatible. Each <code class="docutils literal notranslate"><span class="pre">mm_keys[i]</span></code> describes the multimodal segments
-in <code class="docutils literal notranslate"><span class="pre">block_hashes[i]</span></code>, using the <code class="docutils literal notranslate"><span class="pre">hash</span></code> and <code class="docutils literal notranslate"><span class="pre">start_offset</span></code> fields defined above. This payload
-support does not establish end-to-end multimodal-aware routing compatibility. The final
-identity and normalization contract will be revisited separately after
-<a class="reference external" href="https://github.com/ai-dynamo/dynamo/pull/15095">Dynamo #15095</a> and
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19529">TensorRT-LLM #19529</a> merge.</p>
+in <code class="docutils literal notranslate"><span class="pre">block_hashes[i]</span></code>, using the <code class="docutils literal notranslate"><span class="pre">hash</span></code>, <code class="docutils literal notranslate"><span class="pre">start_offset</span></code>, and optional <code class="docutils literal notranslate"><span class="pre">uuid</span></code> fields defined
+above. As in buffered V2 events, <code class="docutils literal notranslate"><span class="pre">hash</span></code> remains the item digest; <code class="docutils literal notranslate"><span class="pre">uuid</span></code> preserves the
+externally supplied identity without changing block hashes. An absent UUID is omitted
+from the wire payload. This payload support does not establish end-to-end
+multimodal-aware routing compatibility; consumers must support the same identity and
+normalization contract.</p>
 <p><strong>Endpoint convention.</strong> Every attention-DP rank binds <code class="docutils literal notranslate"><span class="pre">base_port</span> <span class="pre">+</span> <span class="pre">rank</span></code> using its
 <strong>global</strong> rank, so <code class="docutils literal notranslate"><span class="pre">N</span></code> ranks occupy <code class="docutils literal notranslate"><span class="pre">[base_port,</span> <span class="pre">base_port</span> <span class="pre">+</span> <span class="pre">N</span> <span class="pre">-</span> <span class="pre">1]</span></code> cluster-wide and
 each rank’s port is distinct — on a multi-node deployment, rank 8 binds <code class="docutils literal notranslate"><span class="pre">base_port</span> <span class="pre">+</span> <span class="pre">8</span></code>
@@ -1086,17 +1112,22 @@ Overlapping ranges are rejected at startup. For <code class="docutils literal no
 have no port, each rank appends a <code class="docutils literal notranslate"><span class="pre">_dp&lt;rank&gt;</span></code> suffix instead.</p>
 <p><strong>Wire format.</strong> Each batch is sent as three ZeroMQ frames: the subscription <code class="docutils literal notranslate"><span class="pre">topic</span></code>,
 an 8-byte big-endian sequence number, and a msgpack payload
-<code class="docutils literal notranslate"><span class="pre">[timestamp,</span> <span class="pre">[events],</span> <span class="pre">data_parallel_rank]</span></code>. Each event is a map tagged with a <code class="docutils literal notranslate"><span class="pre">type</span></code> key —
-<code class="docutils literal notranslate"><span class="pre">BlockStored</span></code> or <code class="docutils literal notranslate"><span class="pre">BlockRemoved</span></code> — carrying int64 block hashes derived from the V2 radix block
-keys. This is the format documented for custom router backends; it differs from vLLM’s
-positional-array encoding of the individual events, though the batch envelope is positional in
-both.</p>
+<code class="docutils literal notranslate"><span class="pre">[timestamp,</span> <span class="pre">[events],</span> <span class="pre">data_parallel_rank]</span></code>. Each event is a map tagged with a <code class="docutils literal notranslate"><span class="pre">type</span></code> key:
+<code class="docutils literal notranslate"><span class="pre">BlockStored</span></code>, <code class="docutils literal notranslate"><span class="pre">BlockRemoved</span></code>, or <code class="docutils literal notranslate"><span class="pre">AllBlocksCleared</span></code>. Stored and removed events carry int64
+block hashes derived from the V2 radix block keys. <code class="docutils literal notranslate"><span class="pre">AllBlocksCleared</span></code> has no additional
+fields. This is the format documented for custom router backends; it differs from vLLM’s
+positional-array encoding of the individual events, though the batch envelope is positional
+in both.</p>
 <p><strong>Delivery guarantees.</strong> Delivery is best effort, and batch loss is observable. Every accepted
 batch reserves a sequence number up front, so a batch dropped by a full publisher queue
 (<code class="docutils literal notranslate"><span class="pre">max_queue_size</span></code>) or by a failed send leaves a hole in the sequence. Subscribers must
 treat any gap as lost KV-cache state and resynchronize rather than assuming continuity. A
 producer-side safety-cap drop is reported in the producer’s logs and counters but does not
-create a sequence gap.</p>
+create a sequence gap. If the last batch is dropped while the engine remains idle, a
+subscriber cannot detect its sequence gap until a later batch arrives. The
+<a class="reference external" href="https://github.com/ai-dynamo/dynamo/blob/e5a2ef3fcc2cc6e12a9185e39c98141a983eaeab/lib/llm/src/kv_router/publisher/zmq_listener.rs#L183-L208">Dynamo TensorRT-LLM sidecar</a>
+currently logs source sequence gaps without automatically resynchronizing, so a lost reset
+marker can leave its routing index stale even after later events arrive.</p>
 <p><strong>Replay.</strong> If <code class="docutils literal notranslate"><span class="pre">replay_endpoint</span></code> is set, the publisher also binds a <code class="docutils literal notranslate"><span class="pre">ROUTER</span></code> socket. A
 subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and
 receives each retained batch as <code class="docutils literal notranslate"><span class="pre">[delimiter,</span> <span class="pre">topic,</span> <span class="pre">seq,</span> <span class="pre">payload]</span></code>, terminated by a sentinel
@@ -1134,11 +1165,11 @@ dropped before reaching the executor.</p>
       </div>
     </a>
     <a class="right-next"
-       href="kv-cache-compression.html"
+       href="kv-hints.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">KV Cache Compression</p>
+        <p class="prev-next-title">KV hint request metadata</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1151,7 +1182,7 @@ dropped before reaching the executor.</p>
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -1212,8 +1243,8 @@ dropped before reaching the executor.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -1285,9 +1316,9 @@ dropped before reaching the executor.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

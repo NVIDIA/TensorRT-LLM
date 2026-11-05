@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/TorchLlmArgs';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -239,7 +239,7 @@
   
 
   
-    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
       <span class="fa-solid fa-outdent"></span>
     </button>
   
@@ -253,7 +253,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -324,14 +324,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -377,6 +377,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -453,6 +454,9 @@
 <li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -476,8 +480,6 @@
 <li class="toctree-l2"><a class="reference internal" href="CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -522,6 +524,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -554,6 +557,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -648,7 +652,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     
@@ -741,6 +745,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">num_serve_frontends:</span> <span class="pre">~typing.Annotated[int</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Ge(ge=1)</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Le(le=64)]</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">serve_frontend_affinity_port_stride:</span> <span class="pre">~typing.Annotated[int</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Gt(gt=0)]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -821,6 +827,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">'LOWPRECISION'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">'MNNVL'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">'NCCL_SYMMETRIC']</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">'AUTO'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mnnvl_allreduce_fp8_payload:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">replicate_embedding:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">checkpoint_loader:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">checkpoint_format:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">checkpoint_io_policy:</span> <span class="pre">~typing.Literal['auto'</span></span></em>,</dd>
@@ -1330,6 +1338,12 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.mnnvl_allreduce_fp8_payload">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">mnnvl_allreduce_fp8_payload</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.mnnvl_allreduce_fp8_payload" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.model">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">model</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span></em><em class="property"> <span class="pre">[Required]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.model" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The path to the model checkpoint or the model name from the Hugging Face Hub.</p>
@@ -1537,6 +1551,12 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.replicate_embedding">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">replicate_embedding</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.replicate_embedding" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.request_stats_max_iterations">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">request_stats_max_iterations</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.request_stats_max_iterations" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The maximum number of iterations for request stats. Set to -1 to keep all request stats. Set to 0 to disable request stats.</p>
@@ -1571,6 +1591,12 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.scheduler_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">scheduler_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="SchedulerConfig.html#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.SchedulerConfig"><span class="pre">SchedulerConfig</span></a></em><em class="property"> <span class="pre">[Optional]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.scheduler_config" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Scheduler config.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.serve_frontend_affinity_port_stride">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">serve_frontend_affinity_port_stride</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">PositiveInt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.serve_frontend_affinity_port_stride" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> With num_serve_frontends=K &gt; 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -1825,29 +1851,9 @@ objects from templates aren’t broken.</p>
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_gms_moe_compat">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_gms_moe_compat</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_gms_moe_compat"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_gms_moe_compat" title="Link to this definition">#</a></dt>
-<dd><p>Reject <code class="docutils literal notranslate"><span class="pre">LoadFormat.GMS</span></code> combined with a MoE load balancer.</p>
-<p>The <code class="docutils literal notranslate"><span class="pre">MoeLoadBalancer</span></code>’s <code class="docutils literal notranslate"><span class="pre">register_weight_slots_after_to_cuda</span></code>
-and <code class="docutils literal notranslate"><span class="pre">finalize_model</span></code> run AFTER the GMS RW pool is closed and
-<code class="docutils literal notranslate"><span class="pre">finalize_write</span></code> has committed, so any CUDA allocations they
-make land in non-GMS memory and are NOT part of the committed
-layout that RO peers receive. The result is “wrong inference,
-no error” on RO peers (broken MoE routing state). Failing at
-config-validation time is strictly better than that silent
-miscompute.</p>
-<p>The fix for this gap (running the MoE finalize work INSIDE
-<code class="docutils literal notranslate"><span class="pre">mem_pool_scope</span></code> and BEFORE <code class="docutils literal notranslate"><span class="pre">finalize_write</span></code> so MoE
-allocations are part of the committed layout) is tracked as
-the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span class="pre">model_loader.py</span></code>’s
-<code class="docutils literal notranslate"><span class="pre">TODO(GMS-MOE-LB)</span></code> comment.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Returns<span class="colon">:</span></dt>
-<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">self</span></code> (Pydantic <code class="docutils literal notranslate"><span class="pre">model_validator</span></code> contract).</p>
-</dd>
-<dt class="field-even">Raises<span class="colon">:</span></dt>
-<dd class="field-even"><p><strong>ValueError</strong> – When <code class="docutils literal notranslate"><span class="pre">load_format</span> <span class="pre">==</span> <span class="pre">LoadFormat.GMS</span></code> and
-    <code class="docutils literal notranslate"><span class="pre">moe_config.load_balancer</span></code> is set.</p>
-</dd>
-</dl>
+<dd><p>Reject GMS when MoE load balancing owns extra device state.</p>
+<p>Load-balancer state is currently allocated after GMS commits its
+shared layout, so read-only peers cannot safely restore that state.</p>
 </dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -1896,6 +1902,12 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_peft_cache_config">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_peft_cache_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_peft_cache_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_per_layer_dynamic_eplb_cuda_graph">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_per_layer_dynamic_eplb_cuda_graph</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_per_layer_dynamic_eplb_cuda_graph"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_per_layer_dynamic_eplb_cuda_graph" title="Link to this definition">#</a></dt>
+<dd><p>Per-layer dynamic EPLB plans cannot be captured in CUDA graphs.</p>
+</dd></dl>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_ray_placement_config">
@@ -2019,7 +2031,7 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 
 
               
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
                 <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
@@ -2102,6 +2114,7 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_stats_len"><code class="docutils literal notranslate"><span class="pre">max_stats_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.mla_skip_correction_threshold"><code class="docutils literal notranslate"><span class="pre">mla_skip_correction_threshold</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.mm_encoder_only"><code class="docutils literal notranslate"><span class="pre">mm_encoder_only</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.mnnvl_allreduce_fp8_payload"><code class="docutils literal notranslate"><span class="pre">mnnvl_allreduce_fp8_payload</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.model"><code class="docutils literal notranslate"><span class="pre">model</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_kwargs"><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.modeling_v2"><code class="docutils literal notranslate"><span class="pre">modeling_v2</span></code></a></li>
@@ -2134,11 +2147,13 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.ray_worker_nsight_options"><code class="docutils literal notranslate"><span class="pre">ray_worker_nsight_options</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.reasoning_parser"><code class="docutils literal notranslate"><span class="pre">reasoning_parser</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.reorder_policy_config"><code class="docutils literal notranslate"><span class="pre">reorder_policy_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.replicate_embedding"><code class="docutils literal notranslate"><span class="pre">replicate_embedding</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.request_stats_max_iterations"><code class="docutils literal notranslate"><span class="pre">request_stats_max_iterations</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.return_perf_metrics"><code class="docutils literal notranslate"><span class="pre">return_perf_metrics</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.revision"><code class="docutils literal notranslate"><span class="pre">revision</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.sampler_force_async_worker"><code class="docutils literal notranslate"><span class="pre">sampler_force_async_worker</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.scheduler_config"><code class="docutils literal notranslate"><span class="pre">scheduler_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.serve_frontend_affinity_port_stride"><code class="docutils literal notranslate"><span class="pre">serve_frontend_affinity_port_stride</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.skip_tokenizer_init"><code class="docutils literal notranslate"><span class="pre">skip_tokenizer_init</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.sleep_config"><code class="docutils literal notranslate"><span class="pre">sleep_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.sparse_attention_config"><code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code></a></li>
@@ -2188,6 +2203,7 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_mx_config"><code class="docutils literal notranslate"><span class="pre">validate_mx_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_parallel_config"><code class="docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_peft_cache_config"><code class="docutils literal notranslate"><span class="pre">validate_peft_cache_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_per_layer_dynamic_eplb_cuda_graph"><code class="docutils literal notranslate"><span class="pre">validate_per_layer_dynamic_eplb_cuda_graph</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_ray_placement_config"><code class="docutils literal notranslate"><span class="pre">validate_ray_placement_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_ray_worker_extension_cls"><code class="docutils literal notranslate"><span class="pre">validate_ray_worker_extension_cls</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_runtime_args"><code class="docutils literal notranslate"><span class="pre">validate_runtime_args</span></code></a></li>
@@ -2225,8 +2241,8 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -2298,9 +2314,9 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       

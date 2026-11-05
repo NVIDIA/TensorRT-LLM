@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc2" />
+  <meta name="docsearch:version" content="1.4.0rc3" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -132,7 +132,7 @@
   
     <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
-  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
     <span class="fa-solid fa-bars"></span>
   </button>
   
@@ -212,14 +212,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
       
@@ -249,7 +249,7 @@
       
       
       
-      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
 
@@ -320,14 +320,14 @@
 
 <div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
   <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
-    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
-    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
-    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
   </button>
   <ul class="dropdown-menu dropdown-menu-end">
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
-    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
   </ul>
 </div></div>
         
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
@@ -449,6 +450,9 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/RequestOutput.html">RequestOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvHintsInput.html">KvHintsInput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ConversationParams.html">ConversationParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
@@ -472,8 +476,6 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/CalibConfig.html">CalibConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/RequestError.html">RequestError</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/BatchingType.html">BatchingType</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
@@ -518,6 +520,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -550,6 +553,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/multimodal.html">Multimodal Request Data</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -644,7 +648,7 @@
     
     <li class="breadcrumb-item breadcrumb-home">
       <a href="../index.html" class="nav-link" aria-label="Home">
-        <i class="fa-solid fa-home"></i>
+        <i class="fa-solid fa-house"></i>
       </a>
     </li>
     <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">API Reference</span></li>
@@ -882,6 +886,45 @@
 
 <dl class="py class">
 <dt class="sig sig-object py">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">KvHintAction</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">action_id</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">action_type</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">action_version</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">payload</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">extra_data</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/kv_hints/protocol.html#KvHintAction"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<dd><p><a class="reference internal" href="reference/KvHintAction.html"><span class="doc">View the full KvHintAction reference</span></a></p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">KvHintsEnvelope</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">protocol_version</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">message_id</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">actions</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">extra_data</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/kv_hints/protocol.html#KvHintsEnvelope"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<dd><p><a class="reference internal" href="reference/KvHintsEnvelope.html"><span class="doc">View the full KvHintsEnvelope reference</span></a></p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">KvHintsInput</span></span></dt>
+<dd><p>alias of <a class="reference internal" href="reference/KvHintsEnvelope.html#tensorrt_llm.llmapi.KvHintsEnvelope" title="tensorrt_llm.kv_hints.protocol.KvHintsEnvelope"><code class="xref py py-class docutils literal notranslate"><span class="pre">KvHintsEnvelope</span></code></a> | <code class="xref py py-class docutils literal notranslate"><span class="pre">dict</span></code>[<code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code>, <code class="xref py py-obj docutils literal notranslate"><span class="pre">JsonValue</span></code>]</p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py">
 <em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">DisaggregatedParams</span></span><span class="sig-paren">(</span>
 
 <dl>
@@ -901,6 +944,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">remote_tail_start</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">multimodal_positions</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">multimodal_lengths</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">orig_elapsed_s</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">multimodal_embedding_handles</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">multimodal_hashes</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mrope_position_ids_handle</span></span></em>,</dd>
@@ -1121,7 +1165,6 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_type</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_dynamic_tree</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dynamic_tree_max_topK</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">num_eagle_layers</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_non_leaves_per_layer</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_layers_to_capture</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_model_arch</span></span></em>,</dd>
@@ -1154,7 +1197,6 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_type</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_dynamic_tree</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dynamic_tree_max_topK</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">num_eagle_layers</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_non_leaves_per_layer</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_layers_to_capture</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_model_arch</span></span></em>,</dd>
@@ -1192,6 +1234,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">use_mtp_vanilla</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_dynamic_tree</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dynamic_tree_max_topK</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">draft_lm_head_dtype</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">draft_moe_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sa_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_nextn_predict_layers</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">begin_thinking_phase_token</span></span></em>,</dd>
@@ -1214,6 +1258,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">waiting_queue_policy</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_python_scheduler</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_prefix_aware_scheduling</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">context_scheduling_policy</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">context_starvation_iterations</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#SchedulerConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
@@ -1285,28 +1331,6 @@
 <dt class="sig sig-object py">
 <em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">MpiCommSession</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">comm</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">n_workers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/mpi_session.html#MpiCommSession"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
 <dd><p><a class="reference internal" href="reference/MpiCommSession.html"><span class="doc">View the full MpiCommSession reference</span></a></p>
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">ExtendedRuntimePerfKnobConfig</span></span><span class="sig-paren">(</span>
-
-<dl>
-<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">multi_block_mode</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">enable_context_fmha_fp32_acc</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_mode</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_cache_size</span></span></em>,</dd>
-</dl>
-
-<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#ExtendedRuntimePerfKnobConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p><a class="reference internal" href="reference/ExtendedRuntimePerfKnobConfig.html"><span class="doc">View the full ExtendedRuntimePerfKnobConfig reference</span></a></p>
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">BatchingType</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#BatchingType"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
-<dd><p><a class="reference internal" href="reference/BatchingType.html"><span class="doc">View the full BatchingType reference</span></a></p>
 </dd></dl>
 
 <dl class="py class">
@@ -1646,6 +1670,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">num_postprocess_workers</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_serve_frontends</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">serve_frontend_affinity_port_stride</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session</span></span></em>,</dd>
@@ -1702,6 +1727,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">stream_interval</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">force_dynamic_quantization</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">allreduce_strategy</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mnnvl_allreduce_fp8_payload</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">replicate_embedding</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">checkpoint_loader</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">checkpoint_format</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">checkpoint_io_policy</span></span></em>,</dd>
@@ -1767,6 +1794,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_balance</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">timeout_iters</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_wait_iters</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_balanced_admission</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_cache_aware_routing</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_routing_load_balance_weight</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_routing_match_rate_threshold</span></span></em>,</dd>
@@ -2142,8 +2170,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
 
 
   <footer class="bd-footer">
@@ -2215,9 +2243,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 26, 2026.</p>
+  <p>Last updated on November 03, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
   
 </div></div>
       
