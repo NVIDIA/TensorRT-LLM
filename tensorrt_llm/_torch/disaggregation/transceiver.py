@@ -2050,9 +2050,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False while a session or cancelled admission fence may access
-        request memory; caller must retry next iteration. Returns True only
-        after transfer and local CUDA claims settle, permitting resource release.
+        Returns False while physical access or qualified context group retirement
+        is pending; caller must keep progressing and retry. Returns True when
+        this transceiver no longer holds the request's resources.
         """
         rid = get_unique_rid(req)
 
@@ -2072,6 +2072,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         instance=self._instance_name,
                         dp_rank=self._dp_rank,
                     )
+
+        if self.supports_logical_context_cancellation(req):
+            # Local quiescence cannot remove a TP participant's retirement vote.
+            # Keep the session until the normal send reaper agrees across ranks.
+            accepted = self.request_logical_context_cancellation(req)
+            return accepted and rid not in self._send_sessions
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
