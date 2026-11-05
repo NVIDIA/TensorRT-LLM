@@ -476,6 +476,7 @@ def test_trtllm_padding_requires_explicit_opt_in() -> None:
 
 @pytest.mark.parametrize("mode", ["dense", "quant", "sparse"])
 def test_legacy_mask_preserves_attention_dispatch(monkeypatch, mode: str) -> None:
+    """Preserve legacy dispatch and verify each mode rejects opt-in masking for the right reason."""
     captured = {}
     _capture_core_forward(monkeypatch, captured)
     attention = _make_wrapper(
@@ -496,5 +497,6 @@ def test_legacy_mask_preserves_attention_dispatch(monkeypatch, mode: str) -> Non
     actual = attention.forward(q, q, q, key_padding_mask=mask, **kwargs)
     torch.testing.assert_close(actual, expected)
     assert captured["forward_args"] == expected_args
-    with pytest.raises(ValueError):
+    match = "trailing padding" if mode == "dense" else "dense self-attention"
+    with pytest.raises(ValueError, match=match):
         attention.forward(q, q, q, key_padding_mask=mask, discard_padded_queries=True, **kwargs)
