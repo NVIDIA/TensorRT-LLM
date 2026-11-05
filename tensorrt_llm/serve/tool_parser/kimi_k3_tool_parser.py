@@ -28,15 +28,19 @@ is seen.
 """
 
 import json
-import os
 import re
 from typing import Any, Dict, List
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .base_tool_parser import BaseToolParser
 from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
+
+# Read once at import. The server imports every tool parser at startup, so a
+# bad value fails the launch instead of every request with strict tools.
+_STRICT_TOOL_GRAMMAR_ENABLED = get_env_flag("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", False)
 
 
 def _unescape_attr(value: str) -> str:
@@ -122,7 +126,7 @@ class KimiK3ToolParser(BaseToolParser):
         forbid the think/response text before the section and the message
         close after it, deadlocking generation.
         """
-        if os.getenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", "0") != "1":
+        if not _STRICT_TOOL_GRAMMAR_ENABLED:
             # Experimental, opt-in: under concurrent guided load with
             # production tool schemas, sampling tripped a device-side assert
             # and hard-killed the deployment (KVV schema suite, job 3054205:

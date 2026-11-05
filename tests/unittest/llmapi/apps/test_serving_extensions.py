@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm.serve import serving_extensions
+from tensorrt_llm.serve.extensions import kimi_k3
 from tensorrt_llm.serve.serving_extensions import (
     ServingExtension,
     apply_model_chat_extensions,
@@ -202,7 +203,7 @@ class TestBuiltinExtensions:
     def test_kimi_param_policy_applies_via_generic_dispatch(self, monkeypatch) -> None:
         from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
-        monkeypatch.setenv("TRTLLM_KIMI_PARAM_POLICY", "1")
+        monkeypatch.setattr(kimi_k3, "_KIMI_PARAM_POLICY_ENABLED", True)
         messages = [{"role": "user", "content": "hi"}]
 
         request = ChatCompletionRequest(model="m", messages=messages, top_p=1.0)
