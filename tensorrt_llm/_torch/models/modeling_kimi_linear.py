@@ -1526,7 +1526,7 @@ def _is_helix_a2a(model_config: ModelConfig) -> bool:
 _K3_ROUTER_BF16_ENV = "KIMI_K3_ROUTER_BF16"
 
 
-def _k3_router_gemm_bf16(tp_group_shares_requests: bool) -> bool:
+def k3_router_gemm_bf16(tp_group_shares_requests: bool) -> bool:
     """Return whether the K3 MoE router gate GEMM takes bf16 inputs.
 
     ``KIMI_K3_ROUTER_BF16`` takes the `get_env_flag` values or ``legacy``.
@@ -1601,7 +1601,7 @@ class KimiK3MoERuntime(nn.Module):
         # summation order, and the upcast is not more accurate.
         # KIMI_K3_ROUTER_BF16=0 selects the upcast on every rank, and =legacy
         # selects it only where the TP group does not share requests.
-        _router_bf16 = _k3_router_gemm_bf16(model_config.mapping.tp_group_shares_requests)
+        _router_bf16 = k3_router_gemm_bf16(model_config.mapping.tp_group_shares_requests)
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)

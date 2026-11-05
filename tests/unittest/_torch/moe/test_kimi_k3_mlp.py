@@ -347,7 +347,7 @@ def test_kimi_k3_router_gemm_dtype_env(monkeypatch, value, shares_requests, expe
         monkeypatch.delenv("KIMI_K3_ROUTER_BF16", raising=False)
     else:
         monkeypatch.setenv("KIMI_K3_ROUTER_BF16", value)
-    assert modeling_kimi_linear._k3_router_gemm_bf16(shares_requests) is expected
+    assert modeling_kimi_linear.k3_router_gemm_bf16(shares_requests) is expected
 
 
 @pytest.mark.cpu_only
@@ -356,7 +356,7 @@ def test_kimi_k3_router_gemm_dtype_env_rejects_unknown_values(monkeypatch):
 
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "bf16")
     with pytest.raises(ValueError, match="KIMI_K3_ROUTER_BF16.*, or legacy"):
-        modeling_kimi_linear._k3_router_gemm_bf16(True)
+        modeling_kimi_linear.k3_router_gemm_bf16(True)
 
 
 @pytest.mark.cpu_only

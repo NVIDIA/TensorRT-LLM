@@ -261,7 +261,7 @@ def test_generic_call_import_scope(tmp_path, monkeypatch, module, accepted):
 
 #: tensorrt_llm imports that compute nothing, so a target's generic path need not declare them: types and configs
 #: it reads, enums it passes, the metadata it is handed and the views it takes of it, the graph-capture context it
-#: asks about and its logger.
+#: asks about, the env switches it reads and its logger.
 _NON_COMPUTE_IMPORTS = frozenset(
     {
         "AllReduceStrategy",
@@ -277,6 +277,7 @@ _NON_COMPUTE_IMPORTS = frozenset(
         "get_env_flag",
         "is_in_breakable_cuda_graph",
         "k3_mla_decode_view",
+        "k3_router_gemm_bf16",
         "logger",
     }
 )
