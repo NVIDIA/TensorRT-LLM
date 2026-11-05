@@ -112,26 +112,45 @@ async def test_a_failed_request_ends_the_completion_stream_with_an_error_event()
     assert chunks[1] == "data: [DONE]\n\n"
 
 
-@pytest.mark.parametrize("temporary,partial", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "temporary,partial,stream,abort_fails",
+    [
+        (False, False, True, False),
+        (True, False, True, False),
+        (True, True, True, False),
+        (True, True, True, True),
+        (True, True, False, True),
+    ],
+)
 @pytest.mark.asyncio
-async def test_admission_failure_preserves_retryable_status(temporary, partial):
+async def test_admission_failure_preserves_retryable_status(
+    temporary, partial, stream, abort_fails
+):
     engine = _FailingEngine("")
 
-    accepted = SimpleNamespace(abort=Mock(), prompt_token_ids=[1])
+    accepted = [
+        SimpleNamespace(
+            abort=Mock(side_effect=RuntimeError("abort failed") if abort_fails else None),
+            prompt_token_ids=[1],
+        ),
+        SimpleNamespace(abort=Mock(), prompt_token_ids=[2]),
+    ]
     calls = []
 
     def reject(*args, **kwargs):
         calls.append(True)
-        if partial and len(calls) == 1:
-            return accepted
+        if partial and len(calls) <= len(accepted):
+            return accepted[len(calls) - 1]
         if temporary:
             raise EngineUnavailableError("command connection is recovering")
         raise ValueError("invalid request")
 
     engine.generate_async = reject
     server = _bare_server(engine)
-    request = CompletionRequest(model="test-model", prompt=[[1], [2]], max_tokens=4, stream=True)
+    request = CompletionRequest(
+        model="test-model", prompt=[[1], [2], [3]], max_tokens=4, stream=stream
+    )
     raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
     response = await server.openai_completion(request, raw)
     assert response.status_code == (503 if temporary else 400)
-    assert accepted.abort.call_count == (1 if partial else 0)
+    assert all(promise.abort.call_count == (1 if partial else 0) for promise in accepted)

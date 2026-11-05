@@ -21,8 +21,9 @@ import threading
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import zmq
 
@@ -492,6 +493,44 @@ def _dispatch_requests(worker: GenerationExecutorWorker,
                 profile_ack_queue.close()
 
 
+@contextmanager
+def _response_queue_lifetime(worker: GenerationExecutorWorker,
+                             notify: Callable[[], None]) -> Iterator[None]:
+    """End classic IPC response queues on their producer's thread."""
+    thread = worker.await_response_thread
+    previous_context = thread.context
+    errors: list[Exception] = []
+
+    def notify_safely() -> None:
+        try:
+            notify()
+        except Exception as error:
+            errors.append(error)
+
+    @contextmanager
+    def response_owner() -> Iterator[None]:
+        try:
+            with previous_context:
+                yield
+        finally:
+            notify_safely()
+
+    thread.context = response_owner()
+    try:
+        yield
+    finally:
+        if thread.ident is None:
+            notify_safely()
+        else:
+            thread.stop()
+            thread.join()
+        thread.context = previous_context
+        if errors:
+            if sys.exc_info()[0] is None:
+                raise errors[0]
+            logger.error(f"Failed to end IPC response queues: {errors[0]!r}")
+
+
 @print_traceback_on_error
 @supervise_worker_process
 def worker_main(
@@ -738,7 +777,9 @@ def worker_main(
             import torch._dynamo.config
             torch._dynamo.config.run_gc_after_compile = False
 
-    with worker:
+    response_queues = (_response_queue_lifetime(
+        worker, notify_proxy_threads_to_quit) if is_leader else nullcontext())
+    with worker, response_queues:
         try:
             worker.block_subordinates()
 
@@ -765,15 +806,11 @@ def worker_main(
 
                 _dispatch_requests(worker, request_queue)
 
-                notify_proxy_threads_to_quit()
-
         except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
             raise e
 
         except Exception as e:  # other critical errors
-            if is_leader:
-                notify_proxy_threads_to_quit()
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e

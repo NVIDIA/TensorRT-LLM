@@ -631,6 +631,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         cumulative ``timeout`` elapses across any number of stale-ack
         consumptions.
 
+        Terminal engine failure interrupts the wait so an admitted HTTP
+        profiling request cannot hold server shutdown until its deadline.
+
         If a stale or out-of-order ack is read (e.g. the previous call
         timed out and its ack arrived after we returned), we discard it
         and keep waiting for the expected kind. Returning on a mismatch
@@ -648,6 +651,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         deadline = time.monotonic() + timeout
         while True:
+            if self._engine_dead or self._fatal_error is not None:
+                raise EngineDeadError(self._fatal_error)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.warning(
@@ -656,13 +661,9 @@ class GenerationExecutorProxy(GenerationExecutor):
                     "may not be on disk yet.")
                 return
             try:
-                ack = self.profile_ack_queue.get(timeout=remaining)
+                ack = self.profile_ack_queue.get(timeout=min(remaining, 0.1))
             except Empty:
-                logger.warning(
-                    f"{expected_kind}_profile: timed out waiting for "
-                    f"worker ack after {timeout:.1f}s. The chrome trace "
-                    "may not be on disk yet.")
-                return
+                continue
             kind, error_msg = ack
             if kind != expected_kind:
                 # Out-of-order ack from a previous call; discard and keep
