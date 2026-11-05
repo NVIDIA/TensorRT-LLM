@@ -60,9 +60,15 @@ failed = set()
 for kind in ("stream", "calls"):
     report = json.load(open(f"{out}/{mode}.{kind}.json"))
     failed |= {k for k, v in report["verdicts"].items() if v == "FAIL"}
+    if kind == "stream":
+        streams = report["denominators"]["responses_streams"]
+        failed_terminals = report["counts"].get("terminal:response.failed", 0)
 expected = set() if want == "-" else set(want.split(","))
-ok = failed == expected
-print(f"{'OK ' if ok else 'BAD'} {mode:22s} expected={sorted(expected)} failed={sorted(failed)}")
+# A row that examined no stream tested nothing (no reply, or none streamed), and overlength is
+# its answer only as a response.failed terminal event.
+ok = failed == expected and streams > 0 and (mode != "overlength" or failed_terminals > 0)
+print(f"{'OK ' if ok else 'BAD'} {mode:22s} streams={streams} expected={sorted(expected)} "
+      f"failed={sorted(failed)}")
 sys.exit(0 if ok else 1)
 PY
 done <<< "$EXPECT"
