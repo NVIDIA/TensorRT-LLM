@@ -121,7 +121,10 @@ def _check_bounded_context(lm_head: LMHead, hidden: torch.Tensor, rank: int) -> 
             torch.cat(compact.context_prompt_logprob_rows), list(range(1, 70)), 0, True
         )
         assert actual == pytest.approx(expected.prompt, abs=1e-5)
-        torch.testing.assert_close(compact.context_prompt_last_logits, reference[139:140].cpu())
+        torch.testing.assert_close(
+            compact.context_prompt_last_logprobs,
+            torch.log_softmax(reference[139:140], dim=-1).cpu(),
+        )
 
     # A rank-local failure preparing the final rows of contexts without
     # requested logits must fail the batch on every rank, not strand the peers

@@ -250,7 +250,7 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
         result=SimpleNamespace(
             context_logits=None,
             context_prompt_logprob_rows=request.py_result.context_prompt_logprob_rows,
-            context_prompt_last_logits=request.py_result.context_prompt_last_logits,
+            context_prompt_last_logprobs=request.py_result.context_prompt_last_logprobs,
             get_result=lambda: SimpleNamespace(output_token_ids=[[13]]),
         ),
     )
@@ -413,7 +413,7 @@ def test_short_compact_prompt_logprobs_fail_only_their_request() -> None:
                 context_logits=None,
                 # One row for a 4-token prompt: a 2-token prefix was reused.
                 context_prompt_logprob_rows=[torch.zeros(1, 2, dtype=torch.float64)],
-                context_prompt_last_logits=torch.zeros(1, 8),
+                context_prompt_last_logprobs=torch.zeros(1, 8),
                 get_result=lambda: SimpleNamespace(output_token_ids=[[5]]),
             ),
         )
