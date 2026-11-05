@@ -74,8 +74,8 @@ class CuteDslFusedMoEBase(CuteDslLocalityDomainMixin, MoEImplBase):
     # No default: a wrong SM set silently admits a layer whose kernel does not
     # exist.
     sm_support: SmSupport
-    # Both leaves run bfloat16-only kernels: NVFP4 writes a bfloat16 output,
-    # and the BF16 ops read and write bfloat16.
+    # Every leaf runs bfloat16-only kernels: NVFP4 and NVFP4_PLUS write a
+    # bfloat16 output, and the BF16 ops read and write bfloat16.
     supported_dtypes = BF16_ONLY
 
     def __init__(
