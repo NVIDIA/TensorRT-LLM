@@ -27,7 +27,8 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.modules.top_k import TopKImplementation
-from tensorrt_llm._torch.utils import is_piecewise_running
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+from tensorrt_llm._torch.utils import is_piecewise_running, is_torch_compiling
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...kernels.attention import indexer_prologue
@@ -849,6 +850,8 @@ class RubinIndexer(Indexer):
         if (
             metadata is not None
             and not is_piecewise_running()
+            and not is_torch_compiling()
+            and not is_in_breakable_cuda_graph()
             and not torch.compiler.is_compiling()
             and metadata.kv_cache_manager is not None
             and metadata.slot_mapping_fp8 is not None
