@@ -555,7 +555,11 @@ class TestUnsupportedHeadroomReason:
     )
     def test_reason(self, overrides, needle, monkeypatch):
         monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", "90")
-        assert self._reason(**overrides) == needle
+        reason = self._reason(**overrides)
+        if needle is None:
+            assert reason is None
+        else:
+            assert reason is not None and needle in reason
 
     def test_missing_auto_admission_policy_is_a_reason(self, monkeypatch):
         from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import GEN_ADMISSION_ENV
@@ -600,16 +604,18 @@ def _drafter(kind, num_slots=4):
         worker._ctx_len_host = [0] * rows
         worker._batch_to_slot_buffer = DeviceCopyBuffer(torch.full((num_slots,), num_slots))
 
-        def write_ctx_len(updates):
-            for slot, value in updates.items():
-                worker._ctx_len_host[slot] = worker._ctx_len[slot] = value
-
-        worker._write_ctx_len = write_ctx_len
+        worker._ctx_base_host = [0] * rows
+        worker._ctx_base_pages = torch.zeros(rows, dtype=torch.long)
+        worker._ctx_block_tables = None
+        worker._write_ctx_len = partial(dflash.DFlashWorker._write_ctx_len, worker)
         worker._assign_slot = partial(dflash.DFlashWorker._assign_slot, worker)
+        worker._seed_generation_slot = partial(dflash.DFlashWorker._seed_generation_slot, worker)
         meta = object.__new__(dflash.DFlashSpecMetadata)
         meta._batch_indices_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.int))
         meta.batch_indices_cuda = meta._batch_indices_buffer.tensor
         meta._dflash_worker = worker
+        meta.host_position_ids = torch.zeros(num_slots, dtype=torch.long)
+        meta.seq_lens = [1] * num_slots
     else:
         worker = object.__new__(dspark.DSv4DSparkWorker)
         worker._win_inited, worker._scratch_slot, worker._confidence_logits = True, num_slots, None

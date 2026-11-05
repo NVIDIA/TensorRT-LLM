@@ -153,6 +153,10 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
+    # The model validator allows at most one non-null preemption bound.
+    schema["$defs"]["GenPreemptionConfig"]["anyOf"] = [
+        {"properties": {name: {"type": "null"}}} for name in ("tpot_budget", "target_output_tps")
+    ]
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

@@ -423,9 +423,15 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         for (model_layer, _attn_type), internal_layer_id in virtual_layer_mapping.items():
             model_layer_by_internal_id.setdefault(int(internal_layer_id), int(model_layer))
 
+    # Appended high-precision layers use their owning local model layer's heads,
+    # including when the low-precision cache has virtual storage layers.
+    local_layer_by_high_id = {
+        int(high): int(local) for local, high in manager.mixed_precision_high_layers.items()
+    }
+
     def _kv_heads_for_layer(internal_layer_id: int) -> int:
-        local_layer_id = internal_layer_id
-        if virtual_layer_mapping is not None:
+        local_layer_id = local_layer_by_high_id.get(internal_layer_id, internal_layer_id)
+        if internal_layer_id not in local_layer_by_high_id and virtual_layer_mapping is not None:
             model_layer = model_layer_by_internal_id.get(internal_layer_id)
             if model_layer is None:
                 raise ValueError(
