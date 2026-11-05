@@ -7392,6 +7392,19 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         # Local slots whose FC1 block scales are in the kernel layout.
         module._cute_dsl_mxfp8_w3_w1_scale_interleaved = set()
 
+    @staticmethod
+    def mark_all_slots_in_kernel_layout(module: torch.nn.Module) -> None:
+        """Record every local slot's FC1 block scales as interleaved.
+
+        For a module that has just written its full FC1 block scales in the
+        kernel layout itself (gate/up interleaved, swizzled), as a finalize
+        leaves them, so that a later refit of one projection's scales
+        deinterleaves a slot before overwriting half of it. The FC1 weight
+        needs no record: it is always in the kernel layout.
+        """
+        module._cute_dsl_mxfp8_w3_w1_scale_interleaved = set(
+            range(module.expert_size_per_partition))
+
     def load_expert_w3_w1_weight(self,
                                  module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
