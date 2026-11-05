@@ -389,7 +389,7 @@ changes:
 | Communication strategies | `test_moe_comm.py` |
 | Routing | `test_moe_routing.py` |
 | Load balancer | `test_moe_load_balancer.py` |
-| CuteDSL MoE ops, including the MXFP8 fused FC12 op against an fp32 reference | `kernels/parallel/test_cute_dsl_moe.py` |
+| CuteDSL MoE ops, including the MXFP8 fused FC12 op (full-GPU and locality-domain) against an fp32 reference | `kernels/parallel/test_cute_dsl_moe.py` |
 | The MXFP8 fused FC12 workspace reset: in-launch input quantization against `mxfp8_quantize`, output zeroing, CUDA-graph replay ordering | `kernels/parallel/test_mxfp8_input_quant.py` |
 | Multi-GPU EP and all-to-all | `multi_gpu/` |
 
@@ -661,20 +661,44 @@ finalize (scatter-add) into one persistent kernel, driven through
   `moe_output_memset_inplace` first. The readiness/scheduler counters and the
   fused input-quantization scratch are allocated per call (uninitialized; the
   same launch clears the counters): the caching allocator is stream-ordered,
-  so calls in flight on different streams, such as overlapped chunks, never
-  share them.
+  so calls in flight on different streams, such as overlapped chunks or
+  locality-domain partitions, never share them.
 - Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
   stream_weights, fc2_stream_weights)` with
   `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
   `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
   (`stream_weights`); `fc2_stream_weights` sets the FC2 loads alone and the
-  tactic space ties it to `stream_weights`. Shorter tactics from older
-  caches normalize.
+  tactic space ties it to `stream_weights`, for the locality-domain shards
+  too (their tuning runs warm, where a cached-FC2 tactic always looks best,
+  and measured cold it loses). Shorter tactics from older caches normalize.
   The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile with its
   power-of-two buckets anchored to `moe_tune_max_num_tokens` (so a small
   warmup still profiles the larger buckets, up to that cap), and the comb
   checker pins the inner `mma_tiler_m` to it.
+- **Locality domains** (`enable_locality_domains`, `plan_moe` op
+  `mxfp8_moe`): `trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin`
+  runs the fused kernel on two compute partitions, each holding half of every
+  expert's inner channels (FC1 weights/scales sliced along N as whole gate/up
+  pairs and 128-row scale atoms, FC2 weights/scales along K; together one copy
+  of the weights). One parent reset launch on the caller's stream clears both
+  partitions' synchronization workspaces, the shared output (`zero_output`,
+  dense case) and quantizes raw BF16/FP16 input once before the fork, so the
+  split pays the same single reset as the full-GPU op and the shards launch
+  GEMM-only. Both shards scatter-add into the shared output, so the split is
+  not bitwise equal to the full-GPU kernel. As for the NVFP4 and BF16 paths
+  the split is a static planner decision: with `enable_locality_domains`
+  every shape of the layer runs the split (its tile / weight-streaming
+  tactics are autotuned like the full-GPU op's), and `transform_weights`
+  shards the weights and releases the full parameters and block scales
+  (`_locality_domain_full_scale_params`), so the shards are the only copy. A
+  refit after that (RLHF) re-creates the full parameters through
+  `pre_reload_weights`, and the next `transform_weights` re-shards and
+  releases them again. Measured on Rubin at the peak HBM clock, module-level
+  per MoE call, worst rank, cold weights: the split saves 7-19% from 4-8
+  tokens/rank up on TEP8, DEP4 and DEP16 decode shapes and is neutral at 1-2
+  tokens; on prefill-sized rows (16K rows/rank) it measured about 20% slower
+  than the full-GPU op, so enable it on decode (generation) engines.
 - **DSL build requirement.** The kernel needs a newer CuTe DSL build (the
   `nvidia-cutlass-dsl` version pinned in `requirements.txt`, 4.8.0) than the
   bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
