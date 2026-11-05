@@ -949,16 +949,12 @@ def _derive_draft_max_attention_window(
 
 def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig,
                           mixed_precision_high_window: bool = False) -> None:
-    """Adapt the target's pool_ratio to a separate one-model draft manager's pools.
-
-    ``mixed_precision_high_window``: the draft manager also gets the cold-page window.
-    """
+    """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
     if draft_kv_config.pool_ratio is None:
         return
     if (draft_kv_config.mixed_precision_kv is not None
             or mixed_precision_high_window):
-        # The draft manager then has its own pool plus a mixed-precision high
-        # pool, so the target's pool_ratio does not fit it.
+        # A mixed-precision draft manager has a high pool too; the target's ratio does not fit.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
             "target KV cache only; the MTP draft KV cache with mixed-precision "

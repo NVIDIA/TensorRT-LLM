@@ -423,9 +423,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             and kv_cache_manager.mixed_precision_low_dtype
             == kv_cache_manager.mixed_precision_high_dtype
         ):
-            # The COMPRESS pool keeps the high precision (cold-page first/last-N) and the high
-            # layer shares it, so a selected compressed row the high layer holds is read from the
-            # high layer's row instead of the pool's row.
+            # Cold-page window: a selected compressed row the high layer holds is read from its row.
             num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
             mixed_precision_high_row_indices(
                 metadata,

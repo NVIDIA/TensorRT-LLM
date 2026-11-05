@@ -7433,9 +7433,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
-        """Reject runtime features that the mixed-precision KV cache and the cold-page
-        first/last-N window do not support.
-        """
+        """Reject what the mixed-precision KV cache and the cold-page window do not support."""
         hot = self.kv_cache_config.mixed_precision_kv is not None
         cold = getattr(self.kv_cache_compression_config,
                        "mixed_precision_high_window", None) is not None
@@ -7443,17 +7441,14 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
         feature = "Mixed-precision KV" if hot else "Mixed-precision cold pages"
         if cold and self.kv_cache_config.dtype == "fp8_ds_mla":
-            # The sparse backends return the inline-scale layout's indices
-            # before the cold-page read path runs.
+            # The sparse backends return that layout's indices before the redirect.
             raise ValueError(
                 f"{feature} do not support kv_cache_config.dtype='fp8_ds_mla'.")
         if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
             raise ValueError(
                 f"{feature} requires kv_cache_config.use_kv_cache_manager_v2=True."
             )
-        # get_attention_backend matches the name case-insensitively. The cold-page
-        # window reads the high rows through TRTLLM's block offsets; FlashInfer
-        # indexes whole pages.
+        # Case-insensitive like get_attention_backend; FlashInfer indexes whole pages.
         backends = "TRTLLM" if cold else "TRTLLM and FLASHINFER"
         if self.attn_backend.upper() not in backends.split(" and "):
             raise ValueError(
