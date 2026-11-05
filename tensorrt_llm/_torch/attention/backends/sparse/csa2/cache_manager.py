@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import replace
@@ -1101,7 +1101,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             **{role.role: MapperKind.REPLICATED for role in CSA2CacheRole},
         }
 
-    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole):
+    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole) -> Hashable | None:
         """Keep remote-tail SWA independently selectable in the transfer layout."""
         if not self.bounded_replay_on_generation or role != CSA2CacheRole.SWA.role:
             return None

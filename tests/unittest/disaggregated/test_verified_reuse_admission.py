@@ -459,7 +459,6 @@ def _coalesced_page_table() -> KVCachePageTable:
                 bytes_per_layer=u,
             ),
         ],
-        kv_head_num_per_rank=1,
     )
     pool = PhysicalPool(base_address=0x10000, slot_bytes=9 * u, num_slots=8)
     return KVCachePageTable(
@@ -490,7 +489,6 @@ def _ignored_role_page_table() -> KVCachePageTable:
                 bytes_per_layer=u,
             ),
         ],
-        kv_head_num_per_rank=1,
     )
     pool = PhysicalPool(base_address=0x20000, slot_bytes=4 * u, num_slots=8)
     return KVCachePageTable(

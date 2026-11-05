@@ -386,9 +386,7 @@ def _synthetic_rank_info(tp: int, adp: bool):
         self_endpoint="",
         transfer_engine_info=b"",
         attention=AttentionInfo(
-            kv_heads_per_rank=4,
             tokens_per_block=8,
-            dims_per_head=64,
             element_bytes=2,
             enable_attention_dp=adp,
             is_mla=False,

@@ -32,9 +32,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def make_rankinfo(
-    kv_heads_per_rank=2,
     tokens_per_block=4,
-    dims_per_head=2,
     element_bytes=1,
     tp_size=2,
     tp_rank=0,
@@ -63,9 +61,7 @@ def make_rankinfo(
         self_endpoint="",
         transfer_engine_info=b"",
         attention=AttentionInfo(
-            kv_heads_per_rank=kv_heads_per_rank,
             tokens_per_block=tokens_per_block,
-            dims_per_head=dims_per_head,
             element_bytes=element_bytes,
             enable_attention_dp=False,
             is_mla=is_mla,
@@ -114,13 +110,14 @@ def test_intact_mapper_identity_degenerate():
 
 def test_intact_mapper_partial_layers():
     """Selecting a contiguous layer subset yields one shifted fragment."""
-    self_ri = make_rankinfo(kv_heads_per_rank=2)
+    self_ri = make_rankinfo()
+    kv_heads, dims_per_head = 2, 2
     # bytes_per_layer = kv_factor * kv_heads * tokens_per_block * dims_per_head * element_bytes
     bytes_per_layer = (
         self_ri.attention.kv_factor
-        * self_ri.attention.kv_heads_per_rank
+        * kv_heads
         * self_ri.attention.tokens_per_block
-        * self_ri.attention.dims_per_head
+        * dims_per_head
         * self_ri.attention.element_bytes
     )
     src_group = MemRegionGroup(ptrs=np.array([10, 20], dtype=np.int64), bytes_per_region=1)
@@ -151,15 +148,16 @@ def test_head_mismatch_mapper():
     # Self holds 2 KV heads at TP=2; the peer holds 4 KV heads at TP=4. Using
     # peer tp_rank=1 (not 2) forces a *nonzero* source-side head offset, so an
     # incorrect head-offset computation cannot pass silently.
-    self_ri = make_rankinfo(kv_heads_per_rank=2, tp_size=2, tp_rank=1)
-    peer_ri = make_rankinfo(kv_heads_per_rank=4, tp_size=4, tp_rank=1)
+    self_kv_heads, peer_kv_heads = 2, 4
+    self_ri = make_rankinfo(tp_size=2, tp_rank=1)
+    peer_ri = make_rankinfo(tp_size=4, tp_rank=1)
     buffers_per_layer = 2  # K and V
     # buffer bytes = heads * tokens_per_block * dims_per_head * element_bytes
     self_buffer_bytes = 2 * 4 * 2 * 1
     peer_buffer_bytes = 4 * 4 * 2 * 1
     self_bytes_per_layer = buffers_per_layer * self_buffer_bytes  # kv_factor x K-buffer bytes
     peer_bytes_per_layer = buffers_per_layer * peer_buffer_bytes
-    bytes_per_head = self_buffer_bytes // self_ri.attention.kv_heads_per_rank  # equals peer side
+    bytes_per_head = self_buffer_bytes // self_kv_heads  # equals peer side
     src_base, dst_base = 111, 222
     src_group = MemRegionGroup(ptrs=np.array([src_base], dtype=np.int64), bytes_per_region=32)
     dst_group = MemRegionGroup(ptrs=np.array([dst_base], dtype=np.int64), bytes_per_region=32)
@@ -171,8 +169,8 @@ def test_head_mismatch_mapper():
         dst_layer_offsets=[peer_layer_off],
         self_ri=self_ri,
         peer_ri=peer_ri,
-        self_kv_heads=self_ri.attention.kv_heads_per_rank,
-        peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
+        self_kv_heads=self_kv_heads,
+        peer_kv_heads=peer_kv_heads,
         self_bytes_per_layer=self_bytes_per_layer,
         peer_bytes_per_layer=peer_bytes_per_layer,
         self_buffers_per_layer=buffers_per_layer,
@@ -198,10 +196,7 @@ def test_head_mismatch_mapper():
     np.testing.assert_array_equal(result.src.memory.ptrs, expected_src_ptrs)
     np.testing.assert_array_equal(result.dst.memory.ptrs, expected_dst_ptrs)
     # Each fragment copies min(self_heads, peer_heads) contiguous heads.
-    cont_heads_bytes = (
-        min(self_ri.attention.kv_heads_per_rank, peer_ri.attention.kv_heads_per_rank)
-        * bytes_per_head
-    )
+    cont_heads_bytes = min(self_kv_heads, peer_kv_heads) * bytes_per_head
     assert result.src.memory.bytes_per_region == cont_heads_bytes
     assert result.dst.memory.bytes_per_region == cont_heads_bytes
 

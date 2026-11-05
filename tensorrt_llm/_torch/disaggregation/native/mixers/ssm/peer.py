@@ -345,38 +345,30 @@ class MambaPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
-    def should_send(
-        self, peer_overlap, peer_rank_info, *, mapper_kind: Optional[MapperKind] = None
-    ) -> "bool | None":
-        """Mamba TP routing.
+    def should_send(self, peer_ri: RankInfo, self_pv: PoolView, peer_pv: PoolView) -> bool | None:
+        """Mamba TP routing for one sharded (conv/SSM) state view pair.
 
-        Sharded state (conv/SSM): always send, each rank owns a unique shard.
-        When mamba_tp == 1 (attention_dp) the state is replicated, so return
-        None to signal fan-in election. REPLICATED side state holds identical
-        bytes on every rank regardless of mamba_tp, so it always elects.
+        Each mamba TP rank owns a unique shard, so it always sends. When
+        mamba_tp == 1 (attention_dp) the state is replicated, so return None
+        to signal fan-in election.
         """
-        if mapper_kind == MapperKind.REPLICATED:
-            return None
         mamba_tp, _ = MambaPolicy._mamba_tp(self._ri)
         if mamba_tp == 1:
-            return None  # caller should use fan-in election
+            return None
         return True
 
     def build_mapper(
         self,
         *,
         peer_ri: RankInfo,
-        mapper_kind: MapperKind,
         self_layer_offsets,
         peer_layer_offsets,
         self_bytes_per_layer: int,
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int = 1,
         peer_buffers_per_layer: int = 1,
-        self_lg=None,
-        peer_lg=None,
-        self_pv: Optional[PoolView] = None,
-        peer_pv: Optional[PoolView] = None,
+        self_pv: PoolView,
+        peer_pv: PoolView,
         src_layer_off: int = 0,
         dst_layer_off: int = 0,
     ) -> RegionMapperBase:
@@ -392,17 +384,18 @@ class MambaPolicy:
         ``extract_slot``. Under full PP overlap these are 0; under partial PP
         overlap they identify which slice of the extraction to transfer.
 
-        The ``mapper_kind`` discriminates conv (SECTIONED), ssm (INDEXED) and
-        replicated side state (REPLICATED). TP info comes from ``self._ri``
-        and ``peer_ri``. Per-section / per-head resharding metadata comes
-        from the views themselves (``PoolView.section_bytes`` /
-        ``PoolView.bytes_per_head``).
+        The view's ``mapper_kind`` discriminates conv (SECTIONED), ssm
+        (INDEXED) and replicated side state (REPLICATED). TP info comes from
+        ``self._ri`` and ``peer_ri``. Per-section / per-head resharding
+        metadata comes from the views themselves (``PoolView.section_bytes``
+        / ``PoolView.bytes_per_head``).
         """
         transfer_layers = len(self_layer_offsets)
+        mapper_kind = self_pv.mapper_kind
 
         if mapper_kind == MapperKind.REPLICATED:
             # Identical bytes on every rank: whole per-layer copy, no TP
-            # resharding. Fan-in ownership is decided by should_send.
+            # resharding. PeerRegistrar.should_send_pool elects the sender.
             if self_bytes_per_layer != peer_bytes_per_layer:
                 raise ValueError(
                     "Replicated state size differs between peers: "
@@ -426,9 +419,6 @@ class MambaPolicy:
                 dst_layer_off=dst_layer_off,
                 block_bytes_per_layer=self_bytes_per_layer,
             )
-
-        if self_pv is None or peer_pv is None:
-            raise ValueError("MambaPolicy.build_mapper needs both pool views under a TP mismatch")
 
         if mapper_kind == MapperKind.SECTIONED:
             if self_pv.section_bytes is None or peer_pv.section_bytes is None:

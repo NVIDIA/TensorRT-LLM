@@ -22,8 +22,18 @@ import pytest
 from tensorrt_llm import bindings
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
+    KVCachePageTable,
+    LocalLayer,
+    PhysicalPool,
+    PhysicalPoolGroup,
+    PoolView,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -102,7 +112,77 @@ def test_rank_info_roundtrip_with_aux_meta():
     assert restored.aux_meta.device == "cpu"
 
 
-def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> None:
+def _drop_rank_field(data: dict) -> None:
+    del data["tp_size"]
+
+
+def _add_unknown_attention_field(data: dict) -> None:
+    data["attention"]["kv_heads_per_rank"] = 2
+
+
+def _drop_layer_group_key(data: dict) -> None:
+    del data["page_table"]["layer_groups"][0]["pool_group_idx"]
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "original_error"),
+    [
+        (_drop_rank_field, "TypeError"),
+        (_add_unknown_attention_field, "TypeError"),
+        (_drop_layer_group_key, "KeyError"),
+    ],
+)
+def test_from_bytes_rejects_payload_of_another_schema(corrupt, original_error: str) -> None:
+    page_table = KVCachePageTable(
+        tokens_per_block=2,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                pool_views=[
+                    PoolView(
+                        pool_idx=0,
+                        buffer_entries=np.array([(0, 0, 8), (0, 8, 8)], dtype=BUFFER_ENTRY_DTYPE),
+                        num_kv_heads=1,
+                    )
+                ],
+            )
+        ],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(base_address=0x1000, slot_bytes=16, num_slots=4)])
+        ],
+    )
+    ri = RankInfo(
+        instance_name="ctx",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+        attention=AttentionInfo(
+            tokens_per_block=2, element_bytes=2, enable_attention_dp=False, is_mla=False
+        ),
+        page_table=page_table,
+    )
+    data = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    corrupt(data)
+
+    with pytest.raises(
+        ValueError, match=rf"does not match this build's schema \({original_error}: "
+    ):
+        RankInfo.from_bytes(msgpack.packb(data))
+
+
+def test_from_bytes_rejects_payload_that_is_not_a_map() -> None:
+    with pytest.raises(ValueError, match=r"does not match this build's schema \(AttributeError: "):
+        RankInfo.from_bytes(msgpack.packb([1, 2]))
+
+
+def test_from_kv_cache_manager_records_bounded_replay(monkeypatch) -> None:
     monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
     mapping = SimpleNamespace(
         rank=0,
@@ -117,17 +197,14 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
     )
     manager = SimpleNamespace(
         mapping=mapping,
-        num_kv_heads_per_layer=[0, 8, 0],
         pp_layers=[0, 1, 2],
         tokens_per_block=32,
-        head_dim=128,
         dtype=bindings.DataType.HALF,
         kv_factor=2,
     )
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
-    assert info.attention.kv_heads_per_rank == 8
     assert info.bounded_replay_on_generation is False
 
     manager.bounded_replay_on_generation = True
@@ -152,10 +229,8 @@ def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
     )
     manager = SimpleNamespace(
         mapping=mapping,
-        num_kv_heads_per_layer=[0, 0],
         pp_layers=[0, 1],
         tokens_per_block=32,
-        head_dim=128,
         dtype=bindings.DataType.HALF,
         kv_factor=2,
     )
@@ -163,7 +238,6 @@ def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
     assert info.attention is not None
-    assert info.attention.kv_heads_per_rank == 0
     assert info.attention.enable_attention_dp
     assert MambaPolicy._mamba_tp(info) == (1, 0)
 
@@ -189,9 +263,7 @@ def test_rank_info_represents_cache_element_bytes(
             enable_attention_dp=False,
         ),
         pp_layers=[0],
-        num_kv_heads_per_layer=[4],
         tokens_per_block=64,
-        head_dim=128,
         dtype=dtype,
         kv_factor=2,
     )

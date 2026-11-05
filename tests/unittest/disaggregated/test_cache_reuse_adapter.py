@@ -130,7 +130,6 @@ def _build_transceiver_for_kv_slice(
     """
     layer_group = AttentionLayerGroup(
         pool_group_idx=0,
-        kv_head_num_per_rank=1,
         sliding_window_size=sliding_window_size,
         local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
     )
@@ -189,9 +188,9 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     # Native lifecycle IDs, not physical pool IDs, index reuse_status. Two
     # distinct window groups can share a physical pool without sharing reuse.
     groups = [
-        AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1),
-        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
-        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
+        AttentionLayerGroup(pool_group_idx=0),
+        AttentionLayerGroup(pool_group_idx=1, sliding_window_size=128),
+        AttentionLayerGroup(pool_group_idx=1, sliding_window_size=128),
     ]
     pages = [[10, 11, 12], [-1, 21, 22], [-1, 31, 32]]
     cache = SimpleNamespace(

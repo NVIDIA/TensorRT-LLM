@@ -99,7 +99,6 @@ def _indexer_pool_view(pool_idx, local_layer_ids, *, pool_role=frozenset({"index
 def _attn_lg(pool_group_idx, local_global_pairs, pool_views, sliding_window=None):
     return AttentionLayerGroup(
         pool_group_idx=pool_group_idx,
-        kv_head_num_per_rank=2,
         sliding_window_size=sliding_window,
         local_layers=[
             LocalLayer(local_layer_id=lid, global_layer_id=gid) for lid, gid in local_global_pairs
@@ -141,7 +140,6 @@ def _rank_info(
     layer_num_per_pp=None,
     page_table=None,
     is_mla=False,
-    kv_heads=2,
 ):
     if layer_num_per_pp is None:
         layer_num_per_pp = [2]
@@ -161,9 +159,7 @@ def _rank_info(
         self_endpoint="",
         transfer_engine_info=b"",
         attention=AttentionInfo(
-            kv_heads_per_rank=kv_heads,
             tokens_per_block=16,
-            dims_per_head=8,
             element_bytes=2,
             enable_attention_dp=False,
             is_mla=is_mla,
