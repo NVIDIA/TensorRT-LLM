@@ -36,6 +36,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     activation_constant_names,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     cutedsl_grouped_gemm_leaf,
     find_cutedsl_grouped_gemm_leaf,
 )
@@ -144,6 +145,10 @@ def find_backend_class(
     if backend_type is MoeBackendType.MARLIN:
         return find_marlin_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTEDSL:
+        # The literal's family: a grouped-GEMM leaf per format, plus the fused
+        # FC12 leaf, the only CuteDSL leaf serving MXFP8.
+        if canonical_quant(quant_algo) == canonical_quant(QuantAlgo.MXFP8):
+            return TrtllmCutedslFusedFc12Mxfp8Impl
         return find_cutedsl_grouped_gemm_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTE_DSL_B12X:
         # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
@@ -622,6 +627,28 @@ def should_skip_cutedsl(
 
     backend_name = backend_type.value  # "CUTEDSL" or "CUTEDSL_FC12"
     intermediate_size = model_config.intermediate_size
+
+    # MXFP8 is served by the CuteDSL fused FC1+FC2 kernel, whose
+    # geometry is fixed: the FC1 scale-factor gather reads 16-byte chunks
+    # (16 UE8M0 scales x 32 elements = 512 K elements per row), the FC2 K /
+    # FC1 N extents must be whole 128-wide MMA tiles, and the gate/up
+    # interleave needs a 128-aligned expanded intermediate. Mirrors the
+    # checks in MXFP8CuteDslFusedMoEMethod.create_weights and the fused op.
+    if quant_algo == QuantAlgo.MXFP8:
+        hidden_size = model_config.hidden_size
+        per_shard = intermediate_size // moe_tp_size if moe_tp_size > 1 else intermediate_size
+        if hidden_size % 512 != 0:
+            return (
+                f"{backend_name} MXFP8: hidden_size={hidden_size} must be a "
+                "multiple of 512 (16-byte FC1 scale-factor gather in the fused "
+                "FC12 kernel)."
+            )
+        if per_shard % 128 != 0:
+            return (
+                f"{backend_name} MXFP8: per-shard intermediate_size={per_shard} "
+                "must be a multiple of 128 (fused FC12 kernel MMA tile / gate-up "
+                "interleave)."
+            )
 
     # NVFP4 with Llama4Renormalize routing has significant accuracy issues.
     # CuteDSL quantizes the FC1 output to NVFP4 from the fp32 accumulator, while
