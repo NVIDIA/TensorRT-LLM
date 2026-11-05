@@ -18,6 +18,7 @@ l0_gr100:
   - unittest/_torch/attention/sparse/msa/test_msa_backend.py::test_segmented_proxy_reads_current_page_table_before_pack_flush
   - unittest/_torch/kernels/serial/test_m3_ctx_clc_gemm.py
   - unittest/_torch/kernels/serial/test_m3_ctx_fused_quant.py
+  - unittest/_torch/kernels/serial/test_sm107_allreduce_rmsnorm_rows.py
   - unittest/_torch/kernels/serial/test_m3_qkv_fusion.py
   - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py::test_minimax_m3_nvfp4_rows_matches_per_token_bitwise
   - unittest/_torch/attention/fmha/test_msa_combine_mxfp8.py
