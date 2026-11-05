@@ -483,9 +483,10 @@ class TestLlmArgsWiring:
         with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
             args._validate_dflash_ctx_budget(memory_budget_bytes=10 * PER_SLOT_BYTES_MSL)
 
-    def test_preemption_headroom_reaches_config_budget_check(self, tmp_path):
+    def test_preemption_headroom_reaches_config_budget_check(self, tmp_path, monkeypatch):
         from tensorrt_llm.llmapi.llm_args import SchedulerConfig
 
+        monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", "90")
         args = self._args(
             tmp_path,
             max_batch_size=8,
@@ -493,6 +494,27 @@ class TestLlmArgsWiring:
         )
         with pytest.raises(ValueError, match="max_batch_size estimated to fit is 6"):
             args._validate_dflash_ctx_budget(memory_budget_bytes=9 * PER_SLOT_BYTES_MSL)
+
+    @pytest.mark.parametrize("percentile", [None, "0", "99", "90"])
+    def test_preemption_budget_matches_admission_policy(self, tmp_path, monkeypatch, percentile):
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
+
+        if percentile is None:
+            monkeypatch.delenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", raising=False)
+        else:
+            monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", percentile)
+        args = self._args(
+            tmp_path,
+            max_batch_size=32,
+            max_seq_len=8192,
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+            scheduler_config=SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+        )
+        if percentile == "90":
+            with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
+                args._validate_dflash_ctx_budget(memory_budget_bytes=1_600_000_000)
+        else:
+            args._validate_dflash_ctx_budget(memory_budget_bytes=1_600_000_000)
 
     def test_default_batch_is_clamped_not_rejected(self, tmp_path):
         # max_batch_size left at its default overruns a tight token budget;

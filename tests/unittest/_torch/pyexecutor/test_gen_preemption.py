@@ -654,11 +654,12 @@ def test_drafter_state_is_kept_for_paused_requests(kind):
 
 
 @pytest.mark.parametrize("kind", ["dflash", "dspark"])
-def test_executor_forced_resume_preserves_displaced_request(kind):
+@pytest.mark.parametrize("target_output_tps", [None, 8.0])
+def test_executor_forced_resume_preserves_displaced_request(kind, target_output_tps):
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import SchedulerOutput
 
-    p = make_preemption()
+    p = make_preemption(target_output_tps=target_output_tps)
     reqs = running(p, 2)
     for i, req in enumerate(reqs):
         req.py_batch_idx = i
@@ -710,6 +711,9 @@ def test_executor_forced_resume_preserves_displaced_request(kind):
     assert scheduled.generation_requests == reqs[:1] and num_fitting == 1
     assert scheduled.paused_in_place_ids == {1}
     assert reqs[1].py_batch_idx is None
+    assert p.paused_ids == {1}
+    assert p._reqs[1].paused_t == now
+    assert p._reqs[1].pauses == 1
     meta.request_ids, meta.num_generations = [0], 1
     meta.paused_in_place_ids = scheduled.paused_in_place_ids
     with patch(f"tensorrt_llm._torch.speculative.{kind}.prefer_pinned", return_value=False):
@@ -717,13 +721,38 @@ def test_executor_forced_resume_preserves_displaced_request(kind):
     assert worker._req_to_slot == old_slots
     assert int(worker._ctx_len[old_slots[1]]) == 77
 
-    # The deferred request can run again without losing its drafter slot.
+    p.observe(reqs, 110.0)
+    PyExecutor._schedule(ex)
+    assert p._reqs[1].paused_t == now
+    assert p._reqs[1].pauses == 1
+
+    # The displaced request's maximum pause forces it ahead of the live
+    # request, even though it appears last in the active list.
+    ex.request_broadcaster.rank0_now = 116.0
+    queue.set_now(116.0)
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]):
+        assert PyExecutor._fetch_new_requests(ex, queue, reqs) == []
+    assert p.stats["forced"] == 2
+    assert p._reqs[1].paused_t is None
+    assert p._reqs[1].paused_total == 8.0
+    assert p._reqs[1].resumed_at_iter == reqs[1].py_decoding_iter
     scheduler.schedule_request.return_value = SchedulerOutput([], [], reqs[1:], [], [], 1)
     resumed, _, _ = PyExecutor._schedule(ex)
+    scheduler.schedule_request.assert_called_with([reqs[1], reqs[0]], set())
     assert resumed.paused_in_place_ids == {0}
+    assert p.paused_ids == {0}
     meta.request_ids, meta.num_generations = [1], 1
     meta.paused_in_place_ids = resumed.paused_in_place_ids
     with patch(f"tensorrt_llm._torch.speculative.{kind}.prefer_pinned", return_value=False):
         meta.prepare()
     assert worker._req_to_slot == old_slots
     assert int(worker._ctx_len[old_slots[1]]) == 77
+
+    # Completion charges the displacement to TPOT inflation rather than
+    # increasing the controller's estimate of unpaused decode time.
+    reqs[1].generated += 20
+    p.observe(reqs, 117.0)
+    p.observe(reqs[:1], 118.0, target_ready=True)
+    assert p.mean_decode_s == pytest.approx(20.0)
+    assert p.stats["scored"] == 1
+    assert p.stats["infl"] > 0.0

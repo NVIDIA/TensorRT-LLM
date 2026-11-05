@@ -7754,6 +7754,8 @@ class TorchLlmArgs(BaseLlmArgs):
         fraction implies) and when a CUDA device is visible.
         ``memory_budget_bytes`` overrides the derivation (tests).
         """
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import \
+            unsupported_headroom_reason
         from tensorrt_llm._torch.speculative.dflash import (
             derive_dflash_ctx_memory_budget_bytes,
             estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
@@ -7830,7 +7832,10 @@ class TorchLlmArgs(BaseLlmArgs):
             tp_size=self.tensor_parallel_size,
             memory_budget_bytes=memory_budget_bytes,
             arena_before_pool=arena_before_pool,
-            gen_preemption_enabled=self.scheduler_config.gen_preemption.enabled,
+            gen_preemption_enabled=(self.scheduler_config.gen_preemption.enabled
+                                    and unsupported_headroom_reason(
+                                        self.scheduler_config.gen_preemption,
+                                        self) is None),
         )
 
     @model_validator(mode="after")

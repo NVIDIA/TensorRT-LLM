@@ -162,6 +162,7 @@ class GenPreemption:
         self.max_paused = paused_cap(max_num_active_requests)
         self._reqs: dict[int, _Req] = {}
         self._paused: dict = {}  # req_id -> request, in pause order
+        self._resumed_ids: set[int] = set()
         self._order = 0
         self._now: Optional[float] = None
         self.theta = 0.0  # log g
@@ -201,6 +202,7 @@ class GenPreemption:
     def step(self, active_requests, now, capacity: int, num_active: int, waiting_queue) -> int:
         """Track, resume, then pause; returns the admission count (paused
         requests hold no slot)."""
+        self._resumed_ids.clear()
         gen_queue = isinstance(waiting_queue, GenAdmissionWaitingQueue)
         self.observe(active_requests, now, gen_queue and waiting_queue.target_s is not None)
         num_active -= len(self._paused)
@@ -210,6 +212,15 @@ class GenPreemption:
                 self._pause(req)
                 num_active -= 1
         return num_active
+
+    def scheduling_order(self, active_requests) -> list:
+        """Give resumed requests the first available batch slots."""
+        return sorted(active_requests, key=lambda req: req.py_request_id not in self._resumed_ids)
+
+    def record_displaced(self, req) -> None:
+        """Charge an unscheduled live decode interval as a bounded pause."""
+        if req.py_request_id not in self._paused:
+            self._pause(req)
 
     def observe(self, active_requests, now: Optional[float], target_ready: bool = False) -> None:
         """Track the active requests; account the ones that left.  Completions
@@ -305,6 +316,7 @@ class GenPreemption:
                 self.stats["forced"] += 1
             n += 1
             del self._paused[rid]
+            self._resumed_ids.add(rid)
             r.resumed_at_iter = req.py_decoding_iter
             r.paused_total = self._paused_s(r)
             r.paused_t = r.laxity_resume_t = None

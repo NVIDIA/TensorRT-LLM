@@ -8663,8 +8663,12 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
+        requests_to_schedule = self.active_requests
+        if getattr(self, "_gen_preemption", None) is not None:
+            requests_to_schedule = self._gen_preemption.scheduling_order(
+                requests_to_schedule)
         scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+            requests_to_schedule, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
@@ -8739,6 +8743,7 @@ class PyExecutor:
                     # Forced resumes may displace another live decode request.
                     # Its previous sample is harvested without a new forward.
                     req.py_batch_idx = None
+                    self._gen_preemption.record_displaced(req)
                     retained_ids.add(req.py_request_id)
             scheduled_requests.paused_in_place_ids = frozenset(retained_ids)
 
