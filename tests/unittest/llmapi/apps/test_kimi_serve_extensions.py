@@ -313,18 +313,20 @@ class TestKimiExtensionMapping:
         assert self.kwargs_of(req)["thinking"] is False
         assert "thinking_effort" not in self.kwargs_of(req)
 
-    def test_medium_effort_has_no_k3_equivalent(self) -> None:
-        req = self.apply(reasoning_effort="medium")
+    @pytest.mark.parametrize("model_type", ["kimi_k3", "kimi_k31"])
+    def test_medium_effort_has_no_kimi_equivalent(self, model_type: str) -> None:
+        req = self.apply(model_type=model_type, reasoning_effort="medium")
         assert "thinking_effort" not in self.kwargs_of(req)
         assert "thinking" not in self.kwargs_of(req)
 
-    def test_k3_rejects_medium_thinking_effort(self) -> None:
-        with pytest.raises(ValueError, match="thinking.effort must be one of low, high, max"):
-            self.apply(thinking={"type": "enabled", "effort": "medium"})
+    @pytest.mark.parametrize("model_type", ["kimi_k3", "kimi_k31"])
+    def test_medium_thinking_effort_rejected(self, model_type: str) -> None:
+        with pytest.raises(ValidationError, match="effort"):
+            self.apply(model_type=model_type, thinking={"type": "enabled", "effort": "medium"})
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+    @pytest.mark.parametrize("effort", ["low", "high", "max"])
     def test_k31_thinking_efforts(self, effort: str) -> None:
-        # Kimi K3.1's chat template adds the medium effort.
+        # Kimi K3.1's chat template renders the same efforts as K3.
         req = self.apply(model_type="kimi_k31", thinking={"type": "enabled", "effort": effort})
         assert self.kwargs_of(req)["thinking_effort"] == effort
         req = self.apply(model_type="kimi_k31", reasoning_effort=effort)

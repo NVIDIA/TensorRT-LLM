@@ -558,7 +558,7 @@ These options are set in the YAML files passed to `trtllm-serve --config`. See t
 
 ### Kimi K3.1 Pro API Behavior
 
-* **Reasoning:** Thinking is on by default. Turn it off per request with `"chat_template_kwargs": {"thinking": false}`, `"thinking": {"type": "disabled"}` or `"reasoning_effort": "none"`. The effort is set with `thinking.effort` or `reasoning_effort`: `low`, `medium`, `high` or `max`. Explicit `chat_template_kwargs` take precedence. The `kimi_k3` reasoning parser returns the reasoning in `reasoning_content` and the answer in `content`.
+* **Reasoning:** Thinking is on by default. Turn it off per request with `"chat_template_kwargs": {"thinking": false}`, `"thinking": {"type": "disabled"}` or `"reasoning_effort": "none"`. The effort is set with `thinking.effort` or `reasoning_effort`: `low`, `high` or `max`. Explicit `chat_template_kwargs` take precedence. The `kimi_k3` reasoning parser returns the reasoning in `reasoning_content` and the answer in `content`.
 * **Tool calling:** The `kimi_k3` tool parser returns calls in `tool_calls`. `tool_choice` accepts `auto`, `required` and `none`; tools can also be declared on system messages (message-level tools, a Kimi API extension).
 * **Strict tool calls (optional):** To constrain tool-call arguments to each tool's JSON schema, start every server (the context and generation servers, or the aggregated server) with `guided_decoding_backend: xgrammar` in its YAML file and `TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR=1` in its environment, and send the tools with `"strict": true`. Tools without `strict` are not constrained, and the model can occasionally emit a tool call with missing arguments. The grammar constrains only the target model, so speculative-decoding acceptance can be somewhat lower.
 * **Sampling:** Use `temperature: 1.0` and `top_p: 0.95`; set both in each request. On the DEP16 generation server (`advanced_sampling_mode: no_topk`), a request's `top_k` is not applied and `min_p` is not supported.
@@ -604,7 +604,7 @@ curl http://<ROUTER_HOST>:65120/v1/chat/completions -H "Content-Type: applicatio
 }' -w "\n"
 ```
 
-`reasoning_effort` takes `low`, `medium`, `high` or `max`, and `none` answers without reasoning. Leave room in `max_tokens` for the reasoning.
+`reasoning_effort` takes `low`, `high` or `max`, and `none` answers without reasoning; any other value leaves the default effort (`max`). Leave room in `max_tokens` for the reasoning.
 
 ### Tool Calling
 

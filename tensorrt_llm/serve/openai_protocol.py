@@ -1058,13 +1058,11 @@ class ChatCompletionThinkingParam(OpenAIBaseModel):
     `keep` is fixed to `"all"` when thinking is enabled and ignored when
     disabled; `effort` is only meaningful when enabled. An explicit
     `effort` wins over a request-level `reasoning_effort`, which applies
-    only when `effort` is absent (and never for a disabled request). The
-    model's serving extension accepts the efforts its chat template renders
-    (`medium` is Kimi K3.1 only).
+    only when `effort` is absent (and never for a disabled request).
     """
     type: Literal["enabled", "disabled"] = "enabled"
     keep: Optional[Literal["all"]] = None
-    effort: Optional[Literal["low", "medium", "high", "max"]] = None
+    effort: Optional[Literal["low", "high", "max"]] = None
 
 
 class ChatCompletionRequest(OpenAIBaseModel):

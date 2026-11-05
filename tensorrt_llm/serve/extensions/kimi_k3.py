@@ -223,7 +223,7 @@ class KimiK3ServingExtension(ServingExtension):
                     derived["thinking"] = False
             elif effort in self._THINKING_EFFORTS:
                 derived["thinking_effort"] = effort
-            # Other efforts (e.g. harmony's "medium" on K3) have no Kimi
+            # Other efforts (e.g. harmony's "medium") have no Kimi
             # equivalent; leave the template default.
         if (
             "tool_choice" in request.model_fields_set
@@ -287,6 +287,4 @@ class KimiK3ServingExtension(ServingExtension):
 
 @register_serving_extension(model_types=("kimi_k31",))
 class KimiK31ServingExtension(KimiK3ServingExtension):
-    """Kimi K3.1: the K3 API semantics plus the ``medium`` thinking effort."""
-
-    _THINKING_EFFORTS = ("low", "medium", "high", "max")
+    """Kimi K3.1: the K3 API semantics; its chat template renders the same thinking efforts."""
