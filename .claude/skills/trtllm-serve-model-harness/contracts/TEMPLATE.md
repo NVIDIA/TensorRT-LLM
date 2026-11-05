@@ -12,8 +12,11 @@ write. Mark each line [measured], [source] or [doc].
 
 - Harness, version, how it was installed, and the config used to point it at a self-hosted
   endpoint (file path and keys).
-- Capture: command line, date, task(s) run, and capture method (`record_requests.py` record-only,
-  forward mode, or trtllm-serve's request trace).
+- Capture: command line, date, task(s) run, and capture method (`record_requests.py` record-only
+  or forward mode).
+- Isolation (`references/smoke.md` section 0): where it keeps configuration, credentials, history
+  and temporary files, and the variables that move them; its own sandbox, if any, what that needs
+  from the host, and how to turn it off; the hosts it calls on its own.
 
 ## 2. Wire
 

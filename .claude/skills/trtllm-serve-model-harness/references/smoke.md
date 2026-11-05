@@ -17,40 +17,59 @@ requests.
 
 For a harness with no recorded traffic yet, S4's wiring run is also how its first corpus is made.
 
-## 0. Isolation and safety
+## 0. The sandbox: prepare it yourself
 
-- **Agents run model-generated commands.** Use a disposable container or VM per run, with no
-  access to the user's home, shared workspaces or cluster credentials. `scripts/pi_kit/` makes one
-  container per pi session. For Codex and Claude Code, start the session runner inside your own
-  disposable container or VM.
-- **One configuration home per session,** never the user's:
+Agents run the commands the model writes. The skill ships no sandbox for that, because each
+harness and each host needs its own (`scripts/pi_kit/` is one, for pi). The agent running this
+skill prepares one that meets every requirement below, and checks it before a real run.
 
-  | Harness | Variable |
-  |---|---|
-  | Codex | `CODEX_HOME` |
-  | Claude Code | `CLAUDE_CONFIG_DIR` |
-  | pi | a fresh `HOME`, or pi's own directory variable |
+**Requirements**
 
-  A dev host holds harness credentials (e.g. `~/.codex/auth.json`, Claude MCP credentials). None
-  of it may be visible to a session.
-- **A harness's own sandbox may not run inside yours.** E.g. Codex's `workspace-write` sandbox
-  needs Linux namespaces; in a container that forbids them every command fails (a panic with exit
-  101, or `bwrap: No permissions to create a new namespace`). When the session already runs in a
-  disposable container, let that container be the sandbox: `SANDBOX=danger-full-access` for
-  `run_codex_sessions.sh`. The trace cannot show this: the failed commands go back to the model as
-  ordinary tool results. `run_codex_sessions.sh` counts them per session in `sessions.tsv`, and
-  exits 3 with a warning when any session had one.
-- **No real credentials in the environment the agent sees.** Agents print their environment and
-  headers (e.g. with `curl -v`), so any credential in reach ends up in the trace.
-- **Restrict egress.** A harness's own calls to its vendor fail under no egress, and that is
-  expected noise. E.g. Claude Code's fast-mode check and WebFetch domain check call
-  `api.anthropic.com` directly.
-  - Best: a container without a network, the endpoint reached through a socket (`scripts/pi_kit/`
-    does this for pi).
-  - On a host: the session runners pass `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and `ALL_PROXY`
-    through when you set them. Point them at a closed local port (`http://127.0.0.1:9`) and put the
-    endpoint's host in `NO_PROXY`. This is best effort: a tool that ignores proxy settings still
-    reaches out.
+| # | Requirement | Why |
+|---|---|---|
+| 1 | Disposable: a container or VM per run, or per session, removed afterwards | A session can leave anything behind |
+| 2 | Nothing of the user's: no home directory, shared workspace, SSH agent, cloud or cluster credentials | Agents read what they can reach |
+| 3 | A fresh configuration home for the harness in every session (below), never the user's | A dev host holds harness credentials, e.g. `~/.codex/auth.json`, Claude MCP credentials |
+| 4 | No real credential in the environment the agent sees: the endpoint key is a dummy | Agents print their environment and headers (e.g. `curl -v`), and the trace keeps it |
+| 5 | Network: the endpoint only, through the recorder; everything else unreachable | The model's commands are unknown. A harness's own calls to its vendor then fail, which is expected noise (e.g. Claude Code's checks against `api.anthropic.com`) |
+| 6 | The harness's tools run inside it: its own sandbox works there, or is turned off so the outer one is the sandbox | A harness sandbox that cannot start fails every command, and the trace still looks normal (below) |
+| 7 | Temporary files inside the session's directory (`TMPDIR`), not the host's `/tmp` | Leftovers and shared state |
+| 8 | Limits: CPU, memory, processes, wall clock; no GPU | A runaway command must not take the host or the GPUs |
+| 9 | The recorder and the trace outside the sandbox | The evidence must survive the sandbox and stay out of the agent's reach |
+
+The configuration home per session, for the shipped harnesses:
+
+| Harness | Variable |
+|---|---|
+| Codex | `CODEX_HOME` |
+| Claude Code | `CLAUDE_CONFIG_DIR` |
+| pi | a fresh `HOME`, or pi's own directory variable |
+
+For a new harness, its contract names where it keeps configuration and credentials (S0,
+`contracts/TEMPLATE.md`).
+
+**Check it before a real run.** From inside, as a session would:
+- a host other than the endpoint is unreachable, and the endpoint answers through the recorder;
+- the home directory and the configuration home are empty, and the environment holds no
+  credential;
+- a wiring run (section 1) runs the fake server's commands: their output comes back, not an
+  error from the harness's own sandbox.
+
+**A harness's own sandbox may not run inside yours** (requirement 6). E.g. Codex's
+`workspace-write` sandbox needs Linux namespaces. In a container that forbids them, every command
+fails (a panic with exit 101, or `bwrap: No permissions to create a new namespace`), and the
+failures go back to the model as ordinary tool results. Inside a sandbox that meets the
+requirements, turn it off: `SANDBOX=danger-full-access` for `run_codex_sessions.sh`, which counts
+such failures per session in `sessions.tsv` and exits 3 with a warning.
+
+**What the session runners do, and do not do.** `scripts/run_*_sessions.sh` give each session
+`env -i`, a fresh configuration home and `TMPDIR` (requirements 3, 4 and 7). They do not isolate
+the file system or the network. On a host they are enough for wiring runs against the fake
+servers, whose calls are harmless (`echo hi`, reading a missing file). There, the runners also
+pass `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and `ALL_PROXY` through when set: point them at a
+closed local port (`http://127.0.0.1:9`), with the endpoint's host in `NO_PROXY`. That is best
+effort, since a tool that ignores proxy settings still reaches out. A real model's sessions (S4,
+S5) run inside the sandbox.
 
 ## 1. Wire it up without a model first (minutes, no GPU)
 

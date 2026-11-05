@@ -111,7 +111,7 @@ inputs and the right checks. That is what this skill provides:
 | S1 adapt | Golden renders against the model's own encoder; parser fault matrix; stop rules; regression tests | Renders byte-equal; zero `calls_differ`, `streams_disagree` and `text_lost`; every new test failed on the old code | `references/adapt.md`, `references/verify-logic.md` |
 | S2 regress | L1 frame replay and L2 fake engine over existing corpora, for every model already supported | Fast-tier `conformance` PASS on every regression corpus | `references/replay.md` |
 | S3 replay | L3: recorded harness requests, one turn at a time, against the new model | Full tier: `inventory` and `conformance` PASS; `model-behavior` within thresholds, or BLOCKED for insufficient n | `references/replay.md`, `references/validate.md` |
-| S4 smoke | L4: the real harness on local tasks, in isolation | Full tier: S3's claims plus `runtime` and `harness-outcome` | `references/smoke.md` |
+| S4 smoke | L4: the real harness on local tasks, in a sandbox the agent prepares (`references/smoke.md` section 0) | Full tier: S3's claims plus `runtime` and `harness-outcome` | `references/smoke.md` |
 | S5 scale | A large run for long-tail rates: a soak, or a production-like campaign on a platform that runs the harness | Human decision. The same checks: frozen traces, a fast verdict, then the full tier | `references/smoke.md` section 4a |
 
 A harness with no recorded traffic yet runs S4 wiring and recording before S3. Its first real
