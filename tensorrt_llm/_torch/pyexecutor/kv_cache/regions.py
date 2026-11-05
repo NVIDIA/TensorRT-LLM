@@ -37,7 +37,6 @@ life cycles spans several V2 layer groups while keeping its id.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -52,6 +51,8 @@ from typing import (
     Union,
     runtime_checkable,
 )
+
+from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
