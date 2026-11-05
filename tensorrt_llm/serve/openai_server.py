@@ -8,11 +8,9 @@ import dataclasses
 import functools
 import importlib
 import os
-import re
 import signal
 import socket
 import sys
-import time
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -20,13 +18,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import uvicorn
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from starlette.routing import Mount
 from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
@@ -35,7 +32,6 @@ from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
-from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
@@ -46,8 +42,6 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.runtime.kv_cache_hash import \
-    get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._base.routing import (RoleGroup, ServerCapabilities,
@@ -73,13 +67,8 @@ from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                MultiFrontendServing,
                                                SharedClockOffset,
                                                follow_clock_offset)
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                MemoryUpdateRequest,
-                                                ResponsesRequest,
+from tensorrt_llm.serve.openai_protocol import (ResponsesRequest,
                                                 ResponsesResponse,
-                                                RuntimeMemoryUpdateRequest,
-                                                StartProfileRequest,
-                                                UpdateWeightsRequest,
                                                 to_llm_conversation_params,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.perf_metrics import PerfMetricsJsonlWriter
@@ -97,15 +86,11 @@ from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
-from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
-from tensorrt_llm.serve.runtime_control_auth import (
-    RuntimeControlReplayCache, validate_runtime_control_request)
+from tensorrt_llm.serve.runtime_control_auth import RuntimeControlReplayCache
 from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
 from tensorrt_llm.version import __version__ as VERSION
 
-from .._utils import (AdjustedSteadyClock,
-                      get_global_steady_clock_now_in_seconds,
-                      set_prometheus_multiproc_dir)
+from .._utils import AdjustedSteadyClock, set_prometheus_multiproc_dir
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 if TYPE_CHECKING:
@@ -147,15 +132,6 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
 
 
 class OpenAIServer:
-
-    @staticmethod
-    def _iteration_stats_buffer_maxlen(
-            iter_stats_max_iterations: Optional[int]) -> Optional[int]:
-        if iter_stats_max_iterations is None or iter_stats_max_iterations == 0:
-            return 1000
-        if iter_stats_max_iterations < 0:
-            return None
-        return iter_stats_max_iterations
 
     def __init__(
             self,
@@ -847,100 +823,6 @@ class OpenAIServer:
             # register /prometheus/metrics
             self.mount_metrics()
 
-    def mount_metrics(self):
-        # Lazy import for prometheus multiprocessing.
-        # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
-        # before prometheus_client is imported.
-        # See https://prometheus.github.io/client_python/multiprocess/
-        from prometheus_client import (CollectorRegistry, make_asgi_app,
-                                       multiprocess)
-        from prometheus_fastapi_instrumentator import Instrumentator
-        registry = CollectorRegistry()
-        multiprocess.MultiProcessCollector(registry)
-        Instrumentator(
-            should_group_status_codes=False,
-            should_respect_env_var=True,
-            excluded_handlers=[".*"],
-            registry=registry,
-        ).add().instrument(self.app).expose(self.app)
-        metrics_app = make_asgi_app(registry=registry)
-        metrics_route = Mount("/prometheus/metrics", metrics_app)
-        metrics_route.path_regex = re.compile(
-            "^/prometheus/metrics(?P<path>.*)$")
-        self.app.routes.append(metrics_route)
-
-    def register_mm_encoder_routes(self):
-        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
-        self.app.add_api_route("/metrics",
-                               self.get_iteration_stats,
-                               methods=["GET"])
-
-    async def _require_rl_control_auth(self, raw_request: Request) -> None:
-        body = await raw_request.body()
-        try:
-            validate_rl_control_request(self._rl_control_api_key, body,
-                                        raw_request.headers)
-        except ValueError as e:
-            raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED,
-                                detail=str(e)) from e
-
-    async def _require_runtime_control_auth(self, raw_request: Request) -> None:
-        body = await raw_request.body()
-        try:
-            route = raw_request.scope.get("route")
-            route_path = getattr(route, "path", None)
-            if route_path is None:
-                raise ValueError("Runtime control route is unavailable.")
-            validate_runtime_control_request(
-                self._runtime_control_api_key,
-                raw_request.method,
-                route_path,
-                body,
-                raw_request.headers,
-                self._runtime_control_replay_cache,
-            )
-        except ValueError as error:
-            raise HTTPException(
-                status_code=HTTPStatus.UNAUTHORIZED,
-                detail=str(error),
-            ) from error
-
-    def _register_runtime_control_routes(self) -> None:
-        if not self._enable_runtime_control_endpoints:
-            return
-
-        dependencies = [Depends(self._require_runtime_control_auth)]
-        self.app.add_api_route("/release_memory",
-                               self.runtime_release_memory,
-                               methods=["POST"],
-                               dependencies=dependencies)
-        self.app.add_api_route("/resume_memory",
-                               self.runtime_resume_memory,
-                               methods=["POST"],
-                               dependencies=dependencies)
-        self.app.add_api_route("/memory_status",
-                               self.runtime_memory_status,
-                               methods=["GET"],
-                               dependencies=dependencies)
-
-    def _register_rl_control_routes(self) -> None:
-        if not self._enable_rl_control_endpoints:
-            return
-
-        dependencies = [Depends(self._require_rl_control_auth)]
-        self.app.add_api_route("/release_memory",
-                               self.release_memory,
-                               methods=["POST"],
-                               dependencies=dependencies)
-        self.app.add_api_route("/resume_memory",
-                               self.resume_memory,
-                               methods=["POST"],
-                               dependencies=dependencies)
-        self.app.add_api_route("/update_weights",
-                               self.update_weights,
-                               methods=["POST"],
-                               dependencies=dependencies)
-
     def register_visual_gen_routes(self):
         """Wire VisualGen serving for the VISUAL_GEN role.
 
@@ -960,19 +842,6 @@ class OpenAIServer:
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
-
-    async def data_transceiver_state(self) -> JSONResponse:
-        """Return the serialized DataTransceiverState as base64-encoded JSON."""
-        state = self.generator.get_data_transceiver_state()
-        if not state:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "No transceiver state available"})
-        import base64
-        return JSONResponse(content={
-            "data_transceiver_state":
-            base64.b64encode(state).decode("utf-8")
-        })
 
     def _register_launcher_forwarding_routes(self) -> None:
         """Attached frontends: forward launcher-owned routes (before register_routes())."""
@@ -1056,242 +925,7 @@ class OpenAIServer:
                 signal.raise_signal(signal.SIGINT)
             return False
 
-    async def health_generate(self, raw_request: Request) -> Response:
-        """Health check that performs a minimal generation."""
-        extra_args = {}
-        if self.generator.args.max_beam_width > 1:
-            extra_args = dict(
-                use_beam_search=True,
-                best_of=self.generator.args.max_beam_width,
-                n=1,
-            )
-        try:
-            # Create a minimal chat request
-            health_request = ChatCompletionRequest(
-                messages=[{
-                    "role": "user",
-                    "content": "hi"
-                }],  # Minimal prompt (often > 1 token after tokenization)
-                model=self.model,
-                max_completion_tokens=1,  # Request only 1 token out
-                stream=False,
-                temperature=0.0,  # Deterministic output
-                **extra_args,
-            )
-
-            # Call the chat completion logic
-            response = await self._chat_serving.openai_chat(
-                health_request, raw_request)
-
-            # Check if the response indicates success (status code 200)
-            if response.status_code == 200:
-                return Response(status_code=200,
-                                content="Generation health check OK")
-            else:
-                logger.error(
-                    f"Health generate check failed with status code: {response.status_code}"
-                )
-                try:
-                    # Attempt to get body for more details if possible
-                    body = response.body if hasattr(
-                        response, 'body') else await response.body()
-                    logger.error(f"Health generate check response body: {body}")
-                except Exception:
-                    pass  # Ignore errors trying to get body details
-                return Response(status_code=500,
-                                content="Generation health check failed")
-
-        except Exception as e:
-            logger.error(f"Health generate check encountered exception: {e}")
-            return Response(status_code=500,
-                            content=f"Generation health check failed: {str(e)}")
-
-    async def get_iteration_stats(self) -> JSONResponse:
-        # Visual-gen deployments use a separate iteration-stats producer
-        # (see ``DiffusionRemoteClient._iter_stats``).  The LLM PyExecutor
-        # stats queue is empty in visual-gen mode, so route /metrics to the
-        # visual-gen-shaped producer instead. Each snapshot mirrors LLM
-        # field names where it makes sense (numActiveRequests,
-        # numQueuedRequests) so downstream consumers that already parse the
-        # LLM /metrics shape work for visual-gen with minimal changes.
-        if self._is_visual_gen:
-            stats = []
-            async for stat in self.generator.get_stats_async(timeout=None):
-                stats.append(stat)
-            return JSONResponse(content=stats)
-
-        # Without iteration stats the engine produces none, so there is
-        # nothing to wait for.
-        if not getattr(self.generator.args, "enable_iter_perf_stats", True):
-            return JSONResponse(content=[])
-
-        # When the background collector loop is active it is the sole
-        # consumer of the engine stats queue; serve /metrics from the tee
-        # buffer it populates so we do not race it for queue items. Racing
-        # caused >80% iteration loss and ~2s per-call latency (nvbug 6102381).
-        # The caller receives the stats accumulated since the previous /metrics
-        # call (up to iter_stats_max_iterations) and the buffer is cleared.
-        if self._iteration_stats_buffer is not None:
-            stats = list(self._iteration_stats_buffer)
-            self._iteration_stats_buffer.clear()
-            return JSONResponse(content=stats)
-
-        # Legacy path: no background collector -> read the queue directly.
-        # The read waits up to 2 s for stats inside a blocking executor call,
-        # so it runs on the metrics thread; on the event loop it would stall
-        # every response being streamed for as long as it waits.
-        # One read at a time: a scrape that arrives while a read is in flight
-        # returns no stats instead of queueing behind it, so scraping an idle
-        # server faster than one read per 2 s cannot build a backlog. A read
-        # drains the queue and hands everything to its own scrape, so when two
-        # scrapers poll at once, one of them regularly gets an empty list.
-        read = self._metrics_stats_read
-        if read is not None and (not read.done()
-                                 or self._metrics_stats_read_waiting):
-            # In flight, or finished with its scrape about to take the stats.
-            return JSONResponse(content=[])
-        if (read is None or self._metrics_stats_read_consumed
-                or read.cancelled()):
-            read = asyncio.get_running_loop().run_in_executor(
-                self._metrics_stats_executor, self.generator.get_stats, 2)
-            self._metrics_stats_read = read
-            self._metrics_stats_read_consumed = False
-        # Otherwise the last read finished after its scrape went away, and
-        # this scrape takes the stats it drained rather than losing them.
-        self._metrics_stats_read_waiting = True
-        try:
-            # Shielded so a scrape that goes away leaves the read running
-            # until its thread finishes, and its stats for the next scrape.
-            stats = await asyncio.shield(read)
-        except RPCError as e:
-            # The executor is unreachable, e.g. while it shuts down.
-            logger.debug(f"Failed to fetch iteration stats: {e}")
-            stats = []
-        except Exception:
-            # The read failed; the next scrape starts a new one.
-            self._metrics_stats_read_consumed = True
-            raise
-        finally:
-            self._metrics_stats_read_waiting = False
-        self._metrics_stats_read_consumed = True
-        return JSONResponse(content=stats)
-
-    async def get_energy_metrics(self) -> JSONResponse:
-        if self.energy_monitor is None:
-            return JSONResponse(
-                content={"error": "Energy monitoring is not available"},
-                status_code=503)
-        total_energy = self.energy_monitor.get_current_energy()
-        if total_energy is None:
-            return JSONResponse(content={"error": "Failed to read GPU energy"},
-                                status_code=503)
-        return JSONResponse(
-            content={
-                "total_energy_j": round(total_energy, 4),
-                "query_time": time.perf_counter(),
-            })
-
-    async def set_steady_clock_offset(
-            self, offset: Annotated[float, Body(embed=True)]) -> Response:
-        self._adjusted_steady_clock.set_reference_offset(offset)
-        logger.info(
-            f"The steady clock offset between local and disagg server: {offset} second"
-        )
-        # Multi-frontend launcher: every frontend stamps perf metrics with it.
-        if self._shared_clock_offset is not None:
-            try:
-                self._shared_clock_offset.publish(offset)
-            except OSError as e:
-                logger.error(
-                    f"Failed to share the steady clock offset with the "
-                    f"attached frontends: {e}")
-                return Response(status_code=500, content=str(e))
-        return Response(status_code=200)
-
-    async def get_steady_clock_offset(self) -> JSONResponse:
-        # The calibrated offset is applied to AdjustedSteadyClock, whose source
-        # is the rank-adjusted global clock. Sample that same clock here so a
-        # process-global offset is not counted twice in emitted metrics.
-        receive_ts = get_global_steady_clock_now_in_seconds()
-        await asyncio.sleep(0.2)
-        transmit_ts = get_global_steady_clock_now_in_seconds()
-        return JSONResponse(content={
-            "receive_ts": receive_ts,
-            "transmit_ts": transmit_ts
-        })
-
-    async def get_kv_cache_events(self) -> JSONResponse:
-        events = []
-        try:
-            async for event in self.generator.get_kv_cache_events_async(0):
-                events.append(event)
-        except (IndexError, asyncio.QueueEmpty):
-            # queue is empty, no more events
-            pass
-        return JSONResponse(content=events)
-
     _extract_metrics = GenerateBaseServing._extract_metrics
-
-    async def _iteration_stats_collector_loop(self):
-        """Background task that continuously collects iteration statistics from the LLM engine.
-
-        This task runs in the background for the lifetime of the server and drains iteration
-        stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
-        (kv_cache_hit_rate, kv_cache_utilization, kv_cache_iter_reuse_rate) are naturally
-        overwritten with the latest value, while counters (missed_blocks_total,
-        gen_alloc_blocks_total, etc.) must be incremented by *every* per-iteration delta
-        to remain accurate.  Logging only the latest stat would drop counter deltas from
-        earlier iterations and could leave gauges unset if the latest iteration had no
-        context-phase activity.
-
-        The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
-        requests complete.
-
-        The loop will continue until the task is cancelled during server shutdown.
-        """
-        try:
-            logger.info("Iteration stats collector loop started")
-            while True:
-                # Wait for signal that requests have completed and stats may
-                # be available (a multi-frontend launcher also polls).
-                woken_by_timer = False
-                try:
-                    await asyncio.wait_for(
-                        self._iteration_stats_wakeup_event.wait(),
-                        timeout=self._iteration_stats_poll_interval)
-                except asyncio.TimeoutError:
-                    woken_by_timer = True
-
-                # Clear the event for next wakeup
-                self._iteration_stats_wakeup_event.clear()
-
-                # Drain all available iteration stats and log each one to Prometheus.
-                # The fetch blocks for up to its timeout, so it runs on the
-                # metrics thread, which /metrics leaves idle while this loop runs.
-                try:
-                    # A timer wakeup (multi-frontend launcher poll) reads
-                    # without waiting.
-                    for llm_stat in await asyncio.get_running_loop(
-                    ).run_in_executor(self._metrics_stats_executor,
-                                      self.generator.get_stats,
-                                      0 if woken_by_timer else 0.5):
-                        self._record_iteration_stat(llm_stat)
-                except Exception as e:
-                    # Log errors but continue collecting stats
-                    logger.error(f"Error collecting iteration stats: {e}",
-                                 exc_info=True)
-                    # Brief sleep to avoid tight loop on persistent errors
-                    await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            logger.info("Iteration stats collector loop cancelled")
-            raise
-
-    def _record_iteration_stat(self, llm_stat: dict) -> None:
-        self.metrics_collector.log_iteration_stats(llm_stat)
-        # Tee into the /metrics snapshot buffer so the HTTP handler can serve
-        # without competing for the engine queue (nvbug 6102381).
-        if self._iteration_stats_buffer is not None:
-            self._iteration_stats_buffer.append(llm_stat)
 
     def _responses_prompt_tokens_excluded_from_usage(
             self, request: ResponsesRequest) -> int:
@@ -1594,251 +1228,6 @@ class OpenAIServer:
             "object": "response",
             "deleted": True
         })
-
-    async def start_profile(
-            self,
-            request: Optional[StartProfileRequest] = None) -> JSONResponse:
-        """Start runtime profiling in the backend engine.
-
-        Request body (all optional): ``output_dir``, ``num_steps``,
-        ``start_step``, ``activities``. See ``StartProfileRequest`` for
-        descriptions.
-
-        The backend ``PyExecutor.start_profile`` schedules the profile
-        window and the broadcasted ``PROFILE_START_REQUEST_ID`` queue
-        item wakes the executor loop, so no tickle-via-generation is
-        needed on this side — the captured chrome trace stays free of
-        synthetic single-token forward passes.
-
-        The underlying ``GenerationExecutor.start_profile`` call may
-        block (it waits for the worker subprocess to ack on the
-        IPC-proxy path, up to ~60s). We run it on a worker thread via
-        ``asyncio.to_thread`` so the FastAPI event loop stays
-        responsive to other endpoints during that wait.
-        """
-        if request is None:
-            request = StartProfileRequest()
-        try:
-            await asyncio.to_thread(
-                self.generator.start_profile,
-                output_dir=request.output_dir,
-                num_steps=request.num_steps,
-                start_step=request.start_step,
-                activities=request.activities,
-            )
-        except RuntimeError as e:
-            # ``PyExecutor.start_profile`` raises RuntimeError when a
-            # profile window is already active or pending. Surface this
-            # to the caller as 409 so they can distinguish it from a
-            # generic backend failure (which keeps 500).
-            msg = str(e)
-            if "already in progress" in msg or "pending" in msg:
-                logger.info(f"/start_profile rejected: {msg}")
-                return JSONResponse(content={
-                    "success": False,
-                    "message": msg
-                },
-                                    status_code=409)
-            logger.error(f"/start_profile failed: {e}")
-            return JSONResponse(content={
-                "success": False,
-                "message": msg
-            },
-                                status_code=500)
-        except (OSError, ValueError, TimeoutError) as e:
-            # OSError: filesystem/IPC failures while preparing the
-            # profile window. ValueError: schema-level rejections that
-            # slipped past Pydantic. TimeoutError: ack-queue wait gave
-            # up. Anything truly unexpected is allowed to propagate to
-            # FastAPI's middleware so we get a real stack trace in the
-            # server log instead of swallowing it as a generic 500.
-            logger.error(f"/start_profile failed: {e}")
-            return JSONResponse(content={
-                "success": False,
-                "message": str(e)
-            },
-                                status_code=500)
-
-        return JSONResponse(content={"message": "Profiling started"})
-
-    async def stop_profile(self) -> JSONResponse:
-        """Stop any in-progress runtime profiling and flush traces.
-
-        The backend ``PyExecutor.stop_profile`` schedules the stop and
-        the broadcasted ``PROFILE_STOP_REQUEST_ID`` queue item wakes the
-        executor loop. The call blocks until ``profile_step()`` has
-        actually fired the stop, so by the time this handler returns 200
-        the chrome trace is on disk. No synthetic ``generate_async([0])``
-        tickle is submitted, so the captured trace is free of HTTP-layer
-        events.
-
-        The wait can take up to ~35s on the IPC-proxy path. We run the
-        blocking call on a worker thread via ``asyncio.to_thread`` so
-        the FastAPI event loop stays responsive to other endpoints
-        (notably ``/health`` for liveness checks) during the flush.
-        """
-        try:
-            await asyncio.to_thread(self.generator.stop_profile)
-        except (RuntimeError, OSError, TimeoutError) as e:
-            # RuntimeError: backend rejected the stop or broadcast
-            # enqueue failed. OSError: filesystem error flushing the
-            # trace. TimeoutError: ack-queue wait gave up. Truly
-            # unexpected exceptions propagate to FastAPI so they show
-            # up as a real stack trace rather than a swallowed 500.
-            logger.error(f"/stop_profile failed: {e}")
-            return JSONResponse(content={"error": str(e)}, status_code=500)
-
-        return JSONResponse(content={"message": "Profiling stopped"})
-
-    @staticmethod
-    def _runtime_control_error_response(error: Exception) -> JSONResponse:
-        if isinstance(error, ValueError):
-            status_code = HTTPStatus.BAD_REQUEST
-        elif (isinstance(error, RuntimeError) and
-              ("already parked" in str(error) or "while state is" in str(error)
-               or "admission transition" in str(error))):
-            status_code = HTTPStatus.CONFLICT
-        else:
-            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-        return JSONResponse(status_code=status_code,
-                            content={"error": {
-                                "message": str(error)
-                            }})
-
-    async def _call_runtime_memory_method(self, method: str,
-                                          tags: Optional[List[str]]) -> object:
-        operation = getattr(self.generator, method)
-        if isinstance(self.generator, AsyncLLM):
-            return await operation(tags)
-        return await asyncio.to_thread(operation, tags)
-
-    async def runtime_release_memory(
-        self,
-        request: Optional[RuntimeMemoryUpdateRequest] = None,
-    ) -> JSONResponse:
-        try:
-            if request is not None and request.tags == []:
-                raise ValueError("Runtime memory tags must not be empty.")
-            tags = None if request is None else request.tags
-            await self._call_runtime_memory_method("release", tags)
-        except Exception as error:
-            return self._runtime_control_error_response(error)
-        return JSONResponse(content={"status": "success"})
-
-    async def runtime_resume_memory(
-        self,
-        request: Optional[RuntimeMemoryUpdateRequest] = None,
-    ) -> JSONResponse:
-        try:
-            if request is not None and request.tags == []:
-                raise ValueError("Runtime memory tags must not be empty.")
-            tags = None if request is None else request.tags
-            await self._call_runtime_memory_method("resume", tags)
-        except Exception as error:
-            return self._runtime_control_error_response(error)
-        return JSONResponse(content={"status": "success"})
-
-    async def runtime_memory_status(self) -> JSONResponse:
-        try:
-            if isinstance(self.generator, AsyncLLM):
-                status = await self.generator.get_memory_status()
-            else:
-                status = await asyncio.to_thread(
-                    self.generator.get_memory_status)
-        except Exception as error:
-            return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                                content={"error": {
-                                    "message": str(error)
-                                }})
-        return JSONResponse(content=status.model_dump(mode="json"))
-
-    async def release_memory(self,
-                             request: MemoryUpdateRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/release_memory endpoint is only supported with AsyncLLM()"
-        await self.generator.collective_rpc('sleep', args=(request.tags, ))
-        return JSONResponse(content={"status": "success"})
-
-    async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/resume_memory endpoint is only supported with AsyncLLM()"
-        await self.generator.collective_rpc('wakeup', args=(request.tags, ))
-        return JSONResponse(content={"status": "success"})
-
-    async def update_weights(self,
-                             request: UpdateWeightsRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/update_weights endpoint is only supported with AsyncLLM()"
-        await self.generator.collective_rpc('update_weights',
-                                            args=(request.weights, ))
-        return JSONResponse(content={"status": "success"})
-
-    async def _live_tokens_per_block(self) -> Optional[int]:
-        """Return the runtime's effective KV block size, or None if unknown.
-
-        The executor layer already turns RPC failures into an empty dict, so
-        the only failure left to absorb here is ``encode_only``, which rejects
-        the call outright. Generators without a KV cache (VisualGen) have no
-        such method. Both mean "fall back to the configured value".
-        """
-        get_capacity = getattr(self.generator, "get_kv_cache_capacity", None)
-        if get_capacity is None:
-            return None
-        try:
-            # Off-loop: the RPC blocks, and this worker's own heartbeat task
-            # shares this loop, so stalling it here can lapse its registration.
-            capacity = await asyncio.to_thread(get_capacity)
-        except RuntimeError as e:
-            logger.debug(f"Could not read live tokens_per_block: {e}")
-            return None
-        return capacity.get("tokensPerBlock") or None
-
-    async def get_server_info(self) -> JSONResponse:
-        # Note: calling self.generator.disaggregated_params and startup_metrics below
-        # may trigger an RPC sync call, blocking the server event loop. Since this server_info
-        # is usually called only once before accepting requests, it's not a big concern.
-        content = {"disaggregated_params": self.generator.disaggregated_params}
-        # A router or caller checks this before trusting prompt token ids that
-        # another process rendered; it is computed once, then reused.
-        render_fingerprint = getattr(self, "_render_fingerprint", None)
-        if render_fingerprint is None:
-            try:
-                # Hashing the vocabulary takes a moment; keep the event loop free.
-                render_fingerprint = await asyncio.to_thread(
-                    lambda: RenderResources.from_server(self).fingerprint())
-                self._render_fingerprint = render_fingerprint
-            except Exception:
-                logger.warning("Could not compute the rendering fingerprint:\n"
-                               f"{traceback.format_exc()}")
-        if render_fingerprint is not None:
-            content["render_fingerprint"] = render_fingerprint
-        args = getattr(self.generator, "args", None)
-        if args is not None:
-            if args.max_batch_size is not None:
-                content["max_batch_size"] = args.max_batch_size
-            kv_cache_config = args.kv_cache_config
-            if kv_cache_config is not None:
-                content[
-                    "kv_cache_hash_algo"] = get_effective_kv_cache_event_hash_algo(
-                        kv_cache_config.kv_cache_event_hash_algo,
-                        kv_cache_config.use_kv_cache_manager_v2)
-                if kv_cache_config.tokens_per_block is not None:
-                    content[
-                        "tokens_per_block"] = kv_cache_config.tokens_per_block
-            # The runtime may override the configured block size (e.g. FlashMLA
-            # forces 64) in the worker process, so args.kv_cache_config still
-            # holds the pre-override value here. A kv-cache-aware router hashes
-            # prompts in whatever block size this endpoint publishes, so a
-            # stale value makes every block hash miss. Prefer the live value.
-            live_tokens_per_block = await self._live_tokens_per_block()
-            if live_tokens_per_block is not None:
-                content["tokens_per_block"] = live_tokens_per_block
-        content["startup_metrics"] = getattr(self.generator, "startup_metrics",
-                                             {})
-        return JSONResponse(content=content)
 
     async def __call__(self,
                        host,
