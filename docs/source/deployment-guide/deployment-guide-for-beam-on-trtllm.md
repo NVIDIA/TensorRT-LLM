@@ -411,26 +411,38 @@ the same scale-table digest, and that the two disaggregated workers report the s
 The same recipes run behind the standard [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo)
 frontend and TensorRT LLM worker (`python3 -m dynamo.frontend` and `python3 -m dynamo.trtllm`),
 aggregated on one node or disaggregated with a prefill worker on one node and a decode worker on
-a second node. These steps were tested with the `ai-dynamo` and `ai-dynamo-runtime`
-`1.7.0.dev20261101` packages, unmodified; that release pins `tensorrt-llm==1.4.0rc2`, the version
-of the TensorRT LLM build containing this guide.
+a second node. Qualification used a patched Dynamo source build with TensorRT LLM `1.4.0rc2`
+and XGrammar `0.1.32`, not the unmodified preview packages. The Dynamo build includes fixes for
+Beam reply parsing, structural-tag registration, constraint validation and token-budget handling.
+These changes and their parser/protocol crate dependencies must be included in the deployment
+package. Installing a stock package with the same version number does not provide those fixes.
+
+The source revisions used for qualification are Dynamo `51f72d9b79255ced5c9755f2f4f6fe3bcaac5127`,
+the patched `dynamo-parsers-v2` crate `a47af00e2d1d` and the patched `dynamo-protocols` crate
+`c623202b57a8`. These identify the tested source builds; they are not published release tags.
+Obtain the corresponding reviewed deployment package before using the commands below.
 
 ### Install Dynamo next to TensorRT LLM
 
-Install the two Dynamo packages into a virtual environment that sees the TensorRT LLM
-installation, without Dynamo's `[trtllm]` extra (which would install a released TensorRT LLM
-wheel over this build):
+Use the deployment package's installation instructions and pinned dependency environment.
+Its base container must first have the package's required runtime dependencies installed and
+their versions checked; creating a venv over an unprepared base image is insufficient.
+Install the supplied Dynamo wheels into a virtual environment that sees this TensorRT LLM
+installation, without Dynamo's `[trtllm]` extra (which would replace it with a released wheel):
 
 ```bash
 python3 -m venv --system-site-packages <DYNAMO_VENV>
-<DYNAMO_VENV>/bin/pip install --dry-run ai-dynamo==1.7.0.dev20261101 ai-dynamo-runtime==1.7.0.dev20261101
-<DYNAMO_VENV>/bin/pip install ai-dynamo==1.7.0.dev20261101 ai-dynamo-runtime==1.7.0.dev20261101
+<DYNAMO_VENV>/bin/pip install --dry-run --no-index --no-deps <AI_DYNAMO_WHEEL> <AI_DYNAMO_RUNTIME_WHEEL>
+<DYNAMO_VENV>/bin/pip install --no-index --no-deps <AI_DYNAMO_WHEEL> <AI_DYNAMO_RUNTIME_WHEEL>
 <DYNAMO_VENV>/bin/python -c "import tensorrt_llm, dynamo.trtllm; print(tensorrt_llm.__file__)"
 ```
 
 The dry run must not plan to replace `torch`, `transformers`, `tensorrt`, `triton` or any `nvidia-*`
 package of the environment, and the last command must print the path of this TensorRT LLM
 installation. Run the frontend and workers with `<DYNAMO_VENV>/bin/python3`.
+Verify the installed package hashes and dependency versions against the deployment manifest.
+The original Dynamo qualification used the eager TensorRT LLM build; a new build combining
+these changes with the GO implementation needs combined runtime validation before distribution.
 
 ### Who processes the text
 
@@ -441,8 +453,10 @@ IDs only. Configure the frontend's text processing through the worker's registra
 - `--custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja`: the checkpoint's chat template.
 - `--dyn-reasoning-parser beam --dyn-tool-call-parser beam`: Dynamo's built-in Beam parser. Both
   flags are needed: Dynamo selects its Beam parser only when both name `beam`.
+- `--guided-decoding-backend xgrammar`: required on every worker for the qualified recipe.
+- `DYN_BEAM_TOOL_CALLS=0` on the frontend: this text-only recipe refuses tool-calling requests.
 
-Use the curated recipes as the worker's `--extra-engine-args`, with `<DRAFTER_CHECKPOINT>` replaced
+Use the eager curated recipes as the worker's `--extra-engine-args`, with `<DRAFTER_CHECKPOINT>` replaced
 and the `reasoning_parser` line removed (reasoning parsing belongs to the frontend here). The commands
 below call the three prepared files `beam-dynamo-aggregated.yaml`, `beam-dynamo-disagg-ctx.yaml` and
 `beam-dynamo-disagg-gen.yaml`. Export the
@@ -455,6 +469,7 @@ the TCP request plane:
 
 ```bash
 export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV=<SHARED_DISCOVERY_DIR> DYN_REQUEST_PLANE=tcp
+export DYN_BEAM_TOOL_CALLS=0 DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS=5000
 ```
 
 ### Aggregated
@@ -467,6 +482,7 @@ python3 -m dynamo.frontend --http-host 0.0.0.0 --http-port 8000 \
 
 python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> --served-model-name beam-nvfp4 \
   --extra-engine-args beam-dynamo-aggregated.yaml --disaggregation-mode agg \
+  --guided-decoding-backend xgrammar \
   --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja
 ```
@@ -486,12 +502,14 @@ later need etcd discovery instead. Each worker must advertise an address the fro
 DYN_TCP_RPC_HOST=<FIRST_NODE_ADDRESS> python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
   --served-model-name beam-nvfp4 --extra-engine-args beam-dynamo-disagg-ctx.yaml \
   --disaggregation-mode prefill --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
+  --guided-decoding-backend xgrammar \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja &
 
 # second node: decode worker
 DYN_TCP_RPC_HOST=<SECOND_NODE_ADDRESS> python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
   --served-model-name beam-nvfp4 --extra-engine-args beam-dynamo-disagg-gen.yaml \
   --disaggregation-mode decode --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
+  --guided-decoding-backend xgrammar \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja
 
 # first node, after both workers are ready: frontend
@@ -509,17 +527,25 @@ frontend lists its models at `/v1/models`, and the GSM8K
 evaluator below works against it in endpoint mode (`--endpoint http://<FIRST_NODE_ADDRESS>:8000
 --served-model-name beam-nvfp4`).
 
-### Differences from the native server
+### Qualified behavior and remaining limits
 
-- A reply that starts without a channel header is returned with empty content by Dynamo's Beam
-  parser, while the native `beam_harmony_text` parser returns that text as the final content.
-  Replies with an analysis or final channel are parsed the same way.
-- Dynamo's Beam parser attaches its turn grammar to every request as guided-decoding data, and
-  `--dyn-structural-tag false` does not remove it in the tested release. These recipes configure
-  no guided-decoding backend, so the TensorRT LLM worker does not apply it.
-- A request whose `max_tokens` exceeds the 69,632-token context is accepted and served; the native
-  server refuses it with HTTP 400.
-- Only the eager recipes (CUDA graphs and overlap scheduling disabled) were tested with Dynamo.
+- Headerless text is preserved as content; tagged and streaming replies separate reasoning and
+  final content without leaking channel markers.
+- XGrammar enforces the supported turn grammar and explicit constraints. Invalid schemas are
+  rejected before generation, and subsequent valid requests remain usable.
+- `--dyn-structural-tag false` disables the automatic turn grammar while preserving supported
+  explicit constraints. Keep XGrammar enabled when using this option.
+- Positive output budgets above the remaining context are accepted and capped to the available
+  context, matching the tested native accept-and-cap behavior. Invalid budgets and overlong
+  prompts are rejected before generation.
+- Omitting the guided-decoding backend is outside the qualified recipe. In that configuration,
+  constraints embedded in structural tags can be silently unenforced; this is a documented
+  limitation, not supported constraint enforcement.
+- One-model speculative decoding can ignore guided-decoder failure reports. Dynamo validates
+  supported constraints before generation, but an engine-side `failed during guided decoding`
+  message must still be investigated as possible unconstrained generation.
+- Only eager execution (CUDA graphs and overlap scheduling disabled) was qualified with Dynamo.
+  The native GO results do not qualify Dynamo with GO enabled.
 
 ## Accuracy and limitations
 
