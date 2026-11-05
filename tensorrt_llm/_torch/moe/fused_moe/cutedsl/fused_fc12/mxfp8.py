@@ -103,6 +103,22 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # FC1 N / FC2 K per rank: 128-row scale atoms and int32-packed scales.
     _INTERMEDIATE_ALIGNMENT = 128
 
+    # Raw BF16/FP16 activations with at most this many elements are quantized
+    # inside the FC12 workspace-reset launch instead of a separate
+    # ``mxfp8_quantize`` launch. Measured on Rubin at the peak HBM clock with
+    # rotating (cold) weights, CUDA-graph replays, native quantize + op vs
+    # the fused op, with both routes on the same tactic and again with each
+    # route autotuned: the fused route saves 1.5-2.8 us (the quantize launch)
+    # at every size from 1 to 256 rows of hidden 4096 and for hidden 2048
+    # and 7168, 3.5-7 us at 512-4096 rows, and is neutral within noise at
+    # 8K-16K rows. 16M elements is 4096 rows of hidden 4096; above it the two
+    # routes are equal, so prefill-sized inputs keep the native launch.
+    FUSED_INPUT_QUANT_MAX_ELEMENTS = 1 << 24
+
+    # The workspace reset indexes the output with Int32, so larger outputs
+    # are cleared by the memset instead.
+    _ZERO_OUTPUT_MAX_ELEMENTS = 2**31 - 1
+
     # ------------------------------------------------------------------
     # Eligibility
     # ------------------------------------------------------------------
@@ -221,6 +237,15 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         self.use_fused_finalize = (
             not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
         )
+        # Anchors the autotuning buckets to the module's saturation token
+        # count (see CuteDslFusedMoEMxfp8Runner.get_tuning_config), so the
+        # decode buckets are profiled even when the warmup forward is large.
+        # Same cap as the Cutlass leaves: ~16k tokens per expert is well into
+        # the compute-bound domain, so profiling beyond it only costs time.
+        self.tune_max_num_tokens = min(
+            model_config.moe_max_num_tokens,
+            16384 * self.num_slots // routing_method.get_experts_per_token(),
+        )
         self._init_output_memset_and_locality_domain(model_config)
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -257,6 +282,25 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # ------------------------------------------------------------------
     # Input quantization and dispatch
     # ------------------------------------------------------------------
+    def _fuses_input_quant(self, x: torch.Tensor) -> bool:
+        """Whether ``x`` is quantized inside the fused FC12 workspace reset.
+
+        The reset kernel uses aligned vector loads and writes one E8M0 scale
+        per 32 elements in linear order, hence the layout requirements. The
+        native quantizer pads the scale columns to ``weight_alignment`` while
+        the fused path writes exactly ``hidden / 32`` columns, so the two agree
+        only when the hidden size is a multiple of the weight alignment.
+        """
+        return (
+            x.dtype in (torch.bfloat16, torch.float16)
+            and x.dim() == 2
+            and x.is_contiguous()
+            and x.shape[1] % self.quant_method.BLOCK_SIZE == 0
+            and x.shape[1] % self.quant_method.weight_alignment == 0
+            and x.data_ptr() % 16 == 0
+            and x.numel() <= self.FUSED_INPUT_QUANT_MAX_ELEMENTS
+        )
+
     def quantize_input(
         self, x: torch.Tensor, post_quant_comm: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -264,19 +308,28 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
 
         The fused FC12 kernel gathers the per-token scales row by row, so they
         are always produced in the linear layout, which is also what post-quant
-        communication transports.
+        communication transports. Without communication, a small enough input
+        is left raw: the op quantizes it in its workspace-reset launch, saving
+        the separate quantize launch.
 
         Args:
             x: ``[num_tokens, hidden_size]`` bfloat16 activations.
-            post_quant_comm: Ignored; both paths produce the same layout.
+            post_quant_comm: Whether the result is dispatched; E4M3 travels on
+                the wire, so it is always quantized here.
 
         Returns:
             ``(x, x_sf)``: e4m3 ``[num_tokens, hidden_size]`` and uint8
-            ``[num_tokens, hidden_size // 32]`` scales.
+            ``[num_tokens, hidden_size // 32]`` scales; or, when quantization is
+            deferred to the op, ``x`` unchanged and an uninitialized scale
+            tensor of that shape, which carries shape metadata only.
         """
-        del post_quant_comm
         x_row = x.shape[0]
         sf_vec_size = self.quant_method.BLOCK_SIZE
+        if not post_quant_comm and self._fuses_input_quant(x):
+            x_sf = torch.empty(
+                (x_row, x.shape[1] // sf_vec_size), dtype=torch.uint8, device=x.device
+            )
+            return x, x_sf
         x, x_sf = torch.ops.trtllm.mxfp8_quantize(
             x, False, alignment=self.quant_method.weight_alignment
         )
@@ -341,23 +394,69 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         if token_selected_experts.size(0) == 0:
             return moe_output
 
+        effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoEMxfp8Runner(
             forward_impl=self.run_moe_mxfp8_impl,
             num_experts=self.num_slots,
-            top_k=token_selected_experts.size(-1),
+            top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             enable_alltoall=enable_alltoall,
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output]
+        tuning_config = runner.get_tuning_config()
         _, best_tactic = tuner.choose_one(
-            "CuteDslFusedMoE::run_moe_mxfp8",
+            self._tuner_key(x.dtype),
             [runner],
-            runner.get_tuning_config(),
+            tuning_config,
             inputs,
         )
         return runner(inputs, tactic=best_tactic)
+
+    @staticmethod
+    def _tuner_key(dtype: torch.dtype) -> str:
+        """Separate quantize/reset timing from the prequantized op cache."""
+        key = "CuteDslFusedMoE::run_moe_mxfp8"
+        if dtype != torch.float8_e4m3fn:
+            key += f"::input_quant::{dtype}"
+        return key
+
+    def _memset_moe_output(
+        self,
+        moe_output: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        tile_size: int,
+        top_k: int,
+        enable_alltoall: bool,
+    ) -> None:
+        """Zero the rows this rank finalizes, on the aux stream when available."""
+        memset_kwargs = dict(
+            input=moe_output,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_tokens_dim=tile_size,
+            top_k=top_k,
+            ep_size=self.mapping.moe_ep_size,
+            enable_alltoall=enable_alltoall,
+        )
+        if self._has_moe_output_memset_aux_stream():
+            memset_stream = self._moe_output_memset_run_stream()
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(memset_stream)
+            with torch.cuda.stream(memset_stream):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
+                self.event_dict[EventType.MoeOutputMemset].record()
+            self.event_dict[EventType.MoeOutputMemset].wait()
+        else:
+            torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
 
     def run_moe_mxfp8_impl(
         self,
@@ -392,30 +491,27 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         )
 
         # The fused finalize scatter-adds into moe_output, so the rows this
-        # rank produces must be zero on entry. Overlap the sparse memset with
-        # the routing metadata on the aux stream when one is available.
-        memset_kwargs = dict(
-            input=moe_output,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            tile_tokens_dim=tile_size,
-            top_k=effective_top_k,
-            ep_size=self.mapping.moe_ep_size,
-            enable_alltoall=enable_alltoall,
-        )
-        if self._has_moe_output_memset_aux_stream():
-            memset_stream = self._moe_output_memset_run_stream()
-            self.event_dict[EventType.Main].record()
-            moe_output.record_stream(memset_stream)
-            with torch.cuda.stream(memset_stream):
-                self.event_dict[EventType.Main].wait()
-                torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
-                self.event_dict[EventType.MoeOutputMemset].record()
-            self.event_dict[EventType.MoeOutputMemset].wait()
-        else:
-            torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
+        # rank produces must be zero on entry. In the dense case (the same
+        # condition under which moe_output_memset_inplace falls back to a full
+        # cudaMemsetAsync) the fused op clears the whole output inside its
+        # workspace reset launch, saving the memset launch and its aux-stream
+        # event pair. Alltoall with ep > top_k keeps the sparse row memset,
+        # overlapped with the routing metadata on the aux stream, and so does
+        # an output past the reset kernel's Int32 element count.
+        zero_output_in_kernel = (
+            not enable_alltoall or self.mapping.moe_ep_size <= effective_top_k
+        ) and moe_output.numel() <= self._ZERO_OUTPUT_MAX_ELEMENTS
+        if not zero_output_in_kernel:
+            self._memset_moe_output(
+                moe_output,
+                tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                tile_size,
+                effective_top_k,
+                enable_alltoall,
+            )
 
         fc_alpha, fc1_norm_const = self._fused_fc12_constants(x.device)
         # The block scales are stored int32-packed (4 UE8M0 per int32 along
@@ -442,5 +538,6 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             swiglu_limit=self.act_clamp,
+            zero_output=zero_output_in_kernel,
         )
         return moe_output

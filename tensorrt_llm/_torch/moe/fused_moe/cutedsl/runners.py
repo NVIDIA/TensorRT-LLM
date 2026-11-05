@@ -528,6 +528,7 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         local_expert_offset: int,
         enable_alltoall: bool = False,
         output_dtype: torch.dtype = torch.bfloat16,
+        tune_max_num_tokens: int | None = None,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -538,6 +539,7 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
+        self.tune_max_num_tokens = tune_max_num_tokens
 
     def unique_id(self) -> tuple:
         return (
@@ -547,6 +549,7 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             self.local_expert_offset,
             self.enable_alltoall,
             self.output_dtype,
+            self.tune_max_num_tokens,
         )
 
     def get_valid_tactics(
@@ -571,12 +574,18 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             )
             # MXFP8 inputs: [x, token_selected_experts, token_final_scales,
             #                x_sf, moe_output]
+            # ``tune_max_num_tokens`` anchors the power-of-two token buckets to
+            # the module's saturation token count instead of the warmup
+            # forward's token count, so the decode buckets (a few tokens per
+            # DP rank) are always profiled; the nested fused-kernel tuning runs
+            # for each of them.
             self.__class__.tuning_config_cache[key] = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
                     ),
                 ),
+                tune_max_num_tokens=self.tune_max_num_tokens,
                 constraint_specs=(
                     ConstraintSpec(1, 0, helper.infer_shape_num_tokens),
                     ConstraintSpec(2, 0, helper.infer_shape_num_tokens),

@@ -84,6 +84,8 @@ def _dense_gemm_scheduler_modes(default: Tuple[str, ...]) -> Tuple[str, ...]:
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUDA_MAX_GRID_DIM_Z = 65_535
+# Largest extent a kernel taking an Int32 element count can address.
+_INT32_MAX = 2**31 - 1
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
 
@@ -18415,6 +18417,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Gated separately from IS_CUTLASS_DSL_RUBIN_AVAILABLE: the vendored
         # kernel needs a newer internal DSL build (see cute_dsl_utils.py).
         if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE:
+            from ..moe.kernels.rubin.fused_fc12_mxfp8_workspace import \
+                reset_fc12_sync_workspace
             from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
                 Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel as \
                 Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
@@ -18500,20 +18504,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
                   MMA tile M (no B-reuse in the fused kernel).
 
                 Tactic: ``(mma_tiler, mma_inst_shape, cluster_shape_mn,
-                scheduler)`` with ``mma_tiler_m == mma_inst_m == tile_size``,
-                ``mma_n in {128, 256}``, ``mma_tiler_k in {128, 256}``
-                (``UMMA_K = 64`` for FP8), ``cluster_shape_mn == (cta_group, 1)``
-                and ``scheduler in {"l2_atomic", "static"}``.
+                scheduler, stream_weights, fc2_stream_weights)`` with
+                ``mma_tiler_m == mma_inst_m == tile_size``, ``mma_n in {128,
+                256}``, ``mma_tiler_k in {128, 256}`` (``UMMA_K = 64`` for
+                FP8), ``cluster_shape_mn == (cta_group, 1)``, ``scheduler in
+                {"l2_atomic", "static"}``, ``stream_weights`` selecting L2
+                evict-first weight loads and ``fc2_stream_weights`` the same
+                policy for the FC2 weight loads alone. Shorter tactics from
+                caches normalize: four elements mean ``stream_weights=False``,
+                five mean the FC2 loads follow ``stream_weights``. The tactic
+                space ties the FC2 policy to ``stream_weights``.
                 """
                 kernel_class = Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
                 kernel_cache = dict()
                 tuning_config_cache = dict()
+                # (use_pdl, zero_output, input dtype) -> compiled reset
+                reset_kernel_cache = dict()
                 sf_vec_size = MXFP8_FUSED_FC12_SF_VEC_SIZE
                 # FP8 UMMA_K is 64; the CTA K tile may be one or two 128-byte atoms.
                 mma_inst_k = 64
                 mma_tiler_k_candidates = (128, 256)
                 mma_n_candidates = (128, 256)
                 scheduler_candidates = ("l2_atomic", "static")
+                # L2 evict-first weight loads pay off once most M tiles read
+                # their expert's weights exactly once (decode with many active
+                # experts per rank) and lose when weights are reused across M
+                # tiles, so the autotuner picks it per token bucket.
+                stream_weights_candidates = (False, True)
                 # The FC1 SFA gather fetches 16-byte chunks of scales per row.
                 fc1_k_alignment = 16 * MXFP8_FUSED_FC12_SF_VEC_SIZE
 
@@ -18523,13 +18540,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              num_local_experts: int,
                              local_expert_offset: int,
                              tile_size: int,
-                             swiglu_limit: float = float("inf")):
+                             swiglu_limit: float = float("inf"),
+                             zero_output: bool = False):
                     super().__init__()
                     self.num_experts = num_experts
                     self.top_k = top_k
                     self.num_local_experts = num_local_experts
                     self.local_expert_offset = local_expert_offset
                     self.tile_size = tile_size
+                    # Clear the whole output inside the workspace reset launch
+                    # instead of a separate memset (dense case only; the caller
+                    # keeps its sparse row memset for alltoall with ep > top_k).
+                    self.zero_output = zero_output
                     # The kernel treats a negative limit as "no clamp".
                     swiglu_limit = float(swiglu_limit)
                     self.swiglu_limit = swiglu_limit if swiglu_limit >= 0 else float(
@@ -18554,11 +18576,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.local_expert_offset,
                         self.tile_size,
                         self.swiglu_limit,
+                        self.zero_output,
                     )
 
                 @property
                 def cta_group(self) -> int:
                     return self.tile_size // 128
+
+                def _use_sparse_gather(self, num_rows: int,
+                                       padded_routes: int) -> bool:
+                    """Pick the dynamic-trip-count FC1 A gather from static shapes.
+
+                    Decode tiles carry a few valid rows per 128-row tile and win
+                    from skipping the wholly padded 16-row groups; full tiles
+                    keep the statically unrolled gather. The DKG rule compares
+                    twice the valid local routes with the padded route count.
+                    The valid count is not known statically, so estimate it as
+                    ``num_rows * top_k`` scaled by this rank's share of the
+                    experts (routes land on local experts in proportion), and
+                    never below ``num_rows`` (with alltoall every arriving row
+                    has at least one local route). Overestimating keeps the
+                    original gather, so the estimate errs that way.
+                    """
+                    local_routes = -(-num_rows * self.top_k *
+                                     self.num_local_experts // self.num_experts)
+                    local_routes = max(num_rows, local_routes)
+                    return local_routes * 2 < padded_routes
 
                 def _default_tactic(self) -> Tuple:
                     return (
@@ -18566,28 +18609,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         (self.tile_size, 128, self.mma_inst_k),
                         (self.cta_group, 1),
                         "l2_atomic",
+                        False,
+                        False,
                     )
 
                 @staticmethod
                 def _normalize_tactic(tactic: Tuple) -> Tuple:
-                    mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = tactic
+                    # Shorter tactics come from caches or precomputed strings
+                    # predating a policy element: four elements keep the
+                    # default policy, five let the FC2 loads follow
+                    # ``stream_weights``.
+                    (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+                     *rest) = tactic
+                    stream_weights = bool(rest[0]) if rest else False
+                    fc2_stream_weights = (bool(rest[1])
+                                          if len(rest) > 1 else stream_weights)
                     return (tuple(int(v) for v in mma_tiler),
                             tuple(int(v) for v in mma_inst_shape),
-                            tuple(int(v)
-                                  for v in cluster_shape_mn), str(scheduler))
+                            tuple(int(v) for v in cluster_shape_mn),
+                            str(scheduler), stream_weights, fc2_stream_weights)
 
-                def _is_tactic_feasible(
-                        self,
-                        mma_tiler: Tuple[int, int, int],
-                        mma_inst_shape: Tuple[int, int, int],
-                        cluster_shape_mn: Tuple[int, int],
-                        scheduler: str,
-                        m: int,
-                        fc1_n: int,
-                        k: int,
-                        l: int,  # noqa: E741
-                        fc2_n: int,
-                        fc2_k: int) -> bool:
+                def _is_tactic_feasible(self, mma_tiler: Tuple[int, int, int],
+                                        mma_inst_shape: Tuple[int, int, int],
+                                        cluster_shape_mn: Tuple[int, int],
+                                        scheduler: str, m: int, fc1_n: int,
+                                        k: int, num_groups: int, fc2_n: int,
+                                        fc2_k: int) -> bool:
                     if not self.__class__.kernel_class.can_implement(
                             a_dtype=cutlass.Float8E4M3FN,
                             b_dtype=cutlass.Float8E4M3FN,
@@ -18598,8 +18645,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             mma_inst_shape=mma_inst_shape,
                             mma_tiler=mma_tiler,
                             cluster_shape_mn=cluster_shape_mn,
-                            fc1_gemm_shape=(m, fc1_n, k, l),
-                            fc2_gemm_shape=(m, fc2_n, fc2_k, l),
+                            fc1_gemm_shape=(m, fc1_n, k, num_groups),
+                            fc2_gemm_shape=(m, fc2_n, fc2_k, num_groups),
                             a_major="k",
                             b_major="k",
                             fc1_c_major="n",
@@ -18645,9 +18692,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_m = self.tile_size
                     cluster_shape_mn = (self.cta_group, 1)
                     valid_tactics = []
-                    for mma_n, mma_tiler_k, scheduler in itertools.product(
-                            self.mma_n_candidates, self.mma_tiler_k_candidates,
-                            self.scheduler_candidates):
+                    for (mma_n, mma_tiler_k, scheduler,
+                         stream_weights) in itertools.product(
+                             self.mma_n_candidates, self.mma_tiler_k_candidates,
+                             self.scheduler_candidates,
+                             self.stream_weights_candidates):
                         # The fused N tile must divide both the FC1 (2*I) and the
                         # FC2 (hidden) output N; the K tile both GEMM K extents.
                         if fc1_n % mma_n != 0 or fc2_n % mma_n != 0:
@@ -18656,12 +18705,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             continue
                         mma_tiler = (mma_m, mma_n, mma_tiler_k)
                         mma_inst_shape = (mma_m, mma_n, self.mma_inst_k)
-                        if self._is_tactic_feasible(mma_tiler, mma_inst_shape,
-                                                    cluster_shape_mn, scheduler,
-                                                    m, fc1_n, k, l, fc2_n,
-                                                    fc2_k):
-                            valid_tactics.append((mma_tiler, mma_inst_shape,
-                                                  cluster_shape_mn, scheduler))
+                        if not self._is_tactic_feasible(
+                                mma_tiler, mma_inst_shape, cluster_shape_mn,
+                                scheduler, m, fc1_n, k, l, fc2_n, fc2_k):
+                            continue
+                        valid_tactics.append(
+                            (mma_tiler, mma_inst_shape, cluster_shape_mn,
+                             scheduler, stream_weights, stream_weights))
 
                     logger.debug(
                         f"CuteDSL Rubin MXFP8 FusedFC12: Found {len(valid_tactics)} "
@@ -18707,8 +18757,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      fc1_norm_const, fc2_b, fc2_sfb, fc2_alpha, output,
                      token_final_scales) = inputs
 
-                    assert fc1_a.dtype == torch.float8_e4m3fn and fc1_a.dim(
-                    ) == 2
+                    assert fc1_a.dtype in (torch.float8_e4m3fn, torch.bfloat16,
+                                           torch.float16) and fc1_a.dim() == 2
+                    input_unquantized = (fc1_a if fc1_a.dtype
+                                         != torch.float8_e4m3fn else None)
+                    if input_unquantized is not None:
+                        assert fc1_a.is_contiguous(
+                        ) and fc1_a.data_ptr() % 16 == 0
                     assert fc1_b.dtype == torch.float8_e4m3fn and fc1_b.dim(
                     ) == 3
                     assert fc2_b.dtype == torch.float8_e4m3fn and fc2_b.dim(
@@ -18724,6 +18779,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     assert fc1_norm_const.numel() == 1
                     assert output.dtype == torch.bfloat16 and output.dim() == 2
                     assert token_final_scales.dtype == torch.float32
+                    # The reset kernel indexes the output with Int32 and reads
+                    # its extent only with zero_output.
+                    reset_output_numel = 0
+                    if self.zero_output:
+                        # 128-bit vector stores in the workspace reset.
+                        assert output.is_contiguous() and output.numel() % 8 == 0 \
+                            and output.data_ptr() % 16 == 0, (
+                                "zero_output needs a contiguous, 16-byte aligned "
+                                "BF16 output with a multiple of 8 elements")
+                        if output.numel() > _INT32_MAX:
+                            raise ValueError(
+                                "zero_output clears at most "
+                                f"{_INT32_MAX} output elements, got "
+                                f"{output.numel()}; clear the output before "
+                                "the call instead")
+                        reset_output_numel = output.numel()
 
                     sf_vec = self.sf_vec_size
                     orig_m, k = fc1_a.size(0), fc1_a.size(1)
@@ -18762,15 +18833,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     assert output.size(1) == fc2_n
                     assert token_final_scales.size() == (num_tokens, self.top_k)
 
-                    if isinstance(tactic, (tuple, list)) and len(tactic) == 4:
-                        mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = \
-                            self._normalize_tactic(tactic)
+                    if isinstance(tactic,
+                                  (tuple, list)) and len(tactic) in (4, 5, 6):
+                        (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+                         stream_weights,
+                         fc2_stream_weights) = self._normalize_tactic(tactic)
                     else:
-                        mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = \
-                            self._default_tactic()
+                        (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+                         stream_weights,
+                         fc2_stream_weights) = self._default_tactic()
                     assert mma_tiler[0] == self.tile_size, (
                         f"Tactic ({tactic}) is incompatible with tile size "
                         f"({self.tile_size})")
+
+                    # Raw input is quantized by the existing workspace-reset
+                    # launch. Own both outputs here: custom-op inputs remain
+                    # read-only, including the scale-shape placeholder. Like
+                    # the workspace below, the scratch is allocated per call:
+                    # the caching allocator is stream-ordered, so concurrent
+                    # calls on different streams (chunk overlap) never share
+                    # it, and nothing is retained per row count.
+                    if input_unquantized is not None:
+                        if input_unquantized.numel() > _INT32_MAX:
+                            raise ValueError(
+                                "MXFP8 fused FC12 input quantization takes at most "
+                                f"{_INT32_MAX} elements, got "
+                                f"{input_unquantized.numel()}")
+                        fc1_a = torch.empty(input_unquantized.shape,
+                                            dtype=torch.float8_e4m3fn,
+                                            device=input_unquantized.device)
+                        fc1_sfa = torch.empty(fc1_sfa.shape,
+                                              dtype=fc1_sfa.dtype,
+                                              device=input_unquantized.device)
 
                     # FC1 intermediate (FC2 A operand) and its swizzled block
                     # scales: written and re-read by the kernel, so plain scratch.
@@ -18781,18 +18875,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     fc1_sfc = torch.empty(m * interm_size // sf_vec,
                                           dtype=fc1_sfa.dtype,
                                           device=fc1_sfa.device)
-                    # Per-launch zeroed workspaces: FC1->FC2 readiness counters
+                    # Per-launch zeroed workspace: FC1->FC2 readiness counters
                     # (one per 128-row M tile is an upper bound for every tile
-                    # geometry) and the two L2-atomic work-ID counters.
-                    fc1_ready = torch.zeros(m // 128,
+                    # geometry) and the two L2-atomic work-ID counters on their
+                    # own 128 B lines. One uninitialized allocation per call,
+                    # cleared by the reset launch below (no fill kernels). The
+                    # caching allocator is stream-ordered, so calls in flight
+                    # on different streams (chunk overlap) get distinct
+                    # buffers, and CUDA graphs capture fixed addresses from
+                    # their private pool.
+                    num_ready = m // 128
+                    ready_words = (num_ready + 31) // 32 * 32
+                    workspace = torch.empty(ready_words + 64,
                                             dtype=torch.int32,
                                             device=fc1_a.device)
-                    fc1_scheduler_counter = torch.zeros(1,
-                                                        dtype=torch.int32,
-                                                        device=fc1_a.device)
-                    fc2_scheduler_counter = torch.zeros(1,
-                                                        dtype=torch.int32,
-                                                        device=fc1_a.device)
+                    fc1_ready = workspace[:num_ready]
+                    fc1_scheduler_counter = workspace[ready_words:ready_words +
+                                                      1]
+                    fc2_scheduler_counter = workspace[ready_words +
+                                                      32:ready_words + 33]
 
                     def _e4m3_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Float8E4M3FN,
@@ -18844,9 +18945,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters = get_max_activate_clusters(
                         cluster_shape_mn[0] * cluster_shape_mn[1])
 
+                    # Static-shape choice (see _use_sparse_gather), so it is
+                    # fixed per CUDA-graph bucket.
+                    sparse_gather = self._use_sparse_gather(orig_m, m)
+
                     cache_key = (self.tile_size, self.top_k, mma_tiler,
                                  mma_inst_shape, cluster_shape_mn, scheduler,
-                                 self.swiglu_limit, max_active_clusters)
+                                 self.swiglu_limit, max_active_clusters,
+                                 sparse_gather, stream_weights,
+                                 fc2_stream_weights)
                     if cache_key not in self.__class__.kernel_cache:
                         gemm = self.__class__.kernel_class(
                             self.sf_vec_size,
@@ -18858,6 +18965,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             use_pdl=TRTLLM_ENABLE_PDL,
                             swiglu_limit=self.swiglu_limit,
                             scheduler=scheduler,
+                            sparse_gather=sparse_gather,
+                            stream_weights=stream_weights,
+                            fc2_stream_weights=fc2_stream_weights,
                         )
                         sf_vec_cx = self.sf_vec_size
                         tile_size_cx = self.tile_size
@@ -19044,6 +19154,59 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     else:
                         compiled_gemm = self.__class__.kernel_cache[cache_key]
 
+                    # Clear the readiness flags and work-ID counters (and, with
+                    # zero_output, the output itself) with one launch. PDL lets
+                    # it overlap the previous kernel's tail and the fused GEMM's
+                    # prologue; the GEMM's griddepcontrol_wait precedes its
+                    # first workspace access. Cluster launches keep the plain
+                    # ordering.
+                    use_reset_pdl = TRTLLM_ENABLE_PDL and (
+                        cluster_shape_mn[0] * cluster_shape_mn[1] == 1)
+                    quant_args = {}
+                    input_dtype = None
+                    if input_unquantized is not None:
+                        input_dtype = input_unquantized.dtype
+                        raw_dtype = (cutlass.BFloat16 if input_dtype
+                                     == torch.bfloat16 else cutlass.Float16)
+                        quant_args = dict(input_raw_ptr=make_ptr(
+                            raw_dtype,
+                            input_unquantized.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16),
+                                          input_quant_ptr=fc1_a_ptr,
+                                          input_scale_ptr=fc1_sfa_ptr,
+                                          input_numel=cutlass.Int32(
+                                              input_unquantized.numel()))
+                    reset_key = (use_reset_pdl, self.zero_output, input_dtype)
+                    compiled_reset = self.__class__.reset_kernel_cache.get(
+                        reset_key)
+                    if compiled_reset is None:
+                        compiled_reset = cute.compile(
+                            reset_fc12_sync_workspace,
+                            fc1_ready_ptr,
+                            cutlass.Int32(m // 128),
+                            fc1_scheduler_counter_ptr,
+                            fc2_scheduler_counter_ptr,
+                            output_ptr,
+                            cutlass.Int32(reset_output_numel),
+                            stream,
+                            use_reset_pdl,
+                            self.zero_output,
+                            **quant_args,
+                        )
+                        self.__class__.reset_kernel_cache[
+                            reset_key] = compiled_reset
+                    compiled_reset(
+                        fc1_ready_ptr,
+                        cutlass.Int32(m // 128),
+                        fc1_scheduler_counter_ptr,
+                        fc2_scheduler_counter_ptr,
+                        output_ptr,
+                        cutlass.Int32(reset_output_numel),
+                        stream,
+                        **quant_args,
+                    )
+
                     compiled_gemm(
                         fc1_a_ptr,
                         fc1_b_ptr,
@@ -19101,6 +19264,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swiglu_limit: float,
                 precomputed_tactic: Optional[str],
                 tuner_key: str,
+                zero_output: bool = False,
             ) -> None:
                 tuner = AutoTuner.get()
                 runner = Sm107Mxfp8FusedFc12MoeRunner(
@@ -19110,6 +19274,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     local_expert_offset,
                     tile_size,
                     swiglu_limit=swiglu_limit,
+                    zero_output=zero_output,
                 )
                 # Input order matches Sm107Mxfp8FusedFc12InputsHelper.
                 inputs = [
@@ -19119,6 +19284,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     fc1_norm_const, fc2_weight, fc2_weight_scale, fc2_alpha,
                     output, token_final_scales
                 ]
+                if input.dtype != torch.float8_e4m3fn:
+                    tuner_key += f"::input_quant::{input.dtype}"
                 if precomputed_tactic is None:
                     _, best_tactic = tuner.choose_one(
                         tuner_key,
@@ -19142,7 +19309,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
                 "SymInt local_expert_offset, SymInt tile_size, "
                 f"float swiglu_limit={SWIGLU_LIMIT_SCALAR_DISABLED}, "
-                "str? precomputed_tactic=None) -> ()",
+                "str? precomputed_tactic=None, bool zero_output=False) -> ()",
                 device_types="cuda")
             def cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
                 input: torch.Tensor,
@@ -19167,13 +19334,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size: int,
                 swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
                 precomputed_tactic: Optional[str] = None,
+                zero_output: bool = False,
             ) -> None:
                 """MXFP8 fused FC1+FC2 MoE on Rubin, scatter-adding into ``output``.
 
                 ``output`` must already be zero for the rows this rank produces
                 (see ``moe_output_memset_inplace``): the fused finalize
-                accumulates ``token_final_scales * fc2`` into it. A negative
-                ``swiglu_limit`` disables the SwiGLU clamp.
+                accumulates ``token_final_scales * fc2`` into it. With
+                ``zero_output`` the op clears the whole ``output`` itself, inside
+                its workspace reset launch, so the caller can skip the dense
+                memset. BF16/FP16 input fuses MXFP8 input quantization into
+                that reset launch; ``input_scale`` then supplies only the
+                expected [orig_m, K/32] shape and is never read or modified.
+                E4M3 input requires populated linear UE8M0 scales as before.
+                A negative ``swiglu_limit`` disables the SwiGLU clamp.
                 """
                 _run_mxfp8_fused_fc12_moe_rubin(
                     input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,
@@ -19183,7 +19357,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     output, token_final_scales, num_experts, top_k,
                     num_local_experts, local_expert_offset, tile_size,
                     swiglu_limit, precomputed_tactic,
-                    "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin")
+                    "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
+                    zero_output)
 
             @torch.library.register_fake(
                 "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin")
@@ -19210,6 +19385,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size: int,
                 swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
                 precomputed_tactic: Optional[str] = None,
+                zero_output: bool = False,
             ) -> None:
                 return None
 

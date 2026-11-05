@@ -547,7 +547,11 @@ finalize (scatter-add) into one persistent kernel, driven through
 
 - Activations: e4m3 `[tokens, hidden]` plus **linear** UE8M0 scales
   `[tokens, hidden/32]` (`mxfp8_quantize(..., swizzled=False)`); the gather
-  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`.
+  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`. Without
+  communication, raw BF16/FP16 inputs up to 16M elements are passed through
+  unquantized and quantized inside the op's workspace-reset launch
+  (`fused_fc12_mxfp8_workspace.py` / `mxfp8_input_quant.py`, bit-compatible
+  with `mxfp8_quantize`), saving the separate quantize launch.
 - Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
   swizzled layout produced by `block_scale_interleave` (int32-packed storage,
   viewed as bytes). FC1 weight and scales are gate/up interleaved at
@@ -556,14 +560,26 @@ finalize (scatter-add) into one persistent kernel, driven through
   projection of a finalized slot).
 - Per-expert `fc1_alpha` / `fc2_alpha` and the FC1 `norm_const` are 1.0 for
   MXFP8 (all scaling lives in the block scales).
-- The output is accumulated into, so `moe_output_memset_inplace` must run
-  first; the per-launch readiness/scheduler counters are zero-initialized
-  inside the op runner.
-- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler)` with
+- The output is accumulated into, so it must be zero on entry. In the dense
+  case (no all-to-all, or `ep_size <= top_k`) the op clears it inside its
+  workspace-reset launch (`zero_output`), up to the reset kernel's Int32
+  element count; otherwise the backend runs the sparse
+  `moe_output_memset_inplace` first. The readiness/scheduler counters and the
+  fused input-quantization scratch are allocated per call (uninitialized; the
+  same launch clears the counters): the caching allocator is stream-ordered,
+  so calls in flight on different streams, such as overlapped chunks, never
+  share them.
+- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+  stream_weights, fc2_stream_weights)` with
   `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
-  `l2_atomic` / `static`. The outer `CuteDslFusedMoEMxfp8Runner` tunes the
-  routing tile and the comb checker pins the inner `mma_tiler_m` to it.
+  `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
+  (`stream_weights`); `fc2_stream_weights` sets the FC2 loads alone and the
+  tactic space ties it to `stream_weights`. Shorter tactics from older
+  caches normalize.
+  The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile, anchored to
+  the module's saturation token count so decode buckets are always profiled,
+  and the comb checker pins the inner `mma_tiler_m` to it.
 - **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
   than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
   `IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE` (true when `cutlass.memory` and
@@ -617,6 +633,7 @@ non-MoE consumers), the MoE files inside mixed directories (`marlin/`,
 | `test_moe_module.py` | ConfigurableMoE integration tests (Backend × Comm × EPLB) | Active |
 | `test_mxfp8_moe_partial_refit.py` | MXFP8 bucketed-refit contract (swizzle / gate-up interleave applied exactly once) for the Cutlass and CuteDSL methods | Active |
 | `kernels/parallel/test_cute_dsl_moe.py` | CuteDSL MoE op-level tests, including the MXFP8 fused FC12 op against an fp32 reference | Active |
+| `kernels/parallel/test_mxfp8_input_quant.py` | The MXFP8 fused FC12 workspace reset: in-launch input quantization against `mxfp8_quantize`, output zeroing, CUDA-graph replay ordering | Active |
 | `test_fused_moe.py` | Legacy MoE tests | Being replaced, do NOT add new tests here |
 | `test_moe.py` | Legacy TRTLLM backend tests | Being replaced, do NOT add new tests here |
 
