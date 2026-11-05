@@ -254,7 +254,7 @@ class TestClassicFrontendProxyEndToEnd:
         from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, _, _ = self._make_proxy_and_fake_worker(tmpdir)
+            proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmpdir)
 
             # Regression: this state lives in GenerationExecutorProxy.__init__,
             # which an attached frontend deliberately skips, so it must be
@@ -267,6 +267,11 @@ class TestClassicFrontendProxyEndToEnd:
             assert not proxy.check_health()
             with pytest.raises(EngineDeadError):
                 proxy.submit(GenerationRequest([1], SamplingParams()))
+            proxy.shutdown()
+            assert not worker_ingress.poll(1), (
+                "an attached frontend failure must never stop shared workers"
+            )
+            worker_ingress.close()
 
     def test_dispatch_routes_own_lane_responses(self):
         import zmq

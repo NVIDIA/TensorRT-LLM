@@ -57,6 +57,7 @@ class _RequestSender:
         batching: bool = True,
         on_failure: weakref.WeakMethod | None = None,
         recovery_timeout: float = RECOVERY_TIMEOUT,
+        stop_workers_on_failure: bool = False,
     ) -> None:
         self._request_queue = request_queue
         self._error_queue = error_queue
@@ -67,6 +68,7 @@ class _RequestSender:
         self._pending_requests = 0
         self._pending_controls = 0
         self._pending_cancel_ids: set[int] = set()
+        self._stop_workers_on_failure = stop_workers_on_failure
         self._enqueued_count = 0
         self._sent_count = 0
         self._cond = threading.Condition()
@@ -146,9 +148,12 @@ class _RequestSender:
         with self._cond:
             if self._terminal_error is None:
                 self._terminal_error = error
+            self._send_sentinel |= self._stop_workers_on_failure
             self._pending.clear()
             self._pending_cancel_ids.clear()
             self._pending_controls = self._pending_requests = 0
+            if not self._is_finalizing():
+                self._start()
             self._cond.notify_all()
 
     def set_control_deadline(self, deadline: float) -> None:
@@ -283,10 +288,6 @@ class _RequestSender:
                     self._confirm_recovery(deadline)
         except Exception as error:
             self._record_failure(error)
-            # A failure consumer may request an orderly stop of surviving
-            # workers. Keep that final request on the socket owner as well.
-            with self._cond:
-                self._cond.wait_for(lambda: self._closed, timeout=1.0)
         finally:
             with self._cond:
                 self._stopping = True
