@@ -676,8 +676,8 @@ def test_every_continuous_chat_usage_caps_the_cached_tokens(serve):
     assert response.status_code == 200, response.text
     usages = [chunk["usage"] for chunk in _sse_data(response.text) if chunk.get("usage")]
     prompt_tokens = len(prompts[0]) - 3
-    # The role chunk, the content chunk and the final usage chunk.
-    assert len(usages) == 3
+    # The role chunk, the content chunk, the finish chunk and the final usage chunk.
+    assert len(usages) == 4
     for usage in usages:
         assert usage["prompt_tokens"] == prompt_tokens
         assert usage["prompt_tokens_details"]["cached_tokens"] == prompt_tokens

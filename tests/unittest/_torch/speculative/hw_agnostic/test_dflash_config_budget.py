@@ -465,7 +465,15 @@ class TestLlmArgsWiring:
         from tensorrt_llm.llmapi.llm_args import CpConfig
 
         monkeypatch.delenv(SKIP_EST_ENV, raising=False)
-        args = self._args(tmp_path, max_batch_size=8, cp_config=CpConfig())
+        # A cp_config counts as context parallelism only with more than
+        # one CP rank; with one rank the Mapping drops it and estimation
+        # runs as without a cp_config.
+        args = self._args(
+            tmp_path,
+            max_batch_size=8,
+            context_parallel_size=2,
+            cp_config=CpConfig(cp_type="HELIX"),
+        )
         assert args._kv_cache_estimation_runs() is False
 
     def test_oversized_batch_rejected_through_llm_args(self, tmp_path):
