@@ -29,6 +29,9 @@ namespace
 {
 
 constexpr size_t kAlignment = 256;
+// Sparse MLA FMHA may read one KV tile past the last indexed row. A token-sparse
+// selection unit is one stored KV row, independent of the number of units per cell.
+constexpr size_t kTailUnits = 128;
 
 size_t alignedBytes(size_t bytes) noexcept
 {
@@ -71,6 +74,9 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         "SparseCellArena requires one pool slot per buffer");
     TLLM_CHECK_WITH_INFO(shape.layerSelection.size() == static_cast<size_t>(shape.numLayers),
         "SparseCellArena requires one selection index per layer");
+    TLLM_CHECK_WITH_INFO(shape.entriesPerSelection % shape.cellsPerBuffer == 0,
+        "SparseCellArena: cells must contain a whole number of selection units");
+    auto const unitsPerCell = static_cast<uint64_t>(shape.entriesPerSelection / shape.cellsPerBuffer);
     for (size_t i = 0; i < shape.bufferLayer.size(); ++i)
     {
         TLLM_CHECK_WITH_INFO(shape.bufferLayer[i] >= 0 && shape.bufferLayer[i] < shape.numLayers,
@@ -91,19 +97,28 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         TLLM_CHECK_WITH_INFO((cellBytes == 0) == (buffers == 0),
             "SparseCellArena: a pool needs both a cell size and buffers drawing on it, or neither");
         TLLM_CHECK_WITH_INFO(buffers >= 0, "SparseCellArena: a pool cannot have a negative buffer count");
+        TLLM_CHECK_WITH_INFO(
+            cellBytes % unitsPerCell == 0, "SparseCellArena: a selection unit must contain a whole number of bytes");
     }
 
     mMaxLeases = maxLeases;
     mMetadataBytes = leaseBytes(mShape);
 
-    // One region per pool, each aligned so that a buffer's cell indices stay relative to its own
-    // pool's base.
+    // Each pool's usable cells are followed by a zeroed KV tile outside the lease geometry,
+    // so an attention over-read cannot reach the next pool or the arena's metadata.
     std::vector<size_t> regionOffset;
+    std::vector<std::pair<size_t, size_t>> tailRegions;
     size_t cellBytes = 0;
     for (auto const& [bytes, buffers] : mShape.pools)
     {
         regionOffset.push_back(cellBytes);
-        cellBytes += alignedBytes(static_cast<size_t>(maxLeases) * buffers * mShape.cellsPerBuffer * bytes);
+        auto const payloadBytes = static_cast<size_t>(maxLeases) * buffers * mShape.cellsPerBuffer * bytes;
+        auto const tailBytes = kTailUnits * (bytes / unitsPerCell);
+        if (tailBytes > 0)
+        {
+            tailRegions.emplace_back(cellBytes + payloadBytes, tailBytes);
+        }
+        cellBytes += alignedBytes(payloadBytes + tailBytes);
     }
 
     size_t const layerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
@@ -117,6 +132,10 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     cuCheck(cuMemAlloc(&base, mNumBytes));
     mMemory = CudaUniqPtr<>{reinterpret_cast<std::byte*>(base)};
 
+    for (auto const& [offset, bytes] : tailRegions)
+    {
+        cuCheck(cuMemsetD8Async(base + offset, 0, bytes, stream));
+    }
     for (auto offset : regionOffset)
     {
         mPoolBase.push_back(base + offset);

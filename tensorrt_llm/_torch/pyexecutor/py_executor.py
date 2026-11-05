@@ -81,6 +81,7 @@ from ..speculative.spec_sampler_base import SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
 from ..speculative.utils import get_static_draft_len, update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
+from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
@@ -768,6 +769,8 @@ class PyExecutor:
         self.runtime_draft_len = (get_static_draft_len(model_engine.spec_config)
                                   if model_engine.is_spec_decode else 0)
         self.llm_args = self.model_engine.llm_args
+        self._decode_only = is_decode_only(
+            self.llm_args.sparse_attention_config)
         self._kv_connector_config = self.llm_args.kv_connector_config
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
@@ -7166,7 +7169,11 @@ class PyExecutor:
         request.py_csa2_remote_tail_start = remote_tail_start
         request.py_csa2_remote_tail_split = split
 
-    def _validate_request(self, request: LlmRequest):
+    def _validate_request(self, request: LlmRequest) -> None:
+        if self._decode_only and not request.is_generation_only_request:
+            raise ValueError(
+                "Sparse KV offload supports generation-only requests; "
+                "route prefill to a context worker.")
         self._configure_csa2_remote_tail(request)
         retention = request.kv_cache_retention_config
         if self._is_kv_manager_v2 and retention is not None:

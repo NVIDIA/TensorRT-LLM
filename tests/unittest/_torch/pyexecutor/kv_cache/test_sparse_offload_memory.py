@@ -22,6 +22,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     SparseBatchShape,
     life_cycle_pages,
     plan_host_history_bytes,
+    request_page_bytes,
     solve_sparse_offload_capacity,
     sparse_arena_bytes,
     sparse_arena_shapes,
@@ -31,9 +32,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     sparse_history_bytes_per_block,
     sparse_history_floor_bytes,
     sparse_units_per_page,
+    validate_sparse_max_seq_len,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     CacheTier,
@@ -159,6 +162,54 @@ def test_units_per_page(unit_tokens: int | None, units_per_page: int) -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("unit_tokens", [1, 4, 128])
+@pytest.mark.parametrize("window", [None, 128])
+def test_sparse_max_seq_len_includes_the_in_flight_ordinal(
+    unit_tokens: int, window: int | None
+) -> None:
+    layer = _layer(
+        7,
+        ("data", 128 * 576, True),
+        window=window,
+        sparse_cache=SparseCacheConfig(
+            num_selected_blocks=2, max_cached_units=128, unit_tokens=unit_tokens
+        ),
+    )
+    assert layer.sparse_cache.max_unit_ordinal == 262_142
+    last_supported_length = 262_143 * unit_tokens - 1
+    # Partial units use floor division, and a window does not rebase ordinals.
+    for length in (262_142 * unit_tokens, last_supported_length):
+        validate_sparse_max_seq_len([layer], max_seq_len=length)
+    for length in (last_supported_length + 1, 262_144 * unit_tokens):
+        with pytest.raises(ValueError, match=f"layer 7 with unit_tokens={unit_tokens}") as exc:
+            validate_sparse_max_seq_len([layer], max_seq_len=length)
+        assert f"max_seq_len={length}" in str(exc.value)
+        assert f"Set max_seq_len <= {last_supported_length}" in str(exc.value)
+
+
+@pytest.mark.cpu_only
+def test_sparse_max_seq_len_checks_each_layers_unit_size() -> None:
+    compressed = _sparse_layer(0)
+    token_sparse = _sparse_layer(1)
+    token_sparse.sparse_cache = SparseCacheConfig(
+        num_selected_blocks=2, max_cached_units=128, unit_tokens=1
+    )
+
+    validate_sparse_max_seq_len([compressed], max_seq_len=1_000_000)
+    with pytest.raises(ValueError, match="layer 1 with unit_tokens=1"):
+        validate_sparse_max_seq_len([compressed, token_sparse], max_seq_len=1_000_000)
+
+
+@pytest.mark.cpu_only
+def test_sparse_max_seq_len_ignores_layers_without_a_fetch_path() -> None:
+    validate_sparse_max_seq_len([], max_seq_len=1 << 30)
+    validate_sparse_max_seq_len(
+        [_layer(0, ("key", 4096, False)), _sparse_layer(1, fetched=False)],
+        max_seq_len=1 << 30,
+    )
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("cells", "lease_bytes"),
     [
@@ -183,6 +234,34 @@ def test_lease_matches_native_layout(cells: int, lease_bytes: int) -> None:
     assert shape.lease_bytes == lease_bytes
     # Shared tables and region alignment are paid once, not per lease.
     assert shape.arena_bytes(513) - shape.arena_bytes(512) == pytest.approx(lease_bytes, abs=512)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("units_per_cell", [1, 32, 64, 128, 256])
+@pytest.mark.parametrize("max_leases", [0, 1, 3])
+@pytest.mark.parametrize("row_bytes", [(576, 36), (3, 1)])
+def test_arena_reserves_one_tile_per_pool(
+    units_per_cell: int, max_leases: int, row_bytes: tuple[int, int]
+) -> None:
+    shape = SparseArenaShape(
+        num_layers=2,
+        num_selections=2,
+        cells_per_buffer=3,
+        units_per_cell=units_per_cell,
+        cell_bytes=tuple(units_per_cell * size for size in row_bytes) * 2,
+    )
+
+    def aligned(size: int) -> int:
+        return (size + 255) // 256 * 256
+
+    # Each pool holds two layers of three cells per lease, followed by 128 rows
+    # total. Zero leases measures the fixed overhead used by the capacity solver.
+    usable_rows = max_leases * 2 * 3 * units_per_cell
+    pool_bytes = sum(aligned((usable_rows + 128) * size) for size in row_bytes)
+    metadata_bytes = aligned(2 * 3 * units_per_cell * 4)
+    assert shape.arena_bytes(max_leases) == pool_bytes + 3 * 256 + max_leases * metadata_bytes
+    assert shape.entries == 2 * 3 * units_per_cell
+    assert shape.lease_bytes == 2 * 3 * units_per_cell * sum(row_bytes) + metadata_bytes
 
 
 @pytest.mark.cpu_only
@@ -502,11 +581,9 @@ def test_sparse_cache_config_rejects_a_unit_that_does_not_divide_a_page() -> Non
         # An explicit size covers the staging buffers too, whatever automatic
         # sizing may pin.
         (1 << 30, 0.0, (1 << 30) - 4096),
-        # Otherwise the pools hold max_batch_size requests...
-        (None, float("inf"), 256 * 1000),
-        # ...unless they and the staging buffers outgrow what automatic sizing
-        # may pin.
-        (None, 50_000.0, 50_000 - 4096),
+        # Otherwise the pools may take all that automatic sizing may pin beside the
+        # staging buffers, whatever max_batch_size or the request lengths.
+        (None, 1_004_096.0, 1_000_000),
     ],
 )
 def test_host_budget(
@@ -515,8 +592,7 @@ def test_host_budget(
     assert (
         plan_host_history_bytes(
             host_history_size=host_history_size,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
+            offloads_history=True,
             pinnable_host_bytes=pinnable_host_bytes,
             staging_bytes=4096,
         )
@@ -525,20 +601,51 @@ def test_host_budget(
 
 
 @pytest.mark.cpu_only
-def test_automatic_host_budget_grows_to_the_floor() -> None:
-    # 256 requests of 1,000 bytes would take 256,000 bytes, short of the 300,000 the
-    # manager's constraint batches need.
+def test_automatic_host_budget_leaves_the_host_tier_its_reserve() -> None:
+    # The pools take what staging and the host tier's 300,000-byte reserve leave.
     assert (
         plan_host_history_bytes(
             host_history_size=None,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
-            pinnable_host_bytes=float("inf"),
+            offloads_history=True,
+            pinnable_host_bytes=1_004_096.0,
             staging_bytes=4096,
             floor_bytes=300_000,
+            host_tier_reserve_bytes=300_000,
         )
-        == 300_000
+        == 700_000
     )
+    # The reserve counts against the floor: 200,000 bytes would be left for history.
+    with pytest.raises(ValueError, match="automatically leaves 0.2MiB .* less than the 0.3MiB"):
+        plan_host_history_bytes(
+            host_history_size=None,
+            offloads_history=True,
+            pinnable_host_bytes=504_096.0,
+            staging_bytes=4096,
+            floor_bytes=300_000,
+            host_tier_reserve_bytes=300_000,
+        )
+    # An explicit size is the user's to split; the reserve does not apply.
+    assert (
+        plan_host_history_bytes(
+            host_history_size=1 << 30,
+            offloads_history=True,
+            pinnable_host_bytes=0.0,
+            staging_bytes=4096,
+            host_tier_reserve_bytes=300_000,
+        )
+        == (1 << 30) - 4096
+    )
+
+
+@pytest.mark.cpu_only
+def test_automatic_host_budget_needs_a_bound_on_host_memory() -> None:
+    with pytest.raises(ValueError, match="Set .*host_history_size"):
+        plan_host_history_bytes(
+            host_history_size=None,
+            offloads_history=True,
+            pinnable_host_bytes=float("inf"),
+            staging_bytes=4096,
+        )
 
 
 @pytest.mark.cpu_only
@@ -558,8 +665,7 @@ def test_host_budget_below_the_floor_is_refused(
     with pytest.raises(ValueError, match=match):
         plan_host_history_bytes(
             host_history_size=host_history_size,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
+            offloads_history=True,
             pinnable_host_bytes=pinnable_host_bytes,
             staging_bytes=4096,
             floor_bytes=300_000,
@@ -580,8 +686,7 @@ def test_host_budget_must_leave_the_pools_room(
     with pytest.raises(ValueError, match=match):
         plan_host_history_bytes(
             host_history_size=host_history_size,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
+            offloads_history=True,
             pinnable_host_bytes=pinnable_host_bytes,
             staging_bytes=4096,
         )
@@ -626,12 +731,66 @@ def test_host_floor_holds_the_largest_constraint_batch() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("window", [1, 8, 127, 128, 129, 300, 1 << 20])
+@pytest.mark.parametrize("num_sink_tokens", [0, 129])
+@pytest.mark.parametrize("headroom", [1, 3])
+def test_request_pages_are_the_most_a_window_holds_at_any_decode_step(
+    window: int, num_sink_tokens: int, headroom: int
+) -> None:
+    num_tokens = 8 * TOKENS_PER_BLOCK + 5
+    layer = AttentionLayerConfig(
+        layer_id=LayerId(0),
+        buffers=[BufferConfig(role=DataRole("key"), size=1)],
+        sliding_window_size=window,
+        num_sink_tokens=num_sink_tokens,
+    )
+    life_cycle = AttnLifeCycle.make(window, num_sink_tokens, TOKENS_PER_BLOCK)
+
+    def held_pages(capacity: int) -> int:
+        stale = life_cycle.get_stale_range(capacity - headroom, TOKENS_PER_BLOCK)
+        return -(-capacity // TOKENS_PER_BLOCK) - len(stale)
+
+    # A page of one byte: the bytes are the pages the native life cycle keeps live at the
+    # step where a request of num_tokens tokens holds the most.
+    assert request_page_bytes(
+        [layer],
+        tokens_per_block=TOKENS_PER_BLOCK,
+        num_tokens=num_tokens,
+        generation_capacity_headroom=headroom,
+    ) == max(held_pages(capacity) for capacity in range(headroom, num_tokens + 1))
+
+
+@pytest.mark.cpu_only
+def test_request_pages_keep_all_history_but_only_a_windows_live_pages() -> None:
+    # At 128K tokens the history life cycle holds 1,024 pages, and each window the two
+    # its live tokens can straddle. Host-backed buffers count, and expanded ones in full.
+    assert request_page_bytes(
+        _v4_flash_like_layers(),
+        tokens_per_block=TOKENS_PER_BLOCK,
+        num_tokens=1 << 17,
+        generation_capacity_headroom=1,
+    ) == (2 * 65_536 + 1024 * (2 * 2176 + 288 + 36 + 2 * (9216 + 1152)) + 2 * (16_384 + 400))
+    # A state life cycle holds one slot whatever the length.
+    ssm = SsmLayerConfig(
+        layer_id=LayerId(5), buffers=[BufferConfig(role=DataRole("ssm"), size=4096)]
+    )
+    assert (
+        request_page_bytes(
+            [ssm],
+            tokens_per_block=TOKENS_PER_BLOCK,
+            num_tokens=1 << 17,
+            generation_capacity_headroom=1,
+        )
+        == 4096
+    )
+
+
+@pytest.mark.cpu_only
 def test_host_budget_is_empty_on_a_rank_without_offloaded_history() -> None:
     assert (
         plan_host_history_bytes(
             host_history_size=None,
-            max_batch_size=256,
-            host_bytes_per_request=0,
+            offloads_history=False,
             pinnable_host_bytes=0.0,
             staging_bytes=0,
         )

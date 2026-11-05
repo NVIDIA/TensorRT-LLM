@@ -68,6 +68,8 @@ _MIB = float(1 << 20)
 
 # SparseCellArena rounds every region to this many bytes.
 SPARSE_ARENA_ALIGNMENT = 256
+# One zeroed KV tile per pool, outside the usable cells (kTailUnits in sparseCache.cpp).
+_SPARSE_ARENA_TAIL_UNITS = 128
 # Every arena and Batch index array holds 32-bit entries (int32_t or uint32_t).
 _INDEX_BYTES = 4
 # A Batch row holds two watermarks, history length and capacity.
@@ -145,13 +147,15 @@ class SparseArenaShape:
     def arena_bytes(self, max_leases: int) -> int:
         """Return the GPU bytes of an arena sized for ``max_leases`` leases."""
         # One region per pool. Buffers of one cell size share a pool, so a region
-        # holds every lease's cells of every buffer of that size.
+        # holds every lease's cells of every buffer of that size, then one fixed
+        # over-read tail. The tail is not part of any lease's usable capacity.
         buffers_by_cell_bytes: dict[int, int] = defaultdict(int)
         for cell_bytes in self.cell_bytes:
             buffers_by_cell_bytes[cell_bytes] += 1
         cell_regions = sum(
             pad_up(
-                max_leases * num_buffers * self.cells_per_buffer * cell_bytes,
+                max_leases * num_buffers * self.cells_per_buffer * cell_bytes
+                + _SPARSE_ARENA_TAIL_UNITS * (cell_bytes // self.units_per_cell),
                 SPARSE_ARENA_ALIGNMENT,
             )
             for cell_bytes, num_buffers in buffers_by_cell_bytes.items()
@@ -171,6 +175,34 @@ def _fetched_sparse_buffers(layer: LayerConfig) -> list[BufferConfig]:
     if getattr(layer, "sparse_cache", None) is None:
         return []
     return [buffer for buffer in layer.buffers if buffer.is_sparse]
+
+
+def validate_sparse_max_seq_len(layers: Sequence[LayerConfig], *, max_seq_len: int) -> None:
+    """Reject sequence lengths that can exceed a sparse probe's unit-ordinal range.
+
+    Args:
+        layers: Final layer configs, including each sparse fetch path's unit size.
+        max_seq_len: Configured sequence-length bound in original tokens.
+
+    Raises:
+        ValueError: A layer's history watermark can exceed the kernel's ordinal limit.
+    """
+    for layer in layers:
+        if not _fetched_sparse_buffers(layer):
+            continue
+        cache = layer.sparse_cache
+        # The history watermark itself names the next in-flight unit. Checking only
+        # the last history ordinal (unit count minus one) would miss that write.
+        max_history_unit = max_seq_len // cache.unit_tokens
+        if max_history_unit > cache.max_unit_ordinal:
+            max_supported_seq_len = (cache.max_unit_ordinal + 1) * cache.unit_tokens - 1
+            raise ValueError(
+                f"Sparse KV cache offload: max_seq_len={max_seq_len} reaches history unit "
+                f"ordinal {max_history_unit} for layer {int(layer.layer_id)} with "
+                f"unit_tokens={cache.unit_tokens}, above the sparse probe limit "
+                f"{cache.max_unit_ordinal}. Set max_seq_len <= {max_supported_seq_len} "
+                "or disable sparse KV cache offload."
+            )
 
 
 def _fetch_path_life_cycles(
@@ -628,36 +660,85 @@ def sparse_history_floor_bytes(
     return slots * sparse_history_bytes_per_block(layers) + len(host_pools) * _HOST_POOL_GRANULARITY
 
 
+def request_page_bytes(
+    layers: Sequence[LayerConfig],
+    *,
+    tokens_per_block: int,
+    num_tokens: int,
+    generation_capacity_headroom: int,
+) -> int:
+    """Return the bytes of the pages one decoding request of ``num_tokens`` tokens holds at most.
+
+    A page counts every buffer of its life cycle, the host-backed ones too, since it
+    moves whole between cache levels. A life cycle that keeps all of its history
+    holds a page per ``tokens_per_block`` tokens. A windowed one holds its sink pages
+    and the pages its live tokens touch, and no more than the whole request's: a
+    decode step keeps ``window_size + generation_capacity_headroom - 1`` tokens live
+    (``AttnLifeCycle.get_stale_range``), and ``n`` tokens touch at most
+    ``ceil((n - 1) / tokens_per_block) + 1`` pages. A state life cycle holds one page.
+
+    Args:
+        layers: Every layer config the manager allocates.
+        tokens_per_block: Tokens per page.
+        num_tokens: Tokens the request's capacity covers.
+        generation_capacity_headroom: Tokens a decode step's capacity holds beyond
+            the request's history.
+    """
+    full_pages = ceil_div(num_tokens, tokens_per_block)
+    total = 0
+    for life_cycle in life_cycle_pages(layers, tokens_per_block):
+        if life_cycle.is_state:
+            pages = 1
+        elif life_cycle.window_size is None:
+            pages = full_pages
+        else:
+            live_tokens = life_cycle.window_size + generation_capacity_headroom - 1
+            live_pages = ceil_div(live_tokens - 1, tokens_per_block) + 1
+            sink_pages = ceil_div(life_cycle.num_sink_tokens, tokens_per_block)
+            pages = min(full_pages, sink_pages + live_pages)
+        total += pages * (life_cycle.device_bytes + life_cycle.host_bytes)
+    return total
+
+
 def plan_host_history_bytes(
     *,
     host_history_size: int | None,
-    max_batch_size: int,
-    host_bytes_per_request: int,
+    offloads_history: bool,
     pinnable_host_bytes: float,
     staging_bytes: int,
     floor_bytes: int = 0,
+    host_tier_reserve_bytes: int = 0,
 ) -> int:
     """Return the host bytes the host-backed history pools may take.
 
+    The budget bounds the pools rather than sizing them, and assumes no request
+    length: the history pools share their slot count with the device-backed
+    pools of their group, so they pin only what the device quota's slots pair
+    with, up to this budget, and requests take slots as they decode.
+
     Offload also pins the sparse Batch's staging buffers, so they come out of
     the same host memory. An explicit ``host_history_size`` covers both.
-    Otherwise the pools hold ``max_batch_size`` requests, capped so that pools
-    and staging fit in the host memory the rank may pin. Either way they must
-    reach ``floor_bytes``: the native manager refuses a smaller budget.
+    Otherwise the history pools come first: they may take all the host memory
+    the rank may pin beside the staging buffers and
+    ``host_tier_reserve_bytes``, which stays for the host cache tier that
+    suspended requests' pages move to. Either way they must reach
+    ``floor_bytes``: the native manager refuses a smaller budget.
 
     Args:
         host_history_size: The configured size, or None to size automatically.
-        max_batch_size: Requests the automatic budget holds.
-        host_bytes_per_request: Host history bytes one request holds.
+        offloads_history: Whether this rank's layers offload any history.
         pinnable_host_bytes: Host bytes automatic sizing may pin for offload;
             ``inf`` when unknown.
         staging_bytes: Pinned host bytes of the sparse Batch's staging buffers.
         floor_bytes: Host bytes the manager's constraint batches need in the
             host-backed pools (:func:`sparse_history_floor_bytes`).
+        host_tier_reserve_bytes: Host bytes automatic sizing keeps for the host
+            cache tier, so suspension has somewhere to move a request.
 
     Raises:
-        ValueError: No host memory is left for the pools, or less than
-            ``floor_bytes``.
+        ValueError: No host memory is left for the pools, less than
+            ``floor_bytes``, or automatic sizing cannot tell how much host
+            memory the rank may pin.
     """
     floor = (
         f"the {floor_bytes / _MIB:.1f}MiB the KV cache manager reserves for the batches it must "
@@ -680,13 +761,19 @@ def plan_host_history_bytes(
                 "host_history_size, or lower max_seq_len."
             )
         return budget
-    if not host_bytes_per_request:
-        # This rank's layers offload no history.
+    if not offloads_history:
         return 0
-    available = pinnable_host_bytes - staging_bytes
+    if math.isinf(pinnable_host_bytes):
+        raise ValueError(
+            "Sizing sparse KV cache offload automatically needs to know how much host memory "
+            "this rank may pin, and neither the available host memory nor RLIMIT_MEMLOCK "
+            "bounds it. Set sparse_attention_config.kv_cache_offload_config.host_history_size."
+        )
+    available = pinnable_host_bytes - staging_bytes - host_tier_reserve_bytes
     pinnable = (
-        f"this rank may pin {max(0.0, pinnable_host_bytes) / _MIB:.1f}MiB, and the sparse "
-        f"Batch's staging buffers take {staging_bytes / _MIB:.1f}MiB"
+        f"this rank may pin {max(0.0, pinnable_host_bytes) / _MIB:.1f}MiB, the sparse Batch's "
+        f"staging buffers take {staging_bytes / _MIB:.1f}MiB, and "
+        f"{host_tier_reserve_bytes / _MIB:.1f}MiB stays for the host cache tier"
     )
     if available <= 0:
         raise ValueError(
@@ -703,7 +790,7 @@ def plan_host_history_bytes(
             "sparse_attention_config.kv_cache_offload_config.host_history_size, lower "
             "max_seq_len, or lower kv_cache_config.host_cache_size."
         )
-    return int(max(min(max_batch_size * host_bytes_per_request, available), floor_bytes))
+    return int(available)
 
 
 # ---------------------------------------------------------------------------
@@ -856,8 +943,11 @@ def solve_sparse_offload_capacity(
 class HostHistoryReservations:
     """Host history pages reserved for admitted requests through their last token.
 
-    A request whose history outgrows the host-backed pool while it decodes has
-    nowhere to go, so admission reserves every page a request can reach.
+    Used only when no cache level lies below the hot one. A suspended request's
+    history then has nowhere to move, so suspension frees no slots, and a
+    decode-only worker cannot recompute either; admission instead reserves
+    every page a request can reach. With a level below, requests take slots as
+    they decode and the scheduler suspends one under pressure.
     """
 
     def __init__(self, capacity_blocks: int) -> None:

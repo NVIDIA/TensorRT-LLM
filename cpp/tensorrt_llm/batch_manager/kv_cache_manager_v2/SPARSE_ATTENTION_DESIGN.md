@@ -440,6 +440,12 @@ shared-memory traffic of the publish pass, which walks the whole resident set an
 most of the kernel's time goes. The split is 14 bits of entry index against 18 of ordinal,
 and both bounds are checked rather than truncated into.
 
+The largest unit ordinal is 262,142, exposed as `SparseCacheConfig.max_unit_ordinal`.
+Offload startup checks `max_seq_len // unit_tokens` against it for every fetched layer
+before sizing or allocating the pools. This includes the history watermark that names
+the next in-flight unit, not just the selected history ordinals. The check is synchronized
+across ranks, so a rank with an unsupported layer stops its peers before serving starts.
+
 Multiplicative hashing rather than identity, because ordinals are small and dense, and dense
 runs make an unsuccessful probe walk the whole run.
 
@@ -1127,6 +1133,12 @@ layout of its own:
 
 - **One region per pool**, sized `maxLeases * buffersInPool * cellsPerBuffer * cellBytes`.
   A lease is an index rather than a cell offset, because a pool's cells-per-lease is its own.
+  Each nonempty region also reserves a zeroed tail of 128 selection units before its
+  alignment padding. For token-sparse MLA, one unit is one stored KV row: this covers
+  FMHA's one-tile over-read past the last indexed row. The tail is per pool, not per
+  buffer or lease, and is excluded from usable cells, entry counts and index arithmetic.
+  Its bytes are `128 * cellBytes / unitsPerCell`, independent of the page's unit count.
+  Shared buffer/layer mappings and lease metadata follow all the padded pool regions.
   A pool index no sparse buffer of the life cycle uses keeps its place in the list and sizes
   to nothing: the arena is indexed by the storage pool index rather than by a dense numbering
   of its own, and an empty region costs only the entry that says where the next one starts.

@@ -370,6 +370,11 @@ class SparseCacheConfig:
     shared memory on the current device.
     """
 
+    @property
+    def max_unit_ordinal(self) -> int:
+        """Largest zero-based unit ordinal supported by the sparse probe index."""
+        ...
+
     num_selected_blocks: int
     """Selection width: units a sparse-attention step selects for this layer."""
 

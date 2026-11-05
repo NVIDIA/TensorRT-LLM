@@ -109,6 +109,10 @@ public:
     // Synchronises.
     static std::pair<std::vector<int32_t>, std::vector<int32_t>> batchWatermarks(Batch const& batch);
 
+    // A Batch's sparse eviction clock as (host counter, staged copy). Both are host memory,
+    // so this neither synchronises nor waits on a publish still uploading the staging.
+    static std::pair<uint32_t, int32_t> batchSparseClock(Batch const& batch);
+
     // Run the sparse resolve kernel over caller-supplied state, so the
     // probe index and victim choice can be exercised without a request.
     // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.

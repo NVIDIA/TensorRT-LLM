@@ -229,9 +229,9 @@ class SparseCellArena;
 // be host memory without the cache following it there. Every request of a life cycle needs
 // the same number of cells, so this is a fixed-size-block free list.
 //
-// One block holds the cells of every lease followed by their metadata. Cells come first so
-// that a cell index is relative to the arena's base, which is what the fetch reports and
-// what get_sparse_cache_base_address returns for a sparse buffer.
+// One block holds each pool's cells and a zeroed over-read tail, followed by shared mappings
+// and lease metadata. Cell indices are relative to their pool's base, which is what the
+// fetch reports and what get_sparse_cache_base_address returns for a sparse buffer.
 // ---------------------------------------------------------------------------
 class SparseCellArena
 {
@@ -274,8 +274,8 @@ public:
         return mShape.pools.at(static_cast<size_t>(pool.value())).second * mShape.cellsPerBuffer;
     }
 
-    //! Device bytes this arena holds: every pool's cell region, the state its leases share,
-    //! and one metadata block per lease -- the whole allocation.
+    //! Device bytes this arena holds: every pool's cell region and over-read tail, the state
+    //! its leases share, and one metadata block per lease -- the whole allocation.
     [[nodiscard]] size_t numBytes() const noexcept
     {
         return mNumBytes;

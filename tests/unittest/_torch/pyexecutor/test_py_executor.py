@@ -326,6 +326,7 @@ def _make_remote_tail_executor_and_request(
     )
     executor = types.SimpleNamespace(
         model_engine=types.SimpleNamespace(model=types.SimpleNamespace(model=model)),
+        _decode_only=False,
         kv_cache_transceiver=types.SimpleNamespace(pipeline_transfer_enabled=False),
         scheduler=types.SimpleNamespace(max_context_length=8192),
         max_num_tokens=8192,
@@ -656,6 +657,7 @@ def _make_admission_executor(model, requests):
     real ones, over a model engine holding `model`; everything else they touch is a stub."""
     executor = types.SimpleNamespace(
         model_engine=types.SimpleNamespace(model=model),
+        _decode_only=False,
         _is_kv_manager_v2=False,
         kv_cache_manager=None,
         kv_cache_transceiver=None,
@@ -681,6 +683,65 @@ def _make_admission_request(request_id: int) -> types.SimpleNamespace:
         sampling_config=None,
         kv_cache_retention_config=None,
     )
+
+
+@pytest.mark.parametrize("offload", [False, True], ids=["resident", "offload"])
+@pytest.mark.parametrize(
+    "request_type",
+    [
+        LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+    ],
+    ids=["context_only", "context_and_generation"],
+)
+def test_sparse_offload_admission_fails_only_prefill_request(
+    offload: bool, request_type: LlmRequestType
+) -> None:
+    def make_request(request_id: int, kind: LlmRequestType) -> LlmRequest:
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=16,
+            input_tokens=[1, 2, 3],
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            draft_tokens=None,
+            llm_request_type=kind,
+        )
+
+    generation_only = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    requests = [
+        make_request(1, generation_only),
+        make_request(2, request_type),
+        make_request(3, generation_only),
+    ]
+    assert requests[0].is_disagg_generation_init_state
+    assert requests[2].is_disagg_generation_init_state
+    existing = make_request(0, generation_only)
+    existing.state = LlmRequestState.GENERATION_IN_PROGRESS
+    executor = _make_admission_executor(None, requests)
+    executor._decode_only = offload
+    executor.active_requests.append(existing)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    expected = [requests[0], requests[2]] if offload else requests
+    assert admitted == expected
+    assert executor.active_requests == [existing, *expected]
+    assert [call.args[0] for call in executor.sampler.validate_request.call_args_list] == expected
+    if offload:
+        executor._handle_errors.assert_called_once_with(
+            "Sparse KV offload supports generation-only requests; route prefill to a context worker.",
+            requests=[requests[1]],
+            charge_budget=False,
+        )
+    else:
+        executor._handle_errors.assert_not_called()
+
+    followup = make_request(4, generation_only)
+    executor._fetch_new_requests.return_value = [followup]
+    assert PyExecutor._fetch_and_activate_new_requests(executor) == [followup]
+    assert executor.active_requests == [existing, *expected, followup]
+    assert executor._handle_errors.call_count == int(offload)
 
 
 def test_model_validation_fails_only_the_request_it_rejects() -> None:
