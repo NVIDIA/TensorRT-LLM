@@ -110,7 +110,7 @@ The first copy prepares the spatial stride-2 convolution. Let $a$ be the last re
 $$
 p_{i,j}=
 \begin{cases}
-a_{i,j}+s_{i,j}, & 0\le i<H,\quad 0\le j<W,\\
+a_{i,j}+s_{i,j}, & 0\le i\lt H,\quad 0\le j\lt W,\\
 0, & i=H\ \text{or}\ j=W.
 \end{cases}
 \qquad (2)
