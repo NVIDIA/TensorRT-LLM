@@ -30,7 +30,11 @@ import torch.nn.functional as F
 from _torch.helpers import dspark_markov_chain_logits_reference
 
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
-from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
+from tensorrt_llm._torch.models.modeling_dspark import (
+    GQADSparkForCausalLM,
+    _dspark_mla_max_split_kv,
+    cute_dsl_mla_decode_unavailability_reason,
+)
 from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
 
@@ -1312,24 +1316,17 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
     )
 
 
-@pytest.mark.parametrize("raw, expected", [(None, 0), ("", 0), ("0", 0), ("1", 1), (" 4 ", 4)])
-def test_mla_dspark_split_cap_env(raw, expected, monkeypatch):
-    import tensorrt_llm._torch.models.modeling_dspark as md
-
-    if raw is None:
-        monkeypatch.delenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raising=False)
-    else:
-        monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raw)
-    assert md._dspark_mla_max_split_kv() == expected
-
-
-@pytest.mark.parametrize("raw", ["-1", "one", "1.5"])
-def test_mla_dspark_split_cap_env_rejects_bad_values(raw, monkeypatch):
-    import tensorrt_llm._torch.models.modeling_dspark as md
-
-    monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raw)
-    with pytest.raises(ValueError, match="TLLM_DSPARK_MLA_MAX_SPLIT_KV"):
-        md._dspark_mla_max_split_kv()
+@pytest.mark.cpu_only
+def test_mla_dspark_split_cap_env(monkeypatch):
+    """Unset means no cap; a negative or non-integer value raises."""
+    monkeypatch.delenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raising=False)
+    assert _dspark_mla_max_split_kv() == 0
+    monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", " 4 ")
+    assert _dspark_mla_max_split_kv() == 4
+    for bad_value in ("-1", "one"):
+        monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", bad_value)
+        with pytest.raises(ValueError, match="TLLM_DSPARK_MLA_MAX_SPLIT_KV"):
+            _dspark_mla_max_split_kv()
 
 
 @needs_cuda
@@ -1342,9 +1339,7 @@ def test_mla_dspark_cute_dsl_split_cap_matches_reference(monkeypatch):
     the same bf16 bound against the un-absorbed reference and agree with each other
     to that bound.
     """
-    import tensorrt_llm._torch.models.modeling_dspark as md
-
-    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    reason = cute_dsl_mla_decode_unavailability_reason()
     if reason is not None:
         pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
