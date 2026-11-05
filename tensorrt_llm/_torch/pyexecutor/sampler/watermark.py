@@ -65,6 +65,15 @@ __all__ = [
 ]
 
 
+# Upper bound on the repeat ring of one handler (8 bytes per position per sequence slot). A
+# longer history is narrowed to fit: repeats farther apart than the narrowed window are then
+# drawn under the key like any other position, which weakens the signal a little but cannot
+# create false positives. The floor of `_MIN_RING_SIZE` positions can exceed the budget only for
+# an unrealistic number of slots.
+MAX_RING_BYTES = 512 << 20
+_MIN_RING_SIZE = 1024
+
+
 def request_wants_watermark(config: "Optional[WatermarkConfig]", request: LlmRequest) -> bool:
     """Whether ``request`` asks for (or is forced into) a watermark, ignoring its sampling mode.
 
@@ -158,6 +167,16 @@ class WatermarkHandler:
         history = config.deduplicate_contexts_max_history
         self._ring_size = max_seq_len if history is None else min(history, max_seq_len)
         if self._dedupe:
+            fits = max(MAX_RING_BYTES // (8 * num_rows) - 1, _MIN_RING_SIZE)
+            if self._ring_size > fits:
+                logger.warning(
+                    f"The watermark repeat history of {self._ring_size} positions per sequence "
+                    f"slot would need more than {MAX_RING_BYTES >> 20} MiB for {num_rows} slots; "
+                    f"narrowing it to {fits} positions. Detection keeps working, with slightly "
+                    "less signal on outputs longer than that. Set "
+                    "deduplicate_contexts_max_history to a smaller value to silence this warning."
+                )
+                self._ring_size = fits
             # One trash column past the ring takes the writes of positions that were not committed.
             self._ring = torch.zeros(
                 (num_rows, self._ring_size + 1), dtype=torch.int64, device=device
