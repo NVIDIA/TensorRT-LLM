@@ -60,7 +60,6 @@ def _request(mm_data=None):
 def _validating_executor(model):
     """Executor shell exposing only what _validate_request touches."""
     executor = object.__new__(PyExecutor)
-    executor._decode_only = False
     executor.kv_cache_transceiver = None
     executor.kv_cache_manager = None
     executor._is_kv_manager_v2 = False

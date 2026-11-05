@@ -7749,7 +7749,8 @@ class PyExecutor:
         request.py_csa2_remote_tail_split = split
 
     def _validate_request(self, request: LlmRequest) -> None:
-        if self._decode_only and not request.is_generation_only_request:
+        if getattr(self, "_decode_only",
+                   False) and not request.is_generation_only_request:
             raise ValueError(
                 "Sparse KV offload supports generation-only requests; "
                 "route prefill to a context worker.")
