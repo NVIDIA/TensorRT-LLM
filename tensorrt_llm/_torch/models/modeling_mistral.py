@@ -27,7 +27,8 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalModelMixin, PreparedLlmInputs)
+    EncoderGroup, MultimodalModelMixin, PreparedLlmInputs,
+    encode_multimodal_by_groups)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -50,8 +51,9 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
-from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
-                                            MultimodalParams)
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalItemPartition, MultimodalParams)
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
@@ -460,12 +462,20 @@ class MistralPixtralEncoderContract:
             (num_images, channels, height, width),
             dtype=dtype or self.dtype,
         )
-        return {
+        data = {
             "image": {
-                "pixel_values": pixel_values,
-                "image_sizes": [[height, width]] * num_images,
+                "pixel_values":
+                pixel_values,
+                "image_sizes":
+                torch.tensor([[height, width]] * num_images,
+                             dtype=torch.int64,
+                             device="cpu"),
             }
         }
+        data[
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = self._build_mm_item_metadata(
+                [], data)
+        return data
 
     def _build_mm_item_metadata(
         self,
@@ -501,7 +511,13 @@ class MistralPixtralEncoderContract:
         return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
-            output_embedding_lengths=output_embedding_lengths)
+            output_embedding_lengths=output_embedding_lengths,
+            input_partitions={
+                "image": {
+                    "pixel_values": MultimodalItemPartition(),
+                    "image_sizes": MultimodalItemPartition(),
+                }
+            })
 
     def get_mm_item_metadata(
         self,
@@ -674,12 +690,9 @@ class MistralHFInputProcessor(MistralPixtralEncoderContract,
         if pixel_values is not None:
             # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
-            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
-            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
-            # reaching the model forward. Since its values are used to infer the amount of padding
-            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
-            # list here to avoid this.
-            processed["image_sizes"] = processed["image_sizes"].tolist()
+            # Geometry stays on the host for patch slicing.
+            processed["image_sizes"] = processed["image_sizes"].to(
+                device="cpu", dtype=torch.int64)
             # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
@@ -801,7 +814,8 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         processed = self.processor(text=inputs["prompt"], images=images)
         input_ids = processed.pop("input_ids").tolist()[0]
         processed.pop("attention_mask", None)
-        processed["image_sizes"] = processed["image_sizes"].tolist()
+        processed["image_sizes"] = processed["image_sizes"].to(
+            device="cpu", dtype=torch.int64)
         return input_ids, {"multimodal_data": {"image": {**processed}}}
 
 
@@ -1014,8 +1028,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         if (self._vision_tower is None or self._multi_modal_projector is None):
             raise ValueError(
                 "Raw multimodal inputs require a local multimodal encoder.")
-        mm_embeds = self._vision_forward(list(multimodal_params))
-        return mm_embeds[0]
+        return encode_multimodal_by_groups(self.mm_encoder_groups,
+                                           list(multimodal_params))
 
     def get_language_model_extra_forward_kwargs(
         self,
@@ -1081,33 +1095,24 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
 
         return sub_model_config
 
-    # NOTE: this is defined as a separate method with this specific signature in order to be compatible
-    # with `get_multimodal_embeddings` callers.
-    def _vision_forward(
-            self,
-            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        multimodal_params_len = len(multimodal_params)
-        pixel_values = [
-            x.multimodal_data["image"]["pixel_values"]
-            for x in multimodal_params
-        ]
-        image_sizes = [
-            x.multimodal_data["image"]["image_sizes"] for x in multimodal_params
-        ]
-        if not (len(pixel_values) == len(image_sizes) == multimodal_params_len):
-            raise ValueError(
-                f"Expected as many `pixel_values` ({len(pixel_values)}) and "
-                f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
-                f"({multimodal_params_len}).")
-        image_sizes = [torch.tensor(x) for x in image_sizes]
-        batched_pixel_values, batched_image_sizes = self.batch_pixel_values(
-            pixel_values=pixel_values, image_sizes=image_sizes)
-        mm_embeds = [
-            self._get_image_features(pixel_values=batched_pixel_values,
-                                     image_sizes=batched_image_sizes)
-        ]
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return ["image.pixel_values", "multimodal_embedding"]
 
-        return mm_embeds
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (EncoderGroup(
+            modalities=("image", ),
+            encoder_fn=self._get_image_features,
+            input_fields={
+                "pixel_values": {
+                    "image": "pixel_values"
+                },
+                "image_sizes": {
+                    "image": "image_sizes"
+                },
+            },
+        ), )
 
     # Original implementation:
     # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/mistral3/
@@ -1117,6 +1122,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         pixel_values: torch.Tensor,
         image_sizes: torch.Tensor,
     ):
+        height, width = image_sizes.max(dim=0).values
+        pixel_values = pixel_values[..., :height, :width]
         with nvtx_range("[mistral] ViT"):
             image_outputs = self._vision_tower(
                 pixel_values=pixel_values,
