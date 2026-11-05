@@ -129,8 +129,8 @@ def supports_context_first_bf16(
         and not use_pure_python_transfer_agent()
         and os.getenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX") == "UCX"
         and get_env_flag("TRTLLM_DISAGG_NO_RETRY", False)
-        and not get_env_flag("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", False)
-        and not get_env_flag("TRTLLM_DISAGG_LAYERWISE", False)
+        and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "0") != "1"
+        and os.getenv("TRTLLM_DISAGG_LAYERWISE", "0") != "1"
     ):
         return False
     if manager.layer_specs is not None and any(

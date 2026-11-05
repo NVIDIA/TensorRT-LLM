@@ -22,12 +22,11 @@ outside CUDA-graph capture (the model's warmup does it).
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Dict, Tuple
 
 import torch
-
-from tensorrt_llm._utils import get_env_flag
 
 NUM_EXPERTS = 896
 TOP_K = 16
@@ -48,7 +47,7 @@ def _arg(t: torch.Tensor):
 
 def _use_pdl() -> bool:
     # Same switch as the C++ launches (tensorrt_llm::common::getEnvEnablePDL).
-    return get_env_flag("TRTLLM_ENABLE_PDL", True)
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 def _check(scores: torch.Tensor, bias: torch.Tensor, hidden_states: torch.Tensor) -> None:

@@ -25,12 +25,11 @@ The kernel compiles on the first call for each configuration, which must happen 
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Dict, Optional
 
 import torch
-
-from tensorrt_llm._utils import get_env_flag
 
 from ._pool_layout import replay_pools_supported, slots_view
 
@@ -68,7 +67,7 @@ def _words(t: torch.Tensor) -> torch.Tensor:
 
 
 def use_pdl() -> bool:
-    return get_env_flag("TRTLLM_ENABLE_PDL", True)
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 @torch.library.custom_op(

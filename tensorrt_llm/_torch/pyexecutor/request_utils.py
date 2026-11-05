@@ -3,6 +3,7 @@
 
 """Utility functions for request processing."""
 
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -12,7 +13,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 
-from tensorrt_llm._utils import get_env_flag, nvtx_range
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -495,7 +496,7 @@ class RequestBroadcaster:
         # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
         pp_send_func = (
             self.dist.isend_object
-            if get_env_flag("TRTLLM_PP_REQ_SEND_ASYNC", False)
+            if os.environ.get("TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1"
             else self.dist.send_object
         )
 

@@ -45,6 +45,7 @@
 
 import ctypes
 import math
+import os
 from typing import Union
 
 import cutlass
@@ -55,9 +56,7 @@ from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from tensorrt_llm._utils import get_env_flag
-
-TRTLLM_ENABLE_PDL = get_env_flag("TRTLLM_ENABLE_PDL", True)
+TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 # WAR for CuTeDSL make_ptr implementation

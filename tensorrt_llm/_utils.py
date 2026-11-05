@@ -510,7 +510,7 @@ def torch_comm():
 
 def mpi_disabled() -> bool:
     """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
-    return get_env_flag("TLLM_DISABLE_MPI", False)
+    return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
 def mpi_rank():

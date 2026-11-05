@@ -44,6 +44,7 @@ see ``health.check_health`` for the host-side report.
 """
 
 import contextlib
+import os
 import platform
 from typing import Optional, Tuple
 
@@ -219,7 +220,7 @@ class PostMoeHop:
         self.workspace: Optional[PostMoeHopWorkspace] = None
         if use_pdl is None:
             use_pdl = (
-                get_env_flag("TRTLLM_ENABLE_PDL", True)
+                os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
                 and torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] >= 9
             )

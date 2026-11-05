@@ -259,7 +259,7 @@ def _mnnvl_device_index(mapping: Mapping) -> int:
 
 def use_mnnvl_fabric_handle(mapping: Mapping) -> bool:
     """Whether MNNVL multicast buffers of ``mapping`` use fabric handles (else POSIX FD IPC)."""
-    return (get_env_flag("TRTLLM_FORCE_MNNVL_AR", False)
+    return (os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
             or mapping.is_multi_node())
 
 

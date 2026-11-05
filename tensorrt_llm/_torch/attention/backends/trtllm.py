@@ -2021,8 +2021,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.skip_softmax_stat = torch.zeros(2,
                                              dtype=torch.uint32,
                                              device='cuda')
-        self.print_skip_softmax_stat = get_env_flag(
-            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", False)
+        self.print_skip_softmax_stat = os.environ.get(
+            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
         # Layer-level fp8 KV-cache scales. Stay at 1.0 (no-op) for the
         # PyTorch backend, which never overrides them. They guarantee the

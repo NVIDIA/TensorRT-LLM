@@ -1197,8 +1197,8 @@ class AutoTuner:
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
             if logger.level == 'debug':
-                fine_grained_on = get_env_flag("TLLM_USE_FINE_GRAINED_SYNC",
-                                               False)
+                fine_grained_on = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC",
+                                                 "0") == "1"
                 logger.debug_once(
                     f"[Autotuner] Inference dispatch: custom_op={custom_op}, runner={best_runner}, "
                     f"tactic={best_tactic}, fine_grained={'ON' if fine_grained_on else 'OFF'}",
@@ -1762,8 +1762,8 @@ class AutoTuner:
 
         fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
-        disable_short_profile = get_env_flag(
-            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", False)
+        disable_short_profile = os.environ.get(
+            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
 
         # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
         if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \

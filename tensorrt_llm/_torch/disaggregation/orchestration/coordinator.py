@@ -8,6 +8,7 @@ hold a reference to it: services are injected, executor-owned behavior is
 reached through the ``interfaces`` Protocols.
 """
 
+import os
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
@@ -18,7 +19,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 )
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
-from tensorrt_llm._utils import get_env_flag, nvtx_range
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.logger import logger
 
@@ -33,13 +34,14 @@ if TYPE_CHECKING:
 
 def is_gen_only_no_context_benchmark() -> bool:
     """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
-    return get_env_flag("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", False)
+    return os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
 
 
 def uses_async_gen_transfer() -> bool:
     """Whether generation KV transfers can remain in flight across iterations."""
-    return not is_gen_only_no_context_benchmark() and not get_env_flag(
-        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", False
+    return (
+        not is_gen_only_no_context_benchmark()
+        and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
     )
 
 

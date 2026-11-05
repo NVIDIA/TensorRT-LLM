@@ -44,7 +44,6 @@ from typing import Any, Dict, Optional, Tuple
 import aiohttp
 import msgpack
 
-from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.llmapi.disagg_utils import (
     DisaggServerConfig,
     MetadataServerConfig,
@@ -406,7 +405,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return info
 
     async def _wait_for_all_servers_ready(self) -> None:
-        gen_only = get_env_flag("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", False)
+        import os
+
+        gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
 
         async def check_servers_ready():
             elapsed_time = 0

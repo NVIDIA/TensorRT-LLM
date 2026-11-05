@@ -44,7 +44,6 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
     convert_to_torch_tensor,
-    get_env_flag,
     get_size_in_bytes,
     is_device_integrated,
     mpi_rank,
@@ -5399,8 +5398,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 # A sizing dry run is not user-visible reuse.
                 kv_cache.drop_cached_token_attribution()
             elif req.is_disagg_generation_init_state:
-                if self._disagg_transfer_overwrites_whole_cached_prefix() or get_env_flag(
-                    "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", False
+                if self._disagg_transfer_overwrites_whole_cached_prefix() or (
+                    os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
                 ):
                     kv_cache.drop_cached_token_attribution()
                 else:
