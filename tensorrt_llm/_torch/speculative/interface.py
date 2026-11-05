@@ -1593,8 +1593,8 @@ class SpecMetadata:
                 if fill_min_p:
                     request_min_ps.append(mp_val)
 
-            _upload_host_values(self.request_temperatures,
-                                request_temperatures, torch.float32)
+            _upload_host_values(self.request_temperatures, request_temperatures,
+                                torch.float32)
             _upload_host_values(self.request_top_ks, request_top_ks,
                                 torch.int32)
             _upload_host_values(self.request_top_ps, request_top_ps,
@@ -1625,8 +1625,7 @@ class SpecMetadata:
                 if fill_min_p:
                     min_ps.extend(mp_val for _ in range(num_tokens))
 
-            _upload_host_values(self.temperatures, temperatures,
-                                torch.float32)
+            _upload_host_values(self.temperatures, temperatures, torch.float32)
             _upload_host_values(self.top_ks, top_ks, torch.int32)
             _upload_host_values(self.top_ps, top_ps, torch.float32)
             if fill_min_p:
