@@ -478,15 +478,8 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
-    // Collect single-GPU post-merge and single-node multi-GPU pre-merge coverage.
+    // The context channel is limited to a single node.
     if (stageName.contains("_Nodes")) {
-        return false
-    }
-    if (testFilter[(IS_POST_MERGE)]) {
-        if (stageName.contains("_GPUs")) {
-            return false
-        }
-    } else if (!stageName.contains("_GPUs") || stageName.contains("Post-Merge")) {
         return false
     }
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
