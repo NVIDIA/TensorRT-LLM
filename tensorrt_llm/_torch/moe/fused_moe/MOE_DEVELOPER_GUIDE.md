@@ -926,6 +926,40 @@ set wrong has a test that catches it:
   set, and the copy keeps a per-layer table of the expert each helper slot
   holds so that it skips experts a whole team already holds. Any other writer
   of those helper rows would invalidate the table.
+- `planner: halo_r` swaps HALO-Q and the TMA copy for HALO-R
+  (`per_layer_dynamic_eplb/halo_r_planner.py`). Its scheduler and unicast
+  relay copy run as one kernel on the `auxiliary_sms` CTAs
+  (`moeRebalanceHaloR.cu`; the planner is in `moeRebalanceHaloRPlanner.h`, the
+  relay device body in `moeRebalanceRelay.cuh`). It reuses the count exchange,
+  ordinal and route passes of `moeRebalanceHaloQKernel.cuh`, the plan field
+  layout and the `CudaPhysicalSlotScheduler` buffers. Its group subclasses
+  `RebalanceSlotSchedulerGroup`, so generations, the route hold, the deferred
+  route wait, the lent routes, the lease and `SchedulerSpinBound` are HALO-Q's;
+  `HaloRRelayEndpoint` replaces the TMA endpoint.
+  HALO-R's helper sets get no multicast object (`helper_multicast=False` on
+  `SharedSlotArenaProvider`): the relay writes peers' helper rows through
+  `peer_helper_bases`, and the provider returns the layer's base
+  `LiveWeightArena`, whose helper planes have `mc_view=None` and no HALO
+  levels. Only the READY record pages keep their multicast objects. Contract tests in
+  `test_halo_r_contracts.py` pin the attributes HALO-R sets for HALO-Q's
+  methods and the methods it overrides. Each CTA checks every status word and
+  then raises the route counter; a failure traps before that, so MegaMoE never
+  reads routes of a failed launch. With `per_layer_resident`, a per-layer
+  residency table (updated by the last CTA before READY, reset on a weight
+  rebind) lets the relay skip receivers that hold their expert and keeps a
+  resident expert in its slot. For breakable prefill graphs, which
+  `validate_per_layer_dynamic_eplb_cuda_graph` admits only for HALO-R, every
+  value a layer call hands the device is constant: READY is 1, drained and
+  reset by the next launch before its count exchange; the route wait waits for
+  `auxiliary_sms` and resets the counter in one batched stream memory
+  operation; MAIN may change between layer calls behind a MAIN-to-MAIN fence;
+  and `finish` joins COPY into MAIN. The fence sees only host layer calls:
+  after a capture the host's MAIN stays the capture stream while replays run on
+  the execution stream, so an eager call on the capture stream after a replay
+  must be ordered after it by the caller, as the breakable runner's
+  `wait_stream` before each warmup does.
+  `forget_helper_residency` is an EP collective that raises when the ranks
+  differ in which layer they reset or how often.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original

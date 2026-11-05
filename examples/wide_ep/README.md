@@ -82,7 +82,7 @@ Attention DP (`enable_attention_dp: true`) is not part of this gate, so EPLB is 
 Load-balancing mode, `standard` or `per_layer_dynamic`. Configs without `mode` are treated as `standard`.
 
 * `standard`: offline or online EPLB, selected by [`layer_updates_per_iter`](#layer_updates_per_iter).
-* `per_layer_dynamic`: per-layer dynamic EPLB, which re-plans the expert replicas of every MoE layer on every forward pass from that pass's routing. It requires the `MEGAMOE_CUTEDSL` backend (`AUTO` resolves to it) and accepts only `num_slots`, `auxiliary_sms` and `helper_slot_mode` besides `mode`. See [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) for an example and its constraints.
+* `per_layer_dynamic`: per-layer dynamic EPLB, which re-plans the expert replicas of every MoE layer on every forward pass from that pass's routing. It requires the `MEGAMOE_CUTEDSL` backend (`AUTO` resolves to it) and accepts only `num_slots`, `auxiliary_sms`, `helper_slot_mode` and `planner` besides `mode`. See [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) for an example and its constraints.
 
 #### `num_slots`
 

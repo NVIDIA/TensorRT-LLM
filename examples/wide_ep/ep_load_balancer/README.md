@@ -307,10 +307,36 @@ Per-layer dynamic EPLB has the following constraints:
 * **Models**: an architecture listed in `moe_model_arch_list` (see [`load_balancer`](../README.md#load_balancer)) with NVFP4 MoE weights, as `MEGAMOE_CUTEDSL` requires. The model can have at most 384 routed experts, and the expert count must be divisible by the EP size.
 * **GPUs**: SM100, SM103 or SM107, with all EP ranks in one NVLink domain that supports multicast. The helper slots are CUDA fabric-handle allocations bound to NVLink multicast objects.
 * **Parallelism**: attention DP (`enable_attention_dp: true`) with pure expert parallelism: `moe_expert_parallel_size` equals the number of GPUs, with no MoE tensor parallelism and no pipeline parallelism. The EP size must be even and between 2 and 32, and the MoE smart router (`moe_cluster_size` greater than 1) is not supported. Unlike `standard` mode, an unsupported model, an EP size of 1, or the smart router raises an error instead of silently disabling the load balancer.
-* **CUDA graphs**: not supported. A non-null `cuda_graph_config` is replaced with `null` and a warning is logged, and any `prefill_cuda_graph_backend` other than `DISABLED` is rejected.
+* **CUDA graphs**: not supported for decode. A non-null `cuda_graph_config` is replaced with `null` and a warning is logged. Any `prefill_cuda_graph_backend` other than `DISABLED` is rejected, except `breakable` with `planner: halo_r` (see below).
 * **Launch queues**: CUDA must be initialized with `CUDA_SCALE_LAUNCH_QUEUES=4x`. The LLM API sets it automatically, in the main process and in every worker, before CUDA is initialized. If the process has already initialized CUDA when the LLM is created, construction fails; export `CUDA_SCALE_LAUNCH_QUEUES=4x` before starting such a process.
-* **`auxiliary_sms`**: the number of SMs of the kernel that runs the HALO-Q scheduler and then the copy, one CTA per SM. It defaults to 4, must be between 1 and 8, and must be lower than the GPU's SM count. Input quantization and, on the SM100 family, DeepSeek-V4's fused shared-expert kernel leave these SMs free, so planning and copying run alongside them.
+* **`auxiliary_sms`**: the number of SMs of the kernel that runs the replica planner and then the copy, one CTA per SM. It defaults to 4 with `halo_q` and 16 with `halo_r`, must be between 1 and 8 with `halo_q` and between 2 and 16 with `halo_r`, and must be lower than the GPU's SM count. Input quantization and, on the SM100 family, DeepSeek-V4's fused shared-expert kernel leave these SMs free, so planning and copying run alongside them.
 * **`helper_slot_mode`**: `per_layer_resident` (the default) gives every MoE layer its own helper slots and skips copying experts that they still hold from the previous forward pass. It costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copies every helper expert in every forward pass.
 * **Speculative decoding**: a one-model draft's MoE layers follow the same rule as the target's: every MoE layer that runs on `MEGAMOE_CUTEDSL` registers as one more per-layer dynamic layer after the target layers, is planned and load-balanced like them, and, with `per_layer_resident`, gets its own helper slots. DSpark drafters shipped inside an NVFP4 target checkpoint, such as `DeepSeek-V4-Pro-nvfp4-DSpark`, do so with NVFP4 draft experts. A draft layer only computes correctly if its checkpoint experts are NVFP4: the `mtp.*` routed experts of the `DeepSeek-V4-Pro-NVFP4` checkpoint are MXFP4, which `MEGAMOE_CUTEDSL` does not serve, so MTP on that checkpoint is not supported with or without this load balancer.
 * **DWDP**: not supported; `dwdp_config` must keep `dwdp_size` at 1.
-* **Fields**: only `mode`, `num_slots`, `auxiliary_sms` and `helper_slot_mode`. `num_slots` is required, must be greater than the expert count, and must be divisible by the EP size. `layer_updates_per_iter` and `initial_global_assignments` are `standard`-only and rejected in this mode.
+* **Fields**: only `mode`, `num_slots`, `auxiliary_sms`, `helper_slot_mode` and `planner`. `num_slots` is required, must be greater than the expert count, and must be divisible by the EP size. `layer_updates_per_iter` and `initial_global_assignments` are `standard`-only and rejected in this mode.
+
+### HALO-R planner
+
+`planner` selects the replica planner and its weight copy. The default, `halo_q`, is described above. `planner: halo_r` replaces both, in one kernel on the same `auxiliary_sms` CTAs:
+
+1. **Plan.** After the same routed-token count exchange, one warp computes the balanced target load and repeatedly moves the routed tokens of an overloaded rank's hottest experts to the lowest-indexed eligible rank that has room for them below that target. Each overloaded rank offers its 4 hottest experts; each receiving rank takes up to `(num_slots - num_experts) / ep_size` distinct experts, one per helper slot. Every rank computes the same plan, and every routed token is then mapped to its owner's resident slot or to a receiver's helper slot.
+2. **Copy.** A relay copy moves each replicated expert over NVLink with ordinary unicast loads and stores. The receivers of an expert split its weights into 32 KiB slices; each receiver pulls its share from the owner and writes it into the helper slot of every receiver. Only the READY flag uses multicast: it is published through the same multicast READY row as with `halo_q`. The helper slots themselves are not bound to multicast objects, so per-layer helper slots add no multicast binds as the number of MoE layers grows.
+
+```yaml
+moe_config:
+    backend: MEGAMOE_CUTEDSL
+    load_balancer:
+      mode: per_layer_dynamic
+      planner: halo_r
+      num_slots: 448     # 384 experts + 2 helper slots on each of 32 EP ranks
+      auxiliary_sms: 16  # optional; 16 is the default with halo_r
+```
+
+`planner: halo_r` works with both helper slot modes and adds these constraints:
+
+* **Helper slots**: at most 4 per rank.
+* **Parallelism**: an even EP size between 2 and 32, with at least 4 experts per rank.
+* **`auxiliary_sms`**: between 2 and 16, 16 by default: CTA 0 plans while the others map routes, and then every CTA copies its share of the relay. More SMs give the relay more copy bandwidth and leave fewer to the fused shared-expert kernel.
+* **`helper_slot_mode`**: with `per_layer_resident`, every rank keeps the same table of the expert each helper slot of a layer holds, so the relay skips a receiver whose slot already holds its expert, and an expert that a receiver keeps stays in its slot. Reloading the weights resets the table on every rank, so the next forward pass copies every helper expert again; ranks that reset different layers stop with an error.
+* **Prefill CUDA graphs**: `prefill_cuda_graph_backend: breakable` is supported. The MoE layers are captured, including the HALO-R kernel; the graph breaks only where the breakable runner already breaks (attention). Every layer call hands the device constant values: every launch publishes READY 1, and the next launch of the layer waits for every rank's READY and resets the row before its count exchange; the route wait waits for `auxiliary_sms` and then resets its counter. A replay therefore needs no host bookkeeping, and eager calls and replays can be mixed.
+* **Failures**: a HALO-R kernel that cannot plan or route (a timeout waiting for a peer, an invalid route) stops the process with a CUDA error before any routes or helper weights it computed are used.

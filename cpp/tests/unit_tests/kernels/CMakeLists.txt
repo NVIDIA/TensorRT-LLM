@@ -119,6 +119,17 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;kernels;moe-communication;gpu")
+add_tllm_gtest(
+  moeRebalanceHaloRTest
+  OWNER
+  kernel
+  SOURCES
+  moe/moeRebalanceHaloRTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-load-balance;host")
 
 set(ROUTING_KERNEL_TEST_SRC
     moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp

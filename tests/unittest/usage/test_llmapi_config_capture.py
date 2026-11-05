@@ -894,6 +894,7 @@ def test_manifest_includes_safe_load_balancer_fields():
         "moe_config.load_balancer.layer_updates_per_iter",
         "moe_config.load_balancer.mode",
         "moe_config.load_balancer.num_slots",
+        "moe_config.load_balancer.planner",
     } <= paths
     assert "moe_config.load_balancer.initial_global_assignments" not in paths
 

@@ -153,6 +153,14 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
+    # Mirror MoePerLayerDynamicLoadBalancerConfig.validate_planner_auxiliary_sms().
+    schema["$defs"][MoePerLayerDynamicLoadBalancerConfig.__name__].update(
+        {
+            "if": {"properties": {"planner": {"const": "halo_r"}}, "required": ["planner"]},
+            "then": {"properties": {"auxiliary_sms": {"minimum": 2}}},
+            "else": {"properties": {"auxiliary_sms": {"maximum": 8}}},
+        }
+    )
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

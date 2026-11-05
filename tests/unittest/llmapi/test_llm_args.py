@@ -375,6 +375,175 @@ class TestMoeConfigPerLayerDynamicEplb:
                           "helper_slot_mode": "shared_banks",
                       })
 
+    def test_planner_defaults_to_halo_q(self) -> None:
+        config = MoeConfig(load_balancer=self._per_layer_dynamic())
+        assert config.load_balancer.planner == "halo_q"
+
+    def test_accepts_halo_r_planner(self) -> None:
+        values = self._per_layer_dynamic()
+        values["planner"] = "halo_r"
+        values["helper_slot_mode"] = "shared_banks"
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.planner == "halo_r"
+        assert config.backend == "MEGAMOE_CUTEDSL"
+
+    @pytest.mark.parametrize("mode",
+                             [None, "per_layer_resident", "shared_banks"])
+    def test_halo_r_accepts_both_helper_slot_modes(self,
+                                                   mode: str | None) -> None:
+        values = self._per_layer_dynamic()
+        values["planner"] = "halo_r"
+        if mode is not None:
+            values["helper_slot_mode"] = mode
+        config = MoePerLayerDynamicLoadBalancerConfig(**values)
+        assert config.helper_slot_mode == (mode or "per_layer_resident")
+
+    # The planner rejection tests build the config directly: MoeConfig
+    # re-raises a load-balancer error with only the input dictionary in its
+    # message, which would hide the reason these tests check.
+    @pytest.mark.parametrize("planner, auxiliary_sms, valid", [
+        pytest.param("halo_q", 0, False, id="halo-q-0"),
+        pytest.param("halo_q", 1, True, id="halo-q-1"),
+        pytest.param("halo_q", 4, True, id="halo-q-4"),
+        pytest.param("halo_q", 8, True, id="halo-q-8"),
+        pytest.param("halo_q", 9, False, id="halo-q-9"),
+        pytest.param("halo_q", 16, False, id="halo-q-16"),
+        pytest.param("halo_r", 0, False, id="halo-r-0"),
+        pytest.param("halo_r", 2, True, id="halo-r-2"),
+        pytest.param("halo_r", 4, True, id="halo-r-4"),
+        pytest.param("halo_r", 12, True, id="halo-r-12"),
+        pytest.param("halo_r", 16, True, id="halo-r-16"),
+        pytest.param("halo_r", 17, False, id="halo-r-17"),
+    ])
+    def test_auxiliary_sm_limit_follows_the_planner(self, planner: str,
+                                                    auxiliary_sms: int,
+                                                    valid: bool) -> None:
+        values = self._per_layer_dynamic()
+        values.update(planner=planner,
+                      helper_slot_mode="shared_banks",
+                      auxiliary_sms=auxiliary_sms)
+        if valid:
+            config = MoePerLayerDynamicLoadBalancerConfig(**values)
+            assert config.auxiliary_sms == auxiliary_sms
+        else:
+            with pytest.raises(ValidationError, match="auxiliary_sms"):
+                MoePerLayerDynamicLoadBalancerConfig(**values)
+
+    def test_halo_r_requires_two_auxiliary_sms(self) -> None:
+        values = self._per_layer_dynamic()
+        values.update(planner="halo_r",
+                      helper_slot_mode="shared_banks",
+                      auxiliary_sms=1)
+        with pytest.raises(ValidationError,
+                           match="requires `auxiliary_sms` >= 2; got 1"):
+            MoePerLayerDynamicLoadBalancerConfig(**values)
+
+    @pytest.mark.parametrize("planner, default", [
+        pytest.param(None, 4, id="planner-unset"),
+        pytest.param("halo_q", 4, id="halo-q"),
+        pytest.param("halo_r", 16, id="halo-r"),
+    ])
+    def test_auxiliary_sm_default_follows_the_planner(self, planner: str | None,
+                                                      default: int) -> None:
+        values = self._per_layer_dynamic()
+        if planner is not None:
+            values["planner"] = planner
+        direct = MoePerLayerDynamicLoadBalancerConfig(**values)
+        config = MoeConfig(load_balancer=values)
+        assert direct.auxiliary_sms == default
+        assert config.load_balancer.auxiliary_sms == default
+        # Either planner's default leaves the field unset.
+        assert "auxiliary_sms" not in direct.model_fields_set
+
+    def test_resolved_halo_r_default_follows_a_new_planner(self) -> None:
+        values = self._per_layer_dynamic()
+        values["planner"] = "halo_r"
+        resolved = MoePerLayerDynamicLoadBalancerConfig(**values)
+        assert resolved.auxiliary_sms == 16
+
+        dumped = resolved.model_dump(exclude_unset=True)
+        dumped["planner"] = "halo_q"
+
+        assert MoePerLayerDynamicLoadBalancerConfig(**dumped).auxiliary_sms == 4
+
+    def test_halo_r_yaml_defaults_to_sixteen_auxiliary_sms(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text(
+            "mode: per_layer_dynamic\nnum_slots: 72\nplanner: halo_r\n")
+
+        config = MoeConfig(load_balancer=str(config_path))
+
+        assert config.load_balancer.planner == "halo_r"
+        assert config.load_balancer.auxiliary_sms == 16
+
+    def test_rejects_unknown_planner(self) -> None:
+        values = self._per_layer_dynamic()
+        values["planner"] = "halo_m"
+        with pytest.raises(ValidationError,
+                           match=r"planner\n\s+Input should be 'halo_q' or "
+                           r"'halo_r'"):
+            MoePerLayerDynamicLoadBalancerConfig(**values)
+
+    def test_standard_mode_rejects_planner(self) -> None:
+        with pytest.raises(ValidationError):
+            MoeConfig(load_balancer={
+                "mode": "standard",
+                "num_slots": 64,
+                "planner": "halo_r"
+            })
+
+    @pytest.mark.parametrize(
+        "num_slots, valid",
+        [
+            pytest.param(392, True, id="one-helper"),
+            pytest.param(416, True, id="four-helpers"),
+            pytest.param(424, False, id="five-helpers"),
+        ],
+    )
+    def test_halo_r_limits_helper_slots(self, num_slots: int,
+                                        valid: bool) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(
+            num_slots=num_slots,
+            planner="halo_r",
+            helper_slot_mode="shared_banks")
+        config.setup(ep_rank=0, ep_size=8)
+        if valid:
+            config.validate_expert_capacity(num_experts=384)
+        else:
+            with pytest.raises(ValueError, match="at most 4 helper slots"):
+                config.validate_expert_capacity(num_experts=384)
+
+    @pytest.mark.parametrize(
+        "ep_size, num_experts, message",
+        [
+            pytest.param(6, 384, None, id="even-ep"),
+            pytest.param(3, 384, "even EP size", id="odd-ep"),
+            pytest.param(64, 384, "even EP size", id="ep-above-32"),
+            pytest.param(32,
+                         96,
+                         "at least 4 experts per EP rank",
+                         id="three-experts-per-rank"),
+        ],
+    )
+    def test_halo_r_limits_ep_geometry(self, ep_size: int, num_experts: int,
+                                       message: str | None) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(
+            num_slots=num_experts + ep_size,
+            planner="halo_r",
+            helper_slot_mode="shared_banks")
+        config.setup(ep_rank=0, ep_size=ep_size)
+        if message is None:
+            config.validate_expert_capacity(num_experts=num_experts)
+        else:
+            with pytest.raises(ValueError, match=message):
+                config.validate_expert_capacity(num_experts=num_experts)
+
+    def test_halo_q_keeps_larger_helper_capacity(self) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=424)
+        config.setup(ep_rank=0, ep_size=8)
+        config.validate_expert_capacity(num_experts=384)
+
     def test_per_layer_dynamic_disables_decode_cuda_graph(self) -> None:
         args = TorchLlmArgs(
             model=llama_model_path,
@@ -387,6 +556,37 @@ class TestMoeConfigPerLayerDynamicEplb:
                 model=llama_model_path,
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
                 moe_config={"load_balancer": self._per_layer_dynamic()})
+
+    def test_per_layer_dynamic_rejects_breakable_graph_with_halo_q(
+            self) -> None:
+        with pytest.raises(ValidationError, match="prefill CUDA graphs"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                moe_config={"load_balancer": self._per_layer_dynamic()})
+
+    @pytest.mark.parametrize("mode", ["per_layer_resident", "shared_banks"])
+    def test_halo_r_accepts_breakable_prefill_graph(self, mode: str) -> None:
+        values = self._per_layer_dynamic()
+        values["planner"] = "halo_r"
+        values["helper_slot_mode"] = mode
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            moe_config={"load_balancer": values})
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE
+        # Decode CUDA graphs stay off for every planner.
+        assert args.cuda_graph_config is None
+
+    def test_halo_r_rejects_piecewise_prefill_graph(self) -> None:
+        values = self._per_layer_dynamic()
+        values["planner"] = "halo_r"
+        values["helper_slot_mode"] = "shared_banks"
+        with pytest.raises(ValidationError, match="prefill CUDA graphs"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                moe_config={"load_balancer": values})
 
     def test_legacy_yaml_defaults_to_standard_mode(self,
                                                    tmp_path: Path) -> None:
