@@ -2792,7 +2792,7 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         ("cutedsl.runners", "CuteDslFusedMoEBF16Runner", 4, 3),
         # The subclass production instantiates for CUTEDSL_FC12. It overrides
         # _tile_sizes, so a green result on the parent is not evidence about it.
-        ("cutedsl.fused_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.fused_fc12.nvfp4", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
     ],
 )
 def test_workload_identity_alone_does_not_prime_inner_tactics(
@@ -2954,7 +2954,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     """
     import inspect
 
-    from tensorrt_llm._torch.moe.fused_moe.cutedsl import fused_fc12 as fc12
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import nvfp4 as fc12
 
     captured = {}
 
@@ -3061,6 +3061,60 @@ def _cute_dsl_eligibility(activation: str = "Swiglu", **deployment_kwargs):
         **deployment_kwargs,
     )
     return TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, deployment)
+
+
+@pytest.mark.parametrize(
+    ("intermediate_size_per_partition", "hidden_size", "enabled"),
+    [
+        pytest.param(768, 2048, True, id="halves-are-128-multiples"),
+        # Qwen3-235B-A22B / GLM-4.5 at moe_tp_size=8: 2 * 192 = 384 splits into 192.
+        pytest.param(192, 4096, False, id="fc1-half-not-128-multiple"),
+        # GPT-OSS-120B hidden size: FC2 halves of 1440.
+        pytest.param(2880, 2880, False, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_plan_vetoes_shards_the_kernels_cannot_tile(
+    intermediate_size_per_partition, hidden_size, enabled
+):
+    """The default split halves FC1 N and FC2 N; a half that is not a 128-row
+    multiple falls back to the full-GPU kernels instead of failing at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        hidden_size=hidden_size,
+    )
+    plan = PartitionPlan(enabled=True, num_partitions=2)
+    adjusted = CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, plan)
+    assert adjusted.enabled is enabled
+    if enabled:
+        assert adjusted is plan
+    else:
+        assert "multiple of 128" in adjusted.reason_if_disabled
+    disabled = PartitionPlan(enabled=False, reason_if_disabled="policy off")
+    assert CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, disabled) is disabled
+
+
+def test_locality_domain_mixin_precedes_moe_impl_base():
+    """The mixin's lifecycle overrides chain to super(), so with the bases
+    swapped MoEImplBase's defaults would silently win; every host must list
+    the mixin first."""
+    import tensorrt_llm._torch.moe.fused_moe  # noqa: F401  (registers every leaf)
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+    from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+
+    hosts = []
+    pending = list(CuteDslLocalityDomainMixin.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        hosts.append(cls)
+        pending.extend(cls.__subclasses__())
+    assert hosts
+    for cls in hosts:
+        mro = cls.__mro__
+        if MoEImplBase in mro:
+            assert mro.index(CuteDslLocalityDomainMixin) < mro.index(MoEImplBase), cls
 
 
 def test_cute_dsl_locality_domain_rejects_eplb():
