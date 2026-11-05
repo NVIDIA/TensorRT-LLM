@@ -82,7 +82,7 @@ The prep issues the prefetch after its own wait and still releases its dependent
 (the FMHA) only at its end; the prefetch reads only the immutable weight, writes
 nothing (its keep-alive store is never taken) and waits on nothing.
 
-LL safety: armed only on decode forwards of 33..512 rows at TEP4 (sm103 and sm107); the
+LL safety: armed only on decode forwards of 33..512 rows at TEP4; the
 8-row paths and the 9..32-row band never see it.
 """
 
@@ -128,14 +128,8 @@ PREP_PREFETCH_MAX_ROWS = 64
 #: GB300 (sm_103) at 176 and 208 rows cuBLAS picks a faster kernel and keeps the call; at
 #: 40, 48 and 80 rows it splits K.
 QKV_TGV_ROWS = frozenset({144, 160, 192, 224, 240, 256})
-#: The same table on R200 (sm_107): empty. There cuBLAS's QKV pick does not split K from 136
-#: rows (every TGV tactic gives its bits), but it is faster than every TGV tactic at every
-#: captured row count of 40..512; below 136 rows
-#: no TGV tactic gives its bits. So at sm_107 the path keeps the built-in QKV GEMM and serves
-#: only the PDL norm-gates.
-QKV_TGV_ROWS_SM107 = frozenset()
 #: The table per device compute capability; any other device keeps the built-in QKV GEMM.
-QKV_TGV_ROWS_BY_CAPABILITY = {(10, 3): QKV_TGV_ROWS, (10, 7): QKV_TGV_ROWS_SM107}
+QKV_TGV_ROWS_BY_CAPABILITY = {(10, 3): QKV_TGV_ROWS}
 #: The TGV tactic of the table, as flashinfer's ``_TGV_CUTE_EXT_TACTIC_CONFIGS`` lists it:
 #: (CTA M, CTA N, A/B stages, 2-CTA MMA) = a 64 x 128 tile, 7 stages, 2-CTA.
 QKV_TGV_CONFIG = (64, 128, 7, True)
@@ -185,9 +179,6 @@ class BatchDenseGemms:
         #: and calls left to the built-in (with why, once each).
         self.counts: Dict[str, int] = {}
         self.declined: Dict[str, int] = {}
-        #: ``decode_qkv_mxfp8``'s records, when it is installed: a QKV call whose input the
-        #: post-FFN join also wrote in MXFP8 runs the MXFP8 GEMM on those operands.
-        self.decode_qkv = None
 
     @staticmethod
     def takes(rows: int) -> bool:
@@ -225,14 +216,8 @@ class BatchDenseGemms:
         ``builtin()`` runs the built-in GEMM (``Linear.apply_linear``); ``module`` is the
         re-classed ``Linear`` when the call carries no bias and no LoRA, else ``None``. The
         QKV site runs the TGV GEMM at the rows of the table; every other call runs the
-        built-in GEMM. With ``decode_qkv_mxfp8`` installed, a QKV call whose input the
-        previous layer's join also wrote in MXFP8 runs the MXFP8 GEMM on those operands.
+        built-in GEMM.
         """
-        if site.role == "qkv" and module is not None and self.decode_qkv is not None:
-            out = self.decode_qkv.take(module, input_tensor)
-            if out is not None:
-                self._count("qkv_mxfp8")
-                return out
         if site.role != "qkv" or module is None or not self.qkv_tgv_rows:
             return builtin()
         if call_rows(input_tensor) not in self.qkv_tgv_rows or not tgv_takes(module, input_tensor):

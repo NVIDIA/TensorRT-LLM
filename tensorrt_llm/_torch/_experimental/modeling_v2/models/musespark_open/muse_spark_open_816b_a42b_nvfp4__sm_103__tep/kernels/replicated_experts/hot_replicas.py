@@ -74,12 +74,7 @@ tuning context, so that window's tactics are profiled like the 64-expert window'
 then gives each of its profiles the 64-expert window's tactic where that is valid.
 
 Layers left on the built-in path (0 and 61: their experts are quantized at load, which
-the census does not cover) run the autotuner's tactic on the owner-only window. With the
-lever ``l061_tile32_pin`` (``decode_expert_tactics.owner_tactic``) their
-armed calls of ``L061_ROWS`` rows run the pinned 32-token tile instead
-(``_patch_owner_pin``): the owner-only expert ids (each expert on its owner, the others
-outside the window) and BF16 weights the autotuner's owner-window profile also runs,
-the layer's own expert tensors, ``decode_expert_tactics.run_fixed``.
+the census does not cover) run the autotuner's tactic on the owner-only window.
 """
 
 from __future__ import annotations
@@ -101,7 +96,6 @@ from ...ops.moe.hot_replica_assign import (
     MAX_ROWS,
     MIN_ROWS,
     RANKS,
-    TOP_K,
     build_table,
     hot_replica_assign,
     pack_table,
@@ -532,96 +526,6 @@ def _patch_experts(layer: _Layer, switch: HotReplicas) -> None:
     experts.forward = types.MethodType(forward, experts)
 
 
-def _patch_owner_pin(index: int, moe, rank: int, switch: HotReplicas, pinned) -> bool:
-    """Pin the tactic of the armed owner-window calls of a layer the hot path leaves
-    (``decode_expert_tactics.owner_tactic``); True if hooked. Only the native NVFP4 leaf
-    the owner-only ``replicated_experts`` window stacks (its ``_replicated_experts``)."""
-    from tensorrt_llm._torch.autotuner import AutoTuner
-    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-
-    from ...ops.moe import decode_expert_tactics as _decode_tactics
-
-    state = getattr(moe, "_replicated_experts", None)
-    if state is None or state.kind != "nvfp4" or BLOCK not in state.by_window:
-        return False
-    stacks = state.by_window[BLOCK]
-    experts = moe.experts
-    backend = _ring_buddy._backend(moe)
-    if not _ring_buddy._is_plain_swiglu(backend):
-        return False
-    previous_forward = experts.forward
-    routing = experts.routing_method
-    act_type = _ring_buddy._act_type(backend)
-    intermediate = backend.w3_w1_weight.shape[-2] // 2
-    tune_max_num_tokens = backend.max_num_tokens
-    counts = {"pinned": 0}
-
-    def forward(self, x, router_logits, *args, do_finalize=True, **kwargs):
-        rows = x.shape[0]
-        if (
-            switch.active
-            and not do_finalize
-            and not args
-            and rows in _decode_tactics.L061_ROWS
-            and isinstance(x, Fp4QuantizedTensor)
-            and not x.is_sf_swizzled
-            and not AutoTuner.get().is_tuning_mode
-        ):
-            tactic = _decode_tactics.owner_tactic(
-                x.fp4_tensor.device,
-                pinned,
-                act_type,
-                TOP_K,
-                2 * x.fp4_tensor.shape[1],
-                intermediate,
-                BLOCK,
-                rows,
-            )
-            if tactic is not None:
-                selected, weights = routing.apply(router_logits)
-                ids = _owner_ids(selected, rank, 0)
-                if counts["pinned"] == 0:
-                    logger.info(
-                        f"[musespark_open] hot_replicas: layer {index}'s {rows}-row owner-window "
-                        f"expert call runs the pinned tactic {tactic}"
-                    )
-                counts["pinned"] += 1
-                return _decode_tactics.run_fixed(
-                    tactic,
-                    [
-                        None,
-                        None,
-                        x.fp4_tensor,
-                        x.scaling_factor.reshape(-1).view(torch.float8_e4m3fn),
-                        stacks["w3_w1_weight"],
-                        stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
-                        None,
-                        None,
-                        None,
-                        None,
-                        stacks["w2_weight"],
-                        stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
-                        None,
-                        stacks["fc31_scale_c"],
-                        stacks["fc31_alpha"],
-                        stacks["fc2_alpha"],
-                        weights.to(torch.bfloat16),
-                        ids,
-                    ],
-                    EXPERTS,
-                    TOP_K,
-                    intermediate,
-                    BLOCK,
-                    routing.routing_method_type,
-                    act_type,
-                    tune_max_num_tokens,
-                )
-        return previous_forward(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
-
-    experts.forward = types.MethodType(forward, experts)
-    return True
-
-
 def _tune_window(layer: _Layer, switch: HotReplicas, x, router_logits) -> None:
     """Under the autotuner's tuning context, run the ``64 + R`` window once so its tactics
     are profiled (one layer suffices: every layer shares the shapes), then give each of
@@ -720,8 +624,7 @@ def _owner_window_tactics(window: int) -> Tuple[int, int]:
 def install(text_model, mapping: Mapping, pin_l061: bool = False) -> Optional[HotReplicas]:
     """Hook every eligible NVFP4 MoE layer of ``text_model``; returns the switch (or None).
 
-    ``pin_l061`` (``l061_tile32_pin``) pins the owner-window tactic of the layers left on
-    the built-in path (``_patch_owner_pin``).
+    ``pin_l061`` is ignored.
 
     Allocates nothing (``HotReplicas.decide`` does, on the first forward). Must run after
     the owner-window install (``ring_buddy.install(windows=1)``), whose expert and routing
@@ -751,22 +654,6 @@ def install(text_model, mapping: Mapping, pin_l061: bool = False) -> Optional[Ho
         _patch_routing(layer, switch)
         _patch_experts(layer, switch)
     text_model._hot_replicas = switch
-    from ...ops.moe import decode_expert_tactics as _decode_tactics
-
-    pinned = _decode_tactics.L061_TILE32_DEFAULT if pin_l061 else None
-    if pinned is not None:
-        hooked = [
-            index
-            for index in sorted(skipped)
-            if _patch_owner_pin(
-                index, text_model.layers[index].feed_forward, mapping.tp_rank, switch, pinned
-            )
-        ]
-        logger.info(
-            f"[musespark_open] hot_replicas: l061_tile32_pin pins {list(pinned)} "
-            f"for the owner-window expert calls of {len(_decode_tactics.L061_ROWS)} decode row "
-            f"counts on layers {hooked}"
-        )
     logger.info(
         f"[musespark_open] hot_replicas: hooks on {len(layers)} NVFP4 MoE layers (copies allocated "
         f"on the first forward of a deployment whose decode steps reach "

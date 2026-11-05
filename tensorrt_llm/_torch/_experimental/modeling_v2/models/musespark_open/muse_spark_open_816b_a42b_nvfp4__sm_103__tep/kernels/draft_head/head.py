@@ -207,11 +207,8 @@ def selector_draft_tokens(
     mapping,
     allreduce: nn.Module | None = None,
     walk=None,
-    tail=None,
-    tail_walk=None,
     *,
     transform: Optional[DraftLogitTransform],
-    rs=None,
 ):
     """Greedy DFlash 2 draft tokens ``[B, K]`` int32 from this rank's ``[B, K, shard]`` logits.
 
@@ -228,47 +225,7 @@ def selector_draft_tokens(
     the keys are then canonical and the unary values the transformed ones, so
     the tokens are the built-in ones on the transformed logits. Keyword-only
     and required, so no call site drops it by accident.
-
-    ``tail`` (``dr_draft_tail.tail.DrDraftTail``, ``draft_head_tail``) runs the steps after the
-    shard GEMM as its own launches when it ``takes`` the call and ``transform`` is None (it
-    ranks the untransformed keys), with the same results; ``tail_walk`` (``accepted,
-    num_accepted, batch_indices, kv_lens, rewind``) then stands in for the
-    ``path_walk_tail`` walk. A tail installed for rejection sampling only
-    (``DrDraftTail.rs_only``) takes no greedy step.
-    ``rs`` (rejection sampling, ``RsWalkArgs``) is passed to the tail, whose walk then
-    draws the drafts from q and writes their q records; only the tail can, so ``rs``
-    with a tail that does not take the call raises. With ``rs`` the tail also takes a
-    step of a drafter that declares a logit transform: the walk applies that transform
-    to q itself (``RsWalkArgs.transform``), and its candidates are the top keys of the
-    untransformed shard, which the monotone transform ranks alike up to ties.
     """
-    if (
-        tail is not None
-        and (rs is not None or (transform is None and not getattr(tail, "rs_only", False)))
-        and tail.takes(local_logits, block_hidden_states, selector)
-    ):
-        if rs is not None:
-            return tail.draft_tokens(
-                local_logits,
-                block_hidden_states,
-                anchor_tokens,
-                selector,
-                draft_path_walk if walk is None else walk,
-                tail_walk,
-                rs=rs,
-            )
-        return tail.draft_tokens(
-            local_logits,
-            block_hidden_states,
-            anchor_tokens,
-            selector,
-            draft_path_walk if walk is None else walk,
-            tail_walk,
-        )
-    if rs is not None:
-        raise RuntimeError(
-            "[musespark_open] draft head: rejection-sampled drafts need the dr draft tail to take the step"
-        )
     requests, positions, shard = local_logits.shape
     local = local_logits.reshape(requests * positions, shard)
     canon = canon_kwargs(transform)
@@ -535,11 +492,6 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
                 reason = NOT_DEFERRED
             if reason is None:
                 reason = self._shard_reason(gen_logits, spec_metadata, full_vocab)
-                if reason == SAMPLED_DRAFTS and self.__dict__.get("_rs") is not None:
-                    # rejection_sampler: a sampled step stays untransformed; the fused walk
-                    # applies the transform to its q, the fallback before the built-in sampler
-                    # (``verify_fold.fold.SpecLoopFoldDFlashWorker._sample_dflash2_block``).
-                    reason = None
             if reason is None and not transform.matches(draft_model):
                 reason = STALE_TABLES
             if reason is None:
@@ -593,7 +545,6 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
                 spec_metadata,
             )
         if takes:
-            tail = self.__dict__.get("_dr_draft_tail")
             tokens = selector_draft_tokens(
                 gen_logits,
                 block_hidden_states,
@@ -602,7 +553,6 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
                 self.mapping,
                 self.__dict__.get("_draft_head_allreduce"),
                 transform=self._draft_head_transform_for(draft_model, gen_logits),
-                **({} if tail is None else {"tail": tail}),
             )
             stand_in = tokens.unsqueeze(-1).expand(*tokens.shape, full_vocab)
             setattr(stand_in, TOKENS_ATTR, tokens)
@@ -627,33 +577,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
         if tokens is not None:
             return tokens
         tokens = super().sample_draft_tokens(logits, spec_metadata, batch_size, **kwargs)
-        rs = self.__dict__.get("_rs")
-        if (
-            rs is not None
-            and spec_metadata.wants_advanced_draft_sampling
-            and logits.dim() == 3
-            and rs.ready(spec_metadata)
-        ):
-            # Fused rejection sampling (kernels/rs_sampler): the drafted slots' q records from the selector
-            # output and the dense q the stock sampler just drew from.
-            rs.sparsify(spec_metadata, kwargs.get("num_contexts", 0), logits, tokens)
         return tokens
-
-    def write_context_onehot_draft_probs(
-        self, spec_metadata, num_contexts, num_gens, draft_len, gen_vocab=None
-    ):
-        super().write_context_onehot_draft_probs(
-            spec_metadata, num_contexts, num_gens, draft_len, gen_vocab
-        )
-        rs = self.__dict__.get("_rs")
-        if (
-            rs is not None
-            and num_contexts > 0
-            and getattr(spec_metadata, "use_rejection_sampling", False)
-            and rs.ready(spec_metadata)
-        ):
-            # Fused rejection sampling: the context slots' records match the one-hot just written.
-            rs.write_onehot(spec_metadata.batch_slot_ids[:num_contexts])
 
 
 def unsupported_reason(worker, draft_model) -> str | None:

@@ -55,7 +55,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import gdc_wait
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
@@ -67,15 +66,6 @@ BLOCK = EXPERTS // RANKS
 TOP_K = 8
 #: The ring sizes the kernel serves: expert-parallel ranks -> experts per block.
 RING_SIZES = {8: EXPERTS // 8, 4: EXPERTS // 4}
-
-
-#: The ``tep8_ring_buddy_pdl`` lever (``configure(rb_pdl=True)``): the 8-rank ring's
-#: table-writing call (``meta_tile``, the TEP8 decode prologue's) launches as a PDL dependent of
-#: the routing kernel before it: the kernel's first statement is ``griddepcontrol.wait`` (nothing
-#: of its producer's is read before it), so its launch and prologue overlap the routing kernel's
-#: tail instead of following it (the traced top-8 -> ring buddy gap is 0.7 us). Launch timing
-#: only: values unchanged.
-_RB_PDL = False
 
 
 def block_of(ranks: int) -> int:
@@ -92,9 +82,7 @@ def block_of(ranks: int) -> int:
 
 
 #: Largest ``M * TOP_K`` one program handles: 64 decode rows (eight requests' K = 7 verify
-#: steps), so ring-buddy balance also places the 33..64-row TEP8 steps under the
-#: ``tep8_ring_buddy_wide`` lever (``ring_buddy.configure(tep8_max_rows=64)``); the kernel is
-#: the same [SLOTS, RANKS] program at a 512-slot tile.
+#: steps): the same [SLOTS, RANKS] program at a 512-slot tile.
 MAX_SLOTS = 512
 
 #: The half window (``half_window_experts``, tep4): a block's upper half starts at this
@@ -112,7 +100,7 @@ HALF_SPAN = 96
 #: 3.08 / 2.37 / 1.73 / 2.15; a one-kernel BF16 cast of the weights is 0.8).
 NUM_WARPS = 4
 
-#: The ``prerouted_experts`` lever at TP8: a call with ``meta_tile`` also writes the routing
+#: At TP8 a call with ``meta_tile`` also writes the routing
 #: tables TRTLLM-gen's expert op reads for the two-window ``[own block | predecessor's block]``
 #: call (``local_expert_offset=0``, ``local_num_experts=2*BLOCK``): expanded->permuted (``e2p``,
 #: -1 where the slot is not this rank's), permuted->token (``p2t``), every CTA's expert and row
@@ -127,62 +115,6 @@ META_FIELDS = ("e2p", "p2t", "c2b", "c2m", "nnc", "tnp")
 #: 32 / 16 rows: 8 warps -3.09 / -2.86 / -2.54 / -1.73 us against the routing-kernel chain,
 #: 4 warps -2.43 / -2.48 / -2.83 / -1.63).
 _META_WARPS = 8
-
-
-#: The ``tep8_tile_placement`` lever (``configure(tile_placement=True, tile_min_rows=...)``):
-#: places the TEP8 prerouted calls (``meta_tile``, balanced, two windows) of at least
-#: ``tile_min_rows`` rows (default 33: bs5-8; the lever serves 41: bs6-8) by expert cost instead
-#: of expert count. An expert's cost is ``A + B * (tiles - 1)`` (tiles of ``meta_tile`` tokens;
-#: ``_TILE_COST`` = ``(A, B)`` in 0.1 us, 20 and 11: FP4 FC1 + FC2 stream an expert in ~2.0 us
-#: and add ~1.1 us per extra tile). The ring flow is the count rule's on those costs; block ``b``
-#: then moves its present experts in descending local index while the moved cost stays short of
-#: its outflow, the last one only if it lands closer. Every rank derives the same placement
-#: (integer arithmetic on the same ids), so each slot still runs on exactly one rank; only which
-#: experts move changes, so it is accuracy-equivalent to the count rule, not bitwise (per-rank
-#: finalize partials). Off: the count rule.
-_TILE_PLACEMENT = False
-_TILE_MIN_ROWS = 33
-_TILE_COST = (20, 11)
-
-
-def configure(
-    *, rb_pdl: bool = False, tile_placement: bool = False, tile_min_rows: int = 33
-) -> None:
-    """Set the settings this module reads when it launches the placement kernel.
-
-    ``lever_settings.apply`` sets them from the model's plan before any install; the defaults
-    are the stock path.
-
-    Args:
-        rb_pdl: the ``tep8_ring_buddy_pdl`` lever: the 8-rank ring's table-writing call
-            launches as a PDL dependent of the routing kernel (``_RB_PDL``).
-        tile_placement: the ``tep8_tile_placement`` lever: TEP8 prerouted calls of at least
-            ``tile_min_rows`` rows place experts by tile cost (``_TILE_PLACEMENT``).
-        tile_min_rows: the fewest rows a call places by tile cost (``_TILE_MIN_ROWS``).
-    """
-    global _RB_PDL, _TILE_PLACEMENT, _TILE_MIN_ROWS
-    _RB_PDL = bool(rb_pdl)
-    _TILE_PLACEMENT = bool(tile_placement)
-    _TILE_MIN_ROWS = int(tile_min_rows)
-    if _TILE_PLACEMENT:
-        try:
-            from tensorrt_llm.logger import logger as _logger
-
-            _logger.info(
-                f"[musespark_open] tep8_tile_placement: prerouted calls of >= {_TILE_MIN_ROWS} "
-                f"rows place experts by cost {_TILE_COST[0]} + {_TILE_COST[1]} x (tiles - 1) "
-                "(0.1 us) on the two-window ring"
-            )
-        except Exception:  # noqa: BLE001 - logging only
-            pass
-
-
-def expert_cost(tokens: int, tile: int, cost=_TILE_COST) -> int:
-    """The tile placement's cost of an expert (0.1 us) for ``tokens`` tokens in ``tile``-token
-    tiles (0 when absent)."""
-    if tokens <= 0:
-        return 0
-    return cost[0] + cost[1] * ((tokens + tile - 1) // tile - 1)
 
 
 def meta_sizes(rows: int, window: int, tile: int) -> Dict[str, int]:
@@ -243,15 +175,7 @@ def _ring_buddy_assign_kernel(
     META: tl.constexpr,
     TILE: tl.constexpr,
     CTAS: tl.constexpr,
-    TILEW: tl.constexpr = False,
-    COST_A: tl.constexpr = 20,
-    COST_B: tl.constexpr = 11,
-    PDL: tl.constexpr = False,
 ):
-    if PDL:
-        # tep8_ring_buddy_pdl: wait for the routing kernel (a PDL predecessor) before reading
-        # anything it wrote
-        gdc_wait()
     tl.static_assert(BLOCK == 32 or BLOCK == 64, "one 32- or 64-bit presence word per block")
     tl.static_assert(not HALF or (BLOCK == 64 and BALANCE), "the half window: tep4, balanced")
     WIDE: tl.constexpr = BLOCK == 64
@@ -305,70 +229,13 @@ def _ring_buddy_assign_kernel(
     else:
         x = tl.zeros([RANKS], dtype=tl.int32)
 
-    if TILEW:
-        # The tile placement: the same ring flow on expert costs (A + B * (tiles - 1), 0.1 us)
-        # and the movers of each block in descending local index while the moved cost stays
-        # short of the block's outflow (the last one only if the outflow is then overshot by no
-        # more than it was missed). Pure integer arithmetic on the step's ids.
-        tl.static_assert(BALANCE and not HALF, "tile placement: the balanced two-window placement")
-        hist = tl.histogram(
-            tl.where(smask, g, EXPERTS), 2 * EXPERTS
-        )  # [2E]; bin E takes the masked slots
-        cnt2 = tl.reshape(hist, (2, EXPERTS))
-        first = tl.arange(0, 2)[:, None] == 0
-        cnt = tl.sum(tl.where(first, cnt2, 0), axis=0)  # [EXPERTS] tokens per expert
-        tiles_e = (cnt + TILE - 1) // TILE
-        cost_e = tl.where(cnt > 0, COST_A + COST_B * (tiles_e - 1), 0)  # [EXPERTS]
-        cost_rb = tl.reshape(cost_e, (RANKS, BLOCK))  # [block, local index]
-        wload = tl.sum(cost_rb, axis=1)  # [RANKS]
-        wspan = ranks + 1
-        wback = (ranks[:, None] - ranks[None, :] + RANKS) % RANKS
-        winarc = wback[:, None, :] < wspan[None, :, None]
-        warc = tl.sum(tl.where(winarc, wload[None, None, :], 0), axis=2)  # [r, n]
-        wneed = tl.where(
-            wspan[None, :] == RANKS,
-            (warc + RANKS - 1) // RANKS,
-            (warc + wspan[None, :]) // (wspan[None, :] + 1),
-        )
-        wt = tl.max(tl.max(wneed, axis=1), axis=0)
-        wx = tl.max(
-            tl.maximum(warc - wspan[None, :] * wt, 0), axis=1
-        )  # [RANKS] cost to move out of each block
-        after_c = tl.cumsum(
-            cost_rb, axis=1, reverse=True
-        )  # cost of the experts at or above each local index
-        before_c = after_c - cost_rb
-        wxb = wx[:, None]
-        move_t = (
-            (cost_rb > 0) & (before_c < wxb) & (2 * wxb >= before_c + after_c)
-        )  # [RANKS, BLOCK]
-        # The count rule's movers on the same grid (present experts with fewer than x[b] present above them); the
-        # step takes the tile rule only where its busiest rank costs less than the count rule's (ties: count).
-        pres = (cost_rb > 0).to(tl.int32)  # codespell:ignore
-        above_n = tl.cumsum(pres, axis=1, reverse=True) - pres  # codespell:ignore
-        move_c = (pres > 0) & (above_n < x[:, None])  # codespell:ignore
-        from_prev_r = ((ranks[:, None] + RANKS - 1) % RANKS) == ranks[
-            None, :
-        ]  # [r, b]: block b moves onto r
-        stay_t = tl.sum(tl.where(move_t, 0, cost_rb), axis=1)
-        out_t = tl.sum(tl.where(move_t, cost_rb, 0), axis=1)
-        stay_c = tl.sum(tl.where(move_c, 0, cost_rb), axis=1)
-        out_c = tl.sum(tl.where(move_c, cost_rb, 0), axis=1)
-        max_t = tl.max(stay_t + tl.sum(tl.where(from_prev_r, out_t[None, :], 0), axis=1), axis=0)
-        max_c = tl.max(stay_c + tl.sum(tl.where(from_prev_r, out_c[None, :], 0), axis=1), axis=0)
-        move = tl.where(max_t < max_c, move_t, move_c)
-        moved_e = tl.reshape(move.to(tl.int32), (EXPERTS,))
-        mv = tl.gather(moved_e, g, 0)  # [SLOTS]
-        er = (blk + mv) % RANKS
-        x = tl.sum(move.to(tl.int32), axis=1)  # [RANKS] experts moved (for the stats)
-    else:
-        # The x[b] present experts of block b with the highest local index move:
-        # a slot's expert moves when fewer than x[b] present experts of its block
-        # sit above it.
-        word_s = tl.reduce(tl.where(in_rank, word[None, :], no_bits), 1, _bit_or)  # [SLOTS]
-        above = _popc((word_s >> shift) >> 1, WIDE)
-        x_blk = tl.sum(tl.where(in_rank, x[None, :], 0), axis=1)  # [SLOTS]
-        er = (blk + (above < x_blk).to(tl.int32)) % RANKS
+    # The x[b] present experts of block b with the highest local index move:
+    # a slot's expert moves when fewer than x[b] present experts of its block
+    # sit above it.
+    word_s = tl.reduce(tl.where(in_rank, word[None, :], no_bits), 1, _bit_or)  # [SLOTS]
+    above = _popc((word_s >> shift) >> 1, WIDE)
+    x_blk = tl.sum(tl.where(in_rank, x[None, :], 0), axis=1)  # [SLOTS]
+    er = (blk + (above < x_blk).to(tl.int32)) % RANKS
 
     if HALF:
         # A moved expert lies in its block's upper half, whose copy sits at local ids
@@ -423,56 +290,6 @@ def _ring_buddy_assign_kernel(
     x_prev = tl.sum(tl.where(from_prev, x[None, :], 0), axis=1)
     tl.store(stats_ptr + ranks, load)
     tl.store(stats_ptr + RANKS + ranks, load - x + x_prev)
-
-
-def place_tile_reference(flat: List[int], ranks: int, tile: int, cost=_TILE_COST) -> List[int]:
-    """The tile placement in plain Python: for each slot's expert, the rank that runs it (the
-    kernel's integer rule)."""
-    size = block_of(ranks)
-    tokens = {}
-    for e in flat:
-        tokens[e] = tokens.get(e, 0) + 1
-    cost_e = [expert_cost(tokens.get(e, 0), tile, cost) for e in range(EXPERTS)]
-    wload = [sum(cost_e[b * size : (b + 1) * size]) for b in range(ranks)]
-    arc = [
-        [sum(wload[(r - k) % ranks] for k in range(n)) for n in range(1, ranks + 1)]
-        for r in range(ranks)
-    ]
-    t = 0
-    for r in range(ranks):
-        for n in range(1, ranks + 1):
-            need = -(-arc[r][n - 1] // ranks) if n == ranks else -(-arc[r][n - 1] // (n + 1))
-            t = max(t, need)
-    x = [max(0, max(arc[r][n - 1] - n * t for n in range(1, ranks + 1))) for r in range(ranks)]
-    moved_t = set()
-    for b in range(ranks):
-        acc = 0
-        for i in range(size - 1, -1, -1):
-            e = b * size + i
-            c = cost_e[e]
-            if c == 0:
-                continue
-            before, after = acc, acc + c
-            if before < x[b] and 2 * x[b] >= before + after:
-                moved_t.add(e)
-            acc = after
-    # the count rule (balance_ring on distinct counts, highest local indexes move)
-    load = [sum(1 for e in range(b * size, (b + 1) * size) if cost_e[e]) for b in range(ranks)]
-    xc = balance_ring(load)[1]
-    moved_c = set()
-    for b in range(ranks):
-        in_block = [e for e in range(b * size, (b + 1) * size) if cost_e[e]]
-        moved_c.update(sorted(in_block, reverse=True)[: xc[b]])
-
-    def busiest(moved):
-        c = [0] * ranks
-        for e in range(EXPERTS):
-            if cost_e[e]:
-                c[(e // size + (e in moved)) % ranks] += cost_e[e]
-        return max(c)
-
-    moved = moved_t if busiest(moved_t) < busiest(moved_c) else moved_c
-    return [(e // size + (e in moved)) % ranks for e in flat]
 
 
 def balance_ring(load: List[int]) -> Tuple[int, List[int]]:
@@ -564,15 +381,6 @@ class RingBuddyAssign(OpWrapper):
             meta["tile"] = meta_tile
             ctas = max(16, triton.next_power_of_2(sizes["c2b"]))
         dummy = stats
-        tilew = (
-            _TILE_PLACEMENT
-            and meta is not None
-            and balance
-            and not half
-            and ranks == 8
-            and selected.shape[0] >= _TILE_MIN_ROWS
-        )
-        pdl = _RB_PDL and meta is not None and ranks == 8
         _ring_buddy_assign_kernel[(1,)](
             selected,
             weights,
@@ -597,12 +405,7 @@ class RingBuddyAssign(OpWrapper):
             META=meta is not None,
             TILE=meta_tile if meta is not None else 8,
             CTAS=ctas,
-            TILEW=tilew,
-            COST_A=_TILE_COST[0],
-            COST_B=_TILE_COST[1],
-            PDL=pdl,
             num_warps=_META_WARPS if meta is not None else NUM_WARPS,
-            launch_pdl=pdl,
         )
         if meta is not None:
             return local_ids, weights_bf16, stats, meta

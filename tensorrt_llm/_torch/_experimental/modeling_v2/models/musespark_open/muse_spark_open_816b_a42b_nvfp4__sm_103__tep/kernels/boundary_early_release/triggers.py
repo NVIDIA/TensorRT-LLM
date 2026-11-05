@@ -101,35 +101,6 @@ BOUNDARY_TRIGGER = "entry"
 #: When the norm-gate kernel lets the output projection launch: right after its wait.
 NORM_GATE_TRIGGER = "after_wait"
 
-#: ``norm_gate_pdl_max_rows`` (``configure``) raises the row bound of the PDL norm-gate copy from 8
-#: (one request) to N <= 128 on decode steps that ``batch_dense_gemms`` does not serve (it is not
-#: composed: the TEP8 composition's multi-request steps of 16..64 rows). Up to 128 rows the
-#: built-in ``apply_output_gate`` launches exactly the Triton ``_attention_norm_gate_kernel`` (same
-#: grid, num_warps 4) that ``ops/attention/norm_gate`` copies statement for statement, so the result
-#: is bitwise; above 128 the built-in runs the CuTe ``rmsnorm_gate``, which this copy is not, so the
-#: bound is capped at 128. What changes is the launch: PDL with the after-wait trigger, so the
-#: output projection (a split-K GEMM that loads its weight before its own wait) launches early and
-#: pre-stages its weight instead of launching after a plain kernel. 0 (the default): the stock
-#: bound (8).
-_PDL_MAX_ROWS = min(128, _norm_gate.MAX_ROWS)
-
-
-def configure(*, norm_gate_pdl_max_rows: int = 0) -> None:
-    """Set the PDL norm-gate's row bound on decode steps ``batch_dense_gemms`` does not serve.
-
-    ``lever_settings.apply`` sets it from the model's plan before any install. The bound is
-    ``norm_gate_pdl_max_rows`` clamped to ``ops/attention/norm_gate``'s 8 rows at least and 128 at
-    most, so 0 keeps 8.
-    """
-    global _PDL_MAX_ROWS
-    _PDL_MAX_ROWS = min(128, max(_norm_gate.MAX_ROWS, int(norm_gate_pdl_max_rows or 0)))
-    if _PDL_MAX_ROWS > _norm_gate.MAX_ROWS:
-        logger.info(
-            "[musespark_open] boundary_early_release: the PDL norm-gate also takes decode steps of "
-            f"{_norm_gate.MAX_ROWS + 1}..{_PDL_MAX_ROWS} rows where batch_dense_gemms is not "
-            f"composed (norm_gate_pdl_max_rows={_PDL_MAX_ROWS})"
-        )
-
 
 class _NormGatePdl:
     """The output gate of a decode step through ``ops/attention/norm_gate``.
@@ -176,11 +147,7 @@ class _NormGatePdl:
         )
 
     def _pdl_max_rows(self) -> int:
-        """8 (the stock bound) unless ``norm_gate_pdl_max_rows`` (``configure``) raises it and
-        ``batch_dense_gemms``, which serves the larger steps when composed, is not."""
-        if getattr(self, "_batch_dense_gemms", None) is not None:
-            return _norm_gate.MAX_ROWS
-        return _PDL_MAX_ROWS
+        return _norm_gate.MAX_ROWS
 
     def _fits_norm_gate(self, attention_output, gate) -> bool:
         """Exactly when the built-in method would launch its Triton kernel, at 1-8 rows (up to
@@ -321,9 +288,7 @@ def weights_before_wait_rows(kernels: Sequence[str]) -> FrozenSet[int]:
     )
 
 
-def drop_converted_prefetches(
-    model, plan, qkv: bool, wide_qkv: Optional[str] = None
-) -> Dict[str, Tuple[int, FrozenSet[int]]]:
+def drop_converted_prefetches(model, plan, qkv: bool) -> Dict[str, Tuple[int, FrozenSet[int]]]:
     """Drop the ``dense_gemm_prefetch`` prefetch of the weights whose GEMM edge this fast path converts.
 
     ``qkv``: the unpooler's prefetch of the next layer's QKV weight, on every
@@ -332,20 +297,14 @@ def drop_converted_prefetches(
     (``weights_before_wait_rows``; the unpooler's and QKV's calls of
     one step have the same rows), and only when the plan launches with
     programmatic dependent launch: without it the consumer cannot start early,
-    and the prefetch is the only thing that streams its weight. With
-    ``wide_qkv`` (``next_qkv_prefetch``'s wide setting, the one its ``install``
-    gets; None is its ``WIDE_OFF``) other than off it is also dropped at the
-    9..32 row counts of the plan's wide QKV table that ``next_qkv_prefetch.drop_rows``
-    names. Returns, per site, how many layers dropped it and at which row counts,
+    and the prefetch is the only thing that streams its weight.
+    Returns, per site, how many layers dropped it and at which row counts,
     for the log line.
     """
-    from ..next_qkv_prefetch.prefetch import WIDE_OFF, drop_rows
-
     if plan is None or not plan.prefetch or not plan.enable_pdl:
         return {}
     none: FrozenSet[int] = frozenset()
-    wide = drop_rows(plan, WIDE_OFF if wide_qkv is None else wide_qkv) if qkv else none
-    rows = {"qkv": weights_before_wait_rows(plan.kernels["qkv"]) | wide if qkv else none}
+    rows = {"qkv": weights_before_wait_rows(plan.kernels["qkv"]) if qkv else none}
     dropped = {site: 0 for site in rows}
     layers = list(model.layers)
     for index, layer in enumerate(layers):

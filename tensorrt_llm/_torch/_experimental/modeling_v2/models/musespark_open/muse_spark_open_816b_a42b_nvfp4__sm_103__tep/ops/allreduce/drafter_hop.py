@@ -89,8 +89,8 @@ stream of the step is live during the drafter forward (the ``context_kv_fork`` s
 joins the main stream before the drafter's first hop), so no kernel of this rank holds an SM
 the hop's clusters wait for. Up to 32 rows (32 clusters = 256 CTAs) every cluster of the call
 is resident together on a GB300 (at most two 128-thread CTAs per SM), so progress needs no
-dispatch order. Above that (sm103's served 56 rows are 448 CTAs on 152 SMs, sm107's served 64
-rows are 512 CTAs on 212 SMs, and the qualification tests' 64..256 rows) not every cluster
+dispatch order. Above that (sm103's served 56 rows are 448 CTAs on 152 SMs,
+and the qualification tests' 64..256 rows) not every cluster
 need be resident at once, and progress
 also relies on CTAs dispatched in grid order on every rank (the assumption the built-in MNNVL
 all-reduce kernels and ``post_attn_hop_wide`` make, which CUDA does not guarantee): the
@@ -139,10 +139,8 @@ WIDE_MAX_ROWS = 256
 #: Rows of the served wide workspace (``wide_drafter_hops``) per compute capability
 #: (``wide_served_rows``). sm103: the drafter blocks of 2..7 requests at K = 7, where the
 #: one-shot hop is faster than the built-in all-reduce, convolution and add-RMSNorm on
-#: GB300 (at 8 requests the two tie; above, the built-in two-shot all-reduce wins). sm107:
-#: the blocks of 2..8 requests; on Rubin the one-shot hop is still the faster one at 64 rows
-#: and the slower one from 128 rows on.
-WIDE_SERVED_ROWS_BY_SM: dict[tuple[int, int], int] = {(10, 3): 56, (10, 7): 64}
+#: GB300 (at 8 requests the two tie; above, the built-in two-shot all-reduce wins).
+WIDE_SERVED_ROWS_BY_SM: dict[tuple[int, int], int] = {(10, 3): 56}
 
 
 def wide_served_rows(capability: Optional[Tuple[int, int]] = None) -> int:
@@ -950,8 +948,8 @@ class DrafterHopWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-                raise RuntimeError("the fused drafter hop runs on SM103 or SM107 only")
+            if torch.cuda.get_device_capability(self.device) != (10, 3):
+                raise RuntimeError("the fused drafter hop runs on SM103 only")
             for tensor in pre_wait:
                 if (
                     tensor.device != self.device

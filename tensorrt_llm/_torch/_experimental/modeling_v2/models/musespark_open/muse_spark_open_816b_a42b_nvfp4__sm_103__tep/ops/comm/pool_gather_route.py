@@ -58,7 +58,7 @@ groups take the tag and slot from the row state as the previous call left
 it, which the quantizing warps advance only after the routing warps signalled
 that they have read it.
 
-Wide calls (``wide_prologue``, TP4): on an inbox of ``WIDE_MAX_ROWS`` rows
+Wide calls (TP4): on an inbox of ``WIDE_MAX_ROWS`` rows
 (``ProjectionInbox(max_rows=WIDE_MAX_ROWS)``) a call may carry 1..32 rows, routing only
 (``PLACE_NONE``; at more than 8 rows the experts are the built-in ones, which read only
 the routing memo). Each CTA then exchanges only its own rows' logit blocks (the

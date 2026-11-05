@@ -20,15 +20,6 @@ class the other draft fast paths left the worker with, the way
 overrides ``_compact_ctx_window``. Operands the op does not take (another arena
 dtype or layout, more than ``MAX_GENS`` generation rows) run the built-in
 method.
-
-``step_window_compact`` (``install_steps``) runs the same in-place compaction on
-the steps that still reach ``_compact_ctx_window`` where the context-K/V fork
-compacts its decode steps itself (the windowed commit of the architectures in
-``dispatch.WINDOWED_COMMIT_SMS``): the mixed steps, whose generation rows store
-their context K/V in the built-in prepare. Its class
-(``StepWindowCompactDFlashWorker``) is not a ``WindowCompactDFlashWorker``, so the
-fork keeps its windowed commit (``context_kv_fork.fork.compacts_after_join`` stays
-False) and a decode step the fork takes runs as before.
 """
 
 from __future__ import annotations
@@ -55,20 +46,6 @@ class WindowCompactDFlashWorker(DFlashWorker):
 
     def _compact_ctx_window(self, slots) -> None:
         if not _compact_in_place(self, slots, "drafter_window_compact"):
-            super()._compact_ctx_window(slots)
-
-
-class StepWindowCompactDFlashWorker(DFlashWorker):
-    """The built-in ``DFlashWorker`` whose ``_compact_ctx_window`` runs ``ctx_window_compact``.
-
-    The same compaction as ``WindowCompactDFlashWorker``, for a worker whose context-K/V
-    fork compacts its own decode steps (``install_steps``). A separate class, not a
-    subclass of ``WindowCompactDFlashWorker``, so the fork keeps its windowed commit.
-    Never constructed: ``install_steps`` re-classes the worker.
-    """
-
-    def _compact_ctx_window(self, slots) -> None:
-        if not _compact_in_place(self, slots, "step_window_compact"):
             super()._compact_ctx_window(slots)
 
 
@@ -164,31 +141,5 @@ def install(spec_worker) -> bool:
     logger.info(
         "[musespark_open] drafter_window_compact: the windowed drafter arena's per-step compaction "
         f"runs in place in two launches (worker class {type(spec_worker).__name__})"
-    )
-    return True
-
-
-def install_steps(spec_worker) -> bool:
-    """Re-class the DFlash worker to run ``StepWindowCompactDFlashWorker``'s compaction.
-
-    For a worker whose context-K/V fork compacts its own decode steps on the side stream
-    (the windowed commit): every step that still reaches ``_compact_ctx_window`` -- the
-    built-in prepare of a mixed step's generation rows -- compacts in place. A worker
-    that already runs ``WindowCompactDFlashWorker``'s compaction is left as it is.
-    Idempotent. Returns whether this call changed the worker's class.
-
-    Raises:
-        ValueError: when the worker cannot take it (``unsupported_worker_reason``).
-    """
-    if isinstance(spec_worker, WindowCompactDFlashWorker):
-        return False
-    if not _recompose(
-        spec_worker, StepWindowCompactDFlashWorker, "step_window_compact", "StepWindowCompact"
-    ):
-        return False
-    logger.info(
-        "[musespark_open] step_window_compact: the windowed drafter arena's compaction of the "
-        "steps the context-K/V fork leaves (mixed steps) runs in place in two launches "
-        f"(worker class {type(spec_worker).__name__})"
     )
     return True

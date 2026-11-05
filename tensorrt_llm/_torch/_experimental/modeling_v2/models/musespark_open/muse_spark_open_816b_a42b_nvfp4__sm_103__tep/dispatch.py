@@ -94,12 +94,6 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("preattn_prep", "swa_paged_decode"),
     ),
     FastPath(
-        "wide_swa_block",
-        "sliding-window decode attention block of 2..4-request decode steps in one call",
-        "construct",
-        ("swa_block",),
-    ),
-    FastPath(
         "full_attention_prep_append",
         "full-attention layers' K/V append folded into the decode prep",
         "construct",
@@ -114,12 +108,6 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     FastPath(
         "full_attention_prep_fold",
         "full-attention decode prep folded into the split-KV FMHA",
-        "construct",
-        ("full_attention_split_kv",),
-    ),
-    FastPath(
-        "wide_full_attention",
-        "full-attention folded prep, split-KV partials and merge of 2..4-request decode steps",
         "construct",
         ("full_attention_split_kv",),
     ),
@@ -139,21 +127,8 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "multi-request decode FMHA over an over-subscribed KV split, 72..512 rows",
         "construct",
     ),
-    FastPath(
-        "mixed_step_gen_rows",
-        "full-attention generation rows of mixed steps with 9..64 generation requests on "
-        "multi_request_split_kv, context rows on the thop op",
-        "construct",
-        ("multi_request_split_kv",),
-    ),
     # Dense projections and prefetch.
     FastPath("dense_gemms", "dense projections on one named kernel per shape", "construct"),
-    FastPath(
-        "wide_dense_gemms",
-        "dense projections of 9..32-row decode steps on flashinfer's split-K at sm107 tep4",
-        "construct",
-        ("dense_gemms",),
-    ),
     FastPath(
         "dense_gemm_prefetch",
         "L2 prefetch of the next dense projection's weight",
@@ -178,12 +153,6 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "post_attention_hop",
         "attention-side all-reduce, residual join and pre-FFN norm in one launch",
         "construct",
-    ),
-    FastPath(
-        "wide_post_attention_hop",
-        "post-attention hop of 9..32-row decode steps on a wide TP4 transport",
-        "construct",
-        ("post_attention_hop",),
     ),
     FastPath(
         "attention_output_into_hop",
@@ -247,21 +216,9 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("moe_prologue", "dense_gemms"),
     ),
     FastPath(
-        "wide_prologue",
-        "MoE prologue and projection gathers of 16..32-row decode steps on wide TP4 inboxes",
-        "construct",
-        ("moe_prologue",),
-    ),
-    FastPath(
         "finalize_transport",
         "expert finalize all-reduce on the fused hop's transport",
         "construct",
-    ),
-    FastPath(
-        "wide_finalize_transport",
-        "expert finalize all-reduce of 17..32-token calls on a 32-token TP4 transport layout",
-        "construct",
-        ("finalize_transport",),
     ),
     FastPath(
         "router_gemm",
@@ -295,12 +252,6 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     # persistent_experts and bf16_routed_experts run over the ring-buddy stack with
     # replicated_experts, else over the rank's own expert block (the owner-only window).
     FastPath("persistent_experts", "NVFP4 experts as one persistent launch", "load"),
-    FastPath(
-        "wide_persistent_experts",
-        "NVFP4 experts of 9..16-row decode steps on the persistent kernel's wide build",
-        "load",
-        ("persistent_experts",),
-    ),
     FastPath(
         "half_window_experts",
         "the ring predecessor's upper expert half on each TP4 rank, balanced per step",
@@ -354,12 +305,6 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("draft_head",),
     ),
     FastPath("drafter_fc_shard", "drafter fc projection column-sharded", "draft"),
-    FastPath(
-        "drafter_fc_inbox",
-        "TP4 sharded drafter fc gathered over the tray's NVLink",
-        "draft",
-        ("drafter_fc_shard",),
-    ),
     FastPath("fused_accept", "acceptance and forced acceptance in one launch", "draft"),
     FastPath("drafter_fixed_gemms", "drafter GEMMs on fixed low-M tactics", "draft"),
     FastPath("context_kv_fork", "drafter context-K/V store on a side stream", "draft"),
@@ -388,8 +333,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "wide_drafter_hops",
-        "the drafter all-reduce hops of 9..56-row (sm107: 9..64-row) block decodes on a wide "
-        "one-shot transport",
+        "the drafter all-reduce hops of 9..56-row block decodes on a wide one-shot transport",
         "draft",
         ("drafter_hops",),
     ),
@@ -430,536 +374,11 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     # Levers on the paths above (``LEVER_NAMES``): each changes how the path it builds on
     # runs, or is an install the plan carries; their rules are ``levers.RULES``.
     FastPath(
-        "packed_prep_append",
-        "multi-request decode prep-append calls of MIN_ROWS rows or more on the packed kernel",
-        "construct",
-        ("multi_request_prep_append",),
-    ),
-    FastPath(
-        "windowed_commit_parallel",
-        "windowed context-K/V commits of MIN_REQUESTS requests or more as a parallel zeroing "
-        "and a tuned compaction",
-        "draft",
-        ("context_kv_fork",),
-    ),
-    FastPath(
-        "context_fp8_dense",
-        "the dense projections of context calls of MIN_ROWS rows or more on the Rubin MXFP8 "
-        "GEMM (lossy)",
-        "load",
-    ),
-    FastPath(
-        "context_fp8_attn_gather",
-        "the sequence-parallel attention input all-gathered in MXFP8 (lossy)",
-        "load",
-        ("context_fp8_dense", "context_sequence_parallel"),
-    ),
-    FastPath(
-        "wide_direct_transports",
-        "the pool and unpool direct transports of 16..32-row captured decode steps",
-        "construct",
-        ("wide_prologue", "pool_into_route", "unpool_into_boundary"),
-    ),
-    FastPath(
-        "wide_router_per_row",
-        "the router shard of 16..32-row decode steps with each row's one-request logits",
-        "construct",
-        ("wide_prologue",),
-    ),
-    FastPath(
-        "wide_oproj_publish",
-        "o_proj of 16..32-row decode steps publishing into the hop's 32-row direct transport",
-        "construct",
-        ("attention_output_into_hop", "wide_post_attention_hop"),
-    ),
-    FastPath(
         "graph_start_qkv_prefetch",
         "layer 0's QKV weight prefetch forked at the start of a decode forward",
         "construct",
         ("next_qkv_prefetch",),
     ),
-    FastPath(
-        "step_loop_on_execution_stream",
-        "the executor's overlap loop issuing the sample and prepare launches on the execution "
-        "stream",
-        "executor",
-        ("deferred_input_prep",),
-    ),
-    FastPath(
-        "incremental_block_offsets",
-        "the staged block-offset copy of only the columns whose page index changed",
-        "executor",
-        ("deferred_input_prep",),
-    ),
-    FastPath(
-        "drafter_kv_side_chain",
-        "the context-K/V side chain with its prologue and arena store fused (dense arena)",
-        "draft",
-        ("context_kv_fork",),
-    ),
-    FastPath(
-        "drafter_fc_early_fork",
-        "the side chain's local fc GEMM forked after the last DFlash capture layer",
-        "draft",
-        ("drafter_kv_side_chain", "drafter_fc_shard"),
-    ),
-    FastPath(
-        "drafter_preamble_from_commit",
-        "the drafter forward's integer preamble written by the folded step's commit (dense arena)",
-        "draft",
-        ("verify_fold", "context_kv_fork"),
-    ),
-    FastPath(
-        "head_sampler_coop_fold",
-        "the head sampler's kernel A with the soft cap computed by the whole CTA, head calls "
-        "of MAX_ROWS rows or fewer",
-        "draft",
-        ("split_sampler",),
-    ),
-    FastPath(
-        "head_multimem_gather",
-        "the 8-row head logits all-gathered over NVLink multicast (MULTIMEM)",
-        "draft",
-        ("split_sampler",),
-    ),
-    FastPath(
-        "prefill_cutedsl_experts",
-        "the NVFP4 experts of 4096..8192-row calls on the Rubin CuTe DSL GEMMs",
-        "load",
-    ),
-    # The Vera Rubin low-latency levers (sm107 compositions, ``levers.RULES``).
-    FastPath(
-        "splitk_pool_split8",
-        "the pool GEMM of 9..32-row TP4 decode calls summing K in 8 slices, with the split-K "
-        "kernel's reduce-scatter epilogue",
-        "construct",
-        ("wide_dense_gemms",),
-    ),
-    FastPath(
-        "splitk_frontier_tables",
-        "the TP4 dense projections of 1..32-row decode calls on the low-latency split-K and "
-        "direct tactic tables",
-        "construct",
-        ("wide_dense_gemms",),
-    ),
-    FastPath(
-        "tep8_wide64_splitk",
-        "the TP8 QKV and o_proj of 33..64-row decode calls on split-K",
-        "construct",
-        ("wide_dense_gemms",),
-    ),
-    FastPath(
-        "tep8_publish_splitk",
-        "the TP8 pool and unpool slices of 33..64-row decode calls published from split-K",
-        "construct",
-        ("projection_publish",),
-    ),
-    FastPath(
-        "tep8_drafter_wide_gemms",
-        "the TP8 drafter projections of 2..4-request blocks on split-K",
-        "draft",
-        ("drafter_fixed_gemms",),
-    ),
-    FastPath(
-        "tep8_fc_shard_wide",
-        "the TP8 sharded drafter fc on decode steps of up to 64 rows, its gather on 128 programs",
-        "draft",
-        ("drafter_fc_shard",),
-    ),
-    FastPath(
-        "weight_prefetch_after_join",
-        "dense weight prefetches joined after their consumer, the QKV prefetch dropped",
-        "construct",
-        ("dense_gemm_prefetch",),
-    ),
-    FastPath(
-        "next_qkv_prefetch_skip",
-        "no next-layer QKV prefetch on decode steps of at most 8 rows",
-        "construct",
-        ("next_qkv_prefetch",),
-    ),
-    FastPath(
-        "swa_one_cluster_block",
-        "the sliding-window decode attention block of one to eight requests as one cluster launch",
-        "construct",
-        ("swa_block",),
-    ),
-    FastPath(
-        "swa_prep_split",
-        "the sliding-window block's prep split off steps of two or more requests whose split "
-        "grid spans several waves",
-        "construct",
-        ("swa_block",),
-    ),
-    FastPath(
-        "swa_eight_requests",
-        "the sliding-window block's merged split kernel: TP8 decode steps of up to eight requests, "
-        "and the one-cluster block's fallback",
-        "construct",
-        ("wide_swa_block",),
-    ),
-    FastPath(
-        "full_attention_fold_multi",
-        "the full-attention decode prep folded into the split-KV FMHA on steps of two to four "
-        "requests",
-        "construct",
-        ("full_attention_prep_fold",),
-    ),
-    FastPath(
-        "split_kv_deep_rings",
-        "the split-KV decode FMHA kernels on a 20-stage TMA ring",
-        "construct",
-        ("full_attention_split_kv", "multi_request_split_kv"),
-    ),
-    FastPath(
-        "bf16_half_window",
-        "the BF16 expert layers on the half expert window",
-        "load",
-        ("half_window_experts",),
-    ),
-    FastPath(
-        "prerouted_experts",
-        "the NVFP4 experts on trtllm::fp4_block_scale_moe_prerouted, from the placement "
-        "kernels' routing tables",
-        "load",
-        ("persistent_experts",),
-    ),
-    FastPath(
-        "tep8_ring_buddy_wide",
-        "the TP8 ring-buddy expert placement on decode steps of up to 64 rows",
-        "load",
-        ("replicated_experts",),
-    ),
-    FastPath(
-        "tep8_ring_buddy_pdl",
-        "the TP8 ring-buddy table writer launched with programmatic dependent launch",
-        "load",
-        ("replicated_experts",),
-    ),
-    FastPath(
-        "tep8_tile_placement",
-        "the TP8 replicated experts placed by tile cost on decode steps of 41 or more rows",
-        "load",
-        ("replicated_experts",),
-    ),
-    FastPath(
-        "tep8_router_push",
-        "the TP8 router columns and their all-gather in one kernel, routing folded into its "
-        "epilogue, on 33..128-row steps",
-        "construct",
-        ("router_gemm",),
-    ),
-    FastPath(
-        "tep8_router_prewait",
-        "the TP8 router GEMM loading its weight before its dependency wait",
-        "construct",
-        ("router_gemm",),
-    ),
-    FastPath(
-        "finalize_entry_trigger",
-        "the expert finalize's dependents released at its entry",
-        "construct",
-        ("finalize_transport",),
-    ),
-    FastPath(
-        "tep8_finalize_transport_64",
-        "the TP8 expert finalize of 17..64-token calls on a 64-token transport",
-        "construct",
-        ("finalize_transport",),
-    ),
-    FastPath(
-        "hop_entry_trigger",
-        "the 8-row post-attention hop kernels' dependents released at their entry",
-        "construct",
-        ("post_attention_hop",),
-    ),
-    FastPath(
-        "tep8_early_multicast_hop",
-        "the TP8 post-attention hop of 9..64-row steps launched early, gathered over multicast, "
-        "two rows per CTA from 41 rows",
-        "construct",
-        ("multi_request_post_attention_hop",),
-    ),
-    FastPath(
-        "tep8_direct_hop",
-        "the TP8 o_proj of 33..64-row steps scattering its partial into the owners' hop slots",
-        "construct",
-        ("multi_request_post_attention_hop", "tep8_wide64_splitk"),
-    ),
-    FastPath(
-        "tep8_publish_join",
-        "the TP8 post-FFN join launched with programmatic dependent launch as one cluster",
-        "construct",
-        ("projection_publish",),
-    ),
-    FastPath(
-        "tep8_pool_programmatic_fork",
-        "the TP8 pool slice GEMM forked programmatically from its producer",
-        "construct",
-        ("projection_publish",),
-    ),
-    FastPath(
-        "tep8_wide_projection_gathers",
-        "the TP8 pool and unpool gathers of 9..32-row steps fused into their consumers",
-        "construct",
-        ("projection_gathers",),
-    ),
-    FastPath(
-        "step_commit_v2",
-        "the step commit's descriptors read as 64-byte rows, the host splitting each piece",
-        "executor",
-        ("deferred_input_prep",),
-    ),
-    FastPath(
-        "wide_norm_gate_pdl",
-        "the post-FFN norm-gates of 33..128-row decode steps launched with programmatic dependent "
-        "launch",
-        "construct",
-        ("boundary_early_release",),
-    ),
-    FastPath(
-        "drafter_kv_glue",
-        "the context-K/V side chain's index math and arena stores in two launches (worker-owned "
-        "arena)",
-        "draft",
-        ("context_kv_fork",),
-    ),
-    FastPath(
-        "drafter_kv_fork_before_head",
-        "the context-K/V side chain forked before the LM-head GEMM",
-        "draft",
-        ("context_kv_fork",),
-    ),
-    FastPath(
-        "context_sp_extra_parts",
-        "large context steps' router input and expert all-gather on the row shard too",
-        "construct",
-        ("context_sequence_parallel",),
-    ),
-    FastPath(
-        "step_window_compact",
-        "windowed drafter arena compaction in place on the steps the context-K/V fork leaves",
-        "draft",
-    ),
-    FastPath(
-        "fmk_context_fmha",
-        "the context rows of mixed steps on the multi-instance paged context FMHA",
-        "construct",
-        ("mixed_step_gen_rows",),
-    ),
-    FastPath(
-        "context_kv_late_join",
-        "the context-K/V side chain joined right before the drafter's first block attention",
-        "draft",
-        ("context_kv_fork",),
-    ),
-    FastPath(
-        "hop_cluster_split",
-        "a row of the wide post-attention hop's calls of ROWS rows on CLUSTER CTAs",
-        "construct",
-        ("multi_request_post_attention_hop",),
-    ),
-    FastPath(
-        "drafter_fc_inbox_wide",
-        "the drafter fc inbox gather sized for MAX_ROWS rows, on PROGRAMS programs",
-        "draft",
-        ("drafter_fc_inbox",),
-    ),
-    FastPath(
-        "l061_tile32_pin",
-        "the 32-token tile pinned for layer 0 / 61's owner-window expert calls of 256..384 rows",
-        "load",
-        ("hot_replicas",),
-    ),
-    FastPath(
-        "router_staged_epilogue",
-        "the router GEMM's partial tiles written through shared memory",
-        "construct",
-        ("router_gemm",),
-    ),
-    FastPath(
-        "decode_qkv_mxfp8",
-        "the QKV projections of published decode steps on the MXFP8 GEMM (lossy)",
-        "load",
-        ("context_fp8_dense", "projection_publish", "batch_dense_gemms"),
-    ),
-    FastPath(
-        "split_kv_deep_ring",
-        "sm107's E4M3-query multi-request split-KV decode on a 20-page ring",
-        "construct",
-        ("multi_request_split_kv",),
-    ),
-    FastPath(
-        "context_prep_rows_vec",
-        "sm107 context steps' pre-attention prep on the vectorized rows kernel",
-        "construct",
-        ("context_prep",),
-    ),
-    FastPath(
-        "context_embedding_replicated",
-        "sm107 context steps' token embedding gathered from the replicated table",
-        "load",
-        ("replicated_embedding",),
-    ),
-    FastPath(
-        "context_sp_router_input",
-        "sm107 sequence-parallel steps' router FP32 input written by the residual join",
-        "construct",
-        ("context_sequence_parallel",),
-    ),
-    FastPath(
-        "swa_blocks_per_program",
-        "the sliding-window split programs of 2..4-sequence decode steps over as many key "
-        "blocks each as the step has sequences",
-        "construct",
-        ("wide_swa_block",),
-    ),
-    FastPath(
-        "wide_qkv_prefetch",
-        "the next QKV weight's L2 prefetch of 9..32-row decode steps forked after the experts",
-        "construct",
-        ("next_qkv_prefetch", "wide_dense_gemms"),
-    ),
-    FastPath(
-        "wide_capture_fold",
-        "the DFlash capture of 16..32-row decode steps written by the boundary on the wide "
-        "direct transport",
-        "construct",
-        ("capture_fold", "wide_direct_transports"),
-    ),
-    # The single-request decode schedule of sm107 TEP8 (``SM107_TEP8_ONLY``).
-    FastPath(
-        "megakernel",
-        "decoder layers 1 to 60 of a one-sequence 8-row decode step as one launch per layer "
-        "(the served build, its numerics-budget levers below)",
-        "load",
-        ("replicated_experts", "three_window_placement"),
-    ),
-    FastPath(
-        "megakernel_one_exchange_boundaries",
-        "the megakernel's MoE boundaries with one exchange, the second norm's statistic from "
-        "the expanded square of the unrounded residual",
-        "load",
-    ),
-    FastPath(
-        "megakernel_two_term_pool",
-        "the megakernel's pool and router GEMVs on the two BF16 terms of the gated residual, "
-        "combined in FP32",
-        "load",
-    ),
-    FastPath(
-        "megakernel_router_by_linearity",
-        "the megakernel's router logits formed from the o_proj partials in FP32",
-        "load",
-    ),
-    FastPath(
-        "megakernel_zero_exchange_boundary",
-        "the megakernel's post-attention boundary without an exchange (no build of the served "
-        "megakernel carries it)",
-        "load",
-    ),
-    FastPath(
-        "layer0_qkv_table",
-        "layer 0's QKV rows of an 8-row decode step gathered from a per-token table, the "
-        "residual's input chain forked beside the gather",
-        "load",
-        ("replicated_embedding", "dense_gemms"),
-    ),
-    FastPath(
-        "edge_bf16_moe_front",
-        "the BF16 expert layers' MoE front in the prologue and the pool transport",
-        "construct",
-        ("moe_prologue", "pool_into_route", "bf16_routed_experts"),
-    ),
-    FastPath(
-        "last_layer_boundary",
-        "the last layer's unpool, gated residual and final norm as one launch; the identity "
-        "row select before the LM head skipped",
-        "load",
-        ("projection_gathers",),
-    ),
-    FastPath(
-        "context_kv_fork_last_layer",
-        "the context-K/V side chain forked on the last decoder layer after its experts",
-        "draft",
-        ("drafter_fc_early_fork",),
-    ),
-    FastPath(
-        "distributed_head_sampler",
-        "the 8-row verify head on an interleaved vocabulary copy and one-shot gathered logits, "
-        "its verify fold released early",
-        "draft",
-        ("split_sampler",),
-    ),
-    FastPath(
-        "drafter_preamble_late_join",
-        "with the commit-written preamble, the context-K/V side chain joined inside the "
-        "drafter forward before layer 0's QK norm and RoPE",
-        "draft",
-        ("drafter_preamble_from_commit", "drafter_block_decode"),
-    ),
-    FastPath(
-        "drafter_folds",
-        "drafter elementwise steps folded into its GEMVs, its layer 0 from a per-token table",
-        "draft",
-        (
-            "drafter_block_conv",
-            "drafter_block_decode",
-            "drafter_fixed_gemms",
-            "drafter_pdl_chain",
-            "draft_head",
-            "replicated_embedding",
-        ),
-    ),
-    FastPath(
-        "draft_head_tail",
-        "the draft head's key selection, merge and path walk of a one-request draft step as "
-        "three launches",
-        "draft",
-        ("drafter_folds", "path_walk_tail"),
-    ),
-    FastPath(
-        "step_loop_inline_commits",
-        "the one-stream step loop's commits with their descriptors in the kernel parameters, "
-        "and the overlap offsets as one launch",
-        "executor",
-        (
-            "step_loop_on_execution_stream",
-            "incremental_block_offsets",
-            "sampler_store",
-            "layer0_qkv_table",
-        ),
-    ),
-    FastPath(
-        "rejection_sampler",
-        "rejection sampling of a one-request decode step fused into the draft-head tail's walk "
-        "and the distributed verify sampler, when the speculative config asks for it",
-        "draft",
-        ("distributed_head_sampler", "drafter_folds", "verify_fold", "path_walk_tail"),
-    ),
-)
-
-#: The levers of the single-request decode schedule: built for sm107 at TP8 with EP8 (the
-#: megakernel's eight-rank kernels and the compute_107a builds), and served by that
-#: composition only.
-SM107_TEP8_ONLY: FrozenSet[str] = frozenset(
-    {
-        "megakernel",
-        "megakernel_one_exchange_boundaries",
-        "megakernel_two_term_pool",
-        "megakernel_router_by_linearity",
-        "megakernel_zero_exchange_boundary",
-        "layer0_qkv_table",
-        "edge_bf16_moe_front",
-        "last_layer_boundary",
-        "context_kv_fork_last_layer",
-        "distributed_head_sampler",
-        "drafter_preamble_late_join",
-        "drafter_folds",
-        "draft_head_tail",
-        "step_loop_inline_commits",
-        "rejection_sampler",
-    }
 )
 
 #: The name of every fast path.
@@ -968,72 +387,8 @@ FAST_PATH_NAMES: FrozenSet[str] = frozenset(path.name for path in FAST_PATHS)
 #: The levers registered beside the fast paths (the last group of ``FAST_PATHS``).
 LEVER_NAMES: FrozenSet[str] = frozenset(
     {
-        "packed_prep_append",
-        "windowed_commit_parallel",
-        "context_fp8_dense",
-        "context_fp8_attn_gather",
-        "wide_direct_transports",
-        "wide_router_per_row",
-        "wide_oproj_publish",
         "graph_start_qkv_prefetch",
-        "step_loop_on_execution_stream",
-        "incremental_block_offsets",
-        "drafter_kv_side_chain",
-        "drafter_fc_early_fork",
-        "drafter_preamble_from_commit",
-        "head_sampler_coop_fold",
-        "head_multimem_gather",
-        "prefill_cutedsl_experts",
-        "splitk_pool_split8",
-        "splitk_frontier_tables",
-        "tep8_wide64_splitk",
-        "tep8_publish_splitk",
-        "tep8_drafter_wide_gemms",
-        "tep8_fc_shard_wide",
-        "weight_prefetch_after_join",
-        "next_qkv_prefetch_skip",
-        "swa_one_cluster_block",
-        "swa_prep_split",
-        "swa_eight_requests",
-        "full_attention_fold_multi",
-        "split_kv_deep_rings",
-        "bf16_half_window",
-        "prerouted_experts",
-        "tep8_ring_buddy_wide",
-        "tep8_ring_buddy_pdl",
-        "tep8_tile_placement",
-        "tep8_router_push",
-        "tep8_router_prewait",
-        "finalize_entry_trigger",
-        "tep8_finalize_transport_64",
-        "hop_entry_trigger",
-        "tep8_early_multicast_hop",
-        "tep8_direct_hop",
-        "tep8_publish_join",
-        "tep8_pool_programmatic_fork",
-        "tep8_wide_projection_gathers",
-        "step_commit_v2",
-        "wide_norm_gate_pdl",
-        "drafter_kv_glue",
-        "drafter_kv_fork_before_head",
-        "context_sp_extra_parts",
-        "step_window_compact",
-        "fmk_context_fmha",
-        "context_kv_late_join",
-        "hop_cluster_split",
-        "drafter_fc_inbox_wide",
-        "l061_tile32_pin",
-        "router_staged_epilogue",
-        "decode_qkv_mxfp8",
-        "split_kv_deep_ring",
-        "context_prep_rows_vec",
-        "context_embedding_replicated",
-        "context_sp_router_input",
-        "swa_blocks_per_program",
-        "wide_qkv_prefetch",
-        "wide_capture_fold",
     }
-    | SM107_TEP8_ONLY
 )
 #: The fast paths a composition is built from; a composition lists its levers explicitly.
 BASE_PATH_NAMES: FrozenSet[str] = FAST_PATH_NAMES - LEVER_NAMES
@@ -1555,7 +910,7 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
     Precondition(
         "the low-M GEMM dispatcher (TRTLLM_LOW_M_GEMM_BACKEND=auto)",
         _low_m_gemm_active,
-        ("dense_gemms", "lm_head_inbox", "drafter_pdl_chain", "distributed_head_sampler"),
+        ("dense_gemms", "lm_head_inbox", "drafter_pdl_chain"),
     ),
     Precondition(
         "the MNNVL one-shot o_proj all-reduce on every layer (MUSESPARK_OPEN_ALLREDUCE=MNNVL "
@@ -1682,14 +1037,6 @@ NO_PREFILL_SEQUENCE_PARALLEL = Precondition(
     _no_prefill_sequence_parallel,
 )
 
-#: On sm107, the built-in model's SM103-measured fused kernels (its cluster residual
-#: boundary, fused finalize all-reduce and sharded projections), which the sm107
-#: compositions build on and whose arithmetic their bitwise paths reproduce.
-SM107_FUSED_KERNELS = Precondition(
-    "the built-in fused kernels on sm107 (MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)",
-    _builtin_switch("_sm107_fused_kernels_enabled", True),
-)
-
 
 def preconditions(paths: FrozenSet[str], served: TargetPaths) -> Tuple[Precondition, ...]:
     """The preconditions of a model built with ``paths`` from composition ``served``."""
@@ -1707,9 +1054,7 @@ def missing_preconditions(
 #: context-K/V fork's side chain and commit, and the verify fold's written-out
 #: context store. Over a windowed arena they address each slot's window from its
 #: base (``_ctx_base``). Where the composition serves this target's compaction
-#: (``WINDOWED_CONTEXT_ARENA_PATHS``) they end with it; on an architecture of
-#: ``WINDOWED_COMMIT_SMS`` their commit compacts in its own kernel
-#: (``ops/spec/context_kv_commit_windowed.py``); elsewhere a windowed arena leaves
+#: (``WINDOWED_CONTEXT_ARENA_PATHS``) they end with it; elsewhere a windowed arena leaves
 #: them out. (The drafter block decode reads only the physical length the built-in
 #: prepare hands it, so it composes over either arena.)
 FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
@@ -1719,31 +1064,12 @@ FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
 #: The fast paths that act only on a windowed drafter context arena: the per-step window
 #: compaction. None of them is composed over a full-length arena, which never compacts.
 WINDOWED_CONTEXT_ARENA_PATHS: Tuple[str, ...] = ("drafter_window_compact",)
-#: The architectures (SM numbers) whose compositions serve ``FULL_CONTEXT_ARENA_PATHS``
-#: over a windowed arena without this target's compaction, on the windowed commit that
-#: compacts in its own kernel.
-WINDOWED_COMMIT_SMS: FrozenSet[int] = frozenset({107})
-#: The fast paths of ``WINDOWED_COMMIT_SMS`` compositions that compact a windowed arena
-#: on the steps the windowed commit does not take (the built-in prepare of a mixed
-#: step's generation rows). Like ``WINDOWED_CONTEXT_ARENA_PATHS`` they leave a plan over
-#: a full-length arena; unlike them they do not stand in for the commit's compaction.
-WINDOWED_STEP_PATHS: Tuple[str, ...] = ("step_window_compact",)
 
 
 def dependents(names: Iterable[str]) -> FrozenSet[str]:
     """``names`` and every fast path that builds on one of them, transitively."""
     names = frozenset(names)
     return frozenset(path for path in FAST_PATH_NAMES if closure((path,)) & names)
-
-
-#: The levers that write the dense full-length drafter arena by its own column rule, and so
-#: need it: the context-K/V side chain with its fused store, its early fc fork, and the
-#: folded commit that also writes the drafter's preamble.
-DENSE_ARENA_LEVERS: Tuple[str, ...] = (
-    "drafter_kv_side_chain",
-    "drafter_fc_early_fork",
-    "drafter_preamble_from_commit",
-)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1761,106 +1087,31 @@ class StructuralRules:
 def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -> StructuralRules:
     """The structural rules of ``deployment`` for the levers of ``served``. Pure.
 
-    * Over a windowed arena, on an architecture outside ``WINDOWED_COMMIT_SMS``, the
+    * Over a windowed arena, the
       arena-writing paths (``FULL_CONTEXT_ARENA_PATHS``) need this target's compaction
       (``WINDOWED_CONTEXT_ARENA_PATHS``), and are left out where it is not served.
-    * Any other arena leaves the compaction out, the per-step compaction
-      (``WINDOWED_STEP_PATHS``) included.
-    * ``DENSE_ARENA_LEVERS`` need a dense full-length arena.
-    * ``windowed_commit_parallel`` runs inside the windowed commit of an architecture of
-      ``WINDOWED_COMMIT_SMS``, so it needs a windowed arena there.
-    * A paged arena leaves out ``incremental_block_offsets``: the step-input stager
-      declines the block-table copy while a draft KV cache manager is attached; and
-      ``drafter_kv_glue``, whose store writes a worker-owned arena.
-    * ``TRTLLM_KV_DEFER_CLOSE=1`` leaves out ``step_loop_on_execution_stream``, which is
-      not validated with the deferred close.
-    * A drafter that declares a logit transform, or one whose transform is not known,
-      leaves out ``draft_head_tail``: its key selection and walk rank the untransformed
-      logits, so they would not reproduce the transformed selector (``draft_head``'s
-      canonical keys and transformed unary values).
-    * A speculative config that does not ask for rejection sampling, or whose request
-      forced acceptance left inert, or one not known, leaves out ``rejection_sampler``.
+    * Any other arena leaves the compaction out.
     """
     arena = deployment.arena
     exclusions: Dict[str, str] = {}
     requires: Dict[str, Tuple[str, ...]] = {}
     if arena is _levers.Arena.WINDOWED:
-        if deployment.sm not in WINDOWED_COMMIT_SMS:
-            compaction = tuple(name for name in WINDOWED_CONTEXT_ARENA_PATHS if name in served)
-            for name in FULL_CONTEXT_ARENA_PATHS:
-                if name not in served:
-                    continue
-                if compaction:
-                    requires[name] = compaction
-                else:
-                    exclusions[name] = (
-                        f"a windowed drafter context arena on sm{deployment.sm}, which serves "
-                        "neither the window compaction nor a commit that compacts"
-                    )
+        compaction = tuple(name for name in WINDOWED_CONTEXT_ARENA_PATHS if name in served)
+        for name in FULL_CONTEXT_ARENA_PATHS:
+            if name not in served:
+                continue
+            if compaction:
+                requires[name] = compaction
+            else:
+                exclusions[name] = (
+                    f"a windowed drafter context arena on sm{deployment.sm}, which serves "
+                    "neither the window compaction nor a commit that compacts"
+                )
     else:
-        for name in WINDOWED_CONTEXT_ARENA_PATHS + WINDOWED_STEP_PATHS:
+        for name in WINDOWED_CONTEXT_ARENA_PATHS:
             if name in served:
                 exclusions[name] = f"the drafter context arena is {arena.value}, not windowed"
-    if arena is not _levers.Arena.DENSE:
-        for name in DENSE_ARENA_LEVERS:
-            if name in served:
-                exclusions[name] = (
-                    f"it needs a dense full-length drafter context arena, not a {arena.value} one"
-                )
-    if "windowed_commit_parallel" in served and (
-        arena is not _levers.Arena.WINDOWED or deployment.sm not in WINDOWED_COMMIT_SMS
-    ):
-        exclusions["windowed_commit_parallel"] = (
-            "it needs a windowed drafter context arena on an architecture whose commit "
-            f"compacts (sm{', sm'.join(str(sm) for sm in sorted(WINDOWED_COMMIT_SMS))}); this "
-            f"is a {arena.value} arena on sm{deployment.sm}"
-        )
-    if arena is _levers.Arena.PAGED and "drafter_kv_glue" in served:
-        exclusions["drafter_kv_glue"] = (
-            "a paged drafter context has no worker-owned arena for its store"
-        )
-    if arena is _levers.Arena.PAGED and "incremental_block_offsets" in served:
-        exclusions["incremental_block_offsets"] = (
-            "the step-input stager declines the block-table copy over a paged drafter context"
-        )
-    if deployment.facts.kv_defer_close and "step_loop_on_execution_stream" in served:
-        exclusions["step_loop_on_execution_stream"] = (
-            f"{_levers.KV_DEFER_CLOSE_ENV}=1: the deferred close is not validated with it"
-        )
-    if "draft_head_tail" in served and deployment.draft_logit_transform is not False:
-        exclusions["draft_head_tail"] = (
-            "the drafter declares a logit transform, which the tail's key selection and walk "
-            "do not apply"
-            if deployment.draft_logit_transform
-            else "the drafter's logit transform is not known"
-        )
-    if "rejection_sampler" in served and deployment.rejection_sampling is not True:
-        exclusions["rejection_sampler"] = (
-            "the speculative config does not ask for rejection sampling, or forced acceptance "
-            "leaves it inert"
-            if deployment.rejection_sampling is False
-            else "whether the speculative config asks for rejection sampling is not known"
-        )
     return StructuralRules(exclusions, requires)
-
-
-def rejection_sampling_of(model_config) -> Optional[bool]:
-    """Whether ``model_config``'s speculative config asks for rejection sampling, or None
-    without one.
-
-    Under forced acceptance (``rs_common.forced_mode``) it is False whatever the config says:
-    the fused path never runs under a forced count. Where the forced-acceptance policy
-    applies (``rs_common.policy_applies``), ``routing.route`` has already switched the
-    engine's flag off; elsewhere the engine's own rejection sampling runs.
-    """
-    spec = getattr(model_config, "spec_config", None)
-    if spec is None:
-        return None
-    if not getattr(spec, "use_rejection_sampling", False):
-        return False
-    from .kernels.rs_sampler import rs_common as _rs_common
-
-    return _rs_common.forced_mode() != "inert"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1945,8 +1196,6 @@ def compose(
             arena,
             engine,
             snapshot,
-            draft_logit_transform=_levers.draft_logit_transform_of(draft_model),
-            rejection_sampling=rejection_sampling_of(model_config),
         )
         rules = structural_rules(served.served, deployment)
         table = _levers.resolve(
@@ -2008,9 +1257,8 @@ def table_for(
     ``levers.Arena`` values; ``knobs`` the lever environment (names under
     ``levers.PREFIX``); ``facts`` the shared-path facts; ``role_source`` defaults to what
     a served deployment of that role reports (agg servers derive their role, the others
-    take the hint); ``draft_logit_transform`` whether the drafter declares a logit transform
-    (None: not known); ``rejection_sampling`` whether the speculative config asks for
-    rejection sampling once forced acceptance has applied (None: not known).
+    take the hint); ``draft_logit_transform`` and ``rejection_sampling`` are accepted and
+    ignored: no lever of this target reads them.
 
     Raises:
         KeyError: for a key no composition serves.
@@ -2032,8 +1280,6 @@ def table_for(
         role_source=role_source,
         arena=_levers.Arena(arena),
         facts=facts or _levers.Facts(),
-        draft_logit_transform=draft_logit_transform,
-        rejection_sampling=rejection_sampling,
     )
     rules = structural_rules(served, deployment)
     return _levers.resolve(

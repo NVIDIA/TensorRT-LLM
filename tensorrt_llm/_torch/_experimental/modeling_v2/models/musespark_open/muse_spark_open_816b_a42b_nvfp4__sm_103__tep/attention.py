@@ -12,7 +12,6 @@ import torch
 
 from tensorrt_llm._torch import flashinfer_utils as _flashinfer_utils
 from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as _fi_gen
-from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     PredefinedAttentionMask,
@@ -124,9 +123,6 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
     #: An instance attribute, not a call keyword: a replay runs the attention op from its
     #: captured arguments without running ``forward``.
     _zero_padded_rows: bool = False
-    #: Set on the instance by ``layers.adopt_model`` under ``context_prep_rows_vec``: a
-    #: ``context_prep`` call takes the op's vectorized rows kernel (``row_vec``).
-    _context_prep_row_vec: bool = False
 
     @classmethod
     def adopt(cls, attention: MuseSparkOpenAttention) -> "MuseSparkOpenTepAttention":
@@ -221,13 +217,11 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
 
     def preprocess_qkv(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]):
         op = self._preattn_prep
-        row_vec = False
         if op is not None:
             fits = self._fits_preattn_prep(qkv, position_ids)
         else:
             op = self._context_prep
             fits = op is not None and self._fits_context_prep(qkv, position_ids)
-            row_vec = self._context_prep_row_vec
         if not fits:
             return super().preprocess_qkv(qkv, position_ids)
         rope = not self.skip_rope
@@ -242,7 +236,7 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
             self._qkv_layout_inverse is not None,
             LAUNCH_PDL,
         )
-        qkv_out, gate = op(*args, row_vec=True) if row_vec else op(*args)
+        qkv_out, gate = op(*args)
         return qkv_out, None, None, gate
 
     def _fits_preattn_prep(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]) -> bool:
@@ -686,60 +680,6 @@ def trtllm_gen_fmha(attn) -> Optional[_fi_gen.FlashInferTrtllmGenFmha]:
     return None
 
 
-class DecodeTrtllmGenFmha(_fi_gen.FlashInferTrtllmGenFmha):
-    """flashinfer's trtllm-gen FMHA, offered for the generation phase only.
-
-    ``select_decode_fmha`` puts one in front of a target layer's FMHA libraries on
-    an architecture whose public library list leaves flashinfer's trtllm-gen FMHA
-    out. The manager then selects it for a generation-only step that the
-    library's own checks accept (``FlashInferTrtllmGenFmha._is_supported`` for the
-    generation phase). A step with a context phase -- a prefill, or a batch that
-    mixes both phases -- finds no context support here and is served by the public
-    libraries, as without this class.
-    """
-
-    def _is_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: AttentionMetadata,
-        forward_args,
-        *,
-        phase: Optional[FmhaPhase] = None,
-    ) -> bool:
-        if phase != FmhaPhase.GENERATION:
-            return False
-        return super()._is_supported(q, k, v, metadata, forward_args, phase=phase)
-
-
-def _decode_fmha_refusal(attn) -> Optional[str]:
-    """Why flashinfer's trtllm-gen FMHA cannot serve ``attn``'s decode steps, or None.
-
-    The static checks of ``FlashInferTrtllmGenFmha.is_available`` other than its
-    SM list; the request checks run per step (``is_supported``).
-    """
-    if not _flashinfer_utils.IS_FLASHINFER_AVAILABLE:
-        return "flashinfer is not installed"
-    missing = _fi_gen.FlashInferTrtllmGenFmha._missing_fused_nanobind_ops()
-    if missing:
-        return f"the binding lacks {', '.join(missing)}"
-    num_heads, num_kv_heads = attn.num_heads, attn.num_kv_heads
-    checks = (
-        (getattr(attn, "skip_correction_threshold", 0.0) > 0.0, "skip-correction"),
-        (getattr(attn, "is_mla_enable", False), "MLA"),
-        (getattr(attn, "sparse_params", None) is not None, "sparse attention"),
-        (
-            num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads,
-            f"{num_heads} query heads over {num_kv_heads} KV heads",
-        ),
-    )
-    for failed, reason in checks:
-        if failed:
-            return reason
-    return None
-
-
 def select_decode_fmha(layers, compute_capability) -> int:
     """Make flashinfer's trtllm-gen FMHA the library each layer's attention selects for decode.
 
@@ -748,38 +688,15 @@ def select_decode_fmha(layers, compute_capability) -> int:
     * sm_103: the public library list already holds it
       (``FlashInferTrtllmGenFmha.is_available``) and the manager selects it;
       nothing changes.
-    * sm_107: the public list leaves it out, so every layer's manager gets a
-      ``DecodeTrtllmGenFmha`` in front of its libraries. Decode steps then run
-      flashinfer's trtllm-gen FMHA where it supports them; prefill and mixed steps
-      keep the public selection.
     * no device (None): nothing changes.
 
     Returns:
         The number of layers whose manager changed.
 
     Raises:
-        ValueError: on sm_107, for a layer whose attention the library cannot
-            serve (nothing changes); for any other architecture.
+        ValueError: for any other architecture.
     """
     sm = sm_of(compute_capability)
     if sm is None or sm == 103:
         return 0
-    if sm != 107:
-        raise ValueError(f"[musespark_open] no decode FMHA selection is written for sm{sm}")
-    refusals = []
-    for layer in layers:
-        reason = _decode_fmha_refusal(layer.self_attn.attn)
-        if reason is not None:
-            refusals.append(f"layer {layer.self_attn.layer_idx}: {reason}")
-    if refusals:
-        raise ValueError(
-            "[musespark_open] flashinfer's trtllm-gen FMHA cannot serve the decode steps: "
-            + "; ".join(refusals)
-        )
-    changed = 0
-    for layer in layers:
-        attn = layer.self_attn.attn
-        if trtllm_gen_fmha(attn) is None:
-            attn._fmha_manager.fmha_libs.insert(0, DecodeTrtllmGenFmha(attn))
-            changed += 1
-    return changed
+    raise ValueError(f"[musespark_open] no decode FMHA selection is written for sm{sm}")

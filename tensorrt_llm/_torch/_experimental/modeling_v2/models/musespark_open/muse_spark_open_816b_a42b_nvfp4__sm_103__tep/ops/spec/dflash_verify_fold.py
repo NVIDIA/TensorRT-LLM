@@ -131,7 +131,7 @@ def _dflash_verify_fold_kernel(
     in_block = qcols < block_size
     mask_id = tl.zeros([], dtype=tl.int64) + mask_token_id
     if PRE_WAIT:
-        # The verify PDL of ``distributed_head_sampler`` (one request, launched with PDL): every
+        # The verify PDL (one request, launched with PDL): every
         # load but the sampled tokens is issued before griddepcontrol.wait -- none of them is
         # written by the sampler, and the sampler releases this kernel only after its own wait
         # (``pre_wait`` in the op) -- and every store after it. The same statements on the same
@@ -266,7 +266,7 @@ class DflashVerifyFold(OpWrapper):
     ``_seq_lens_cuda`` (read). One Triton program (grid 1, 1 warp), JIT-compiled
     per (K, block, force mode, buffer flags); loops over the requests
     (``MAX_REQUESTS``). No programmatic-dependent-launch attributes, except with
-    ``pre_wait`` (the verify PDL of ``distributed_head_sampler``, one request): launched
+    ``pre_wait`` (the verify PDL, one request): launched
     with PDL, every load but the sampled tokens' before ``griddepcontrol.wait``, every
     store after it. The caller guarantees the predecessor (the sampler's draw)
     releases it only after its own wait, so every value loaded before the wait is final.

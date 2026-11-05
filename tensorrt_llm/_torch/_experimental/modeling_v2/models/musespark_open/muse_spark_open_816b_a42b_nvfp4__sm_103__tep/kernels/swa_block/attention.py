@@ -25,14 +25,6 @@ with the same arithmetic and fewer edges:
   the output projection launch after its own wait, as the PDL norm-gate copy of
   ``boundary_early_release`` does.
 
-* Key blocks per split program (the ``swa_blocks_per_program`` lever, installed by
-  ``install_multi``): off, every step runs the one-block split grid; on (``AUTO``),
-  each step of 2..4 sequences picks its geometry from its sequence count
-  (``AUTO_SPLIT_GEOMETRY``: blocks and the split kernel's register cap), and a
-  one-sequence step keeps the one-block grid. The partials and every output bit
-  are unchanged (``ops/attention/swa_block``); only the program count and the
-  programs resident per SM change.
-
 Full-attention layers, prefill steps and any step ``paged_decode_attention``
 would not take run exactly as without these features. Every value is the one
 the four-kernel chain computes.
@@ -69,7 +61,7 @@ window and late-predecessor tests of ``attention/test_modeling_v2_swa_block.py``
 from __future__ import annotations
 
 import dataclasses
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 
@@ -79,74 +71,9 @@ from tensorrt_llm.logger import logger
 
 from ...attention import MuseSparkOpenTepAttention, MuseSparkOpenTepDecodeAttention
 from ...dispatch import LAUNCH_PDL
-from ...ops.attention import swa_block as _swa_ops
 from ...ops.attention.paged_decode_attention import window_splits
 from ...ops.attention.preattn_prep import HEAD_DIM, preattn_prep
-from ...ops.attention.swa_block import (
-    _ONE2_MAX_REQUESTS,
-    MAX_BLOCKS_PER_PROGRAM,
-    MAX_ROWS,
-    MULTI_MAX_REQUESTS,
-    SPLIT_REGISTER_CAP,
-    max_blocks,
-    swa_block_attention,
-    swa_block_multi_attention,
-)
-
-#: The geometry setting that picks blocks per split program by the step's sequence count.
-AUTO = "auto"
-#: ``AUTO``: (key blocks per split program, split register cap or ``None``) by the step's
-#: sequence count, the fastest geometry of a tep4 rank on sm107. The split grid's time is set
-#: by its rounds of resident programs first: the one-block kernel fits 3 programs per SM, so
-#: ``n`` sequences need ``n`` rounds; 2 blocks per program keep 3 per SM (2 sequences in one
-#: round); 3 or 4 blocks per program fit 3 per SM only under ``SPLIT_REGISTER_CAP`` (3
-#: sequences at 3 blocks, 4 at 4, in one round); one sequence is a single round already.
-AUTO_SPLIT_GEOMETRY = {
-    1: (1, None),
-    2: (2, None),
-    3: (3, SPLIT_REGISTER_CAP),
-    4: (4, SPLIT_REGISTER_CAP),
-}
-
-
-def check_setting(setting: Union[int, str]) -> Union[int, str]:
-    """``setting`` when it is ``AUTO`` or a fixed ``1`` .. ``MAX_BLOCKS_PER_PROGRAM``.
-
-    Raises:
-        ValueError: on any other value.
-    """
-    if setting == AUTO or (type(setting) is int and 1 <= setting <= MAX_BLOCKS_PER_PROGRAM):
-        return setting
-    raise ValueError(
-        f"[musespark_open] swa_block: blocks per split program must be 1..{MAX_BLOCKS_PER_PROGRAM} "
-        f"or {AUTO!r}, got {setting!r}"
-    )
-
-
-def split_geometry(setting: Union[int, str], requests: int) -> Tuple[int, Optional[int]]:
-    """(key blocks per split program, split register cap or ``None``) of a step of
-    ``requests`` sequences under ``setting``; a fixed ``setting`` has no cap."""
-    if setting == AUTO:
-        return AUTO_SPLIT_GEOMETRY.get(requests, (1, None))
-    return setting, None
-
-
-def describe_geometry(bpp: int, max_registers: Optional[int]) -> str:
-    """``bpp`` with its register cap, as the install lines print it."""
-    return f"{bpp}" if max_registers is None else f"{bpp} (<= {max_registers} registers)"
-
-
-def describe_blocks_per_program(setting: Union[int, str]) -> str:
-    """The install lines' wording of ``setting``."""
-    if setting == AUTO:
-        table = ", ".join(
-            f"{n}: {describe_geometry(*geometry)}"
-            for n, geometry in sorted(AUTO_SPLIT_GEOMETRY.items())
-        )
-        return f"key blocks per split program by sequences (blocks {{{table}}})"
-    if setting == 1:
-        return "1 key block per split program"
-    return f"{setting} key blocks per split program"
+from ...ops.attention.swa_block import max_blocks, swa_block_attention
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,15 +97,8 @@ class _SwaBlock:
     ``DecodeTarget`` passes it) on a sliding-window layer runs the block
     through ``ops/attention/swa_block``; every other call is the base class's.
     The per-call attributes are set by ``forward`` and cleared when it returns.
-
-    With ``_swa_multi`` (set by the ``wide_swa_block`` fast path) a decode step of
-    2..``MULTI_MAX_REQUESTS`` generation sequences of equal row count runs the block too,
-    through ``swa_block_multi_attention``: each sequence's rows, cache bytes and output are
-    the one-sequence block's.
     """
 
-    _swa_multi: bool = False
-    _swa_blocks_per_program: Union[int, str] = 1
     _swa_block: Optional[SwaBlockPlan]
     _swa_raw: bool
     _swa_gate: Optional[torch.Tensor]
@@ -347,12 +267,6 @@ class _SwaBlock:
             f"(fused_prep={raw}, fused_gate={gate is not None}, q_fp8={decode.q_fp8})",
             key="musespark_open.swa_block.installed",
         )
-        bpp, max_registers = split_geometry(self._swa_blocks_per_program, requests)
-        logger.info_once(
-            f"[musespark_open] swa_block: decode steps of {requests} sequence(s) run "
-            f"{describe_geometry(bpp, max_registers)} key block(s) per split program",
-            key=f"musespark_open.swa_block.blocks_per_program_{requests}_{bpp}_{max_registers}",
-        )
         out = self._swa_block_call(
             q,
             attn_metadata,
@@ -361,8 +275,6 @@ class _SwaBlock:
             raw,
             gate,
             requests,
-            bpp,
-            max_registers,
         )
         self._swa_gated = gate is not None
         return out, None
@@ -385,33 +297,8 @@ class _SwaBlock:
         )
 
     def _step_requests(self, md) -> int:
-        """The sequences of this step the block takes in one call: 1, or under ``_swa_multi`` the
-        2..``MULTI_MAX_REQUESTS`` generation sequences of a step whose host ``seq_lens`` are all
-        ``rows / sequences`` (at most ``MAX_ROWS``). Host-side reads only."""
-        if not self._swa_multi:
-            return 1
-        n = md.num_seqs
-        rows = md.num_tokens
-        seq_lens = getattr(md, "seq_lens", None)
-        # swa_block's ``one2`` (swa_eight_requests), read per call: TEP8 layers (2 KV heads) take
-        # up to 8 sequences.
-        cap = (
-            _ONE2_MAX_REQUESTS
-            if _swa_ops._SWA_ONE2 and self.num_key_value_heads == 2
-            else MULTI_MAX_REQUESTS
-        )
-        if (
-            not 2 <= n <= cap
-            or md.num_generations != n
-            or rows % n
-            or rows // n > MAX_ROWS
-            or seq_lens is None
-            or seq_lens.is_cuda
-            or seq_lens.numel() < n
-            or bool((seq_lens[:n] != rows // n).any())
-        ):
-            return 1
-        return n
+        """The sequences of this step the block takes in one call: 1."""
+        return 1
 
     def _swa_block_call(
         self,
@@ -422,8 +309,6 @@ class _SwaBlock:
         raw: bool,
         gate,
         requests: int = 1,
-        bpp: int = 1,
-        max_registers: Optional[int] = None,
     ):
         attn = self.attn
         rows = md.num_tokens
@@ -444,12 +329,10 @@ class _SwaBlock:
             torch.bfloat16,
         )
         rope = raw and not self.skip_rope
-        multi = requests > 1
-        op = swa_block_multi_attention if multi else swa_block_attention
-        return op(
+        return swa_block_attention(
             q[:rows],
             kv_pool,
-            block_tables if multi else block_tables[0],
+            block_tables[0],
             md.kv_lens_cuda_runtime[:requests],
             attn.kv_scale_orig_quant,
             self.num_heads,
@@ -466,8 +349,6 @@ class _SwaBlock:
             gate=gate,
             gate_eps=self.o_head_norm.variance_epsilon,
             enable_pdl=LAUNCH_PDL,
-            blocks_per_program=bpp,
-            split_max_registers=max_registers,
         )
 
     def apply_output_gate(self, attention_output, gate):
@@ -504,7 +385,6 @@ class _SwaBlock:
         attention._swa_gate = None
         attention._swa_gated = False
         attention._swa_position_ids = None
-        attention._swa_blocks_per_program = 1
         return attention
 
 
@@ -547,57 +427,4 @@ def log_installed(layers, plan: SwaBlockPlan) -> None:
     )
 
 
-def install_multi(model, blocks_per_program: Union[int, str] = 1) -> int:
-    """``wide_swa_block``: let every sliding-window layer's ``swa_block`` take 2..4-request steps.
-
-    Called after the attention re-class. Sets ``_swa_multi`` on each sliding-window layer
-    whose attention carries ``swa_block``, and its key blocks per split program to
-    ``blocks_per_program`` (``AUTO`` under the ``swa_blocks_per_program`` lever, else the
-    one-block grid); returns how many.
-
-    Raises:
-        ValueError: if a sliding-window layer does not carry ``swa_block``, or for a
-            ``blocks_per_program`` ``check_setting`` refuses.
-    """
-    setting = check_setting(blocks_per_program)
-    count = 0
-    one2 = 0
-    for layer in model.layers:
-        attention = layer.self_attn
-        if not attention.is_sliding:
-            continue
-        if not isinstance(attention, _SwaBlock):
-            raise ValueError(
-                "[musespark_open] wide_swa_block extends swa_block; layer "
-                f"{layer.layer_idx} carries {type(attention).__name__}"
-            )
-        attention._swa_multi = True
-        attention._swa_blocks_per_program = setting
-        if (
-            _swa_ops._SWA_ONE2
-            and attention.num_key_value_heads == 2
-            and hasattr(attention, "_mr_append_min_seqs")
-        ):
-            # swa_block's ``one2``: the one-launch block of 5..8 sequences does its own prep and K/V
-            # append on these layers, so multi_request_prep_append (installed before this) folds
-            # only larger steps here.
-            attention._mr_append_min_seqs = max(
-                attention._mr_append_min_seqs, _ONE2_MAX_REQUESTS + 1
-            )
-            one2 += 1
-        count += 1
-    logger.info(
-        f"[musespark_open] wide_swa_block: swa_block on decode steps of 2..{MULTI_MAX_REQUESTS} "
-        f"requests of up to {MAX_ROWS} rows each on {count} sliding-window layers "
-        f"({describe_blocks_per_program(setting)})"
-        + (
-            f"; swa_eight_requests: also 5..{_ONE2_MAX_REQUESTS} requests on {one2} TEP8 layers "
-            "(one launch; multi_request_prep_append stands down for them)"
-            if one2
-            else ""
-        )
-    )
-    return count
-
-
-__all__ = ["AUTO", "SwaBlockPlan", "attention_class", "install_multi", "log_installed"]
+__all__ = ["SwaBlockPlan", "attention_class", "log_installed"]

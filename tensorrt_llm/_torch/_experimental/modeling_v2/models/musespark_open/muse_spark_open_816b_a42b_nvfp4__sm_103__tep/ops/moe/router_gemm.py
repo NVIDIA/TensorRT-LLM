@@ -11,13 +11,13 @@ runs in plain TF32 (every weight rounded to 11 bits).
 
 This entry runs the CuTe BF16x3 router GEMM ``ops/moe/bf16x3_router_gemm.Sm100BF16x3RouterGemm``
 (the kernel behind the built-in ``MUSESPARK_OPEN_BF16X3_ROUTER`` option,
-``cute_dsl_kernels/blackwell/bf16x3_router_gemm``, moved into this target with its
-pre-wait build) and sums its split-K partials with the multiplier folded in. The GEMM
+``cute_dsl_kernels/blackwell/bf16x3_router_gemm``, moved into this target)
+and sums its split-K partials with the multiplier folded in. The GEMM
 computes ``W X^T`` on tcgen05: the 256 experts are the MMA's M dimension (two tiles of 128),
 the call's rows its N dimension (one tile of the next power of two of up to 128 rows, then
 128-row tiles), so the weight is streamed once per 128 rows. A call of ``t`` row tiles on a
 device of ``S`` SMs runs ``splits(rows) = S // (2 * t)`` K splits -- 76, 38, 25, 19
-on GB300's 152 SMs, 106, 53, 35, 26 on R200's 212 -- so that its ``2 * t * splits``
+on GB300's 152 SMs -- so that its ``2 * t * splits``
 CTAs fill the GPU's SMs in one wave; each CTA owns every ``splits``-th K tile of 64.
 It splits each FP32 weight it loads into three BF16 terms, ``w = w0 + w1 + w2`` --
 exact for every FP32 value of normal magnitude --
@@ -38,13 +38,6 @@ TF32x3 kernel also rounds every weight to 22 bits, the TF32 ``Linear`` to 11.
 Programmatic dependent launch: the GEMM waits (``griddepcontrol.wait``) before its
 first load and releases its dependents after its last MMA; the sum kernel waits
 before reading the partials and releases its dependents.
-
-With the lever ``router_staged_epilogue`` (``set_staged_epilogue``) the GEMM runs as
-``ops/moe/router_gemm_staged.Sm100BF16x3RouterGemmStaged``: the same pipeline and MMAs,
-with each CTA's partial tile written through shared memory (one bulk copy per row, or
-16-byte vector stores) instead of one 4-byte store per element; the same partials bit
-for bit. That build has no pre-wait variant: the staged epilogue is served on TEP4, the
-pre-wait build (``tep8_router_prewait``) on TEP8.
 """
 
 from __future__ import annotations
@@ -118,18 +111,13 @@ def device_sms() -> int:
 def splits(rows: int, sms: Optional[int] = None) -> int:
     """The K splits of a call of ``rows`` rows on a device of ``sms`` SMs (default: the
     current device's): one CTA per SM over the call's ``2 * t`` output tiles -- 76, 38,
-    25, 19 for 1, 2, 3, 4 row tiles on 152 SMs, 106, 53, 35, 26 on 212."""
+    25, 19 for 1, 2, 3, 4 row tiles on 152 SMs."""
     sms = device_sms() if sms is None else sms
     return sms // (EXPERT_TILES * triton.cdiv(rows, ROW_TILE))
 
 
 def _gemm(tile: int):
-    if _staged_epilogue is not None:
-        from .router_gemm_staged import Sm100BF16x3RouterGemmStaged
-
-        return Sm100BF16x3RouterGemmStaged.compile(tile, HIDDEN, _staged_epilogue, False)
-    # Imported at the first compile, as before the move; ``compile`` builds with the module's
-    # configured pre-wait setting (``bf16x3_router_gemm.configure``).
+    # Imported at the first compile, as before the move.
     from .bf16x3_router_gemm import Sm100BF16x3RouterGemm
 
     return Sm100BF16x3RouterGemm.compile(tile, HIDDEN)
@@ -169,7 +157,7 @@ class RouterGemm(OpWrapper):
         ``[M, 256]`` FP32 logits, newly allocated.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Budgeted, not bitwise: the test gates every cell against the float64 product

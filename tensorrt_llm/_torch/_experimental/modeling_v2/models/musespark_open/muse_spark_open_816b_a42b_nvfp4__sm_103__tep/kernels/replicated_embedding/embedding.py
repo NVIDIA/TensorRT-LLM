@@ -25,11 +25,7 @@ NaN or infinity (the fp32 sum canonicalizes a NaN's sign and payload).
 Larger calls (long prefill chunks) run the built-in path; a prefill chunk of
 at most ``MAX_ROWS`` ids takes the gather, with the same bits (the sharded
 partials are one owner row and zero rows, whatever all-reduce sums them).
-With ``context_embedding_replicated``, on the architectures of
-``CONTEXT_ROWS_BY_SM`` every call up to that many ids takes the gather, context
-steps included: their built-in path is the masks, a
-full-width masked fill of the step's rows and an all-reduce of ``rows x 8192``
-bf16 before the first layer. Every rank sees the same row count for a call, so
+Every rank sees the same row count for a call, so
 every rank takes the same branch and the all-reduce call sequence stays
 identical across ranks.
 """
@@ -55,19 +51,8 @@ from ...ops.embedding.replicated_gather import replicated_embedding_gather
 #: noise block). The gather has no row limit of its own.
 MAX_ROWS = 576
 
-#: Largest call served from the replicated table, by SM version, where context steps take
-#: it too (at least a context step's ``max_num_tokens``) under ``context_embedding_replicated``;
-#: ``MAX_ROWS`` elsewhere and without it (``max_rows``).
-CONTEXT_ROWS_BY_SM = {107: 1 << 16}
-
 #: Attribute of the re-classed module that holds the largest call its table serves.
 ROWS_ATTR = "_replicated_max_rows"
-
-
-def max_rows(sm: int, context_rows: bool) -> int:
-    """The largest call the table serves on ``sm``: ``CONTEXT_ROWS_BY_SM``'s with
-    ``context_rows`` (``context_embedding_replicated``), else ``MAX_ROWS``."""
-    return CONTEXT_ROWS_BY_SM.get(sm, MAX_ROWS) if context_rows else MAX_ROWS
 
 
 #: Shard rows all-gathered per collective while the table is built.
@@ -177,7 +162,7 @@ def _value_census(table: torch.Tensor) -> tuple[int, int, int]:
 def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
     """Build the replicated table and re-class ``text_model.embed_tokens``; collective over TP.
 
-    The table serves calls of at most ``max_rows(sm, context_rows)`` ids.
+    The table serves calls of at most ``MAX_ROWS`` ids; ``context_rows`` is ignored.
 
     Every rank must call this at the same point, after the weights are final
     and before any CUDA graph is captured (the shell's ``load_weights``). A
@@ -235,9 +220,7 @@ def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
     )
     if reason is not None:
         raise ValueError(reason)
-    rows = max_rows(
-        _tp_agreement.sm_of(torch.cuda.get_device_capability(table.device)), context_rows
-    )
+    rows = MAX_ROWS
     embedding.__dict__[TABLE_ATTR] = table
     embedding.__dict__[ROWS_ATTR] = rows
     changed = type(embedding) is not ReplicatedEmbedding

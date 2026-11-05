@@ -11,8 +11,7 @@ of a multicast transport, so the GEMM's own epilogue stores publish the slice to
 rank. The consumers -- the pre-expert RMSNorm + NVFP4 quantization
 (``pool_publish_fp4quant``) and the post-FFN join (``unpool_publish_join`` below) --
 poll their rows of their own copy, reset them and compute the built-in kernels'
-arithmetic on the gathered row. ``unpool_publish_join_mxfp8`` is that join which also
-writes the MXFP8 quantization of the next input it hands on (``decode_qkv_mxfp8``).
+arithmetic on the gathered row.
 
 Transport (Lamport, payload as flag). Every rank holds ``BUFFERS x TP source ranks x
 max_rows x columns`` BF16 -- rank-major, so rank ``r``'s slot of buffer ``b`` is one
@@ -87,14 +86,10 @@ __all__ = [
     "WORLDS",
     "buffer_sequence",
     "check_buffer_sequence",
-    "configure",
     "local_columns",
-    "mxfp8_reference",
-    "mxfp8_scale_bytes",
     "producer_refusal",
     "publish_projection",
     "unpool_publish_join",
-    "unpool_publish_join_mxfp8",
 ]
 
 #: The TP size the transports connect: one GB300 tray.
@@ -129,559 +124,19 @@ GUARD_RELOG_S = 60.0
 #: The producers the census certified: at every served row count of both sites, cuBLAS
 #: (``torch.mm`` into the slot) picks beta-zero kernels that store each element once, and
 #: splits K only through a separate reduction kernel. Keyed by (torch version, cuBLASLt
-#: version, SM count): cuBLAS's kernel choice depends on all three. 152 SMs is GB300 (sm103),
-#: 212 SMs Rubin (sm107).
+#: version, SM count): cuBLAS's kernel choice depends on all three. 152 SMs is GB300 (sm103).
 CERTIFIED_PRODUCERS = frozenset(
     {
         ("2.14.0a0+b2c75dd062.nv26.09", 130800, 152),
-        ("2.14.0a0+b2c75dd062.nv26.09", 130800, 212),
     }
 )
 #: The TP8 slice shapes (pool ``[R, 8192] x [512, 8192]^T``, unpool ``[R, 4096] x [1024, 4096]^T``)
 #: are other GEMMs than the TP4 census drove, so TP8 publishes only with a producer the TP8 census
 #: (33..448 rows, both sites) certified. Same key as above.
-CERTIFIED_PRODUCERS_TP8 = frozenset({("2.14.0a0+b2c75dd062.nv26.09", 130800, 212)})
+CERTIFIED_PRODUCERS_TP8 = frozenset()
 #: Environment variables that resize torch's cuBLAS workspaces, which changes cuBLAS's choice
 #: of split-K kernels; the census ran with none set.
 CUBLAS_WORKSPACE_ENV = ("CUBLAS_WORKSPACE_CONFIG", "CUBLASLT_WORKSPACE_SIZE")
-
-#: ``tep8_publish_splitk`` (``configure``) publishes the TP8 pool and unpool slices of 33..64-row
-#: decode steps (5..8 requests at K = 7) from the split-K kernel (``ops/gemm/splitk_gemm.py``,
-#: flashinfer's ``dense_bf16_gemm_sm100_splitk`` moved into this target) instead of cuBLAS. The
-#: kernel reduces its K slices in-kernel (cluster DSMEM) and only its owner CTA stores, each element
-#: of the slot once with its final value, from registers (no read-back, no partials in the slot: the
-#: census property), so a publication is one launch instead of cuBLAS's nvjet + splitKreduce, and
-#: the weight is staged before the dependency wait. split_k 4 is the 8-row cells' (``dense_gemms``
-#: SM107_KERNELS), so every row keeps its one-request bits; against cuBLAS one BF16 ulp at most
-#: (99.87-99.96 % of elements equal). Needs the kernel's 64-row tiles (``splitk_gemm``'s wide64
-#: setting, the ``tep8_wide64_splitk`` lever). Publishes only with the (SM count, pool producer key,
-#: unpool producer key) that the split-K producer census certified
-#: (``CERTIFIED_SPLITK_PRODUCERS_TP8``: every row count 33..64 of both sites, two trials each); a
-#: producer key is ``splitk_gemm.producer_key``: the kernel's device code and what the publication
-#: compiles with under this process's settings, so host-side edits of the kernel file keep the
-#: certification and a kernel change drops it. Otherwise, and when off, cuBLAS as before.
-#: Rank-uniform: every rank applies the same plan and reads the same files and device type.
-TEP8_PUBLISH_SPLITK = False
-#: Rows the split-K producer serves (the kernel's M <= 64 under the wide64 gate); other row counts keep cuBLAS.
-SPLITK_MIN_ROWS, SPLITK_MAX_ROWS = 33, 64
-#: (K, columns) of the TP8 slice -> (mma_m, mma_n, split_k, ab_stages): the fastest split-K-4 tile
-#: at 40..64 rows behind an early-releasing predecessor, from a sweep of the kernel's tactics.
-TP8_PUBLISH_SPLITK_TACTICS = {
-    (UNPOOL_HIDDEN, POOL_HIDDEN // 8): (64, 16, 4, 10),  # pool [R, 8192] x [512, 8192]^T
-    (POOL_HIDDEN, UNPOOL_HIDDEN // 8): (64, 32, 4, 8),  # unpool [R, 4096] x [1024, 4096]^T
-}
-#: (SM count, pool producer key, unpool producer key). The census first ran keyed on the hash of
-#: flashinfer's kernel file: the build with 64-row tiles, and that build with the deeper stages in
-#: oversized shared memory (128 checks, 0 failures), both with these tactics at 212 SMs. The entry
-#: below is the latter census carried over to ``ops/gemm/splitk_gemm.py``: for these two bias-free
-#: split-K-4 tactics, without the reduce-scatter epilogue (its branches are compile-time out), that
-#: kernel traces the same code at the same launch (opt-in shared memory, mailbox v4, owner store,
-#: PDL). A census rerun on the unified file confirms it.
-#: The md5 is of the device code as formatted in this tree; its AST is the census build's
-#: (95e7ff00...), so the census carries over.
-CERTIFIED_SPLITK_PRODUCERS_TP8 = frozenset(
-    {
-        (
-            212,
-            ("534e6f639ccb0b27b855884d278a2883", (64, 16, 4, 10), "owner", "v4", "opt-in", True),
-            ("534e6f639ccb0b27b855884d278a2883", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
-        ),
-    }
-)
-#: Whether the kernel launches with programmatic dependent launch (the model's ``dispatch.LAUNCH_PDL``): it reads only
-#: the weight (a parameter) before its dependency wait, and stores into the slot only after it.
-_SPLITK_PDL = True
-_splitk_state: dict = {}
-
-
-def _splitk_site_key(splitk, tactic: Tuple[int, int, int, int]):
-    """The producer key of one site's tactic, the same at every served row count, else None."""
-    keys = {
-        splitk.producer_key(rows, splitk.SplitKTactic(*tactic), _SPLITK_PDL)
-        for rows in (SPLITK_MIN_ROWS, SPLITK_MAX_ROWS)
-    }
-    return keys.pop() if len(keys) == 1 else None
-
-
-def _splitk_publisher():
-    """``(run_splitk_dense, SplitKTactic)`` when the split-K producer is selected and certified here, else None.
-
-    Decided once per ``configure`` and logged once; every rank decides alike (same plan, files and
-    device type).
-    """
-    if "publisher" in _splitk_state:
-        return _splitk_state["publisher"]
-    publisher, reason = None, None
-    if not TEP8_PUBLISH_SPLITK:
-        _splitk_state["publisher"] = None
-        return None
-    try:
-        from ..gemm import splitk_gemm as splitk
-
-        enabled = getattr(splitk, "_wide64_enabled", None)
-        if enabled is None or not enabled():
-            reason = (
-                "the split-K kernel does not serve 33..64 rows (needs its wide64 setting, the "
-                "tep8_wide64_splitk lever)"
-            )
-        else:
-            key = (
-                torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count,
-                _splitk_site_key(
-                    splitk, TP8_PUBLISH_SPLITK_TACTICS[(UNPOOL_HIDDEN, POOL_HIDDEN // 8)]
-                ),
-                _splitk_site_key(
-                    splitk, TP8_PUBLISH_SPLITK_TACTICS[(POOL_HIDDEN, UNPOOL_HIDDEN // 8)]
-                ),
-            )
-            if key not in CERTIFIED_SPLITK_PRODUCERS_TP8:
-                reason = f"the split-K producer census does not cover {key}"
-            else:
-                publisher = (splitk.run_splitk_dense, splitk.SplitKTactic)
-    except Exception as error:  # noqa: BLE001 - an unusable producer keeps cuBLAS
-        reason = f"split-K kernel unavailable ({error!r})"
-    if publisher is not None:
-        logger.info(
-            "[musespark_open] projection_publish: TP8 pool / unpool slices of "
-            f"{SPLITK_MIN_ROWS}..{SPLITK_MAX_ROWS}-row steps publish from flashinfer split-K "
-            "(tep8_publish_splitk)"
-        )
-    else:
-        logger.warning(
-            "[musespark_open] projection_publish: tep8_publish_splitk ignored, cuBLAS publishes: "
-            f"{reason}"
-        )
-    _splitk_state["publisher"] = publisher
-    return publisher
-
-
-#: ``tep8_pool_programmatic`` (``configure``; the ``tep8_pool_programmatic_fork`` lever) gives the
-#: TP8 pool slice GEMM of a 33..64-row step (on the MoE preparation stream) a programmatic edge from
-#: the post-attention hop instead of the full edge of the stream fork. At TEP8 bs4-8 the pool GEMM
-#: starts 3.3-4.5 us after the wide hop ends (bs8: 4.35-4.77 us, p10-p90), while the router GEMM --
-#: the hop's programmatic dependent on the main stream -- starts before it ends; the pool chain
-#: (GEMM, consumer) then trails the router chain by ~4.3 us per layer and is the join's critical
-#: input. With the edge programmatic the hop's trigger launches both dependents (a grid may have
-#: two; CUDA 13.4 graphs take a kernel node with two outgoing programmatic edges): the split-K GEMM
-#: stages its weight slice before ``griddepcontrol.wait`` and reads the hop's output, and stores
-#: into the transport, only after it -- so only launch order and edges change (bitwise). Taken only
-#: while capturing, only when the split-K producer (``_splitk_tactic``) publishes the call (a kernel
-#: that waits on its prerequisite grid before reading), and only when the stream fork's source was
-#: exactly one kernel node.
-TEP8_POOL_PROGRAMMATIC = False
-
-#: ``tep8_join_pdl`` (``configure``; the ``tep8_publish_join`` lever) launches the post-FFN join
-#: (``UnpoolPublishJoin``, ``_unpool_publish_join_kernel``) with programmatic dependent launch and
-#: an entry trigger, when the model launches with PDL (``dispatch.LAUNCH_PDL``). Every program first
-#: waits for its prerequisite grid (``griddepcontrol.wait``, before any read: the residual, the
-#: gains and the poll of the transport all follow it), then releases its dependents
-#: (``griddepcontrol.launch_dependents``). The next layer's QKV GEMM -- flashinfer's split-K, a PDL
-#: launch that stages its weight slice before its own dependency wait and reads the join's output
-#: only after it -- then becomes resident on the SMs the join's programs leave and streams its
-#: weight while the join waits for the exchange; it can read ``next_input`` only after this grid
-#: completes, and the join's completion still implies its predecessor's (the join waited). Only
-#: launch order changes: bitwise. Off: the plain launch.
-TEP8_JOIN_PDL = False
-
-
-_join_pdl_logged: list = []
-
-
-def _join_pdl() -> bool:
-    """Whether the join launches with PDL: the gate, and the model launching with PDL (logged once)."""
-    if not TEP8_JOIN_PDL:
-        return False
-    try:
-        from ...dispatch import LAUNCH_PDL
-    except Exception:  # noqa: BLE001 - no model dispatch module: keep the plain launch
-        return False
-    if not _join_pdl_logged:
-        _join_pdl_logged.append(True)
-        logger.info(
-            "[musespark_open] projection_publish: tep8_join_pdl: the post-FFN join launches "
-            f"{'with PDL and an entry trigger' if LAUNCH_PDL else 'plain (the model launches without PDL)'}"
-        )
-    return bool(LAUNCH_PDL)
-
-
-#: ``join_cluster`` (``configure``; the ``tep8_publish_join`` lever) runs the post-FFN join
-#: (``UnpoolPublishJoin``) as a cluster kernel (NVRTC, CUDA C++) instead of the Triton program a
-#: row: the same 512 threads a row as the Triton join (layout #blocked: Triton thread T owns
-#: elements [8T, 8T+8) and [4096+8T, 4096+8T+8)) split over a cluster of CL CTAs (8 up to 128 rows,
-#: 4 above), with the arithmetic of the PTX Triton emits for this kernel at BLOCK_H 8192 and 16
-#: warps, operation for operation: the BF16 gain product, the fma / add in-thread tree, the
-#: xor-16..1 warp butterfly, the 16 warp sums reduced in the order every lane of Triton's xor-8..1
-#: cross-warp butterfly computes (shared across the cluster through DSMEM st.async + mbarrier),
-#: div.full.f32 by 8192, rsqrt.approx.ftz.f32, fma(residual, alpha, normed * beta), and the
-#: FP32-residual variant's mul / add next-variance tree. Bitwise the Triton join on every output
-#: (checked at worlds 16 / 8 / 4, rows 33..448, NORM_FP32 0 / 1, gain on, 3 seeds each; the
-#: transport polled per thread and reset to the sentinel as the Triton join does: each element still
-#: has one reader and one resetter). Launched as the Triton join is launched: with PDL and an entry
-#: trigger under ``tep8_join_pdl``, plain otherwise. Compiled with NVRTC on the first eager call per
-#: (device, gain, FP32 residual, cluster); a call inside a capture before that keeps the Triton join
-#: (logged once). Off: the Triton join exactly.
-JOIN_CLUSTER = False
-#: Rows from which the cluster size is 4 (measured: CL 8 -2.07 / -1.89 / -1.50 us at 40 / 64 / 128
-#: rows, CL 4 -0.80 at 192 where CL 8 ties).
-JOIN_CLUSTER_4_FROM_ROWS = 129
-_JOIN_CL_FN: dict = {}
-_JOIN_CL_LOGGED: list = []
-
-
-def configure(
-    *,
-    tep8_publish_splitk: bool = False,
-    tep8_pool_programmatic: bool = False,
-    tep8_join_pdl: bool = False,
-    join_cluster: bool = False,
-) -> None:
-    """Set the TP8 publication and post-FFN join settings this module reads at install and launch.
-
-    ``lever_settings.apply`` sets them from the model's plan before any install. The defaults
-    are the cuBLAS publication, the full stream-fork edge and the plain Triton join.
-
-    Args:
-        tep8_publish_splitk: TP8 slices of 33..64 rows publish from the split-K kernel when its
-            producer is certified (``TEP8_PUBLISH_SPLITK``).
-        tep8_pool_programmatic: the TP8 pool slice GEMM's fork edge from the post-attention hop
-            is made programmatic while capturing (``TEP8_POOL_PROGRAMMATIC``).
-        tep8_join_pdl: the post-FFN join launches with PDL and an entry trigger
-            (``TEP8_JOIN_PDL``).
-        join_cluster: the post-FFN join runs as the bitwise cluster kernel (``JOIN_CLUSTER``).
-    """
-    global TEP8_PUBLISH_SPLITK, TEP8_POOL_PROGRAMMATIC, TEP8_JOIN_PDL, JOIN_CLUSTER
-    TEP8_PUBLISH_SPLITK = bool(tep8_publish_splitk)
-    TEP8_POOL_PROGRAMMATIC = bool(tep8_pool_programmatic)
-    TEP8_JOIN_PDL = bool(tep8_join_pdl)
-    JOIN_CLUSTER = bool(join_cluster)
-    # The split-K producer is decided once from TEP8_PUBLISH_SPLITK (``_splitk_publisher``).
-    _splitk_state.clear()
-    if JOIN_CLUSTER:
-        logger.info(
-            "[musespark_open] projection_publish: join_cluster: the post-FFN join of 33..512-row "
-            "decode steps runs as the bitwise cluster kernel (8 CTAs a row up to 128 rows, 4 above)"
-        )
-
-
-_JOIN_CL_SRC = r"""
-typedef unsigned short u16;
-typedef unsigned int u32;
-typedef unsigned long long u64;
-#ifndef NORM_FP32
-#define NORM_FP32 0
-#endif
-#ifndef HAS_GAIN
-#define HAS_GAIN 1
-#endif
-#ifndef PUB
-#define PUB 1
-#endif
-#ifndef CL
-#define CL 4  // CTAs a row; each runs 512 / CL of the Triton join's 512 threads
-#endif
-#define NT (512 / CL)
-#define NW (NT / 32)
-__device__ __forceinline__ float bf2f(u32 h) { return __uint_as_float(h << 16); }
-__device__ __forceinline__ u32 f2bf(float f) { unsigned short r; asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(r) : "f"(f)); return r; }
-__device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
-__device__ __forceinline__ float div_full(float a, float b) { float r; asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
-__device__ __forceinline__ float rsqrt_ftz(float a) { float r; asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
-__device__ __forceinline__ void unpack8(uint4 q, float* v) {
-  v[0] = bf2f(q.x & 0xffffu); v[1] = bf2f(q.x >> 16); v[2] = bf2f(q.y & 0xffffu); v[3] = bf2f(q.y >> 16);
-  v[4] = bf2f(q.z & 0xffffu); v[5] = bf2f(q.z >> 16); v[6] = bf2f(q.w & 0xffffu); v[7] = bf2f(q.w >> 16); }
-__device__ __forceinline__ uint4 ld16(const void* p) { return *reinterpret_cast<const uint4*>(p); }
-__device__ __forceinline__ uint4 ld_vol(const void* p) {
-  uint4 q; asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(q.x), "=r"(q.y), "=r"(q.z), "=r"(q.w) : "l"(p) : "memory");
-  return q; }
-__device__ __forceinline__ bool has_sentinel(uint4 q) {
-  u32 w[4] = {q.x, q.y, q.z, q.w};
-  bool s = false;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) s |= ((w[i] & 0xffffu) == 0xfffeu) | ((w[i] >> 16) == 0xfffeu);
-  return s; }
-// Triton's in-thread order (fma tree: the first variance, and the BF16-first next variance)
-__device__ __forceinline__ float thread_sum_fma(const float* x, const float* y) {
-  const float ax = __fmaf_rn(x[0], x[0], __fmul_rn(x[2], x[2])), ay = __fmaf_rn(x[1], x[1], __fmul_rn(x[3], x[3]));
-  const float bx = __fmaf_rn(x[4], x[4], __fmul_rn(x[6], x[6])), by = __fmaf_rn(x[5], x[5], __fmul_rn(x[7], x[7]));
-  const float cx = __fmaf_rn(y[0], y[0], __fmul_rn(y[2], y[2])), cy = __fmaf_rn(y[1], y[1], __fmul_rn(y[3], y[3]));
-  const float dx = __fmaf_rn(y[4], y[4], __fmul_rn(y[6], y[6])), dy = __fmaf_rn(y[5], y[5], __fmul_rn(y[7], y[7]));
-  return __fadd_rn(__fadd_rn(__fadd_rn(ax, bx), __fadd_rn(cx, dx)), __fadd_rn(__fadd_rn(ay, by), __fadd_rn(cy, dy))); }
-// the FP32-residual next variance: squares then an add tree, no fma (the PTX Triton emits there)
-__device__ __forceinline__ float thread_sum_mul(const float* x, const float* y) {
-  float q[16];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) { q[i] = __fmul_rn(x[i], x[i]); q[8 + i] = __fmul_rn(y[i], y[i]); }
-  const float ax = __fadd_rn(q[0], q[2]), ay = __fadd_rn(q[1], q[3]), bx = __fadd_rn(q[4], q[6]), by = __fadd_rn(q[5], q[7]);
-  const float cx = __fadd_rn(q[8], q[10]), cy = __fadd_rn(q[9], q[11]), dx = __fadd_rn(q[12], q[14]), dy = __fadd_rn(q[13], q[15]);
-  return __fadd_rn(__fadd_rn(__fadd_rn(ax, bx), __fadd_rn(cx, dx)), __fadd_rn(__fadd_rn(ay, by), __fadd_rn(cy, dy))); }
-__device__ __forceinline__ u32 smem_u32(const void* p) { return (u32)__cvta_generic_to_shared(p); }
-// the row total: warp butterfly, the 16 warp sums to every CTA of the row's cluster (st.async + mbarrier),
-// then the tree every lane of Triton's cross-warp xor-8/4/2/1 butterfly computes
-__device__ __forceinline__ float row_sum(float s, float* wsum, u64* bar, int rank) {
-#pragma unroll
-  for (int off = 16; off >= 1; off >>= 1) s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, off));
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  if (lane < CL) {  // lane q sends this warp's sum to CTA q
-    u32 raddr, rbar;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(raddr) : "r"(smem_u32(wsum + NW * rank + warp)), "r"(lane));
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(rbar) : "r"(smem_u32(bar)), "r"(lane));
-    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                 :: "r"(raddr), "r"(__float_as_uint(s)), "r"(rbar) : "memory");
-  }
-  asm volatile("{\n .reg .pred p;\n W: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n @!p bra W;\n}"
-               :: "r"(smem_u32(bar)) : "memory");
-  float W[16];
-#pragma unroll
-  for (int i = 0; i < 16; ++i) W[i] = wsum[i];
-  const float a0 = __fadd_rn(__fadd_rn(W[0], W[8]), __fadd_rn(W[4], W[12]));
-  const float a2 = __fadd_rn(__fadd_rn(W[2], W[10]), __fadd_rn(W[6], W[14]));
-  const float a1 = __fadd_rn(__fadd_rn(W[1], W[9]), __fadd_rn(W[5], W[13]));
-  const float a3 = __fadd_rn(__fadd_rn(W[3], W[11]), __fadd_rn(W[7], W[15]));
-  return __fadd_rn(__fadd_rn(a0, a2), __fadd_rn(a1, a3)); }
-
-extern "C" __global__ void __launch_bounds__(NT)
-pubjoin4(float* out, const float* residual, const u16* branch, const u16* gain, const float* alpha, const float* beta,
-         float eps, u16* next_out, const u16* next_w, float next_eps, int* guard, int buffer, int world, int capacity,
-         int columns, long long guard_rounds, int trigger) {
-  __shared__ __align__(16) float wsum0[16];
-  __shared__ __align__(16) float wsum1[16];
-  __shared__ __align__(8) u64 bars[2];
-  const int t = threadIdx.x, rank = blockIdx.x % CL, row = blockIdx.x / CL;
-  const int T = rank * NT + t;
-  const int c0 = 8 * T, c1 = 4096 + 8 * T;
-  if (t == 0) {
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(smem_u32(bars + i)) : "memory");
-      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], 64;" :: "r"(smem_u32(bars + i)) : "memory");
-    }
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-  }
-  __syncthreads();
-  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;" ::: "memory");
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  if (trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-  // every input first (their latencies overlap), the branch last
-  const long long rb = (long long)row * 8192;
-  uint4 g0q = ld16(gain + c0), g1q = ld16(gain + c1), w0q = ld16(next_w + c0), w1q = ld16(next_w + c1);
-  float r0[8], r1[8], a0[8], a1[8], b0[8], b1[8];
-  *reinterpret_cast<float4*>(r0) = *reinterpret_cast<const float4*>(residual + rb + c0);
-  *reinterpret_cast<float4*>(r0 + 4) = *reinterpret_cast<const float4*>(residual + rb + c0 + 4);
-  *reinterpret_cast<float4*>(r1) = *reinterpret_cast<const float4*>(residual + rb + c1);
-  *reinterpret_cast<float4*>(r1 + 4) = *reinterpret_cast<const float4*>(residual + rb + c1 + 4);
-  *reinterpret_cast<float4*>(a0) = *reinterpret_cast<const float4*>(alpha + c0);
-  *reinterpret_cast<float4*>(a0 + 4) = *reinterpret_cast<const float4*>(alpha + c0 + 4);
-  *reinterpret_cast<float4*>(a1) = *reinterpret_cast<const float4*>(alpha + c1);
-  *reinterpret_cast<float4*>(a1 + 4) = *reinterpret_cast<const float4*>(alpha + c1 + 4);
-  *reinterpret_cast<float4*>(b0) = *reinterpret_cast<const float4*>(beta + c0);
-  *reinterpret_cast<float4*>(b0 + 4) = *reinterpret_cast<const float4*>(beta + c0 + 4);
-  *reinterpret_cast<float4*>(b1) = *reinterpret_cast<const float4*>(beta + c1);
-  *reinterpret_cast<float4*>(b1 + 4) = *reinterpret_cast<const float4*>(beta + c1 + 4);
-  float x[8], y[8];
-#if PUB
-  const int s0 = c0 / columns, s1 = c1 / columns;
-  u16* box0 = const_cast<u16*>(branch) + ((long long)(buffer * world + s0) * capacity + row) * columns + (c0 - s0 * columns);
-  u16* box1 = const_cast<u16*>(branch) + ((long long)(buffer * world + s1) * capacity + row) * columns + (c1 - s1 * columns);
-  uint4 q0 = ld_vol(box0), q1 = ld_vol(box1);
-  long long rounds = 0;
-  while (has_sentinel(q0) | has_sentinel(q1)) {
-    q0 = ld_vol(box0); q1 = ld_vol(box1);
-    if (guard_rounds > 0 && ++rounds == guard_rounds) atomicExch_system(guard, 1);
-  }
-  const uint4 sent = make_uint4(0xfffefffeu, 0xfffefffeu, 0xfffefffeu, 0xfffefffeu);
-  *reinterpret_cast<uint4*>(box0) = sent;  // retire the consumed halves
-  *reinterpret_cast<uint4*>(box1) = sent;
-  unpack8(q0, x); unpack8(q1, y);
-#else
-  unpack8(ld16(branch + rb + c0), x); unpack8(ld16(branch + rb + c1), y);
-#endif
-#if HAS_GAIN
-  {
-    float g0[8], g1[8];
-    unpack8(g0q, g0); unpack8(g1q, g1);
-#pragma unroll
-    for (int i = 0; i < 8; ++i) { x[i] = rbf(__fmul_rn(x[i], g0[i])); y[i] = rbf(__fmul_rn(y[i], g1[i])); }
-  }
-#endif
-  const float inv = rsqrt_ftz(__fadd_rn(div_full(row_sum(thread_sum_fma(x, y), wsum0, bars, rank), 8192.0f), eps));
-  float u0[8], u1[8], n0[8], n1[8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    u0[i] = __fmaf_rn(r0[i], a0[i], __fmul_rn(rbf(__fmul_rn(inv, x[i])), b0[i]));
-    u1[i] = __fmaf_rn(r1[i], a1[i], __fmul_rn(rbf(__fmul_rn(inv, y[i])), b1[i]));
-#if NORM_FP32
-    n0[i] = u0[i]; n1[i] = u1[i];
-#else
-    n0[i] = rbf(u0[i]); n1[i] = rbf(u1[i]);
-#endif
-  }
-  float* o = out + rb;
-  *reinterpret_cast<float4*>(o + c0) = make_float4(u0[0], u0[1], u0[2], u0[3]);
-  *reinterpret_cast<float4*>(o + c0 + 4) = make_float4(u0[4], u0[5], u0[6], u0[7]);
-  *reinterpret_cast<float4*>(o + c1) = make_float4(u1[0], u1[1], u1[2], u1[3]);
-  *reinterpret_cast<float4*>(o + c1 + 4) = make_float4(u1[4], u1[5], u1[6], u1[7]);
-#if NORM_FP32
-  const float sum2 = thread_sum_mul(n0, n1);
-#else
-  const float sum2 = thread_sum_fma(n0, n1);
-#endif
-  const float inv2 = rsqrt_ftz(__fadd_rn(div_full(row_sum(sum2, wsum1, bars + 1, rank), 8192.0f), next_eps));
-  float w0[8], w1[8];
-  unpack8(w0q, w0); unpack8(w1q, w1);
-  u32 p0[4], p1[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    p0[i] = f2bf(__fmul_rn(__fmul_rn(inv2, n0[2 * i]), __fadd_rn(w0[2 * i], 1.0f)))
-          | (f2bf(__fmul_rn(__fmul_rn(inv2, n0[2 * i + 1]), __fadd_rn(w0[2 * i + 1], 1.0f))) << 16);
-    p1[i] = f2bf(__fmul_rn(__fmul_rn(inv2, n1[2 * i]), __fadd_rn(w1[2 * i], 1.0f)))
-          | (f2bf(__fmul_rn(__fmul_rn(inv2, n1[2 * i + 1]), __fadd_rn(w1[2 * i + 1], 1.0f))) << 16);
-  }
-  u16* no = next_out + rb;
-  *reinterpret_cast<uint4*>(no + c0) = make_uint4(p0[0], p0[1], p0[2], p0[3]);
-  *reinterpret_cast<uint4*>(no + c1) = make_uint4(p1[0], p1[1], p1[2], p1[3]);
-  if (!trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-}
-"""
-
-
-def _join_cl_size(rows: int) -> int:
-    return 4 if rows >= JOIN_CLUSTER_4_FROM_ROWS else 8
-
-
-def _join_cl_check(r):
-    if int(r[0]) != 0:
-        raise RuntimeError(f"projection_publish join cluster kernel: CUDA/NVRTC error {r!r}")
-    return r[1] if len(r) == 2 else r[1:]
-
-
-def _join_cl_function(device: torch.device, has_gain: bool, norm_fp32: bool, cl: int):
-    """The compiled cluster join, or ``None`` if it is not compiled yet and a capture is running."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, bool(has_gain), bool(norm_fp32), int(cl))
-    fn = _JOIN_CL_FN.get(key)
-    if fn is not None:
-        return fn
-    if torch.cuda.is_current_stream_capturing():
-        if not _JOIN_CL_LOGGED:
-            _JOIN_CL_LOGGED.append(True)
-            logger.warning(
-                "[musespark_open] projection_publish: join_cluster: first join inside a CUDA-graph "
-                "capture; this capture keeps the Triton join (the cluster kernel compiles on an "
-                "eager call)"
-            )
-        return None
-    from cuda.bindings import driver as cu
-    from cuda.bindings import nvrtc
-
-    major, minor = torch.cuda.get_device_capability(index)
-    prog = _join_cl_check(
-        nvrtc.nvrtcCreateProgram(_JOIN_CL_SRC.encode(), b"publish_join_cluster.cu", 0, [], [])
-    )
-    opts = [
-        f"--gpu-architecture=sm_{major}{minor}".encode(),
-        b"-std=c++17",
-        b"-default-device",
-        b"-DPUB=1",
-        f"-DHAS_GAIN={int(bool(has_gain))}".encode(),
-        f"-DNORM_FP32={int(bool(norm_fp32))}".encode(),
-        f"-DCL={int(cl)}".encode(),
-    ]
-    r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
-    if int(r[0]) != 0:
-        n = _join_cl_check(nvrtc.nvrtcGetProgramLogSize(prog))
-        log = b" " * n
-        nvrtc.nvrtcGetProgramLog(prog, log)
-        raise RuntimeError(
-            "projection_publish join cluster kernel: NVRTC compile failed:\n"
-            + log.decode(errors="replace")
-        )
-    n = _join_cl_check(nvrtc.nvrtcGetCUBINSize(prog))
-    cubin = b" " * n
-    _join_cl_check(nvrtc.nvrtcGetCUBIN(prog, cubin))
-    with torch.cuda.device(index):
-        mod = _join_cl_check(cu.cuModuleLoadData(cubin))
-        f = _join_cl_check(cu.cuModuleGetFunction(mod, b"pubjoin4"))
-    regs = int(
-        _join_cl_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, f))
-    )
-    lmem = int(
-        _join_cl_check(
-            cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f)
-        )
-    )
-    _JOIN_CL_FN[key] = (f, mod)
-    logger.info(
-        "[musespark_open] projection_publish: join_cluster: post-FFN join cluster kernel "
-        f"compiled for sm_{major}{minor} on device {index} (cluster {cl} x {512 // cl} threads, gain {bool(has_gain)}, "
-        f"FP32 next-norm residual {bool(norm_fp32)}, regs {regs}, local {lmem} B)"
-    )
-    return _JOIN_CL_FN[key]
-
-
-def _join_cl_launch(
-    fn,
-    cl,
-    rows,
-    updated,
-    residual,
-    receive,
-    gain,
-    alpha,
-    beta,
-    post_eps,
-    next_input,
-    weight,
-    pre_eps,
-    guard_ptr,
-    buffer,
-    world,
-    capacity,
-    columns,
-    guard_rounds,
-    pdl,
-):
-    from cuda.bindings import driver as cu
-
-    cfg = cu.CUlaunchConfig()
-    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = cl * rows, 1, 1
-    cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 512 // cl, 1, 1
-    cfg.sharedMemBytes = 0
-    cfg.hStream = cu.CUstream(torch.cuda.current_stream(residual.device).cuda_stream)
-    a1 = cu.CUlaunchAttribute()
-    a1.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
-    a1.value.clusterDim.x, a1.value.clusterDim.y, a1.value.clusterDim.z = cl, 1, 1
-    attrs = [a1]
-    if pdl:
-        a2 = cu.CUlaunchAttribute()
-        a2.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
-        a2.value.programmaticStreamSerializationAllowed = 1
-        attrs.append(a2)
-    cfg.attrs = attrs
-    cfg.numAttrs = len(attrs)
-    vp, ll, fl, ii = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float, ctypes.c_int
-    args = (
-        (
-            updated.data_ptr(),
-            residual.data_ptr(),
-            receive.data_ptr(),
-            gain.data_ptr(),
-            alpha.data_ptr(),
-            beta.data_ptr(),
-            float(post_eps),
-            next_input.data_ptr(),
-            weight.data_ptr(),
-            float(pre_eps),
-            int(guard_ptr),
-            int(buffer),
-            int(world),
-            int(capacity),
-            int(columns),
-            int(guard_rounds),
-            int(bool(pdl)),
-        ),
-        (vp, vp, vp, vp, vp, vp, fl, vp, vp, fl, vp, ii, ii, ii, ii, ll, ii),
-    )
-    _join_cl_check((cu.cuLaunchKernelEx(cfg, fn[0], args, 0)[0], None))
 
 
 def capture_dependencies(stream: torch.cuda.Stream):
@@ -748,24 +203,7 @@ def programmatic_from(stream: torch.cuda.Stream, sources) -> bool:
 
 def _splitk_tactic(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor):
     """The split-K tactic for this publication, or None (cuBLAS)."""
-    if not SPLITK_MIN_ROWS <= hidden.shape[0] <= SPLITK_MAX_ROWS or hidden.dim() != 2:
-        return None
-    tactic = TP8_PUBLISH_SPLITK_TACTICS.get((hidden.shape[1], weight.shape[0]))
-    if tactic is None or _splitk_publisher() is None:
-        return None
-    if not (
-        hidden.dtype == weight.dtype == slot.dtype == torch.bfloat16
-        and hidden.is_contiguous()
-        and weight.is_contiguous()
-        and slot.is_contiguous()
-        and tuple(slot.shape) == (hidden.shape[0], weight.shape[0])
-        and hidden.data_ptr() % 32 == 0
-        and weight.data_ptr() % 32 == 0
-        and slot.data_ptr() % 16 == 0
-        and not torch.is_grad_enabled()
-    ):
-        return None
-    return tactic
+    return None
 
 
 def local_columns(width: int, world: int = WORLD) -> int:
@@ -817,8 +255,8 @@ class PublishTransport:
         self.allocated = 0
         self._comm = comm if comm is not None else _get_mnnvl_workspace_comm(mapping)
         refusal: Optional[str] = None
-        if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-            refusal = "the projection publish transport runs on SM103 and SM107 only"
+        if torch.cuda.get_device_capability(self.device) != (10, 3):
+            refusal = "the projection publish transport runs on SM103 only"
         elif not prefer_pinned():
             refusal = "the guard words need pinned host memory, which this platform does not pin"
         if not _mnnvl_workspace_all_succeeded(self._comm, refusal is None):
@@ -1025,15 +463,8 @@ def publish_projection(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.T
     ``slot`` is a transport slot (``PublishTransport.slot``): the GEMM's epilogue stores
     are the publication. ``weight`` is the rank's ``[columns, K]`` row slice of the
     projection's weight (contiguous rows of the loaded weight; no copy). Only with a
-    certified producer (``producer_refusal``). With ``TEP8_PUBLISH_SPLITK`` a TP8 slice of
-    33..64 rows publishes from the split-K kernel instead, when its producer is certified
-    (``_splitk_publisher``).
+    certified producer (``producer_refusal``).
     """
-    tactic = _splitk_tactic(hidden, weight, slot)
-    if tactic is not None:
-        run_splitk_dense, splitk_tactic = _splitk_publisher()
-        run_splitk_dense(hidden, weight.t(), None, slot, _SPLITK_PDL, splitk_tactic(*tactic))
-        return
     torch.mm(hidden, weight.t(), out=slot)
 
 
@@ -1085,7 +516,6 @@ if triton is not None:
         SENTINEL_I16: tl.constexpr,
         GUARD: tl.constexpr,
         GUARD_BREAK: tl.constexpr,
-        PDL: tl.constexpr = False,
     ):
         """The built-in ``_gated_residual_after_rmsnorm_kernel`` (FUSE_NEXT_NORM) on a published branch.
 
@@ -1095,11 +525,6 @@ if triton is not None:
         built-in kernel's statements run unchanged on it (the same ``[BLOCK_H]`` tensors and
         ``num_warps``, so the same reductions).
         """
-        if PDL:
-            # TEP8_JOIN_PDL: wait for the prerequisite grid before any read, then let the dependent
-            # (the next QKV GEMM) become resident and stage its weight.
-            tl.extra.cuda.gdc_wait()
-            tl.extra.cuda.gdc_launch_dependents()
         token = tl.program_id(0)
         offs = tl.arange(0, BLOCK_H)
         mask = offs < HIDDEN
@@ -1148,125 +573,6 @@ if triton is not None:
         next_output = next_input * tl.rsqrt(next_variance + next_eps)
         next_output = next_output * (next_weight + 1.0)
         tl.store(next_out_ptr + base, next_output, mask=mask)
-
-    @triton.jit(do_not_specialize=["buffer", "rows", "pad_rows"])
-    def _unpool_publish_join_mxfp8_kernel(
-        out_ptr,  # [T, HIDDEN] fp32, the new residual stream
-        residual_ptr,  # [T, HIDDEN] fp32, the old one
-        receive_ptr,  # int16 [BUFFERS, WORLD, CAPACITY, COLUMNS], this rank's copy
-        gain_ptr,  # [HIDDEN] (1 + w) when HAS_GAIN, else unread
-        alpha_ptr,  # [HIDDEN] fp32
-        beta_ptr,  # [HIDDEN] fp32
-        eps,
-        next_out_ptr,
-        next_weight_ptr,
-        next_eps,
-        values_ptr,  # [T, HIDDEN] E4M3, the MXFP8 values of next_out
-        scales_ptr,  # int32 words of next_out's 128x4-swizzled UE8M0 scales
-        guard_ptr,  # int32, pinned host memory
-        buffer,
-        rows,  # T
-        pad_rows,  # T rounded up to 128
-        WORLD_SIZE: tl.constexpr,
-        CAPACITY: tl.constexpr,
-        COLUMNS: tl.constexpr,
-        HIDDEN: tl.constexpr,
-        BLOCK_H: tl.constexpr,
-        HAS_GAIN: tl.constexpr,
-        NORM_FP32_RESIDUAL: tl.constexpr,
-        SENTINEL_I16: tl.constexpr,
-        GUARD: tl.constexpr,
-        GUARD_BREAK: tl.constexpr,
-    ):
-        """``_unpool_publish_join_kernel``, then the MXFP8 quantization of the BF16 row it stored.
-
-        Up to the BF16 store of ``next_out`` the statements are ``_unpool_publish_join_kernel``'s,
-        unchanged, so ``out`` and ``next_out`` are its bits. After a CTA barrier, which makes
-        every thread's BF16 stores of the row visible to the whole program, the program reads
-        the row back as ``[HIDDEN / 32, 32]`` blocks and writes ``quant.mxfp8_quantize``'s
-        recipe of it (``context_fp8_dense``): one UE8M0 scale per 1x32 block, amax / 448
-        rounded up to a power of two, the values divided by it and rounded to E4M3. Reading
-        the row back instead of reusing the registers keeps the join's registers and layouts
-        those of the served kernel (64 registers per thread, two programs per SM).
-
-        Scales go to the 128x4-swizzled layout the MXFP8 GEMMs read
-        (``get_sf_out_offset_128x4``): the four scales of blocks ``4c .. 4c + 3`` of row ``r``
-        are one 32-bit word. Program ``t`` also zeroes the scale rows ``t + rows + j * rows``
-        below ``pad_rows`` (the 128-row pad), so the scale buffer holds what
-        ``mxfp8_quantize`` writes, pad included.
-        """
-        token = tl.program_id(0)
-        offs = tl.arange(0, BLOCK_H)
-        mask = offs < HIDDEN
-        base = token * HIDDEN + offs
-
-        source = offs // COLUMNS
-        box = (
-            receive_ptr
-            + ((buffer * WORLD_SIZE + source) * CAPACITY + token) * COLUMNS
-            + (offs - source * COLUMNS)
-        )
-        raw = tl.load(box, mask=mask, other=0, volatile=True)
-        pending = tl.max((raw == SENTINEL_I16).to(tl.int32), axis=0)
-        rounds = 0
-        while pending != 0:
-            raw = tl.load(box, mask=mask, other=0, volatile=True)
-            pending = tl.max((raw == SENTINEL_I16).to(tl.int32), axis=0)
-            if GUARD > 0:
-                rounds += 1
-                if rounds == GUARD:
-                    tl.atomic_xchg(guard_ptr, 1, sem="relaxed", scope="sys")
-                    if GUARD_BREAK:
-                        pending = pending * 0
-        # Retire the consumed halves before this grid can complete.
-        tl.store(box, tl.full([BLOCK_H], SENTINEL_I16, tl.int16), mask=mask)
-        branch = raw.to(tl.bfloat16, bitcast=True)
-
-        scaled = branch.to(tl.float32)
-        if HAS_GAIN:
-            gain = tl.load(gain_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-            scaled = (scaled * gain).to(branch.dtype).to(tl.float32)
-        variance = tl.sum(scaled * scaled, axis=0) / HIDDEN
-        normed = (scaled * tl.rsqrt(variance + eps)).to(branch.dtype).to(tl.float32)
-
-        residual = tl.load(residual_ptr + base, mask=mask, other=0.0).to(tl.float32)
-        alpha = tl.load(alpha_ptr + offs, mask=mask, other=0.0)
-        beta = tl.load(beta_ptr + offs, mask=mask, other=0.0)
-        updated = alpha * residual + beta * normed
-        tl.store(out_ptr + base, updated, mask=mask)
-        if NORM_FP32_RESIDUAL:
-            next_input = updated
-        else:
-            next_input = updated.to(branch.dtype).to(tl.float32)
-        next_variance = tl.sum(next_input * next_input, axis=0) / HIDDEN
-        next_weight = tl.load(next_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        next_output = next_input * tl.rsqrt(next_variance + next_eps)
-        next_output = next_output * (next_weight + 1.0)
-        tl.store(next_out_ptr + base, next_output, mask=mask)
-
-        tl.debug_barrier()
-        GROUPS: tl.constexpr = HIDDEN // 32
-        WORDS: tl.constexpr = GROUPS // 4
-        K_TILES: tl.constexpr = HIDDEN // 128
-        block = tl.arange(0, GROUPS)
-        at = token * HIDDEN + block[:, None] * 32 + tl.arange(0, 32)[None, :]
-        x = tl.load(next_out_ptr + at).to(tl.float32)
-        amax = tl.max(tl.abs(x), axis=1)
-        bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
-        # UE8M0 rounded towards +inf: the exponent, plus one when any mantissa bit is set.
-        exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-        exponent = tl.minimum(exponent, 254)
-        # 2^(127 - exponent), the reciprocal of the scale; 0 for an all-zero block.
-        inverse = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
-        inverse = tl.where(amax > 0.0, inverse, 0.0)
-        tl.store(values_ptr + at, (x * inverse[:, None]).to(tl.float8e4nv))
-        words = tl.sum(tl.reshape(exponent, (WORDS, 4)) << (tl.arange(0, 4) * 8)[None, :], axis=1)
-        word = tl.arange(0, WORDS) * 128
-        row_word = (token // 128) * (K_TILES * 128) + (token % 32) * 4 + (token % 128) // 32
-        tl.store(scales_ptr + row_word + word, words)
-        for pad in range(rows + token, pad_rows, rows):
-            pad_word = (pad // 128) * (K_TILES * 128) + (pad % 32) * 4 + (pad % 128) // 32
-            tl.store(scales_ptr + pad_word + word, tl.zeros([WORDS], tl.int32))
 
 
 def _residual_num_warps() -> int:
@@ -1292,7 +598,7 @@ class UnpoolPublishJoin(OpWrapper):
     none) and ``guard_break`` select the poll guard (``guard_break`` for tests only).
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Certified bit for bit against the built-in Triton join run on the gathered branch
@@ -1322,40 +628,6 @@ class UnpoolPublishJoin(OpWrapper):
         next_input = torch.empty(
             (rows, UNPOOL_HIDDEN), dtype=torch.bfloat16, device=residual.device
         )
-        pdl = _join_pdl()
-        if (
-            JOIN_CLUSTER
-            and not guard_break
-            and residual.is_contiguous()
-            and next_input.is_contiguous()
-        ):
-            # The bitwise cluster join (JOIN_CLUSTER above).
-            cl = _join_cl_size(rows)
-            fn = _join_cl_function(residual.device, gain is not None, bool(norm_fp32_residual), cl)
-            if fn is not None:
-                _join_cl_launch(
-                    fn,
-                    cl,
-                    rows,
-                    updated,
-                    residual,
-                    transport.receive(),
-                    gain if gain is not None else weight,
-                    alpha,
-                    beta,
-                    post_eps,
-                    next_input,
-                    weight,
-                    pre_eps,
-                    transport.control_ptr(),
-                    int(buffer),
-                    transport.world,
-                    transport.max_rows,
-                    transport.columns,
-                    int(guard),
-                    pdl,
-                )
-                return updated, next_input
         _unpool_publish_join_kernel[(rows,)](
             updated,
             residual,
@@ -1380,8 +652,6 @@ class UnpoolPublishJoin(OpWrapper):
             GUARD=int(guard),
             GUARD_BREAK=bool(guard_break),
             num_warps=_residual_num_warps(),
-            # Passed only under TEP8_JOIN_PDL, so the plain build is unchanged.
-            **({"PDL": True, "launch_pdl": True} if pdl else {}),
         )
         return updated, next_input
 
@@ -1460,172 +730,6 @@ class UnpoolPublishJoin(OpWrapper):
 
 
 unpool_publish_join = UnpoolPublishJoin()
-
-
-#: Elements per MXFP8 block (one UE8M0 scale each), and the row tile of the swizzled scales.
-MXFP8_BLOCK = 32
-MXFP8_SCALE_ROWS = 128
-
-
-def mxfp8_scale_bytes(rows: int, columns: int = UNPOOL_HIDDEN) -> int:
-    """Bytes of the 128x4-swizzled UE8M0 scales of ``rows`` x ``columns`` MXFP8 values."""
-    padded = -(-rows // MXFP8_SCALE_ROWS) * MXFP8_SCALE_ROWS
-    return padded * (columns // MXFP8_BLOCK)
-
-
-def mxfp8_reference(rows_bf16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(E4M3 values, 128x4-swizzled UE8M0 scales)`` of BF16 ``[M, K]`` rows, in plain torch.
-
-    The recipe of ``context_fp8_dense.quant.mxfp8_quantize`` (and ``trtllm::mxfp8_quantize``):
-    per 1x32 block, scale = amax / 448 rounded up to a power of two, values ``x / scale``
-    rounded to nearest E4M3; an all-zero block has scale byte 0 and zero values. The scale of
-    block ``b`` of row ``r`` sits at ``get_sf_out_offset_128x4(r, b)``; rows past ``M`` up to
-    the 128-row pad are zero.
-    """
-    m, k = rows_bf16.shape
-    blocks = k // MXFP8_BLOCK
-    x = rows_bf16.float().view(m, blocks, MXFP8_BLOCK)
-    amax = x.abs().amax(dim=-1)
-    bits = (amax * (1.0 / 448.0)).view(torch.int32)
-    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-    exponent = exponent.clamp(max=254)
-    inverse = ((254 - exponent) << 23).view(torch.float32)
-    inverse = torch.where(amax > 0, inverse, torch.zeros_like(inverse))
-    values = (x * inverse[..., None]).view(m, k).to(torch.float8_e4m3fn)
-    padded = -(-m // MXFP8_SCALE_ROWS) * MXFP8_SCALE_ROWS
-    row = torch.arange(padded, device=rows_bf16.device)[:, None]
-    block = torch.arange(blocks, device=rows_bf16.device)[None, :]
-    offset = (
-        (row // 128) * (blocks // 4) * 512
-        + (block // 4) * 512
-        + (row % 32) * 16
-        + ((row % 128) // 32) * 4
-        + (block % 4)
-    )
-    full = torch.zeros((padded, blocks), dtype=torch.uint8, device=rows_bf16.device)
-    full[:m] = exponent.to(torch.uint8)
-    scales = torch.empty(padded * blocks, dtype=torch.uint8, device=rows_bf16.device)
-    scales[offset.flatten()] = full.flatten()
-    return values, scales
-
-
-class UnpoolPublishJoinMxfp8(OpWrapper):
-    """``UnpoolPublishJoin``, which also writes the MXFP8 quantization of the next input.
-
-    The arguments are ``UnpoolPublishJoin``'s. Returns ``(updated, next_input, values,
-    scales)``: the join's two outputs, bit for bit those of ``unpool_publish_join``, and
-    ``mxfp8_reference(next_input)``: E4M3 ``[rows, 8192]`` values and the 128x4-swizzled
-    UE8M0 scales (``mxfp8_scale_bytes(rows)`` bytes), the operands the Rubin MXFP8 GEMMs
-    take for the next layer's QKV projection. A collective over the TP4 group, as
-    ``UnpoolPublishJoin``.
-
-    Ownership: program ``t`` is the only writer of row ``t`` of every output, of its scale
-    row and of the pad scale rows ``rows + t + j * rows``; the values and scales are fresh
-    tensors that no other kernel writes. A consumer launched after this grid (in stream
-    order, or as a PDL dependent that waits on it) reads them complete.
-    """
-
-    ARCHS = frozenset({Arch.SM_107})
-
-    note = """
-    The join part is the served kernel's statements, unchanged; its outputs are certified
-    bit for bit against `unpool_publish_join` and the MXFP8 outputs against
-    `mxfp8_reference` (itself bit for bit `context_fp8_dense.quant.mxfp8_quantize`), on an
-    emulated transport, through CUDA-graph replays with changing inputs.
-    """
-
-    def __call__(
-        self,
-        transport: PublishTransport,
-        buffer: int,
-        rows: int,
-        residual: torch.Tensor,
-        gain: Optional[torch.Tensor],
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-        weight: torch.Tensor,
-        post_eps: float,
-        pre_eps: float,
-        norm_fp32_residual: bool = False,
-        guard: int = GUARD_ROUNDS,
-        guard_break: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        updated = torch.empty_like(residual)
-        next_input = torch.empty(
-            (rows, UNPOOL_HIDDEN), dtype=torch.bfloat16, device=residual.device
-        )
-        values = torch.empty(
-            (rows, UNPOOL_HIDDEN), dtype=torch.float8_e4m3fn, device=residual.device
-        )
-        scales = torch.empty(mxfp8_scale_bytes(rows), dtype=torch.uint8, device=residual.device)
-        pad_rows = -(-rows // MXFP8_SCALE_ROWS) * MXFP8_SCALE_ROWS
-        _unpool_publish_join_mxfp8_kernel[(rows,)](
-            updated,
-            residual,
-            transport.receive(),
-            gain if gain is not None else alpha,
-            alpha,
-            beta,
-            post_eps,
-            next_input,
-            weight,
-            pre_eps,
-            values,
-            scales.view(torch.int32),
-            _GuardWords(transport.control_ptr()),
-            int(buffer),
-            int(rows),
-            int(pad_rows),
-            WORLD_SIZE=transport.world,
-            CAPACITY=transport.max_rows,
-            COLUMNS=transport.columns,
-            HIDDEN=UNPOOL_HIDDEN,
-            BLOCK_H=UNPOOL_HIDDEN,
-            HAS_GAIN=gain is not None,
-            NORM_FP32_RESIDUAL=bool(norm_fp32_residual),
-            SENTINEL_I16=_SENTINEL_I16,
-            GUARD=int(guard),
-            GUARD_BREAK=bool(guard_break),
-            num_warps=_residual_num_warps(),
-        )
-        return updated, next_input, values, scales
-
-    def reference(
-        self,
-        per_rank_slices: Sequence[torch.Tensor],
-        residual: torch.Tensor,
-        gain: Optional[torch.Tensor],
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-        weight: torch.Tensor,
-        post_eps: float,
-        pre_eps: float,
-        norm_fp32_residual: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``UnpoolPublishJoin.reference``, then ``mxfp8_reference`` of its BF16 next input.
-
-        The collective exception to mirroring, as ``UnpoolPublishJoin.reference``.
-        """
-        updated, next_input = unpool_publish_join.reference(
-            per_rank_slices,
-            residual,
-            gain,
-            alpha,
-            beta,
-            weight,
-            post_eps,
-            pre_eps,
-            norm_fp32_residual,
-        )
-        values, scales = mxfp8_reference(next_input)
-        return updated, next_input, values, scales
-
-    def is_valid(self, *args, **kwargs) -> None:
-        """``UnpoolPublishJoin.is_valid``: the same operands and transport."""
-        unpool_publish_join.is_valid(*args, **kwargs)
-
-
-unpool_publish_join_mxfp8 = UnpoolPublishJoinMxfp8()
 
 
 def available() -> bool:

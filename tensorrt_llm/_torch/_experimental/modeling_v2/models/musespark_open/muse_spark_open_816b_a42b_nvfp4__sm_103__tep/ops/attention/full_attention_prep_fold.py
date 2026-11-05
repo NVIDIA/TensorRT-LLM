@@ -250,10 +250,10 @@ class FullAttnSplitKvFold(OpWrapper):
             or not part_lse.is_contiguous()
             or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
             or qkv.device.type != "cuda"
-            or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
+            or torch.cuda.get_device_capability(qkv.device) != (10, 3)
         ):
             raise ValueError(
-                "full_attention_prep_fold takes, on one sm_103 or sm_107 device and 16-byte aligned: "
+                "full_attention_prep_fold takes, on one sm_103 device and 16-byte aligned: "
                 "a BF16 raw "
                 f"projection [1..{MAX_ROWS}, {raw_width(kv_heads)}] (unit last stride, rows a "
                 "multiple of 8 elements apart), a contiguous FP8 E4M3 pool [blocks, "
@@ -493,10 +493,10 @@ class FullAttnSplitKvFoldMulti(OpWrapper):
             or not part_lse.is_contiguous()
             or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
             or qkv.device.type != "cuda"
-            or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
+            or torch.cuda.get_device_capability(qkv.device) != (10, 3)
         ):
             raise ValueError(
-                "full_attention_prep_fold_multi takes, on one sm_103 or sm_107 device and 16-byte "
+                "full_attention_prep_fold_multi takes, on one sm_103 device and 16-byte "
                 f"aligned: a BF16 raw projection [R x 1..{MAX_ROWS}, {raw_width(kv_heads)}] (unit "
                 "last stride, rows a multiple of 8 elements apart), a contiguous FP8 E4M3 pool, an "
                 f"int32 [R, 2, pages] table (K and V rows adjacent, at most {stages} pages per split "

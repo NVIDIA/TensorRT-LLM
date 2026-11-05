@@ -97,35 +97,6 @@ from ..projection_gathers.gathers import MuseSparkOpenTepGatherMoE, _require_ali
 #: the routing kernel (``_full_routing_kernel``) and the memo the experts and the
 #: finalize read (``MuseSparkOpenRoutingMethod.apply``); its ``reference`` runs them.
 
-# ---- edge_bf16_moe_front: the BF16-expert layers' decode front through the routed chain ----
-#: Part of the ``edge_bf16_moe_front`` fast path (``install(bf16_front=True)``, which gives the
-#: layers their ``_pf_unit_scale``). The two layers the checkpoint leaves with BF16 experts (0 and
-#: 61) have no NVFP4 input quantization, so ``_pool_quant_args`` declines them and their decode
-#: front is the built-in two-stream one: the replicated FP32 router over its whole 8 MiB weight on
-#: every rank, the routing kernel and the ring-buddy placement on one stream, the pool GEMM, the
-#: built-in column gather and the pre-expert RMSNorm on the other. With the fast path a decode step
-#: of at most 8 rows of such a layer runs the NVFP4 layers' routed chain instead:
-#:
-#: * ``1``: the router shard (``ops/moe/router_shard``, on the router-fork side stream when
-#:   installed), the pool GEMM, then ``ops/comm/pool_gather_route`` for the pool gather (its
-#:   ``gathered`` row), the logit exchange, the routing and the placement; its NVFP4 outputs are
-#:   not read. The pre-expert norm is then the built-in module on the gathered row.
-#:   Value-identical by construction: every output the experts and the finalize read is a
-#:   certified bitwise reproduction of the built-in chain (the router columns, the routing ids and
-#:   FP32 weights, the placement's local ids and BF16 weights, the gathered row), and the norm is
-#:   the built-in call on the same row.
-#: * ``2``: as ``1``, with the pre-expert norm computed inside the routed kernel
-#:   (``pool_gather_route(..., bf16_norm=weight)``): the gathered row's sum of squares is the one
-#:   the kernel already forms for the quantization, which is flashinfer's ``row_reduce`` over the
-#:   same 64-thread row geometry as flashinfer's ``RMSNormKernel`` at this width, and the output is
-#:   ``bf16((x * rstd) * (w + 1))`` as that kernel computes it (``ops/comm/pool_gather_route``).
-#:
-#: ``0`` keeps the built-in front. Every rank takes the same branch (shapes, dtypes and
-#: construction-time state only). The layer's ``_pf_unit_scale``, set only by
-#: ``install(model, bf16_front=True)`` (the ``edge_bf16_moe_front`` fast path), is what turns the
-#: front on: without it ``_pf_bf16_site`` is False and both modes keep the built-in front.
-PF_BF16_FRONT = "2"
-
 
 def _placement(moe, world: Optional[int] = None):
     """``(kind, static_from, state)`` of the replicated experts' placement on this layer, if installed and active.
@@ -160,25 +131,8 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
     #: ``pool_direct.DirectPoolSite`` (its producers publish into the routed kernel's
     #: transport); None otherwise.
     _pool_direct_armed = None
-    #: ``wide_prologue``: the TP4 wide inbox (``WIDE_MAX_ROWS`` rows) of the 16..32-row
-    #: prologue, or None (those steps keep the built-in prepare).
-    _wide_inbox: Optional[ProjectionInbox] = None
-    #: ``wide_prologue``: whether the 16..32-row router shard gives each row its
-    #: one-request bits (``router_shard_rows``) instead of the built-in tensor-core
-    #: router's (``router_shard_wide``); the ``wide_router_per_row`` lever.
-    _wide_router_rows: bool = False
-    #: ``wide_prologue``: whether ``pool_into_route`` and ``unpool_into_boundary`` also
-    #: build their 16..32-row direct transports; the ``wide_direct_transports`` lever.
-    _wide_direct: bool = False
-    #: ``edge_bf16_moe_front``: the routed kernel's unit global scale on a BF16-expert layer (set
-    #: by ``install(bf16_front=True)``), else None.
-    _pf_unit_scale: Optional[torch.Tensor] = None
 
     def prepare_moe_inputs(self, hidden_states: torch.Tensor):
-        if self._wide_inbox is not None:
-            wide = self._wide_prepare(hidden_states)
-            if wide is not None:
-                return wide
         warps = self._prologue_router_warps(hidden_states)
         if warps is None:
             self._pool_direct_refuse_declined(hidden_states)
@@ -192,15 +146,6 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
         probe = hidden_states.view(-1)[: rows * columns].view(rows, columns)
         args = self._pool_quant_args(probe)
         if args is None:
-            if (
-                self._pool_direct_armed is not None
-                and PF_BF16_FRONT == "2"
-                and self._pf_bf16_site()
-            ):
-                # PF_BF16_FRONT 2 on the direct transport (``pool_into_route``, the armed site).
-                return self._pool_direct_armed.prepare_bf16(self, hidden_states, warps)
-            if PF_BF16_FRONT in ("1", "2") and self._pf_bf16_front_applies(hidden_states):
-                return self._pf_bf16_front(hidden_states, warps, fused_norm=PF_BF16_FRONT == "2")
             self._pool_direct_refuse_declined(hidden_states)
             return super().prepare_moe_inputs(hidden_states)
         gain, global_scale = args
@@ -269,102 +214,6 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
         self._prologue_record_routing(out, place, state, world)
         return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
 
-    def _wide_router_shard(
-        self, hidden_states: torch.Tensor, rank: int, warps: int, out: torch.Tensor, world: int
-    ) -> None:
-        """This rank's router logit columns of a 16..32-row call into ``out`` (``[rows, L]`` FP32).
-
-        By default ``router_shard_wide``: the built-in 16..32-row router's bits (its TF32x3
-        tensor-core split-K and reduce). With ``_wide_router_rows``, ``router_shard_rows`` at
-        ``warps``: each row's logits are the built-in small-batch router's for that row in a
-        one-request call, one launch and no reduce, but other bits than the built-in
-        16..32-row launch's.
-        """
-        if self._wide_router_rows:
-            _shard.router_shard_rows(
-                hidden_states,
-                self.router.weight,
-                rank,
-                self.metap_multiplier,
-                warps,
-                out,
-                ranks=world,
-            )
-        else:
-            _shard.router_shard_wide(
-                hidden_states, self.router.weight, rank, self.metap_multiplier, out, ranks=world
-            )
-
-    def _wide_prepare(self, hidden_states: torch.Tensor):
-        """``wide_prologue``: the prologue of a 16..32-row decode step, or None (nothing launched).
-
-        Where the built-in decode would run its tensor-core router and the fused routing on
-        a pool-deferring call of 16..32 rows: this rank's router columns
-        (``_wide_router_shard``) on the router fork's side stream, the pool slice GEMM on the
-        current one, and ``pool_gather_route`` on the
-        wide inbox -- the pool gather + quantization, the logit exchange and the routing
-        (no placement: above 8 rows the experts are the built-in ones and read only the
-        routing memo). The pool slice is this rank's columns of the built-in replicated
-        pool projection, by a GEMM of its own shape.
-        """
-        rows = hidden_states.shape[0] if hidden_states.dim() == 2 else 0
-        if not _shard.WIDE_MIN_ROWS <= rows <= _shard.WIDE_MAX_ROWS:
-            return None
-        if self._prologue_router_conditions(hidden_states, _shard.WIDE_MAX_ROWS) is None:
-            return None
-        inbox = self._wide_inbox
-        world = inbox.world
-        columns = _route.local_columns(world)
-        probe = hidden_states.view(-1)[: rows * columns].view(rows, columns)
-        args = self._pool_quant_args(probe, max_rows=inbox.max_rows)
-        if args is None:
-            return None
-        gain, global_scale = args
-        # One request's warp count (the built-in launch's at 8 rows), for router_shard_rows.
-        warps = _shard.builtin_warps(
-            _shard.MAX_ROWS, getattr(self, "_prepare_stream", None) is not None
-        )
-        if self._pool_direct_armed is not None:
-            # pool_into_route's wide site: the same chain with the producers publishing.
-            return self._pool_direct_armed.prepare(self, hidden_states, warps, gain, global_scale)
-        routing = self.experts.routing_method
-        side = self._router_stream
-        local = _shard.local_experts(world)
-        with self.nvtx("router"):
-            main = torch.cuda.current_stream()
-            logits_local = torch.empty(
-                (rows, local), device=hidden_states.device, dtype=torch.float32
-            )
-            if side is None:
-                self._wide_router_shard(hidden_states, inbox.rank, warps, logits_local, world)
-            else:
-                side.wait_stream(main)
-                with torch.cuda.stream(side):
-                    self._wide_router_shard(hidden_states, inbox.rank, warps, logits_local, world)
-        with self.nvtx("pool"):
-            projected = self._replicated_projection(
-                self.pooler, hidden_states, self._pool_gather_workspace
-            )
-            if side is not None:
-                main.wait_stream(side)
-            bias = routing.e_score_correction_bias
-            _require_aligned(pooled=projected, gain=gain, bias=bias, logits=logits_local)
-            out = _route.pool_gather_route(
-                projected,
-                logits_local,
-                inbox,
-                gain,
-                global_scale,
-                self.pre_expert_norm.variance_epsilon,
-                bias,
-                routing.renorm_eps,
-                _route.PLACE_NONE,
-                enable_pdl=self._prologue_enable_pdl,
-                return_gathered=False,
-            )
-        self._prologue_record_routing(out, _route.PLACE_NONE, None, world)
-        return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
-
     def _prologue_record_routing(self, out, place: int, state, world: int = 8) -> None:
         """What the experts and the finalize read, keyed on the logits object: the
         routing memo, and the replicated experts' placement."""
@@ -378,122 +227,6 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
             elif place == _route.PLACE_HALF:
                 state.placement += (_route.HALF_SPAN,)
             state.last_stats = out.stats
-
-    # ---- edge_bf16_moe_front (PF_BF16_FRONT) ----
-    def _pf_bf16_front_applies(self, hidden_states: torch.Tensor) -> bool:
-        """Whether this call of a BF16-expert layer takes the routed chain (``edge_bf16_moe_front``).
-
-        Called after ``_prologue_router_warps`` accepted the call (a pool-deferring decode call
-        of at most 8 contiguous BF16 rows, the built-in router and routing) and
-        ``_pool_quant_args`` declined it. Requires the BF16 leaf under the replicated experts'
-        two-window stacked path (whose experts read the placement the routed kernel records),
-        no direct pool transport armed on this layer, the 4096-wide pool and the gemma pre-expert
-        norm. Reads construction-time state, shapes and dtypes only, so every rank answers alike.
-        """
-        return self._pool_direct_armed is None and self._pf_bf16_site()
-
-    def _pf_bf16_site(self) -> bool:
-        """``_pf_bf16_front_applies`` without its transport condition (construction-time state).
-
-        Also what makes a BF16-expert layer a direct-transport site (``pool_into_route``'s
-        ``_routes_bf16``, ``OB_BF16_DIRECT``).
-        """
-        state = getattr(self, "_replicated_experts", None)
-        norm = self.pre_expert_norm
-        weight = getattr(norm, "weight", None)
-        return (
-            self._prologue_inbox is not None
-            and getattr(self, "_pf_unit_scale", None) is not None
-            and state is not None
-            and state.active
-            and state.kind == "bf16"
-            and getattr(state, "windows", 2) == 2
-            and self.expert_hidden_size == _route.HIDDEN
-            and getattr(self, "_pool_gather_workspace", None) is not None
-            and tuple(self.pooler.weight.shape) == (_route.HIDDEN, _shard.HIDDEN)
-            and getattr(norm, "use_gemma", False)
-            and isinstance(weight, torch.Tensor)
-            and weight.dtype == torch.bfloat16
-            and tuple(weight.shape) == (_route.HIDDEN,)
-            and weight.is_contiguous()
-        )
-
-    def _pf_bf16_front(self, hidden_states: torch.Tensor, warps: int, fused_norm: bool):
-        """``edge_bf16_moe_front``: the routed chain for a BF16-expert layer; ``(router_logits, normed pool)``.
-
-        The NVFP4 prologue's order and streams (router shard, pool GEMM, join, routed pool
-        kernel), with the routed kernel's ``gathered`` row as the pool gather. ``fused_norm``
-        (``PF_BF16_FRONT`` 2): the kernel also writes the pre-expert norm of that
-        row; otherwise the built-in ``prepare_expert_input`` normalizes it. The NVFP4 payload the
-        kernel forms from ``gain`` and a unit global scale is not read.
-        """
-        routing = self.experts.routing_method
-        inbox = self._prologue_inbox
-        world = inbox.world
-        side = self._router_stream
-        rows = hidden_states.shape[0]
-        with self.nvtx("router"):
-            if side is None:
-                logits_local = _shard.router_shard(
-                    hidden_states,
-                    self.router.weight,
-                    inbox.rank,
-                    self.metap_multiplier,
-                    warps,
-                    self._prologue_enable_pdl,
-                    ranks=world,
-                )
-            else:
-                main = torch.cuda.current_stream()
-                logits_local = torch.empty(
-                    (rows, _shard.local_experts(world)),
-                    device=hidden_states.device,
-                    dtype=torch.float32,
-                )
-                side.wait_stream(main)
-                with torch.cuda.stream(side):
-                    _shard.router_shard_side(
-                        hidden_states,
-                        self.router.weight,
-                        inbox.rank,
-                        self.metap_multiplier,
-                        warps,
-                        logits_local,
-                        ranks=world,
-                    )
-        with self.nvtx("pool"):
-            projected = self._replicated_projection(
-                self.pooler, hidden_states, self._pool_gather_workspace
-            )
-            if side is not None:
-                main.wait_stream(side)
-            place, static_from, state = _placement(self, world)
-            bias = routing.e_score_correction_bias
-            # The NVFP4 operands only shape a payload this front does not read (mode 1) or that the
-            # kernel does not form (mode 2): the norm's own weight and the install-time unit scale.
-            gain = self.pre_expert_norm.weight
-            _require_aligned(pooled=projected, gain=gain, bias=bias, logits=logits_local)
-            norm_weight = gain if fused_norm else None
-            out = _route.pool_gather_route(
-                projected,
-                logits_local,
-                inbox,
-                gain,
-                self._pf_unit_scale,
-                self.pre_expert_norm.variance_epsilon,
-                bias,
-                routing.renorm_eps,
-                place,
-                static_from,
-                enable_pdl=self._prologue_enable_pdl,
-                return_gathered=not fused_norm,
-                bf16_norm=norm_weight,
-            )
-            normed = out.normed if fused_norm else self.prepare_expert_input(out.gathered)
-        self._prologue_record_routing(out, place, state, world)
-        return out.logits, normed
-
-    # ---- edge_bf16_moe_front: end ----
 
     def _pool_direct_refuse_declined(self, hidden_states: torch.Tensor) -> None:
         """Raise when ``pool_into_route`` armed this layer and its call does not take the routed path.
@@ -577,10 +310,7 @@ def install(model: MuseSparkOpenModel, bf16_front: bool = False) -> int:
     """Re-class every layer's projection-gather MoE as the prologue MoE; build its inbox.
 
     The inbox rows carry the pool slice and the logit block: 512 words at TP8,
-    1024 at TP4 (``pool_gather_route.row_words``).
-
-    ``bf16_front``: the ``edge_bf16_moe_front`` fast path (``PF_BF16_FRONT``), whose routed
-    kernel reads a unit global scale on the BF16-expert layers.
+    1024 at TP4 (``pool_gather_route.row_words``). ``bf16_front`` is ignored.
 
     Returns the number of layers installed: 0, on every rank alike, when the
     pool site is not fused (``projection_gathers.fusable_sites`` agrees on that
@@ -612,19 +342,11 @@ def install(model: MuseSparkOpenModel, bf16_front: bool = False) -> int:
     world = mapping.tp_size
     inbox = ProjectionInbox(mapping, row_words=_route.row_words(world))
     enable_pdl = LAUNCH_PDL
-    # edge_bf16_moe_front: the routed kernel's global-scale operand on a BF16-expert layer (its
-    # NVFP4 payload is not read there); made here, before any graph capture.
-    unit_scale = (
-        torch.ones(1, dtype=torch.float32, device=torch.cuda.current_device())
-        if bf16_front
-        else None
-    )
     for layer in layers:
         moe = layer.feed_forward
         moe.__class__ = MuseSparkOpenTepPrologueMoE
         moe._prologue_inbox = inbox
         moe._prologue_enable_pdl = bool(enable_pdl)
-        moe._pf_unit_scale = unit_scale
     logger.info(
         f"[musespark_open] moe_prologue: one-chain MoE prologue on the decode path of all {len(layers)} layers "
         f"(TP{world} router shard of {_shard.local_experts(world)} experts, routing and any "

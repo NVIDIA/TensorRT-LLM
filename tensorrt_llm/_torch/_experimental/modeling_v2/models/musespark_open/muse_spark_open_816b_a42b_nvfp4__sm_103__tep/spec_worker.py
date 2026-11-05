@@ -43,15 +43,7 @@ then the built-in ``hidden_norm``. The gather depends on the TP width:
   ``FC_SHARD_MAX_ROWS`` rows run the built-in method.
 * TP4 (one node of four): the four ``[rows, 2048]`` slices are joined by the
   built-in NCCL all-gather (``tensorrt_llm._torch.distributed.allgather``),
-  which takes any row count, so every call is sharded. With ``drafter_fc_inbox``
-  calls of at most ``FC_INBOX_MAX_ROWS`` rows are gathered over the tray's
-  NVLink by the built-in projection-gather kernel on a workspace of their own
-  (``InboxGatherColumns``) instead, larger ones by the NCCL all-gather: the
-  same bytes in the same order, and no queueing behind the step's other NCCL
-  collectives on the shared communicator. ``drafter_fc_inbox_wide`` sizes that
-  workspace for more rows and sets its program count (``WideProjectionGather``:
-  the same kernel and inbox protocol on a larger allocation), so the decode steps
-  of up to that many rows skip the NCCL all-gather too.
+  which takes any row count, so every call is sharded.
 
 The rank's GEMM runs on the fixed low-M tactic listed for its shape
 (``ops/gemm/fixed_low_m_gemm.py``) whether or not ``drafter_fixed_gemms`` is
@@ -110,49 +102,7 @@ from .ops.spec.dflash_accept import (
 #: The sharded ``fc`` path's row bound at TP8, where the fabric projection
 #: gather serves decode steps at batch 1 (K + 1 <= 8 rows); larger calls
 #: (prefill chunks, batched decode) run the built-in. TP4 has no row bound.
-#: ``fc_shard_wide`` (``configure``) raises the TP8 bound to 64 rows (decode steps of up to eight
-#: requests at K + 1 = 8). The fabric projection gather's workspace already allocates 128 rows per
-#: call at TP8 (``_MAX_TOKENS``), so steps of 2..8 requests multiply each rank's [1024, 40960]
-#: block of ``fc`` (84 MB) and gather the slices, instead of the whole replicated weight (671 MB,
-#: 53-61 us on cuBLAS at the head of the context-K/V side chain). The rank's GEMM runs the fixed
-#: low-M tactic listed for its row count (``fixed_low_m_gemm``, whose ``tep8_fc_wide`` entries keep
-#: the 8-row cell's split_k, so a row's bits are its one-request bits), else ``F.linear`` on the
-#: block. Not bitwise against the replicated cuBLAS GEMM (another K split); only draft tokens can
-#: move. Larger calls (prefill chunks) still run the built-in.
 FC_SHARD_MAX_ROWS = 8
-
-#: ``fc_gather_programs`` (``configure``): N > 0 launches the TP8 fc gather (the built-in
-#: ``_gather_columns`` kernel on the fc's own workspace) with N programs instead of the built-in's
-#: 32, so a call of up to N * 256 / 512 rows is one tile per program (the kernel polls each peer's
-#: slot once per tile, in sequence). The same bytes in the same places; every rank is configured
-#: alike before the workspace's first call. 0 (the default) keeps the built-in's count.
-TEP8_FC_GATHER_PROGRAMS = 0
-
-#: ``fc_shard_prewarm`` (``configure``): ``install_sharded_fc`` prewarms the shard's BLAS handles
-#: (``_prewarm_sharded_fc``). Off by default.
-FC_SHARD_PREWARM = False
-
-
-def configure(
-    *, fc_shard_wide: bool = False, fc_gather_programs: int = 0, fc_shard_prewarm: bool = False
-) -> None:
-    """Set the sharded ``fc``'s TP8 row bound, its TP8 gather's program count and its prewarm.
-
-    ``lever_settings.apply`` sets them from the model's plan before any install.
-
-    Args:
-        fc_shard_wide: TP8 calls of up to 64 rows take the sharded ``fc`` (``FC_SHARD_MAX_ROWS``;
-            off: 8).
-        fc_gather_programs: programs of the TP8 fc gather (``TEP8_FC_GATHER_PROGRAMS``; 0: the
-            built-in's).
-        fc_shard_prewarm: create the shard GEMM's BLAS handles (and at TP4 connect the gather) at
-            install (``FC_SHARD_PREWARM``).
-    """
-    global FC_SHARD_MAX_ROWS, TEP8_FC_GATHER_PROGRAMS, FC_SHARD_PREWARM
-    FC_SHARD_MAX_ROWS = 64 if fc_shard_wide else 8
-    TEP8_FC_GATHER_PROGRAMS = int(fc_gather_programs or 0)
-    FC_SHARD_PREWARM = bool(fc_shard_prewarm)
-
 
 #: The TP widths the sharded ``fc`` is written for: 8 gathers over the fabric
 #: projection-gather workspace, 4 with the built-in NCCL all-gather.
@@ -229,133 +179,6 @@ class AllGatherColumns:
         from tensorrt_llm._torch.distributed import allgather
 
         return allgather(local, self.mapping, dim=-1)
-
-
-#: Rows a TP4 ``drafter_fc_inbox`` call gathers over the projection-gather workspace (its
-#: allocation's token capacity); larger calls take the NCCL all-gather.
-FC_INBOX_MAX_ROWS = 128
-#: The most rows a ``drafter_fc_inbox_wide`` workspace may hold: 64 requests at K = 7.
-FC_INBOX_WIDE_MAX_ROWS = 512
-
-
-class WideProjectionGather:
-    """The built-in projection-gather kernel and inbox protocol on a workspace of
-    ``max_rows`` rows (the built-in allocation holds 128) and ``programs`` CTAs.
-
-    The kernel (``musespark_open_projection_gather._gather_columns``) takes the inbox
-    size (``SLOT_WORDS``) and the program count as arguments: every program stores its
-    words of the rank's slice into slot ``rank`` of every peer's inbox, tagged with the
-    program's epoch, polls the same words of every peer's slot in its own inbox, writes
-    them to the output in rank order and retires them. A program waits only on the same
-    program of the peers, which publishes before it polls, so with programs dispatched in
-    grid order every call completes; the double-buffered slots alternate per program as
-    in the built-in workspace. The output is the slices joined by columns in rank order,
-    the bytes of the NCCL all-gather. Calls must form one ordered chain on every rank with
-    the same shapes, as for the built-in workspace.
-    """
-
-    def __init__(self, mapping, max_rows: int, programs: Optional[int] = None) -> None:
-        from tensorrt_llm._mnnvl_utils import MnnvlMemory
-        from tensorrt_llm._torch.distributed.communicator import Distributed
-        from tensorrt_llm._torch.models import musespark_open_projection_gather as _pg
-
-        if mapping.tp_size != 4 or mapping.enable_attention_dp or mapping.cp_size != 1:
-            raise ValueError("WideProjectionGather serves TP4 without attention DP or CP")
-        if not all(Distributed.get(mapping).tp_allgather(MnnvlMemory.supports_mnnvl())):
-            raise ValueError("WideProjectionGather requires NVLink on every TP rank")
-        MnnvlMemory.initialize()
-        self._kernel = _pg._gather_columns
-        self.mapping = mapping
-        self.world = mapping.tp_size
-        self.max_rows = int(max_rows)
-        self.device = torch.cuda.current_device()
-        self.programs = int(programs or _pg._PROGRAMS)
-        self.slot_words = self.max_rows * (_pg._MAX_COLUMNS // self.world) // 2
-        self.data_owner = _pg._ProjectionMnnvlMemory(
-            mapping, 2 * self.world * self.slot_words * _pg._PAYLOAD_WORD_BYTES
-        )
-        record = type(self.data_owner).allocated_map[self.data_owner.ptr]
-        if record.comm_size != self.world or record.comm_rank != mapping.tp_rank:
-            raise RuntimeError("WideProjectionGather allocation does not match the TP group")
-        self.data = self.data_owner.as_torch_strided_tensor(torch.int64)
-        self.data[mapping.tp_rank].zero_()
-        self.counters = torch.zeros(self.programs, dtype=torch.uint64, device="cuda")
-        torch.cuda.synchronize()
-        Distributed.get(mapping).tp_allgather(True)
-
-    def gather(self, local: torch.Tensor) -> torch.Tensor:
-        """Gather contiguous BF16 ``[M, N / TP]`` columns (``M <= max_rows``) in rank order."""
-        if not (
-            local.is_cuda
-            and local.device.index == self.device
-            and local.dtype == torch.bfloat16
-            and local.ndim == 2
-            and local.is_contiguous()
-            and 1 <= local.shape[0] <= self.max_rows
-            and local.shape[1] in (4096 // self.world, 8192 // self.world)
-        ):
-            raise ValueError("Unsupported projection gather tensor contract")
-        output = torch.empty(
-            (local.shape[0], local.shape[1] * self.world), dtype=local.dtype, device=local.device
-        )
-        self._kernel[(self.programs,)](
-            local.view(torch.int32),
-            self.data,
-            self.counters,
-            output.view(torch.int32),
-            self.data.stride(0),
-            self.slot_words,
-            self.mapping.tp_rank,
-            self.world,
-            local.shape[1] // 2,
-            local.numel() // 2,
-            self.programs,
-            256,
-            num_warps=4,
-        )
-        return output
-
-
-class InboxGatherColumns:
-    """The TP4 gather of the sharded ``fc`` over the tray's NVLink (``drafter_fc_inbox``).
-
-    Calls of 1..``max_rows`` contiguous BF16 rows (``FC_INBOX_MAX_ROWS``, or
-    ``drafter_fc_inbox_wide``'s MAX_ROWS) go through the built-in projection-gather kernel
-    on this gather's own workspace, any other call through the NCCL all-gather
-    (``AllGatherColumns``). Both join the slices by columns in rank order, so the output
-    is the same bytes. Every rank makes the same calls with the same row counts, and the
-    drafter's calls are ordered on the CUDA streams (the context-K/V fork's side chain
-    joins the main stream before the next call), as the workspace requires.
-    """
-
-    def __init__(
-        self, mapping, max_rows: Optional[int] = None, programs: Optional[int] = None
-    ) -> None:
-        from tensorrt_llm._torch.models.musespark_open_projection_gather import (
-            ProjectionGatherWorkspace,
-        )
-
-        self.max_rows = FC_INBOX_MAX_ROWS if max_rows is None else int(max_rows)
-        if not FC_INBOX_MAX_ROWS <= self.max_rows <= FC_INBOX_WIDE_MAX_ROWS:
-            raise ValueError(
-                f"[musespark_open] drafter_fc_inbox holds {FC_INBOX_MAX_ROWS}.."
-                f"{FC_INBOX_WIDE_MAX_ROWS} rows, not {self.max_rows}"
-            )
-        if self.max_rows > FC_INBOX_MAX_ROWS or programs is not None:
-            self.workspace = WideProjectionGather(mapping, self.max_rows, programs)
-        else:
-            self.workspace = ProjectionGatherWorkspace(mapping)
-        self.fallback = AllGatherColumns(mapping)
-
-    def gather(self, local: torch.Tensor) -> torch.Tensor:
-        if (
-            local.dim() == 2
-            and 1 <= local.shape[0] <= self.max_rows
-            and local.dtype == torch.bfloat16
-            and local.is_contiguous()
-        ):
-            return self.workspace.gather(local)
-        return self.fallback.gather(local)
 
 
 def sharded_project_target_hidden(
@@ -464,12 +287,6 @@ def install_sharded_fc(
             gather = ProjectionGatherWorkspace(mapping)
         except ValueError as exc:  # raised alike on every rank (it all-gathers the check)
             return f"projection gather unavailable: {exc}"
-        if TEP8_FC_GATHER_PROGRAMS > 0 and TEP8_FC_GATHER_PROGRAMS != gather.programs:
-            # Per-program epochs and slots: a fresh counter per program, before the workspace's first call.
-            gather.programs = TEP8_FC_GATHER_PROGRAMS
-            gather.counters = torch.zeros(
-                TEP8_FC_GATHER_PROGRAMS, dtype=torch.uint64, device="cuda"
-            )
     elif gather is None:
         gather = AllGatherColumns(mapping)
     draft_model._fc_shard = ShardedFc(
@@ -481,67 +298,7 @@ def install_sharded_fc(
         max_rows=FC_SHARD_MAX_ROWS if world == 8 else None,
     )
     draft_model.project_target_hidden = types.MethodType(sharded_project_target_hidden, draft_model)
-    if FC_SHARD_PREWARM:
-        _prewarm_sharded_fc(draft_model._fc_shard, draft_model.fc.weight)
     return None
-
-
-#: The prewarm (``fc_shard_prewarm``) prevents a context-worker hang: the sharded ``fc``'s
-#: ``F.linear`` was the first cuBLAS call of the executor's worker thread, which PyTorch serves with
-#: a thread-local handle created lazily (``cublasCreate``, device memory outside the caching
-#: allocator). On a disaggregated context worker that first call came after the KV pool (0.8 of the
-#: free memory) and the transceiver's 2 x 5120 MiB kv-bounce buffers had left rank 0 without room
-#: for it: CUBLAS_STATUS_ALLOC_FAILED on rank 0 only, the step diverged and HangDetector killed the
-#: ranks. With it on, the install (model build: before the memory profile, the KV pool and the
-#: transceiver) runs the shard's GEMM on a short-lived thread -- creating the cuBLAS and cuBLASLt
-#: handles, which PyTorch returns to its per-device pool when that thread exits, so the worker
-#: thread later reserves them instead of calling cublasCreate -- and, where the gather takes any
-#: row count (TP4: ``max_rows`` None), one 1024-row gather (collective: every rank installs), so
-#: the NCCL all-gather's lazily connected resources exist too. TP8's fabric gather takes at most
-#: ``max_rows`` rows and connects nothing lazily; larger TP8 calls run the built-in ``fc``. Same
-#: kernels, same values: nothing the step computes changes.
-def _prewarm_sharded_fc(state: "ShardedFc", weight: torch.Tensor) -> None:
-    import threading
-
-    device = weight.device
-    k = weight.shape[1]
-    errors = []
-
-    def work() -> None:
-        try:
-            torch.cuda.set_device(device)
-            w = torch.zeros(state.rows, k, dtype=weight.dtype, device=device)
-            bias = torch.zeros(state.rows, dtype=weight.dtype, device=device)
-            for rows in (1, 8, 128, 1024):
-                x = torch.zeros(rows, k, dtype=weight.dtype, device=device)
-                F.linear(x, w)  # the shard GEMM's cuBLAS path (handle + this stream's workspace)
-                F.linear(x, w, bias)  # the cuBLASLt (bias epilogue) path's handle
-            torch.cuda.synchronize(device)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
-
-    thread = threading.Thread(target=work, name="musespark-fc-shard-prewarm", daemon=True)
-    thread.start()
-    thread.join()
-    if errors:
-        logger.warning(f"[musespark_open] fc shard prewarm: BLAS prewarm failed: {errors[0]!r}")
-    connected = state.max_rows is None
-    if connected:
-        try:
-            # above the NVLink inbox's 128 rows: the NCCL all-gather the prefill chunks take (its runtime connect)
-            state.gather.gather(torch.zeros(1024, state.rows, dtype=weight.dtype, device=device))
-            torch.cuda.synchronize(device)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[musespark_open] fc shard prewarm: gather prewarm failed: {exc!r}")
-    gathered = (
-        " and the gather connected"
-        if connected
-        else f" (the gather takes at most {state.max_rows} rows: none to connect)"
-    )
-    logger.info(
-        "[musespark_open] fc shard prewarm: cuBLAS / cuBLASLt handles created on a pooled thread"
-        f"{gathered} at install (rank {state.rank}, shard [{state.rows}, {k}], {type(state.gather).__name__})"
-    )
 
 
 # --------------------------------------------------------------------------
@@ -904,16 +661,10 @@ def install(
     fc_shard: bool,
     fused_accept: bool,
     fixed_gemms: bool,
-    fc_inbox: bool = False,
-    fc_inbox_rows: Optional[int] = None,
-    fc_inbox_programs: Optional[int] = None,
 ) -> None:
     """Install the drafter worker fast paths asked for on the drafter and the worker.
 
-    ``fc_shard`` (``drafter_fc_shard``) column-shards the drafter's fc (at TP4 with
-    ``fc_inbox``, ``drafter_fc_inbox``, its decode-size calls gathered over the tray's
-    NVLink: ``InboxGatherColumns``, on ``fc_inbox_rows`` rows and ``fc_inbox_programs``
-    programs with ``drafter_fc_inbox_wide``, else the built-in workspace), ``fused_accept``
+    ``fc_shard`` (``drafter_fc_shard``) column-shards the drafter's fc, ``fused_accept``
     fuses the worker's acceptance, ``fixed_gemms`` (``drafter_fixed_gemms``) puts
     the drafter's GEMM call sites on fixed low-M tactics.
 
@@ -935,30 +686,12 @@ def install(
         if draft_model is None:
             raise ValueError("[musespark_open] drafter_fc_shard cannot run here: no drafter")
         was_installed = sharded_fc_installed(draft_model)
-        gather = None
-        if fc_inbox and not was_installed:
-            if getattr(mapping, "tp_size", None) != 4:
-                raise ValueError(
-                    "[musespark_open] drafter_fc_inbox is the TP4 gather of the sharded fc, not TP"
-                    f"{getattr(mapping, 'tp_size', None)}"
-                )
-            gather = InboxGatherColumns(mapping, fc_inbox_rows, fc_inbox_programs)
-        extra = {"gather": gather} if gather is not None else {}
-        reason = install_sharded_fc(draft_model, mapping, enable_pdl, **extra)
+        reason = install_sharded_fc(draft_model, mapping, enable_pdl)
         if reason is not None:
             raise ValueError(f"[musespark_open] drafter_fc_shard cannot run here: {reason}")
         if not was_installed:
             if draft_model._fc_shard.world == 8:
                 gather = f"a fabric gather up to {draft_model._fc_shard.max_rows} rows"
-                if TEP8_FC_GATHER_PROGRAMS > 0:
-                    gather += f" ({TEP8_FC_GATHER_PROGRAMS} programs)"
-            elif isinstance(draft_model._fc_shard.gather, InboxGatherColumns):
-                inbox = draft_model._fc_shard.gather
-                gather = (
-                    f"the tray's projection gather up to {inbox.max_rows} rows "
-                    f"({inbox.workspace.programs} programs; drafter_fc_inbox), an NCCL "
-                    "all-gather above"
-                )
             else:
                 gather = "an NCCL all-gather, any row count"
             logger.info(

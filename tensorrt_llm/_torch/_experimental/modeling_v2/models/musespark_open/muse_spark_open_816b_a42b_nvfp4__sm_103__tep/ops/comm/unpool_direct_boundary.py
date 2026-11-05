@@ -57,7 +57,7 @@ Ownership and reuse (cuFlow):
   stopped, shows up there, and ``start_guard_watch`` logs it from the host.
 
 Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
-requests (16..32 rows, ``wide_prologue``) take a separate workspace whose slots hold 32
+requests (16..32 rows) take a separate workspace whose slots hold 32
 rows (``3 buffers x 4 source ranks x 32 rows x 2048``), with its own buffer sequence;
 the kernel is the gather boundary's at those row counts (a cluster of 4 CTAs, one per
 peer slice) with the slot stride of 32 rows. The 8-row layout is unchanged.
@@ -638,8 +638,8 @@ class UnpoolDirectWorkspace:
         refusal: Optional[str] = None
         if not _AVAILABLE:
             refusal = "CuTe DSL or the built-in cluster boundary is unavailable"
-        elif torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-            refusal = "the direct unpool boundary runs on SM103 or SM107 only"
+        elif torch.cuda.get_device_capability(self.device) != (10, 3):
+            refusal = "the direct unpool boundary runs on SM103 only"
         elif not prefer_pinned():
             refusal = "the guard words need pinned host memory, which this platform does not pin"
         if not _mnnvl_workspace_all_succeeded(self._comm, refusal is None):

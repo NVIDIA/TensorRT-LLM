@@ -62,7 +62,7 @@ Ownership and reuse (cuFlow):
   ``guard_ns`` sets a guard word in host memory (and keeps polling).
 
 Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
-requests (16..32 rows, ``wide_prologue``) run the wide tagged kernel's statements, in
+requests (16..32 rows) run the wide tagged kernel's statements, in
 which each CTA routes only its own two rows (no placement, no early ids). A record is
 then the source rank's ``[32, C]`` pool slot followed by one ``[32, L]`` FP32 logit
 block, the router's output as it is (``router_shard_rows`` with the block as its
@@ -140,40 +140,8 @@ CHUNKS = _route.CHUNKS
 CENSUS_WORDS = 2 * CHUNKS
 CENSUS_ARRIVED = CHUNKS
 CENSUS_READ = CHUNKS + 1
-#: The ``prerouted_experts`` lever at TP4 (``configure(prerouted_meta=True)``): the wide
-#: half-window kernel also builds the TRTLLM-gen routing metadata of the expert op -- one token
-#: count per expert next to the census (its atomic's old value is the slot's position within its
-#: expert), the tile-8 prefix over the 96-expert window, the expanded->permuted and
-#: permuted->token maps and the CTA tables -- and issues no dependent trigger, so the expert GEMMs
-#: launch on it directly (``ops/moe/prerouted_experts``, no routing kernel). Off: the kernel and
-#: workspace without metadata.
-_META = False
-#: The expert op's window (``HALF_SPAN``) and token tile the metadata is laid out for.
-META_WINDOW = 96
-META_TILE = 8
-#: Census words per buffer: the presence, arrival and read words, then (meta) one count per expert.
-#: Derived from ``_META`` (``configure``).
-CENSUS_STRIDE = CENSUS_WORDS + (EXPERTS if _META else 0)
-
-
-def configure(*, prerouted_meta: bool = False) -> None:
-    """Set whether the wide half-window kernel writes the expert op's routing metadata.
-
-    ``lever_settings.apply`` sets it from the model's plan before any install; the default is
-    the kernel without metadata. It must precede every ``PoolDirectWorkspace``: a workspace
-    sizes its census buffers from ``CENSUS_STRIDE``, which follows the setting.
-
-    Args:
-        prerouted_meta: the ``prerouted_experts`` lever (``_META``); the metadata is written
-            only where ``ops/moe/prerouted_experts`` finds TRT-LLM's prerouted op.
-    """
-    global _META, CENSUS_STRIDE
-    stride = CENSUS_WORDS + (EXPERTS if prerouted_meta else 0)
-    if _AVAILABLE and stride != CENSUS_STRIDE:
-        # A kernel compiled before reads the census at the previous stride.
-        _compile.cache_clear()
-    _META = bool(prerouted_meta)
-    CENSUS_STRIDE = stride
+#: Census words per buffer: the presence, arrival and read words.
+CENSUS_STRIDE = CENSUS_WORDS
 
 
 def pool_row_words(world: int) -> int:
@@ -326,36 +294,6 @@ if _AVAILABLE:
         )
 
     @dsl_user_op
-    def _atom_relaxed_gpu_add(address, value, *, loc=None, ip=None):
-        """A relaxed GPU-scope add returning the old value (the routing metadata: a slot's
-        position in its expert)."""
-        return Uint32(
-            _asm(
-                T.i32(),
-                [_i64(address, loc, ip), _u32(value, loc, ip)],
-                "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;",
-                "=r,l,r",
-                loc,
-                ip,
-            )
-        )
-
-    @dsl_user_op
-    def _shfl_up_b32(value, delta, *, loc=None, ip=None):
-        """``shfl.sync.up`` over the full warp (the routing metadata's tile prefix); lanes below
-        ``delta`` get their own value."""
-        return Uint32(
-            _asm(
-                T.i32(),
-                [_u32(value, loc, ip), _u32(delta, loc, ip)],
-                "shfl.sync.up.b32 $0, $1, $2, 0, -1;",
-                "=r,r,r",
-                loc,
-                ip,
-            )
-        )
-
-    @dsl_user_op
     def _ld_acquire_gpu_b32(address, *, loc=None, ip=None):
         return Uint32(
             _asm(
@@ -421,7 +359,6 @@ if _AVAILABLE:
             world: int = WORLD,
             max_rows: int = MAX_ROWS,
             census: int = 0,
-            meta: bool = False,
             bf16_norm: bool = False,
         ):
             check_layout(world, max_rows)
@@ -452,20 +389,12 @@ if _AVAILABLE:
             )
             self.place = place
             self.census = int(census)
-            # The expert op's routing metadata (prerouted_meta; wide half window only).
-            self.meta = bool(meta) and wide and place == PLACE_HALF
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
             self.pool_row_words = pool_row_words(world)
             self.pool_slot_words = pool_slot_words(world, max_rows)
             self.box_words = box_words(world)
             self.record_words = record_words(world, max_rows)
-
-        def _route_smem_bytes(self) -> int:
-            # The routing metadata: + the per-expert counts [256], the window's counts and CTA
-            # offsets [96 each] and four flag words, with alignment slack.
-            extra = (EXPERTS + 2 * META_WINDOW + 4) * 4 + 4 * 16 if self.meta else 0
-            return super()._route_smem_bytes() + extra
 
         @cute.jit
         def __call__(
@@ -488,12 +417,6 @@ if _AVAILABLE:
             local_ids: Int64,
             weights_bf16: Int64,
             stats: Int64,
-            m_e2p: Int64,
-            m_p2t: Int64,
-            m_c2b: Int64,
-            m_c2m: Int64,
-            m_nnc: Int64,
-            m_tnp: Int64,
             dry: Int32,
             enable_pdl: cutlass.Constexpr[bool],
             store_gathered: cutlass.Constexpr[bool],
@@ -526,12 +449,6 @@ if _AVAILABLE:
                 local_ids,
                 weights_bf16,
                 stats,
-                m_e2p,
-                m_p2t,
-                m_c2b,
-                m_c2m,
-                m_nnc,
-                m_tnp,
                 dry,
                 enable_pdl,
                 store_gathered,
@@ -566,12 +483,6 @@ if _AVAILABLE:
             local_ids: Int64,
             weights_bf16: Int64,
             stats: Int64,
-            m_e2p: Int64,
-            m_p2t: Int64,
-            m_c2b: Int64,
-            m_c2m: Int64,
-            m_nnc: Int64,
-            m_tnp: Int64,
             dry: Int32,
             enable_pdl: cutlass.Constexpr[bool],
             store_gathered: cutlass.Constexpr[bool],
@@ -611,17 +522,6 @@ if _AVAILABLE:
                 Uint32, cute.make_layout((MAX_ROWS * TOP_K,)), byte_alignment=16
             )
             sCensus = smem.allocate_tensor(Uint32, cute.make_layout((CHUNKS,)), byte_alignment=16)
-            if cutlass.const_expr(self.meta):
-                sCounts = smem.allocate_tensor(
-                    Uint32, cute.make_layout((EXPERTS,)), byte_alignment=16
-                )
-                sLocal = smem.allocate_tensor(
-                    Uint32, cute.make_layout((META_WINDOW,)), byte_alignment=16
-                )
-                sCtaOff = smem.allocate_tensor(
-                    Uint32, cute.make_layout((META_WINDOW,)), byte_alignment=16
-                )
-                sMisc = smem.allocate_tensor(Uint32, cute.make_layout((4,)), byte_alignment=16)
             world = self.world
             local_count = self.local_experts
             record_bytes = self.record_words * 4
@@ -841,7 +741,7 @@ if _AVAILABLE:
                     # Early ids with an early trigger: the routing warps' trigger (after the
                     # logit poll) is the CTA's only one, since the first trigger in a
                     # CTA counts and these warps can finish first.
-                    if cutlass.const_expr(self.trigger == 0 and not self.meta):
+                    if cutlass.const_expr(self.trigger == 0):
                         if enable_pdl:
                             cute.arch.griddepcontrol_launch_dependents()
                 else:
@@ -874,12 +774,6 @@ if _AVAILABLE:
                     if cutlass.const_expr(self.place != PLACE_NONE):
                         if rt < CHUNKS:
                             _st_shared_b32(sCensus.iterator + rt, Uint32(0))
-                    rank_e = Uint32(0)
-                    census_meta = Int64(0)
-                    if cutlass.const_expr(self.meta):
-                        census_meta = Int64(self.census) + Int64(buffer) * Int64(CENSUS_STRIDE * 4)
-                        if rt == 0:
-                            _st_shared_b32(sMisc.iterator + 1, Uint32(0))
                     if cutlass.const_expr(self.wide):
                         # The CTA's own rows of each sender's block: words 4 rt of its
                         # [rows_per_block, L] rows (fewer when its last row is past M).
@@ -1019,14 +913,6 @@ if _AVAILABLE:
                                         sSelected.iterator + row * TOP_K + lane, expert_id
                                     )
                                     _st_shared_b32(sWeights.iterator + row * TOP_K + lane, weight)
-                                    if cutlass.const_expr(self.meta):
-                                        # Routing metadata: this slot's position within its expert.
-                                        rank_e = _atom_relaxed_gpu_add(
-                                            census_meta
-                                            + Int64(CENSUS_WORDS * 4)
-                                            + Int64(expert_id) * 4,
-                                            Uint32(1),
-                                        )
                                 out = Int64(global_row * TOP_K + lane) * 4
                                 _st_global_b32(selected + out, expert_id)
                                 _st_global_b32(weights + out, weight)
@@ -1080,16 +966,6 @@ if _AVAILABLE:
                                     sCensus.iterator + rt,
                                     _ld_relaxed_gpu_b32(census + Int64(rt * 4)),
                                 )
-                            if cutlass.const_expr(self.meta):
-                                for j in cutlass.range_constexpr(EXPERTS // ROUTE_THREADS):
-                                    _st_shared_b32(
-                                        sCounts.iterator + rt + j * ROUTE_THREADS,
-                                        _ld_relaxed_gpu_b32(
-                                            census
-                                            + Int64((CENSUS_WORDS + j * ROUTE_THREADS) * 4)
-                                            + Int64(rt * 4)
-                                        ),
-                                    )
                             _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
                             if rt == 0:
                                 read = _atom_acq_rel_gpu_add(
@@ -1098,20 +974,6 @@ if _AVAILABLE:
                                 if _eq(read + Uint32(1), ctas) != Uint32(0):
                                     for word in cutlass.range_constexpr(CENSUS_WORDS):
                                         _st_relaxed_gpu_b32(census + Int64(word * 4), Uint32(0))
-                                    if cutlass.const_expr(self.meta):
-                                        _st_shared_b32(sMisc.iterator + 1, Uint32(1))
-                            if cutlass.const_expr(self.meta):
-                                # The last reader's CTA also clears the counts, every routing thread
-                                # its share (every CTA copied them before its read arrival).
-                                _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
-                                if _ld_shared_b32(sMisc.iterator + 1) != Uint32(0):
-                                    for j in cutlass.range_constexpr(EXPERTS // ROUTE_THREADS):
-                                        _st_relaxed_gpu_b32(
-                                            census
-                                            + Int64((CENSUS_WORDS + j * ROUTE_THREADS) * 4)
-                                            + Int64(rt * 4),
-                                            Uint32(0),
-                                        )
                         w0, w1, w2, w3 = _load_shared_words(sCensus.iterator)
                         w4, w5, w6, w7 = _load_shared_words(sCensus.iterator + 4)
                         words = [w0, w1, w2, w3, w4, w5, w6, w7]
@@ -1226,71 +1088,6 @@ if _AVAILABLE:
                         else:
                             xs = [Uint32(0) for _ in range(world)]
                             moved_r = Uint32(0)
-                        if cutlass.const_expr(self.meta):
-                            # Routing metadata: the 96-expert window's token counts, their tile-8
-                            # prefix and (CTA 0) the CTA tables, as the expert op's routing kernel
-                            # builds them.
-                            if rt < META_WINDOW:
-                                _st_shared_b32(sLocal.iterator + rt, Uint32(0))
-                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
-                            for j in cutlass.range_constexpr(EXPERTS // ROUTE_THREADS):
-                                cnt_g = _ld_shared_b32(sCounts.iterator + rt + j * ROUTE_THREADS)
-                                if cnt_g != Uint32(0):
-                                    placed_g = _placed_expert(
-                                        Uint32(rt + j * ROUTE_THREADS),
-                                        words,
-                                        xs,
-                                        self.peer_rank,
-                                        x2s,
-                                        world,
-                                        True,
-                                    )
-                                    if _lt_u(placed_g, Uint32(META_WINDOW)) != Uint32(0):
-                                        _st_shared_b32(sLocal.iterator + placed_g, cnt_g)
-                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
-                            if rwarp == 0:
-                                per_lane = META_WINDOW // 32
-                                cnts = [
-                                    _ld_shared_b32(sLocal.iterator + per_lane * lane + i)
-                                    for i in range(per_lane)
-                                ]
-                                tiles = [(c + Uint32(META_TILE - 1)) >> 3 for c in cnts]
-                                own = tiles[0]
-                                for i in cutlass.range_constexpr(1, per_lane):
-                                    own = own + tiles[i]
-                                incl = own
-                                for d in cutlass.range_constexpr(5):
-                                    up = _shfl_up_b32(incl, Uint32(1 << d))
-                                    incl = incl + _sel(
-                                        _lt_u(Uint32(lane), Uint32(1 << d)), Uint32(0), up
-                                    )
-                                base = incl - own
-                                offs = []
-                                for i in cutlass.range_constexpr(per_lane):
-                                    offs.append(base)
-                                    _st_shared_b32(sCtaOff.iterator + per_lane * lane + i, base)
-                                    base = base + tiles[i]
-                                total = _shfl_idx_b32(incl, Uint32(31))
-                                if bidx == 0:
-                                    for i in cutlass.range_constexpr(per_lane):
-                                        for c in cutlass.range_constexpr(4):
-                                            if _lt_u(Uint32(c), tiles[i]) != Uint32(0):
-                                                cta = offs[i] + Uint32(c)
-                                                _st_global_b32(
-                                                    m_c2b + Int64(cta) * 4,
-                                                    Uint32(per_lane * lane + i),
-                                                )
-                                                _st_global_b32(
-                                                    m_c2m + Int64(cta) * 4,
-                                                    _min_u32(
-                                                        (cta + Uint32(1)) * Uint32(META_TILE),
-                                                        offs[i] * Uint32(META_TILE) + cnts[i],
-                                                    ),
-                                                )
-                                    if lane == 0:
-                                        _st_global_b32(m_nnc, total)
-                                        _st_global_b32(m_tnp, total * Uint32(META_TILE))
-                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
                         from_prev = _shfl_idx_b32(
                             moved_r, (lane_r + Uint32(world - 1)) & Uint32(world - 1)
                         )
@@ -1338,21 +1135,6 @@ if _AVAILABLE:
                             _st_global_b32(local_ids + Int64(slot_index) * 4, placed)
                             w_bits = _ld_shared_b32(sWeights.iterator + shared_index)
                             _st_global_b16(weights_bf16 + Int64(slot_index) * 2, _bf16_bits(w_bits))
-                            if cutlass.const_expr(self.meta):
-                                is_local = _lt_u(placed, Uint32(META_WINDOW))
-                                perm = (
-                                    _ld_shared_b32(
-                                        sCtaOff.iterator + _sel(is_local, placed, Uint32(0))
-                                    )
-                                    * Uint32(META_TILE)
-                                    + rank_e
-                                )
-                                _st_global_b32(
-                                    m_e2p + Int64(slot_index) * 4,
-                                    _sel(is_local, perm, Uint32(0xFFFFFFFF)),
-                                )
-                                if is_local != Uint32(0):
-                                    _st_global_b32(m_p2t + Int64(perm) * 4, Uint32(own_row))
                         held_load = loads[0]
                         for b in cutlass.range_constexpr(1, world):
                             held_load = _sel(_eq(lane_r, Uint32(b)), loads[b], held_load)
@@ -1369,9 +1151,8 @@ if _AVAILABLE:
                     if cutlass.const_expr(self.stamps != 0):
                         if rt == 0:
                             _stamp_timer(Int64(self.stamps) + Int64(bidx * 64 + 24))
-                    if cutlass.const_expr(not self.meta):
-                        if enable_pdl:
-                            cute.arch.griddepcontrol_launch_dependents()
+                    if enable_pdl:
+                        cute.arch.griddepcontrol_launch_dependents()
 
     @functools.lru_cache(maxsize=64)
     def _compile(
@@ -1390,7 +1171,6 @@ if _AVAILABLE:
         world: int = WORLD,
         max_rows: int = MAX_ROWS,
         census: int = 0,
-        meta: bool = False,
         bf16_norm: bool = False,
     ):
         kernel = _PoolDirectRouteKernel(
@@ -1406,7 +1186,6 @@ if _AVAILABLE:
             world,
             max_rows,
             census,
-            meta,
             bf16_norm,
         )
         rows = cute.sym_int()
@@ -1433,12 +1212,6 @@ if _AVAILABLE:
                 Int64(0),
                 Int64(0),
                 Int32(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
                 Int64(0),
                 Int64(0),
                 Int64(0),
@@ -1558,8 +1331,8 @@ class PoolDirectWorkspace:
             refusal = (
                 "CuTe DSL, flashinfer's RMSNormFP4QuantKernel or the direct poll is unavailable"
             )
-        elif torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-            refusal = "the direct routed pool kernel runs on SM103 or SM107 only"
+        elif torch.cuda.get_device_capability(self.device) != (10, 3):
+            refusal = "the direct routed pool kernel runs on SM103 only"
         elif not prefer_pinned():
             refusal = "the guard words need pinned host memory, which this platform does not pin"
         if not _mnnvl_workspace_all_succeeded(self._comm, refusal is None):
@@ -1584,32 +1357,6 @@ class PoolDirectWorkspace:
                     if self.wide
                     else None
                 )
-                # prerouted_meta: the expert op's routing metadata, written by the wide
-                # half-window kernel (one set: a layer's expert GEMMs read it before the next
-                # layer's kernel can pass its dependency wait).
-                # Only where the prerouted backend is registered (ops/moe/prerouted_experts:
-                # TRT-LLM's fp4_block_scale_moe_prerouted op): without it the workspace writes no
-                # metadata and builds the kernel without it, and every expert call is the stock
-                # call.
-                from ..moe import prerouted_experts as _prerouted
-
-                self.meta = (
-                    _meta_buffers(self.max_rows, self.device)
-                    if self.wide and _META and _prerouted.available()
-                    else None
-                )
-                if self.meta is not None:
-                    logger.info(
-                        "[musespark_open] pool_direct_route prerouted_meta: the wide "
-                        "half-window kernel writes the expert op's routing metadata (96-expert window, "
-                        f"8-token tiles, {self.max_rows} rows) and triggers no dependent"
-                    )
-                elif self.wide and _META:
-                    logger.warning(
-                        "[musespark_open] pool_direct_route prerouted_meta off: no "
-                        f"prerouted backend (this build registers no trtllm::{_prerouted.OP_NAME}); "
-                        "the wide kernel writes no metadata"
-                    )
                 self.control = torch.zeros(
                     CONTROL_WORDS, dtype=torch.int32, pin_memory=prefer_pinned()
                 )
@@ -1796,8 +1543,6 @@ class PoolDirectWorkspace:
             self.world,
             self.max_rows,
             self._census.data_ptr() if self.wide and place != PLACE_NONE else 0,
-            # The metadata build exactly where the workspace holds the metadata (``self.meta``).
-            bool(getattr(self, "meta", None) is not None and place == PLACE_HALF),
             bf16_norm,
         )
         # A dry launch loads the module now, not inside a capture.
@@ -1855,11 +1600,8 @@ def _launch(
     buffer: int,
     bias: int,
     dry: int = 0,
-    meta=None,
 ) -> None:
     placed = out.local_ids is not None
-    # The routing-metadata pointers (0: the kernel was compiled without metadata).
-    mp = [0] * 6 if meta is None else [meta[name].data_ptr() for name in META_FIELDS]
     compiled(
         out.gathered,
         gain,
@@ -1879,44 +1621,8 @@ def _launch(
         out.local_ids.data_ptr() if placed else 0,
         out.weights_bf16.data_ptr() if placed else 0,
         out.stats.data_ptr() if placed else 0,
-        mp[0],
-        mp[1],
-        mp[2],
-        mp[3],
-        mp[4],
-        mp[5],
         dry,
     )
-
-
-#: The routing-metadata tensors, in the kernel's argument order.
-META_FIELDS = ("e2p", "p2t", "c2b", "c2m", "nnc", "tnp")
-
-
-def meta_sizes(max_rows: int) -> dict:
-    """Element counts of the expert op's routing metadata at ``max_rows`` rows on the 96-expert
-    window with 8-token tiles (TRT-LLM's ``getMaxNumCgasInBatchDim`` /
-    ``getMaxPermutedPaddedCount`` / ``getRouteMapAllocCount``)."""
-    slots = max_rows * TOP_K
-    filled = min(META_WINDOW, slots)
-    ctas = filled + (slots - filled) // META_TILE
-    return dict(e2p=slots, p2t=ctas * META_TILE + 1, c2b=ctas, c2m=ctas, nnc=1, tnp=1)
-
-
-def meta_view(meta: dict, rows: int) -> dict:
-    """The routing metadata an expert call of ``rows`` rows reads (its expanded->permuted map
-    as ``[rows, 8]``)."""
-    view = dict(meta)
-    view["e2p"] = meta["e2p"][: rows * TOP_K].view(rows, TOP_K)
-    view["rows"] = rows
-    return view
-
-
-def _meta_buffers(max_rows: int, device) -> dict:
-    return {
-        name: torch.zeros(count, dtype=torch.int32, device=device)
-        for name, count in meta_sizes(max_rows).items()
-    }
 
 
 _SHARED: dict = {}
@@ -2069,9 +1775,6 @@ class PoolDirectRoute(OpWrapper):
             workspace.control_ptr(),
             int(buffer),
             bias.data_ptr(),
-            meta=getattr(workspace, "meta", None)
-            if place == PLACE_HALF and workspace.wide
-            else None,
         )
         if publish:
             early.arm(out.local_ids)

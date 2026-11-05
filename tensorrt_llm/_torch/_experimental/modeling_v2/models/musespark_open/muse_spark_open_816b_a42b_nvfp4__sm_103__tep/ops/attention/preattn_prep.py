@@ -387,167 +387,6 @@ def _preattn_prep_rows_kernel(
     tl.store(out + 7, y7.to(tl.bfloat16), mask=valid4)
 
 
-#: SM versions where a call with ``row_vec`` (``context_prep_rows_vec``) runs
-#: ``_preattn_prep_rows_vec_kernel`` in place of ``_preattn_prep_rows_kernel`` (same bits,
-#: vectorized row loads and stores).
-ROW_VEC_SMS = frozenset({107})
-#: Rows per program and warps of ``_preattn_prep_rows_vec_kernel``.
-ROW_VEC_BLOCK = 64
-ROW_VEC_WARPS = 4
-
-
-# ``rows`` only bounds the last program's mask, as in ``_preattn_prep_rows_kernel``.
-@triton.jit(do_not_specialize=["rows"])
-def _preattn_prep_rows_vec_kernel(
-    qkv_ptr,
-    qkv_out_ptr,
-    gate_out_ptr,
-    cos_sin_ptr,
-    positions_ptr,
-    rows,
-    qkv_stride,
-    qkv_out_stride,
-    gate_out_stride,
-    eps,
-    q_scale,
-    NUM_Q_HEADS: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    QKV_PERMUTED: tl.constexpr,
-    APPLY_ROPE: tl.constexpr,
-    LAUNCH_WITH_PDL: tl.constexpr,
-    BLOCK: tl.constexpr,
-    TRIGGER_AT_ENTRY: tl.constexpr = False,
-):
-    """``_preattn_prep_rows_kernel`` with one 16-byte load and store per norm lane.
-
-    Each norm lane's eight consecutive elements are one ``[BLOCK, 8, 8]`` load, taken
-    apart in registers (``tl.split`` over the element index's bits), and the outputs
-    are joined back the same way for one store. Between the load and the store every
-    row runs ``_preattn_prep_rows_kernel``'s arithmetic on the same operands in the
-    same order -- the in-lane ``add.rn`` chain over elements 0..7, the size-2 sums over
-    lane bits 0, 1, 2, the same BF16 roundings and FTZ RoPE -- so the outputs are the
-    same bits.
-    """
-    D: tl.constexpr = 64
-    HALF: tl.constexpr = 32
-    if LAUNCH_WITH_PDL:
-        if TRIGGER_AT_ENTRY:
-            tl.extra.cuda.gdc_launch_dependents()
-        tl.extra.cuda.gdc_wait()
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = row < rows
-    row = row.to(tl.int64)
-    head = tl.program_id(1)
-    is_q = head < NUM_Q_HEADS
-    kv_head = head - NUM_Q_HEADS
-    in_row = qkv_ptr + row * qkv_stride
-    out_row = qkv_out_ptr + row * qkv_out_stride
-
-    d = tl.arange(0, D)[None, :]
-    valid2 = valid[:, None]
-    if is_q:
-        if QKV_PERMUTED:
-            gate_in = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * D + head * D
-        else:
-            gate_in = head * 2 * D + D
-        gate = tl.load(in_row[:, None] + gate_in + d, mask=valid2)
-        tl.store(gate_out_ptr + row[:, None] * gate_out_stride + head * D + d, gate, mask=valid2)
-    else:
-        if QKV_PERMUTED:
-            v_in = NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
-        else:
-            v_in = 2 * NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
-        value = tl.load(in_row[:, None] + v_in + d, mask=valid2)
-        tl.store(
-            out_row[:, None] + (NUM_Q_HEADS + NUM_KV_HEADS) * D + kv_head * D + d,
-            value,
-            mask=valid2,
-        )
-
-    if QKV_PERMUTED:
-        in_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
-    else:
-        in_off = tl.where(is_q, head * 2 * D, 2 * NUM_Q_HEADS * D + kv_head * D)
-    out_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
-    scale = tl.where(is_q, q_scale, 1.0)
-
-    lane = tl.arange(0, 8)[None, :, None]
-    element = tl.arange(0, 8)[None, None, :]
-    valid3 = valid[:, None, None]
-    x = tl.load(in_row[:, None, None] + in_off + lane * 8 + element, mask=valid3, other=0.0)
-    # Element e = 4a + 2b + c of a lane: split off c, then b, then a.
-    x = tl.reshape(x.to(tl.float32), (BLOCK, 8, 2, 2, 2))
-    x_c0, x_c1 = tl.split(x)
-    x_c0b0, x_c0b1 = tl.split(x_c0)
-    x_c1b0, x_c1b1 = tl.split(x_c1)
-    x0, x4 = tl.split(x_c0b0)
-    x2, x6 = tl.split(x_c0b1)
-    x1, x5 = tl.split(x_c1b0)
-    x3, x7 = tl.split(x_c1b1)
-    s = libdevice.add_rn(x0 * x0, x1 * x1)
-    s = libdevice.add_rn(s, x2 * x2)
-    s = libdevice.add_rn(s, x3 * x3)
-    s = libdevice.add_rn(s, x4 * x4)
-    s = libdevice.add_rn(s, x5 * x5)
-    s = libdevice.add_rn(s, x6 * x6)
-    s = libdevice.add_rn(s, x7 * x7)
-    # Lane l = 4 * bit2 + 2 * bit1 + bit0: sum over bit 0, then bit 1, then bit 2.
-    s = tl.reshape(s, (BLOCK, 2, 2, 2))
-    total = tl.sum(tl.sum(tl.sum(s, axis=3), axis=2), axis=1)
-    inverse_rms = _rsqrt_approx_ftz(total / 64.0 + eps)[:, None]
-    y0 = _normalize(x0, inverse_rms, scale)
-    y1 = _normalize(x1, inverse_rms, scale)
-    y2 = _normalize(x2, inverse_rms, scale)
-    y3 = _normalize(x3, inverse_rms, scale)
-    y4 = _normalize(x4, inverse_rms, scale)
-    y5 = _normalize(x5, inverse_rms, scale)
-    y6 = _normalize(x6, inverse_rms, scale)
-    y7 = _normalize(x7, inverse_rms, scale)
-
-    if APPLY_ROPE:
-        position = tl.load(positions_ptr + row, mask=valid, other=0).to(tl.int64)
-        table = (
-            cos_sin_ptr + position[:, None, None] * D + lane * 4 + tl.arange(0, 4)[None, None, :]
-        )
-        # Pair j = 2 * j1 + j0 of a lane (elements 2j, 2j + 1): split off j0, then j1.
-        cos = tl.reshape(tl.load(table, mask=valid3, other=0.0), (BLOCK, 8, 2, 2))
-        sin = tl.reshape(tl.load(table + HALF, mask=valid3, other=0.0), (BLOCK, 8, 2, 2))
-        cos_even, cos_odd = tl.split(cos)
-        cos0, cos2 = tl.split(cos_even)
-        cos1, cos3 = tl.split(cos_odd)
-        sin_even, sin_odd = tl.split(sin)
-        sin0, sin2 = tl.split(sin_even)
-        sin1, sin3 = tl.split(sin_odd)
-        y0, y1 = _rotate(y0, y1, cos0, sin0)
-        y2, y3 = _rotate(y2, y3, cos1, sin1)
-        y4, y5 = _rotate(y4, y5, cos2, sin2)
-        y6, y7 = _rotate(y6, y7, cos3, sin3)
-
-    y_c0 = tl.join(
-        tl.join(y0.to(tl.bfloat16), y4.to(tl.bfloat16)),
-        tl.join(y2.to(tl.bfloat16), y6.to(tl.bfloat16)),
-    )
-    y_c1 = tl.join(
-        tl.join(y1.to(tl.bfloat16), y5.to(tl.bfloat16)),
-        tl.join(y3.to(tl.bfloat16), y7.to(tl.bfloat16)),
-    )
-    y = tl.reshape(tl.join(y_c0, y_c1), (BLOCK, 8, 8))
-    tl.store(out_row[:, None, None] + out_off + lane * 8 + element, y, mask=valid3)
-
-
-_SM_BY_DEVICE: dict = {}
-
-
-def _sm_of(device: torch.device) -> int:
-    """``10 * major + minor`` of a CUDA device, cached per device index."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    sm = _SM_BY_DEVICE.get(index)
-    if sm is None:
-        major, minor = torch.cuda.get_device_capability(index)
-        sm = _SM_BY_DEVICE[index] = 10 * major + minor
-    return sm
-
-
 def is_rope_table(cos_sin: torch.Tensor) -> bool:
     """Whether ``cos_sin`` is a table the entry reads: contiguous fp32 ``[positions, 2, 32]``."""
     return (
@@ -608,9 +447,7 @@ class PreattnPrep(OpWrapper):
     PDL-aware or not. ``trigger_at_entry`` (with ``enable_pdl``) lets the
     dependent launch as soon as every program of this grid has started; a
     dependent must then read nothing this grid writes before its own
-    ``griddepcontrol.wait``. It changes no value. ``row_vec`` lets a call above
-    ``ROW_KERNEL_MIN_ROWS`` rows on ``ROW_VEC_SMS`` take the vectorized rows kernel; it
-    changes no value either.
+    ``griddepcontrol.wait``. It changes no value.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -624,9 +461,6 @@ class PreattnPrep(OpWrapper):
     to 32768 (``context_prep``). Up to 512 rows the grid is (rows, H + G), one
     warp per program; above 512 rows it is (ceil(rows / 16), H + G), four warps
     per program of 16 rows of one head (``_preattn_prep_rows_kernel``), with the
-    same per-row arithmetic; with ``row_vec`` on sm107 (``ROW_VEC_SMS``) it is (ceil(rows / 64),
-    H + G), four warps per program of 64 rows of one head with one 16-byte load
-    and store per norm lane (``_preattn_prep_rows_vec_kernel``), again with the
     same per-row arithmetic.
 
     Bit-identical, gated by its own test against the built-in attention's
@@ -695,32 +529,6 @@ class PreattnPrep(OpWrapper):
         elif position_ids is not None:
             raise ValueError("preattn_prep: position_ids without a cos/sin table")
         if rows == 0:
-            return qkv_out, gate_out
-        if row_vec and rows > ROW_KERNEL_MIN_ROWS and _sm_of(qkv.device) in ROW_VEC_SMS:
-            _preattn_prep_rows_vec_kernel[
-                (triton.cdiv(rows, ROW_VEC_BLOCK), num_q_heads + num_kv_heads)
-            ](
-                qkv,
-                qkv_out,
-                gate_out,
-                cos_sin,
-                positions,
-                rows,
-                qkv.stride(0),
-                qkv_out.stride(0),
-                gate_out.stride(0),
-                eps,
-                q_scale,
-                NUM_Q_HEADS=num_q_heads,
-                NUM_KV_HEADS=num_kv_heads,
-                QKV_PERMUTED=qkv_permuted,
-                APPLY_ROPE=cos_sin is not None,
-                LAUNCH_WITH_PDL=enable_pdl,
-                BLOCK=ROW_VEC_BLOCK,
-                num_warps=ROW_VEC_WARPS,
-                launch_pdl=enable_pdl,
-                **({"TRIGGER_AT_ENTRY": True} if enable_pdl and trigger_at_entry else {}),
-            )
             return qkv_out, gate_out
         if rows > ROW_KERNEL_MIN_ROWS:
             _preattn_prep_rows_kernel[(triton.cdiv(rows, ROW_BLOCK), num_q_heads + num_kv_heads)](
