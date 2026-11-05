@@ -34,6 +34,14 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttentionLayerConfig,
+    BufferConfig,
+    GpuCacheTierConfig,
+    KVCacheManagerConfig,
+    LayerId,
+    SsmLayerConfig,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -247,6 +255,53 @@ def test_draft_pool_ratio_holds_the_scarcest_target_token_capacity():
 def test_draft_pool_ratio_needs_one_share_per_target_lifecycle():
     with pytest.raises(ValueError, match="2 entries for 3 target layer groups"):
         _insert_draft_pool_ratio([0.5, 0.5], [1, 1, 1, 1], [True] * 4, 1)
+
+
+def _draft_pool_ratio_manager_and_config(pool_ratio):
+    # Layer groups: target attention (256 B/block), recurrent state, draft (128 B/block).
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager._appended_draft_layer_specs = {2: None}
+    manager.max_seq_len = 1024
+    manager._pool_ratio_groups = []
+    config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
+        layers=[
+            AttentionLayerConfig(layer_id=LayerId(0), buffers=[BufferConfig(role="key", size=256)]),
+            SsmLayerConfig(layer_id=LayerId(1), buffers=[BufferConfig(role="ssm", size=1024)]),
+            AttentionLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[BufferConfig(role="key", size=128)],
+                sliding_window_size=4096,
+            ),
+        ],
+        initial_pool_ratio=pool_ratio,
+    )
+    return manager, config
+
+
+def test_draft_pool_ratio_full_list_is_checked_against_token_parity():
+    manager, config = _draft_pool_ratio_manager_and_config([0.6, 0.4])
+    parity = manager._with_draft_pool_ratio(config).initial_pool_ratio
+    assert parity == pytest.approx([0.6 / 1.3, 0.4 / 1.3, 0.3 / 1.3])
+
+    manager, config = _draft_pool_ratio_manager_and_config(parity)
+    assert manager._with_draft_pool_ratio(config) is config
+    # The native grouping is checked against this order once built.
+    assert [group for group, _ in manager._pool_ratio_groups] == [0, 1, 2]
+
+    # Draft entry placed first instead of last: rejected, naming the draft group.
+    manager, config = _draft_pool_ratio_manager_and_config(list(reversed(parity)))
+    with pytest.raises(ValueError, match=r"draft layer group \(group 2\)"):
+        manager._with_draft_pool_ratio(config)
+
+
+def test_draft_pool_ratio_arity_error_names_the_layer_group_order():
+    manager, config = _draft_pool_ratio_manager_and_config([0.25] * 4)
+    with pytest.raises(
+        ValueError, match=r"Layer groups in order: 0: layer 0 .*2: layer 2 .*\(draft\)"
+    ):
+        manager._with_draft_pool_ratio(config)
 
 
 def test_base_manager_hooks_read_appended_draft_specs():

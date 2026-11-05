@@ -1043,8 +1043,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         A configured ``pool_ratio`` lists the target's lifecycles; the draft
         lifecycle's share is inserted for token parity (see
-        ``_insert_draft_pool_ratio``). Native lifecycles are registered in
-        layer and buffer order.
+        ``_insert_draft_pool_ratio``). A full-length ``pool_ratio`` is checked
+        against that share instead. Native lifecycles are registered in layer
+        and buffer order.
         """
         ratio = config.initial_pool_ratio
         if ratio is None or not self._appended_draft_layer_specs:
@@ -1077,23 +1078,59 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 block_bytes[keys.index(key)] += buffer.size
                 is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
                 (draft_keys if is_draft else target_keys).add(key)
-        if len(ratio) == len(keys):
-            return config
-        if len(draft_keys) != 1 or draft_keys & target_keys or len(ratio) != len(keys) - 1:
-            raise ValueError(
-                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
-                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)})"
-            )
+        has_draft_group = len(draft_keys) == 1 and not draft_keys & target_keys
+        draft_group = keys.index(next(iter(draft_keys))) if has_draft_group else None
+        groups = ", ".join(
+            f"{group}: layer {layer_id} {role}" + (" (draft)" if group == draft_group else "")
+            for group, (layer_id, role) in enumerate(representatives)
+        )
         full_history = [
             key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
         ]
         self._pool_ratio_groups = representatives
+        if len(ratio) == len(keys):
+            if draft_group is not None:
+                self._check_draft_pool_share(ratio, block_bytes, full_history, draft_group, groups)
+            return config
+        if draft_group is None or len(ratio) != len(keys) - 1:
+            raise ValueError(
+                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
+                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)}). "
+                f"Layer groups in order: {groups}"
+            )
         return replace(
             config,
             initial_pool_ratio=_insert_draft_pool_ratio(
-                ratio, block_bytes, full_history, keys.index(draft_keys.pop())
+                ratio, block_bytes, full_history, draft_group
             ),
         )
+
+    @staticmethod
+    def _check_draft_pool_share(
+        ratio: Sequence[float],
+        block_bytes: Sequence[int],
+        full_history: Sequence[bool],
+        draft_group: int,
+        groups: str,
+    ) -> None:
+        """Compare a full-length pool_ratio's draft entry with the token-parity share."""
+        if not any(full for group, full in enumerate(full_history) if group != draft_group):
+            return
+        target = [share for group, share in enumerate(ratio) if group != draft_group]
+        parity = _insert_draft_pool_ratio(
+            [share / sum(target) for share in target], block_bytes, full_history, draft_group
+        )
+        given = ratio[draft_group] / sum(ratio)
+        message = (
+            f"kv_cache_config.pool_ratio gives the draft layer group (group {draft_group}) "
+            f"{given:.4f} of the pool; token parity with the target needs "
+            f"{parity[draft_group]:.4f} ({[round(share, 4) for share in parity]}). "
+            f"Layer groups in order: {groups}"
+        )
+        if not 0.5 <= given / parity[draft_group] <= 2.0:
+            raise ValueError(f"{message}. List only the target layer groups to insert it.")
+        if abs(given / parity[draft_group] - 1.0) > 0.1:
+            logger.warning(message)
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""
