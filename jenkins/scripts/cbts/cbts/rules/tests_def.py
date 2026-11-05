@@ -274,6 +274,7 @@ class TestsDefRule(Rule):
         self._total_blocks = len(yaml_index.blocks)
         self._acc_class_indexes: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None
         self._acc_reference_consumers: dict[str, set[str]] = {}
+        self._acc_test_methods: set[str] = set()
         self._acc_source_texts: tuple[str, ...] = ()
 
     def _compute_anchors(self, git_path: str, yaml_path: str, diff: str) -> list[str]:
@@ -396,7 +397,9 @@ class TestsDefRule(Rule):
     def _reference_key_anchors(self, key: str) -> list[str]:
         """Anchors for one reference-YAML top-level key.
 
-        A `TestC::test_m` key resolves through the class index.
+        A `TestC::test_m` key selects a method only when it is defined on
+        the class. Otherwise the class is retained, including inherited
+        tests, and namespace consumers are included as well.
         Other acceptance keys select every consumer of their namespace,
         including variants constructed by appending a suffix to another key.
         Module-level constants and helpers select the whole test file.
@@ -407,11 +410,16 @@ class TestsDefRule(Rule):
             anchors = list(self._accuracy_model_to_classes().get(key, ()))
         else:
             class_name, method = match.groups()
-            anchors = [
-                f"{c}::{method}" for c in self._accuracy_class_to_paths().get(class_name, ())
-            ]
+            anchors = []
+            for qualified in self._accuracy_class_to_paths().get(class_name, ()):
+                method_anchor = f"{qualified}::{method}"
+                if method_anchor in self._acc_test_methods:
+                    anchors.append(method_anchor)
+                else:
+                    anchors.append(qualified)
+                    anchors.extend(self._acc_reference_consumers.get(class_name, ()))
         namespace, separator, _ = key.partition("::")
-        return anchors or (
+        return sorted(set(anchors)) or (
             sorted(self._acc_reference_consumers.get(namespace, ())) if separator else []
         )
 
@@ -477,6 +485,12 @@ class TestsDefRule(Rule):
                         continue
                     qualified = f"{rel}::{node.name}"
                     by_class.setdefault(node.name, []).append(qualified)
+                    self._acc_test_methods.update(
+                        f"{qualified}::{child.name}"
+                        for child in node.body
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and child.name.startswith("test")
+                    )
                     for child in node.body:
                         if not isinstance(child, ast.Assign):
                             continue
