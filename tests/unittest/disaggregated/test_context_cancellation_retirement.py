@@ -2,20 +2,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Context cancellation leaves native transfer retirement independently owned."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from test_context_first_ownership import _native_pair, _request, _worker
+
+__extra_import_path__ = ["../_torch/disaggregation"]
+
+from fake_dist import FakeDistGroup, FakeDistRank
+from test_context_first_ownership import _KV_RESULT_REPORT_TOKEN, _native_pair, _request, _worker
 from test_transfer_ownership_regressions import _sole_piece
 
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
+from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_mod
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    ExecutorRequestQueue,
+    RequestQueueItem,
+)
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
@@ -37,16 +49,23 @@ def _harness(
     worker: transfer_mod.TransferWorker,
     request: SimpleNamespace,
     session: transfer_mod.TxSession | None,
+    *,
+    dist: FakeDistRank | None = None,
 ) -> SimpleNamespace:
     """Run real coordinator/transfer-manager/reaper code with controlled engine effects."""
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._context_first_ownership = True
+    transceiver._pending_rank_info_admissions = None
     transceiver._send_sessions = {} if session is None else {401: session}
     transceiver._send_reqs = {} if session is None else {401: request}
     transceiver._ever_had_send_session = session is not None
-    transceiver._ctx_need_tp_sync = False
+    transceiver._wait_reqs = {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver.kv_transfer_timeout_ms = 1000
+    transceiver._ctx_need_tp_sync = dist is not None and dist.tp_size > 1
     transceiver._ctx_need_pp_sync = False
-    transceiver._dist = Mock(tp_size=1)
+    transceiver._dist = dist if dist is not None else Mock(tp_size=1)
     transceiver._transfer_worker = worker
     # Expiring unrelated peer-discovery metadata is outside this cancellation test.
     worker.sweep_stale_req_infos = Mock()
@@ -59,6 +78,7 @@ def _harness(
     registry = SimpleNamespace(
         contains=lambda req: req in active,
         active_requests=lambda: active,
+        remove=active.remove,
         canceled_request_ids=lambda: [],
     )
     effects = Mock()
@@ -66,11 +86,10 @@ def _harness(
         transceiver=transceiver,
         transfer_manager=transfers,
         kv_cache_manager=manager,
-        dist=SimpleNamespace(world_size=1),
+        dist=dist if dist is not None else SimpleNamespace(world_size=1),
         effects=effects,
         registry=registry,
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     return SimpleNamespace(
         transceiver=transceiver,
@@ -233,6 +252,11 @@ def test_context_cancel_without_gen_retires_once_and_fences_late_receiver(
 
     assert harness.coordinator.request_logical_context_cancellation(request)
     assert harness.coordinator.request_logical_context_cancellation(request)
+    # A legacy cancellation caller cannot bypass the normal retirement reaper.
+    drain_started = tx._retirement._drain_started
+    worker._retirement_watchdog.clock = lambda: 2.0
+    assert not harness.transceiver.cancel_request(request)
+    assert tx._retirement._drain_started == drain_started
     assert harness.transceiver._send_sessions[401] is tx
     assert harness.transfers.requests_in_transfer()[401] is request
     harness.manager.unpin_blocks_by_id.assert_not_called()
@@ -262,10 +286,151 @@ def test_context_cancel_without_gen_retires_once_and_fences_late_receiver(
     )
     worker._sender._queue_session_quiescence = Mock()
     worker._sender._save_peer_req_info = Mock()
-    worker._sender._respond_with_kv(b"peer", [b"REQUEST_DATA", late.to_bytes()])
+    worker._sender._respond_with_kv(
+        b"peer", [b"REQUEST_DATA", late.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
     worker._sender._queue_session_quiescence.assert_called_once_with(401, "gen", 0)
     worker._sender._save_peer_req_info.assert_not_called()
     assert not worker._sender._sessions
+
+
+def _assert_transfer_only_progress(
+    harness: SimpleNamespace, dist: FakeDistRank, monkeypatch: pytest.MonkeyPatch
+) -> PyExecutor:
+    """Exercise real idle and shutdown predicates against each rank's lifecycle state."""
+    executor = object.__new__(PyExecutor)
+    executor._disagg_coordinator = harness.coordinator
+    executor.kv_cache_transceiver = harness.transceiver
+    executor.async_transfer_manager = harness.transfers
+    executor.kv_connector_manager = None
+    executor.active_requests = harness.active
+    executor.waiting_queue = FCFSWaitingQueue()
+    executor.is_shutdown = True
+    assert executor._has_pending_context_retirement()
+    assert not executor.should_stop_processing
+
+    executor.is_shutdown = False
+    executor.dist = dist
+    executor.enable_attention_dp = False
+    executor.control_requests = []
+    executor.request_accumulated = []
+    executor._disable_mpi = False
+    executor.hang_detector = SimpleNamespace(pause=nullcontext)
+    executor.executor_request_queue = ExecutorRequestQueue(
+        dist=dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=1000
+    )
+    request_queue = executor.executor_request_queue.request_queue
+    original_get = request_queue.get
+
+    def nonblocking_get(block: bool = True, timeout: float | None = None) -> RequestQueueItem:
+        assert not block, "Rank-aligned retirement must not wait to fill a request batch"
+        return original_get(block=block, timeout=timeout)
+
+    monkeypatch.setattr(request_queue, "get", nonblocking_get)
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.return_value = []
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, len(harness.active))
+    executor.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=False)
+    return executor
+
+
+@pytest.mark.parametrize("result_already_sent", [False, True])
+@pytest.mark.parametrize("pending_write", [False, True])
+def test_context_timeout_skew_retains_claims_until_tp_retirement(
+    monkeypatch: pytest.MonkeyPatch, result_already_sent: bool, pending_write: bool
+) -> None:
+    """One expired rank cannot leave the collective loop before its peer retires."""
+    now = {"value": 100.0}
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = []
+    requests = []
+    pending = None
+    for rank in range(2):
+        request = _context_request()
+        # A send without all peers is exempt until three transfer timeouts.
+        request.py_kv_transfer_start_time = 96.0 if rank == 0 else 100.0
+        request.is_disagg_generation_transmission_in_progress = False
+        request.create_response = Mock(return_value=None)
+        if pending_write and rank == 1:
+            worker, tx, rx, meta, backend_request, status, _ = _native_pair(
+                monkeypatch, completes=False
+            )
+            worker._sender._deliver_kv_to_agent(meta)
+            pending = worker, tx, rx, backend_request, status
+        else:
+            worker = _worker()
+            tx = worker.create_tx_session(request)
+            tx.send(_sole_piece(tokens=16))
+        harness = _harness(worker, request, tx, dist=group.rank(rank))
+        harness.transfers.start_transfer(request)
+        if not result_already_sent:
+            harness.active.append(request)
+        harness.effects.fail_requests.side_effect = (
+            lambda *_args, active=harness.active, **_kwargs: active.clear()
+        )
+        ranks.append(harness)
+        requests.append(request)
+
+    group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
+    assert [request.py_kv_transfer_timed_out for request in requests] == [True, False]
+    group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+    assert not ranks[0].transceiver.cancel_request(requests[0])
+    assert ranks[0].transceiver._send_sessions[401].resources_drained()
+    executors = []
+    for rank, harness in enumerate(ranks):
+        assert 401 in harness.transceiver._send_sessions
+        assert harness.transfers.requests_in_transfer() == {401: requests[rank]}
+        harness.manager.unpin_blocks_by_id.assert_not_called()
+        harness.effects.fail_requests.assert_not_called()
+        harness.effects.terminate_request.assert_not_called()
+        assert not harness.coordinator._context_cancellation_drains
+        executors.append(_assert_transfer_only_progress(harness, group.rank(rank), monkeypatch))
+
+    now["value"] = 104.0
+    group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
+    group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+    assert all(harness.transfers.requests_in_transfer() for harness in ranks)
+    if pending is not None:
+        group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+        worker, tx, rx, backend_request, status = pending
+        operation = tx.kv_tasks[0]._physical_operations[0]
+        assert operation.request is backend_request and operation.status is status
+        for harness in ranks:
+            assert 401 in harness.transceiver._send_sessions
+            assert harness.transfers.requests_in_transfer()
+            harness.manager.unpin_blocks_by_id.assert_not_called()
+        status.is_completed.return_value = True
+        worker._sender._poll_in_doubt_transfers(0)
+    group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+    group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+    if pending is not None:
+        assert rx.close()
+        assert operation.request is None and operation.status is None
+
+    assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
+    for harness, request in zip(ranks, requests):
+        assert not harness.transceiver._send_sessions
+        assert not harness.transfers.requests_in_transfer()
+        assert harness.transceiver.cancel_request(request)
+        harness.manager.unpin_blocks_by_id.assert_called_once_with(91)
+        harness.effects.stage_transfer_response.assert_not_called()
+        request.create_response.assert_not_called()
+        if result_already_sent:
+            harness.effects.fail_requests.assert_not_called()
+            harness.effects.terminate_request.assert_called_once_with(request)
+        else:
+            assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+            harness.effects.fail_requests.assert_called_once_with(
+                "Error in kv cache transfer for context requests", [request], charge_budget=False
+            )
+            harness.effects.terminate_request.assert_not_called()
+
+    for executor in executors:
+        assert not executor._has_pending_context_retirement()
+        executor.is_shutdown = True
+        assert executor.should_stop_processing
 
 
 @pytest.mark.parametrize("settles", [False, True])

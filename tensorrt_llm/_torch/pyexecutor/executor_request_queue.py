@@ -281,6 +281,8 @@ class ExecutorRequestQueue:
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
@@ -291,6 +293,8 @@ class ExecutorRequestQueue:
             client_id: Original frontend identity, not an executor request ID.
         """
         with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
             self.request_queue.put(
                 RequestQueueItem(client_id,
                                  is_canceled_request=True,
@@ -343,6 +347,17 @@ class ExecutorRequestQueue:
         """Return whether rank zero can enqueue shutdown/control sentinels."""
         with self.enqueue_lock:
             return self.active and self.dist.rank == 0
+
+    def _can_enqueue_cancellation(self) -> bool:
+        # The caller holds enqueue_lock, including the enqueue-time recheck.
+        return (self.active and self.dist.rank == 0
+                and self.admission_state in (RequestAdmissionState.RUNNING,
+                                             RequestAdmissionState.PARKING))
+
+    def can_enqueue_cancellation(self) -> bool:
+        """Allow cancellation of existing work while admission drains for sleep."""
+        with self.enqueue_lock:
+            return self._can_enqueue_cancellation()
 
     def get_from_request_queue(
             self,

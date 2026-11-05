@@ -4,6 +4,7 @@
 import atexit
 import dataclasses
 import datetime
+import itertools
 import math
 import os
 import sys
@@ -2858,6 +2859,10 @@ class PyExecutor:
         """
         return self.executor_request_queue.can_enqueue_request()
 
+    def _can_enqueue_cancellation(self) -> bool:
+        """Keep existing-work cancellation open during a sleep drain."""
+        return self.executor_request_queue.can_enqueue_cancellation()
+
     def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
         self.executor_request_queue.begin_sleep_transition(tag.value
                                                            for tag in tags)
@@ -3013,7 +3018,8 @@ class PyExecutor:
         """Keep qualified source retirement live after the logical result leaves.
 
         Returns:
-            Whether a TP-consensus-retired source claim still needs progress.
+            Whether a source claim still awaits TP-agreed retirement. All
+            qualified cleanup paths retain these claims until group settlement.
         """
         transfers = getattr(self, "async_transfer_manager", None)
         return (getattr(self, "kv_cache_transceiver", None) is not None
@@ -7100,8 +7106,8 @@ class PyExecutor:
         # weights-N+1. Wait for the transfers as well.
         #
         # Legacy transfers are bounded: a stuck or lost transfer must not park
-        # the control request
-        # forever -- a refit that never fires hangs the whole training loop,
+        # the control request forever -- a refit that never fires hangs the
+        # training loop,
         # which is worse than the staleness this avoids. Past the deadline, warn
         # and proceed. A KV connector's pending loads and transfers are still
         # waited for without a bound. Protected ownership instead follows its
@@ -8548,6 +8554,41 @@ class PyExecutor:
                                    None) or 1000
         return datetime.timedelta(milliseconds=poll_interval_ms)
 
+    def _fetch_drain_cancellations(
+            self, waiting_queue: WaitingQueue) -> List[RequestQueueItem]:
+        """Fetch only cancellations for work already on this side of the control."""
+        retained = self.async_transfer_manager.requests_in_transfer().values()
+        request_ids = {item.id for item in waiting_queue}
+        request_ids.update(
+            req.parent_request_id if req.is_child else req.py_request_id
+            for req in itertools.chain(self.active_requests, retained))
+        client_ids = {req.py_client_id for req in retained}
+        if self.enable_attention_dp:
+            # Every bridge rank enters this fixed drain-fetch slot, including
+            # empty ranks. Rank zero need not own the request being cancelled.
+            participants = self.dist.tp_allgather((request_ids, client_ids))
+            request_ids = set().union(*(ids for ids, _ in participants))
+            client_ids = set().union(*(ids for _, ids in participants))
+        if self.dist.rank != 0:
+            return []
+        self.request_accumulated.extend(
+            self.executor_request_queue.get_from_request_queue(
+                datetime.timedelta(0), wait_for_batch=False))
+        cancellations = []
+        deferred = []
+        for item in self.request_accumulated:
+            matches_existing = (item.id in request_ids
+                                if item.cancel_context_client_id is None else
+                                item.cancel_context_client_id in client_ids)
+            if item.is_canceled_request and matches_existing:
+                cancellations.append(item)
+            else:
+                # In particular, a cancel for a submit behind the control must
+                # stay with that submit, not be consumed as an unknown request.
+                deferred.append(item)
+        self.request_accumulated[:] = deferred
+        return cancellations
+
     def _fetch_and_enqueue_requests(
             self,
             waiting_queue: WaitingQueue,
@@ -8572,13 +8613,16 @@ class PyExecutor:
         """
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
-        # ADP polls owner-local completions before routing. All owners must
-        # skip this broadcast together while a control request drains. TP
-        # still needs the broadcast to deliver rank-zero prefix completions.
-        if control_pending and (self.enable_attention_dp or not (
-                connector is not None and connector.prefix_reservations_enabled
-                and connector.has_pending_loads())):
-            return
+        # Continue the existing broadcast slot for cancellations during drain.
+        # The request-independent capability selects the same bridge on every
+        # ADP rank; unqualified ADP and connector controls keep their old path.
+        if control_pending and self.enable_attention_dp:
+            transceiver = self.kv_cache_transceiver
+            if (not self.control_requests[0].control_requires_drain
+                    or connector is not None or transceiver is None
+                    or transceiver.supports_idle_request_cancellation()
+                    is not True):
+                return
 
         # Calculate timeout. Never wait once the shutdown sentinel has been
         # consumed: no further item will arrive to wake a blocking get(), so
@@ -8587,8 +8631,8 @@ class PyExecutor:
         # on `shutdown_event`.
         pending_retirement = (self.disagg.has_retiring_gen_receives
                               or self._has_pending_context_retirement())
-        idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown
+        idle = (not control_pending and total_num_live_requests == 0
+                and len(waiting_queue) == 0 and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
                 and not pending_retirement)
         # Only trust the hint on the busy path; `idle`, `control_pending` and
@@ -8624,7 +8668,10 @@ class PyExecutor:
 
         # Fetch requests from rank 0
         new_requests = []
-        if self.dist.rank == 0 and not control_pending:
+        if control_pending:
+            if self.control_requests[0].control_requires_drain:
+                new_requests = self._fetch_drain_cancellations(waiting_queue)
+        elif self.dist.rank == 0:
             # Process accumulated requests that were queued during control request handling.
             if len(self.request_accumulated) != 0:
                 new_requests.extend(self.request_accumulated)
@@ -8632,6 +8679,8 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
+                # Zero queue timeout does not disable waiting to fill a batch.
+                # Retirement and shutdown must keep progressing without arrivals.
                 new_requests.extend(
                     self.executor_request_queue.get_from_request_queue(
                         timeout,
@@ -8979,11 +9028,6 @@ class PyExecutor:
                                          new_requests_hint=new_requests_hint)
         self._cancel_queued_context_requests(waiting_queue)
 
-        # Cancellation must not wait for an execution slot. These requests use
-        # normal conversion/response routing, but leave before model scheduling.
-        cancelled_contexts = self._take_cancelled_context_requests(
-            waiting_queue)
-
         # 2b. GEN slot preemption: resume paused requests, then pause running
         # ones for at-risk waiting requests.
         preemption = getattr(self, "_gen_preemption", None)
@@ -9000,7 +9044,6 @@ class PyExecutor:
         # 3. Pop requests from waiting queue
         new_requests, placement = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests, all_rank_states)
-        new_requests = cancelled_contexts + new_requests
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -11829,36 +11872,6 @@ class PyExecutor:
         return [
             req for req in new_requests if req.py_request_id not in retired_ids
         ]
-
-    def _take_cancelled_context_requests(
-            self, waiting_queue: WaitingQueue) -> list[RequestQueueItem]:
-        """Extract qualified queued cancellations without consuming capacity.
-
-        Args:
-            waiting_queue: Rank-replicated requests not yet activated.
-
-        Returns:
-            CTX requests to convert and cancel before model scheduling.
-        """
-        if (not self.canceled_req_ids
-                or getattr(self, "kv_connector_manager", None) is not None
-                or not self.disagg.supports_logical_context_cancellation()):
-            return []
-        cancelled = set(self.canceled_req_ids)
-        selected = []
-        for item in waiting_queue:
-            if item.id not in cancelled or item.request is None:
-                continue
-            params = getattr(item.request, "py_disaggregated_params", None)
-            if (item.request.request_type
-                    == RequestType.REQUEST_TYPE_CONTEXT_ONLY
-                    and params is not None and params.schedule_style
-                    == DisaggScheduleStyle.CONTEXT_FIRST
-                    and type(params.disagg_request_id) is int
-                    and params.disagg_request_id >= 0):
-                selected.append(item)
-        waiting_queue.remove_by_ids({item.id for item in selected})
-        return selected
 
     def _progress_context_cancellations(
             self, new_requests: List[LlmRequest]) -> List[LlmRequest]:
