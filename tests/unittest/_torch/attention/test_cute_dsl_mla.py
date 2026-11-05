@@ -225,8 +225,10 @@ def _select_mla_generation_fmha(
         (103, 24, 6, False, True, "cute_dsl_mla"),
         # The same verify shape without Helix keeps the perf gate.
         (103, 48, 6, True, False, "trtllm_gen"),
-        # H=48 page-64 single-token Helix needs the coverage path on SM103.
+        # Single-token Helix decode at 48 heads on 64-token pages has no
+        # fallback kernel on either architecture.
         (103, 48, 1, True, True, "cute_dsl_mla"),
+        (100, 48, 1, True, True, "cute_dsl_mla"),
         # Single-token H=96 is unchanged (measured perf-table entry).
         (103, 96, 1, True, False, "cute_dsl_mla"),
         # Head counts TRTLLM-Gen serves keep the perf gate.
@@ -442,25 +444,32 @@ def test_page_size_exclusive_to_cute_dsl_needs_a_page_size() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "page_size, fp8_kv, helix, sm, kernel_supported, expected",
+    "page_size, fp8_kv, helix, sm, num_heads, kernel_supported, expected",
     [
-        (64, True, True, 103, True, "cute_dsl_mla"),
-        (32, True, True, 103, True, "trtllm_gen"),
-        (128, True, True, 103, True, "trtllm_gen"),
-        (64, False, True, 103, True, "trtllm_gen"),
-        (64, True, False, 103, True, "trtllm_gen"),
-        (64, True, True, 100, True, "trtllm_gen"),
-        (64, True, True, 103, False, "trtllm_gen"),
+        # The fallback pads 33-63 heads to a 64-row Q tile that has kernels
+        # for 32-token pages only.
+        (64, True, True, 103, 48, True, "cute_dsl_mla"),
+        (64, True, True, 100, 48, True, "cute_dsl_mla"),
+        (64, False, True, 103, 48, True, "cute_dsl_mla"),
+        (128, True, True, 103, 48, True, "cute_dsl_mla"),
+        (64, True, True, 103, 40, True, "cute_dsl_mla"),
+        # The fallback serves these, so the perf gate still decides.
+        (32, True, True, 103, 48, True, "trtllm_gen"),
+        (64, True, True, 103, 24, True, "trtllm_gen"),
+        (64, True, True, 103, 64, True, "trtllm_gen"),
+        (64, True, True, 103, 96, True, "trtllm_gen"),
+        (64, True, False, 103, 48, True, "trtllm_gen"),
+        (64, True, True, 103, 48, False, "trtllm_gen"),
     ],
 )
-def test_mla_generation_helix_fp8_page64_coverage(
-    monkeypatch, page_size, fp8_kv, helix, sm, kernel_supported, expected
+def test_mla_generation_helix_decode_without_fallback_kernel(
+    monkeypatch, page_size, fp8_kv, helix, sm, num_heads, kernel_supported, expected
 ) -> None:
     assert (
         _select_mla_generation_fmha(
             monkeypatch,
             sm=sm,
-            num_heads=48,
+            num_heads=num_heads,
             seq_len_q=1,
             fp8_kv=fp8_kv,
             helix=helix,
@@ -479,7 +488,7 @@ def test_mla_generation_helix_fp8_page64_coverage(
         (64, 1, True, True, True, "cute_dsl_mla"),
         (64, 1, True, True, False, "trtllm_gen"),
         (32, 1, True, True, True, "trtllm_gen"),
-        (64, 1, False, True, True, "trtllm_gen"),
+        (64, 1, False, True, True, "cute_dsl_mla"),
         (64, 1, True, False, True, "trtllm_gen"),
         (64, 6, True, True, True, "cute_dsl_mla"),
         (32, 6, True, True, True, "cute_dsl_mla"),
