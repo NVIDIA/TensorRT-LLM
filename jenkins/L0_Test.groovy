@@ -558,11 +558,6 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     echo "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
                     testFailed = true
                 } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
-                    String scope = retryContext?.scope ?: InfraFailure.K8S
-                    def classified = classifyFailure(pipeline, e, scope, retryContext)
-                    if (classified instanceof InfraFailure) {
-                        unrerunInfraFailure = classified
-                    }
                     // Same duration/no-signature gap as the regular-test path: this
                     // finished but failed, and was never actually rerun, so
                     // results_isolated_${i}.xml still carries the original
@@ -573,6 +568,13 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                 }
             }
             if (testFailed) {
+                if (!rerunResult.failed) {
+                    String scope = retryContext?.scope ?: InfraFailure.K8S
+                    def classified = classifyFailure(pipeline, e, scope, retryContext)
+                    if (classified instanceof InfraFailure) {
+                        unrerunInfraFailure = classified
+                    }
+                }
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
                     throw e
                 }
@@ -6139,11 +6141,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         } else if (hadUnfinishedTests) {
                             echo "Some tests terminated unexpectedly, please check the test report."
                         } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
-                            String scope = retryContext?.scope ?: InfraFailure.K8S
-                            def classified = classifyFailure(pipeline, e, scope, retryContext)
-                            if (classified instanceof InfraFailure) {
-                                unrerunInfraFailure = classified
-                            }
                             // Failures that finished (not a timeout) but were never
                             // rerun because duration > 10 min and no known failure
                             // signature matched: results.xml still carries their
@@ -6153,6 +6150,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             hasUnrerunFailure = true
                         }
                         if (rerunResult.failed || hadUnfinishedTests || hasUnrerunFailure) {
+                            if (!rerunResult.failed) {
+                                String scope = retryContext?.scope ?: InfraFailure.K8S
+                                def classified = classifyFailure(pipeline, e, scope, retryContext)
+                                if (classified instanceof InfraFailure) {
+                                    unrerunInfraFailure = classified
+                                }
+                            }
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
                                 throw e
                             }
@@ -6248,7 +6252,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             throw infraFailure
         }
 
-        def unfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
+        def unfinishedTests = fileExists("${stageName}/results-timeout.xml") ||
+            generateTimeoutTestResultXml(pipeline, stageName)
         if ((rerunFailed || hasUnrerunFailure || unfinishedTests) && perfRegressionExitCode == null &&
                 refreshFailedTestWaives(llmSrc, stageName, preprocessedLists)) {
             return
