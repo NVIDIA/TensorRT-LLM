@@ -1142,7 +1142,9 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
     def test_finish_does_not_flush_incomplete_wrapped_call(
             self, sample_tools, parser, text):
         """An opened tool call is not flushed as normal content."""
-        parser.parse_streaming_increment(text, sample_tools)
+        increment = parser.parse_streaming_increment(text, sample_tools)
+        assert increment.normal_text == ""
+        assert increment.calls == []
 
         result = parser.finish(sample_tools)
 
