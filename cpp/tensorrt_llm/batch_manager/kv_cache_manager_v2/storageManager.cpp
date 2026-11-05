@@ -463,6 +463,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mGpuArena = config.gpuArena;
     mDropUnreferencedOnRebalance = config.dropUnreferencedOnRebalance;
     mInPlaceRelocation = config.inPlaceRelocation;
+    if (mGpuArena && mInPlaceRelocation)
+    {
+        // In-place relocation copies on a pooled TemporaryCudaStream. The pool creates its 128 streams on first
+        // use, which otherwise lands inside the first rebalance that relocates a live request (~6.4 ms measured
+        // there with DeepSeek-V4-Flash). Create them now, at startup.
+        static_cast<void>(CudaStreamPool::instance());
+    }
     if (mGpuArena)
     {
         // The whole GPU quota becomes one arena, rounded down to whole physical chunks. Like the VMM path
