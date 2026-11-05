@@ -55,10 +55,11 @@ def test_plan_mla_split_kv_policy(kv_lens: list[int], rows: int, expected: list[
 
 
 def test_plan_kernel_matches_host_mirror() -> None:
+    """Every block size the launch picks for the batch (one warp of lanes up to the request cap)."""
     mod = _plan_mod()
     generator = torch.Generator().manual_seed(3)
     for rows in (1, 4, 8):
-        for batch in (1, 3, 8, 16, 37, 128):
+        for batch in (1, 3, 8, 16, 37, 128, 300, 1024):
             kv = torch.randint(1, 300_000, (batch,), generator=generator)
             kv[0] = 262144  # a long one
             kv_lens = kv.tolist()

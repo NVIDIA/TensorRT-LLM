@@ -57,6 +57,12 @@ _SPLIT_PLAN_MIN_TILES = 4
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
 # optimum within 5%.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# The plan kernel is one program over the batch, padded to a power of two of at
+# least one warp: its candidate cuts are each a reduction over the batch, so a
+# block sized for the maximum request count would make every launch pay for
+# _SPLIT_PLAN_MAX_REQUESTS lanes.
+_SPLIT_PLAN_MIN_BLOCK = 32
+_SPLIT_PLAN_LANES_PER_WARP = 256
 # ``assumed_align`` the decode runner compiles the page table and the KV
 # lengths with; their runtime pointers must keep it.
 _KERNEL_INPUT_ALIGN_BYTES = 16
@@ -164,6 +170,7 @@ def launch_mla_split_kv_plan(
             or not tensor.is_cuda
         ):
             raise ValueError(f"{name} must be a contiguous CUDA int32 vector of >= {num_requests}")
+    block = max(_SPLIT_PLAN_MIN_BLOCK, triton.next_power_of_2(num_requests))
     _mla_split_kv_plan_kernel[(1,)](
         cache_seqs,
         plan,
@@ -175,8 +182,8 @@ def launch_mla_split_kv_plan(
         MIN_TILES=_SPLIT_PLAN_MIN_TILES,
         PIECE_COST=_SPLIT_PLAN_PIECE_COST_TILES,
         MAX_PIECES=_SPLIT_PLAN_MAX_SPLIT,
-        BLOCK=_SPLIT_PLAN_MAX_REQUESTS,
-        num_warps=4,
+        BLOCK=block,
+        num_warps=max(1, min(4, block // _SPLIT_PLAN_LANES_PER_WARP)),
     )
 
 
