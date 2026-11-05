@@ -77,7 +77,9 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslGroupedGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12.nvfp4 import (
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
@@ -5125,6 +5127,7 @@ def should_skip_locality_domain_param(
     activation_type: ActivationType,
     swiglu_gptoss_style: bool,
     dtype: torch.dtype,
+    model_config: Optional[MoeModelConfig] = None,
 ) -> Optional[str]:
     """Return a static skip reason for locality domain MoE backend params."""
     if backend_type != MoeBackendType.CUTEDSL:
@@ -5138,6 +5141,12 @@ def should_skip_locality_domain_param(
         return "locality domain MoE backend test only supports SwiGLU"
     if swiglu_gptoss_style:
         return "locality domain MoE backend test does not cover GPT-OSS SwiGLU style"
+    # CuteDslLocalityDomainMixin._adjust_locality_domain_plan runs such shapes
+    # on the full-GPU kernels, so the locality-domain ops would not be tuned.
+    if model_config is not None and (
+        (2 * model_config.intermediate_size) % 256 != 0 or model_config.hidden_size % 256 != 0
+    ):
+        return "locality domain shards must be 128-row multiples"
     return None
 
 
@@ -5250,6 +5259,7 @@ def generate_test_params() -> List:
                 ActivationType.Swiglu,
                 swiglu_gptoss_style,
                 dtype,
+                model_config,
             )
             locality_domain_param_values = (
                 dtype,
