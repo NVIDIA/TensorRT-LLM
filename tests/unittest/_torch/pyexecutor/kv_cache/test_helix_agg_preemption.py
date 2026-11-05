@@ -422,8 +422,7 @@ def test_agg_helix_suspends_and_resumes_identically(host_cache_size: Optional[in
     same."""
     scenario = SCENARIOS["decode_pressure"]
     ranks = [
-        _make_rank(cp_rank, scenario, host_cache_size=host_cache_size)
-        for cp_rank in range(CP_SIZE)
+        _make_rank(cp_rank, scenario, host_cache_size=host_cache_size) for cp_rank in range(CP_SIZE)
     ]
     for manager, _ in ranks:
         assert manager.has_cache_tier_below_gpu
