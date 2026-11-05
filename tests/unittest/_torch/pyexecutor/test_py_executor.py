@@ -1482,6 +1482,8 @@ def test_update_v2_context_resources_advances_unpaired_draft():
     executor.kv_cache_manager = Mock()
     executor.draft_kv_cache_manager = Mock()
     executor.enable_joint_kv_cache_reuse = False
+    executor.resource_manager = Mock()
+    executor.resource_manager.get_resource_manager.return_value = None
     scheduled_batch = object()
 
     PyExecutor._update_v2_context_resources(executor, scheduled_batch)
