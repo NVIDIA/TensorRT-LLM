@@ -132,6 +132,10 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     )
     executor.is_shutdown = False
     executor.canceled_req_ids = []
+    # Set by PyExecutor.__init__; read by the loops, request fetch and ADP dummy padding.
+    executor.previous_batch = None
+    executor.track_unique_tokens = True
+    executor._adp_dummy_is_gen = True
     executor.executor_request_queue = ExecutorRequestQueue(
         dist=executor.dist,
         max_batch_size=2,

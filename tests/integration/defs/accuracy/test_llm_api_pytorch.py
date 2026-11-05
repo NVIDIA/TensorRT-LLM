@@ -2113,6 +2113,7 @@ class TestDeepSeekV41(LlmapiAccuracyTestHarness):
             assert acceptance_length >= 3.0, (
                 f"DSpark acceptance length {acceptance_length:.3f} < 3.0")
 
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.threadleak(enabled=False)
     def test_breakable_prefill_cuda_graph(
             self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2121,11 +2122,6 @@ class TestDeepSeekV41(LlmapiAccuracyTestHarness):
         Bounded replay plans every attention-DP prefill batch, so the 128- and 1,500-token
         prompts both run eagerly with the decoder pass from its own graphs.
         """
-        world_size = get_mpi_world_size()
-        available_gpus = get_device_count() if world_size == 1 else world_size
-        if available_gpus < 4:
-            pytest.skip("Requires at least 4 GPUs")
-
         for name in tuple(os.environ):
             if name.startswith("TRTLLM_V41_"):
                 monkeypatch.delenv(name)
