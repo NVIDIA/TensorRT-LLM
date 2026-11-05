@@ -59,7 +59,6 @@ def _penalty_mapping_meta(
         verify_lens=None,
         qo_indptr=None,
         total_verify_tokens=None,
-        watermark_ready=False,
     )
     if verify_lens is not None:
         lens = torch.tensor(verify_lens, dtype=torch.int32)

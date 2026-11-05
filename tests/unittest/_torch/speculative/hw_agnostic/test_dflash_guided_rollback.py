@@ -62,7 +62,6 @@ def _worker_inputs(batch_size, num_contexts, runtime_draft_len):
         is_cuda_graph=False,
         request_ids=None,
         batch_indices_cuda=None,
-        watermark_ready=False,
     )
     attn = types.SimpleNamespace(
         num_seqs=batch_size,

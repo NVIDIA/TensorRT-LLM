@@ -247,6 +247,7 @@ class DraftLoopOps:
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
         device = logits.device
+        worker._reject_watermark(spec_metadata)
         target_tokens = worker._sample_tokens_for_batch(logits, spec_metadata, 0, batch_size)
 
         force_mode, base_total, max_total, frac = 0, 0, draft_len + 1, 0.0

@@ -56,6 +56,15 @@ from .spec_tail_kernels import strict_accept
 from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 
+def _watermark_active(spec_metadata) -> bool:
+    """Whether text watermarking is configured and prepared on this metadata.
+
+    Metadata objects that predate the feature have no ``watermark_ready``; they are not
+    watermarked.
+    """
+    return getattr(spec_metadata, "watermark_ready", False)
+
+
 def supports_sharded_target_sampling(spec_config, mapping) -> bool:
     """Whether a one-model MTP-Eagle worker samples its target tokens on
     vocabulary-sharded logits where a batch allows it: TP > 1 without
@@ -2061,8 +2070,13 @@ class SpecWorkerBase(nn.Module, ABC):
 
         self._execute_guided_decoder_if_present(logits)
 
-        target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
-            logits, spec_metadata, num_contexts, batch_size)
+        if _watermark_active(spec_metadata):
+            target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
+                logits, spec_metadata, num_contexts, batch_size)
+        else:
+            watermark_plans = None
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
 
         accepted_tokens = torch.zeros((batch_size, 1),
                                       dtype=torch.int,
@@ -2072,13 +2086,14 @@ class SpecWorkerBase(nn.Module, ABC):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-        self._commit_watermark(spec_metadata,
-                               watermark_plans,
-                               accepted_tokens,
-                               num_accepted_tokens,
-                               num_contexts,
-                               batch_size,
-                               has_drafts=False)
+        if watermark_plans is not None:
+            self._commit_watermark(spec_metadata,
+                                   watermark_plans,
+                                   accepted_tokens,
+                                   num_accepted_tokens,
+                                   num_contexts,
+                                   batch_size,
+                                   has_drafts=False)
 
         next_draft_tokens = torch.zeros((batch_size, 0),
                                         dtype=torch.int,
@@ -2321,8 +2336,13 @@ class SpecWorkerBase(nn.Module, ABC):
             logits = logits.unsqueeze(0)
 
         # Sample tokens using per-request sampling parameters
-        target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
-            logits, spec_metadata, num_contexts, batch_size, draft_tokens)
+        if _watermark_active(spec_metadata):
+            target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
+                logits, spec_metadata, num_contexts, batch_size, draft_tokens)
+        else:
+            watermark_plans = None
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
 
         if spec_metadata is None or not spec_metadata.is_ragged_verify:
             force = self._fused_force_params(runtime_draft_len, spec_metadata,
@@ -2333,13 +2353,14 @@ class SpecWorkerBase(nn.Module, ABC):
                 accepted_tokens, num_accepted_tokens = fused_strict_accept(
                     target_tokens, draft_tokens, num_contexts, batch_size,
                     force)
-                self._commit_watermark(spec_metadata,
-                                       watermark_plans,
-                                       accepted_tokens,
-                                       num_accepted_tokens,
-                                       num_contexts,
-                                       batch_size,
-                                       has_drafts=True)
+                if watermark_plans is not None:
+                    self._commit_watermark(spec_metadata,
+                                           watermark_plans,
+                                           accepted_tokens,
+                                           num_accepted_tokens,
+                                           num_contexts,
+                                           batch_size,
+                                           has_drafts=True)
                 return accepted_tokens, num_accepted_tokens
             # Context requests accept the sampled token only; generation
             # requests count the leading draft tokens equal to the target's.
@@ -2350,13 +2371,14 @@ class SpecWorkerBase(nn.Module, ABC):
                 num_contexts,
                 runtime_draft_len,
                 spec_metadata=spec_metadata)
-            self._commit_watermark(spec_metadata,
-                                   watermark_plans,
-                                   accepted_tokens,
-                                   num_accepted_tokens,
-                                   num_contexts,
-                                   batch_size,
-                                   has_drafts=True)
+            if watermark_plans is not None:
+                self._commit_watermark(spec_metadata,
+                                       watermark_plans,
+                                       accepted_tokens,
+                                       num_accepted_tokens,
+                                       num_contexts,
+                                       batch_size,
+                                       has_drafts=True)
             return accepted_tokens, num_accepted_tokens
 
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
@@ -2765,7 +2787,7 @@ class SpecWorkerBase(nn.Module, ABC):
             vocab = probs.shape[-1]
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
-            if (spec_metadata.watermark_ready
+            if (_watermark_active(spec_metadata)
                     and spec_metadata.watermark.keys_drafts):
                 draft_tokens = self._watermark_draft_step(
                     spec_metadata, batch_size, draft_step, draft_tokens, probs)
@@ -2927,12 +2949,16 @@ class SpecWorkerBase(nn.Module, ABC):
         # === Context subset: sample target's first token directly ===
         context_plan = generation_plan = None
         if num_contexts > 0:
-            ctx_target_tokens, context_plans = (
-                self._sample_tokens_and_watermark_plans(logits[:num_contexts],
-                                                        spec_metadata,
-                                                        num_contexts,
-                                                        num_contexts))
-            context_plan = context_plans[0] if context_plans else None
+            if _watermark_active(spec_metadata):
+                ctx_target_tokens, context_plans = (
+                    self._sample_tokens_and_watermark_plans(
+                        logits[:num_contexts], spec_metadata, num_contexts,
+                        num_contexts))
+                context_plan = context_plans[0] if context_plans else None
+            else:
+                ctx_target_tokens = self._sample_tokens_for_batch(
+                    logits[:num_contexts], spec_metadata, num_contexts,
+                    num_contexts)
             accepted_tokens[:num_contexts, 0] = ctx_target_tokens
 
         # === Generation subset: rejection sampling on the gen slice ===
@@ -3053,7 +3079,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=offset,
             )
 
-            if spec_metadata.watermark_ready:
+            if _watermark_active(spec_metadata):
                 # The kernel decides which drafts are accepted and draws the token that
                 # follows them. Redraw that token under the watermark's second key so the
                 # output distribution stays the target's (see keyed_recovery).
@@ -3092,7 +3118,7 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:] = torch.minimum(
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
-        if spec_metadata.watermark_ready:
+        if _watermark_active(spec_metadata):
             self._commit_watermark(spec_metadata,
                                    (context_plan, generation_plan),
                                    accepted_tokens,
@@ -3675,14 +3701,6 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
-        # A watermarked sample must be committed to the slot's context state by whoever accepts the
-        # tokens, which callers of this method do not do. Reject the configuration here, at the
-        # first forward (warmup or CUDA-graph capture): a per-request check would run once, at
-        # capture, and a later watermarked request would replay the captured unwatermarked sampler.
-        if spec_metadata.watermark_ready:
-            raise NotImplementedError(
-                "this model's speculative sampling path does not support text watermarking: "
-                "remove watermark_config")
         if isinstance(logits, VocabShardedLogits):
             return logits.select_tokens(spec_metadata)
         if not spec_metadata.is_all_greedy_sample:
@@ -3727,6 +3745,21 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return sampled_tokens
 
+    @staticmethod
+    def _reject_watermark(spec_metadata: SpecMetadata) -> None:
+        """Refuse a watermark on a sampling path that cannot commit it.
+
+        A watermarked sample must be committed to the slot's context state by whoever accepts
+        the tokens, which callers of ``_sample_tokens_for_batch`` do not do. Rejecting the
+        configuration at the first forward (warmup or CUDA-graph capture) matters: a
+        per-request check would run once, at capture, and a later watermarked request would
+        replay the captured unwatermarked sampler.
+        """
+        if _watermark_active(spec_metadata):
+            raise NotImplementedError(
+                "this model's speculative sampling path does not support text watermarking: "
+                "remove watermark_config")
+
     def _sample_tokens_and_watermark_plans(
         self,
         logits: torch.Tensor,
@@ -3735,16 +3768,14 @@ class SpecWorkerBase(nn.Module, ABC):
         batch_size: int,
         draft_tokens: Optional[torch.Tensor] = None,
     ):
-        """``_sample_tokens_for_batch`` that also applies the watermark.
+        """``_sample_tokens_for_batch`` for a batch that carries a watermark.
 
-        ``draft_tokens`` ([num_gens, k]) are the drafts verified by the generation rows, whose
+        Callers use it only when ``_watermark_active``; other batches keep calling
+        ``_sample_tokens_for_batch``. ``draft_tokens`` ([num_gens, k]) are the drafts verified by the generation rows, whose
         logits rows follow the ``num_contexts`` context rows; None means one row per request.
         Returns the sampled tokens and, when a watermark is in play, the plans to hand to
         ``_commit_watermark`` once the accepted tokens are known (else None).
         """
-        if not spec_metadata.watermark_ready:
-            return self._sample_tokens_for_batch(logits, spec_metadata,
-                                                 num_contexts, batch_size), None
         watermark_plans = None
         if isinstance(logits, VocabShardedLogits):
             # A sampled, watermarked row needs the whole distribution, not this rank's shard.
