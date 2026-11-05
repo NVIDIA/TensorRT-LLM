@@ -49,8 +49,10 @@ write before it lands and is also used toward a process of the pool that runs an
   ``MC_TCP_PROGRESS_TIMEOUT_SEC`` (``:404-414, 496-526``), while the target may still apply data
   it received into the object's space (``:838-840``). A revoke frees that space at once
   (``mooncake-store/src/master_service.cpp:4776, 4869``), so such a row's session is never revoked
-  by the driver; the master frees a put left unfinished only after
-  ``put_start_release_timeout_sec`` (600 s by default; ``master_service.cpp:4441-4450``).
+  by the driver; the master frees a put left unfinished only ``put_start_release_timeout_sec``
+  after it started (600 s by default; ``mooncake-store/include/types.h:120-121``), whether a later
+  start replaced it (``master_service.cpp:4446-4449``) or its reaper,
+  ``DiscardExpiredProcessingReplicas``, found it (``:9167-9169``).
 - ``batch_get_into`` waits on one transfer future per key, and a future can give up with
   TRANSFER_FAIL (after 60 s, on a status error, after a partly posted RDMA batch;
   ``mooncake-store/src/transfer_task.cpp:746-905, 1239-1258``) while its transfer still runs;
