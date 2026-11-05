@@ -10,7 +10,9 @@ from typing import Any, Mapping
 
 from ..checks.check_config import checkpoint_remote_code
 from ..spec.task_schema import DEFAULT_PERF_CONCURRENCY
+from .harness.bench import AGENTX_DATASET, AGENTX_DURATION_S
 from .measure import BenchPart, BenchSpec
+from .schema import AGENTX_WORKLOAD_KEYS
 from .serving_config import derive_serving_config, write_serving_config
 
 PACKAGE = Path(__file__).resolve().parent.parent
@@ -104,7 +106,13 @@ class TuneSpec:
                 f"ISL {self.isl} / OSL {self.osl}, concurrency {self.concurrency}, CUDA graphs on."
             )
         rows = [
-            f"`{p.name}`: ISL {p.isl} / OSL {p.osl}, concurrency {list(p.concurrencies)}"
+            (
+                f"`{p.name}`: AgentX trace replay of {p.agentx['dataset']} for "
+                f"{p.agentx['duration_s']} s per point (about ISL {p.isl} / OSL {p.osl} per "
+                f"request, prefixes reused across turns), concurrency {list(p.concurrencies)}"
+                if p.client == "agentx"
+                else f"`{p.name}`: ISL {p.isl} / OSL {p.osl}, concurrency {list(p.concurrencies)}"
+            )
             + (f", constraint {dict(p.constraint)}" if p.constraint else "")
             for p in self.parts
         ]
@@ -147,6 +155,16 @@ def _part(task: Mapping[str, Any], workdir: Path, entry: Mapping[str, Any]) -> B
             config["trust_remote_code"] = True
         config.update(entry.get("llm_api_options") or {})
         configs = [write_serving_config(workdir / "configs" / f"serving-{name}.yaml", config)]
+    client = str(workload.get("client", "random"))
+    agentx = {}
+    if client == "agentx":
+        agentx = {k: workload[k] for k in AGENTX_WORKLOAD_KEYS if workload.get(k) is not None}
+        agentx.setdefault("dataset", AGENTX_DATASET)
+        agentx.setdefault("duration_s", AGENTX_DURATION_S)
+        # One corpus and client cache per campaign, shared by every measurement.
+        agentx["hf_home"] = str(
+            Path(agentx.get("hf_home") or workdir / "agentx-cache" / "hf").resolve()
+        )
     return BenchPart(
         name=name,
         isl=isl,
@@ -154,4 +172,6 @@ def _part(task: Mapping[str, Any], workdir: Path, entry: Mapping[str, Any]) -> B
         concurrencies=concurrency,
         configs=configs,
         constraint={k: float(v) for k, v in (entry.get("constraint") or {}).items()},
+        client=client,
+        agentx=agentx,
     )
