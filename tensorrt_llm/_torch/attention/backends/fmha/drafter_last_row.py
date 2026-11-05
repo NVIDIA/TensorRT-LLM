@@ -295,11 +295,15 @@ def mark_drafter_last_row_attention(draft_model: torch.nn.Module) -> int:
     ):
         from .manager import FmhaManager
 
-        backend._fmha_manager = FmhaManager(backend)
-    logger.info(
-        "drafter_ctx_last_row enabled ahead of "
-        f"{[type(lib).__name__ for lib in backend._fmha_manager.fmha_libs[1:]]}"
-    )
+        manager = FmhaManager(backend)
+        backend._fmha_manager = manager
+    if manager is None:
+        logger.info("drafter_ctx_last_row marked for deferred FMHA initialization")
+    else:
+        logger.info(
+            "drafter_ctx_last_row enabled ahead of "
+            f"{[type(lib).__name__ for lib in manager.fmha_libs[1:]]}"
+        )
     return 1
 
 

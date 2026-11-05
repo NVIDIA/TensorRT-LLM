@@ -1904,7 +1904,6 @@ def _ctx_reduce_norm(
         or hidden // 8 > 1024
         or x.dtype != torch.bfloat16
         or not ctx_eager_only()
-        or not hasattr(torch.ops.trtllm, "minimax_m3_ctx_residual_rmsnorm_mxfp8")
     ):
         return None
     reduced = m3_allreduce(x, core.allreduce, AllReduceParams(fusion_op=AllReduceFusionOp.NONE))

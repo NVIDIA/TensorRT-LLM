@@ -49,10 +49,57 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     proxy_segment_rows,
 )
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 context step-input staging",
+)
+def test_segmented_proxy_reads_current_page_table_before_pack_flush(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation must gather this step's pages while unrelated input copies remain packed."""
+    monkeypatch.setattr(msa_backend_module.h2d_cache, "enabled", lambda: True)
+    monkeypatch.setattr(msa_backend_module, "SKIP_UNCHANGED_BLOCK_TABLE", False)
+    monkeypatch.setattr(msa_backend_module, "TAIL_FILL_IN_FORWARD", True)
+    device = torch.device("cuda", torch.cuda.current_device())
+    metadata = _span_metadata(num_contexts=1, qo_lens=(257,), kv_lens=(385,))
+    block_ids = torch.tensor([[19, 7, 13, 2]], dtype=torch.int32)
+    # tokens_per_block is an instance field; the other members come from the production manager interface.
+    manager = Mock(spec_set=[*dir(KVCacheManagerV2), "tokens_per_block"])
+    manager.tokens_per_block = 128
+    manager.get_buffers.return_value = torch.empty(1, device=device)
+    manager.get_block_ids_per_seq.return_value = block_ids
+    metadata.kv_cache_manager = manager
+    metadata.request_ids = [0]
+    metadata._msa_buffers_ready = True
+    metadata._msa_decode_span = None
+    metadata.msa_out_cache_loc = torch.full((257,), -1, dtype=torch.int32, device=device)
+    metadata.msa_kv_indices = torch.full((4,), -1, dtype=torch.int32, device=device)
+    metadata.msa_proxy_kv_indices = torch.full((9,), -1, dtype=torch.int32, device=device)
+    metadata.msa_block_table = torch.zeros((1, 4), dtype=torch.int32, device=device)
+    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32, device=device)
+    metadata.msa_subpage_block_table = None
+    metadata.msa_cu_q_lens = None
+    monkeypatch.setattr(metadata, "_msa_kv_lens_may_change", lambda: False)
+    pack = step_inputs.StepInputPack(device)
+    with step_inputs.active(pack):
+        step_inputs.begin()
+        try:
+            metadata._build_msa_fields()
+            assert step_inputs.is_open(), "the regression must check pages before a pack flush"
+            assert bool((metadata.msa_out_cache_loc == -1).all()), (
+                "unrelated slot copies must remain deferred"
+            )
+            assert metadata.msa_proxy_kv_indices.cpu().tolist() == [19, 7, 19, 7, 13, 19, 7, 13, 2]
+        finally:
+            step_inputs.flush()
+    manager.get_block_ids_per_seq.assert_called_once_with([0])
 
 
 @pytest.mark.cpu_only

@@ -35,6 +35,7 @@ def test_router_cast_fallbacks():
         assert torch.equal(_bits(out), _bits(t.to(torch.float32)))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sm_version,enabled,expected", [(107, True, True), (103, True, False), (107, False, False)]
 )

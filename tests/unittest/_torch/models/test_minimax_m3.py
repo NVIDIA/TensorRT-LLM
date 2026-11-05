@@ -3373,18 +3373,23 @@ def test_ctx_fp4_input_scale_rejects_cutedsl_awq_prescale(has_prescale: bool) ->
 
 
 @pytest.mark.cpu_only
-def test_minimax_m3_gate_tf32_refit_preserves_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("direct_reload", [False, True], ids=["explicit_refresh", "direct_reload"])
+def test_minimax_m3_gate_tf32_refit_preserves_allocation(
+    monkeypatch: pytest.MonkeyPatch, direct_reload: bool
+) -> None:
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
     monkeypatch.setattr(modeling_minimaxm3, "_ROUTER_TC_GEN", False)
     # CPU check uses the real bitwise TF32 conversion; captured replay is tested on Rubin.
     gate = modeling_minimaxm3.MiniMaxM3Gate(64, 8, 2, 1.0)
     gate.load_weights([{"weight": torch.ones(8, 64)}])
+    assert gate._weight_tf32 is None
     gate.cache_tf32_weight()
     captured_weight = gate._weight_tf32
     ptr = captured_weight.data_ptr()
     gate.load_weights([{"weight": torch.full((8, 64), 2.0)}])
-    gate.cache_tf32_weight()
+    if not direct_reload:
+        gate.cache_tf32_weight()
     assert gate._weight_tf32 is captured_weight
     assert gate._weight_tf32.data_ptr() == ptr
     torch.testing.assert_close(captured_weight, torch.full((8, 64), 2.0), rtol=0, atol=0)

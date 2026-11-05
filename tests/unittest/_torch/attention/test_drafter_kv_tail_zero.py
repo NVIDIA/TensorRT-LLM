@@ -8,8 +8,32 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha import drafter_last_row
+from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
 PAGE, HEADS, D = 128, 4, 128
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("initialized", [False, True], ids=["deferred", "initialized"])
+def test_mark_drafter_last_row_preserves_manager_lifecycle(initialized: bool) -> None:
+    """A deferred backend can be marked before its FMHA manager is constructed."""
+    backend = TrtllmAttention.__new__(TrtllmAttention)
+    torch.nn.Module.__init__(backend)
+    manager = None
+    if initialized:
+        manager = FmhaManager.__new__(FmhaManager)
+        library = drafter_last_row.DrafterLastRowContextFmha.__new__(
+            drafter_last_row.DrafterLastRowContextFmha
+        )
+        manager.fmha_libs = [library]
+    backend._fmha_manager = manager
+    draft = torch.nn.Module()
+    draft.attn = backend
+    assert not drafter_last_row.DrafterLastRowContextFmha._is_available(backend)
+    assert drafter_last_row.mark_drafter_last_row_attention(draft) == 1
+    assert drafter_last_row.DrafterLastRowContextFmha._is_available(backend)
+    assert backend._fmha_manager is manager
 
 
 def _pool_and_tables(kv_lens, seed=0):

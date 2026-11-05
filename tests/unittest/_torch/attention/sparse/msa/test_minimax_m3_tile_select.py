@@ -175,9 +175,9 @@ torch.save(out.cpu(), sys.argv[1])
 @sm107
 def test_tile_select_v2_kill_switch_same_tables(tmp_path):
     tables = {}
-    # The v2 launch is the default; TRTLLM_M3_SELECT_TILE_V2=0 opts in to the v4 launch.
+    # The v4 launch is the default; TRTLLM_M3_SELECT_TILE_V2=1 selects the older v2 launch.
     for name, env in (
-        ("v3", {"TRTLLM_M3_SELECT_TILE_V2": "0"}),
+        ("v4", {"TRTLLM_M3_SELECT_TILE_V2": "0"}),
         ("v2", {"TRTLLM_M3_SELECT_TILE_V2": "1"}),
     ):
         path = tmp_path / f"{name}.pt"
@@ -187,7 +187,7 @@ def test_tile_select_v2_kill_switch_same_tables(tmp_path):
             check=True,
         )
         tables[name] = torch.load(path)
-    assert torch.equal(tables["v2"], tables["v3"])
+    assert torch.equal(tables["v2"], tables["v4"])
 
 
 @pytest.mark.parametrize(

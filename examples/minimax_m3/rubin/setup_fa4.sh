@@ -24,7 +24,15 @@ if [[ -e "${fa4_destination}" ]]; then
     echo "Destination already exists: ${fa4_destination}" >&2
     exit 1
 fi
-package_directory="$(python3 -c 'import os, flash_attn; print(os.path.dirname(flash_attn.__file__))')"
+package_directory="$(python3 -c '
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("flash_attn.cute")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("The pinned flash-attn-4 package is required")
+print(Path(next(iter(spec.submodule_search_locations))).parent)
+')"
 target="flash_attn/cute/flash_fwd_sm100.py"
 actual_sha256="$(sha256sum "${package_directory}/cute/flash_fwd_sm100.py" | cut -d ' ' -f 1)"
 if [[ "${actual_sha256}" != "${BASE_SHA256}" ]]; then

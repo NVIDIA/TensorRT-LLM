@@ -240,7 +240,6 @@ def test_gate_tf32_cuda_graph_replay_after_refit(monkeypatch) -> None:
         captured = gate(x)
     before = captured.clone()
     gate.load_weights([{"weight": -weight}])
-    gate.cache_tf32_weight()
     assert gate._weight_tf32.data_ptr() == ptr
     graph.replay()
     torch.testing.assert_close(captured, gate(x), rtol=0, atol=0)
@@ -273,6 +272,7 @@ def test_gate_tf32_vs_loaded_split_weight_and_complete_routing(
 
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
     gate.cache_tf32_weight()
+    assert gate._weight_tf32 is not None
     optimized = gate(x)
     optimized_ids, optimized_weights = gate.routing_method.apply(optimized)
     reference = x.double() @ weight.double().t()

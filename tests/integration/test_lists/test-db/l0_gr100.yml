@@ -14,6 +14,7 @@ l0_gr100:
       backend: pytorch
   tests:
   # MiniMax-M3 context kernels and router validation; all run on one Rubin GPU.
+  - unittest/_torch/attention/sparse/msa/test_msa_backend.py::test_segmented_proxy_reads_current_page_table_before_pack_flush
   - unittest/_torch/kernels/serial/test_m3_ctx_clc_gemm.py
   - unittest/_torch/kernels/serial/test_m3_ctx_fused_quant.py
   - unittest/_torch/kernels/serial/test_m3_qkv_fusion.py
@@ -27,6 +28,12 @@ l0_gr100:
   - unittest/_torch/moe/test_cutedsl_rubin_deterministic.py
   - unittest/_torch/moe/test_cutedsl_swiglu_oai_resolution.py
   - unittest/_torch/moe/test_router_gemm_tf32.py
+  - unittest/_torch/modeling/test_minimax_m3_router_fp32_cast.py
+  - unittest/_torch/modeling/test_minimax_m3_router_tc_gen.py
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_mxfp8_small_m_buckets_map_first_on_sm107
+  - unittest/_torch/kernels/parallel/test_mxfp8_mxfp8_gemm.py::test_mxfp8_native_tactic_cache_sm107_small_m_buckets
+  - unittest/_torch/kernels/parallel/test_mxfp8_mxfp8_gemm.py::test_mxfp8_mxfp8_sm107_tactics_bitwise_equal
+  - unittest/_torch/models/test_minimax_m3.py::test_embedding_gather_matches_f_embedding_for_any_id_layout
   - unittest/_torch/moe/test_unpermute_residual.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   # MiniMax-M3 Rubin target unit tests.

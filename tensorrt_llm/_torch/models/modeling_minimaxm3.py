@@ -1093,7 +1093,7 @@ class MiniMaxM3Gate(nn.Module):
 
     def cache_tf32_weight(self) -> None:
         """Build the TF32-rounded weight copy for the fixed-tile router (after every weight load)."""
-        if _CTX_ROUTER_TF32_FIXED and self._sm107_fp32_cast:
+        if self._weight_tf32 is not None or (_CTX_ROUTER_TF32_FIXED and self._sm107_fp32_cast):
             from ..moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
 
             refreshed = prepare_router_weight_tf32(self.weight.float())
@@ -1189,6 +1189,8 @@ class MiniMaxM3Gate(nn.Module):
             else:
                 # In place, so a CUDA graph that captured the buffer reads the new weight.
                 self.split_weight.copy_(split)
+            if self._weight_tf32 is not None:
+                self.cache_tf32_weight()
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)

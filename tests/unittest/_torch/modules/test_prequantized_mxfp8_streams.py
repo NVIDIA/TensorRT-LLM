@@ -53,7 +53,9 @@ def test_a_take_on_another_stream_keeps_the_pair_alive_until_the_consumer_reads_
 
 def test_a_take_on_the_producing_stream_records_nothing(monkeypatch) -> None:
     recorded = []
-    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, s: recorded.append(s))
+    monkeypatch.setattr(
+        torch.Tensor, "record_stream", lambda self, s: recorded.append((id(self), s))
+    )
     source = torch.empty((1024,), dtype=torch.bfloat16, device="cuda")
     q = torch.zeros((1024,), dtype=torch.uint8, device="cuda")
     sf = torch.zeros((32,), dtype=torch.uint8, device="cuda")
@@ -63,4 +65,5 @@ def test_a_take_on_the_producing_stream_records_nothing(monkeypatch) -> None:
     linear.set_prequantized_mxfp8(source, q, sf, tag="test_streams")
     aux = torch.cuda.Stream()
     assert _take_on(aux, source) is not None
-    assert recorded == [aux, aux]
+    assert sorted(tensor_id for tensor_id, _ in recorded) == sorted((id(q), id(sf)))
+    assert all(stream == aux for _, stream in recorded)

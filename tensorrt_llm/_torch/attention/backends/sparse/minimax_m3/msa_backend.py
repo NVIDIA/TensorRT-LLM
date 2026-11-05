@@ -1359,8 +1359,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         the plain page table already serves the proxy.
 
         The segmented page table is gathered on the device from msa_kv_indices, which the
-        caller has just staged. Segmented steps have context rows, so they are never a replay
-        of a captured decode graph and no step-input pack defers that copy past this gather.
+        caller has just copied on the current stream. The copy must precede this gather even
+        when the caller has an open step-input pack.
         """
         self._msa_proxy_segments = None
         if self.msa_proxy_kv_indices is None or not needs_flat_page_table:
@@ -1487,7 +1487,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_tail_start = None
             _fill_unused_slots(self.msa_out_cache_loc, total_new_tokens)
         if kv_indices is not None:
-            step_inputs.copy_(self.msa_kv_indices[: int(kv_indices.shape[0])], kv_indices)
+            # The segmented proxy gathers this table during preparation, before the step-input pack flushes.
+            self.msa_kv_indices[: int(kv_indices.shape[0])].copy_(kv_indices, non_blocking=True)
         self._stage_proxy_segments(page_size, needs_flat_page_table)
 
         # 2-D page table and per-request length for the decode kernels,
