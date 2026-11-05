@@ -395,14 +395,19 @@ def test_todo_profile_fields_are_unknown():
     assert profile.get_path("timeouts.first_event_s") == 30
 
 
-@pytest.mark.parametrize("text, cls", [
-    ("Permission to use Bash has been denied.", "aborted"),
-    ("<tool_use_error>Error: No such tool available: Foo</tool_use_error>", "unsupported"),
-    ("<tool_use_error>InputValidationError: Read failed</tool_use_error>", "arguments_rejected"),
+@pytest.mark.parametrize("harness, text, cls", [
+    ("claude-code", "Permission to use Bash has been denied.", "aborted"),
+    ("claude-code", "<tool_use_error>Error: No such tool available: Foo</tool_use_error>",
+     "unsupported"),
+    ("claude-code", "<tool_use_error>InputValidationError: Read failed</tool_use_error>",
+     "arguments_rejected"),
+    ("pi-messages", "Operation aborted", "aborted"),
+    ("pi-messages", "Tool foo not found", "unsupported"),
+    ("pi-messages", 'Validation failed for tool "read":', "arguments_rejected"),
 ])  # fmt: skip
-def test_claude_code_error_wordings_count_only_on_an_error_result(text, cls):
-    """A Claude Code outcome wording in a result without is_error: true is the tool's output."""
-    path = os.path.join(os.path.dirname(VALIDATE), "..", "profiles", "harness", "claude-code.yaml")
+def test_messages_error_wordings_count_only_on_an_error_result(harness, text, cls):
+    """Over Messages an outcome wording in a result without is_error: true is the tool's output."""
+    path = os.path.join(os.path.dirname(VALIDATE), "..", "profiles", "harness", f"{harness}.yaml")
     rules = profiles.outcome_rules(profiles.load_profile(path))
     assert rules.classify(text, True) == cls
     assert rules.classify(text, False) == rules.classify(text, None) == "result"

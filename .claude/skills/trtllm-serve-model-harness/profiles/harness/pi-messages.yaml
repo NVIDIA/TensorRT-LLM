@@ -46,16 +46,19 @@ tools:
 parallel_tool_calls: not sent      # measured
 
 outcomes:                   # tool_result blocks by tool_use_id; measured (the same strings
-                            # over all three APIs): every error carries is_error: true, so order matters
+                            # over all three APIs): every error carries is_error: true, so order matters,
+                            # and a result without it is the tool's output, whatever its text
   aborted:                  # a call pi did not run. Measured: a reply with calls that stopped at
                             # stop_reason "max_tokens" (pi-agent-core agent-loop.js:359). From source: a
                             # run aborted mid-call (:444, :509, :528; not reachable with -p) and a
                             # beforeToolCall hook's block (:514, extensions only)
     regex: '^Tool call "[^"]+" was not executed: |Command aborted$'   # bash's own abort, tools/bash.js:271
     prefix: ["Operation aborted", "Tool execution was blocked"]
-  unsupported: {regex: '^Tool \S+ not found$'}   # agent-loop.js:492, a call to an undeclared tool
+    is_error: true
+  unsupported: {regex: '^Tool \S+ not found$', is_error: true}   # agent-loop.js:492, an undeclared tool
   arguments_rejected:       # pi-ai utils/validation.js:309 (schema) and :282 (arguments not a JSON object)
     prefix: ['Validation failed for tool "', 'Invalid arguments for tool "']
+    is_error: true
   tool_error: {is_error: true}   # the tool ran and failed, e.g. Node's ENOENT or bash's
                                  # "Command exited with code N" (tools/bash.js:297)
 
