@@ -87,6 +87,22 @@ def uses_nvfp4_mla_record_cache(attn: "TrtllmAttention") -> bool:
     return get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT
 
 
+def prims_ts_reads_nvfp4_mla_records() -> bool:
+    """Whether DSA generation over NVFP4 records runs on :class:`PrimsTSDsaSparseMlaFmha` here.
+
+    The process-wide half of its availability check: the library is enabled, and the GPU and the
+    CuTe DSL toolchain can run it. Every layer the record layout admits (DSA with a 512 + 64
+    latent) passes the per-layer half, so DSA metadata can skip the gather's FP8 rows.
+    """
+    from .registry import get_enabled_fmha_lib_classes
+
+    if PrimsTSDsaSparseMlaFmha not in get_enabled_fmha_lib_classes():
+        return False
+    if get_sm_version() not in (100, 103):
+        return False
+    return get_prims_ts_toolchain_unsupported_reason() is None
+
+
 class PrimsTSDsaSparseMlaFmha(Fmha):
     """DSA generation-phase sparse MLA on PrimTS, reading NVFP4 KV records in place."""
 
@@ -433,4 +449,8 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
         )
 
 
-__all__ = ["PrimsTSDsaSparseMlaFmha", "uses_nvfp4_mla_record_cache"]
+__all__ = [
+    "PrimsTSDsaSparseMlaFmha",
+    "prims_ts_reads_nvfp4_mla_records",
+    "uses_nvfp4_mla_record_cache",
+]

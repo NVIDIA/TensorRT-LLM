@@ -332,7 +332,9 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
     auto& kv_scale_cache_buffer = kv_cache_buffers.kvScaleCacheBuffer;
     if (kv_cache_quant_mode.hasFp4KvCache())
     {
-        TLLM_CHECK_WITH_INFO(kv_scale_cache_buffer.data != nullptr, "NVFP4 MLA cache requires a block-scale pool.");
+        // The inline-scale record keeps its block scales in the data pool.
+        TLLM_CHECK_WITH_INFO(residual_dim == 2 * rope_size || kv_scale_cache_buffer.data != nullptr,
+            "NVFP4 MLA cache requires a block-scale pool.");
     }
     tk::KvCacheDataType cache_type = tk::cacheTypeFromQuantMode(kv_cache_quant_mode);
 

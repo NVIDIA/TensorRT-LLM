@@ -42,7 +42,8 @@ def get_nvfp4_mla_kv_cache_layout() -> str:
     scales in the scale pool, all under one global scale. ``fp8rope`` stores the 352-byte record
     that FlashInfer PrimTS's D576 sparse MLA reads as ``kv_cache_format="nvfp4.fp8rope"``: 256 B of
     E2M1 NoPE, 64 B of E4M3 RoPE and the 32 NoPE block scales (block ``b`` at byte
-    ``320 + 8 * (b % 4) + b // 4``), with real-valued block scales and no global scale.
+    ``320 + 8 * (b % 4) + b // 4``), with real-valued block scales, no global scale and no
+    scale pool.
     """
     layout = os.environ.get(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_RESIDUAL_LAYOUT)
     if layout not in (NVFP4_MLA_RESIDUAL_LAYOUT, NVFP4_MLA_RECORD_LAYOUT):
@@ -594,6 +595,18 @@ class DSACacheManagerV2(KVCacheManagerV2):
         """Return the formal V2 page scale and layer offset for sparse MLA."""
         return self._primary_pool_page_index_params[local_layer_idx]
 
+    def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> List[DataRole]:
+        roles = super()._get_buffer_roles_for_layer(local_layer_idx)
+        if self.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT:
+            # Records keep their block scales inline, so there is no scale pool.
+            return [role for role in roles if role != Role.KEY_BLOCK_SCALE]
+        return roles
+
+    def _get_block_scale_role(self, role_a: DataRole, layer_id: int) -> Optional[DataRole]:
+        if self.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT:
+            return None
+        return super()._get_block_scale_role(role_a, layer_id)
+
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {
             local_layer_idx: [
@@ -723,7 +736,15 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 self.index_head_dim, self.quant_block_size, self.use_fp4
             )
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        if self.dtype == DataType.NVFP4 and self.mla_kv_cache_residual_dim > 0:
+        if self.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT:
+            if data_role in (Role.KEY, Role.ALL):
+                cache_bytes = (
+                    super().get_layer_bytes_per_token(local_layer_idx, Role.KEY)
+                    + self.mla_kv_cache_residual_dim // 2
+                )
+            elif data_role == Role.KEY_BLOCK_SCALE:
+                cache_bytes = 0
+        elif self.dtype == DataType.NVFP4 and self.mla_kv_cache_residual_dim > 0:
             if data_role == Role.KEY:
                 cache_bytes += self.mla_kv_cache_residual_dim // 2
             elif data_role == Role.KEY_BLOCK_SCALE:
@@ -763,7 +784,14 @@ class DSACacheManagerV2(KVCacheManagerV2):
             num_attention_layers = KVCacheManager._resolve_num_attention_layers(
                 model_config, mapping, num_layers
             )
-            cache_bytes += num_attention_layers * (residual_dim // 2 + math.ceil(residual_dim / 16))
+            if get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
+                # The record carries its block scales inline instead of in a scale pool.
+                head_dim = config.kv_lora_rank + config.qk_rope_head_dim
+                cache_bytes += num_attention_layers * (residual_dim // 2 - math.ceil(head_dim / 16))
+            else:
+                cache_bytes += num_attention_layers * (
+                    residual_dim // 2 + math.ceil(residual_dim / 16)
+                )
         return cache_bytes
 
     def shutdown(self) -> None:
