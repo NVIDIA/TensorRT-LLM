@@ -15,7 +15,10 @@ What is checked, without model files or captured data:
   token's absolute position, and changes no other written slot;
 * prefix reuse through the manager: a matching prefix is claimed page by page and only the
   rest of the prompt is computed, a different first token misses, and two live requests
-  sharing a prefix never write each other's slots;
+  sharing a prefix never write each other's slots; with stable expert selection, reused
+  and freshly computed prefixes produce matching final logits within BF16 rounding bounds;
+* exhausted compute-only requests run no further attention, and a failed prefill or decode
+  cannot be retried but can still be released;
 * the sampler's greedy choice on identical logits (lowest index among exact maxima);
 * the sliding window at the cache level: at query position 512 the sliding layer excludes
   key 0 exactly and the full layer keeps it;
@@ -284,6 +287,38 @@ def test_handles_are_owned_and_bounded() -> None:
         other.release(foreign)
 
 
+@pytest.mark.parametrize("step", ["prefill", "decode"])
+def test_failed_step_cannot_be_retried(monkeypatch: pytest.MonkeyPatch, step: str) -> None:
+    model = loaded()
+    with BeamSmallModelGenerator(model) as gen:
+        state = gen.create_request([1, 2, 3], max_new_tokens=2, sample=False)
+        if step == "decode":
+            gen.prefill(state)
+        error = RuntimeError("injected forward failure")
+        calls = 0
+
+        def fail_forward(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise error
+
+        monkeypatch.setattr(gen, "_forward", fail_forward)
+        with pytest.raises(RuntimeError, match="injected forward failure") as caught:
+            if step == "prefill":
+                gen.prefill(state)
+            else:
+                gen.decode(state, 7)
+        assert caught.value is error and state.lifecycle is Lifecycle.FAILED
+        with pytest.raises(ValueError, match="failed"):
+            gen.prefill(state)
+        with pytest.raises(ValueError, match="failed"):
+            gen.decode(state, 7)
+        assert calls == 1
+        gen.release(state)
+        assert state.lifecycle is Lifecycle.RELEASED and gen.live_requests == ()
+        assert state.request_id not in gen.manager.kv_cache_map
+
+
 # ------------------------------------------------------------------ cache contents
 
 
@@ -314,6 +349,14 @@ def test_decode_appends_exactly_its_own_keys_and_values() -> None:
                 record["positions"] == [position, position] and record["input"] == "teacher_forced"
             )
             assert record["capacity"] >= position + 1 and record["history"] == position + 1
+        before = written_bytes(gen.manager, state.request_id, state.consumed)
+        with counting_attention_calls() as calls:
+            with pytest.raises(ValueError, match="budget.*spent"):
+                gen.decode(state, tokens[-1])
+        assert calls == []
+        assert state.explicit_tokens == len(tokens) and state.consumed == len(prompt) + len(tokens)
+        assert gen.manager.kv_cache_map[state.request_id].history_length == state.consumed
+        assert torch.equal(written_bytes(gen.manager, state.request_id, state.consumed), before)
         gen.release(state)
 
 
@@ -351,6 +394,52 @@ def test_prefix_reuse_claims_whole_pages_and_computes_the_rest() -> None:
         assert control.reused == 0 and control.computed_prompt_tokens == 81
         assert torch.equal(written_bytes(gen.manager, control.request_id, 64)[: 4 * 64], dense)
         gen.release(control)
+
+
+def test_prefix_reuse_logits_match_fresh_prefill_with_stable_routing() -> None:
+    """Compare actual cached and fresh forwards without near-tie expert-selection changes."""
+    model = loaded()
+    biases = [
+        tensor
+        for name, tensor in model.checkpoint_tensors().items()
+        if name.endswith("e_score_correction_bias")
+    ]
+    assert len(biases) == 3
+    originals = [bias.clone() for bias in biases]
+    common = token_stream("reuse_common", 64)
+    prompt = common + token_stream("reuse_suffix_b", 17)
+    try:
+        # Sigmoid scores lie in [0, 1]. Spacing the selection-only bias by 2 fixes
+        # expert ordering across both paths while leaving mixing weights unbiased.
+        with torch.no_grad():
+            for bias in biases:
+                bias.copy_(2 * torch.arange(bias.numel(), device=bias.device, dtype=bias.dtype))
+        with BeamSmallModelGenerator(model) as gen:
+            source = gen.create_request(
+                common + token_stream("reuse_suffix_a", 17), max_new_tokens=1, sample=False
+            )
+            gen.prefill(source)
+            gen.release(source)
+            reused = gen.create_request(prompt, max_new_tokens=1, sample=False)
+            reused_logits = gen.prefill(reused).logits
+            assert reused.reused == 64 and reused.computed_prompt_tokens == 17
+            assert reused.consumed == len(prompt)
+            gen.release(reused)
+            fresh = gen.create_request(prompt, max_new_tokens=1, sample=False, reuse=False)
+            fresh_logits = gen.prefill(fresh).logits
+            assert fresh.reused == 0 and fresh.computed_prompt_tokens == len(prompt)
+            assert fresh.consumed == len(prompt)
+            # Fixed-route, six-layer BF16 comparison; paged and fresh attention can
+            # differ in rounding, so bitwise equality is not the numerical contract.
+            torch.testing.assert_close(
+                reused_logits.double(), fresh_logits.double(), atol=0.3, rtol=2**-7
+            )
+            gen.release(fresh)
+    finally:
+        # Restore only after all caches bound to the controlled weights have closed.
+        with torch.no_grad():
+            for bias, original in zip(biases, originals):
+                bias.copy_(original)
 
 
 def test_two_live_requests_stay_isolated() -> None:
@@ -423,11 +512,17 @@ def test_weights_cannot_change_under_an_open_cache() -> None:
         gen.prefill(state)
         assert state.reused == 64
         gen.decode(live, 7)
+        gen.release(state)
+        state = gen.create_request(prompt, max_new_tokens=1, sample=False)
         with torch.no_grad():
             original.mul_(1.0)
-        with counting_attention_calls() as calls, pytest.raises(ValueError, match="changed"):
-            gen.decode(live, 7)
+        with counting_attention_calls() as calls:
+            with pytest.raises(ValueError, match="changed"):
+                gen.prefill(state)
+            with pytest.raises(ValueError, match="changed"):
+                gen.decode(live, 7)
         assert calls == []
+        assert state.lifecycle is Lifecycle.NEW and state.request_id not in gen.manager.kv_cache_map
     model.load_weights(tensors)
     with BeamSmallModelGenerator(model) as gen:
         state = gen.create_request(prompt, max_new_tokens=1, sample=False)
