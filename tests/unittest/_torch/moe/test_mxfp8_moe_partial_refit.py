@@ -43,7 +43,10 @@ from _torch.moe.moe_test_utils import finalize_moe_refit, refit_moe_in_buckets
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
@@ -81,12 +84,16 @@ BACKENDS = ["CUTLASS", "CUTEDSL"]
 def _skip_if_backend_unavailable(backend: str) -> None:
     if backend == "CUTLASS" and get_sm_version() not in (100, 103, 107):
         pytest.skip("CUTLASS MXFP8 MoE is limited to SM100/SM103/SM107 by can_implement")
-    if backend == "CUTEDSL" and not (
-        get_sm_version() == 107 and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE
-    ):
+    if backend != "CUTEDSL":
+        return
+    sm = get_sm_version()
+    fused_fc12_ok = (sm == 107 and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE) or (
+        sm in (100, 103) and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE
+    )
+    if not fused_fc12_ok:
         pytest.skip(
-            "CUTEDSL MXFP8 MoE requires Rubin (SM107) with a CuTe DSL "
-            "build that supports the fused FC12 kernel"
+            "CUTEDSL MXFP8 MoE requires Rubin (SM107) or Blackwell (SM100/SM103) "
+            "with a CuTe DSL build that supports the fused FC12 kernel"
         )
 
 

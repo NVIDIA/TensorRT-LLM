@@ -250,7 +250,7 @@ Every implementation a tactic can pin, generated from the implementation registr
 | `trtllm.cutedsl.grouped_gemm.nvfp4` | `cutedsl.grouped_gemm.nvfp4` | `CUTEDSL` | 5 | CuTe DSL NVFP4 grouped GEMM: gather + FC1 + fused activation, then FC2 + finalize; SM100/SM103/SM107. |
 | `trtllm.cutedsl.grouped_gemm.nvfp4_plus` | `nvfp4_plus` | `CUTEDSL` | 6 | CuTe DSL NVFP4_PLUS (E2M1 with UE5M3 scales per 32 values) grouped GEMM: gather + FC1 + fused SwiGLU, then FC2 + finalize; SM107. |
 | `trtllm.cutedsl.grouped_gemm.none` | `cutedsl.none` | `CUTEDSL` | 7 | CuTe DSL BF16 grouped GEMM on Rubin (SM107): gather + FC1 + fused SwiGLU, then FC2 + fused finalize. |
-| `trtllm.cutedsl.fused_fc12.mxfp8` | `cutedsl.mxfp8` | `CUTEDSL` | 9 | Rubin (SM107) MXFP8 fused FC1 + SwiGLU + FC2 + finalize persistent CuTe DSL grouped GEMM. |
+| `trtllm.cutedsl.fused_fc12.mxfp8` | `cutedsl.mxfp8` | `CUTEDSL` | 9 | Rubin (SM107) / Blackwell (SM100/SM103) MXFP8 fused FC1 + SwiGLU + FC2 + finalize persistent CuTe DSL grouped GEMM. |
 | `trtllm.cutedsl.fused_fc12.nvfp4` | `fused_fc12.nvfp4` | `CUTEDSL_FC12` | 8 | Rubin (SM107) NVFP4 fused FC1 + SwiGLU/SiTU + FC2 + finalize persistent CuTe DSL grouped GEMM. |
 | `deepgemm.cuda.grouped_gemm.fp8_block_scales` | `deepgemm.grouped_gemm` | `DEEPGEMM` | 17 | DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107. |
 | `trtllm.cutedsl.dense_gemm.nvfp4` | `dense_gemm` | `DENSEGEMM` | 18 | CuTe DSL dense GEMM with fused SwiGLU over NVFP4, SM100/SM103 min-latency. |
