@@ -80,7 +80,6 @@ add_library(
   cudaArchitectures.cpp
   cudaFp8Utils.cu
   cudaProfilerUtils.cpp
-  mcastDevMemUtils.cpp
   ncclUtils.cpp
   opUtils.cpp
   safetensors.cpp

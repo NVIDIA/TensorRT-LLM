@@ -33,6 +33,9 @@ from tensorrt_llm._torch.distributed.ops import (
     MNNVLAllReduce, get_or_scale_allreduce_mnnvl_workspace)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     discard_nccl_window_tensor_outputs
+from tensorrt_llm.bindings.internal.runtime import (McastGPUBuffer,
+                                                    MnnvlTransport,
+                                                    MnnvlWorkspace)
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -384,8 +387,18 @@ def mnnvl_growth_graph_forward(tensor_parallel_size: int,
                                        torch.full_like(output, expected))
 
             before = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]
-            # Two-shot footprint 2 * 4096 * 7168 * 2 B: well past the initial 16 MiB per Lamport buffer.
-            big = torch.ones((4096, 7168), dtype=torch.bfloat16, device="cuda")
+
+            def oversized_input(workspace):
+                # Exceed the usable capacity, including any allocation-granularity slack.
+                bytes_per_token = 2 * input_.shape[-1] * input_.element_size()
+                num_tokens = (
+                    workspace["buffer_size_bytes"] // bytes_per_token +
+                    tensor_parallel_size)
+                return torch.ones((num_tokens, input_.shape[-1]),
+                                  dtype=input_.dtype,
+                                  device=input_.device)
+
+            big = oversized_input(before)
             torch.testing.assert_close(
                 allreduce(big), torch.full_like(big, tensor_parallel_size))
             after = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]
@@ -405,9 +418,7 @@ def mnnvl_growth_graph_forward(tensor_parallel_size: int,
                         output, expected + tensor_parallel_size * (1 + step)))
 
             # No capture used `after`: growing past it keeps only `before`, which the graph still launches on.
-            wider = torch.ones((6144, 7168),
-                               dtype=torch.bfloat16,
-                               device="cuda")
+            wider = oversized_input(after)
             torch.testing.assert_close(
                 allreduce(wider), torch.full_like(wider, tensor_parallel_size))
             assert MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping][
@@ -421,7 +432,8 @@ def mnnvl_growth_graph_forward(tensor_parallel_size: int,
             torch.testing.assert_close(output,
                                        torch.full_like(output, expected))
 
-            huge = torch.ones((8192, 7168), dtype=torch.bfloat16, device="cuda")
+            huge = oversized_input(
+                MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping])
             with pytest.raises(RuntimeError, match="during CUDA graph capture"):
                 with torch.cuda.graph(torch.cuda.CUDAGraph()):
                     allreduce(huge)
@@ -487,6 +499,136 @@ def mnnvl_checkpoint_rejects_wrong_membership(world_size: int,
                 os.environ[name] = value
             else:
                 os.environ.pop(name, None)
+
+
+def mnnvl_rejects_shifted_workspace(
+        tensor_parallel_size: int,
+        tensor_parallel_rank: int,
+        use_qualified_workspace: bool = False) -> bool:
+    from tensorrt_llm._torch._experimental.modeling_v2._native import \
+        load_family_ops
+
+    kimi_ops = load_family_ops(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+    rank = tensorrt_llm.mpi_rank()
+    assert rank == tensor_parallel_rank
+    torch.cuda.set_device(rank)
+    if use_qualified_workspace:
+        buffer = MnnvlWorkspace(256, MnnvlTransport.FABRIC, rank,
+                                MPI.COMM_WORLD.py2f())
+        assert buffer.is_available, buffer.reason
+    else:
+        buffer = McastGPUBuffer(256, tensor_parallel_size, rank, rank, True,
+                                MPI.COMM_WORLD.py2f())
+    base = buffer.get_uc_buffer(rank, (64, ), torch.float32, 0)
+    multicast = buffer.get_mc_buffer((64, ), torch.float32, 0)
+    assert multicast.shape == base.shape
+    assert multicast.dtype == base.dtype
+    if use_qualified_workspace:
+        assert buffer.get_local_buffer().data_ptr() == base.data_ptr()
+    for peer in range(tensor_parallel_size):
+        assert buffer.get_uc_buffer(peer, (1, ), torch.float32, 0).numel() == 1
+    sliced = base[4:]
+    shifted_storage = buffer.get_uc_buffer(rank, (60, ), torch.float32, 4)
+    assert sliced.storage_offset() == 4
+    assert shifted_storage.storage_offset() == 0
+    assert sliced.data_ptr() == base.data_ptr() + 16
+    assert shifted_storage.data_ptr() == sliced.data_ptr()
+
+    # Invalid input dimensions prevent a kernel launch even if workspace validation is missing.
+    input_tensor = torch.zeros((8, ), dtype=torch.bfloat16, device="cuda")
+    norm_weight = torch.ones_like(input_tensor)
+    flags = torch.zeros((9, ), dtype=torch.uint32, device="cuda")
+
+    def invoke(workspace: torch.Tensor) -> None:
+        torch.ops.trtllm.mnnvl_fusion_allreduce(input_tensor, norm_weight, None,
+                                                1e-5, workspace, flags, True,
+                                                None,
+                                                int(AllReduceFusionOp.RMS_NORM))
+
+    def invoke_allgather(workspace: torch.Tensor) -> None:
+        torch.ops.trtllm.glm_mnnvl_allgather(input_tensor.float(), workspace,
+                                             flags, tensor_parallel_size)
+
+    def invoke_hist_topk(workspace: torch.Tensor) -> None:
+        torch.ops.trtllm.glm_dsa_hist_topk(input_tensor, flags, flags,
+                                           workspace, flags, 1,
+                                           tensor_parallel_size)
+
+    def invoke_hop(workspace: torch.Tensor) -> None:
+        rows = input_tensor.view(1, 8)
+        torch.ops.trtllm.glm_mnnvl_hop(rows, rows, norm_weight, 1e-5, workspace,
+                                       flags, False)
+
+    def invoke_draft(workspace: torch.Tensor) -> None:
+        torch.ops.trtllm.glm_draft_sample_glue(logits=input_tensor,
+                                               exchange_buffer=workspace,
+                                               exchange_flags=flags,
+                                               group_size=tensor_parallel_size,
+                                               draft_tokens=flags,
+                                               draft_step=0,
+                                               embed_table=None,
+                                               hidden=None,
+                                               enorm_weight=None,
+                                               hnorm_weight=None,
+                                               eps=1e-5,
+                                               col_lo=0,
+                                               col_hi=0,
+                                               glue_out=None,
+                                               positions_in=None,
+                                               positions_out=None,
+                                               gather_ids=None,
+                                               seq_lens=None,
+                                               fill_seq_lens=False,
+                                               kv_lens=None,
+                                               kv_update=0,
+                                               rewind_accepted=None,
+                                               draft_len=0,
+                                               block_offsets=None,
+                                               dsa_layout=[],
+                                               req_idx_per_token=None,
+                                               slot_mapping_fp8=None,
+                                               slot_mapping_scale=None,
+                                               gen_kv_indptr=None,
+                                               gen_cached_token_indptr=None,
+                                               accepted_tokens=None,
+                                               batch_indices=None,
+                                               num_accepted=None,
+                                               next_new_tokens=None)
+
+    def invoke_kimi_fusion(workspace: torch.Tensor) -> None:
+        kimi_ops.k3_mnnvl_fusion_allreduce(input_tensor, norm_weight, None,
+                                           1e-5, workspace, flags, True, None,
+                                           int(AllReduceFusionOp.RMS_NORM))
+
+    def invoke_kimi_attn_res(workspace: torch.Tensor) -> None:
+        kimi_ops.mnnvl_allreduce_attn_res(input_tensor, None, input_tensor,
+                                          norm_weight, norm_weight, norm_weight,
+                                          1e-5, 1e-5, workspace, flags)
+
+    def invoke_kimi_allgather_split(workspace: torch.Tensor) -> None:
+        kimi_ops.mnnvl_allgather_split(input_tensor, 0, tensor_parallel_size,
+                                       workspace, flags)
+
+    # Each valid base reaches an independent argument check before any kernel launch.
+    for call, argument_error in (
+        (invoke, "input must have at least 2 dimensions"),
+        (invoke_allgather, "input must be BF16"),
+        (invoke_hist_topk, "logits must be a row-major FP32 matrix"),
+        (invoke_hop, "comm_buffer must be the"),
+        (invoke_draft, r"logits must be \[rows, vocab_shard\]"),
+        (invoke_kimi_fusion, "input must have at least 2 dimensions"),
+        (invoke_kimi_attn_res, r"input must be \[num_tokens, hidden\]"),
+        (invoke_kimi_allgather_split, "input must be a contiguous"),
+    ):
+        for workspace in (base, base.view(8, 8)):
+            with pytest.raises(RuntimeError, match=argument_error):
+                call(workspace)
+        for workspace in (sliced, shifted_storage):
+            with pytest.raises(RuntimeError,
+                               match="local unicast allocation base"):
+                call(workspace)
+    return True
 
 
 @torch.inference_mode()
@@ -877,6 +1019,26 @@ def test_mnnvl_workspace_growth_keeps_captured_graphs(
         mnnvl_growth_graph_forward,
         [tensor_parallel_size] * tensor_parallel_size,
         range(tensor_parallel_size),
+    )
+    assert all(results)
+
+
+@pytest.mark.skipif(
+    platform.machine().lower() != "aarch64" or torch.cuda.device_count() < 2
+    or not MnnvlMemory.supports_mnnvl(),
+    reason="requires at least two GB200 GPUs with fabric-backed MNNVL",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("use_qualified_workspace", [False, True],
+                         ids=["raw-buffer", "qualified-workspace"])
+def test_mnnvl_rejects_shifted_workspace(mpi_pool_executor,
+                                         use_qualified_workspace) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        mnnvl_rejects_shifted_workspace,
+        [tensor_parallel_size] * tensor_parallel_size,
+        range(tensor_parallel_size),
+        [use_qualified_workspace] * tensor_parallel_size,
     )
     assert all(results)
 

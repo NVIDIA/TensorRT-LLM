@@ -15,7 +15,6 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/mcastGroupComm.h"
 #include <cstddef>
@@ -27,6 +26,12 @@
 
 namespace tensorrt_llm::runtime
 {
+
+class McastDeviceMemory;
+using DeviceMemoryOwner = std::shared_ptr<McastDeviceMemory>;
+
+//! Delete the shared allocation owner retained by a multicast tensor storage.
+void deleteMcastDevMemOwner(void* context);
 
 //! \brief A class that manages multicast device memory for efficient communication between GPUs.
 //!
@@ -76,20 +81,16 @@ public:
         return mUcPtrsDev;
     }
 
-    //! Get the raw unicast pointer to a given rank
-    void* getUnicastPtr(uint32_t rank)
-    {
-        auto* data_ptr = reinterpret_cast<void*>(mUcPtrs[rank]);
-        tensorrt_llm::common::registerMcastDevMemBuffer(data_ptr, this);
-        return data_ptr;
-    }
+    //! Get the raw unicast pointer to a given rank.
+    [[nodiscard]] void* getUnicastPtr(uint32_t rank) const;
 
-    //! Get the raw multicast pointer
-    void* getMulticastPtr()
+    //! Get the raw multicast pointer.
+    [[nodiscard]] void* getMulticastPtr() const;
+
+    //! Get the usable logical buffer size, excluding the synchronization pad.
+    [[nodiscard]] size_t getBufferSize() const
     {
-        auto* data_ptr = reinterpret_cast<void*>(mMcPtr);
-        tensorrt_llm::common::registerMcastDevMemBuffer(data_ptr, this);
-        return data_ptr;
+        return mBufSize;
     }
 
     [[nodiscard]] size_t getRank() const
