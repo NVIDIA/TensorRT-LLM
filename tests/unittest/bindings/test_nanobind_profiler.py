@@ -46,7 +46,7 @@ class TensorSubclass(torch.Tensor):
     pass
 
 tensor = torch.arange(6, dtype=torch.int32).reshape(2, 3)
-if os.environ['PR6_SUBCLASS'] == '1':
+if os.environ['NB_PROFILER_TEST_SUBCLASS'] == '1':
     tensor = tensor.as_subclass(TensorSubclass)
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / 'execution.json'
@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory() as directory:
             execution_trace_observer=observer,
         ) as prof:
             assert bindings.QuantMode.none().value == 0
-            if os.environ['PR6_KEYWORD'] == '1':
+            if os.environ['NB_PROFILER_TEST_KEYWORD'] == '1':
                 config = bindings.executor.LoraConfig(task_id=1, config=tensor)
             else:
                 config = bindings.executor.LoraConfig(1, None, tensor)
@@ -122,8 +122,8 @@ def test_nanobind_results_errors_and_selection(
         environment.pop("TLLM_PROFILE_CUSTOM_REGIONS", None)
     else:
         environment["TLLM_PROFILE_CUSTOM_REGIONS"] = selector
-    environment["PR6_KEYWORD"] = str(int(keyword))
-    environment["PR6_SUBCLASS"] = str(int(subclass))
+    environment["NB_PROFILER_TEST_KEYWORD"] = str(int(keyword))
+    environment["NB_PROFILER_TEST_SUBCLASS"] = str(int(subclass))
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(Path(__file__).resolve().parents[1]), environment.get("PYTHONPATH", "")]
     )
@@ -169,9 +169,6 @@ def test_nanobind_property_stubs_are_valid_python() -> None:
 def test_explicit_omitted_region_warns_once(selector: str, option: str) -> None:
     """An explicit unavailable native probe explains an otherwise empty trace."""
     script = f"""
-import warnings
-
-warnings.filterwarnings('error', message=r'.*{option}=OFF')
 import tensorrt_llm.bindings as bindings
 import tensorrt_llm.bindings
 print('capability=' + str(int(getattr(bindings.BuildInfo, '{option}'))))
