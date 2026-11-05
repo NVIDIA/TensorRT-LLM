@@ -2,7 +2,6 @@ import copy
 import math
 import os
 from functools import partial
-from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -13,7 +12,9 @@ from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
 from transformers.models.auto import CONFIG_MAPPING
 
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalParams)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -25,6 +26,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_siglip import SiglipVisionModel
@@ -238,48 +240,33 @@ def adaptive_anyres_postprocessing(
 
 
 def compute_adaptive_params(
-    pixel_values: Optional[List[List[torch.FloatTensor]]] = None,
-    num_queries_vis_abstractors: Optional[List[List[int]]] = None,
-    num_queries_vis_abstractors_slow: Optional[List[List[int]]] = None,
-    image_sizes: Optional[List[List[List[int]]]] = None,
-    is_videos: Optional[List[bool]] = None,
-    first_last_frames_slows: Optional[List[bool]] = None,
+    num_grids: List[int],
+    num_queries_vis_abstractors: List[int],
+    num_queries_vis_abstractors_slow: List[int],
+    image_sizes: List[List[int]],
+    is_videos: List[bool],
+    first_last_frames_slows: List[bool],
+    is_first_images: List[bool],
+    is_last_images: List[bool],
 ) -> Tuple[List[int], List[int], List[List[int]], List[bool], List[List[int]]]:
+    """Plan the abstractor queries of a batch of images.
+
+    Every argument has one entry per image. `num_grids` counts the crops of
+    each image; `is_first_images` and `is_last_images` mark the first and the
+    last image of its request.
+    """
     assert all(
-        all(isinstance(value, int) and value >= 0 for value in sublist)
-        for sublist in num_queries_vis_abstractors
+        isinstance(value, int) and value >= 0
+        for value in num_queries_vis_abstractors
     ), "All values in num_queries_vis_abstractors must be integers >= 0."
 
     assert all(
-        all(isinstance(value, int) and value >= 0 for value in sublist)
-        for sublist in num_queries_vis_abstractors_slow
+        isinstance(value, int) and value >= 0
+        for value in num_queries_vis_abstractors_slow
     ), "All values in num_queries_vis_abstractors_slow must be integers >= 0."
-
-    assert is_videos is not None
-
-    is_first_images = []
-    is_last_images = []
-    for is_video in is_videos:
-        for idx, is_video_item in enumerate(is_video):
-            if idx == 0:
-                is_first_images.append(True)
-            else:
-                is_first_images.append(False)
-            if idx == len(is_video) - 1:
-                is_last_images.append(True)
-            else:
-                is_last_images.append(False)
-
-    num_queries_vis_abstractors = list(chain(*num_queries_vis_abstractors))
-    num_queries_vis_abstractors_slow = list(
-        chain(*num_queries_vis_abstractors_slow))
-    image_sizes = list(chain(*image_sizes))
-    is_videos = list(chain(*is_videos))
-    first_last_frames_slows = list(chain(*first_last_frames_slows))
 
     use_slowfast = any(
         [num_query > 0 for num_query in num_queries_vis_abstractors_slow])
-    num_grids = [pixel_value.shape[0] for pixel_value in chain(*pixel_values)]
     num_grids = [0] + num_grids
     group_ids = []
 
@@ -565,6 +552,16 @@ class HCXVisionCAbstractor(nn.Module):
         return nn.Sequential(*layers)
 
 
+def _per_image_tensor(preprocessed_image: Dict[str, Any], key: str,
+                      dtype: torch.dtype) -> Optional[torch.Tensor]:
+    """One request's per-image values as a host tensor, one entry per image.
+
+    The processor returns one list per batch sample, and a request is sample 0.
+    """
+    values = preprocessed_image.get(key, None)
+    return None if values is None else torch.tensor(values[0], dtype=dtype)
+
+
 class HCXVisionInputProcessor(BaseMultimodalDummyInputsBuilder,
                               BaseMultimodalInputProcessor):
 
@@ -777,22 +774,42 @@ class HCXVisionInputProcessor(BaseMultimodalDummyInputsBuilder,
         if not preprocessed_image:
             return fused_input_ids.to(torch.int32).tolist(), {}
 
+        pixel_values = torch.stack(preprocessed_image['pixel_values'][0], dim=0)
+        num_images, num_grids = pixel_values.shape[:2]
+        image_index = torch.arange(num_images)
         multimodal_data = {}
         multimodal_data["image"] = {
+            # The crops of every image on dim 0, num_grids per image.
             "pixel_values":
-            torch.stack(preprocessed_image['pixel_values'][0],
-                        dim=0).to(torch.bfloat16),
+            pixel_values.flatten(0, 1).to(torch.bfloat16),
+            "num_grids":
+            torch.full((num_images, ), num_grids, dtype=torch.int64),
             "image_sizes":
-            preprocessed_image.get('image_sizes', None),
+            _per_image_tensor(preprocessed_image, 'image_sizes', torch.int64),
             "is_videos":
-            preprocessed_image.get('is_videos', None),
+            _per_image_tensor(preprocessed_image, 'is_videos', torch.bool),
             "num_queries_vis_abstractors":
-            preprocessed_image.get('num_queries_vis_abstractors', None),
+            _per_image_tensor(preprocessed_image, 'num_queries_vis_abstractors',
+                              torch.int64),
             "num_queries_vis_abstractors_slow":
-            preprocessed_image.get('num_queries_vis_abstractors_slow', None),
+            _per_image_tensor(preprocessed_image,
+                              'num_queries_vis_abstractors_slow', torch.int64),
             "first_last_frames_slows":
-            preprocessed_image.get('first_last_frames_slows', None),
+            _per_image_tensor(preprocessed_image, 'first_last_frames_slows',
+                              torch.bool),
+            "is_first_images":
+            image_index == 0,
+            "is_last_images":
+            image_index == num_images - 1,
         }
+        # The encoder emits vision_query_lengths rows per image, in order.
+        multimodal_data[
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+                [("image", index) for index in range(num_images)],
+                output_embedding_lengths=[
+                    int(length)
+                    for length in preprocessed_image["vision_query_lengths"][0]
+                ])
         return fused_input_ids.to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data
         }
@@ -861,42 +878,54 @@ class HCXVisionModel(nn.Module):
 
         self.image_newline.data.copy_(weights["image_newline"])
 
-    def _parse_and_batch_multimodal_data(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[List[torch.Tensor], Dict[str, List[Any]]]:
-        """Parse and batch multimodal data from MultimodalParams objects."""
-        pixel_values = [
-            list(
-                torch.unbind(
-                    multimodal_param.multimodal_data["image"]["pixel_values"],
-                    dim=0)) for multimodal_param in multimodal_params
-        ]
-        mm_extra_data = {
-            key: [
-                multimodal_param.multimodal_data["image"][key][0]
-                for multimodal_param in multimodal_params
-            ]
-            for key in multimodal_params[0].multimodal_data["image"].keys()
-        }
-        return pixel_values, mm_extra_data
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        """One vision tower call for the crops of every image in the batch."""
+        # Every encoder input is the image payload field of the same name.
+        fields = ("pixel_values", "num_grids", "image_sizes", "is_videos",
+                  "num_queries_vis_abstractors",
+                  "num_queries_vis_abstractors_slow", "first_last_frames_slows",
+                  "is_first_images", "is_last_images")
+        return (EncoderGroup(
+            modalities=("image", ),
+            encoder_fn=self._encode_images,
+            input_fields={name: dict(image=name)
+                          for name in fields},
+        ), )
 
     @torch.inference_mode()
-    def forward(self, multimodal_params: List[MultimodalParams]):
+    def forward(
+            self,
+            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        return [
+            encode_multimodal_by_groups(self.mm_encoder_groups,
+                                        multimodal_params)
+        ]
 
-        pixel_values, mm_extra_data = self._parse_and_batch_multimodal_data(
-            multimodal_params)
-        image_sizes = mm_extra_data.get("image_sizes", None)
-        is_videos = mm_extra_data.get("is_videos", None)
-        num_queries_vis_abstractors = mm_extra_data.get(
-            "num_queries_vis_abstractors", None)
-        num_queries_vis_abstractors_slow = mm_extra_data.get(
-            "num_queries_vis_abstractors_slow", None)
-        first_last_frames_slows = mm_extra_data.get("first_last_frames_slows",
-                                                    None)
+    def _encode_images(
+        self,
+        pixel_values: torch.Tensor,
+        num_grids: torch.Tensor,
+        image_sizes: torch.Tensor,
+        is_videos: Optional[torch.Tensor],
+        num_queries_vis_abstractors: Optional[torch.Tensor],
+        num_queries_vis_abstractors_slow: Optional[torch.Tensor],
+        first_last_frames_slows: Optional[torch.Tensor],
+        is_first_images: torch.Tensor,
+        is_last_images: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode packed image crops; returns each image's rows, image after image.
 
-        len_pixel_values = [len(pixel_value) for pixel_value in pixel_values]
-        concat_pixel_values = torch.cat(list(chain(*pixel_values)),
-                                        dim=0)  # list of list of 4D Tensor
+        `pixel_values` holds the crops of every image on dim 0, and
+        `num_grids` how many belong to each image. The other inputs have one
+        entry per image and stay on the host (see
+        `HCXVisionForCausalLM.multimodal_data_device_paths`).
+        """
+        split_sizes = num_grids.tolist()
+        image_sizes = image_sizes.tolist()
+        if is_videos is not None:
+            is_videos = is_videos.tolist()
+        concat_pixel_values = pixel_values
 
         n_chunks = 1
         total_len = concat_pixel_values.size(0)
@@ -933,9 +962,6 @@ class HCXVisionModel(nn.Module):
 
         if num_queries_vis_abstractors is None:
             assert num_queries_vis_abstractors_slow is None
-            image_sizes = list(chain(*image_sizes))
-            if is_videos is not None:
-                is_videos = list(chain(*is_videos))
             group_ids = None
             image_forward_outs = self.mm_projector(image_forward_outs)
         else:
@@ -946,12 +972,14 @@ class HCXVisionModel(nn.Module):
                 is_videos,
                 group_ids,
             ) = compute_adaptive_params(
-                pixel_values,
-                num_queries_vis_abstractors,
-                num_queries_vis_abstractors_slow,
+                split_sizes,
+                num_queries_vis_abstractors.tolist(),
+                num_queries_vis_abstractors_slow.tolist(),
                 image_sizes,
                 is_videos,
-                first_last_frames_slows,
+                first_last_frames_slows.tolist(),
+                is_first_images.tolist(),
+                is_last_images.tolist(),
             )
             image_forward_outs = self.mm_projector(
                 image_forward_outs,
@@ -959,9 +987,6 @@ class HCXVisionModel(nn.Module):
                 num_grids=num_grids,
             )
         if self.anyres:
-            split_sizes = [
-                pixel_value.shape[0] for pixel_value in chain(*pixel_values)
-            ]
             if num_queries_vis_abstractors is None:
                 image_features = anyres_postprocessing(
                     image_forward_outs=image_forward_outs,
@@ -998,16 +1023,7 @@ class HCXVisionModel(nn.Module):
                     image_forward_out.unsqueeze(0)
                     for image_forward_out in image_forward_outs
                 ]
-        image_features = [
-            image_features[sum(len_pixel_values[:i]):sum(len_pixel_values[:i +
-                                                                          1])]
-            for i in range(len(len_pixel_values))
-        ]
-        mm_embeds = [
-            torch.cat(list(chain(image_feature)), dim=0)
-            for image_feature in image_features
-        ]
-        return mm_embeds
+        return torch.cat(image_features, dim=0)
 
 
 @register_auto_model("HCXVisionForCausalLM")
@@ -1077,6 +1093,12 @@ class HCXVisionForCausalLM(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        # Only the crops go to the device. The per-image values stay on the
+        # host, where the encoder reads them as Python values.
+        return ["image.pixel_values", "multimodal_embedding"]
 
     @torch.inference_mode()
     def forward(
