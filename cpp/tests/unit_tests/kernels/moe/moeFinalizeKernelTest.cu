@@ -14,30 +14,37 @@
  * limitations under the License.
  */
 
-// On SM100 and SM103, finalizeMoeRoutingKernelLauncher runs finalizeMoeRoutingWarpKernel when the rows are whole
-// 128-bit vectors, the pointers are vector aligned and top_k <= 32, and the block-per-row kernels otherwise; on other
-// GPUs it always runs the block-per-row kernels. Both must produce bitwise identical outputs. The tests run the
-// launcher several times on the same data, with the buffers it reads or writes either 16-byte aligned (warp kernel) or
-// shifted by 4, 8 or 12 bytes (block-per-row kernels, which access memory in 32-bit words), compare the outputs bit for
-// bit and check, with a stream capture, which kernel each launch runs.
+// On SM100 and SM103, finalizeMoeRoutingKernelLauncher runs finalizeMoeRoutingWarpKernel when the pointers are
+// 128-bit aligned and top_k <= 32, and the block-per-row kernels otherwise; on other GPUs it always runs the
+// block-per-row kernels. Both must produce bitwise identical outputs. The tests run the launcher several times on the
+// same data, with the buffers it reads or writes either 16-byte aligned (warp kernel) or shifted by 4, 8 or 12 bytes
+// (block-per-row kernels, which access memory in 32-bit words), compare the outputs bit for bit and check, with a
+// stream capture, which kernel each launch runs. Rows that are not whole 128-bit vectors are rejected by the launcher.
 
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
 #include "tensorrt_llm/kernels/moe/cutlass/include/moe_util_kernels.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <span>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -51,47 +58,29 @@ namespace
 
 namespace ck = tensorrt_llm::kernels::cutlass_kernels;
 
-struct CudaFree
-{
-    void operator()(void* ptr) const
-    {
-        cudaFree(ptr);
-    }
-};
+using tensorrt_llm::runtime::BufferManager;
+using tensorrt_llm::runtime::CudaStream;
+using tensorrt_llm::runtime::IBuffer;
+using tensorrt_llm::runtime::MemoryType;
 
-using DeviceMemory = std::unique_ptr<void, CudaFree>;
+//! Share of the GEMM output and bias values replaced by special values when FinalizeCase::specialValues is set.
+constexpr float kSpecialValueRate = 0.03F;
+//! Share of the router scales replaced by special values when FinalizeCase::specialValues is set.
+constexpr float kSpecialScaleRate = 0.05F;
+//! Share of the top-k slots whose expert id belongs to no rank.
+constexpr float kNoExpertRate = 0.1F;
 
-DeviceMemory allocateDevice(size_t bytes)
-{
-    void* ptr = nullptr;
-    TLLM_CUDA_CHECK(cudaMalloc(&ptr, std::max<size_t>(bytes, 1)));
-    return DeviceMemory(ptr);
-}
-
-//! Device copy of a host vector, starting `offset` elements into the allocation.
+//! View of a device copy of a host vector; the view keeps the allocation alive.
 template <class T>
 struct DeviceArray
 {
-    DeviceMemory memory;
-    T* data = nullptr;
+    IBuffer::SharedPtr view;
+
+    T* data() const
+    {
+        return static_cast<T*>(view->data());
+    }
 };
-
-template <class T>
-DeviceArray<T> toDevice(std::vector<T> const& host, size_t offset = 0)
-{
-    DeviceArray<T> array{allocateDevice((host.size() + offset) * sizeof(T))};
-    array.data = static_cast<T*>(array.memory.get()) + offset;
-    TLLM_CUDA_CHECK(cudaMemcpy(array.data, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
-    return array;
-}
-
-template <class T>
-std::vector<T> toHost(T const* device, size_t count)
-{
-    std::vector<T> host(count);
-    TLLM_CUDA_CHECK(cudaMemcpy(host.data(), device, count * sizeof(T), cudaMemcpyDeviceToHost));
-    return host;
-}
 
 template <class T>
 using Bits = std::conditional_t<sizeof(T) == 2, uint16_t, uint32_t>;
@@ -153,6 +142,29 @@ struct BufferOffsets
 //! Every buffer aligned (warp kernel when the shape allows it), then every buffer shifted by 4 bytes.
 constexpr std::array<BufferOffsets, 2> kAlignedAndShifted{{{}, {4, 4, 4}}};
 
+//! Who builds the expert maps the launcher reads.
+enum class MapBuilder
+{
+    //! The host, giving every top-k slot with an expert on this rank its own permuted row.
+    kHost,
+    //! fusedBuildExpertMapsSortFirstToken (up to 256 tokens, top_k 1, 2, 4, 6 or 8), which does the same.
+    kFused,
+    //! threeStepBuildExpertMapsSortFirstToken, which gives a permuted row only to the first slot of each (token,
+    //! expert) pair.
+    kThreeStep,
+};
+
+char const* toString(MapBuilder builder)
+{
+    switch (builder)
+    {
+    case MapBuilder::kHost: return "host";
+    case MapBuilder::kFused: return "fused";
+    case MapBuilder::kThreeStep: return "threeStep";
+    }
+    return "?";
+}
+
 struct FinalizeCase
 {
     int64_t numRows = 0;
@@ -169,8 +181,23 @@ struct FinalizeCase
     bool specialValues = false;
     //! The last numPaddingRows rows have no expert at all, like the padding rows of an all-to-all receive buffer.
     int64_t numPaddingRows = 0;
+    //! Probability that a top-k slot repeats the expert of an earlier slot of the same token.
+    float repeatedExpertRate = 0.F;
+    MapBuilder mapBuilder = MapBuilder::kHost;
     uint32_t seed = 0;
 };
+
+std::string describe(FinalizeCase const& c)
+{
+    std::ostringstream os;
+    os << "numRows=" << c.numRows << " hidden=" << c.hidden << " paddedHidden=" << c.paddedHidden << " topK=" << c.topK
+       << " numExperts=" << c.numExperts << " epSize=" << c.epSize << " epRank=" << c.epRank << " tpRank=" << c.tpRank
+       << " enableAlltoall=" << c.enableAlltoall << " withScales=" << c.withScales << " withBias=" << c.withBias
+       << " specialValues=" << c.specialValues << " numPaddingRows=" << c.numPaddingRows
+       << " repeatedExpertRate=" << c.repeatedExpertRate << " mapBuilder=" << toString(c.mapBuilder)
+       << " seed=" << c.seed;
+    return os.str();
+}
 
 template <class T>
 class MoeFinalizeKernelTest : public ::testing::Test
@@ -178,12 +205,27 @@ class MoeFinalizeKernelTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        TLLM_CUDA_CHECK(cudaStreamCreate(&mStream));
+        mStream = std::make_shared<CudaStream>();
+        mManager = std::make_unique<BufferManager>(mStream);
     }
 
-    void TearDown() override
+    //! Device copy of `host`, starting `offset` elements into its allocation.
+    template <class V>
+    DeviceArray<V> upload(std::vector<V> const& host, size_t offset = 0) const
     {
-        TLLM_CUDA_CHECK(cudaStreamDestroy(mStream));
+        std::vector<V> storage(offset + host.size());
+        std::copy(host.begin(), host.end(), storage.begin() + static_cast<std::ptrdiff_t>(offset));
+        IBuffer::SharedPtr const buffer = mManager->copyFrom(storage, MemoryType::kGPU);
+        return {IBuffer::slice(buffer, offset, host.size())};
+    }
+
+    template <class V>
+    std::vector<Bits<V>> downloadBits(DeviceArray<V> const& array) const
+    {
+        std::vector<Bits<V>> host(array.view->getSize());
+        mManager->copy(*array.view, host.data(), MemoryType::kCPU);
+        mStream->synchronize();
+        return host;
     }
 
     template <class V>
@@ -196,7 +238,8 @@ protected:
         std::vector<V> values(count);
         for (auto& value : values)
         {
-            value = (special && uniform(rng) < 0.03F) ? fromBits<V>(specials[pick(rng)]) : fromFloat<V>(normal(rng));
+            value = (special && uniform(rng) < kSpecialValueRate) ? fromBits<V>(specials[pick(rng)])
+                                                                  : fromFloat<V>(normal(rng));
         }
         return values;
     }
@@ -206,9 +249,9 @@ protected:
     std::vector<std::string> capturedKernelNames(Launch const& launch)
     {
         cudaGraph_t graph{};
-        TLLM_CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeThreadLocal));
+        TLLM_CUDA_CHECK(cudaStreamBeginCapture(mStream->get(), cudaStreamCaptureModeThreadLocal));
         launch();
-        TLLM_CUDA_CHECK(cudaStreamEndCapture(mStream, &graph));
+        TLLM_CUDA_CHECK(cudaStreamEndCapture(mStream->get(), &graph));
         size_t numNodes = 0;
         TLLM_CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &numNodes));
         std::vector<cudaGraphNode_t> nodes(numNodes);
@@ -220,10 +263,15 @@ protected:
             TLLM_CUDA_CHECK(cudaGraphNodeGetType(node, &type));
             if (type == cudaGraphNodeTypeKernel)
             {
-                cudaKernelNodeParams params{};
-                TLLM_CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &params));
+                // Extended launches may capture a kernel-object-backed node, which the runtime parameter structure
+                // cannot represent.
+                CUDA_KERNEL_NODE_PARAMS params{};
+                CUresult result = cuGraphKernelNodeGetParams(node, &params);
+                TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Could not read a kernel node's parameters: %d", result);
                 char const* name = nullptr;
-                TLLM_CUDA_CHECK(cudaFuncGetName(&name, params.func));
+                result
+                    = params.func != nullptr ? cuFuncGetName(&name, params.func) : cuKernelGetName(&name, params.kern);
+                TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Could not read a kernel node's name: %d", result);
                 names.emplace_back(name);
             }
         }
@@ -235,14 +283,17 @@ protected:
     //! and compares the outputs bit for bit with those of the first run.
     void runCase(FinalizeCase const& c, std::span<BufferOffsets const> offsetsList = kAlignedAndShifted)
     {
+        SCOPED_TRACE(describe(c));
         std::mt19937 rng(c.seed);
         int64_t const paddedHidden = c.paddedHidden > 0 ? c.paddedHidden : c.hidden;
         int64_t const numExpertsPerNode = c.numExperts / c.epSize;
         int64_t const startExpert = numExpertsPerNode * c.epRank;
         int64_t const expandedRows = c.numRows * c.topK;
+        auto const isLocalExpert
+            = [&](int expert) { return expert - startExpert >= 0 && expert - startExpert < numExpertsPerNode; };
 
-        // Distinct experts per token; about one slot in ten has an id that belongs to no rank, and every slot of the
-        // padding rows does.
+        // Distinct experts per token unless repeatedExpertRate > 0; about one slot in ten has an id that belongs to no
+        // rank, and every slot of the padding rows does.
         std::vector<int> tokenSelectedExperts(expandedRows);
         std::vector<int> experts(c.numExperts);
         std::iota(experts.begin(), experts.end(), 0);
@@ -252,38 +303,86 @@ protected:
             std::shuffle(experts.begin(), experts.end(), rng);
             for (int64_t k = 0; k < c.topK; ++k)
             {
+                int expert = experts[k];
+                if (c.repeatedExpertRate > 0.F && k > 0 && uniform(rng) < c.repeatedExpertRate)
+                {
+                    expert = experts[std::uniform_int_distribution<int64_t>(0, k - 1)(rng)];
+                }
                 bool const isPadding = row >= c.numRows - c.numPaddingRows;
-                tokenSelectedExperts[row * c.topK + k] = (isPadding || uniform(rng) < 0.1F) ? -1 : experts[k];
+                tokenSelectedExperts[row * c.topK + k] = (isPadding || uniform(rng) < kNoExpertRate) ? -1 : expert;
             }
         }
+        auto const dTokenSelectedExperts = upload(tokenSelectedExperts);
 
-        // Expert maps as the MoE sort kernels build them: the slots with an expert on this rank are sorted by expert
-        // into permuted rows [0, numValid); unpermuted row = k * numRows + token. The entries of the other slots are
-        // never read; a huge value makes sure a read would fault.
-        constexpr int kNeverRead = 0x3FFFFFFF;
-        std::vector<int> unpermutedToPermuted(expandedRows, kNeverRead);
-        std::vector<int> permutedToUnpermuted(expandedRows, kNeverRead);
-        std::vector<int64_t> expertFirstTokenOffset(numExpertsPerNode + 1, 0);
-        std::vector<std::pair<int64_t, int64_t>> localSlots; // (local expert, unpermuted row)
-        for (int64_t row = 0; row < c.numRows; ++row)
+        DeviceArray<int> dUnpermutedToPermuted;
+        DeviceArray<int> dPermutedToUnpermuted;
+        DeviceArray<int64_t> dExpertFirstTokenOffset;
+        if (c.mapBuilder == MapBuilder::kHost)
         {
-            for (int64_t k = 0; k < c.topK; ++k)
+            // Expert maps as the MoE sort kernels build them: the slots with an expert on this rank are sorted by
+            // expert into permuted rows [0, numValid); unpermuted row = k * numRows + token. The entries of the other
+            // slots are never read; a huge value makes sure a read would fault.
+            constexpr int kNeverRead = 0x3FFFFFFF;
+            std::vector<int> unpermutedToPermuted(expandedRows, kNeverRead);
+            std::vector<int> permutedToUnpermuted(expandedRows, kNeverRead);
+            std::vector<int64_t> expertFirstTokenOffset(numExpertsPerNode + 1, 0);
+            std::vector<std::pair<int64_t, int64_t>> localSlots; // (local expert, unpermuted row)
+            for (int64_t row = 0; row < c.numRows; ++row)
             {
-                int64_t const expert = tokenSelectedExperts[row * c.topK + k] - startExpert;
-                if (expert >= 0 && expert < numExpertsPerNode)
+                for (int64_t k = 0; k < c.topK; ++k)
                 {
-                    localSlots.emplace_back(expert, k * c.numRows + row);
+                    int const expert = tokenSelectedExperts[row * c.topK + k];
+                    if (isLocalExpert(expert))
+                    {
+                        localSlots.emplace_back(expert - startExpert, k * c.numRows + row);
+                    }
                 }
             }
+            std::sort(localSlots.begin(), localSlots.end());
+            for (size_t permuted = 0; permuted < localSlots.size(); ++permuted)
+            {
+                unpermutedToPermuted[localSlots[permuted].second] = static_cast<int>(permuted);
+                permutedToUnpermuted[permuted] = static_cast<int>(localSlots[permuted].second);
+                ++expertFirstTokenOffset[localSlots[permuted].first + 1];
+            }
+            std::partial_sum(
+                expertFirstTokenOffset.begin(), expertFirstTokenOffset.end(), expertFirstTokenOffset.begin());
+            dUnpermutedToPermuted = upload(unpermutedToPermuted);
+            dPermutedToUnpermuted = upload(permutedToUnpermuted);
+            dExpertFirstTokenOffset = upload(expertFirstTokenOffset);
         }
-        std::sort(localSlots.begin(), localSlots.end());
-        for (size_t permuted = 0; permuted < localSlots.size(); ++permuted)
+        else
         {
-            unpermutedToPermuted[localSlots[permuted].second] = static_cast<int>(permuted);
-            permutedToUnpermuted[permuted] = static_cast<int>(localSlots[permuted].second);
-            ++expertFirstTokenOffset[localSlots[permuted].first + 1];
+            // The production builders. The three-step builder leaves the unpermutedToPermuted entries of a token's
+            // repeated slots unwritten, and both kernels read them; pre-filling with 0 keeps those reads in range.
+            dUnpermutedToPermuted = upload(std::vector<int>(expandedRows, 0));
+            dPermutedToUnpermuted = upload(std::vector<int>(expandedRows, 0));
+            dExpertFirstTokenOffset = upload(std::vector<int64_t>(numExpertsPerNode + 1, 0));
+            if (c.mapBuilder == MapBuilder::kFused)
+            {
+                ASSERT_TRUE(ck::fusedBuildExpertMapsSortFirstToken(dTokenSelectedExperts.data(),
+                    dPermutedToUnpermuted.data(), dUnpermutedToPermuted.data(), dExpertFirstTokenOffset.data(),
+                    c.numRows, static_cast<int>(numExpertsPerNode), static_cast<int>(c.topK),
+                    static_cast<int>(startExpert), static_cast<int>(startExpert + numExpertsPerNode), mStream->get()))
+                    << "the fused builder does not support this case";
+            }
+            else
+            {
+                int64_t const tokensPerBlock = ck::computeNumTokensPerBlock(c.numRows, numExpertsPerNode);
+                int64_t const blocksPerSeq = tensorrt_llm::common::ceilDiv(c.numRows, tokensPerBlock);
+                auto const blockedExpertCounts = upload(std::vector<int>(numExpertsPerNode * blocksPerSeq));
+                auto const blockedExpertCountsCumsum = upload(std::vector<int>(numExpertsPerNode * blocksPerSeq));
+                auto const blockedRowToUnpermutedRow = upload(std::vector<int>(numExpertsPerNode * c.numRows));
+                auto const permutedTokenSelectedExperts = upload(std::vector<int>(expandedRows));
+                ck::threeStepBuildExpertMapsSortFirstToken(dTokenSelectedExperts.data(),
+                    permutedTokenSelectedExperts.data(), dPermutedToUnpermuted.data(), dUnpermutedToPermuted.data(),
+                    dExpertFirstTokenOffset.data(), blockedExpertCounts.data(), blockedExpertCountsCumsum.data(),
+                    blockedRowToUnpermutedRow.data(), c.numRows, numExpertsPerNode, c.topK,
+                    static_cast<int>(startExpert), mStream->get());
+            }
+            TLLM_CUDA_CHECK(cudaGetLastError());
+            mStream->synchronize();
         }
-        std::partial_sum(expertFirstTokenOffset.begin(), expertFirstTokenOffset.end(), expertFirstTokenOffset.begin());
 
         auto const gemmOutput = randomValues<T>(expandedRows * paddedHidden, c.specialValues, rng);
         auto const bias = randomValues<T>(c.withBias ? numExpertsPerNode * paddedHidden : 0, c.specialValues, rng);
@@ -293,55 +392,50 @@ protected:
         for (auto& scale : scales)
         {
             scale = uniform(rng) * 2.F - 0.5F;
-            if (c.specialValues && uniform(rng) < 0.05F)
+            if (c.specialValues && uniform(rng) < kSpecialScaleRate)
             {
                 scale = fromBits<float>(specialScales[pickSpecialScale(rng)]);
             }
         }
         // Rows that the no-filling (all-to-all) variant does not write keep this pattern.
-        std::vector<Bits<T>> outputInit(c.numRows * c.hidden);
+        std::vector<Bits<T>> outputInitBits(c.numRows * c.hidden);
         std::uniform_int_distribution<uint32_t> anyBits;
-        for (auto& bits : outputInit)
+        for (auto& bits : outputInitBits)
         {
             bits = static_cast<Bits<T>>(anyBits(rng));
         }
+        std::vector<T> outputInit(outputInitBits.size());
+        std::memcpy(outputInit.data(), outputInitBits.data(), outputInitBits.size() * sizeof(T));
 
-        auto const dScales = toDevice(scales);
-        auto const dUnpermutedToPermuted = toDevice(unpermutedToPermuted);
-        auto const dPermutedToUnpermuted = toDevice(permutedToUnpermuted);
-        auto const dTokenSelectedExperts = toDevice(tokenSelectedExperts);
-        auto const dExpertFirstTokenOffset = toDevice(expertFirstTokenOffset);
+        auto const dScales = upload(scales);
         ck::MOEParallelismConfig const parallelismConfig(c.tpRank + 1, c.tpRank, c.epSize, c.epRank);
 
-        constexpr int64_t kElemsPerVector = 16 / sizeof(T);
         int const smVersion = tensorrt_llm::common::getSMVersion();
-        bool const shapeFitsWarpKernel = (smVersion == 100 || smVersion == 103) && c.topK >= 1 && c.topK <= 32
-            && c.hidden % kElemsPerVector == 0 && paddedHidden % kElemsPerVector == 0;
+        bool const shapeFitsWarpKernel = (smVersion == 100 || smVersion == 103) && c.topK >= 1 && c.topK <= 32;
         bool const biasIsRead = c.withBias && c.tpRank == 0;
         std::vector<std::vector<Bits<T>>> outputs;
         for (auto const& offsets : offsetsList)
         {
+            SCOPED_TRACE(::testing::Message()
+                << "run " << outputs.size() << ", byte offsets: GEMM output " << offsets.gemmOutput << ", output "
+                << offsets.output << ", bias " << offsets.bias);
             bool const expectWarpKernel = shapeFitsWarpKernel && offsets.gemmOutput % 16 == 0
                 && offsets.output % 16 == 0 && (!biasIsRead || offsets.bias % 16 == 0);
-            if (c.numRows == 0 && !expectWarpKernel)
-            {
-                continue; // The block-per-row kernels cannot be launched with an empty grid.
-            }
-            auto const dGemmOutput = toDevice(gemmOutput, offsets.gemmOutput / sizeof(T));
-            auto const dBias = toDevice(bias, offsets.bias / sizeof(T));
-            auto const dOutput = toDevice(outputInit, offsets.output / sizeof(T));
+            auto const dGemmOutput = upload(gemmOutput, offsets.gemmOutput / sizeof(T));
+            auto const dBias = upload(bias, offsets.bias / sizeof(T));
+            auto const dOutput = upload(outputInit, offsets.output / sizeof(T));
             auto const launch = [&]()
             {
-                ck::finalizeMoeRoutingKernelLauncher<T, T, T>(dGemmOutput.data, reinterpret_cast<T*>(dOutput.data),
-                    c.withBias ? dBias.data : nullptr, c.withScales ? dScales.data : nullptr,
-                    dUnpermutedToPermuted.data, dPermutedToUnpermuted.data, dTokenSelectedExperts.data,
-                    dExpertFirstTokenOffset.data, c.numRows, paddedHidden, c.hidden, c.topK, numExpertsPerNode,
-                    parallelismConfig, c.enableAlltoall, mStream);
+                ck::finalizeMoeRoutingKernelLauncher<T, T, T>(dGemmOutput.data(), dOutput.data(),
+                    c.withBias ? dBias.data() : nullptr, c.withScales ? dScales.data() : nullptr,
+                    dUnpermutedToPermuted.data(), dPermutedToUnpermuted.data(), dTokenSelectedExperts.data(),
+                    dExpertFirstTokenOffset.data(), c.numRows, paddedHidden, c.hidden, c.topK, numExpertsPerNode,
+                    parallelismConfig, c.enableAlltoall, mStream->get());
             };
             launch();
             TLLM_CUDA_CHECK(cudaGetLastError());
-            TLLM_CUDA_CHECK(cudaStreamSynchronize(mStream));
-            outputs.push_back(toHost(dOutput.data, outputInit.size()));
+            mStream->synchronize();
+            outputs.push_back(downloadBits(dOutput));
 
             auto const names = capturedKernelNames(launch);
             if (c.numRows == 0)
@@ -352,8 +446,7 @@ protected:
             ASSERT_EQ(names.size(), 1U);
             EXPECT_NE(names.front().find("finalizeMoeRouting"), std::string::npos) << names.front();
             EXPECT_EQ(names.front().find("finalizeMoeRoutingWarpKernel") != std::string::npos, expectWarpKernel)
-                << names.front() << " (offsets " << offsets.gemmOutput << ", " << offsets.output << ", " << offsets.bias
-                << ", topK=" << c.topK << ", hidden=" << c.hidden << ")";
+                << names.front();
         }
 
         for (size_t i = 1; i < outputs.size(); ++i)
@@ -362,40 +455,33 @@ protected:
             EXPECT_EQ(mismatch.first, outputs[0].end())
                 << "first difference at element " << (mismatch.first - outputs[0].begin()) << " of "
                 << outputs[0].size() << ": bits " << std::hex << static_cast<uint32_t>(*mismatch.first) << " vs "
-                << static_cast<uint32_t>(*mismatch.second) << std::dec << " (run " << i << ", numRows=" << c.numRows
-                << ", hidden=" << c.hidden << ", topK=" << c.topK << ", epSize=" << c.epSize
-                << ", enableAlltoall=" << c.enableAlltoall << ")";
+                << static_cast<uint32_t>(*mismatch.second) << std::dec << " (run " << i << ")";
         }
 
-        // The no-filling variant must leave the rows of tokens without an expert on this rank untouched.
-        if (c.epSize > 1 && c.enableAlltoall)
+        // The rows of tokens without an expert on this rank: the no-filling (all-to-all) variant must leave them
+        // untouched, and the zero-filling one must write +0.0 (all bits clear).
+        bool const zeroFill = !(c.epSize > 1 && c.enableAlltoall);
+        std::vector<Bits<T>> const zeroRow(c.hidden, 0);
+        for (int64_t row = 0; row < c.numRows; ++row)
         {
-            for (int64_t row = 0; row < c.numRows; ++row)
+            auto const slots = std::span(tokenSelectedExperts).subspan(row * c.topK, c.topK);
+            if (std::any_of(slots.begin(), slots.end(), isLocalExpert))
             {
-                bool hasLocalExpert = false;
-                for (int64_t k = 0; k < c.topK; ++k)
-                {
-                    int64_t const expert = tokenSelectedExperts[row * c.topK + k] - startExpert;
-                    hasLocalExpert = hasLocalExpert || (expert >= 0 && expert < numExpertsPerNode);
-                }
-                if (hasLocalExpert)
-                {
-                    continue;
-                }
-                auto const init = outputInit.begin() + row * c.hidden;
-                for (size_t i = 0; i < outputs.size(); ++i)
-                {
-                    auto const first = outputs[i].begin() + row * c.hidden;
-                    ASSERT_TRUE(std::equal(first, first + c.hidden, init))
-                        << "run " << i << " wrote row " << row
-                        << ", which has no expert on this rank (numRows=" << c.numRows << ", topK=" << c.topK
-                        << ", epSize=" << c.epSize << ")";
-                }
+                continue;
+            }
+            auto const expected = zeroFill ? zeroRow.begin() : outputInitBits.begin() + row * c.hidden;
+            for (size_t i = 0; i < outputs.size(); ++i)
+            {
+                auto const first = outputs[i].begin() + row * c.hidden;
+                ASSERT_TRUE(std::equal(first, first + c.hidden, expected))
+                    << "run " << i << (zeroFill ? " did not zero row " : " wrote row ") << row
+                    << ", which has no expert on this rank";
             }
         }
     }
 
-    cudaStream_t mStream{};
+    std::shared_ptr<CudaStream> mStream;
+    std::unique_ptr<BufferManager> mManager;
 };
 
 using FinalizeTypes = ::testing::Types<half, float, __nv_bfloat16>;
@@ -469,11 +555,14 @@ TYPED_TEST(MoeFinalizeKernelTest, TopKUpToWarpSizeAndBeyond)
 
 TYPED_TEST(MoeFinalizeKernelTest, PaddedAndNarrowRows)
 {
-    for (auto const& [hidden, paddedHidden] : {std::pair<int64_t, int64_t>{8, 8}, {24, 24}, {2880, 3072}, {4096, 4224}})
+    // 2052 elements are whole 128-bit vectors for float but not for half and bfloat16, which the launcher rejects.
+    constexpr int64_t kElemsPerVector = 16 / sizeof(TypeParam);
+    for (auto const& [hidden, paddedHidden] :
+        {std::pair<int64_t, int64_t>{8, 8}, {24, 24}, {2880, 3072}, {4096, 4224}, {2052, 2052}})
     {
         for (bool const enableAlltoall : {false, true})
         {
-            this->runCase({.numRows = 129,
+            FinalizeCase const c{.numRows = 129,
                 .hidden = hidden,
                 .paddedHidden = paddedHidden,
                 .topK = 4,
@@ -483,7 +572,47 @@ TYPED_TEST(MoeFinalizeKernelTest, PaddedAndNarrowRows)
                 .enableAlltoall = enableAlltoall,
                 .withBias = true,
                 .specialValues = true,
-                .seed = static_cast<uint32_t>(hidden)});
+                .seed = static_cast<uint32_t>(hidden)};
+            if (hidden % kElemsPerVector == 0 && paddedHidden % kElemsPerVector == 0)
+            {
+                this->runCase(c);
+            }
+            else
+            {
+                EXPECT_THROW(this->runCase(c), tensorrt_llm::common::TllmException) << describe(c);
+            }
+        }
+    }
+}
+
+TYPED_TEST(MoeFinalizeKernelTest, OutputWiderThanGemmOutputThrows)
+{
+    EXPECT_THROW(this->runCase({.numRows = 16, .hidden = 2064, .paddedHidden = 2048, .topK = 2, .numExperts = 8}),
+        tensorrt_llm::common::TllmException);
+}
+
+TYPED_TEST(MoeFinalizeKernelTest, RepeatedExpertsWithProductionMaps)
+{
+    // A token can list one expert in several top-k slots. The fused builder gives each of those slots a permuted row;
+    // the three-step builder gives one only to the first slot of each (token, expert) pair.
+    for (auto const mapBuilder : {MapBuilder::kFused, MapBuilder::kThreeStep})
+    {
+        for (int64_t const topK : {6, 8})
+        {
+            for (auto const& [epSize, enableAlltoall] : {std::pair{1, false}, {4, false}, {4, true}})
+            {
+                this->runCase({.numRows = mapBuilder == MapBuilder::kFused ? 200 : 777,
+                    .hidden = 2048,
+                    .topK = topK,
+                    .numExperts = 32,
+                    .epSize = epSize,
+                    .epRank = epSize - 1,
+                    .enableAlltoall = enableAlltoall,
+                    .withBias = true,
+                    .repeatedExpertRate = 0.3F,
+                    .mapBuilder = mapBuilder,
+                    .seed = static_cast<uint32_t>(100 * static_cast<int>(mapBuilder) + 10 * topK + epSize)});
+            }
         }
     }
 }

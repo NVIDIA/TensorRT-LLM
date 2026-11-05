@@ -205,7 +205,7 @@ def test_cutlass_moe_finalize_aligned_matches_offset(
     dtype: torch.dtype, enable_alltoall: bool
 ) -> None:
     """The non-fused finalize gives the same bits for a 16-byte aligned GEMM output, which takes the
-    warp-per-row kernel on SM100/SM103, and for one 4 bytes off, which takes the block-per-row kernels.
+    warp kernel on SM100/SM103, and for one 4 bytes off, which takes the block-per-row kernels.
 
     Top-8 of 64 experts under EP 8 with router scales and a bias. With all-to-all, rows of tokens
     without an expert on this rank are not written, so only the other rows are compared.
