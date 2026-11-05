@@ -854,8 +854,13 @@ def test_a_wrong_shaped_out_is_resized_and_the_guard_refuses_it() -> None:
     assert standalone.shape == (16, 16, 512) and standalone.data_ptr() != ptr
 
     a, w, out, _, parent = _build(spec, seed=22, m=16)
-    for wrong in (out[:, :15], out[..., :511], out[0], torch.zeros_like(out)[:15]):
-        with pytest.raises(AssertionError, match=r"out must be \[B, M, N\]"):
+    for wrong, refusal in (
+        (out[:, :15], r"out must be \[B, M, N\]"),
+        (out[..., :511], r"out must be \[B, M, N\]"),
+        (out[0], "a, b, out must be 3D"),
+        (torch.zeros_like(out)[:15], r"out must be \[B, M, N\]"),
+    ):
+        with pytest.raises(AssertionError, match=refusal):
             with validating(op):
                 op(a, w, wrong)
     assert bool((_bits(parent) == SENT).all())
