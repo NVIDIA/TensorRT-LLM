@@ -56,8 +56,8 @@ At inference, each residual block computes
 
 $$
 \begin{aligned}
-h_1 &= C_1\bigl(\mathrm{SiLU}(N_1(x))\bigr),\cr
-h_2 &= C_2\bigl(\mathrm{SiLU}(N_2(h_1))\bigr),\cr
+h_1 &= C_1\bigl(\mathrm{SiLU}(N_1(x))\bigr),\\
+h_2 &= C_2\bigl(\mathrm{SiLU}(N_2(h_1))\bigr),\\
 y &= S(x)+h_2.
 \end{aligned}
 \qquad (1)
@@ -110,7 +110,7 @@ The first copy prepares the spatial stride-2 convolution. Let $a$ be the last re
 $$
 p_{i,j}=
 \begin{cases}
-a_{i,j}+s_{i,j}, & 0\le i<H,\quad 0\le j<W,\cr
+a_{i,j}+s_{i,j}, & 0\le i<H,\quad 0\le j<W,\\
 0, & i=H\ \text{or}\ j=W.
 \end{cases}
 \qquad (2)
@@ -134,7 +134,7 @@ values. The `contiguous` operation copies the rearranged tensor. For example, wi
 $$
 \begin{aligned}
 A(r)_{2c,t,i,j}
- &=\tfrac12\bigl(r_{c,t,2i,2j}+r_{c,t,2i,2j+1}\bigr),\cr
+ &=\tfrac12\bigl(r_{c,t,2i,2j}+r_{c,t,2i,2j+1}\bigr),\\
 A(r)_{2c+1,t,i,j}
  &=\tfrac12\bigl(r_{c,t,2i+1,2j}+r_{c,t,2i+1,2j+1}\bigr).
 \end{aligned}
@@ -194,7 +194,7 @@ Consider one channel and a three-tap filter. The inputs overlap between neighbor
 
 $$
 \begin{aligned}
-y_0 &= d_0g_0+d_1g_1+d_2g_2,\cr
+y_0 &= d_0g_0+d_1g_1+d_2g_2,\\
 y_1 &= d_1g_0+d_2g_1+d_3g_2.
 \end{aligned}
 \qquad (8)
@@ -206,9 +206,9 @@ Direct convolution in <a href="#eq-direct-f23">Eq. 8</a> computes six products. 
 
 $$
 \begin{aligned}
-m_0&=(d_0-d_2)g_0,\cr
-m_1&=(d_1+d_2)(g_0+g_1+g_2)/2,\cr
-m_2&=(d_2-d_1)(g_0-g_1+g_2)/2,\cr
+m_0&=(d_0-d_2)g_0,\\
+m_1&=(d_1+d_2)(g_0+g_1+g_2)/2,\\
+m_2&=(d_2-d_1)(g_0-g_1+g_2)/2,\\
 m_3&=(d_1-d_3)g_2.
 \end{aligned}
 \qquad (9)
@@ -232,8 +232,8 @@ With multiple input channels, each $m_i$ becomes a sum of products over channels
 
 $$
 \begin{aligned}
-M_i &= V_iU_i,\cr
-V_i &: N_{\mathrm{tiles}}\times C_{\mathrm{in}},\cr
+M_i &= V_iU_i,\\
+V_i &: N_{\mathrm{tiles}}\times C_{\mathrm{in}},\\
 U_i &: C_{\mathrm{in}}\times C_{\mathrm{out}}.
 \end{aligned}
 \qquad (10)
@@ -528,7 +528,7 @@ The transform coefficients come from polynomial arithmetic. To see the construct
 
 $$
 \begin{aligned}
-a(z)&=a_0+a_1z,\cr
+a(z)&=a_0+a_1z,\\
 g(z)&=g_0+g_1z+g_2z^2.
 \end{aligned}
 \qquad (12)
@@ -542,9 +542,9 @@ Instead of forming all six pairwise products, evaluate the polynomials at $0$, $
 
 $$
 \begin{aligned}
-q_0 &= a_0g_0,\cr
-q_+ &= (a_0+a_1)(g_0+g_1+g_2),\cr
-q_- &= (a_0-a_1)(g_0-g_1+g_2),\cr
+q_0 &= a_0g_0,\\
+q_+ &= (a_0+a_1)(g_0+g_1+g_2),\\
+q_- &= (a_0-a_1)(g_0-g_1+g_2),\\
 q_\infty &= a_1g_2.
 \end{aligned}
 \qquad (13)
@@ -556,9 +556,9 @@ The notation $\infty$ means selecting the leading coefficient, not evaluating fl
 
 $$
 \begin{aligned}
-c_0 &= q_0,\cr
-c_1 &= (q_+-q_-)/2-q_\infty,\cr
-c_2 &= (q_++q_-)/2-q_0,\cr
+c_0 &= q_0,\\
+c_1 &= (q_+-q_-)/2-q_\infty,\\
+c_2 &= (q_++q_-)/2-q_0,\\
 c_3 &= q_\infty.
 \end{aligned}
 \qquad (14)
