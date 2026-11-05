@@ -5074,7 +5074,7 @@ def instantiate_sampler(
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
         max_num_sequences=max_num_sequences,
-        watermark_config=llm_args.watermark_config,
+        watermark_config=getattr(llm_args, "watermark_config", None),
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):

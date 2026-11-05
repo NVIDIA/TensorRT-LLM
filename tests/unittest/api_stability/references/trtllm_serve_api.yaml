@@ -287,7 +287,7 @@ models:
         kind: extension
         type: Optional[bool]
         default: null
-        status: stable
+        status: prototype
         required: false
       add_special_tokens:
         kind: extension
@@ -692,7 +692,7 @@ models:
         kind: extension
         type: Optional[bool]
         default: null
-        status: stable
+        status: prototype
         required: false
       prompt_ignore_length:
         kind: extension

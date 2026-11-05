@@ -28,7 +28,7 @@ out = llm.generate(["Write a short note about GPUs."], SamplingParams(temperatur
 | `key` | required | Secret integer in `[0, 2**64)`. Detection needs the same value. Excluded from `repr`. |
 | `context_width` | 4 | Number of preceding tokens that seed each decision, 1 to 64. Larger values are less robust to edits; above 16 a warning is logged. |
 | `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this; `"single_turn"` searches the tokens the request generates; `"all"` also searches the prompt (for example earlier turns of a conversation) and leaves the first `context_width` generated tokens unwatermarked. |
-| `deduplicate_contexts_max_history` | 8192 | How many generated positions back the repeat search reaches. `None` means the whole generation. |
+| `deduplicate_contexts_max_history` | 8192 | How many generated positions back the repeat search reaches. `None` means the whole generation. The repeat search keeps 8 bytes per position per sequence slot on the GPU: about 134 MB for 2048 slots at the default, and `None` sizes it to `max_seq_len`, which can take several GB. |
 | `allow_target_only_watermarking` | `False` | Only for speculative decoding with rejection sampling: leave accepted draft tokens unmarked (see below). |
 | `allow_request_opt_out` | `True` | Whether a request may set `SamplingParams.watermarking=False`. Set to `False` to enforce the watermark on every request that can carry one. |
 | `prf` | `"philox"` | Pseudo-random function. Fast but not cryptographic: it does not protect against key recovery or forgery. |
@@ -104,8 +104,11 @@ specific combinations:
 
 ## Limitations
 
-- Sampling becomes deterministic given the context. Requests with `n > 1` and the same prompt produce
-  the same text until their contexts diverge, and repeated contexts are not watermarked.
+- Sampling becomes deterministic given the context, and repeated contexts are not watermarked.
+- Parallel sampling (`n > 1`) is supported, but watermarked candidates can be identical while their
+  contexts remain identical. The same holds for repeated requests with the same prompt. A request
+  `seed` does not change a watermarked draw: it only affects the tokens that ordinary sampling picks
+  for repeated contexts, which is the only source of divergence between candidates.
 - Low-entropy output (code, short answers) and heavily edited text carry little signal.
 - A fixed key applies the same random values wherever a context recurs across requests. For answers
   of one token from a small set (multiple choice, labels) many requests share their context, so the key

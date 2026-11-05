@@ -257,8 +257,6 @@ def _validate_on_executor(request) -> None:
         _enable_penalty=False,
         _penalty_supported=True,
         _fused_sampling=False,
-        _watermark_config=None,
-        _watermark_unsupported_reason=None,
     )
     SpecSampler.validate_request(sampler, request)
 
