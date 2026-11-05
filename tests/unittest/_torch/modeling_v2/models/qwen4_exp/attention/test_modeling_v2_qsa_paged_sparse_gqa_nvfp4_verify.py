@@ -94,11 +94,13 @@ def build(
     global_v=1.0,
     request_dtype=torch.int32,
     pool_pages=None,
+    q_heads=24,
+    kv_heads=2,
 ):
     """The decode op's test state for `segments` ((first position, rows) per request, in row
     order) with `_selected_tokens(overlap)`."""
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    tpb, kv, d, q_heads = 32, 2, 256, 24
+    tpb, kv, d = 32, kv_heads, 256
     positions = torch.cat([torch.arange(s, s + n, device=DEV) for s, n in segments])
     req = torch.cat([torch.full((n,), i, device=DEV) for i, (_, n) in enumerate(segments)])
     rows = positions.numel()
@@ -152,9 +154,8 @@ def _args(spec, seed):
     if spec.get("gated"):
         rows = args["q"].shape[0]
         g = torch.Generator(device=DEV).manual_seed(seed + 1)
-        args["output_gate"] = torch.randn(rows, 24 * 256, generator=g, device=DEV).to(
-            torch.bfloat16
-        )
+        width = args["q"].shape[1] * args["q"].shape[2]
+        args["output_gate"] = torch.randn(rows, width, generator=g, device=DEV).to(torch.bfloat16)
     return args
 
 

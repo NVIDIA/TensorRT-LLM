@@ -433,6 +433,17 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
             spec=dict(_TP4, pos=tuple(1000 + 113 * r for r in range(72))),
         ),
         Cell(
+            why="tp4/tep4 rank, decode 32 requests, e4m3 pool (a rank of a kv_fp8 engine)",
+            spec=dict(_TP4, pos=tuple(2000 + 151 * r for r in range(32)), fp8=True),
+        ),
+        Cell(
+            why="tp4/tep4 rank, e4m3 pool, MTP-3 verify 10 requests x 4 rows, a group end among "
+            "them",
+            spec=dict(
+                _TP4, pos=tuple(3000 + 211 * r for r in range(10)), rows_per_request=4, fp8=True
+            ),  # fmt: skip
+        ),
+        Cell(
             why="dep4 rank, decode 16 requests at 20k..94k (ht's step), e4m3 pool",
             spec=dict(_DEP4, pos=_HT16, fp8=True),
         ),

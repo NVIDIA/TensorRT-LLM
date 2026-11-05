@@ -54,6 +54,8 @@ _ENGINE = dict(_CKPT, pool="engine", role_pages=24, layer_slot=11, slots=128, wi
 #: A tp4 / tep4 rank: one KV head, k and v at heads 6 and 7 of the fused projection row
 #: `[q 6 | k 1 | v 1 | gate 6 | index 3]` (17 heads of 256, row stride 4352).
 _TP4 = dict(_ENGINE, hkv=1, heads_q=6, row_pad_heads=9, row_stride=4352)
+#: The same rank under `kv_cache_config.dtype: fp8`: one KV head into an e4m3 pool.
+_TP4_FP8 = dict(_TP4, cache_dtype=torch.float8_e4m3fn)
 
 #: A dep4 rank (attention DP, every head): the tp1 row `[q 24 | k 2 | v 2 | gate 24 | index 3]`
 #: (55 heads, row stride 14080) over the kv_fp8 variant's e4m3 pool.
@@ -152,6 +154,11 @@ class QsaPagedKvStore(OpWrapper):
             why="fp8 decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
             spec=_spec(_MTP7_32, pages=1200, slots=40, cache_dtype=_F8),
         ),
+        Cell(
+            why="fp8 MTP7 at a tp4 / tep4 rank's draft layer: 32 requests x 8 rows of the packed "
+            "[6 + 1 + 1] row, one KV head",
+            spec=_spec(_MTP7_32, pages=1200, slots=40, cache_dtype=_F8, hkv=1, heads_q=6),
+        ),
         # The default target's members over the engine's own pool: one rank's page count, the
         # 24-role-page stride, layer 47's view, a 128-row table.
         Cell(
@@ -171,6 +178,20 @@ class QsaPagedKvStore(OpWrapper):
             why="tp4 context, 8192 rows (max_num_tokens): a mid-page chunk to 9215 and a "
             "request's first 1023",
             spec=_engine(_TP4, "tp4", _PREFILL_8192, PAGES_TEP4),
+        ),
+        Cell(
+            why="tep4 kv_fp8 decode, 128 rows: hkv 1 off the 4352-wide row into an e4m3 pool "
+            "of tep4's 257109 pages (a kv_fp8 engine holds more)",
+            spec=_engine(_TP4_FP8, "tep4", _DECODE_128, PAGES_TEP4),
+        ),
+        Cell(
+            why="tep4 kv_fp8 MTP7 verify, 128 requests x 8 rows (1024) to position 16383: hkv 1 "
+            "into an e4m3 pool, table width 516",
+            spec=_engine(_TP4_FP8, "tep4", _MTP7_128, PAGES_TEP4, width=516),
+        ),
+        Cell(
+            why="tp4 kv_fp8 context, 8192 rows (max_num_tokens): hkv 1 into an e4m3 pool",
+            spec=_engine(_TP4_FP8, "tp4", _PREFILL_8192, PAGES_TEP4),
         ),
         Cell(
             why="dep4 kv_fp8 decode, 32 rows: hkv 2 off the 14080-wide row into a "
@@ -228,7 +249,7 @@ class QsaPagedKvStore(OpWrapper):
 
     Not certified: duplicate destinations, multiple devices, a scaled fp8
     pool (there is no scale argument), fp8 conversion of values past 448, the
-    packed-QKV-row (MTP draft layer) layout over a bf16 pool or at one KV head,
+    packed-QKV-row (MTP draft layer) layout over a bf16 pool,
     fp16 rows, head geometry other than D 256 with Hkv 1 or 2 and 32-token
     pages, int32 positions or int64 request indices, head-major rows, sliced
     or transposed tables, `rows == 0`, and of the rows that resolve to no slot

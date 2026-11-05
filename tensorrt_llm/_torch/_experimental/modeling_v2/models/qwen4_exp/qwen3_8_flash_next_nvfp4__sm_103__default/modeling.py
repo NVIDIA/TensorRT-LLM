@@ -428,6 +428,10 @@ from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
+    FLASHINFER_REPLAY_RING_SIZE,
+    flashinfer_cached_replay_update,
+)
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
@@ -921,13 +925,33 @@ def _moe_layer_scalars_cd(w, i: int) -> dict[str, torch.Tensor]:
 
 
 class _Replay(NamedTuple):
-    """The GDN cached replay's history buffers and bookkeeping of one manager."""
+    """The GDN cached replay's history buffers and bookkeeping of one manager: two history
+    halves a slot (`old`, the Triton / CuTe replay), or, under FlashInfer's ring replay
+    (`TRTLLM_USE_GDN_FLASHINFER_REPLAY`), a 32-row ring a slot (`ring`, `cache_base`)."""
 
-    old: dict  # GDN layer -> (old_x, old_B, old_dt, old_dA_cumsum)
+    old: dict  # GDN layer -> (old_x, old_B, old_dt, old_dA_cumsum); empty under the ring
     cache_buf_idx: torch.Tensor  # [slots] int32: the history half each slot writes next
     prev_num_accepted: torch.Tensor  # [slots] int32: tokens pending since the checkpoint
     history: int  # rows a history half holds
     width: int  # the one verify width a step may carry per generation request
+    ring: dict | None = None  # GDN layer -> (k_ring, u_ring, g_ring), FlashInfer's layout
+    cache_base: torch.Tensor | None = None  # [slots] int32: each slot's ring start
+
+
+def _check_replay_ring(g, layer: int, slots: int, k_ring, u_ring, g_ring) -> None:
+    """One GDN layer's FlashInfer ring buffers at this rank's heads: `[slots, H, 32, K]`,
+    `[slots, HV, 32, V]` in the state's bf16 and `[slots, HV, 32]` fp32 cumulative gates."""
+    ring = FLASHINFER_REPLAY_RING_SIZE
+    shapes = (
+        (k_ring, (slots, g.num_k_heads, ring, g.head_k_dim), torch.bfloat16),
+        (u_ring, (slots, g.num_v_heads, ring, g.head_v_dim), torch.bfloat16),
+        (g_ring, (slots, g.num_v_heads, ring), torch.float32),
+    )
+    for t, shape, dtype in shapes:
+        assert t is not None and tuple(t.shape) == shape and t.dtype == dtype, (
+            f"layer {layer}: a FlashInfer replay ring of {None if t is None else tuple(t.shape)} "
+            f"{None if t is None else t.dtype}; this rank's heads need {shape} {dtype}"
+        )
 
 
 class _Bound(NamedTuple):
@@ -1567,10 +1591,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"KV addressing over {len(pools)} pools is not certified; layer->pool ids "
             f"{sorted(pools)}"
         )
-        assert self.quant_mode != QM_NVFP4_KV_CACHE or md.use_paged_context_fmha, (
-            "an NVFP4 KV cache is read by the paged-context attention kernels only, which the "
-            "engine enables for chunked prefill, KV cache block reuse or speculative decoding"
-        )
         g = _pool.pool_geometry(
             self.model_config.pretrained_config,
             self.mapping,
@@ -1677,10 +1697,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 "(TRTLLM_USE_GDN_REPLAY=0), which this target does not assemble; leave "
                 "TRTLLM_USE_GDN_REPLAY unset for the cached replay"
             )
-        assert not getattr(cm, "use_gdn_flashinfer_ring_replay", False), (
-            "the manager laid its replay history out for the FlashInfer ring kernel; this "
-            "target runs the double-buffered Triton cached replay"
-        )
         assert layer_caches[g0].intermediate_ssm is None, (
             "the cache manager runs the cached-replay verify path and also allocated a "
             "per-step recurrent buffer; the runtime allocates one or the other"
@@ -1690,6 +1706,27 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         _pool.check_replay_state(
             history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0
         )
+        if getattr(cm, "use_gdn_flashinfer_ring_replay", False):
+            # FlashInfer's ring replay (the manager chose it at load: MTP with 3 or 7 drafts
+            # over a bf16 state): a 32-row ring of history a slot and layer, folded in-kernel.
+            ring = {}
+            for i, cache in layer_caches.items():
+                ring[i] = (cache.k_ring, cache.u_ring, cache.g_ring)
+                _check_replay_ring(g, i, ssm0.shape[0], *ring[i])
+            cache_base = layer_caches[g0].cache_base
+            assert cache_base is not None and tuple(cache_base.shape) == (ssm0.shape[0],), (
+                "the ring replay's per-slot start is missing or not one entry per slot"
+            )
+            replay = _Replay(
+                {},
+                meta.cache_buf_idx,
+                meta.prev_num_accepted_tokens,
+                history,
+                width,
+                ring,
+                cache_base,
+            )
+            return dict(int_idx=int_idx, int_conv=int_conv, replay=replay)
         old = {}
         for i, cache in layer_caches.items():
             old[i] = (cache.old_x, cache.old_B, cache.old_dt, cache.old_dA_cumsum)
@@ -2226,9 +2263,12 @@ def _verify_state(core, mm, num_decodes: int) -> tuple:
     `update_mamba_states` promotes the conv windows from, and the replay's work items. Work
     items go to the kernel from `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests on, and the
     kernel leaves the history commit to the manager's all-layer commit exactly when the
-    manager runs one after the step -- the stock Gated-DeltaNet layer's two conditions."""
+    manager runs one after the step -- the stock Gated-DeltaNet layer's two conditions. The
+    FlashInfer ring replay folds in-kernel and reads no work items."""
     assert core._bound.int_idx is not None, "the cache-manager bind has not run"
     int_idx = core._bound.int_idx[:num_decodes]
+    if core._bound.replay.ring is not None:
+        return int_idx, None, None, False
     partitioned = num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
     all_layer = partitioned and bool(
         getattr(core._bound.cm, "use_gdn_cached_replay_all_layer_commit", False)
@@ -2260,7 +2300,8 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
     replay = core._bound.replay
     ssm = pools.ssm[i]
     cute = ssm.dtype == torch.bfloat16
-    pdl = _GDN_REPLAY_PDL and cute
+    # Only the CuTe replay is launched as the conv's programmatic dependent.
+    pdl = _GDN_REPLAY_PDL and cute and replay.ring is None
     if mq_out is None:
         # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major.
         x3 = torch.transpose(torch.reshape(mq, [n, p, core.conv_dim]), 1, 2)
@@ -2280,8 +2321,32 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
         )
         # Back to token-major: one contiguous copy, which the kernel reads q/k/v from directly.
         mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
-    old_x, old_B, old_dt, old_dA = replay.old[i]
     qv, kv, vv = torch.split(mq_out, [core.key_dim, core.key_dim, core.value_dim], 1)
+    if replay.ring is not None:
+        # FlashInfer's ring replay reads q/k/v as column slices of `mq_out` (one token stride)
+        # and `a` / `b` through their row stride, and the per-row history length and ring
+        # start gathered by slot; the manager advances both after the step.
+        k_ring, u_ring, g_ring = replay.ring[i]
+        slots = si_d.long()
+        out = flashinfer_cached_replay_update(
+            q=torch.reshape(qv, [n, p, core.num_k_heads, core.head_k_dim]),
+            k=torch.reshape(kv, [n, p, core.num_k_heads, core.head_k_dim]),
+            v=torch.reshape(vv, [n, p, core.num_v_heads, core.head_v_dim]),
+            a=torch.reshape(a, [n, p, core.num_v_heads]),
+            b=torch.reshape(b, [n, p, core.num_v_heads]),
+            A_log=L.a_log,
+            dt_bias=L.dt_bias,
+            ssm_states=ssm,
+            state_indices=si_d,
+            k_ring=k_ring,
+            u_ring=u_ring,
+            g_ring=g_ring,
+            hist_len=replay.prev_num_accepted[slots],
+            cache_base=replay.cache_base[slots],
+            history_size=replay.history,
+        )
+        return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
+    old_x, old_B, old_dt, old_dA = replay.old[i]
     if cute:
         replay_op = gdn_cached_replay_cute
     else:
@@ -3506,9 +3571,11 @@ def _copy_positions(position_ids: torch.Tensor) -> torch.Tensor:
     return pos3
 
 
-def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens) -> dict:
+def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens, paged_context) -> dict:
     """thop_attention's batch state off the prepared metadata. Tensors are engine-owned
-    persistent buffers refreshed in place; Python ints are per-capture constants."""
+    persistent buffers refreshed in place; Python ints are per-capture constants.
+    `paged_context` forces the paged-context path the engine enables only for chunked prefill
+    or KV cache block reuse: an NVFP4 pool's context kernels exist on it alone."""
     return dict(
         sequence_length=md.kv_lens_cuda_runtime,
         host_past_key_value_lengths=md.kv_lens_runtime,
@@ -3529,7 +3596,7 @@ def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens) -> dic
         num_contexts=num_contexts,
         num_ctx_tokens=num_ctx_tokens,
         trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-        use_paged_context_fmha=md.use_paged_context_fmha,
+        use_paged_context_fmha=md.use_paged_context_fmha or paged_context,
         beam_width=md.effective_beam_width,
         cache_indirection=md.cache_indirection,
         block_ids_per_seq=md.block_ids_per_seq,
@@ -3659,7 +3726,9 @@ class PrefillTarget:
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's batch state."""
-        return _step_args(md, md.num_contexts, md.num_ctx_tokens)
+        return _step_args(
+            md, md.num_contexts, md.num_ctx_tokens, self.core.quant_mode == QM_NVFP4_KV_CACHE
+        )
 
     # --------------------------------------------------------------- blocks ---
 
@@ -4634,7 +4703,12 @@ class DecodeTarget:
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """See PrefillTarget.step_args. Context counts are stated, not read: routing
         guarantees them, and a decode-only CUDA graph would freeze whatever it read."""
-        return _step_args(md, num_contexts=0, num_ctx_tokens=0)
+        return _step_args(
+            md,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            paged_context=self.core.quant_mode == QM_NVFP4_KV_CACHE,
+        )
 
     # --------------------------------------------------------------- blocks ---
 

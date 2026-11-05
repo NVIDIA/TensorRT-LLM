@@ -83,6 +83,26 @@ _DEP4 = dict(pages=292, slots=32, slot_pages=24, layer=11)
 _OFFSET_EDGE = 2**31
 
 
+#: One tp4 / tep4 rank's engine under `kv_nvfp4`: 6 q heads and one of the 2 KV heads,
+#: `max_batch_size` 128 and MTP's `max_seq_len` 16384 give a `[128, 516]` table, the same trunk
+#: layout. A page of layer 11's scale plane advances 24 x 1 x 32 x 16 bytes, so 2^31 bytes lies
+#: at page 174763 (the data plane's at 21846).
+_TP4 = dict(q_heads=6, kv_heads=1, pages=516, slots=128, slot_pages=24, layer=11)
+
+
+def _tp4_context(segments, pool_pages) -> dict:
+    """A context step of a tp4 / tep4 rank's kv_nvfp4 engine: the prefill pair, the prefill
+    kernel, at 6 q heads a KV head."""
+    return _decode(
+        segments,
+        launches=_PREFILL,
+        prefill_pair=True,
+        pool_pages=pool_pages,
+        offset_edge=_OFFSET_EDGE,
+        **_TP4,
+    )
+
+
 def _dep4_context(segments, pool_pages) -> dict:
     """A context step of dep4's kv_nvfp4 engine: the prefill pair, the prefill kernel."""
     return _decode(
@@ -970,6 +990,12 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
             "selection budget; 87401 pages (not a multiple of 16)",
             spec=_dep4_context(((8960, 256), (0, 160), (2000, 64), (5000, 32)), pool_pages=87401),
         ),
+        Cell(
+            why="tp4/tep4 8192-row context chunk at 6 q / 1 kv head: a request at 8320..16383 "
+            "(MTP's max_seq_len, table column 511) and one from 0, [128, 516] table, trunk "
+            "layout, pages straddling 2^31 bytes of the scale plane; 174900 pages",
+            spec=_tp4_context(((8320, 8064), (0, 128)), pool_pages=174900),
+        ),
     )
 
     note = """
@@ -1048,7 +1074,7 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     deterministic.
 
     Every row, request, page and position index is widened to 64 bits before any
-    product. Not certified: head geometries other than 24/2 x 256;
+    product. Not certified: head geometries other than 24/2 and 6/1 x 256;
     `tokens_per_block` other than 32; more than 8192 rows; capture of the
     context/mixed site; a pool of one slot; second-level scales other than 1.0
     (the target binds ones); the prefill pair on the split-K kernel (256 context

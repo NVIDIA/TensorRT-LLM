@@ -39,6 +39,8 @@ l0_gb300_multi_gpus:
   # pre-merge (l0_gb300); mmmu runs in QA (llm_function_core).
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_nvfp4_kv_no_reuse] TIMEOUT (60)
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_disaggregated_dep2 TIMEOUT (90)
   # qwen4_exp target at tp1, post-merge: its AgentX engines (NVFP4 KV, MTP2 with rejection
   # sampling, the breakable prefill graph, every opt-in projection) on one context and one

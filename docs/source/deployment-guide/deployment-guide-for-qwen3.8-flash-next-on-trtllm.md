@@ -220,6 +220,7 @@ It supports these single-node layouts:
 Under `auto`, these settings make the server fall back to the built-in model; under `require`, the server fails at startup:
 
 * Any other layout, including `enable_lm_head_tp_in_adp: true` with attention DP.
+* A checkpoint of the same shape whose config changes what it computes, for example `norm_topk_prob: false`, another `num_experts_per_tok`, or other rope settings.
 * Speculative decoding other than one-model MTP, or a draft length that changes at runtime.
 * MTP with `TRTLLM_USE_GDN_REPLAY=0`.
 * A KV cache dtype other than the checkpoint's bf16, `fp8` or `nvfp4`.

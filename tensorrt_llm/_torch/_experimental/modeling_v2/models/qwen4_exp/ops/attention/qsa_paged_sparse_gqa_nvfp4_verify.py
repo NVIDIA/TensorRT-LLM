@@ -1961,6 +1961,32 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
             spec=_verify(tuple((2100 + (37 * i) % 1900, 4) for i in range(256)), gated=True),
         ),
         Cell(
+            why="tep4 MTP3 verify, 32 requests x 4 rows at a rank's 6 q / 1 kv head: 24 MMA rows "
+            "a group, gate fused, the MTP engine's [128, 516] table",
+            spec=_verify(
+                tuple((2100 + (53 * i) % 1900, 4) for i in range(32)),
+                gated=True,
+                q_heads=6,
+                kv_heads=1,
+                slots=128,
+                pages=516,
+            ),
+        ),
+        Cell(
+            why="tep4 MTP3 verify at 512 rows (128 requests x 4, the largest captured batch) at "
+            "6 q / 1 kv head, gate fused, trunk layout",
+            spec=_verify(
+                tuple((2100 + (37 * i) % 14000, 4) for i in range(128)),
+                gated=True,
+                q_heads=6,
+                kv_heads=1,
+                slots=128,
+                pages=516,
+                slot_pages=24,
+                layer=11,
+            ),
+        ),
+        Cell(
             why="groups spanning requests (3, 4, 4, 1, 4 x 5, 2 rows: misaligned and partial "
             "groups), early positions, int64 request indices, non-unit global scales, trunk "
             "layout",
@@ -2002,6 +2028,10 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
     SM), followed by the row merge; past one wave the units of the full waves take one
     CTA each (bf16 output, the gate fused) and the units of the partial last wave two to four,
     only their rows merged.
+
+    Head geometries: tp1 / dep4's 24 q over 2 KV heads and a tp4 / tep4 rank's 6 over 1 (24
+    MMA rows a group at T = 4), each held by the cells against `reference` and the per-row
+    kernel.
 
     GB300, one layer, cold L2, T = 4, the decode step's call (output gate on) on MTP3 verify
     selections dumped from a served run (a request's rows' union 1.4-1.7x a row's selection,

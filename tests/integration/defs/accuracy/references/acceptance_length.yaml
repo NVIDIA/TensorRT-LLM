@@ -243,6 +243,15 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_nvfp4_kv:
 ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_fp8_kv:
   ref_al: 3.512
   min_al: 3.34
+# Read by test_mtp3_gsm8k_quantized_kv's pass keys (3k-6k tokens, the sparse attention path):
+# the NVFP4 cases at tp4 and tep4 (6 query heads a KV head) and the FP8 cases at dep4 and tep4.
+# modeling_v2's own readings on GB300; min_al 2.5% below, as for tp1_mtp3_long_context.
+ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_nvfp4_kv_long_context:
+  ref_al: 3.962
+  min_al: 3.86
+ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_fp8_kv_long_context:
+  ref_al: 3.962
+  min_al: 3.86
 # Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context
 # (test_qwen4_exp.py), over the pass keys of tp1_mtp3_long_context at tep4: three drafts with
 # IndexShare on, bf16 KV.

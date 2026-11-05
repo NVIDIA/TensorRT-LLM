@@ -181,6 +181,19 @@ def _qwen4_exp_config(**vision_overrides):
         num_attention_heads=24,
         linear_num_value_heads=48,
         vocab_size=248320,
+        # The settings the target pins (`routing._TEXT_SETTINGS`), as the normalized config
+        # carries them: rope theta and partial factor flattened to the top level.
+        norm_topk_prob=True,
+        num_experts_per_tok=10,
+        hidden_act="silu",
+        num_key_value_heads=2,
+        head_dim=256,
+        attention_bias=False,
+        output_gate_type="sigmoid",
+        tie_word_embeddings=False,
+        rope_theta=10000000,
+        partial_rotary_factor=0.25,
+        rope_scaling=dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True),
     )
     vision = dict(
         depth=27,

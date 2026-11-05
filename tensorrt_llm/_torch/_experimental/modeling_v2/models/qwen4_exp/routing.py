@@ -37,6 +37,31 @@ _SM = (10, 3)
 # also matches fine-tunes; the accuracy gate pins identity.
 _TEXT_SHAPE = (48, 2560, 512, 24, 48, 248320)
 
+# The checkpoint's settings that change what it computes without changing a weight's shape,
+# at the values the target implements: a fine-tune of the same shape that changed one would
+# load and run with wrong logits and no error. Read off the text config as the target reads
+# them (`_text_settings`).
+_TEXT_SETTINGS = {
+    # The routed experts: Renormalize routing over the top 10 and a SiLU activation.
+    "norm_topk_prob": True,
+    "num_experts_per_tok": 10,
+    "hidden_act": "silu",
+    # Attention: two KV heads of 256, no projection bias, a sigmoid output gate, and an output
+    # head of its own.
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "attention_bias": False,
+    "output_gate_type": "sigmoid",
+    "tie_word_embeddings": False,
+    # Rope: a quarter of the head (64 dims), theta 1e7, interleaved mRoPE over sections
+    # 11 / 11 / 10, unscaled.
+    "rope_theta": 1e7,
+    "partial_rotary_factor": 0.25,
+    "mrope_section": (11, 11, 10),
+    "mrope_interleaved": True,
+    "rope_factor": None,
+}
+
 # (depth, hidden, heads, merge, out_hidden, num_pos, deepstack_indexes, act).
 # `deepstack_visual_indexes == ()` is the key member: a deepstack sibling has a merger
 # list these targets lack.
@@ -108,6 +133,24 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
         prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
         load_balancer=llm_args.moe_config.load_balancer is not None,
     )
+
+
+def _text_settings(text) -> dict:
+    """`_TEXT_SETTINGS`' entries as `text` declares them. The rope fields are the target's
+    reading: the `rope_parameters` dict, or the flattened `rope_scaling` with the theta and
+    the partial factor at the top level."""
+    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None) or {}
+    settings = {name: getattr(text, name, None) for name in _TEXT_SETTINGS}
+    settings.update(
+        rope_theta=rope.get("rope_theta", getattr(text, "rope_theta", None)),
+        partial_rotary_factor=rope.get(
+            "partial_rotary_factor", getattr(text, "partial_rotary_factor", None)
+        ),
+        mrope_section=tuple(rope.get("mrope_section") or ()),
+        mrope_interleaved=rope.get("mrope_interleaved"),
+        rope_factor=rope.get("factor"),
+    )
+    return settings
 
 
 def layout(mapping: Mapping) -> Optional[str]:
@@ -302,6 +345,14 @@ def route(
     )
 
     checkpoint = compute_capability == _SM and shape == _TEXT_SHAPE and vshape == _VISION_SHAPE
+    if checkpoint:
+        settings = _text_settings(text)
+        differs = {k: v for k, v in settings.items() if v != _TEXT_SETTINGS[k]}
+        if differs:
+            raise NoTarget(
+                f"the checkpoint has Qwen3.8-Flash-Next's shape but declares {differs}; the "
+                f"target implements { ({k: _TEXT_SETTINGS[k] for k in differs}) }"
+            )
     # Qwen3.8-Flash-Next-NVFP4 on GB300s (sm103): on one at tp1, on four at tp4, tep4 or dep4,
     # MTP-Eagle or no speculation; on two at dep2, without speculation.
     member = layout(mapping)

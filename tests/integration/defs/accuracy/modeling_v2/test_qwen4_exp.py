@@ -397,12 +397,17 @@ _TP4 = dict(
 # Attention replicated, each rank serving its own requests; the routed experts by expert.
 _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
 
-# The quantized KV pools, one layout each: NVFP4 at tp4 with the breakable prefill graph
-# (routed at attention TP only), FP8 at dep4 (MTP under attention DP, each rank drafting for
-# its own requests).
+# The quantized KV pools: NVFP4 at tp4 with the breakable prefill graph (routed at attention
+# TP only); FP8 at dep4 (MTP under attention DP, each rank drafting for its own requests); FP8
+# at tep4 over FlashInfer's ring replay (`TRTLLM_USE_GDN_FLASHINFER_REPLAY=force`, which fails
+# the build if the ring cannot run); NVFP4 at tep4 with chunked prefill and block reuse off, so
+# the engine leaves its paged-context attention off and the target takes it for the NVFP4 pool.
+# The attention-TP cases run 6 query heads a KV head on each rank.
 _QUANTIZED_KV = [
-    pytest.param(_TP4, "nvfp4", True, id="tp4_nvfp4_kv_breakable"),
-    pytest.param(_DEP4, "fp8", False, id="dep4_fp8_kv"),
+    pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
+    pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
+    pytest.param(_TEP4, "fp8", dict(flashinfer_ring=True), id="tep4_fp8_kv_flashinfer_ring"),
+    pytest.param(_TEP4, "nvfp4", dict(paged_context=False), id="tep4_nvfp4_kv_no_reuse"),
 ]
 
 
@@ -713,24 +718,34 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("parallel, kv_dtype, breakable", _QUANTIZED_KV)
-    def test_mtp3_gsm8k_quantized_kv(self, mocker, parallel, kv_dtype, breakable):
-        """gsm8k with three drafts over a quantized KV pool, block reuse and chunked prefill.
+    @pytest.mark.parametrize("parallel, kv_dtype, variant", _QUANTIZED_KV)
+    def test_mtp3_gsm8k_quantized_kv(self, mocker, parallel, kv_dtype, variant):
+        """gsm8k, then pass keys over 3k-6k tokens, with three drafts over a quantized KV pool.
 
-        gsm8k reads the MTP row of references/gsm8k.yaml for that KV dtype, its acceptance
-        length held to that dtype's floor in references/acceptance_length.yaml.
+        Block reuse and chunked prefill are on unless the case turns them off. gsm8k reads the
+        MTP row of references/gsm8k.yaml for that KV dtype; the pass keys are past the QSA
+        indexer's 2048-token budget, so they take the sparse attention path over the quantized
+        pool, which gsm8k never leaves. Both acceptance lengths are held to that dtype's floors
+        in references/acceptance_length.yaml.
         """
+        paged_context = variant.get("paged_context", True)
         kv_cache_config = KvCacheConfig(
             dtype=kv_dtype,
             free_gpu_memory_fraction=0.6,
-            enable_block_reuse=True,
+            enable_block_reuse=paged_context,
             mamba_ssm_cache_dtype="bfloat16",
         )
-        engine = dict(self.ENGINE_MTP, enable_chunked_prefill=True, kv_cache_config=kv_cache_config)
-        if breakable:
+        engine = dict(
+            self.ENGINE_MTP, enable_chunked_prefill=paged_context, kv_cache_config=kv_cache_config
+        )
+        if variant.get("breakable"):
             engine.update(self.BREAKABLE_PREFILL)
+        env = dict(_VALIDATE)
+        if variant.get("flashinfer_ring"):
+            env["TRTLLM_USE_GDN_FLASHINFER_REPLAY"] = "force"
+        key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
         with (
-            scoped_env_overrides(_VALIDATE) as rank_env,
+            scoped_env_overrides(env) as rank_env,
             LLM(
                 self.MODEL_PATH,
                 speculative_config=self.MTP3,
@@ -741,8 +756,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
                 env_overrides=rank_env,
             ) as llm,
         ):
-            self._gsm8k(
-                mocker, llm, f"mtp3 {kv_dtype} kv", f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
+            self._gsm8k(mocker, llm, f"mtp3 {kv_dtype} kv", key)
+            self._passkeys(
+                llm, _PASSKEY_LENGTHS, 3, f"{key}_long_context", f"mtp3 {kv_dtype} kv long context"
             )
 
     @skip_not_sm103

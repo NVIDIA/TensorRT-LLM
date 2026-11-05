@@ -74,6 +74,16 @@ _DEP4_DECODE = ((9215, 1), (0, 1), (31, 1), (32, 1), (33, 1)) + tuple(
 )
 
 
+#: One tp4 / tep4 rank's kv_nvfp4 pool: one KV head (k and v at heads 6 and 7 of the packed
+#: `[q 6 | k 1 | v 1]` row), the trunk layout and a `[128, 516]` table (MTP's max_seq_len
+#: 16384). A slot's 24 role pages of one KV head are half dep4's, so the same pool bytes hold
+#: twice the slots: 426590 puts the stores past 2^31 bytes of both planes.
+_TP4_PAGES = 426590
+_TP4 = dict(
+    hkv=1, heads_q=6, slots=128, width=516, slot_pages=24, layer=11, last_page=0, large=True
+)
+
+
 def _spec(segments, pages, **overrides) -> dict:
     """`segments` is `(first position, rows)` per request, in row order."""
     return {**_CKPT, "segments": segments, "pages": pages, **overrides}
@@ -413,6 +423,16 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
             why="dep4 kv_nvfp4 decode: 32 requests of the 128 table rows at positions 0..9215 "
             "across page edges, on the rank's 213295-slot pool",
             spec=_spec(_DEP4_DECODE, pages=_DEP4_PAGES, **_DEP4),
+        ),
+        Cell(
+            why="tep4 kv_nvfp4 decode: 32 requests at positions 0..16383, one KV head, the last "
+            "request's last page on the pool's last slot",
+            spec=_spec(((16383, 1),) + _DEP4_DECODE[1:], pages=_TP4_PAGES, **_TP4),
+        ),
+        Cell(
+            why="tp4 kv_nvfp4 context chunk: 8192 rows (max_num_tokens) at one KV head, a prompt's "
+            "chunk to position 16383 and another's first 1024",
+            spec=_spec(((9216, 7168), (0, 1024)), pages=_TP4_PAGES, **_TP4),
         ),
         Cell(
             why="dep4 kv_nvfp4 context chunk: 8192 rows (max_num_tokens), one prompt's chunk at "

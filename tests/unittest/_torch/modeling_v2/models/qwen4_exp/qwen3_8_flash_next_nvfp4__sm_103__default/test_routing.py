@@ -89,6 +89,19 @@ def _qwen4_exp_config(text_overrides=None, **vision_overrides):
         num_attention_heads=24,
         linear_num_value_heads=48,
         vocab_size=248320,
+        # The settings the target pins (`routing._TEXT_SETTINGS`), as the normalized config
+        # carries them: rope theta and partial factor flattened to the top level.
+        norm_topk_prob=True,
+        num_experts_per_tok=10,
+        hidden_act="silu",
+        num_key_value_heads=2,
+        head_dim=256,
+        attention_bias=False,
+        output_gate_type="sigmoid",
+        tie_word_embeddings=False,
+        rope_theta=10000000,
+        partial_rotary_factor=0.25,
+        rope_scaling=dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True),
     )
     text.update(text_overrides or {})
     vision = dict(
@@ -320,6 +333,55 @@ def test_another_checkpoint_shape_declines():
     _declined(config, match="text shape")
 
 
+_ROPE = dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True)
+
+
+@pytest.mark.parametrize(
+    "override, field",
+    [
+        (dict(norm_topk_prob=False), "norm_topk_prob"),
+        (dict(num_experts_per_tok=8), "num_experts_per_tok"),
+        (dict(hidden_act="gelu"), "hidden_act"),
+        (dict(num_key_value_heads=4), "num_key_value_heads"),
+        (dict(attention_bias=True), "attention_bias"),
+        (dict(output_gate_type="silu"), "output_gate_type"),
+        (dict(tie_word_embeddings=True), "tie_word_embeddings"),
+        (dict(rope_theta=1e6), "rope_theta"),
+        (dict(partial_rotary_factor=0.5), "partial_rotary_factor"),
+        (dict(rope_scaling=dict(_ROPE, mrope_interleaved=False)), "mrope_interleaved"),
+        (dict(rope_scaling=dict(_ROPE, mrope_section=[16, 8, 8])), "mrope_section"),
+        (dict(rope_scaling=dict(_ROPE, factor=4.0)), "rope_factor"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else None,
+)
+def test_a_same_shape_checkpoint_with_other_settings_declines(override, field):
+    """A fine-tune with the checkpoint's shape that changes what it computes, which the target
+    would run with wrong logits and no error: `auto` keeps the built-in model."""
+    config = _model_config(pretrained_config=_qwen4_exp_config(override), **_LAYOUTS["tep4"])
+    _declined(config, match=f"'{field}'")
+
+
+def test_the_settings_read_off_the_rope_parameters_dict():
+    """A config that keeps its rope fields in `rope_parameters` (theta and partial factor
+    inside) is read the same way, as the target reads it."""
+    rope = dict(
+        rope_type="default",
+        rope_theta=10000000,
+        partial_rotary_factor=0.25,
+        mrope_section=[11, 11, 10],
+        mrope_interleaved=True,
+    )
+    text = dict(
+        rope_parameters=rope, rope_scaling=None, rope_theta=None, partial_rotary_factor=None
+    )
+    _claimed(_model_config(pretrained_config=_qwen4_exp_config(text), **_LAYOUTS["tep4"]))
+    text["rope_parameters"] = dict(rope, rope_theta=5e6)
+    _declined(
+        _model_config(pretrained_config=_qwen4_exp_config(text), **_LAYOUTS["tep4"]),
+        match="'rope_theta'",
+    )
+
+
 def test_a_deepstack_vision_tower_declines():
     config = _model_config(
         pretrained_config=_qwen4_exp_config(deepstack_visual_indexes=[5, 11, 17]),
@@ -340,6 +402,31 @@ def test_sm100_declines(monkeypatch):
 @pytest.mark.parametrize("member", sorted(_LAYOUTS))
 def test_quantized_kv_cache_dtypes_match(member, dtype):
     _claimed(_model_config(**_LAYOUTS[member]), kv_cache_config=KvCacheConfig(dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    "chunked, reuse",
+    [(False, False), (True, False), (False, True)],
+    ids=["neither", "chunked_prefill", "block_reuse"],
+)
+@pytest.mark.parametrize("dtype", ["fp8", "nvfp4"])
+def test_a_quantized_kv_cache_matches_with_or_without_the_paged_context_path(dtype, chunked, reuse):
+    """The engine enables its paged-context attention only for chunked prefill or block reuse;
+    the target takes it for an NVFP4 pool either way, so neither setting is declined."""
+    _claimed(
+        _model_config(**_LAYOUTS["tep4"]),
+        enable_chunked_prefill=chunked,
+        kv_cache_config=KvCacheConfig(dtype=dtype, enable_block_reuse=reuse),
+    )
+
+
+@pytest.mark.parametrize("value", ["1", "force"])
+@pytest.mark.parametrize("max_draft_len", [3, 7])
+def test_mtp_matches_with_the_flashinfer_ring_replay(monkeypatch, max_draft_len, value):
+    """`TRTLLM_USE_GDN_FLASHINFER_REPLAY` lays the replay history out as FlashInfer's ring at 3
+    and 7 drafts over a bf16 state, which the target's verify step runs."""
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", value)
+    _claimed(_model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_LAYOUTS["tep4"]))
 
 
 def test_other_kv_cache_algorithms_decline():

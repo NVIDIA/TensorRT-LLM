@@ -23,6 +23,8 @@
    "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_disaggregated_dep2": 382.8,
    "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context": 468.77,
    "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv]": 377.08,
+   "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring]": 700.0,
+   "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_nvfp4_kv_no_reuse]": 700.0,
    "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable]": 597.49,
    "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_mmmu": 793.46,
    "accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_breakable_prefill_matches_eager": 730.6153846153846,

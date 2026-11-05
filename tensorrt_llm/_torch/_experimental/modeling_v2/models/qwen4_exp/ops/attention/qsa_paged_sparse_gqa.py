@@ -74,6 +74,9 @@ _OFFSET_EDGE = 2**31
 #: 516 at MTP's 16384.
 _TP4 = dict(q_heads=6, kv_heads=1, slots=128, pages=292, **_TRUNK)
 _TP4_MTP = dict(_TP4, pages=516)
+#: The same ranks under `kv_cache_config.dtype: fp8`: an e4m3 pool at 6 q heads a KV head.
+_TP4_FP8 = dict(_TP4, **_FP8)
+_TP4_MTP_FP8 = dict(_TP4_MTP, **_FP8)
 #: One dep4 rank (attention DP): tp1's 24 / 2 heads and a 32-row table (128 requests over 4
 #: ranks); a bf16 pool, or the kv_fp8 variant's e4m3 pool.
 _DEP4 = dict(q_heads=24, kv_heads=2, slots=32, pages=292, **_TRUNK)
@@ -252,6 +255,35 @@ class QsaPagedSparseGqa(OpWrapper):
             ),
         ),
         Cell(
+            why="tep4 kv_fp8 gated decode 32 x 1 row: 6 q / 1 kv head over an e4m3 pool, q and "
+            "the gate off the 17-head fused row, 32-way split-K + gated merge",
+            spec=_default(_spread(32, 1, 9215), _TP4_FP8, _SPLIT_K, splits=32, **_TP4_ROW),
+        ),
+        Cell(
+            why="tep4 kv_fp8 MTP3 gated verify 128 x 4 rows = 512: 6 q / 1 kv head over an e4m3 "
+            "pool, 4-way split-K + gated merge, [128, 516] table, rows to position 16383",
+            spec=_default(
+                _spread(128, 4, 16380),
+                _TP4_MTP_FP8,
+                _SPLIT_K,
+                splits=4,
+                rows_per_request=4,
+                **_TP4_ROW,
+            ),
+        ),
+        Cell(
+            why="tep4 kv_fp8 8192-row context step with the prefill pair: 6 q / 1 kv head over "
+            "an e4m3 pool on the prefill kernel, q off the 17-head fused row",
+            spec=_default(
+                ((0, 8065),) + _spread(127, 1, 9215),
+                _TP4_FP8,
+                _PREFILL,
+                prefill_pair=True,
+                q_layout="fused_row",
+                row_heads=17,
+            ),
+        ),
+        Cell(
             why="dep4 core gated decode 32 x 1 row: 24 q / 2 kv heads over a bf16 pool, q and "
             "the gate off the 55-head (14080-wide) fused row, 8-way split-K + gated merge",
             spec=_default(_spread(32, 1, 9215), _DEP4, _SPLIT_K, splits=8, **_DEP4_ROW),
@@ -367,9 +399,9 @@ class QsaPagedSparseGqa(OpWrapper):
     one-split launch (the 1024-row MTP7 verify, which allocates only its
     output), of the 512-row MTP3 verify and of the prefill kernel; dep4's
     gated decode below 16 rows (its 64- and 32-way splits at 24/2); an fp8
-    pool at 6/1 (no tp4 / tep4 member stores one) and on the prefill kernel
-    with q off the 55-head row (the fp8 context cell reads the packed
-    `[q | k | v]` slice); positions past 16383; rows whose selection
+    pool on the prefill kernel with q off the 55-head row (the dep4 fp8
+    context cell reads the packed `[q | k | v]` slice; the tep4 one, at 6/1,
+    reads q off the 17-head row); positions past 16383; rows whose selection
     resolves no token (all padding, a foreign
     request, unmapped pages); an fp16 pool or q; standalone contiguous K/V
     buffers; int64 request indices. Hard limits: not probed; the largest
