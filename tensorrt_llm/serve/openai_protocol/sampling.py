@@ -17,7 +17,7 @@
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 from openai.types.responses import ResponseFormatTextConfig
@@ -102,7 +102,20 @@ def _response_format_to_guided_decoding_params(
     response_format: Optional[ResponseFormat],
     reasoning_parser: Optional[str] = None,
     chat_template_kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    structured_output_format: Optional[
+        Callable[[Dict[str, Any], Optional[Dict[str, Any]]],
+                 Optional[Dict[str, Any]]]] = None,
 ) -> Optional[GuidedDecodingParams]:
+    """Turn ``response_format`` into guided-decoding parameters.
+
+    With ``reasoning_parser``, the constraint is placed relative to the
+    parser's reasoning markup: by the serving extension registered under that
+    parser name when there is one, else around the parser's markers. A caller
+    that knows the extension passes its ``structured_output_format`` hook as
+    ``structured_output_format`` instead of a parser name; a ``None`` result
+    of the hook applies the raw grammar from the first generated token.
+    """
     if response_format is None:
         guided_decoding_params = None
     elif response_format.type == "text":
@@ -148,7 +161,9 @@ def _response_format_to_guided_decoding_params(
     else:
         raise ValueError(f"Unsupported response format: {response_format.type}")
 
-    if guided_decoding_params is None or reasoning_parser is None:
+    if guided_decoding_params is None:
+        return guided_decoding_params
+    if reasoning_parser is None and structured_output_format is None:
         return guided_decoding_params
 
     if guided_decoding_params.structural_tag is not None:
@@ -167,7 +182,9 @@ def _response_format_to_guided_decoding_params(
     elif guided_decoding_params.grammar is not None:
         content = {"type": "grammar", "grammar": guided_decoding_params.grammar}
 
-    extension_format = structured_output_format_for(reasoning_parser)
+    extension_format = (structured_output_format
+                        if structured_output_format is not None else
+                        structured_output_format_for(reasoning_parser))
     if extension_format is not None:
         # A registered per-model serving extension owns the placement of the
         # constraint relative to this model's reasoning markup.

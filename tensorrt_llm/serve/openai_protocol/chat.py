@@ -18,7 +18,7 @@
 
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.chat import \
@@ -411,11 +411,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # doc: end-chat-completion-extra-params
 
-    def to_sampling_params(self,
-                           vocab_size: Optional[int] = None,
-                           gather_generation_logits: bool = False,
-                           reasoning_parser: Optional[str] = None,
-                           backend: Optional[str] = None) -> SamplingParams:
+    def to_sampling_params(
+        self,
+        vocab_size: Optional[int] = None,
+        gather_generation_logits: bool = False,
+        reasoning_parser: Optional[str] = None,
+        backend: Optional[str] = None,
+        *,
+        structured_output_format: Optional[
+            Callable[[Dict[str, Any], Optional[Dict[str, Any]]],
+                     Optional[Dict[str, Any]]]] = None
+    ) -> SamplingParams:
+        """Build the engine's sampling parameters for this request.
+
+        ``structured_output_format`` places the ``response_format`` constraint
+        through a serving extension's hook instead of ``reasoning_parser``
+        (see ``_response_format_to_guided_decoding_params``).
+        """
         sampling_logprobs = None
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
@@ -458,7 +470,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format,
                 reasoning_parser=reasoning_parser,
-                chat_template_kwargs=self.chat_template_kwargs),
+                chat_template_kwargs=self.chat_template_kwargs,
+                structured_output_format=structured_output_format),
             thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias

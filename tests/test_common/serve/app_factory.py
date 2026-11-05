@@ -106,6 +106,9 @@ class AggConfig:
     model_name: str = "fake-model"  # OpenAIServer(model=...): the /v1/models id
     tool_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
+    # --tool_parser / --reasoning_parser values that name a serving extension
+    # (gpt_oss) rather than a parser, as the CLI splits them off.
+    parser_aliases: tuple = ()
     num_postprocess_workers: int = 0  # > 0 takes the postprocess-worker path
     # Attached frontend of a multi-frontend server: registers the launcher
     # forwarding routes ahead of the local handlers, which they shadow.
@@ -245,6 +248,7 @@ class ServeTestEnv:
             enable_runtime_control_endpoints=config.runtime_control,
             runtime_control_api_key="test-key" if config.runtime_control else None,
             multi_frontend_serving=multi_frontend_serving,
+            parser_aliases=config.parser_aliases,
         )
         self._servers.append(server)
         return server

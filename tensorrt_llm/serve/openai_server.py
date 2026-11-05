@@ -23,8 +23,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, AsyncIterator, Dict, List,
-                    Optional, Union)
+from typing import (TYPE_CHECKING, Annotated, Any, AsyncIterator, Dict,
+                    FrozenSet, List, Optional, Sequence, Union)
 
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
@@ -86,7 +86,8 @@ from tensorrt_llm.serve.api.visual_gen.protocol import (ImageEditRequest,
                                                         ImageObject)
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
@@ -126,7 +127,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
-from tensorrt_llm.serve.render import (RenderResources, mount_render_endpoints,
+from tensorrt_llm.serve.render import (RenderResources, harmony_enabled_for,
+                                       mount_render_endpoints,
                                        prepare_chat_request,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
@@ -142,7 +144,10 @@ from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
-from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
+from tensorrt_llm.serve.serving_extensions import (
+    UNSUPPORTED_FEATURE_MESSAGES, UNSUPPORTED_FEATURE_ORDER, OutputMode,
+    UnsupportedFeature, cli_alias_model_types, get_serving_extension,
+    load_builtin_extensions, serving_extension_cli_aliases)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -259,6 +264,31 @@ def _configure_parser_special_token_decoding(
         # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
         # changes the protocol and prevents the K3 parsers from matching it.
         sampling_params.spaces_between_special_tokens = False
+
+
+def _reject_unsupported_request_features(request: ChatCompletionRequest,
+                                         declared: FrozenSet[str]) -> None:
+    """Reject the request features the model's serving path does not provide.
+
+    ``declared`` is what the extension's ``unsupported_features()`` returned.
+    The features a request shows by itself are checked in the order of
+    ``UNSUPPORTED_FEATURE_ORDER``, so a request with two of them reports the
+    same one the harmony chat handler always reported; the thinking budget is
+    checked once the sampling parameters exist. Raises ``ValueError`` with the
+    feature's message, which the chat path answers as a 400.
+    """
+    for feature in UNSUPPORTED_FEATURE_ORDER:
+        if feature not in declared:
+            continue
+        if feature is UnsupportedFeature.NAMED_TOOL_CHOICE:
+            used = isinstance(request.tool_choice,
+                              ChatCompletionNamedToolChoiceParam)
+        elif feature is UnsupportedFeature.TOP_LOGPROBS:
+            used = bool(request.logprobs and request.top_logprobs)
+        else:
+            continue
+        if used:
+            raise ValueError(UNSUPPORTED_FEATURE_MESSAGES[feature])
 
 
 def _record_generator_termination(generator) -> None:
@@ -583,26 +613,27 @@ class OpenAIServer(_VideoRoutesMixin):
         return iter_stats_max_iterations
 
     def __init__(
-            self,
-            generator: Union[LLM, MultimodalEncoder, "VisualGen"],
-            model: str,
-            tool_parser: Optional[str],
-            server_role: Optional[ServerRole],
-            metadata_server_cfg: MetadataServerConfig,
-            disagg_cluster_config: Optional[DisaggClusterConfig] = None,
-            multimodal_server_config: Optional[MultimodalServerConfig] = None,
-            chat_template: Optional[str] = None,
-            allow_request_chat_template: bool = False,
-            embedding_max_queue_delay: float = 0.005,
-            embedding_max_queue_size: int = 2048,
-            input_processor_workers: int = 8,
-            media_load_workers: int = 8,
-            internal_disagg_auth_key: Optional[str] = None,
-            enable_rl_control_endpoints: bool = False,
-            rl_control_api_key: Optional[str] = None,
-            enable_runtime_control_endpoints: bool = False,
-            runtime_control_api_key: Optional[str] = None,
-            multi_frontend_serving: Optional[MultiFrontendServing] = None):
+        self,
+        generator: Union[LLM, MultimodalEncoder, "VisualGen"],
+        model: str,
+        tool_parser: Optional[str],
+        server_role: Optional[ServerRole],
+        metadata_server_cfg: MetadataServerConfig,
+        disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+        multimodal_server_config: Optional[MultimodalServerConfig] = None,
+        chat_template: Optional[str] = None,
+        allow_request_chat_template: bool = False,
+        embedding_max_queue_delay: float = 0.005,
+        embedding_max_queue_size: int = 2048,
+        input_processor_workers: int = 8,
+        media_load_workers: int = 8,
+        internal_disagg_auth_key: Optional[str] = None,
+        enable_rl_control_endpoints: bool = False,
+        rl_control_api_key: Optional[str] = None,
+        enable_runtime_control_endpoints: bool = False,
+        runtime_control_api_key: Optional[str] = None,
+        multi_frontend_serving: Optional[MultiFrontendServing] = None,
+        parser_aliases: Sequence[str] = ()):
         if enable_rl_control_endpoints:
             logger.warning(
                 "RL control endpoints are deprecated; use generic runtime "
@@ -646,6 +677,10 @@ class OpenAIServer(_VideoRoutesMixin):
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
+        # ``--tool_parser`` / ``--reasoning_parser`` values that name a serving
+        # extension (gpt_oss) instead of a parser; checked against the served
+        # model in _init_llm.
+        self._parser_aliases = tuple(parser_aliases)
         # Attached frontends serve the launcher's port: only it registers.
         self._registers_server = (multi_frontend_serving is None
                                   or multi_frontend_serving.is_launcher)
@@ -1046,17 +1081,39 @@ class OpenAIServer(_VideoRoutesMixin):
 
         self.conversation_store = ConversationHistoryStore()
 
-        # gpt-oss
+        # gpt-oss: the harmony path is on when the model type's serving
+        # extension consumes its output as harmony tokens and
+        # DISABLE_HARMONY_ADAPTER=1 is not set.
         self.harmony_adapter: HarmonyAdapter | None = None
-        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
-        if disable_harmony or self.model_config is None:
-            self.use_harmony = False
-        else:
-            self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
+        model_type = (resolve_top_level_model_type(self.model_config)
+                      if self.model_config is not None else None)
+        self.use_harmony = (harmony_enabled_for(model_type)
+                            if self.model_config is not None else False)
+        # The hooks the chat path will consult: the model's extension with the
+        # harmony switch on, the generic defaults otherwise.
+        harmony_hooks = get_serving_extension(
+            model_type if self.use_harmony else None)
 
         self._ensure_post_processor_hook_supported(
-            self.use_harmony,
+            harmony_hooks.output_mode(),
             getattr(self.generator.args, "post_processor_hook", None))
+        self._ensure_harmony_parser_options_supported(
+            use_harmony=self.use_harmony,
+            model_type=model_type,
+            tool_parser=self.tool_parser,
+            reasoning_parser=self.generator.args.reasoning_parser,
+            parser_aliases=self._parser_aliases)
+        # The legacy chat handler stays reachable behind this switch until a
+        # future release removes it; the switch also makes this server's chat
+        # handler use the generic hooks for gpt-oss, so /health_generate
+        # behaves as it did before.
+        self._gpt_oss_legacy_chat = (self.use_harmony and os.getenv(
+            "TRTLLM_GPT_OSS_LEGACY_CHAT", "0") == "1")
+        if self._gpt_oss_legacy_chat:
+            logger.warning(
+                "TRTLLM_GPT_OSS_LEGACY_CHAT=1: gpt-oss chat completions use "
+                "the legacy chat_harmony handler. This switch will be removed "
+                "in a future release.")
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
@@ -1083,19 +1140,71 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
     def _ensure_post_processor_hook_supported(
-            use_harmony: bool, post_processor_hook: Optional[str]) -> None:
+            output_mode: OutputMode,
+            post_processor_hook: Optional[str]) -> None:
         """Reject ``--post_processor_hook`` combined with a harmony/gpt-oss model.
 
-        The harmony output path is rebuilt from raw token ids, not detokenized
-        text, so the text-based hook cannot act there.
+        ``output_mode`` is what the model's serving extension declares with the
+        harmony switch applied. The harmony output path is rebuilt from raw
+        token ids, not detokenized text, so the text-based hook cannot act
+        there.
         """
-        if use_harmony and post_processor_hook:
+        if output_mode is not OutputMode.TEXT and post_processor_hook:
             raise ValueError(
                 "--post_processor_hook is not supported with harmony/gpt-oss models "
                 "in this version: the harmony output path is reconstructed from "
                 "raw token ids and would bypass the text-based hook. Disable the "
                 "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
                 "not needed.")
+
+    @staticmethod
+    def _ensure_harmony_parser_options_supported(
+            *, use_harmony: bool, model_type: Optional[str],
+            tool_parser: Optional[str], reasoning_parser: Optional[str],
+            parser_aliases: Sequence[str]) -> None:
+        """Reject parser options that the harmony path would silently ignore.
+
+        A ``--tool_parser`` / ``--reasoning_parser`` alias (gpt_oss) applies
+        only to a model it is registered for, with the harmony path on. With
+        the harmony path on, any other tool or reasoning parser is refused:
+        gpt-oss parses tool calls and reasoning from its token stream, so the
+        parser would never run. With the harmony path off (another model, or
+        ``DISABLE_HARMONY_ADAPTER=1``) nothing else is checked and text parsers
+        apply as before.
+        """
+        for alias in parser_aliases:
+            alias_model_types = cli_alias_model_types(alias)
+            if use_harmony and model_type in alias_model_types:
+                continue
+            if model_type in alias_model_types:
+                why = ("DISABLE_HARMONY_ADAPTER=1 turned the harmony path off, "
+                       "which the alias stands for")
+            else:
+                why = (f"the served model type {model_type!r} is not one the "
+                       f"alias is registered for "
+                       f"({', '.join(alias_model_types) or 'none'})")
+            raise ValueError(
+                f"--tool_parser / --reasoning_parser {alias!r} does not apply "
+                f"to this server: {why}. Remove the option.")
+        if not use_harmony:
+            return
+        aliases_of_model = [
+            alias for alias in serving_extension_cli_aliases()
+            if model_type in cli_alias_model_types(alias)
+        ]
+        explicit = aliases_of_model[0] if aliases_of_model else None
+        for option, value in (("--tool_parser", tool_parser),
+                              ("--reasoning_parser", reasoning_parser)):
+            if value is None or value in aliases_of_model:
+                continue
+            choose = (f", pass {option} {explicit} to choose harmony parsing "
+                      "explicitly" if explicit is not None else "")
+            raise ValueError(
+                f"gpt-oss models parse tool calls and reasoning from the "
+                f"harmony token stream, so {option} {value!r} would be "
+                f"ignored. Remove the option{choose}, or set "
+                f"DISABLE_HARMONY_ADAPTER=1 to serve the model with text "
+                f"parsers.")
 
     def _logit_bias_vocab_size(self) -> int:
         for config in (self.model_config,
@@ -1311,9 +1420,13 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
+        # gpt-oss goes through openai_chat with its serving extension's hooks;
+        # the dedicated harmony handler stays behind TRTLLM_GPT_OSS_LEGACY_CHAT
+        # for one release.
         self.app.add_api_route(
             "/v1/chat/completions",
-            self.openai_chat if not self.use_harmony else self.chat_harmony,
+            self.chat_harmony if self.use_harmony and self._gpt_oss_legacy_chat
+            else self.openai_chat,
             methods=["POST"])
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
@@ -2075,11 +2188,33 @@ class OpenAIServer(_VideoRoutesMixin):
             # are the first stage of the shared prompt-preparation pipeline.
             render_resources = RenderResources.from_server(self)
             extension = render_resources.extension
+            # The token-level hooks follow the harmony switch. Under the
+            # legacy-chat switch the generic hooks apply, so this handler runs
+            # the text path for gpt-oss, as its in-process callers
+            # (/health_generate) did before the harmony route moved here.
+            hooks = render_resources.harmony_hooks
+            if render_resources.use_harmony and self._gpt_oss_legacy_chat:
+                hooks = get_serving_extension(None)
+            token_output = hooks.output_mode() is OutputMode.HARMONY_TOKENS
+            # A model whose output is consumed as tokens has no text parsers:
+            # the startup check refuses any other configured parser, and a
+            # reasoning parser named in a config file is not applied here.
+            reasoning_parser = (None if token_output else
+                                self.generator.args.reasoning_parser)
+            tool_parser = None if token_output else self.tool_parser
             tool_dicts = prepare_chat_request(request,
                                               render_resources).tool_dicts
             required_mode = extension.required_tool_choice_mode()
             required_tool_grammar = (request.tool_choice == "required"
                                      and required_mode == "grammar")
+            declared_unsupported = hooks.unsupported_features()
+            _reject_unsupported_request_features(request, declared_unsupported)
+            extra_stop_token_ids = hooks.extra_stop_token_ids()
+            if extra_stop_token_ids:
+                if request.stop_token_ids:
+                    request.stop_token_ids.extend(extra_stop_token_ids)
+                else:
+                    request.stop_token_ids = list(extra_stop_token_ids)
             conversation: List[ConversationMessage] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -2090,22 +2225,37 @@ class OpenAIServer(_VideoRoutesMixin):
                 vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
-                reasoning_parser=self.generator.args.reasoning_parser,
-                backend=self.generator.args.backend)
+                reasoning_parser=reasoning_parser,
+                backend=self.generator.args.backend,
+                # Token output: the extension places the structured-output
+                # constraint (gpt-oss: on the final channel), not a parser.
+                structured_output_format=hooks.structured_output_format
+                if token_output else None)
+            if UnsupportedFeature.TOP_LOGPROBS in declared_unsupported:
+                # Accepted without top_logprobs, but never asked of the
+                # engine: the token-output response builders report none.
+                sampling_params.logprobs = None
+            if (UnsupportedFeature.THINKING_TOKEN_BUDGET in declared_unsupported
+                    and sampling_params.thinking_token_budget is not None):
+                raise ValueError(UNSUPPORTED_FEATURE_MESSAGES[
+                    UnsupportedFeature.THINKING_TOKEN_BUDGET])
+            if token_output:
+                # The adapter rebuilds the text from the token ids.
+                sampling_params.detokenize = False
             if required_tool_grammar:
                 _validate_required_tool_grammar_request(
                     request,
                     sampling_params,
                     guided_decoding_backend=self.generator.args.
                     guided_decoding_backend,
-                    tool_parser=self.tool_parser,
-                    reasoning_parser=self.generator.args.reasoning_parser)
+                    tool_parser=tool_parser,
+                    reasoning_parser=reasoning_parser)
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
             add_thinking_budget_logits_processor(
                 sampling_params,
-                reasoning_parser=self.generator.args.reasoning_parser,
+                reasoning_parser=reasoning_parser,
                 tokenizer=self.tokenizer,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
@@ -2168,9 +2318,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                  "guided-decoding settings."),
                         err_type="BadRequestError",
                         status_code=HTTPStatus.BAD_REQUEST)
-                if (self.generator.args.guided_decoding_backend is None
-                        and not _parser_extracts_forced_tool_calls(
-                            self.tool_parser)):
+                if (self.generator.args.guided_decoding_backend is None and
+                        not _parser_extracts_forced_tool_calls(tool_parser)):
                     # Parsers that extract forced calls from their own markup
                     # need no grammar, so this only applies to the constrained
                     # path below.
@@ -2194,7 +2343,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                         status_code=HTTPStatus.BAD_REQUEST)
                 forced_tool_name = request.tool_choice.function.name
 
-            reasoning_parser_name = self.generator.args.reasoning_parser
+            reasoning_parser_name = reasoning_parser
             # Message-level (dynamic) tools are a model extension (Kimi API);
             # only models whose extension declares them render them, so other
             # models keep ignoring the key entirely.
@@ -2212,18 +2361,17 @@ class OpenAIServer(_VideoRoutesMixin):
             _configure_parser_special_token_decoding(
                 sampling_params,
                 reasoning_parser_name=reasoning_parser_name,
-                tool_parser_name=self.tool_parser,
+                tool_parser_name=tool_parser,
                 has_tools=bool(request.tools) or bool(dynamic_tools))
             all_tools = (request.tools or []) + dynamic_tool_params
-            if self.tool_parser and all_tools:
+            if tool_parser and all_tools:
                 # When strict=True on any tool, apply constrained decoding
                 # via structural tags (only if response_format doesn't already
                 # set guided decoding). Dynamic tools must be in the grammar
                 # too, or their calls would be masked out.
                 if sampling_params.guided_decoding is None and not required_tool_grammar:
-                    if (forced_tool_name is not None
-                            and _parser_extracts_forced_tool_calls(
-                                self.tool_parser)):
+                    if (forced_tool_name is not None and
+                            _parser_extracts_forced_tool_calls(tool_parser)):
                         # This parser handles forced calls by extracting them
                         # from its own native markup (see
                         # ``BaseToolParser.extracts_forced_tool_calls``), so
@@ -2241,7 +2389,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         try:
                             forced_tool_begin_prefix, forced_guided = (
                                 _build_forced_tool_call_decoding(
-                                    request.tools, self.tool_parser,
+                                    request.tools, tool_parser,
                                     forced_tool_name))
                         except ValueError as e:
                             raise serving_error(
@@ -2254,7 +2402,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         # ``triggered_tags`` semantics. Engages only when at
                         # least one tool has ``strict=True``.
                         strict_guided = _build_tool_strict_guided_decoding_params(
-                            all_tools, self.tool_parser)
+                            all_tools, tool_parser)
                         if strict_guided is not None:
                             sampling_params.guided_decoding = strict_guided
             elif forced_tool_name is not None:
@@ -2264,23 +2412,32 @@ class OpenAIServer(_VideoRoutesMixin):
                              "server to be started with --tool_parser."),
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
-            postproc_args = ChatPostprocArgs.from_request(request)
-            self._apply_spec_decode_stats_opt_in(postproc_args)
-            # Some models' prompt-token accounting excludes trailing rendered
-            # tokens (kimi_k3: the generation channel opener); the model still
-            # sees the full prompt.
-            postproc_args.num_prompt_tokens_offset = (
-                render_resources.prompt_tokens_excluded_from_usage(
-                    add_generation_prompt=request.add_generation_prompt,
-                    pre_tokenized=request.prompt_token_ids is not None
-                    or request.prompt_token_ids_b64 is not None,
-                    request_chat_template=request.chat_template,
-                ))
-            if dynamic_tool_params:
-                # The tool parser must see dynamic tools to recognize their
-                # calls in the model output.
-                postproc_args.tools = (postproc_args.tools
-                                       or []) + dynamic_tool_params
+            if token_output:
+                # The harmony response builders take the request fields they
+                # need; none of the text-parser fields apply.
+                postproc_args = ChatCompletionPostprocArgs.from_request(request)
+            else:
+                postproc_args = ChatPostprocArgs.from_request(request)
+                # Some models' prompt-token accounting excludes trailing
+                # rendered tokens (kimi_k3: the generation channel opener);
+                # the model still sees the full prompt.
+                postproc_args.num_prompt_tokens_offset = (
+                    render_resources.prompt_tokens_excluded_from_usage(
+                        add_generation_prompt=request.add_generation_prompt,
+                        pre_tokenized=request.prompt_token_ids is not None
+                        or request.prompt_token_ids_b64 is not None,
+                        request_chat_template=request.chat_template,
+                    ))
+                if dynamic_tool_params:
+                    # The tool parser must see dynamic tools to recognize
+                    # their calls in the model output.
+                    postproc_args.tools = (postproc_args.tools
+                                           or []) + dynamic_tool_params
+            if (UnsupportedFeature.SPEC_DECODE_STATS
+                    not in declared_unsupported):
+                # The harmony response builders carry no per-request
+                # spec-decode data, so a server-side opt-in is not applied.
+                self._apply_spec_decode_stats_opt_in(postproc_args)
             self._validate_internal_disagg_request(request, ctx)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -2303,25 +2460,35 @@ class OpenAIServer(_VideoRoutesMixin):
                                  (request.prompt_token_ids is not None
                                   or request.prompt_token_ids_b64))
 
-            try:
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
-                    request.messages,
-                    self.model_config,
-                    self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs,
-                    resolve_media=resolve_media,
-                )
-            except ValidationError:
-                # ValidatorIterator rejects extra fields; fall back to raw JSON.
-                raw_body = await ctx.json()
-                raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
-                    raw_messages,
-                    self.model_config,
-                    self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs,
-                    resolve_media=resolve_media,
-                )
+            mm_data = mm_embeddings = None
+            if token_output:
+                # The extension renders the messages itself (gpt-oss: the
+                # harmony adapter), so nothing parses them here: historical
+                # tool-call arguments are taken as written and no media is
+                # resolved, as the dedicated harmony handler always did.
+                mm_coroutines = None
+                mm_placeholder_counts = mm_item_order = None
+            else:
+                try:
+                    conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
+                        request.messages,
+                        self.model_config,
+                        self.multimodal_server_config,
+                        request_media_io_kwargs=request.media_io_kwargs,
+                        resolve_media=resolve_media,
+                    )
+                except ValidationError:
+                    # ValidatorIterator rejects extra fields; fall back to raw
+                    # JSON.
+                    raw_body = await ctx.json()
+                    raw_messages = raw_body.get("messages", [])
+                    conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
+                        raw_messages,
+                        self.model_config,
+                        self.multimodal_server_config,
+                        request_media_io_kwargs=request.media_io_kwargs,
+                        resolve_media=resolve_media,
+                    )
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
@@ -2333,6 +2500,15 @@ class OpenAIServer(_VideoRoutesMixin):
             rendered_prompt = None
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
+            elif token_output:
+                # Rendered synchronously by the extension (gpt-oss: the
+                # harmony adapter), as the dedicated harmony handler did.
+                token_ids = hooks.render_prompt(request, render_resources)
+                if token_ids is None:
+                    raise RuntimeError(
+                        "the serving extension declares token output but "
+                        "rendered no prompt")
+                prompt = token_ids
             else:
                 # Render (and append the forced named-tool prefix, see
                 # ``_build_forced_tool_call_decoding``) while the media loads.
@@ -2362,75 +2538,92 @@ class OpenAIServer(_VideoRoutesMixin):
                     rendered_prompt = rendered.template_text
             prompt = prompt_inputs(prompt)
 
-            if request.prompt_token_ids is not None:
-                mm_data, mm_embeddings = await mm_coroutines
-            if mm_data:
-                self._attach_multimodal_data(prompt, request, mm_data,
-                                             mm_item_order)
-            if mm_embeddings:
-                prompt["multi_modal_embeddings"] = mm_embeddings
-            if mm_data and mm_embeddings:
-                raise ValueError(
-                    "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
-                )
+            if not token_output:
+                # Token output carries the bare prompt: no media, no
+                # processor kwargs, as the dedicated harmony handler did.
+                if request.prompt_token_ids is not None:
+                    mm_data, mm_embeddings = await mm_coroutines
+                if mm_data:
+                    self._attach_multimodal_data(prompt, request, mm_data,
+                                                 mm_item_order)
+                if mm_embeddings:
+                    prompt["multi_modal_embeddings"] = mm_embeddings
+                if mm_data and mm_embeddings:
+                    raise ValueError(
+                        "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
+                    )
 
-            if request.mm_processor_kwargs:
-                prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+                if request.mm_processor_kwargs:
+                    prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
             thinking = None
-            postproc_args.reasoning_parser = self.generator.args.reasoning_parser
-            # Templates that prefill <think>/</think> leave the marker in the
-            # prompt, so the request kwargs alone cannot tell the parser which
-            # mode was rendered. Take it from the prompt instead.
-            if postproc_args.reasoning_parser and (
-                    ReasoningParserFactory.resolves_thinking_from_prompt(
-                        postproc_args.reasoning_parser)):
-                if rendered_prompt and request.add_generation_prompt:
-                    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
-                        postproc_args.reasoning_parser, rendered_prompt)
-                if thinking is None and request.disaggregated_params is not None:
-                    # Generation worker: it never rendered, so use the mode the
-                    # context worker resolved and relayed.
-                    thinking = request.disaggregated_params.resolved_thinking
+            if not token_output:
+                postproc_args.reasoning_parser = reasoning_parser
+                # Templates that prefill <think>/</think> leave the marker in
+                # the prompt, so the request kwargs alone cannot tell the
+                # parser which mode was rendered. Take it from the prompt
+                # instead.
+                if postproc_args.reasoning_parser and (
+                        ReasoningParserFactory.resolves_thinking_from_prompt(
+                            postproc_args.reasoning_parser)):
+                    if rendered_prompt and request.add_generation_prompt:
+                        thinking = ReasoningParserFactory.resolve_prefilled_thinking(
+                            postproc_args.reasoning_parser, rendered_prompt)
+                    if thinking is None and request.disaggregated_params is not None:
+                        # Generation worker: it never rendered, so use the
+                        # mode the context worker resolved and relayed.
+                        thinking = request.disaggregated_params.resolved_thinking
+                        if thinking is None:
+                            _warn_unresolvable_thinking_once(
+                                postproc_args.reasoning_parser)
+                    if thinking is not None:
+                        # Both keys, because the parser ORs them: leaving a
+                        # stale `thinking` in place would override what we
+                        # resolved.
+                        postproc_args.chat_template_kwargs = {
+                            **(request.chat_template_kwargs or {}),
+                            "thinking": thinking,
+                            "enable_thinking": thinking,
+                        }
+                # A token-output extension declares no required-tool mode, so
+                # prepare_chat_request has rejected tool_choice="required" for
+                # it above; the grammar is only ever built for text output.
+                if required_tool_grammar:
                     if thinking is None:
-                        _warn_unresolvable_thinking_once(
-                            postproc_args.reasoning_parser)
-                if thinking is not None:
-                    # Both keys, because the parser ORs them: leaving a stale
-                    # `thinking` in place would override what we resolved.
-                    postproc_args.chat_template_kwargs = {
-                        **(request.chat_template_kwargs or {}),
-                        "thinking": thinking,
-                        "enable_thinking": thinking,
-                    }
-            if required_tool_grammar:
-                if thinking is None:
-                    raise ValueError(
-                        "Cannot resolve required-tool reasoning state from the rendered prompt."
-                    )
-                parser = ToolParserFactory.create_tool_parser(self.tool_parser)
-                build_required = functools.partial(
-                    parser.build_required_structural_tag,
-                    request.tools,
-                    thinking=thinking)
-                required_format = await asyncio.get_running_loop(
-                ).run_in_executor(self._input_proc_executor, build_required)
-                if required_format is None:
-                    raise ValueError(
-                        "The configured tool parser does not support required tools."
-                    )
-                sampling_params.guided_decoding = GuidedDecodingParams(
-                    structural_tag=required_format.model_dump_json(
-                        by_alias=True))
-                postproc_args.tool_parser_grammar_constrained = True
-            postproc_args.tool_parser = self.tool_parser
-            postproc_args.tool_call_id_type = self.tool_call_id_type
-            if conversation and conversation[-1].get(
-                    "content") and conversation[-1].get("role") == get_role():
-                postproc_args.last_message_content = conversation[-1]["content"]
+                        raise ValueError(
+                            "Cannot resolve required-tool reasoning state from the rendered prompt."
+                        )
+                    parser = ToolParserFactory.create_tool_parser(tool_parser)
+                    build_required = functools.partial(
+                        parser.build_required_structural_tag,
+                        request.tools,
+                        thinking=thinking)
+                    required_format = await asyncio.get_running_loop(
+                    ).run_in_executor(self._input_proc_executor, build_required)
+                    if required_format is None:
+                        raise ValueError(
+                            "The configured tool parser does not support required tools."
+                        )
+                    sampling_params.guided_decoding = GuidedDecodingParams(
+                        structural_tag=required_format.model_dump_json(
+                            by_alias=True))
+                    postproc_args.tool_parser_grammar_constrained = True
+                postproc_args.tool_parser = tool_parser
+                postproc_args.tool_call_id_type = self.tool_call_id_type
+                if conversation and conversation[-1].get(
+                        "content") and conversation[-1].get(
+                            "role") == get_role():
+                    postproc_args.last_message_content = conversation[-1][
+                        "content"]
+            if token_output:
+                post_processor = (chat_harmony_streaming_post_processor
+                                  if request.stream else
+                                  chat_harmony_post_processor)
+            else:
+                post_processor = (chat_stream_post_processor if request.stream
+                                  else chat_response_post_processor)
             postproc_params = PostprocParams(
-                post_processor=chat_stream_post_processor
-                if request.stream else chat_response_post_processor,
+                post_processor=post_processor,
                 postproc_args=postproc_args,
             )
 
@@ -2457,7 +2650,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
-                streaming=request.stream,
+                # ``"stream": null`` validates to None; the engine takes a bool.
+                streaming=bool(request.stream),
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,

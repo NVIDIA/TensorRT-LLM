@@ -14,25 +14,29 @@
 # limitations under the License.
 """Serving extension for gpt-oss (Harmony) checkpoints."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from tensorrt_llm.serve.serving_extensions import (
     OutputMode,
     ServingExtension,
+    UnsupportedFeature,
     register_serving_extension,
 )
 
 _FINAL_CHANNEL_START = "<|start|>assistant<|channel|>final<|message|>"
 
 
-@register_serving_extension(model_types=("gpt_oss",), reasoning_parsers=("gpt_oss",))
+@register_serving_extension(
+    model_types=("gpt_oss",), reasoning_parsers=("gpt_oss",), cli_aliases=("gpt_oss",)
+)
 class GptOssServingExtension(ServingExtension):
     """Harmony prompt rendering and output mode for gpt-oss.
 
     Chat-request preprocessing is the generic path. The prompt is rendered to
     Harmony token ids rather than through a chat template, the output is
-    consumed as tokens, and the guided-decoding constraint is placed on the
-    ``final`` channel.
+    consumed as tokens, the Harmony stop tokens are added to every request, the
+    guided-decoding constraint is placed on the ``final`` channel, and the
+    request features the Harmony path does not provide are rejected.
     """
 
     def render_prompt(self, request, res: Any = None) -> Optional[List[int]]:
@@ -50,6 +54,31 @@ class GptOssServingExtension(ServingExtension):
     def output_mode(self) -> OutputMode:
         """Output is consumed as raw token ids by the Harmony adapter."""
         return OutputMode.HARMONY_TOKENS
+
+    def extra_stop_token_ids(self) -> List[int]:
+        """Harmony's ``<|return|>`` and ``<|call|>``, from the process-wide adapter."""
+        # Deferred, like render_prompt: harmony_adapter imports openai_protocol,
+        # which imports the extension registry that loads this module. Looked up
+        # on the module at call time, so tests can replace get_harmony_adapter.
+        from tensorrt_llm.serve import harmony_adapter as harmony_adapter_module
+
+        return harmony_adapter_module.get_harmony_adapter().get_stop_tokens()
+
+    def unsupported_features(self) -> FrozenSet[str]:
+        """What the Harmony path does not provide.
+
+        A named ``tool_choice``, ``thinking_token_budget`` and ``top_logprobs``
+        are rejected; per-request speculative-decoding stats are never opted in,
+        because the Harmony response builders carry no such data.
+        """
+        return frozenset(
+            {
+                UnsupportedFeature.NAMED_TOOL_CHOICE,
+                UnsupportedFeature.THINKING_TOKEN_BUDGET,
+                UnsupportedFeature.TOP_LOGPROBS,
+                UnsupportedFeature.SPEC_DECODE_STATS,
+            }
+        )
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]

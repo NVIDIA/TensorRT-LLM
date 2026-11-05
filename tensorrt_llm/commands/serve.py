@@ -77,6 +77,8 @@ from tensorrt_llm.serve.middleware.user_middleware import \
 from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
                                                LAUNCHER_UDS_NAME,
                                                MultiFrontendServing)
+from tensorrt_llm.serve.serving_extensions import (
+    serving_extension_cli_aliases, split_cli_parser_alias)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -598,25 +600,26 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
 
 
 def launch_server(
-        host: str,
-        port: int,
-        llm_args: dict,
-        tool_parser: Optional[str] = None,
-        middleware: Sequence[str] = (),
-        chat_template: Optional[str] = None,
-        metadata_server_cfg: Optional[MetadataServerConfig] = None,
-        server_role: Optional[ServerRole] = None,
-        disagg_cluster_config: Optional[DisaggClusterConfig] = None,
-        multimodal_server_config: Optional[MultimodalServerConfig] = None,
-        served_model_name: Optional[str] = None,
-        allow_request_chat_template: bool = False,
-        num_input_processor_workers: int = 8,
-        num_media_load_workers: int = 8,
-        multi_frontend_enabled: bool = True,
-        internal_disagg_auth_key: Optional[str] = None,
-        report_addr: Optional[str] = None,
-        enable_runtime_control_endpoints: bool = False,
-        runtime_control_api_key: Optional[str] = None):
+    host: str,
+    port: int,
+    llm_args: dict,
+    tool_parser: Optional[str] = None,
+    middleware: Sequence[str] = (),
+    chat_template: Optional[str] = None,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+    server_role: Optional[ServerRole] = None,
+    disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+    multimodal_server_config: Optional[MultimodalServerConfig] = None,
+    served_model_name: Optional[str] = None,
+    allow_request_chat_template: bool = False,
+    num_input_processor_workers: int = 8,
+    num_media_load_workers: int = 8,
+    multi_frontend_enabled: bool = True,
+    internal_disagg_auth_key: Optional[str] = None,
+    report_addr: Optional[str] = None,
+    enable_runtime_control_endpoints: bool = False,
+    runtime_control_api_key: Optional[str] = None,
+    parser_aliases: Sequence[str] = ()):
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
@@ -765,7 +768,8 @@ def launch_server(
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
                     runtime_control_api_key=runtime_control_api_key,
-                    multi_frontend_serving=multi_frontend_serving)
+                    multi_frontend_serving=multi_frontend_serving,
+                    parser_aliases=parser_aliases)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -1219,20 +1223,26 @@ def launch_visual_gen_server(
     "applied after --config and dedicated CLI flags. Not supported for "
     "startup, telemetry, environment, server-only, or VisualGen settings.",
     status="prototype")
-@stability_option("--reasoning_parser",
-                  type=click.Choice(["auto"] +
-                                    list(ReasoningParserFactory.keys())),
-                  default=None,
-                  help="Specify the parser for reasoning models. "
-                  "Use 'auto' to automatically select based on the model.",
-                  status="prototype")
-@stability_option("--tool_parser",
-                  type=click.Choice(["auto"] +
-                                    list(ToolParserFactory.parsers.keys())),
-                  default=None,
-                  help="Specify the parser for tool models. "
-                  "Use 'auto' to automatically select based on the model.",
-                  status="prototype")
+@stability_option(
+    "--reasoning_parser",
+    type=click.Choice(["auto"] + list(ReasoningParserFactory.keys()) +
+                      serving_extension_cli_aliases()),
+    default=None,
+    help="Specify the parser for reasoning models. "
+    "Use 'auto' to automatically select based on the model. "
+    "A model that parses reasoning from its own token stream "
+    "(gpt-oss) is chosen explicitly by its name.",
+    status="prototype")
+@stability_option(
+    "--tool_parser",
+    type=click.Choice(["auto"] + list(ToolParserFactory.parsers.keys()) +
+                      serving_extension_cli_aliases()),
+    default=None,
+    help="Specify the parser for tool models. "
+    "Use 'auto' to automatically select based on the model. "
+    "A model that parses tool calls from its own token stream "
+    "(gpt-oss) is chosen explicitly by its name.",
+    status="prototype")
 @stability_option("--metadata_server_config_file",
                   type=str,
                   default=None,
@@ -1531,6 +1541,16 @@ def serve(
                 param_hint="--reasoning_parser")
         logger.info(f"Auto-detected reasoning parser: {resolved}")
         reasoning_parser = resolved
+    # A serving-extension alias (gpt_oss) names a model that parses its own
+    # token stream: it is checked against the served model at startup and
+    # never reaches the parser registries or the engine arguments.
+    tool_parser, tool_parser_alias = split_cli_parser_alias(tool_parser)
+    reasoning_parser, reasoning_parser_alias = split_cli_parser_alias(
+        reasoning_parser)
+    parser_aliases = tuple(
+        dict.fromkeys(alias
+                      for alias in (tool_parser_alias, reasoning_parser_alias)
+                      if alias is not None))
     if "--revision" in sys.argv:
         logger.warning("--revision is deprecated, use --hf_revision instead.")
 
@@ -1721,6 +1741,8 @@ def serve(
                 server_role,
                 "disagg_cluster_config":
                 disagg_cluster_config,
+                "parser alias":
+                ", ".join(parser_aliases) or None,
             }
             for name, value in unsupported_args.items():
                 if value is not None:
@@ -1789,7 +1811,8 @@ def serve(
                 internal_disagg_auth_key=internal_disagg_auth_key,
                 report_addr=report_addr,
                 enable_runtime_control_endpoints=enable_sleep_mode,
-                runtime_control_api_key=runtime_control_api_key)
+                runtime_control_api_key=runtime_control_api_key,
+                parser_aliases=parser_aliases)
 
     def _serve_visual_gen():
         from tensorrt_llm.visual_gen.args import VisualGenArgs

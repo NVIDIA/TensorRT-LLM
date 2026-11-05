@@ -21,16 +21,25 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.serving_extensions import ServingExtension, get_serving_extension
+from tensorrt_llm.serve.serving_extensions import (
+    OutputMode,
+    ServingExtension,
+    get_serving_extension,
+)
 
 from .fingerprint import compute_fingerprint
 
 
 def harmony_enabled_for(model_type: Optional[str]) -> bool:
-    """Whether prompts for ``model_type`` are rendered by the Harmony adapter."""
+    """Whether prompts for ``model_type`` are rendered by the Harmony adapter.
+
+    True when the serving extension registered for the model type consumes its
+    output as Harmony tokens (gpt-oss) and ``DISABLE_HARMONY_ADAPTER=1`` is not
+    set.
+    """
     if os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1":
         return False
-    return model_type == "gpt_oss"
+    return get_serving_extension(model_type).output_mode() is OutputMode.HARMONY_TOKENS
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,18 @@ class RenderResources:
     def fingerprint(self) -> dict:
         """Rendering-configuration fingerprint (see :mod:`.fingerprint`)."""
         return compute_fingerprint(self)
+
+    @property
+    def harmony_hooks(self) -> ServingExtension:
+        """The extension whose token-level hooks apply here.
+
+        ``render_prompt``, ``output_mode``, ``extra_stop_token_ids`` and
+        ``unsupported_features`` follow the harmony switch (``use_harmony``,
+        which honors ``DISABLE_HARMONY_ADAPTER``); the extension lookup does
+        not, so the fingerprint keeps the model's extension class. Without the
+        switch these hooks answer as the generic path does.
+        """
+        return self.extension if self.use_harmony else get_serving_extension(None)
 
     def prompt_tokens_excluded_from_usage(
         self,
