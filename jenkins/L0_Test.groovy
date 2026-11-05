@@ -304,8 +304,7 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
-    // Collect single-GPU post-merge coverage and trial multi-GPU pre-merge coverage.
-    // Multi-node stages remain excluded from this experiment.
+    // Collect single-GPU post-merge and single-node multi-GPU pre-merge coverage.
     if (stageName.contains("_Nodes")) {
         return false
     }
@@ -443,8 +442,6 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                         sh "mkdir -p ${cbtsLocalDir}"
                         // Pack the per-process databases on the login node.
                         def archiveScript = "cd '${remoteWs}' && { sleep 2; " +
-                            "echo CBTS remote coverage files: && " +
-                            "find . -maxdepth 1 -type f -name '.cbtscov.${stageName}*.sqlite' | wc -l; " +
                             "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
                             "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }"
                         def archiveScriptB64 = archiveScript.bytes.encodeBase64().toString()
@@ -468,7 +465,6 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                             ) == 0
                             if (gotArchive) {
                                 sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
-                                sh "echo CBTS local coverage files: && find ${cbtsLocalDir} -type f -name '.cbtscov.*.sqlite' | wc -l"
                             } else {
                                 echo "CBTS: coverage archive transfer failed for ${stageName}."
                             }
