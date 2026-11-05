@@ -591,18 +591,6 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
-        // Always re-tar the local stage directory and upload it directly, rather
-        // than trusting the last checkpoint uploaded by the checkpoint branch to
-        // still match it (the superseded-file rename above, or other
-        // post-snapshot writes, can leave it stale). Use --transform so tar
-        // contents carry the postTag filename without touching on-disk
-        // results*.xml files.
-        ensureStageResultNotUploaded("${stageName}${postTag}")
-        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-        uploadTestResult("results-${stageName}${postTag}.tar.gz", "test-results", attemptTargets(stageName, postTag))
-        deleteProgressArtifact(pipeline, stageName, postTag)
-
         // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
         if (isCbtsStage(stageName)) {
             CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
@@ -641,6 +629,18 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 }
             }
         }
+
+        // Always re-tar the local stage directory and upload it directly, rather
+        // than trusting the last progress snapshot uploaded by
+        // progress_upload_snapshot.sh to still match it (the superseded-file
+        // rename above, or other post-snapshot writes, can leave it stale). Use
+        // --transform so tar contents carry the postTag filename without
+        // touching on-disk results*.xml files.
+        ensureStageResultNotUploaded("${stageName}${postTag}")
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        uploadTestResult("results-${stageName}${postTag}.tar.gz", "test-results", attemptTargets(stageName, postTag))
+        deleteProgressArtifact(pipeline, stageName, postTag)
     }
 
     // For a reportable attempt, rename local results*.xml with postTag so
