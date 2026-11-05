@@ -37,6 +37,7 @@ from tensorrt_llm.logger import logger
 
 LAUNCHER_UDS_NAME = "launcher.sock"
 LAUNCHER_UDS_ENV = "TLLM_SERVE_LAUNCHER_UDS"
+LAUNCHER_RECOVERY_HEADER = "x-trtllm-recovering"
 CLOCK_OFFSET_NAME = "clock_offset"
 
 # Launcher-owned routes. Attached frontends register them ahead of the local
@@ -89,6 +90,12 @@ class MultiFrontendServing:
     @property
     def is_attached(self) -> bool:
         return not self.is_launcher
+
+
+@dataclass(frozen=True)
+class _LauncherHealth:
+    status: Optional[int]
+    recovering: bool = False
 
 
 class LauncherForwarder:
@@ -144,17 +151,20 @@ class LauncherForwarder:
                 },
             )
 
-    async def get_status(self, path: str, timeout_s: float = 5.0) -> Optional[int]:
-        """HTTP status of ``GET path`` on the launcher, ``None`` if unreachable."""
+    async def get_health(self, timeout_s: float = 5.0) -> _LauncherHealth:
+        """Read launcher readiness and its bounded transport-recovery state."""
         try:
             session = await self._get_session()
             async with session.get(
-                f"http://launcher{path}", timeout=aiohttp.ClientTimeout(total=timeout_s)
+                "http://launcher/health", timeout=aiohttp.ClientTimeout(total=timeout_s)
             ) as resp:
                 await resp.read()
-                return resp.status
+                return _LauncherHealth(
+                    resp.status,
+                    resp.status == 503 and resp.headers.get(LAUNCHER_RECOVERY_HEADER) == "1",
+                )
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            return None
+            return _LauncherHealth(None)
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -250,19 +260,19 @@ class AttachedFrontendWatchdog:
             if loop.time() < next_health:
                 continue
             next_health = loop.time() + self._health_interval
-            status = await self._forwarder.get_status("/health")
-            if status == 200:
+            health = await self._forwarder.get_health()
+            if health.status == 200 or health.recovering:
                 launcher_answered = True
                 failures = 0
                 continue
-            if not launcher_answered and status is None:
+            if not launcher_answered and health.status is None:
                 continue
             launcher_answered = True
             failures += 1
             if failures >= self._health_failures:
                 self._die(
                     f"launcher frontend /health failed {failures} "
-                    f"consecutive times (last status: {status})"
+                    f"consecutive times (last status: {health.status})"
                 )
                 return
 
