@@ -102,10 +102,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
-    MiniMaxM3MsaSparseAttention,
-    msa_backend,
-)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MsaCopySite
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -4495,6 +4492,8 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
 #: work touches the destination before its barrier: the graph replay, or right after the anchor's own staged copy for a
 #: ``flush_after`` site. ``TLLM_DEVICE_COPY_CHECK=1`` verifies it. Whether an upload is skipped as unchanged is not the
 #: plan's business: the buffer owners decide (the MSA attention metadata skips its unchanged uploads).
+#: No device work reads a merged destination before the replay (MSA expands the sub-page table inside the forward),
+#: so the plan needs no ``flush_after`` barrier.
 _COPY_PLAN = CopyPlan(
     merge={
         CopySite.GRAPH_INPUT_IDS,
@@ -4506,11 +4505,6 @@ _COPY_PLAN = CopyPlan(
         MsaCopySite.N_VALID_BLOCKS,
         MsaCopySite.OUT_CACHE_LOC,
         MsaCopySite.KV_INDICES,
-        # This target's KV pool has sub-pages. The forward expands the sub-page table from the block table
-        # (msa_backend.SUBPAGE_IN_GRAPH), so nothing reads it on the device before the replay; with that switch off,
-        # write_subpage_block_table reads it right after its copy, on exactly the steps the copy was issued, and
-        # BLOCK_TABLE is a barrier (flush_after below). SEQ_LENS has no such reader because MSA stages tables on the
-        # host.
         MsaCopySite.BLOCK_TABLE,
         MsaCopySite.SEQ_LENS,
         MsaCopySite.QO_LENS,
@@ -4520,7 +4514,6 @@ _COPY_PLAN = CopyPlan(
         MsaCopySite.Q_INTRA,
         MsaCopySite.KV_LENS_STAGED,
     },
-    flush_after=set() if msa_backend.SUBPAGE_IN_GRAPH else {MsaCopySite.BLOCK_TABLE},
 )
 
 

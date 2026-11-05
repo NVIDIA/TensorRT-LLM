@@ -209,6 +209,19 @@ class DecoderRunner(ScheduledModelRunner):
             if self.copy_plan
             else None
         )
+        if self._copier is not None:
+            final = self.copy_plan.final_flush
+            logger.info(
+                f"[device copy] {len(self.copy_plan.merge)} merged sites, "
+                f"{len(self.copy_plan.flush_after)} barriers, "
+                f"parallel scatter {self.copy_plan.parallel_scatter}, final flush "
+                + (
+                    "eager"
+                    if final is None
+                    else f"in graph (early copy {final.early_copy}, "
+                    f"one-launch prologue {final.prologue_op is not None}, step epoch {final.step_epoch})"
+                )
+            )
         # Heads that can project context logits eagerly; the model is fixed.
         self._context_logits_heads = context_logits_heads(
             model, mapping, is_spec_decode=config.is_spec_decode

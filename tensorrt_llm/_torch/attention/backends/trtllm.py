@@ -188,8 +188,9 @@ class HelixMlaChunkPlan:
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
     # Whether this metadata's skippable uploads (_upload_metadata) skip values their destination already holds.
-    # Sound only while no other engine writes these buffers: an engine whose metadata class sets it gives its CUDA
-    # graph metadata private buffers. A metadata class that owns every writer of its buffers sets it.
+    # Sound only for a destination its upload alone writes: no other engine (an engine whose metadata class sets it
+    # gives its CUDA graph metadata private buffers), and no captured forward of another graph key sharing the pooled
+    # block. A metadata class routes only such destinations through _upload_metadata.
     skips_unchanged_uploads: ClassVar[bool] = False
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
@@ -486,13 +487,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         ``tokens_per_gen_step`` is the headroom for the in-flight step's tokens the graph key cannot see."""
         return None
 
-    def _upload_metadata(self, site: CopySiteEnum, dst: torch.Tensor,
-                         src: torch.Tensor) -> bool:
+    def _upload_metadata(self,
+                         site: CopySiteEnum,
+                         dst: torch.Tensor,
+                         src: torch.Tensor,
+                         changed_span: bool = False) -> bool:
         """A host-to-device metadata upload, skipped when unchanged if the metadata class skips them; True if issued.
 
-        ``src`` is a host tensor the caller does not write again before the copy runs."""
+        ``src`` is a host tensor the caller does not write again before the copy runs. ``changed_span``: see
+        ``DeviceCopyBuffer.update``. Use it only for a destination this upload alone writes: CUDA graph metadata of
+        every graph key takes its buffers from one pool, and a captured forward's device writes into a block rerun at
+        each replay, so a record of any other pooled buffer does not describe its device contents."""
         if self.skips_unchanged_uploads:
-            return self._upload_buffer(site, dst).update(src, view=dst)
+            return self._upload_buffer(site,
+                                       dst).update(src,
+                                                   view=dst,
+                                                   changed_span=changed_span)
         return device_copy.copy(site, dst, src)
 
     def _post_init_with_buffers(self, buffers) -> None:

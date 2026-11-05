@@ -50,18 +50,14 @@ from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "tail_in_forward", [True, False], ids=["tail_in_forward", "tail_in_prepare"]
-)
 @pytest.mark.parametrize("empty_state", ["empty_batch", "no_requests", "no_lengths"])
 def test_msa_metadata_clears_padded_cache_slot_tail(
-    monkeypatch: pytest.MonkeyPatch, empty_state: str, tail_in_forward: bool
+    monkeypatch: pytest.MonkeyPatch, empty_state: str
 ) -> None:
     """A smaller replay must not reuse the previous step's live cache slots."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
-    monkeypatch.setattr(msa_backend, "TAIL_FILL_IN_FORWARD", tail_in_forward)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     metadata._ensure_upload_buffers()
@@ -88,7 +84,7 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
         # live count off it.
         metadata._num_tokens = count
         metadata._build_msa_fields()
-        # TAIL_FILL_IN_FORWARD: the forward (on_update_kv_lens) fills the tail before anything reads it.
+        # The forward (on_update_kv_lens) fills the tail before anything reads it.
         metadata._fill_tail_in_forward()
         assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
             4 - count

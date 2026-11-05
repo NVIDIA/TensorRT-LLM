@@ -1,22 +1,50 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""H2DSkipCache(changed_span=True): a changed packed 2-D upload stages only each row's changed span."""
+"""DeviceCopyBuffer.update(..., changed_span=True) through a site in the plan's changed_span: a changed merged 2-D
+upload stages only each row's changed span."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
-from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache, copy_h2d_if_changed
-from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
+from tensorrt_llm._torch.pyexecutor import device_copy
+from tensorrt_llm._torch.pyexecutor.device_copy import (
+    CopyPlan,
+    CopySiteEnum,
+    DeviceCopier,
+    DeviceCopyBuffer,
+    Direction,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 ROWS, WIDTH = 4, 1024
 
 
+class _Site(CopySiteEnum):
+    TABLE = ("test_changed_span.table", Direction.H2D)
+
+
+@pytest.fixture(autouse=True)
+def _no_check_mode(monkeypatch):
+    monkeypatch.setattr(device_copy, "CHECK_MODE", False)
+
+
+def _copier(changed_span: bool = True) -> DeviceCopier:
+    plan = CopyPlan(
+        merge={_Site.TABLE},
+        changed_span={_Site.TABLE} if changed_span else set(),
+        parallel_scatter=True,
+    )
+    return DeviceCopier(plan, torch.device("cuda", torch.cuda.current_device()))
+
+
 @pytest.fixture
 def pack():
-    return StepInputPack(torch.device("cuda"), parallel_scatter=True)
+    return _copier()
+
+
+def _record(buf: torch.Tensor) -> DeviceCopyBuffer:
+    return DeviceCopyBuffer(buf, site=_Site.TABLE)
 
 
 def _table(seed, rows=ROWS, width=WIDTH):
@@ -26,22 +54,23 @@ def _table(seed, rows=ROWS, width=WIDTH):
     ).pin_memory()
 
 
-def _upload(pack, cache, dst, src):
-    """One step: open the pack, route the copy through the cache, issue the pack; returns the staged copies."""
-    with h2d_cache.active(cache), step_inputs.active(pack):
-        step_inputs.begin()
-        copied = copy_h2d_if_changed(dst, src, pack=True)
-        staged = list(pack.h2d)
-        step_inputs.flush()
+def _upload(copier, record, dst, src):
+    """One step: open the pack, upload through the record, issue the pack; returns the staged copies."""
+    with device_copy.active(copier):
+        device_copy.begin()
+        copied = record.update(src, view=dst, changed_span=True)
+        staged = list(copier._pack.h2d)
+        device_copy.flush()
     torch.cuda.synchronize()
     return copied, staged
 
 
 @pytest.mark.parametrize("changed_span", [False, True])
-def test_device_rows_equal_the_source_after_every_step(pack, changed_span):
+def test_device_rows_equal_the_source_after_every_step(changed_span):
     """Bitwise: whatever is staged, the device view holds the source after each step."""
-    cache = H2DSkipCache(changed_span=changed_span)
+    pack = _copier(changed_span)
     buf = torch.full((8, 2 * WIDTH), -7, dtype=torch.int32, device="cuda")
+    cache = _record(buf)
     dst = buf[:ROWS, :WIDTH]
     src = _table(0)
     generator = torch.Generator().manual_seed(1)
@@ -59,8 +88,8 @@ def test_device_rows_equal_the_source_after_every_step(pack, changed_span):
 
 
 def test_one_changed_entry_stages_one_element(pack):
-    cache = H2DSkipCache(changed_span=True)
     dst = torch.zeros((ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(dst)
     src = _table(2)
     _upload(pack, cache, dst, src)
 
@@ -74,8 +103,8 @@ def test_one_changed_entry_stages_one_element(pack):
 
 
 def test_each_changed_row_stages_its_first_to_last_changed_column(pack):
-    cache = H2DSkipCache(changed_span=True)
     dst = torch.zeros((ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(dst)
     src = _table(3)
     _upload(pack, cache, dst, src)
 
@@ -93,8 +122,8 @@ def test_each_changed_row_stages_its_first_to_last_changed_column(pack):
 
 
 def test_wider_view_uploads_the_columns_the_shadow_does_not_cover(pack):
-    cache = H2DSkipCache(changed_span=True)
     buf = torch.full((ROWS, WIDTH), -1, dtype=torch.int32, device="cuda")
+    cache = _record(buf)
     src = _table(4)
     _upload(pack, cache, buf[:, : WIDTH // 2], src[:, : WIDTH // 2].contiguous().pin_memory())
 
@@ -107,8 +136,8 @@ def test_wider_view_uploads_the_columns_the_shadow_does_not_cover(pack):
 
 
 def test_a_mostly_changed_table_is_staged_whole(pack):
-    cache = H2DSkipCache(changed_span=True)
     dst = torch.zeros((ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(dst)
     _upload(pack, cache, dst, _table(5))
 
     src = _table(6)
@@ -118,9 +147,11 @@ def test_a_mostly_changed_table_is_staged_whole(pack):
     assert torch.equal(dst.cpu(), src)
 
 
-def test_off_by_default_the_whole_view_is_staged(pack):
-    cache = H2DSkipCache()
+def test_a_site_outside_the_plans_changed_span_stages_the_whole_view():
+    pack = _copier(changed_span=False)
+    assert not CopyPlan().changed_span
     dst = torch.zeros((ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(dst)
     src = _table(7)
     _upload(pack, cache, dst, src)
 
@@ -131,23 +162,30 @@ def test_off_by_default_the_whole_view_is_staged(pack):
     assert [nbytes for _, _, nbytes in staged] == [ROWS * WIDTH * 4]
 
 
-def test_an_unpacked_copy_copies_the_whole_view(pack):
-    cache = H2DSkipCache(changed_span=True)
+def test_an_unmerged_copy_copies_the_whole_view(pack, monkeypatch):
+    """No open pack: one eager copy of the view, not one per row span."""
     dst = torch.zeros((ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(dst)
     src = _table(8)
-    with h2d_cache.active(cache):
-        copy_h2d_if_changed(dst, src)
+    with device_copy.active(pack):
+        cache.update(src, view=dst, changed_span=True)
         src = src.clone().pin_memory()
         src[1, 1] += 1
-        assert copy_h2d_if_changed(dst, src) is True
+        copies = []
+        real = device_copy.copy
+        monkeypatch.setattr(
+            device_copy, "copy", lambda *a, **k: copies.append(tuple(a[1].shape)) or real(*a, **k)
+        )
+        assert cache.update(src, view=dst, changed_span=True) is True
     torch.cuda.synchronize()
+    assert copies == [(ROWS, WIDTH)]
     assert torch.equal(dst.cpu(), src)
 
 
 def test_a_view_with_another_row_stride_is_staged_whole(pack):
     """The shadow describes other device bytes: nothing of it may be trusted."""
-    cache = H2DSkipCache(changed_span=True)
     buf = torch.zeros((2 * ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(buf)
     src = _table(9)
     _upload(pack, cache, buf[:ROWS], src)
 
@@ -155,3 +193,48 @@ def test_a_view_with_another_row_stride_is_staged_whole(pack):
 
     assert [nbytes for _, _, nbytes in staged] == [WIDTH * 4] * ROWS
     assert torch.equal(buf[::2].cpu(), src)
+
+
+def test_a_discarded_span_upload_drops_the_record(pack):
+    """A merged span copy whose pack is discarded never lands: the record is dropped, so the next step sends all."""
+    dst = torch.zeros((ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(dst)
+    src = _table(10)
+    _upload(pack, cache, dst, src)
+    changed = src.clone().pin_memory()
+    changed[0, 3] += 1
+    with device_copy.active(pack):
+        device_copy.begin()
+        cache.update(changed, view=dst, changed_span=True)
+        device_copy.discard()
+    assert cache.host_values is None
+    _, staged = _upload(pack, cache, dst, changed)
+    assert [nbytes for _, _, nbytes in staged] == [ROWS * WIDTH * 4]
+    assert torch.equal(dst.cpu(), changed)
+
+
+def test_a_barrier_site_stages_the_whole_view_with_one_barrier():
+    """Per-row spans through a flush_after site would each flush on their own: the whole view goes instead."""
+    plan = CopyPlan(
+        merge={_Site.TABLE},
+        flush_after={_Site.TABLE},
+        changed_span={_Site.TABLE},
+        parallel_scatter=True,
+    )
+    copier = DeviceCopier(plan, torch.device("cuda", torch.cuda.current_device()))
+    dst = torch.zeros((ROWS, WIDTH), dtype=torch.int32, device="cuda")
+    cache = _record(dst)
+    src = _table(11)
+    with device_copy.active(copier):
+        device_copy.begin()
+        cache.update(src, view=dst, changed_span=True)
+        changed = src.clone().pin_memory()
+        changed[1, 7] += 1
+        segments_before = copier._pack.seg
+        cache.update(changed, view=dst, changed_span=True)
+        # One more segment (the barrier after the whole view), not one per span.
+        assert copier._pack.seg > segments_before
+        assert not copier._pack.h2d
+        device_copy.flush()
+    torch.cuda.synchronize()
+    assert torch.equal(dst.cpu(), changed)

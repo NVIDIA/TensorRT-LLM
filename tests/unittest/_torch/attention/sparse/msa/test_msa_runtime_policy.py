@@ -491,7 +491,6 @@ def _expected_subpages(metadata, rows: int) -> torch.Tensor:
 
 @requires_cuda
 def test_the_first_reader_of_a_forward_expands_the_subpage_table(monkeypatch):
-    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
     metadata = _subpage_metadata(rows=3, max_blocks=40, factor=2)
     calls = []
     real = msa_backend.write_subpage_block_table
@@ -510,8 +509,7 @@ def test_the_first_reader_of_a_forward_expands_the_subpage_table(monkeypatch):
 
 
 @requires_cuda
-def test_each_forward_expands_the_current_block_table(monkeypatch):
-    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
+def test_each_forward_expands_the_current_block_table():
     metadata = _subpage_metadata(rows=2, max_blocks=16, factor=4)
     metadata.msa_subpage_rows(0, 2)
     metadata.msa_block_table[:2, :5] += 11
@@ -524,8 +522,7 @@ def test_each_forward_expands_the_current_block_table(monkeypatch):
 
 
 @requires_cuda
-def test_a_captured_forward_expands_the_table_at_every_replay(monkeypatch):
-    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
+def test_a_captured_forward_expands_the_table_at_every_replay():
     metadata = _subpage_metadata(rows=4, max_blocks=32, factor=2)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

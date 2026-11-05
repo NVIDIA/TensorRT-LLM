@@ -285,6 +285,9 @@ class CUDAGraphRunner:
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        # Graphs captured with a copier's in-graph final flush prologue, and that copier
+        # (device_copy.capture_prologue).
+        self._prologue_copiers: Dict[KeyType, Any] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
@@ -912,6 +915,11 @@ class CUDAGraphRunner:
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
             with nccl_window_graph_capture(graph, graph_pool):
+                # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
+                prologue_copier = (None if self._pre_replay_hooks else
+                                   device_copy.capture_prologue())
+                if prologue_copier is not None:
+                    self._prologue_copiers[key] = prologue_copier
                 output = forward_fn(capture_inputs)
             # The addresses the graph baked in, for the strict buffer check.
             self._record_strict_buffer_snapshot(key)
@@ -1042,8 +1050,15 @@ class CUDAGraphRunner:
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
         # Issue the step's merged copies (no-op without an open pack) before
-        # anything below reads the static inputs on the device.
-        device_copy.flush()
+        # anything below reads the static inputs on the device; a graph captured
+        # with the copier's prologue issues them itself at the start of the replay.
+        prologue_copier = self._prologue_copiers.get(key)
+        captured_copier_active = (prologue_copier is not None
+                                  and device_copy.is_active(prologue_copier))
+        device_copy.flush(in_graph=captured_copier_active)
+        if prologue_copier is not None and not captured_copier_active:
+            # Replayed outside the copier's context: nothing filled its window.
+            prologue_copier.quiesce_graph_window()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if position_id_offsets is not None:
@@ -1062,7 +1077,11 @@ class CUDAGraphRunner:
             for hook in self._pre_replay_hooks:
                 hook(key, seqlen, hook_tensors, current_inputs)
 
-        self.graphs[key].replay()
+        try:
+            self.graphs[key].replay()
+        finally:
+            if prologue_copier is not None:
+                prologue_copier.on_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref
@@ -1582,6 +1601,7 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self._pre_replay_position_ids = None
+        self._prologue_copiers.clear()
         self.reset_padding_dummies()
         del self.memory_pool
         self.memory_pool = None

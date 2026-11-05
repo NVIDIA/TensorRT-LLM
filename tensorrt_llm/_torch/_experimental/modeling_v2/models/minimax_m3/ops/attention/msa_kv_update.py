@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MSA KV-length correction in one launch (this target's ``MsaKvUpdate`` hook)."""
+"""The MSA KV-length correction in one launch (the op MSA's own update in ``kernels/msa_kv_update`` runs)."""
 
 from __future__ import annotations
 

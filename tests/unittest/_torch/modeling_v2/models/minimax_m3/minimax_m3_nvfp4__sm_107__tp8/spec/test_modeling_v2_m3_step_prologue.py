@@ -10,8 +10,15 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_step_prologue import (  # noqa: E501
     m3_step_prologue as op,
 )
-from tensorrt_llm._torch.pyexecutor import step_inputs
-from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
+from tensorrt_llm._torch.pyexecutor import device_copy
+from tensorrt_llm._torch.pyexecutor.device_copy import (
+    CopyPlan,
+    CopySiteEnum,
+    DeviceCopier,
+    Direction,
+    InGraph,
+    _Pack,
+)
 
 __extra_import_path__ = ["../../../..", "."]
 from _m3_spec_inputs import gen, seed_of  # noqa: E402 — needs the path declared above
@@ -19,16 +26,16 @@ from _validating import certifying, validating  # noqa: E402, F401
 
 if not torch.cuda.is_available():
     pytest.skip("m3_step_prologue requires a CUDA device", allow_module_level=True)
-# The reference and the pack tests run this branch's step_inputs (the step epoch, prologue_op): a run that mounts only
+# The reference and the pack tests run this branch's device_copy (the step epoch, prologue_op): a run that mounts only
 # the target's files gets the image's older module, whose graph scatter has no epoch argument.
-assert "epoch" in step_inputs._graph_scatter_kernel.arg_names, (
-    "tensorrt_llm/_torch/pyexecutor/step_inputs.py is not this branch's (no step epoch): mount the shared pyexecutor "
-    "files (step_inputs.py, runtime_hooks.py, engine/runners/decoder/runner.py, h2d_cache.py) with the target"
+assert "epoch" in device_copy._graph_scatter_kernel.arg_names, (
+    "tensorrt_llm/_torch/pyexecutor/device_copy.py is not this branch's (no step epoch): mount the shared pyexecutor "
+    "files (device_copy.py, runtime_hooks.py, cuda_graph_runner.py, engine/runners/decoder/runner.py) with the target"
 )
 
-MAX_DESC = StepInputPack.MAX_DESC
-WINDOW = StepInputPack.GRAPH_WINDOW
-DATA_START = StepInputPack.HEADER_BYTES + StepInputPack.DESC_BYTES * MAX_DESC
+MAX_DESC = _Pack.MAX_DESC
+WINDOW = _Pack.GRAPH_WINDOW
+DATA_START = _Pack.HEADER_BYTES + _Pack.DESC_BYTES * MAX_DESC
 ARENA = 1 << 20
 
 
@@ -134,22 +141,31 @@ def test_graph_replays_scatter_each_new_window() -> None:
         assert int(epoch.item()) == int(ref_epoch.item()) == step + 2, step
 
 
+@pytest.fixture(autouse=True)
+def _no_check_mode(monkeypatch):
+    # The pack tests compare destinations of discarded steps; check mode (on for unit tests) would poison them.
+    monkeypatch.setattr(device_copy, "CHECK_MODE", False)
+
+
+class _Site(CopySiteEnum):
+    H2D = ("test_step_prologue.h2d", Direction.H2D)
+    D2D = ("test_step_prologue.d2d", Direction.D2D)
+
+
 def _pack_case(prologue_op):
-    pack = StepInputPack(
-        torch.device("cuda", torch.cuda.current_device()),
+    plan = CopyPlan(
+        merge={_Site.H2D, _Site.D2D},
         parallel_scatter=True,
-        in_graph=True,
-        early_copy=True,
-        step_epoch=True,
-        prologue_op=prologue_op,
+        final_flush=InGraph(early_copy=True, prologue_op=prologue_op, step_epoch=True),
     )
+    pack = DeviceCopier(plan, torch.device("cuda", torch.cuda.current_device()))
     a, b, c = (torch.zeros(16, dtype=torch.int32, device="cuda") for _ in range(3))
     out = torch.zeros(48, dtype=torch.int32, device="cuda")
     graph = torch.cuda.CUDAGraph()
-    with step_inputs.active(pack):
+    with device_copy.active(pack):
         torch.cuda.synchronize()
         with torch.cuda.graph(graph):
-            assert step_inputs.capture_prologue() is pack
+            assert device_copy.capture_prologue() is pack
             out.copy_(torch.cat([a, b, c]))
     return pack, graph, (a, b, c), out
 
@@ -160,16 +176,19 @@ def _pack_step(pack, graph, dsts, values, overlap=False, flush=True):
     def host(v):
         return torch.tensor(v, dtype=torch.int32).pin_memory()
 
-    with step_inputs.active(pack):
-        step_inputs.begin()
-        step_inputs.copy_(a, host(values[0]))
-        step_inputs.copy_(b, host(values[1]))
+    def copy(dst, src):
+        device_copy.copy(_Site.D2D if src.is_cuda else _Site.H2D, dst, src)
+
+    with device_copy.active(pack):
+        device_copy.begin()
+        copy(a, host(values[0]))
+        copy(b, host(values[1]))
         if overlap:
-            step_inputs.copy_(a[:4], host([-1, -2, -3, -4]))
-        step_inputs.copy_(c, a)  # a device copy reading a host copy's destination
+            copy(a[:4], host([-1, -2, -3, -4]))
+        copy(c, a)  # a device copy reading a host copy's destination
         if not flush:
-            step_inputs.discard()
-        step_inputs.flush(in_graph=True)
+            device_copy.discard()
+        device_copy.flush(in_graph=True)
     graph.replay()
 
 
@@ -177,7 +196,7 @@ def test_pack_with_the_one_launch_prologue_matches_the_default() -> None:
     """The same pack steps through the default prologue and the one-launch one: the same outputs and epochs, and the
     one-launch prologue is engaged (the default's warm-up compile is not what bumped its epoch)."""
     packs = [_pack_case(None), _pack_case(op)]
-    assert packs[0][0].prologue_op is None and packs[1][0].prologue_op is op
+    assert packs[0][0]._pack.prologue_op is None and packs[1][0]._pack.prologue_op is op
     for step in range(6):
         va = [step * 100 + i for i in range(16)]
         vb = [step * 1000 - i for i in range(16)]
