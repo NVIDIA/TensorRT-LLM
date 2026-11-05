@@ -61,6 +61,9 @@ from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
+    target_test_modules_check as target_tests,
+)
+from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
     tests_check as delivered_tests,
 )
 from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
@@ -1513,6 +1516,25 @@ def test_delivery_runs_the_delivered_tests_at_head_and_holds_on_their_passing(
     results.tests[f"{test}::test_a"] = {"outcome": "failed", "message": "wrong"}
     check = delivered_tests(stage, report)
     assert not check.passed and check.detail.startswith("FAILING")
+
+
+def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
+    """An onboarded target arrived with 35 test modules, past what a reviewer accepts."""
+    target = f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/target"
+    tests = tmp_path / catalog_paths.model_ops_tests_dir(target)
+    (tests / "attention").mkdir(parents=True)
+    (tests / "_helpers.py").write_text("x = 1\n")
+    for n in range(20):
+        (tests / "attention" / f"test_modeling_v2_op{n}.py").write_text("def test_a():\n    pass\n")
+    check = target_tests(tmp_path, target)
+    assert check.passed and check.detail.startswith("20 test module(s), 40 lines")
+    assert "WARNING" not in check.detail
+    (tests / "test_forward.py").write_text("def test_b():\n    pass\n")
+    check = target_tests(tmp_path, target)
+    assert check.passed, "the budget never blocks delivery"
+    assert check.detail.startswith("21 test module(s)")
+    assert "WARNING: more than the 20 a reviewer accepts" in check.detail
+    assert target_tests(tmp_path, f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/other") is None
 
 
 _requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
