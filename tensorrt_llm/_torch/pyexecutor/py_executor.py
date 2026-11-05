@@ -6856,7 +6856,8 @@ class PyExecutor:
                     # generation KV caches, both of which can mutate V2 page
                     # indices used by the current batch's input preparation.
                     self._wait_for_model_engine_input_copy()
-                    self._process_previous_batch()
+                    self._process_previous_batch(
+                        scheduled_batch if can_queue else None)
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
                 else:
@@ -6926,7 +6927,8 @@ class PyExecutor:
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
 
-    def _process_previous_batch(self):
+    def _process_previous_batch(
+            self, current_batch: Optional[ScheduledRequests] = None):
         scheduled_requests = self.previous_batch.scheduled_requests
         # A request that finishes here may still be in the in-flight next
         # batch, which writes KV past the committed prefix after commit/close.
@@ -6950,6 +6952,18 @@ class PyExecutor:
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
                                      self.previous_batch)
+
+        # The previous sample is now harvested. Requests absent from the
+        # current forward must resume from their host tokens, not an unrelated
+        # batch's device output. Keep the marker written by the current forward
+        # for requests that are still overlapping; their next sample is pending.
+        current_request_ids = {
+            request.py_request_id
+            for request in current_batch.all_requests()
+        } if current_batch is not None else set()
+        for request in scheduled_requests.all_requests():
+            if request.py_request_id not in current_request_ids:
+                request.py_batch_idx = None
 
     def _forward_step_inter_pp(self,
                                scheduled_batch,
