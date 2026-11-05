@@ -14,9 +14,9 @@
 # limitations under the License.
 """CuteDSL grouped GEMM: FC1 and FC2 as two grouped-GEMM launches.
 
-:mod:`.base` is the abstract root, :mod:`.nvfp4` and :mod:`.bf16` are the
-leaves, and :mod:`.eligibility` holds the gates their ``can_implement``
-composes. Importing this package registers both leaves.
+:mod:`.base` is the abstract root, :mod:`.nvfp4`, :mod:`.nvfp4_plus` and
+:mod:`.bf16` are the leaves, and :mod:`.eligibility` holds the gates their
+``can_implement`` composes. Importing this package registers every leaf.
 """
 
 from tensorrt_llm.models.modeling_utils import QuantAlgo

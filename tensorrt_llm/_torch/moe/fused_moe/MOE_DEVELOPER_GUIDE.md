@@ -1093,7 +1093,7 @@ implementation. The parent holds what they share, leaves at least
 because a descriptor is exactly one identity. How much else it implements
 follows how much the formats share: `TrtllmGenFusedMoEBase` implements none of
 the four (its formats differ in kernel ABI, so each leaf gets its methods
-through a per-ABI layer), `CuteDslFusedMoEBase` none either (its two formats
+through a per-ABI layer), `CuteDslFusedMoEBase` none either (its three formats
 share construction, the locality-domain plan and the weight lifecycle, but run
 different ops), `MarlinFusedMoEBase` three (one ABI serves both formats), and
 `CutlassFusedMoEBase` defaults for `quantize_input` and `run_moe` that most
