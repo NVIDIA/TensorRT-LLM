@@ -388,6 +388,28 @@ def test_a_mutation_that_hangs_is_detected_and_restored(tmp_path):
     assert target.read_text() == "HANG = False\n"
 
 
+def test_a_gate_on_a_failing_baseline_does_not_pass(tmp_path):
+    """A property that fails before any bug is planted proves nothing: the gate exits 1."""
+    gate = tmp_path / ".claude" / "skills" / "s" / "scripts" / "mutate.py"
+    gate.parent.mkdir(parents=True)
+    shutil.copy(os.path.join(SCRIPTS, "mutate.py"), gate)
+    target = tmp_path / "target.py"
+    target.write_text("VALUE = 1\n")
+    mutations = tmp_path / "t.mutations"
+    mutations.write_text("[mutation]\nname = other\nfile = target.py\n"
+                         "find = VALUE = 1\nreplace = VALUE = 2\n")  # fmt: skip
+    runner = tmp_path / "runner.py"
+    runner.write_text(f"import sys\nprint(open({str(target)!r}).read())\nsys.exit(1)\n")
+
+    result = subprocess.run([sys.executable, str(gate), str(mutations), "--runner", str(runner)],
+                            capture_output=True, text=True, timeout=60,
+                            env=dict(os.environ, TMPDIR=str(tmp_path)))  # fmt: skip
+
+    assert "baseline: ALREADY FAILING" in result.stdout and "DETECTED other" in result.stdout
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert target.read_text() == "VALUE = 1\n"
+
+
 # --------------------------------------------------------------------------- pi kit
 
 

@@ -33,8 +33,8 @@ stopped and counts as DETECTED: the property did not hold.
 
 ``file`` paths are relative to the root of the repository that holds this skill.
 
-Exit codes: 0 every mutation detected, 1 a mutation was missed, 2 usage error,
-3 UNAVAILABLE.
+Exit codes: 0 every mutation detected on a passing baseline, 1 a mutation was missed or the
+baseline already fails (then nothing is proven), 2 usage error, 3 UNAVAILABLE.
 """
 
 import argparse
@@ -160,7 +160,9 @@ def main() -> int:
             "A missed mutation means the property does not constrain that "
             "behaviour. Strengthen the property; do not delete the mutation."
         )
-    return 1 if missed else 0
+    if not baseline_clean:
+        print("The baseline fails, so no DETECTED above proves anything: the gate does not pass.")
+    return 1 if missed or not baseline_clean else 0
 
 
 if __name__ == "__main__":
