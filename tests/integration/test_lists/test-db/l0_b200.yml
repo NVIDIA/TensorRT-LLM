@@ -495,7 +495,6 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_edit_example
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_example TIMEOUT (30)
   - unittest/_torch/visual_gen/test_cosmos3_edge.py
-  - unittest/_torch/visual_gen/test_cosmos3_example_prompts.py
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
