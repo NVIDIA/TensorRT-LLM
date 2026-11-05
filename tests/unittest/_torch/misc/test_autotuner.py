@@ -1950,17 +1950,17 @@ def test_locality_domain_runner_forwards_the_tactic_space_key():
 
 
 def test_configure_autotuner_nvmmh_installs_the_engine_policy(monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.model_engine import \
-        _configure_autotuner_nvmmh
+    from tensorrt_llm._torch.pyexecutor.engine.model_setup import \
+        configure_autotuner_nvmmh
     from tensorrt_llm.llmapi.llm_args import AutoTunerNvMMHConfig
 
     tuner = AutoTuner.get()
     monkeypatch.setattr(tuner, "nvmmh_config", None)
-    _configure_autotuner_nvmmh(
+    configure_autotuner_nvmmh(
         SimpleNamespace(autotuner_nvmmh_config=AutoTunerNvMMHConfig(
             max_tactics=7)))
     assert tuner.nvmmh_config == NvMMHConfig(max_tactics=7)
-    _configure_autotuner_nvmmh(SimpleNamespace(autotuner_nvmmh_config=None))
+    configure_autotuner_nvmmh(SimpleNamespace(autotuner_nvmmh_config=None))
     assert tuner.nvmmh_config is None
 
 

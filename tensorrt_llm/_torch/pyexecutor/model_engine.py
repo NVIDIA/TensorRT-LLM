@@ -27,7 +27,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.interface import AttentionMetadata, AttentionRuntimeFeatures
-from ..autotuner import AutoTuner, NvMMHConfig
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -45,6 +44,7 @@ from .engine.lora import resolve_lora_owner
 from .engine.model_setup import (
     apply_torch_compile,
     compile_model,
+    configure_autotuner_nvmmh,
     create_model_loader,
     init_process_setup,
     prepare_loaded_model,
@@ -107,33 +107,6 @@ def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
 # Clearing and recapturing the piecewise graphs is the part that was dropped:
 # refit moves no tensor, so the captures stay valid and PWCG stays hot across a
 # refit (976 graphs measured still live) instead of going cold.
-
-
-def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
-    """Install the engine's nvMatmulHeuristics policy on the process AutoTuner.
-
-    Runs before model construction because CuTe DSL runners may enumerate
-    tactics while modules are built. The policy is process-wide, so engines
-    that share a process should use the same config; target and draft engines
-    share the LLM args and therefore the policy.
-    """
-    # Partial test doubles of TorchLlmArgs may omit the field.
-    config = getattr(llm_args, "autotuner_nvmmh_config", None)
-    if config is None and AutoTuner._instance is None:
-        return
-    if config is not None:
-        from ..custom_ops import cutedsl_matmul_heuristics
-
-        if not cutedsl_matmul_heuristics.IS_NVMMH_AVAILABLE:
-            logger.warning_once(
-                "autotuner_nvmmh_config is set but nvMatmulHeuristics cannot "
-                "be imported; CuTe DSL GEMM/BMM runners tune their full "
-                "tactic space.",
-                key="autotuner_nvmmh_unavailable",
-            )
-    AutoTuner.get().nvmmh_config = (
-        None if config is None else NvMMHConfig(max_tactics=config.max_tactics)
-    )
 
 
 class ModelEngine:
@@ -199,7 +172,7 @@ class ModelEngine:
                 "encode_only models run through EncoderExecutor, which does not use ModelEngine."
             )
         init_process_setup(mapping, dist)
-        _configure_autotuner_nvmmh(llm_args)
+        configure_autotuner_nvmmh(llm_args)
 
         (
             max_beam_width,
