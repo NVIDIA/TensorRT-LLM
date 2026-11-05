@@ -29,12 +29,11 @@ outside CUDA-graph capture.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Dict, Optional
 
 import torch
-
-from tensorrt_llm._utils import get_env_flag
 
 MAX_TOKENS = 64  # tokens of a k3_mla_q / k3_mla_qkv call
 MAX_REQUESTS = 8
@@ -55,7 +54,7 @@ def _arg(t: torch.Tensor, align: int = 16):
 
 
 def _use_pdl() -> bool:
-    return get_env_flag("TRTLLM_ENABLE_PDL", True)
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 _arg_dummies: Dict[tuple, torch.Tensor] = {}

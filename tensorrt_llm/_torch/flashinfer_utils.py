@@ -1,7 +1,6 @@
+import os
 import platform
 import traceback
-
-from tensorrt_llm._utils import get_env_flag
 
 from ..logger import logger
 
@@ -9,7 +8,7 @@ IS_FLASHINFER_AVAILABLE = False
 
 
 def get_env_enable_pdl() -> bool:
-    enabled = get_env_flag("TRTLLM_ENABLE_PDL", True)
+    enabled = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     if enabled and not getattr(get_env_enable_pdl, "_printed", False):
         logger.info("PDL enabled")
         setattr(get_env_enable_pdl, "_printed", True)

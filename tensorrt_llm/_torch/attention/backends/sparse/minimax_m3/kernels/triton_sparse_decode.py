@@ -36,6 +36,7 @@ Differences from upstream:
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -43,7 +44,6 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
-from tensorrt_llm._utils import get_env_flag
 
 from .msa_utils import check_decode_span_shape
 
@@ -67,7 +67,7 @@ NVFP4_SF_VEC_SIZE = 16
 
 
 def _pdl_enabled() -> bool:
-    return get_env_flag("TRTLLM_ENABLE_PDL", True)
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 @triton.jit

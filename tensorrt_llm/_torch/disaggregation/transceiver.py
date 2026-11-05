@@ -244,8 +244,8 @@ def _validate_fp4_mla_bridge_profile(
         # those writes stopped.
         and cache_transceiver_config.kv_cache_bounce_size_mb == 0
         and not cache_transceiver_config.enable_pipelined_transfer
-        and not get_env_flag("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", False)
-        and not get_env_flag("TRTLLM_DISAGG_LAYERWISE", False)
+        and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
+        and os.getenv("TRTLLM_DISAGG_LAYERWISE") != "1"
     )
     if not supported:
         raise ValueError(

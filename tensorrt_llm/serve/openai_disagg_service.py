@@ -14,12 +14,13 @@
 
 import asyncio
 import json
+import os
 import re
 from typing import Callable, Optional
 
 from fastapi import HTTPException
 
-from tensorrt_llm._utils import get_env_flag, get_global_steady_clock_now_in_seconds
+from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
@@ -519,7 +520,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         return None, True
 
     async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:
-        if get_env_flag("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", False):
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             # Hard-code first token, ctx_request_id for testing
             request.disaggregated_params = DisaggregatedParams(
                 request_type="generation_only",

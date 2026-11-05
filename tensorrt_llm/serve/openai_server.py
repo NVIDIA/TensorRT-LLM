@@ -1007,7 +1007,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
-        disable_harmony = get_env_flag("DISABLE_HARMONY_ADAPTER", False)
+        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
         if disable_harmony or self.model_config is None:
             self.use_harmony = False
         else:

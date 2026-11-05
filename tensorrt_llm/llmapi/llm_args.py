@@ -5859,7 +5859,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         if self.backend != "DEFAULT":
             return self.backend, None
         for env_var, backend in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
-            if get_env_flag(env_var, False):
+            if os.getenv(env_var) == "1":
                 return backend, env_var
         return "NIXL", None
 

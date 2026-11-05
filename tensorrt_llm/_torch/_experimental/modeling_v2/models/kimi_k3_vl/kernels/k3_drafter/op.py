@@ -29,12 +29,11 @@ which must happen outside CUDA-graph capture.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Dict
 
 import torch
-
-from tensorrt_llm._utils import get_env_flag
 
 MAX_TOKENS = 8  # per request
 MAX_REQUESTS = 8
@@ -63,7 +62,7 @@ def _arg(t: torch.Tensor, align: int = 16):
 
 
 def _use_pdl() -> bool:
-    return get_env_flag("TRTLLM_ENABLE_PDL", True)
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 def supports_attn(

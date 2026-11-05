@@ -20,13 +20,14 @@ This module implements the DeepEP (Deep Expert Parallelism) communication method
 DeepEP supports both pre-quant and post-quant dispatch modes.
 """
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
-from tensorrt_llm._utils import get_env_flag, local_mpi_size
+from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -92,7 +93,9 @@ class DeepEP(Communication):
 
         self.expert_size_per_partition = expert_size_per_partition
         self.use_cuda_graph = use_cuda_graph
-        self.enable_postquant_alltoall = get_env_flag("TRTLLM_MOE_POST_QUANT_ALLTOALLV", True)
+        self.enable_postquant_alltoall = (
+            os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
+        )
 
         # Initialize DeepEP buffer
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)

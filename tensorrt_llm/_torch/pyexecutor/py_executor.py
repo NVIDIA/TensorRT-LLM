@@ -1863,7 +1863,7 @@ class PyExecutor:
         buffer.
         """
         tp_size = self.dist.tp_size
-        gather_all_ranks = get_env_flag("TLLM_METRICS_ALL_RANKS", False)
+        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if not (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
                 and self.enable_attention_dp):
             return
@@ -3501,7 +3501,7 @@ class PyExecutor:
         scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
 
         tp_size = getattr(self.dist, "tp_size", 1)
-        gather_all_ranks = get_env_flag("TLLM_METRICS_ALL_RANKS", False)
+        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
                 and self.enable_attention_dp and attention_dp_rank is None):
             import json as _json

@@ -107,7 +107,7 @@ def worker_count(num_payloads: int, *, local_ranks: int = 1) -> int:
     Zero when the on-disk cache or JIT compilation is disabled: a worker could
     then compile but keep nothing.
     """
-    if get_env_flag("FLASHINFER_CUTE_DSL_DISABLE_CACHE", False) or os.environ.get(
+    if os.environ.get("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "0") == "1" or os.environ.get(
         "FLASHINFER_DISABLE_JIT"
     ):
         return 0
