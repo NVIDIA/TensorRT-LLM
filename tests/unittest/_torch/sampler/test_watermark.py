@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.sampler import watermark as watermark_module
 from tensorrt_llm._torch.pyexecutor.sampler.watermark import (
     WatermarkHandler,
     request_wants_watermark,
@@ -371,6 +372,13 @@ class TestHandler:
     def _handler(self, **kwargs):
         config = WatermarkConfig(key=99, context_width=3, **kwargs)
         return config, WatermarkHandler(config, max_num_sequences=4, max_seq_len=64)
+
+    def test_repeat_history_is_capped_by_memory(self, monkeypatch):
+        monkeypatch.setattr(watermark_module, "MAX_RING_BYTES", 8 * 3000 * 5)
+        config = WatermarkConfig(key=99, context_width=3, deduplicate_contexts_max_history=None)
+        handler = WatermarkHandler(config, max_num_sequences=4, max_seq_len=1 << 20)
+        assert handler._ring.numel() * 8 <= watermark_module.MAX_RING_BYTES
+        assert handler._ring_size == 3000 - 1
 
     def test_seeds_follow_the_token_stream(self):
         config, handler = self._handler()

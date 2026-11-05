@@ -28,7 +28,7 @@ out = llm.generate(["Write a short note about GPUs."], SamplingParams(temperatur
 | `key` | required | Secret integer in `[0, 2**64)`. Detection needs the same value. Excluded from `repr`. |
 | `context_width` | 4 | Number of preceding tokens that seed each decision, 1 to 64. Larger values are less robust to edits; above 16 a warning is logged. |
 | `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this; `"single_turn"` searches the tokens the request generates; `"all"` also searches the prompt (for example earlier turns of a conversation) and leaves the first `context_width` generated tokens unwatermarked. |
-| `deduplicate_contexts_max_history` | 8192 | How many generated positions back the repeat search reaches. `None` means the whole generation. The repeat search keeps 8 bytes per position per sequence slot on the GPU: about 134 MB for 2048 slots at the default, and `None` sizes it to `max_seq_len`, which can take several GB. |
+| `deduplicate_contexts_max_history` | 8192 | How many generated positions back the repeat search reaches. `None` means the whole generation. GPU memory is 8 bytes per position per sequence slot (about 134 MB for 2048 slots at the default), capped at 512 MiB. |
 | `allow_target_only_watermarking` | `False` | Only for speculative decoding with rejection sampling: leave accepted draft tokens unmarked (see below). |
 | `allow_request_opt_out` | `True` | Whether a request may set `SamplingParams.watermarking=False`. Set to `False` to enforce the watermark on every request that can carry one. |
 | `prf` | `"philox"` | Pseudo-random function. Fast but not cryptographic: it does not protect against key recovery or forgery. |
@@ -83,7 +83,7 @@ positions, or whose tokens the model was nearly certain about, cannot reach a sm
 keyed tokens per request, because that would need a device-to-host read on every step.
 
 Tokenize text with the tokenizer used for generation. The configuration must match generation: key,
-`context_width`, PRF and deduplication settings. Without `prompt_token_ids` the first `context_width`
+`context_width`, PRF and deduplication settings (a smaller `deduplicate_contexts_max_history` than the engine's lowers detection power). Without `prompt_token_ids` the first `context_width`
 positions are not scored. A fixed key reuses random values across documents, so the nominal p-value
 assumes independent inputs; measure the false-positive rate on representative unwatermarked text
 before relying on a decision. Detection outputs can help an attacker imitate or strip the watermark.
