@@ -4,11 +4,13 @@
 
 import _rank_job
 import pytest
+import torch
 
 from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() != 107, reason="owned GLM IPC kernels require SM107"
+    get_sm_version() != 107 or torch.cuda.device_count() < _rank_job.WORLD_SIZE,
+    reason="requires SM107 and at least four visible GPUs",
 )
 
 
