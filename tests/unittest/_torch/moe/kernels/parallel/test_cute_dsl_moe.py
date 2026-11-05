@@ -3096,6 +3096,28 @@ def test_locality_domain_plan_vetoes_shards_the_kernels_cannot_tile(
     assert CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, disabled) is disabled
 
 
+@pytest.mark.parametrize(
+    ("fc1_n", "fc2_n"),
+    [
+        pytest.param(384, 4096, id="fc1-half-odd-multiple-of-64"),
+        pytest.param(1536, 2880, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_split_rejects_shards_the_kernels_cannot_tile(fc1_n, fc2_n):
+    """The split checks the stored widths itself, so a weight padded past what
+    the plan veto saw fails at load instead of at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        _locality_domain_plan=PartitionPlan(enabled=True, num_partitions=2),
+        w3_w1_weight=torch.empty(1, fc1_n, 8),
+        w2_weight=torch.empty(1, fc2_n, 8),
+    )
+    with pytest.raises(ValueError, match="multiple of 128"):
+        CuteDslLocalityDomainMixin._split_weights_for_locality_domain(host)
+
+
 def test_locality_domain_mixin_precedes_moe_impl_base():
     """The mixin's lifecycle overrides chain to super(), so with the bases
     swapped MoEImplBase's defaults would silently win; every host must list
