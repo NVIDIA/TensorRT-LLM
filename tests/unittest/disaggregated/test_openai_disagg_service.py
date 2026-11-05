@@ -27,8 +27,10 @@ import pytest
 import torch
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from llmapi.apps.render_helpers import use_harmony_vocab
 from openai.types.responses import ResponseErrorEvent, ResponseFailedEvent, ResponseStatus
 from starlette.requests import Request
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ConversationAwareADPRouter,
@@ -509,11 +511,15 @@ async def test_subagent_body_id_and_affinity_at_router_dispatch(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
 @pytest.mark.parametrize("scope", ["context", "both"])
-@pytest.mark.parametrize("handler_name", ["openai_chat", "chat_harmony"])
+# threadleak is off: the gpt-oss workers are built through the real constructor,
+# whose input-processor pool is shut down without waiting at environment exit.
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("handler_name", ["openai_chat", "chat_harmony", "openai_chat_gpt_oss"])
 @pytest.mark.parametrize("affinity_enabled", [False, True])
 @pytest.mark.parametrize("configured_role", [False, True])
 async def test_subagent_affinity_http_worker_adp_placement(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
     schedule_style: str,
     scope: str,
     handler_name: str,
@@ -524,8 +530,14 @@ async def test_subagent_affinity_http_worker_adp_placement(
 
     Only model execution/tokenization and response postprocessing are stubbed;
     the service, HTTP client, worker chat handler and ADP router execute normally.
-    Rank states are deterministic CPU fixtures, not a GPU execution test.
+    Rank states are deterministic CPU fixtures, not a GPU execution test. The
+    ``openai_chat_gpt_oss`` case runs the default handler of a gpt-oss worker
+    built through the real constructor, with the harmony hooks on.
     """
+    gpt_oss_worker = handler_name == "openai_chat_gpt_oss"
+    if gpt_oss_worker:
+        use_harmony_vocab(monkeypatch)
+    gpt_oss_env = None
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
     monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", mock.Mock())
 
@@ -569,36 +581,48 @@ async def test_subagent_affinity_http_worker_adp_placement(
             )
             return SimpleNamespace(prompt_token_ids=[1, 2, 3])
 
-        server = object.__new__(OpenAIServer)
-        server.server_role = role if configured_role else None
-        server._internal_disagg_auth_key = auth_key
-        server.allow_request_chat_template = False
-        server.generator = SimpleNamespace(
-            args=SimpleNamespace(
-                num_postprocess_workers=0,
-                gather_generation_logits=False,
-                reasoning_parser=None,
-                backend="pytorch",
-                cache_transceiver_config={"backend": "UCX"},
-            ),
-            generate_async=generate,
-        )
-        server.model_config = SimpleNamespace(model_type="llama", vocab_size=1000)
-        server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1000))
-        server.multimodal_server_config = None
-        server.tool_parser = None
-        server.tool_call_id_type = "random"
-        server.chat_template = None
-        server.harmony_adapter = mock.Mock()
-        server.harmony_adapter.get_stop_tokens.return_value = [999]
-        server.await_disconnected = AsyncMock()
-
         async def postprocess(promise, postproc_params, raw_request, disaggregated_params):
             return _make_chat_response(
                 "length" if role == ServerRole.CONTEXT else "stop",
                 disagg_request_id=disaggregated_params.disagg_request_id,
             )
 
+        if gpt_oss_worker:
+            # The real constructor on a fake gpt-oss checkpoint: use_harmony and
+            # the gpt-oss hooks come from _init_llm. Only what the hand-built
+            # workers below set is overridden.
+            server = gpt_oss_env.build_openai_server(
+                AggConfig(model_type="gpt_oss", role=role if configured_role else None)
+            )
+            server._internal_disagg_auth_key = auth_key
+            server.generator.args.cache_transceiver_config = {"backend": "UCX"}
+            server.generator.generate_async = generate
+            handler = server.openai_chat
+        else:
+            server = object.__new__(OpenAIServer)
+            server.server_role = role if configured_role else None
+            server._internal_disagg_auth_key = auth_key
+            server.allow_request_chat_template = False
+            server.generator = SimpleNamespace(
+                args=SimpleNamespace(
+                    num_postprocess_workers=0,
+                    gather_generation_logits=False,
+                    reasoning_parser=None,
+                    backend="pytorch",
+                    cache_transceiver_config={"backend": "UCX"},
+                ),
+                generate_async=generate,
+            )
+            server.model_config = SimpleNamespace(model_type="llama", vocab_size=1000)
+            server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1000))
+            server.multimodal_server_config = None
+            server.tool_parser = None
+            server.tool_call_id_type = "random"
+            server.chat_template = None
+            server.harmony_adapter = mock.Mock()
+            server.harmony_adapter.get_stop_tokens.return_value = [999]
+            handler = getattr(server, handler_name)
+        server.await_disconnected = AsyncMock()
         server._create_chat_response = postprocess
 
         async def handle(http_request: web.Request) -> web.Response:
@@ -610,7 +634,7 @@ async def test_subagent_affinity_http_worker_adp_placement(
                 == DisaggScheduleStyle[schedule_style.upper()]
             )
             raw_request = Request({"type": "http", "headers": http_request.raw_headers})
-            response = await getattr(server, handler_name)(request, raw_request)
+            response = await handler(request, raw_request)
             return web.Response(
                 body=response.body, status=response.status_code, content_type="application/json"
             )
@@ -620,6 +644,8 @@ async def test_subagent_affinity_http_worker_adp_placement(
         return app
 
     async with AsyncExitStack() as stack:
+        if gpt_oss_worker:
+            gpt_oss_env = stack.enter_context(isolated_serve_env(tmp_path))
         session = await stack.enter_async_context(aiohttp.ClientSession())
         for role, instance_router, client_attr in (
             (ServerRole.CONTEXT, service._ctx_router, "_ctx_client"),

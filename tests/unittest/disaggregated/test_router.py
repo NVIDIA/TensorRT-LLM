@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import copy
+import json
 import os
 import random
 import threading
@@ -2665,6 +2666,129 @@ async def test_chat_harmony_preserves_original_tool_conversion_error() -> None:
     assert failing_tool.calls == 1
     server.create_error_response.assert_called_once_with(
         message=str(original_error), err_type="internal_error")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_gpt_oss_router_tokens_match_openai_chat_server_input(
+        monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """KV-cache routing must hash the same Harmony tokens the default handler uses."""
+    use_harmony_vocab(monkeypatch)
+    from test_common.serve.app_factory import AggConfig, isolated_serve_env
+
+    from tensorrt_llm.serve.chat_tokenization import \
+        tokenize_harmony_chat_request
+
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32,
+                                model_path="/models/gpt-oss-checkpoint")
+    router_tokenizer = _mock_tokenizer(token_ids=[900, 901, 902])
+    body = {
+        "model":
+        "fake-model",
+        "messages": [{
+            "role": "developer",
+            "content": "Use tools when useful."
+        }, {
+            "role": "user",
+            "content": "weather in Paris?"
+        }],
+        "tools": [_get_weather_tool().model_dump()],
+        "tool_choice":
+        "auto",
+        "reasoning_effort":
+        "medium",
+        "max_completion_tokens":
+        1,
+    }
+    harmony_tokens = tokenize_harmony_chat_request(
+        ChatCompletionRequest(**body))
+
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=router_tokenizer), mock.patch(
+                               "tensorrt_llm.serve.router_utils."
+                               "resolve_model_type_from_config",
+                               return_value="gpt_oss"):
+        router._server_info = {
+            "server1": {
+                "render_fingerprint":
+                router._render_resources("fake-model").fingerprint()
+            }
+        }
+        router_request = ChatCompletionRequest(**body)
+        router_token_ids = router._tokenize(router_request)[0]
+
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig(model_type="gpt_oss"))
+        client = env.client(server.app)
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200, response.text
+        # The handler runs the engine's preprocess on the prompt; the ids are
+        # what preprocess received.
+        server_token_ids = list(
+            server.generator.preprocess_calls[0].inputs["prompt_token_ids"])
+
+    assert router_token_ids == server_token_ids
+    assert router_request.prompt_token_ids == harmony_tokens
+    assert server_token_ids == harmony_tokens
+    router_tokenizer.apply_chat_template.assert_not_called()
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_openai_chat_preserves_original_tool_conversion_error_for_gpt_oss(
+        tmp_path) -> None:
+    """The first tool dump that fails is the answer; nothing re-runs it."""
+    from test_common.serve.app_factory import AggConfig, isolated_serve_env
+
+    original_error = RuntimeError("original tool conversion failure")
+
+    class FailingTool:
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def model_dump(self, *args, **kwargs) -> dict[str, object]:
+            self.calls += 1
+            raise original_error if self.calls == 1 else RuntimeError(
+                "diagnostic tool conversion failure")
+
+    failing_tool = FailingTool()
+    request = ChatCompletionRequest(
+        model="fake-model",
+        messages=[{
+            "role": "user",
+            "content": "weather in Paris?"
+        }],
+    )
+    object.__setattr__(request, "tools", [failing_tool])
+
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig(model_type="gpt_oss"))
+        response = asyncio.run(
+            server.openai_chat(request, _synthetic_chat_request()))
+
+    body = json.loads(response.body)
+    assert (response.status_code, body["type"],
+            body["message"]) == (400, "BadRequestError", str(original_error))
+    assert failing_tool.calls == 1
+
+
+def _synthetic_chat_request():
+    """A Request for an in-process handler call: no client connection behind it."""
+    from starlette.requests import Request
+
+    return Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [],
+        "state": {
+            "no_client_connection": True
+        },
+    })
 
 
 @pytest.mark.parametrize("router_class",
