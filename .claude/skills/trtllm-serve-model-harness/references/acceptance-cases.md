@@ -47,8 +47,10 @@ validator tree.
 ## 1. Responses: `scripts/validate/fake_responses_server.py`
 
 `controls.py` runs these through `verdict.py`. The reference checkers still run them with
-`scripts/validate/run_controls.sh <corpus.jsonl> <out> [python]`, given any recorded or
-synthetic Responses requests with tool declarations.
+`scripts/validate/run_controls.sh <corpus.jsonl> <out> [python]`, given recorded or
+synthetic Responses requests with tool declarations. The requests are replayed as recorded, so
+the `two_calls` row needs at least one with `parallel_tool_calls: false`; without one,
+`ptc_violation` is NOT_APPLICABLE and the row reports BAD.
 
 | Mode | Breaks | Expected set |
 |---|---|---|

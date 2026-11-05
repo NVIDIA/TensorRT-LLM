@@ -19,8 +19,10 @@
 # Run it before trusting a verdict, and after editing any check.
 #
 # usage: run_controls.sh <corpus.jsonl> [out_dir] [python]
-# The corpus comes from ../build_replay_corpus.py (any recorded
-# Responses requests; the fake server only reads their tool declarations).
+# The corpus comes from ../build_replay_corpus.py: recorded Responses requests with tool
+# declarations, which the fake server reads. Entries are replayed as recorded, so the two_calls
+# row needs at least one with `parallel_tool_calls: false`; without one, ptc_violation is
+# NOT_APPLICABLE and the row reports BAD.
 set -u
 CORPUS=${1:?corpus.jsonl}
 OUT=${2:-/tmp/conformance_controls}
