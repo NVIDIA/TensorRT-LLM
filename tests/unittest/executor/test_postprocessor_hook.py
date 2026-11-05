@@ -310,11 +310,12 @@ def test_harmony_model_rejects_post_processor_hook():
     text-based hook, so the server refuses the combination at startup.
     """
     from tensorrt_llm.serve.openai_server import OpenAIServer
+    from tensorrt_llm.serve.serving_extensions import OutputMode
 
     guard = OpenAIServer._ensure_post_processor_hook_supported
     with pytest.raises(ValueError, match="not supported with harmony"):
-        guard(use_harmony=True, post_processor_hook="my_pkg.guardrail.Hook")
+        guard(OutputMode.HARMONY_TOKENS, post_processor_hook="my_pkg.guardrail.Hook")
     # Every other combination is allowed.
-    guard(use_harmony=False, post_processor_hook="my_pkg.guardrail.Hook")
-    guard(use_harmony=True, post_processor_hook=None)
-    guard(use_harmony=False, post_processor_hook=None)
+    guard(OutputMode.TEXT, post_processor_hook="my_pkg.guardrail.Hook")
+    guard(OutputMode.HARMONY_TOKENS, post_processor_hook=None)
+    guard(OutputMode.TEXT, post_processor_hook=None)

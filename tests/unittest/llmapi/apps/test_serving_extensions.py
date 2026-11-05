@@ -159,6 +159,7 @@ class TestBuiltinExtensions:
         monkeypatch.setattr(serving_extensions, "_builtins_loaded", False)
         monkeypatch.setattr(serving_extensions, "_BY_MODEL_TYPE", {})
         monkeypatch.setattr(serving_extensions, "_BY_REASONING_PARSER", {})
+        monkeypatch.setattr(serving_extensions, "_CLI_ALIASES", {})
         for name in [
             mod for mod in sys.modules if mod.startswith(serving_extensions._BUILTINS_PACKAGE)
         ]:
@@ -804,6 +805,41 @@ class TestExtensionHooks:
             )
             == 0
         )
+        assert extension.extra_stop_token_ids() == []
+        assert extension.unsupported_features() == frozenset()
+
+    def test_declared_unsupported_features_are_known(self) -> None:
+        """A misspelled feature name would silently drop its rejection."""
+        serving_extensions.load_builtin_extensions()
+        for extension in set(serving_extensions._BY_MODEL_TYPE.values()):
+            for value in extension.unsupported_features():
+                try:
+                    serving_extensions.UnsupportedFeature(value)
+                except ValueError:
+                    pytest.fail(
+                        f"{type(extension).__name__} declares unknown unsupported feature "
+                        f"{value!r}; use an UnsupportedFeature member (a misspelled name "
+                        "silently drops the rejection)"
+                    )
+
+    def test_gpt_oss_declares_stop_tokens_and_unsupported_features(self, harmony_vocab) -> None:
+        from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+
+        gpt_oss = serving_extensions.get_serving_extension("gpt_oss")
+        # The adapter returns its two stop ids in no fixed order.
+        assert sorted(gpt_oss.extra_stop_token_ids()) == sorted(
+            get_harmony_adapter().get_stop_tokens()
+        )
+        assert gpt_oss.unsupported_features() == frozenset(
+            {
+                serving_extensions.UnsupportedFeature.NAMED_TOOL_CHOICE,
+                serving_extensions.UnsupportedFeature.THINKING_TOKEN_BUDGET,
+                serving_extensions.UnsupportedFeature.TOP_LOGPROBS,
+                serving_extensions.UnsupportedFeature.SPEC_DECODE_STATS,
+            }
+        )
+        # The members are strings: a declared set matches by value too.
+        assert "named_tool_choice" in gpt_oss.unsupported_features()
 
     def test_load_builtin_extensions_keeps_its_private_alias(self) -> None:
         assert (
@@ -919,3 +955,121 @@ class TestExtensionHooks:
         tool = self._namespaced_tool(namespace=namespace, name=name)
 
         assert deepseek_v41.serialize_tool(tool) == tool.model_dump()
+
+
+class TestCliAliases:
+    """``cli_aliases`` extend the parser choices without becoming parsers."""
+
+    def test_gpt_oss_is_an_alias_for_its_model_type(self) -> None:
+        assert "gpt_oss" in serving_extensions.serving_extension_cli_aliases()
+        assert serving_extensions.cli_alias_model_types("gpt_oss") == ("gpt_oss",)
+        assert serving_extensions.cli_alias_model_types("qwen3") == ()
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [(None, (None, None)), ("qwen3", ("qwen3", None)), ("gpt_oss", (None, "gpt_oss"))],
+    )
+    def test_split_cli_parser_alias(self, name, expected) -> None:
+        assert serving_extensions.split_cli_parser_alias(name) == expected
+
+    def test_aliases_collide_with_no_parser_name(self) -> None:
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+        from tensorrt_llm.serve.tool_parser import ToolParserFactory
+
+        aliases = serving_extensions.serving_extension_cli_aliases()
+        assert len(aliases) == len(set(aliases)), f"duplicate CLI aliases: {aliases}"
+        parser_names = set(ReasoningParserFactory.keys()) | set(ToolParserFactory.parsers)
+        for alias in aliases:
+            assert alias not in parser_names and alias != "auto", (
+                f"CLI alias {alias} collides with a parser name; choose another alias"
+            )
+
+    def test_registration_records_the_alias(self, monkeypatch) -> None:
+        monkeypatch.setattr(serving_extensions, "_CLI_ALIASES", {})
+        monkeypatch.setattr(serving_extensions, "_builtins_loaded", True)
+        model_key = "cli-alias-test-model"
+        alias = "cli-alias-test"
+
+        @serving_extensions.register_serving_extension(
+            model_types=(model_key,), cli_aliases=(alias,)
+        )
+        class AliasedExtension(ServingExtension):
+            pass
+
+        try:
+            assert serving_extensions.cli_alias_model_types(alias) == (model_key,)
+            assert serving_extensions.split_cli_parser_alias(alias) == (None, alias)
+            # The alias is not a lookup key of the extension registry.
+            assert type(serving_extensions.get_serving_extension(alias)) is ServingExtension
+        finally:
+            serving_extensions._BY_MODEL_TYPE.pop(model_key, None)
+
+
+# threadleak is off: the servers are built through the real constructor, whose
+# input-processor pool is shut down without waiting at environment exit.
+@pytest.mark.threadleak(enabled=False)
+class TestGenericChatPath:
+    """The generic path keeps its behavior with the hooks consulted unconditionally."""
+
+    _CHAT = {"model": "fake-model", "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_generic_chat_requests_reach_generate_async_unchanged(self, tmp_path) -> None:
+        from test_common.serve.app_factory import AggConfig, isolated_serve_env
+
+        with isolated_serve_env(tmp_path) as env:
+            server = env.build_openai_server(AggConfig(model_type="llama"))
+            client = env.client(server.app)
+
+            assert client.post("/v1/chat/completions", json=self._CHAT).status_code == 200
+            plain = server.generator.generate_calls[-1].sampling_params
+            assert not plain.stop_token_ids, "no stop ids are added on the generic path"
+            assert plain.detokenize is True
+
+            # The scripted failure fires inside generate_async, after the call
+            # is recorded: the fake engine produces no logprobs to post-process,
+            # and what matters here is what the engine was asked for.
+            from test_common.serve.fakes import ScriptedOutput
+
+            server.generator.script(
+                ScriptedOutput(raise_on_call=RuntimeError("stop at submission"))
+            )
+            client.post(
+                "/v1/chat/completions", json={**self._CHAT, "logprobs": True, "top_logprobs": 2}
+            )
+            with_logprobs = server.generator.generate_calls[-1].sampling_params
+            assert with_logprobs.logprobs == 2, (
+                "top_logprobs reaches the engine on the generic path"
+            )
+
+    def test_generic_chat_rejections_keep_their_messages(self, tmp_path) -> None:
+        from test_common.serve.app_factory import AggConfig, isolated_serve_env
+
+        with isolated_serve_env(tmp_path) as env:
+            server = env.build_openai_server(AggConfig(model_type="llama"))
+            client = env.client(server.app)
+
+            named = client.post(
+                "/v1/chat/completions",
+                json={
+                    **self._CHAT,
+                    "tools": [_WEATHER_TOOL],
+                    "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+                },
+            )
+            assert (named.status_code, named.json()["message"]) == (
+                400,
+                "tool_choice with a named function requires the server to be started with a "
+                "guided decoding backend (set `guided_decoding_backend` to 'xgrammar' or "
+                "'llguidance').",
+            )
+            budget = client.post(
+                "/v1/chat/completions", json={**self._CHAT, "thinking_token_budget": 16}
+            )
+            assert (budget.status_code, budget.json()["message"]) == (
+                400,
+                "thinking_token_budget requires a configured reasoning_parser",
+            )
+            messages = set(serving_extensions.UNSUPPORTED_FEATURE_MESSAGES.values())
+            assert named.json()["message"] not in messages
+            assert budget.json()["message"] not in messages
+            assert server.generator.generate_calls == []
