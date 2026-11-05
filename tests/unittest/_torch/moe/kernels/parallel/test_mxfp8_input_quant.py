@@ -20,7 +20,7 @@ from tensorrt_llm._utils import get_sm_version
     "num_tokens,hidden", [(0, 512), (1, 512), (7, 224), (21, 4096), (256, 4096)]
 )
 @pytest.mark.parametrize("use_pdl,zero_output", [(False, False), (False, True), (True, True)])
-def test_fc12_quantize_reset(dtype, num_tokens, hidden, use_pdl, zero_output):
+def test_fc12_quantize_reset(dtype, num_tokens, hidden, use_pdl, zero_output) -> None:
     """Check native bytes, empty input, reset coverage, and changing graph input."""
     import cutlass
     import cutlass.cute as cute
@@ -105,7 +105,7 @@ def test_fc12_quantize_reset(dtype, num_tokens, hidden, use_pdl, zero_output):
 )
 @pytest.mark.parametrize("num_ready,num_output", [(0, 0), (777, 512), (8193, 65536)])
 @pytest.mark.parametrize("use_pdl,zero_output", [(False, False), (False, True), (True, True)])
-def test_fc12_reset_only_replay(num_ready, num_output, use_pdl, zero_output):
+def test_fc12_reset_only_replay(num_ready, num_output, use_pdl, zero_output) -> None:
     """Reset-only calls preserve all buffers and graph ordering without raw input."""
     import cutlass
     import cutlass.cute as cute

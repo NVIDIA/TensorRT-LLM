@@ -890,9 +890,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
     :param sparse_gather: Compile the FC1 A gather as a dynamic-trip-count loop
         that skips 16-row groups lying wholly beyond a tile's valid rows (decode
         tiles with a few real rows per 128-row tile). Leave it False for full
-        tiles: that keeps the original statically unrolled loop, which is faster
-        when every group is live. The caller selects it per launch from the
-        routing (only one loop body is ever compiled).
+        tiles: that keeps the statically unrolled loop, which is faster when
+        every group is live. The runner selects it per compile from the static
+        shapes (``Sm107Mxfp8FusedFc12MoeRunner._use_sparse_gather``), so each
+        compiled kernel contains one loop body.
     :param fc2_stream_weights: Cache policy for the FC2 B (weight) TMA loads
         alone; ``None`` follows ``stream_weights``.
     :param stream_weights: Give the FC1/FC2 B (weight) TMA loads L2 evict-first
@@ -3081,69 +3082,80 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         (None, None, None, None, fc1_a_producer_state.index)
                     ]
 
-                    # Compile-time choice (``sparse_gather``): the original
-                    # statically unrolled loop (compile-time `i`, no per-group
-                    # guards) for full tiles, or the dynamic-trip-count loop that
-                    # skips wholly padded 16-row groups for decode tiles. Only one
-                    # body is traced, so neither variant pays for the other.
+                    # Compile-time choice (``sparse_gather``): the statically unrolled
+                    # loop (compile-time `i`, no per-group guards) for full tiles, or the
+                    # dynamic-trip-count loop that skips wholly padded 16-row groups for
+                    # decode tiles. Both run the same per-row gather (its operands are
+                    # passed explicitly: a staged loop cannot capture them); only one loop is
+                    # traced, so neither variant pays for the other.
+                    def gather_fc1_a_row(
+                        i,
+                        A_gmem_thread_offset,
+                        a_token_offset_tensor,
+                        a_predicate_tensor,
+                        tFC1AgA_ktile,
+                        tFC1AsA_ktile,
+                        a_atom_copy,
+                        a_elems,
+                        a_k_atom,
+                        a_k_passes,
+                    ) -> None:
+                        A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
+                            a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
+                            divby=a_elems,
+                        )
+                        a_predicate_slice = cute.make_rmem_tensor(
+                            cute.make_layout((1,)), cutlass.Boolean
+                        )
+                        a_predicate_slice[0] = a_predicate_tensor[i]
+                        # One 16-byte copy per 128-byte atom column of the K tile.
+                        for kk in cutlass.range_constexpr(a_k_passes):
+                            A_gmem_slice_offset = cute.assume(
+                                A_gmem_row_offset + kk * a_k_atom, divby=a_elems
+                            )
+                            tFC1AgA_slice_ptr = tFC1AgA_ktile.iterator + A_gmem_slice_offset
+                            tFC1AgA_slice = cute.make_tensor(
+                                tFC1AgA_slice_ptr, layout=cute.make_layout((a_elems,))
+                            )
+                            tFC1AsA_slice = cute.make_tensor(
+                                tFC1AsA_ktile[(None, i, None, kk)].iterator,
+                                layout=cute.make_layout((a_elems,)),
+                            )
+                            cute.copy_atom_call(
+                                a_atom_copy,
+                                tFC1AgA_slice,
+                                tFC1AsA_slice,
+                                pred=a_predicate_slice,
+                            )
+
                     if cutlass.const_expr(not (self.sparse_gather and self.a_dtype.width == 8)):
                         for i in range(self.fc1_a_num_loads):
-                            A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
-                                a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
-                                divby=a_elems,
+                            gather_fc1_a_row(
+                                i,
+                                A_gmem_thread_offset,
+                                a_token_offset_tensor,
+                                a_predicate_tensor,
+                                tFC1AgA_ktile,
+                                tFC1AsA_ktile,
+                                a_atom_copy,
+                                a_elems,
+                                a_k_atom,
+                                self.fc1_a_k_passes,
                             )
-                            a_predicate_slice = cute.make_rmem_tensor(
-                                cute.make_layout((1,)), cutlass.Boolean
-                            )
-                            a_predicate_slice[0] = a_predicate_tensor[i]
-                            # One 16-byte copy per 128-byte atom column of the K tile.
-                            for kk in cutlass.range_constexpr(self.fc1_a_k_passes):
-                                A_gmem_slice_offset = cute.assume(
-                                    A_gmem_row_offset + kk * a_k_atom, divby=a_elems
-                                )
-                                tFC1AgA_slice_ptr = tFC1AgA_ktile.iterator + A_gmem_slice_offset
-                                tFC1AgA_slice = cute.make_tensor(
-                                    tFC1AgA_slice_ptr, layout=cute.make_layout((a_elems,))
-                                )
-                                tFC1AsA_slice = cute.make_tensor(
-                                    tFC1AsA_ktile[(None, i, None, kk)].iterator,
-                                    layout=cute.make_layout((a_elems,)),
-                                )
-                                cute.copy_atom_call(
-                                    a_atom_copy,
-                                    tFC1AgA_slice,
-                                    tFC1AsA_slice,
-                                    pred=a_predicate_slice,
-                                )
                     else:
                         for i in cutlass.range(a_num_loads):
-                            A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
-                                a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
-                                divby=a_elems,
+                            gather_fc1_a_row(
+                                i,
+                                A_gmem_thread_offset,
+                                a_token_offset_tensor,
+                                a_predicate_tensor,
+                                tFC1AgA_ktile,
+                                tFC1AsA_ktile,
+                                a_atom_copy,
+                                a_elems,
+                                a_k_atom,
+                                self.fc1_a_k_passes,
                             )
-                            a_predicate_slice = cute.make_rmem_tensor(
-                                cute.make_layout((1,)), cutlass.Boolean
-                            )
-                            a_predicate_slice[0] = a_predicate_tensor[i]
-                            # One 16-byte copy per 128-byte atom column of the K tile.
-                            for kk in cutlass.range_constexpr(self.fc1_a_k_passes):
-                                A_gmem_slice_offset = cute.assume(
-                                    A_gmem_row_offset + kk * a_k_atom, divby=a_elems
-                                )
-                                tFC1AgA_slice_ptr = tFC1AgA_ktile.iterator + A_gmem_slice_offset
-                                tFC1AgA_slice = cute.make_tensor(
-                                    tFC1AgA_slice_ptr, layout=cute.make_layout((a_elems,))
-                                )
-                                tFC1AsA_slice = cute.make_tensor(
-                                    tFC1AsA_ktile[(None, i, None, kk)].iterator,
-                                    layout=cute.make_layout((a_elems,)),
-                                )
-                                cute.copy_atom_call(
-                                    a_atom_copy,
-                                    tFC1AgA_slice,
-                                    tFC1AsA_slice,
-                                    pred=a_predicate_slice,
-                                )
 
                     # SFA for the same stage, issued by the same threads so
                     # the single producer_commit below covers A and SFA. The
