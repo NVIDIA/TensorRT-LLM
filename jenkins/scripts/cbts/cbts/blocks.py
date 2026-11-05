@@ -239,12 +239,14 @@ class YAMLIndex:
         return idx
 
     def _load_one(self, yml_path: Path) -> None:
+        """Index every test-db context (top-level key) that `yml_path` defines."""
         data = yaml.safe_load(yml_path.read_text()) or {}
         for context, blocks_data in data.items():
             if context != "version" and isinstance(blocks_data, list):
                 self._load_context(context, blocks_data)
 
     def _load_context(self, yaml_stem: str, blocks_data: list) -> None:
+        """Index the blocks of context `yaml_stem` and map each of their tests to its blocks."""
         for i, block_data in enumerate(blocks_data):
             if not isinstance(block_data, dict):
                 continue

@@ -58,6 +58,7 @@ def _write_test_db(test_db_dir: Path) -> None:
 
 
 def test_yaml_index_loads_every_context_of_a_file(tmp_path: Path) -> None:
+    """Each context of a multi-context file gets its own blocks and waive lookup."""
     _write_test_db(tmp_path / "test-db")
     index = YAMLIndex.load(tmp_path / "test-db")
 
@@ -74,6 +75,7 @@ def test_yaml_index_loads_every_context_of_a_file(tmp_path: Path) -> None:
 
 
 def test_narrowed_test_db_has_one_file_per_context(tmp_path: Path) -> None:
+    """Both narrowed test-dbs write each affected context alone to `<context>.yml`."""
     _write_test_db(tmp_path / "test-db")
 
     filtered = tmp_path / "filtered"
