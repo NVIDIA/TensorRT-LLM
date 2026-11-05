@@ -74,10 +74,11 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_encoder import \
     prepare_encoder_attn_metadata as _prepare_qwen_vl_vision_attn_metadata
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import (EncoderGroup, MultimodalModelMixin,
+                                        encode_multimodal_by_groups)
 from .modeling_multimodal_utils import (
-    _install_processor_output_validation_filter, find_input_mm_embeds,
-    fuse_input_embeds, get_attached_multimodal_embeddings,
+    VisionNormalization, _install_processor_output_validation_filter,
+    find_input_mm_embeds, fuse_input_embeds, get_attached_multimodal_embeddings,
     get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
@@ -1543,81 +1544,45 @@ class Qwen2VisionModelBase(nn.Module):
                            converted_weights,
                            params_map=pattern_mapping)
 
-    def _parse_and_batch_multimodal_data(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
+    def encode_batched(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        vision_normalization: Optional[VisionNormalization] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the ViT once on the payload keys the encoder group batched.
 
-        pixel_values_list = []
-        pixel_values_videos_list = []
-        image_grid_thw_list = []
-        video_grid_thw_list = []
+        Image rows come first, then video rows. ``vision_normalization`` and
+        ``second_per_grid_ts`` are declared by the shared Qwen producer; this
+        tower takes normalized pixels and reads neither. Called by `forward`,
+        which already runs in inference mode.
+        """
+        pixel_values, grid_thw = _concat_qwen_vision_inputs(
+            pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw)
+        embed = self.visual(pixel_values, grid_thw=grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        return embed
 
-        for multimodal_param in multimodal_params:
-            # Process images if present
-            if multimodal_param.multimodal_data.get("image") is not None:
-                pixel_values_list.append(
-                    multimodal_param.multimodal_data["image"]["pixel_values"])
-                image_grid_thw_list.append(
-                    multimodal_param.multimodal_data["image"]["image_grid_thw"])
-
-            # Process videos if present
-            if multimodal_param.multimodal_data.get("video") is not None:
-                pixel_values_videos_list.append(
-                    multimodal_param.multimodal_data["video"]
-                    ["pixel_values_videos"])
-                video_grid_thw_list.append(
-                    multimodal_param.multimodal_data["video"]["video_grid_thw"])
-
-        # Concatenate tensors
-        mm_content_dict = {}
-        if pixel_values_list:
-            mm_content_dict["pixel_values"] = torch.cat(
-                pixel_values_list,
-                dim=0) if len(pixel_values_list) > 1 else pixel_values_list[0]
-        if pixel_values_videos_list:
-            mm_content_dict["pixel_values_videos"] = torch.cat(
-                pixel_values_videos_list,
-                dim=0) if len(pixel_values_videos_list
-                              ) > 1 else pixel_values_videos_list[0]
-
-        # Prepare extra data
-        mm_extra_data = {}
-        if image_grid_thw_list:
-            mm_extra_data["image_grid_thw"] = torch.cat(
-                image_grid_thw_list, dim=0) if len(
-                    image_grid_thw_list) > 1 else image_grid_thw_list[0]
-        if video_grid_thw_list:
-            mm_extra_data["video_grid_thw"] = torch.cat(
-                video_grid_thw_list, dim=0) if len(
-                    video_grid_thw_list) > 1 else video_grid_thw_list[0]
-
-        return mm_content_dict, mm_extra_data
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        """One group: the ViT tells image and video items apart by their grid rows."""
+        return (EncoderGroup(modalities=("image", "video"),
+                             encoder_fn=self.encode_batched), )
 
     @nvtx_range("Qwen2VisionModelBase forward()")
     @torch.inference_mode()
-    def forward(self, multimodal_params: List[MultimodalParams]):
-
-        mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(
-            multimodal_params)
-        pixel_values = mm_content_data.get("pixel_values", None)
-        pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
-
-        image_grid_thw = mm_extra_data.get("image_grid_thw", None)
-        video_grid_thw = mm_extra_data.get("video_grid_thw", None)
-
-        embeds = []
-        if pixel_values is not None:
-            embed = self.visual(pixel_values, grid_thw=image_grid_thw)
-            if isinstance(embed, BaseModelOutputWithPooling):
-                embed = embed.pooler_output
-            embeds.append(embed)
-
-        if pixel_values_videos is not None:
-            embed = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-            if isinstance(embed, BaseModelOutputWithPooling):
-                embed = embed.pooler_output
-            embeds.append(embed)
-        return embeds
+    def forward(
+            self,
+            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        """Encode the batch; rows come back in request order, then prompt order."""
+        return [
+            encode_multimodal_by_groups(self.mm_encoder_groups,
+                                        multimodal_params)
+        ]
 
 
 class Qwen2_5_VLVisionAttention(Attention):

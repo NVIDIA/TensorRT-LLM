@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -21,6 +21,9 @@ from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
 from transformers import Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VisionTransformerPretrainedModel
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1026,6 +1029,286 @@ def test_qwen3_vision_encoders_take_the_declared_keys() -> None:
     for encoder in (Qwen3VisionModelBase, Cosmos3EdgeVisionEncoder):
         parameters = inspect.signature(encoder.encode_batched).parameters
         assert set(parameters) - {"self"} == declared, encoder.__name__
+
+
+# Qwen2-VL and Qwen2.5-VL (also Exaone4.5) use the same requests; the
+# `_legacy_qwen2vl_*` oracles copy the packing and forward that their encoder group
+# replaced.
+
+
+def _legacy_qwen2vl_parse_and_batch_multimodal_data(
+    multimodal_params: List[MultimodalParams],
+) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
+    """Copy of the `Qwen2VisionModelBase._parse_and_batch_multimodal_data` body this change
+    replaced."""
+    pixel_values_list = []
+    pixel_values_videos_list = []
+    image_grid_thw_list = []
+    video_grid_thw_list = []
+
+    for multimodal_param in multimodal_params:
+        # Process images if present
+        if multimodal_param.multimodal_data.get("image") is not None:
+            pixel_values_list.append(multimodal_param.multimodal_data["image"]["pixel_values"])
+            image_grid_thw_list.append(multimodal_param.multimodal_data["image"]["image_grid_thw"])
+
+        # Process videos if present
+        if multimodal_param.multimodal_data.get("video") is not None:
+            pixel_values_videos_list.append(
+                multimodal_param.multimodal_data["video"]["pixel_values_videos"]
+            )
+            video_grid_thw_list.append(multimodal_param.multimodal_data["video"]["video_grid_thw"])
+
+    # Concatenate tensors
+    mm_content_dict = {}
+    if pixel_values_list:
+        mm_content_dict["pixel_values"] = (
+            torch.cat(pixel_values_list, dim=0)
+            if len(pixel_values_list) > 1
+            else pixel_values_list[0]
+        )
+    if pixel_values_videos_list:
+        mm_content_dict["pixel_values_videos"] = (
+            torch.cat(pixel_values_videos_list, dim=0)
+            if len(pixel_values_videos_list) > 1
+            else pixel_values_videos_list[0]
+        )
+
+    # Prepare extra data
+    mm_extra_data = {}
+    if image_grid_thw_list:
+        mm_extra_data["image_grid_thw"] = (
+            torch.cat(image_grid_thw_list, dim=0)
+            if len(image_grid_thw_list) > 1
+            else image_grid_thw_list[0]
+        )
+    if video_grid_thw_list:
+        mm_extra_data["video_grid_thw"] = (
+            torch.cat(video_grid_thw_list, dim=0)
+            if len(video_grid_thw_list) > 1
+            else video_grid_thw_list[0]
+        )
+
+    return mm_content_dict, mm_extra_data
+
+
+def _legacy_qwen2vl_vision_forward(
+    visual, multimodal_params: List[MultimodalParams]
+) -> List[torch.Tensor]:
+    """Copy of the `Qwen2VisionModelBase.forward` body this change replaced: one ViT
+    call per modality, image rows then video rows."""
+    mm_content_data, mm_extra_data = _legacy_qwen2vl_parse_and_batch_multimodal_data(
+        multimodal_params
+    )
+    pixel_values = mm_content_data.get("pixel_values", None)
+    pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
+
+    image_grid_thw = mm_extra_data.get("image_grid_thw", None)
+    video_grid_thw = mm_extra_data.get("video_grid_thw", None)
+
+    embeds = []
+    if pixel_values is not None:
+        embed = visual(pixel_values, grid_thw=image_grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        embeds.append(embed)
+
+    if pixel_values_videos is not None:
+        embed = visual(pixel_values_videos, grid_thw=video_grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        embeds.append(embed)
+    return embeds
+
+
+class _Qwen2StubVisual:
+    """Stands in for the Qwen2-VL ViT and records its inputs. Each output row
+    sums one block of 4 patch rows, so a row depends only on its item."""
+
+    def __init__(self) -> None:
+        self.inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
+        self.inputs.append((pixel_values, grid_thw))
+        assert int(grid_thw.prod(dim=-1).sum()) == pixel_values.shape[0]
+        merged = pixel_values.reshape(-1, 4, pixel_values.shape[-1]).sum(dim=1)
+        return BaseModelOutputWithPooling(last_hidden_state=pixel_values, pooler_output=merged)
+
+
+def _qwen2_tiny_hf_visual() -> Qwen2VisionTransformerPretrainedModel:
+    """A random-weight HF Qwen2-VL ViT, small enough for the CPU (fp32, eager attention)."""
+    config = Qwen2VLVisionConfig(
+        depth=2,
+        embed_dim=32,
+        hidden_size=16,
+        mlp_ratio=2,
+        num_heads=2,
+        in_channels=3,
+        patch_size=1,
+        spatial_merge_size=2,
+        temporal_patch_size=_QWEN_TEST_ROW_WIDTH // 3,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    return Qwen2VisionTransformerPretrainedModel(config).eval()
+
+
+def _qwen2_vision_encoder(visual) -> SimpleNamespace:
+    """The real Qwen2-VL group and encoder bound to `visual` on a CPU object."""
+    vision = SimpleNamespace(visual=visual, calls=[])
+
+    def encode_batched(**inputs):
+        vision.calls.append(inputs)
+        return modeling_qwen2vl.Qwen2VisionModelBase.encode_batched(vision, **inputs)
+
+    vision.encode_batched = encode_batched
+    vision.mm_encoder_groups = modeling_qwen2vl.Qwen2VisionModelBase.mm_encoder_groups.fget(vision)
+    return vision
+
+
+def _qwen2_encode(vision: SimpleNamespace, params: List[MultimodalParams]) -> List[torch.Tensor]:
+    with torch.inference_mode():
+        return modeling_qwen2vl.Qwen2VisionModelBase.forward(vision, params)
+
+
+def _legacy_qwen2_encode(visual, params: List[MultimodalParams]) -> List[torch.Tensor]:
+    with torch.inference_mode():
+        return _legacy_qwen2vl_vision_forward(visual, params)
+
+
+def _qwen2_per_item_rows(visual, requests: list) -> torch.Tensor:
+    """The legacy encoder on one item at a time; a request's rows are its items in prompt order."""
+    return torch.cat(
+        [
+            _legacy_qwen2_encode(visual, [_qwen_vision_request([item])])[0]
+            for items in requests
+            for item in items
+        ]
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batch", list(_QWEN_VISION_BATCHES))
+def test_qwen2_vision_group_matches_legacy_packer(batch: str) -> None:
+    requests = _QWEN_VISION_BATCHES[batch]
+    params = [_qwen_vision_request(items) for items in requests]
+    visual, legacy_visual = _Qwen2StubVisual(), _Qwen2StubVisual()
+
+    batched = _qwen2_encode(_qwen2_vision_encoder(visual), params)
+    legacy = _legacy_qwen2_encode(legacy_visual, params)
+
+    # The legacy forward called the ViT once per modality, image rows first. The group concatenates
+    # the same tensors for one call and returns one tensor.
+    assert len(batched) == 1 and len(visual.inputs) == 1
+    _assert_same_tensors(
+        visual.inputs[0], tuple(torch.cat(parts) for parts in zip(*legacy_visual.inputs))
+    )
+    if len(legacy) == 1:
+        # With one modality, the legacy rows were already in request, then prompt order.
+        assert torch.equal(batched[0], legacy[0])
+    assert torch.equal(batched[0], _qwen2_per_item_rows(_Qwen2StubVisual(), requests))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batch", list(_QWEN_VISION_BATCHES))
+def test_qwen2_vision_hf_tower_batched_matches_per_item(batch: str) -> None:
+    requests = _QWEN_VISION_BATCHES[batch]
+    params = [_qwen_vision_request(items) for items in requests]
+    visual = _qwen2_tiny_hf_visual()
+    vision = _qwen2_vision_encoder(visual)
+
+    (batched,) = _qwen2_encode(vision, params)
+    legacy = _legacy_qwen2_encode(visual, params)
+
+    assert len(vision.calls) == 1
+    if len(legacy) == 1:
+        # Same ViT input as the legacy forward in one call, so the same rows.
+        assert torch.equal(batched, legacy[0])
+    # Batching changes only the GEMM shapes, so only the floating-point order differs.
+    torch.testing.assert_close(
+        batched, _qwen2_per_item_rows(visual, requests), rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.cpu_only
+def test_qwen2_vision_group_encodes_selected_items() -> None:
+    # Item scheduling and partial cache hits encode views of selected items.
+    request = _qwen_vision_request(
+        [
+            ("image", 1, (1, 2, 2)),
+            ("video", 2, (2, 2, 2)),
+            ("image", 3, (1, 2, 4)),
+            ("image", 4, (1, 4, 2)),
+        ]
+    )
+    other = _qwen_vision_request([("image", 5, (1, 2, 2))])
+    selected = [(request, 3), (request, 2), (request, 1), (other, 0)]
+    residuals = [
+        residual
+        for residual, _, _ in MultimodalModelMixin().prepare_multimodal_encoder_inputs(selected)
+    ]
+    visual, legacy_visual = _Qwen2StubVisual(), _Qwen2StubVisual()
+
+    (batched,) = _qwen2_encode(_qwen2_vision_encoder(visual), residuals)
+    _legacy_qwen2_encode(legacy_visual, residuals)
+
+    assert len(visual.inputs) == 1
+    _assert_same_tensors(
+        visual.inputs[0], tuple(torch.cat(parts) for parts in zip(*legacy_visual.inputs))
+    )
+    # The selected items get the rows they get inside their full requests.
+    vision = _qwen2_vision_encoder(_Qwen2StubVisual())
+    full = {
+        id(param): _qwen2_encode(vision, [param])[0].split(
+            param.item_metadata.output_embedding_lengths
+        )
+        for param in (request, other)
+    }
+    assert torch.equal(batched, torch.cat([full[id(param)][i] for param, i in selected]))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mm_counts", [{"image": 2}, {"video": 2}, {"video": 1, "image": 2}], ids=str
+)
+def test_qwen2_vision_profiling_dummy_encodes_through_the_group(mm_counts: dict) -> None:
+    class Processor(modeling_qwen2vl.Qwen2_5VLInputProcessorBase):
+        def _get_dummy_grid_for_modality(self, modality: str, max_num_encoder_tokens: int):
+            return {"image": (1, 2, 4), "video": (2, 2, 4)}[modality]
+
+    processor = object.__new__(Processor)
+    processor._config = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2, patch_size=1, in_channels=_QWEN_TEST_ROW_WIDTH
+        )
+    )
+    params = [
+        MultimodalParams(
+            multimodal_data=processor.get_dummy_mm_data(
+                max_num_encoder_tokens=64, mm_counts=mm_counts, dtype=torch.float32
+            )
+        )
+    ]
+    visual = _Qwen2StubVisual()
+
+    (batched,) = _qwen2_encode(_qwen2_vision_encoder(visual), params)
+
+    assert len(visual.inputs) == 1
+    assert batched.shape[0] == sum(params[0].item_metadata.output_embedding_lengths)
+
+
+@pytest.mark.cpu_only
+def test_qwen2_vision_encoders_take_the_declared_keys() -> None:
+    from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5_VisionModel
+
+    metadata = _qwen_vision_request(
+        [("image", 1, (1, 2, 2)), ("video", 2, (2, 2, 2))]
+    ).item_metadata
+    declared = set(metadata.input_partitions["image"]) | set(metadata.input_partitions["video"])
+    for encoder in (modeling_qwen2vl.Qwen2VisionModelBase, Exaone4_5_VisionModel):
+        parameters = inspect.signature(encoder.encode_batched).parameters
+        assert set(parameters) - {"self"} == declared, encoder.__name__
+        assert encoder.mm_encoder_groups is modeling_qwen2vl.Qwen2VisionModelBase.mm_encoder_groups
 
 
 @pytest.mark.cpu_only
