@@ -18,7 +18,6 @@ from .config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _ceil_div,
-    _env_enabled_default,
     _env_int,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
@@ -178,8 +177,8 @@ def _v_packed_cache_tag(
 def _triton_prepack_v_enabled() -> bool:
     if _fp4_mla_attention_backend() != "triton":
         return False
-    default = _env_enabled_default("TRTLLM_FP4_MLA_PREPACK_V", True)
-    return _env_enabled_default("TRTLLM_FP4_MLA_TRITON_PREPACK_V", default)
+    default = get_env_flag("TRTLLM_FP4_MLA_PREPACK_V", True)
+    return get_env_flag("TRTLLM_FP4_MLA_TRITON_PREPACK_V", default)
 
 
 def _triton_can_prepack_v(v_head_dim: int, page_size: int, block_v: int) -> bool:

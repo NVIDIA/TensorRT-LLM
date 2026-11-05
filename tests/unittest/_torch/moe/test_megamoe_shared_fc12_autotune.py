@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tensorrt_llm._utils import get_env_flag
+
 _ROOT = Path(__file__).resolve().parents[4]
 _SOURCE = _ROOT / "tensorrt_llm/_torch/moe/kernels/megamoe_shared_fc12.py"
 _AUTOTUNER = _ROOT / "tensorrt_llm/_torch/autotuner.py"
@@ -459,8 +461,6 @@ class CpuContractTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
     def test_original_autotuner_primes_each_cached_tactic_before_serving(self):
-        from tensorrt_llm._utils import get_env_flag
-
         source = ast.parse(_AUTOTUNER.read_text())
         autotuner_class = next(
             n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "AutoTuner"

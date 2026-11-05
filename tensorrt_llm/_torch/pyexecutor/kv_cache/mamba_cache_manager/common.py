@@ -242,7 +242,7 @@ def get_tensor_size_bytes(tensor):
 def use_py_mamba_cache_manager() -> bool:
     """Check if PythonMambaCacheManager should be forced (agg mode override).
 
-    Returns True if TRTLLM_USE_PY_MAMBA='1' is set, False otherwise.
+    Returns True when ``TRTLLM_USE_PY_MAMBA`` is on; it is off by default.
 
     Agg-mode-only override: forces the V1-route MixedMambaHybridCacheManager
     with PythonMambaCacheManager inside instead of the configured manager.

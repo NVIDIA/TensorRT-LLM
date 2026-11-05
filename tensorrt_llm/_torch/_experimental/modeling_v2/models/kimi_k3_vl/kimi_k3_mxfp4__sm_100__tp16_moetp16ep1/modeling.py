@@ -924,8 +924,7 @@ class KimiK3MoERuntime(nn.Module):
         # accumulate/output (checkpoint stores the gate weight in bf16; saves a
         # per-layer input cast + fp32 splitK pair on the bs1 decode path).
         # KIMI_K3_ROUTER_BF16=0 forces the upcast-to-fp32 GEMM.
-        _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
-        _router_bf16 = _router_bf16_env == "1" if _router_bf16_env is not None else True
+        _router_bf16 = get_env_flag("KIMI_K3_ROUTER_BF16", True)
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)

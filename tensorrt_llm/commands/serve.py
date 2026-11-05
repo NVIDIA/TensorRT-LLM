@@ -2900,9 +2900,9 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     _refuse_dense_dwdp_on_generation_servers(disagg_cfg)
 
     from tensorrt_llm._utils import mpi_rank
-    if not get_env_flag(
-            DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT,
-            False):
+    run_remote_mpi_session_client = get_env_flag(
+        DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT, False)
+    if not run_remote_mpi_session_client:
         set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
@@ -2920,9 +2920,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
                                                        if blocker else "auto")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
-    if get_env_flag(
-            DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT,
-            False):
+    if run_remote_mpi_session_client:
         instance_idx = os.environ.get(
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
