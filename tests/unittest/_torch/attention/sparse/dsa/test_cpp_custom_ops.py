@@ -345,11 +345,9 @@ def test_nvfp4_mla_record_kv_cache_gather():
     """Gather inline-scale ``nvfp4.fp8rope`` records (residual_dim = 2 * rope) into E4M3 rows."""
     num_pool_tokens = 6
     records, expected_rows = _make_nvfp4_mla_records(num_pool_tokens)
-    # The record layout never reads the scale pool, but the op requires its pointer.
-    scale_pool = torch.zeros((num_pool_tokens, 44), dtype=torch.uint8, device="cuda")
+    # Records keep their block scales inline; the cache has no scale pool.
     host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
     host_pool_pointers[0, 0, 0] = records.data_ptr()
-    host_pool_pointers[0, 0, 1] = scale_pool.data_ptr()
     host_pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
     global_indices = torch.tensor([[5, 0, -1], [3, 1, 6]], dtype=torch.int32, device="cuda")
     output = torch.zeros((*global_indices.shape, 576), dtype=torch.float8_e4m3fn, device="cuda")
@@ -381,10 +379,8 @@ def test_nvfp4_mla_record_context_kv_cache_gather():
     """Gather inline-scale records through a paged table with layer offsets."""
     pool_tokens = 8
     records, expected_rows = _make_nvfp4_mla_records(pool_tokens, seed=1)
-    scale_pool = torch.zeros((pool_tokens, 44), dtype=torch.uint8, device="cuda")
     pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
     pointers[0, 0, 0] = records.data_ptr()
-    pointers[0, 0, 1] = scale_pool.data_ptr()
     mapping = torch.tensor([[0, 0]], dtype=torch.int32)
     topk = torch.tensor([[0, 2, -1], [3, 1, 8]], dtype=torch.int32, device="cuda")
     requests = torch.zeros(2, dtype=torch.int32, device="cuda")

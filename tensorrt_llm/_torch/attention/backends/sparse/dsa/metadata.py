@@ -26,7 +26,7 @@ from ..offload import (
     get_sparse_offload_metadata_layers,
 )
 from ..params import use_self_sampling_gvr
-from .cache_manager import is_dsa_cache_manager
+from .cache_manager import NVFP4_MLA_RECORD_LAYOUT, is_dsa_cache_manager
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     Indexer,
@@ -1063,6 +1063,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self._offloads_dsa_latent():
             # Offloaded rows are dequantized into the offload state's scratch instead.
             return
+        if getattr(self.kv_cache_manager, "mla_kv_cache_layout", None) == NVFP4_MLA_RECORD_LAYOUT:
+            from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
+
+            if prims_ts_reads_nvfp4_mla_records():
+                # PrimTS reads the records in place, so generation gathers no FP8 rows.
+                return
 
         # MTP verifies the current token and max_draft_tokens draft tokens for
         # every generation request. Each query row has its own TopK selection,

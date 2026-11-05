@@ -279,8 +279,10 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     auto& kv_cache_buffer = kv_cache_buffers.kvCacheBuffer;
     if (kv_cache_quant_mode.hasFp4KvCache())
     {
-        TLLM_CHECK_WITH_INFO(
-            kv_cache_buffers.kvScaleCacheBuffer.data != nullptr, "NVFP4 MLA cache requires a block-scale pool.");
+        // The inline-scale record keeps its block scales in the data pool.
+        bool const record_layout = residual_dim == 2 * qk_rope_head_dim;
+        TLLM_CHECK_WITH_INFO(record_layout || kv_cache_buffers.kvScaleCacheBuffer.data != nullptr,
+            "NVFP4 MLA cache requires a block-scale pool.");
         TLLM_CHECK_WITH_INFO(kv_only || quant_q_buffer.has_value(), "NVFP4 MLA decode requires an FP8 query buffer.");
     }
 

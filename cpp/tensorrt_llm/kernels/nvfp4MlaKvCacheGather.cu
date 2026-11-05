@@ -908,6 +908,11 @@ int32_t getPersistentBlockCount(int64_t workItems, int32_t blocksPerSm = kBlocks
 
 } // namespace
 
+bool isNvFp4MlaRecordLayout(int32_t headDim, int32_t residualDim)
+{
+    return headDim == kMlaHeadDim && residualDim == kMlaRecordResidualDim;
+}
+
 void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
     int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream)
@@ -956,7 +961,7 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
                 globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens);
         }
     }
-    else if (headDim == kMlaHeadDim && residualDim == kMlaRecordResidualDim)
+    else if (isNvFp4MlaRecordLayout(headDim, residualDim))
     {
         int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
         nvFp4MlaRecordKvCacheGatherKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
@@ -1134,7 +1139,7 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
                 selectedGlobalIndices, output, globalDequantScale, totalKvTokens, outputCapacity, headDim, residualDim,
                 numPoolTokens);
     }
-    else if (headDim == kMlaHeadDim && residualDim == kMlaRecordResidualDim)
+    else if (isNvFp4MlaRecordLayout(headDim, residualDim))
     {
         nvFp4MlaContextKvCacheGatherKernel<MlaContextRowLayout::kRecord><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(
             dataPool, scalePool, selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale,
