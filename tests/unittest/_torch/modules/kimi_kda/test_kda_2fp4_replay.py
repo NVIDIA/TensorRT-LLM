@@ -229,9 +229,24 @@ def _verification_descriptors(
     )
 
 
-@pytest.mark.parametrize(("heads", "tokens"), [(1, 1), (3, 4), (3, 8), (12, 7)])
-def test_dspark_native_verify_acceptance_and_rollover(heads: int, tokens: int) -> None:
+@pytest.mark.parametrize(
+    ("heads", "tokens", "scheduling_sms"),
+    [(1, 1, None), (3, 4, None), (3, 8, None), (12, 7, None), (12, 4, 1), (96, 7, 1)],
+)
+def test_dspark_native_verify_acceptance_and_rollover(
+    heads: int,
+    tokens: int,
+    scheduling_sms: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Only accepted candidates advance Conv/state; rejected suffixes are ignored."""
+    if scheduling_sms is not None:
+        from tensorrt_llm._torch.custom_ops import cute_dsl_kda_2fp4_mtp_replay as replay_ops
+
+        # A small scheduling budget exercises packed and persistent grid-stride
+        # kernels without allocating a production-sized batch in this test.
+        monkeypatch.setattr(replay_ops, "_num_sms", lambda: scheduling_sms)
+        monkeypatch.setattr(replay_ops._persistent, "_num_sms", lambda: scheduling_sms)
     batch, capacity = 3, 16 + tokens
     pool, slots, original, _ = _fixture(batch, heads)
     shape = (batch, heads, capacity, 128)
@@ -303,6 +318,11 @@ def test_dspark_native_verify_acceptance_and_rollover(heads: int, tokens: int) -
         expected_k[live, :, position] = kn
         expected_u[live, :, position] = update.bfloat16()
         expected_g[live, :, position] = cumulative
+    inactive = (
+        torch.arange(capacity, device="cuda")[None, None, :, None]
+        >= history.length[:, None, None, None]
+    )
+    history.u.masked_fill_(inactive, float("nan"))
     actual = ops.verify(
         raw,
         **fused,
@@ -712,6 +732,7 @@ def test_replay_never_reads_residual(dspark: bool) -> None:
     tokens = 4 if dspark else 1
     if dspark:
         history = _verification_history(history, tokens)
+    history.u.fill_(float("nan"))
     fused = _fused_inputs(tokens, 3)
     conv_before = fused["conv_state"].clone()
     x = torch.randn((tokens, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
