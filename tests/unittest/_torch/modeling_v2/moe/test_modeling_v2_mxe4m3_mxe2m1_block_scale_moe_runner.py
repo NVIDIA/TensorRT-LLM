@@ -18,14 +18,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_blo
 
 __extra_import_path__ = [".."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
+from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
 
 DEV = "cuda"
-# The reference GEMMs must be true fp32; TF32 would leave the reference with
-# 10 mantissa bits, coarser than the bf16 output it is meant to bound.
-torch.backends.cuda.matmul.allow_tf32 = False
 
 # Relative distance between neighbouring bf16 values (1 + 2^-7 stored mantissa
 # bits -> one ulp is 2^-8 of the binade top).
@@ -391,6 +389,7 @@ def _q_intermediate(act: torch.Tensor, recipe: str | None = None) -> torch.Tenso
     return (q * scale).reshape(rows, cols)
 
 
+@true_fp32_matmul()
 def _ref_moe(
     x_valid,
     ids,
@@ -782,8 +781,9 @@ def test_intermediate_is_mxfp8_quantized():
             gemm1_clamp_limit=limit,
         ).float()
 
-        up = xv @ _dequant(up_c[0], up_s[0]).t()
-        gate = xv @ _dequant(gt_c[0], gt_s[0]).t()
+        with true_fp32_matmul():
+            up = xv @ _dequant(up_c[0], up_s[0]).t()
+            gate = xv @ _dequant(gt_c[0], gt_s[0]).t()
         act = (
             (up.clamp(-7.0, 7.0) + 1.0)
             * gate.clamp(max=7.0)
@@ -1846,19 +1846,20 @@ def test_certified_cells(cell):
         entry = dict(topk_ids=ids, topk_weights=wts)
 
     # 1. The entry's reference against this file's, on identical inputs.
-    entry_ref = moe.reference(
-        xv,
-        ids,
-        wts,
-        sub_ref["up"],
-        sub_ref["gate"],
-        sub_ref["down"],
-        alpha=alpha,
-        beta=beta,
-        clamp_limit=limit,
-        local_expert_offset=off,
-        local_num_experts=n,
-    )
+    with true_fp32_matmul():
+        entry_ref = moe.reference(
+            xv,
+            ids,
+            wts,
+            sub_ref["up"],
+            sub_ref["gate"],
+            sub_ref["down"],
+            alpha=alpha,
+            beta=beta,
+            clamp_limit=limit,
+            local_expert_offset=off,
+            local_num_experts=n,
+        )
     local_ref = _ref_moe(xv, ids, wts, sub_ref, alpha, beta, limit, offset=off, num_local=n)
     torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
 

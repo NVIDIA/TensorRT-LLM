@@ -79,7 +79,9 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     # attribute loads, matching MpiTopology's precomputed rank lists.
     @torch.compiler.disable
     def _resolve_mesh_dim(self, name: str) -> tuple:
-        pg = self._get_mesh_dim_by_name(name).get_group()
+        pg = getattr(self, '_tp_group_pg', None) if name == 'tp' else None
+        if pg is None:
+            pg = self._get_mesh_dim_by_name(name).get_group()
         group_name = pg.group_name if hasattr(pg, 'group_name') else ''
         resolved = (pg, pg.rank(), self._get_group_ranks(pg), group_name)
         # Before torch.distributed is initialized (single-process runs) the

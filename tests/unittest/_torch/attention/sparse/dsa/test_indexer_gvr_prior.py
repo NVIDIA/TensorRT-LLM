@@ -177,6 +177,9 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         aux_stream=None,
     )
     indexer.forward_prepared = MethodType(Indexer.forward_prepared, indexer)
+    indexer._copy_reused_topk = MethodType(Indexer._copy_reused_topk, indexer)
+    indexer._fill_decode_topk = MethodType(Indexer._fill_decode_topk, indexer)
+    indexer._store_mtp_shared_rows = MethodType(Indexer._store_mtp_shared_rows, indexer)
     with (
         patch.object(
             top_k, "update_gvr_prior_from_prefill", wraps=top_k.update_gvr_prior_from_prefill

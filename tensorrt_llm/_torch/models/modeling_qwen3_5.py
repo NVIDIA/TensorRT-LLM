@@ -23,7 +23,7 @@ from transformers import PretrainedConfig
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -455,11 +455,12 @@ def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     cfg = qcd.get("lm_head")
     pretrained = model_config.pretrained_config
     mapping = model_config.mapping
+    sm = get_sm_version()
     return (
         cfg is not None
         and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
         and _has_nvfp4_gemm_block_width(cfg)
-        and get_sm_version() in (100, 103, 120)
+        and (is_sm_100f(sm) or is_sm_120f(sm))
         and not getattr(pretrained, "tie_word_embeddings", False)
         and not mapping.enable_attention_dp
         and getattr(pretrained, "vocab_size", 0) % mapping.tp_size == 0
@@ -743,6 +744,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     """
 
     supports_encoder_cache = True
+    # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
+    model_specific_llm_args = Qwen3NextForCausalLM.model_specific_llm_args
 
     @classmethod
     def get_model_defaults(cls, llm_args):
@@ -782,6 +785,15 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
             "mrope_config.mrope_position_ids",
             "mrope_config.mrope_position_deltas",
         ]
+
+    def prepare_mrope_config(
+        self, multimodal_params, num_generation_requests, position_ids, **kwargs
+    ):
+        # No packed mrope cos/sin table (position_ids None skips only that): the decoder's attention applies RoPE
+        # itself (rope_fusion off) and never reads it. The position deltas are still kept.
+        return super().prepare_mrope_config(
+            multimodal_params, num_generation_requests, None, **kwargs
+        )
 
     def load_weights(
         self,

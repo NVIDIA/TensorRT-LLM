@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from ..conftest import get_device_count, llm_models_root, trt_environment
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
-from .pytorch_model_config import get_model_yaml_config
+from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
@@ -95,7 +95,8 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
-    "glm_5_fp8",
+    "glm_5.3_fp8",
+    "glm_5.3_flash_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
     "qwen3.6_35b_a3b_fp4_mtp",
@@ -130,12 +131,15 @@ SPEC_DEC_REAL_DATASET_MODELS = {
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
+    "gpt_oss_120b_eagle3": "cnn_dailymail",
+    "qwen3.6_35b_a3b_fp4_mtp": "cnn_dailymail",
 }
 
 # All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "glm_5.3_flash_fp8_mtp",
     "deepseek_v4_pro_base_fp8",
     *QWEN38_MTP_MODELS,
     "qwen3_4b_eagle3",
@@ -469,6 +473,8 @@ class PerfTestConfig:
         pp_size: int = 1,
         num_gpus: int = 1,
         moe_backend: str | None = None,
+        prefix_len: int = 0,
+        cfg_presets: str | None = None,
     ):
         # The model name.
         self.model_name = model_name
@@ -519,6 +525,10 @@ class PerfTestConfig:
         # Number of GPUs.
         self.num_gpus = num_gpus
         self.moe_backend = moe_backend
+        # Shared random prefix length (serve only), added in front of every prompt.
+        self.prefix_len = prefix_len
+        # "+"-joined names from PERF_CONFIG_PRESETS in pytorch_model_config.py.
+        self.cfg_presets = cfg_presets
 
     def to_string(self,
                   custom_server_name: str = None,
@@ -632,6 +642,12 @@ class PerfTestConfig:
         if self.moe_backend is not None:
             entries.append(f"moe:{self.moe_backend}")
 
+        if self.prefix_len > 0:
+            entries.append(f"prefix:{self.prefix_len}")
+
+        if self.cfg_presets is not None:
+            entries.append(f"cfg:{self.cfg_presets}")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -739,6 +755,14 @@ class PerfTestConfig:
         if labels and labels[0].startswith("moe:"):
             self.moe_backend = labels.pop(0).removeprefix("moe:")
 
+        self.prefix_len = 0
+        if labels and labels[0].startswith("prefix:"):
+            self.prefix_len = int(labels.pop(0).removeprefix("prefix:"))
+
+        self.cfg_presets = None
+        if labels and labels[0].startswith("cfg:"):
+            self.cfg_presets = labels.pop(0).removeprefix("cfg:")
+
         assert len(
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
@@ -778,6 +802,22 @@ class PerfTestConfig:
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
         VALID_KV_CACHE_DTYPES = ["auto", "fp8"]
         assert self.kv_cache_dtype in VALID_KV_CACHE_DTYPES, f"Invalid kv_cache_dtype {self.kv_cache_dtype}!"
+
+        if self.prefix_len > 0:
+            assert self.runtime == "serve", \
+                "prefix (shared random prompt prefix) requires the serve runtime!"
+            assert self.model_name not in SPEC_DEC_REAL_DATASET_MODELS \
+                and self.model_name not in SERVE_IMAGE_MODELS, \
+                "prefix applies only to the random text dataset!"
+
+        if self.cfg_presets is not None:
+            unknown_presets = [
+                name for name in self.cfg_presets.split("+")
+                if name not in PERF_CONFIG_PRESETS
+            ]
+            assert not unknown_presets, (
+                f"Unknown cfg preset(s) {unknown_presets}; "
+                f"known presets: {sorted(PERF_CONFIG_PRESETS)}")
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
@@ -931,7 +971,7 @@ class PerfTestConfig:
             return None
 
         sequence_lengths = {
-            input_len + output_len
+            self.prefix_len + input_len + output_len
             for input_len, output_len in zip(
                 self.input_lens, self.output_lens, strict=True)
         }
@@ -1455,6 +1495,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 "--random-range-ratio",
                 "0.0",
             ]
+            if self._config.prefix_len > 0:
+                client_cmd += [
+                    "--random-prefix-len",
+                    str(self._config.prefix_len)
+                ]
         if self._config.concurrency != -1:
             client_cmd += ["--max-concurrency", str(self._config.concurrency)]
         if self._config.streaming == "streaming":
@@ -1512,6 +1557,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                           num_requests)
 
     def get_commands(self):
+        """Build performance commands with per-case server log storage."""
         num_gpus = self._config.num_gpus
 
         if is_windows() and num_gpus > 1:
@@ -1583,14 +1629,31 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             elif self._config.model_name == "minimax_m3_fp4":
                 # Cold MSA JIT compilation can exceed the default 10 minutes.
                 server_timeout = 1800
+            elif self._config.model_name == "glm_5.3_fp8":
+                # Allow time for checkpoint loading and cold executor warmup.
+                server_timeout = 1800
+            elif self._config.model_name == "muse_spark_open_nvfp4":
+                # Allow time for NVFP4 checkpoint loading and executor warmup.
+                server_timeout = 3600
+            elif self._config.model_name in {
+                    "glm_5.3_flash_fp8", "glm_5.3_flash_fp8_mtp"
+            }:
+                # Weight loading and executor warmup can exceed 10 minutes.
+                server_timeout = 3600
             else:
                 server_timeout = 600
+            server_log_dir = None
+            if self._output_dir is not None:
+                server_log_dir = os.path.abspath(
+                    os.path.join(self._output_dir, "detailed_results",
+                                 os.path.basename(engine_dir)))
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
                                            client_cmds=client_cmds,
                                            data_cmds=data_cmds,
                                            server_env=server_env,
                                            server_timeout=server_timeout,
-                                           warmup_passes=warmup_passes)
+                                           warmup_passes=warmup_passes,
+                                           server_log_dir=server_log_dir)
 
         # PyTorch loads model checkpoints directly.
         build_cmd = []
