@@ -35,9 +35,10 @@ from .utils import EngineDeadError, EngineUnavailableError
 class _RequestSender:
     """Own command sends and closure, including the worker shutdown message.
 
-    Ordinary queue saturation rejects admission. Cancellation has separate
-    reserved capacity. A connection outage pauses admission until a worker
-    barrier confirms receipt, or one absolute recovery deadline expires.
+    Ordinary queue saturation rejects admission. Cancellation retains one
+    intent per admitted request until delivery. A connection outage pauses
+    admission until a worker barrier confirms receipt, or one absolute recovery
+    deadline expires.
     """
 
     MAX_BATCH_SIZE = 1024
@@ -65,6 +66,7 @@ class _RequestSender:
         self._pending = collections.deque()
         self._pending_requests = 0
         self._pending_controls = 0
+        self._pending_cancel_ids: set[int] = set()
         self._enqueued_count = 0
         self._sent_count = 0
         self._cond = threading.Condition()
@@ -100,23 +102,29 @@ class _RequestSender:
             )
             self._thread.start()
 
-    def send(self, payload: bytes, *, control: bool = False) -> None:
+    def send(
+        self, payload: bytes, *, control: bool = False, cancellation_id: int | None = None
+    ) -> None:
         """Queue a captured command, rejecting work that cannot be admitted."""
         with self._cond:
             if self._terminal_error is not None:
                 raise EngineDeadError(self._terminal_error)
             if self._closed:
                 raise EngineUnavailableError("Executor command sender is stopping")
-            if not control and self._recovering:
+            if cancellation_id is not None and cancellation_id in self._pending_cancel_ids:
+                return
+            if not control and cancellation_id is None and self._recovering:
                 raise EngineUnavailableError("Executor command connection is recovering")
             count = self._pending_controls if control else self._pending_requests
             limit = self.MAX_PENDING_CONTROLS if control else self.MAX_PENDING_REQUESTS
-            if count >= limit:
+            if cancellation_id is None and count >= limit:
                 raise EngineUnavailableError("Executor command queue is full")
-            self._pending.append((payload, control))
+            self._pending.append((payload, control, cancellation_id))
             self._enqueued_count += 1
             ticket = self._enqueued_count
-            if control:
+            if cancellation_id is not None:
+                self._pending_cancel_ids.add(cancellation_id)
+            elif control:
                 self._pending_controls += 1
             else:
                 self._pending_requests += 1
@@ -139,6 +147,7 @@ class _RequestSender:
             if self._terminal_error is None:
                 self._terminal_error = error
             self._pending.clear()
+            self._pending_cancel_ids.clear()
             self._pending_controls = self._pending_requests = 0
             self._cond.notify_all()
 
@@ -232,7 +241,7 @@ class _RequestSender:
                 self._put_until(payload, deadline)
                 retry_at = time.monotonic() + self.ACK_RETRY_INTERVAL
 
-    def _take_batch(self) -> list[bytes] | None:
+    def _take_batch(self) -> list[tuple[bytes, bool, int | None]] | None:
         with self._cond:
             while not self._pending and not self._closed and self._terminal_error is None:
                 self._cond.wait()
@@ -242,12 +251,14 @@ class _RequestSender:
                 return None
             size = self.MAX_BATCH_SIZE if self._batching else 1
             items = [self._pending.popleft() for _ in range(min(size, len(self._pending)))]
-            for _, control in items:
-                if control:
+            for _, control, cancellation_id in items:
+                if cancellation_id is not None:
+                    continue
+                elif control:
                     self._pending_controls -= 1
                 else:
                     self._pending_requests -= 1
-            return [payload for payload, _ in items]
+            return items
 
     def _run(self) -> None:
         try:
@@ -260,9 +271,12 @@ class _RequestSender:
                     deadline = max(
                         time.monotonic() + self._recovery_timeout, self._control_deadline
                     )
-                self._put_until(batch, deadline)
+                self._put_until([payload for payload, _, _ in batch], deadline)
                 with self._cond:
                     self._sent_count += len(batch)
+                    for _, _, cancellation_id in batch:
+                        if cancellation_id is not None:
+                            self._pending_cancel_ids.discard(cancellation_id)
                     recovering = self._recovering
                     self._cond.notify_all()
                 if recovering:
