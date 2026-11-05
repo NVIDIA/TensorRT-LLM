@@ -1656,21 +1656,22 @@ class _MoeScalars:
 
 def _router_logits(core, i: int, h: torch.Tensor) -> torch.Tensor:
     """The fp32 router logits of MoE layer ``i`` when the MoE runs unfused outside ``ROUTER_TC_GEN``'s rows (the decode
-    steps' engines route in-kernel): ``F.linear(float(h), w)``, the built-in gate's generation-step arithmetic; the
+    steps' engines route in-kernel): this target's existing ``F.linear(float(h), w)`` arithmetic; the
     experts then quantize their bf16 input themselves."""
     _record("m3_fp32_linear", h.shape[0] if h.dim() == 2 else 0)
     return m3_fp32_linear(h, core.w[f"l{i}_router"])
 
 
 def _context_router_logits(core, i: int, h: torch.Tensor) -> torch.Tensor:
-    """The router logits of a step with context rows past ``ROUTER_TC_GEN``'s rows: the built-in gate's context-step
-    arithmetic, the fixed-tile TF32 router (``torch.ops.trtllm.router_gemm_tf32`` over the TF32-rounded weight, its
-    row-count-independent tile and K order; TRTLLM_CTX_ROUTER_TF32_FIXED=0 is the kill), else the fp32 router."""
-    w_tf32 = core.router_w_tf32.get(i)
-    if w_tf32 is not None and h.dtype == torch.bfloat16 and h.dim() == 2 and h.is_contiguous():
-        taken("router_gemm_tf32", h.shape[0], "fixed-tile TF32 context router")
-        _record("router_gemm_tf32", h.shape[0])
-        return torch.ops.trtllm.router_gemm_tf32(h, w_tf32)
+    """Context logits from all three BF16 weight terms, with fixed tile and K/term order within each split-K regime.
+
+    TRTLLM_CTX_ROUTER_TF32_FIXED=0 retains this target's existing fp32 router fallback.
+    """
+    w_split = core.router_w_split.get(i)
+    if w_split is not None and h.dtype == torch.bfloat16 and h.dim() == 2 and h.is_contiguous():
+        taken("router_gemm", h.shape[0], "fixed-tile BF16-split context router")
+        _record("router_gemm", h.shape[0])
+        return torch.ops.trtllm.router_gemm(h, w_split)
     return _router_logits(core, i, h)
 
 
@@ -2011,7 +2012,7 @@ def _ctx_fused_qkv(core, i: int, hidden: torch.Tensor, position_ids, step: dict)
             ),
             core.rms_eps,
         )
-    except AssertionError:
+    except (AssertionError, ValueError):
         # A cache geometry outside the kernel's alignment contract: the caller's projection + producer (the MXFP8
         # activation taken here is quantized again there, bitwise the same).
         return None
@@ -2474,7 +2475,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         self.mapping = mapping
         # Whether the 9..16-row generation router takes the TF32 tensor-core kernel (set by prebuild_kernels).
         self.router_tc_cluster16 = False
-        self.router_w_tf32: Dict[int, torch.Tensor] = {}
+        self.router_w_split: Dict[int, torch.Tensor] = {}
         self.vocab_size = cfg.vocab_size
         d = _weights.MODEL_WEIGHTS.dims(self)
         self.num_layers = d.num_layers
@@ -2652,14 +2653,18 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             )
             for i in sorted(self.moe_layers)
         }
-        # The fixed-tile TF32 context router's TF32-rounded weights (_context_router_logits), as the built-in gate
-        # builds them after every weight load; none under its kill (TRTLLM_CTX_ROUTER_TF32_FIXED=0).
-        from tensorrt_llm._torch.models.modeling_minimaxm3 import _CTX_ROUTER_TF32_FIXED
-        from tensorrt_llm._torch.moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
+        # The same three-term weight representation as the built-in context gate, with stable refit buffers.
+        from tensorrt_llm._torch.models.modeling_minimaxm3 import (
+            _CTX_ROUTER_TF32_FIXED,
+            split_router_weight_bf16,
+        )
+        from tensorrt_llm._torch.moe.fused_moe import (
+            router_gemm,  # noqa: F401 - registers the custom op
+        )
 
-        self.router_w_tf32 = (
+        self.router_w_split = (
             {
-                i: prepare_router_weight_tf32(self.w[f"l{i}_router"].float())
+                i: split_router_weight_bf16(self.w[f"l{i}_router"].float())
                 for i in sorted(self.moe_layers)
             }
             if _CTX_ROUTER_TF32_FIXED
@@ -2674,12 +2679,12 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
     def cache_derived_state(self) -> None:
         """Build the target and refresh captured router weights after in-place refit."""
         self.post_load_weights()
-        from tensorrt_llm._torch.moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
+        from tensorrt_llm._torch.models.modeling_minimaxm3 import split_router_weight_bf16
 
         # post_load_weights intentionally skips rebuilding unchanged storages;
         # their contents can still change on refit. Captures retain these buffers.
-        for i, cached in self.router_w_tf32.items():
-            cached.copy_(prepare_router_weight_tf32(self.w[f"l{i}_router"].float()))
+        for i, cached in self.router_w_split.items():
+            cached.copy_(split_router_weight_bf16(self.w[f"l{i}_router"].float()))
 
     def _derive_moe(self, i: int) -> _MoeScalars:
         """The routed experts' kernel scalars from the checkpoint's per-tensor scales (trtllm-gen NVFP4 layout).

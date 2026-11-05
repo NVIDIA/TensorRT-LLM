@@ -21,6 +21,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <optional>
 #include <tuple>
@@ -51,6 +52,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     int64_t const rows = inter.numel() / hidden;
     TORCH_CHECK(weight.is_contiguous() && weight.scalar_type() == at::kBFloat16 && weight.numel() == hidden);
     TORCH_CHECK(weight.device() == inter.device(), "weight must use the inter device");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(inter.data_ptr()) % 16 == 0, "inter must be 16-byte aligned");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(residual.data_ptr()) % 16 == 0, "residual must be 16-byte aligned");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0, "weight must be 16-byte aligned");
     TORCH_CHECK(hidden % 256 == 0 && hidden / 8 <= 1024, "hidden must be a multiple of 256 and at most 8192");
     bool const fp4 = fp4GlobalScale.has_value();
     if (fp4)

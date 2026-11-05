@@ -119,3 +119,23 @@ def test_ctx_residual_rmsnorm_rejects_unsupported_architecture() -> None:
         torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
             inter, torch.zeros_like(inter), inter.reshape(-1), EPS, True
         )
+
+
+@pytest.mark.parametrize("operand", ["inter", "residual", "weight"])
+def test_ctx_residual_rmsnorm_rejects_unaligned_storage_before_writing(operand: str) -> None:
+    args = {
+        "inter": torch.zeros((2, 256), dtype=torch.bfloat16, device="cuda"),
+        "residual": torch.zeros((2, 256), dtype=torch.bfloat16, device="cuda"),
+        "weight": torch.ones(256, dtype=torch.bfloat16, device="cuda"),
+    }
+    original = args[operand]
+    args[operand] = torch.ones(original.numel() + 1, dtype=original.dtype, device=original.device)[
+        1:
+    ].view(original.shape)
+    assert args[operand].is_contiguous() and args[operand].data_ptr() % 16 == 2
+    before = args["inter"].clone()
+    with pytest.raises(RuntimeError, match=f"{operand} must be 16-byte aligned"):
+        torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+            args["inter"], args["residual"], args["weight"], EPS, True
+        )
+    assert torch.equal(args["inter"], before)

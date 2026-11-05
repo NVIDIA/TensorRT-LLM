@@ -852,25 +852,15 @@ def _ctx_qkv_fused_runner(
     return _CTX_QKV_FUSED_RUNNERS[key]
 
 
-# CTX prefill router: a fixed-tile TF32 tensor-core GEMM (router_gemm_tf32) reads the BF16 hidden states directly
-# against the TF32-rounded weight. Its tile and K order depend on the row count only through its split-K cap (8192
-# rows), so a token's logits are the same in every chunk size on either side of the cap (cuBLAS picks an M-dependent
-# algorithm at every M), and it replaces the fp32 cast + linear. Same
-# TF32 class as the cuBLAS path it replaces (the container enables TF32). TRTLLM_CTX_ROUTER_TF32_FIXED=0 is the kill
-# switch.
+# Fixed-tile context router: BF16 activations multiply all three loaded BF16 weight terms, with FP32
+# accumulation. Tile and K/term order are fixed within each split-K regime (the cap is 8192 rows).
+# TRTLLM_CTX_ROUTER_TF32_FIXED=0 keeps the stock router.
 _CTX_ROUTER_TF32_FIXED = os.environ.get("TRTLLM_CTX_ROUTER_TF32_FIXED", "1") == "1"
-_CTX_ROUTER_TF32_LOGGED = False
-# Pure generation steps (no context rows) keep the stock router below: the fixed-tile kernel runs a 128-row tile with a
-# serial K loop, so a decode batch pays its full ~70 us per layer, which the stock cuBLAS path does in ~13 us. Context
-# steps keep the fixed tile at every size, so a prefill token's logits stay independent of its chunk.
-# Kill switch: TRTLLM_M3_ROUTER_TF32_IN_GEN=1 keeps the fixed tile in generation steps too.
+_CTX_ROUTER_FIXED_LOGGED = False
+# Pure generation steps keep the stock router unless TRTLLM_M3_ROUTER_TF32_IN_GEN=1 selects the fixed tile.
 _ROUTER_TF32_IN_GEN = os.environ.get("TRTLLM_M3_ROUTER_TF32_IN_GEN", "0") == "1"
-# SM107 generation steps of 9..16 rows (TP2 GEN batch 4 with 3 drafts) run the stock router as a cuBLAS TF32
-# split-K GEMM + splitKreduce (~9.8 us/call standalone); the TF32 tensor-core router (minimax_m3_router_tc, 16-CTA
-# clusters only, one reduction order) takes 2.9-3.5 us/call (GEMM-AR 796203) and is closer to the fp32 product
-# (max |dlogit| 1.7e-6 vs 6.7e-5 for cuBLAS TF32). Rule 1b: top-4 sets may change near ties (1 / 10,240 random rows).
-# Devices that cannot co-schedule 16-CTA clusters keep the stock router. Rule-1b gates passed (GSM McNemar greedy
-# p 0.839 / sampled p 0.424; natural AL at 9..16 rows dAL +0.002). Kill switch: TRTLLM_M3_ROUTER_TC_GEN=0.
+# SM107 generation steps of 9..16 rows may use the TF32 tensor-core router on devices that support 16-CTA
+# clusters. Other generation calls use the loaded stock gate. TRTLLM_M3_ROUTER_TC_GEN=0 keeps that stock path.
 _ROUTER_TC_GEN = os.environ.get("TRTLLM_M3_ROUTER_TC_GEN", "1") == "1"
 _ROUTER_TC_GEN_MIN_ROWS = 9
 # The router_tc launch also emits the routed experts' NVFP4 input (packed e2m1 + linear block scales, bit-identical to
@@ -1082,7 +1072,7 @@ class MiniMaxM3Gate(nn.Module):
         self.register_buffer("split_weight", None, persistent=False)
 
         self._sm107_fp32_cast = _SM107_ROUTER_FP32_CAST and get_sm_version() == 107
-        self._weight_tf32: Optional[torch.Tensor] = None
+        self._use_fixed_router = False
         # SM107 generation steps of 9..16 rows: the TF32 tensor-core router (16-CTA clusters, see _router_tc_gen_ok).
         self._router_tc_gen = (
             _ROUTER_TC_GEN
@@ -1091,17 +1081,25 @@ class MiniMaxM3Gate(nn.Module):
             and hidden_size % 1024 == 0
         )
 
-    def cache_tf32_weight(self) -> None:
-        """Build the TF32-rounded weight copy for the fixed-tile router (after every weight load)."""
-        if self._weight_tf32 is not None or (_CTX_ROUTER_TF32_FIXED and self._sm107_fp32_cast):
-            from ..moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
+    def cache_fixed_router_weight(self) -> None:
+        """Refresh the registered split weight in place and enable the fixed-tile context router."""
+        geometry_supported = (
+            self.hidden_size > 0
+            and self.hidden_size % 32 == 0
+            and 16 <= self.num_experts <= 256
+            and self.num_experts & (self.num_experts - 1) == 0
+        )
+        if geometry_supported and (
+            self._use_fixed_router or (_CTX_ROUTER_TF32_FIXED and self._sm107_fp32_cast)
+        ):
+            from ..moe.fused_moe import router_gemm  # noqa: F401 - registers the custom op
 
-            refreshed = prepare_router_weight_tf32(self.weight.float())
-            if self._weight_tf32 is None:
-                self._weight_tf32 = refreshed
+            refreshed = split_router_weight_bf16(self.weight.float())
+            if self.split_weight is None:
+                self.split_weight = refreshed
             else:
-                # Captures retain this allocation across refit.
-                self._weight_tf32.copy_(refreshed)
+                self.split_weight.copy_(refreshed)
+            self._use_fixed_router = True
         if self._router_tc_gen:
             # Decide the TF32 tensor-core router at load time (cluster query + its log), never inside a CUDA-graph
             # capture of a 9..16-row bucket; a device without 16-CTA clusters keeps the stock router.
@@ -1133,22 +1131,23 @@ class MiniMaxM3Gate(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, generation_only: bool = False) -> torch.Tensor:
         if (
-            self._weight_tf32 is not None
+            self._use_fixed_router
+            and self.split_weight is not None
             and not (generation_only and not _ROUTER_TF32_IN_GEN)
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.dim() == 2
             and hidden_states.is_contiguous()
         ):
-            global _CTX_ROUTER_TF32_LOGGED
-            if not _CTX_ROUTER_TF32_LOGGED and not is_torch_compiling():
-                _CTX_ROUTER_TF32_LOGGED = True
-                logger.info("[M3 Gate] fixed-tile TF32 router engaged")
-            return torch.ops.trtllm.router_gemm_tf32(hidden_states, self._weight_tf32)
+            global _CTX_ROUTER_FIXED_LOGGED
+            if not _CTX_ROUTER_FIXED_LOGGED and not is_torch_compiling():
+                _CTX_ROUTER_FIXED_LOGGED = True
+                logger.info("[M3 Gate] fixed-tile BF16-split router engaged")
+            return torch.ops.trtllm.router_gemm(hidden_states, self.split_weight)
         if self.router_tc_applies(hidden_states, generation_only):
             return torch.ops.trtllm.minimax_m3_router_tc(
                 hidden_states, self.weight, None, get_env_enable_pdl()
             )[0]
-        if self._weight_tf32 is not None and generation_only and not is_torch_compiling():
+        if self._use_fixed_router and generation_only and not is_torch_compiling():
             logger.info_once(
                 "[M3 Gate] stock router (generation_only)", key="m3_router_stock_generation_only"
             )
@@ -1189,8 +1188,6 @@ class MiniMaxM3Gate(nn.Module):
             else:
                 # In place, so a CUDA graph that captured the buffer reads the new weight.
                 self.split_weight.copy_(split)
-            if self._weight_tf32 is not None:
-                self.cache_tf32_weight()
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
@@ -2586,7 +2583,7 @@ class MiniMaxM3Attention(Attention):
                 torch.cat(norm_weights),
                 norm_eps,
             )
-        except AssertionError:
+        except (AssertionError, ValueError):
             # A cache geometry outside the kernel's alignment contract: the caller runs the stock projection +
             # producer (the MXFP8 activation it already took is re-quantized there, bitwise the same).
             return None
@@ -4058,7 +4055,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         super().cache_derived_state()
         for module in self.modules():
             if isinstance(module, MiniMaxM3Gate):
-                module.cache_tf32_weight()
+                module.cache_fixed_router_weight()
 
     def setup_aliases(self) -> None:
         """Chain each decoder layer's next_layer_layernorm for POST fusion.

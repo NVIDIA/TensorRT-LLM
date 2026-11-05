@@ -16,7 +16,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch.moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
+from tensorrt_llm._torch.models.modeling_minimaxm3 import split_router_weight_bf16
 
 LAYERS = 4
 
@@ -177,12 +177,22 @@ def test_a_prefill_moe_layer_takes_the_mc_finalize_boundary_when_it_folds(monkey
 def test_ctx_router_cache_refreshes_in_place_after_refit(monkeypatch: pytest.MonkeyPatch) -> None:
     core = modeling.MiniMaxM3Tp2ModelingV2.__new__(modeling.MiniMaxM3Tp2ModelingV2)
     torch.nn.Module.__init__(core)
-    core.w = {"l0_router": torch.ones(8, 64)}
-    core.router_w_tf32 = {0: prepare_router_weight_tf32(core.w["l0_router"])}
-    captured = core.router_w_tf32[0]
+    core.w = {"l0_router": torch.full((8, 64), 1.0 + 2**-9 + 2**-18)}
+    core.router_w_split = {0: split_router_weight_bf16(core.w["l0_router"])}
+    captured = core.router_w_split[0]
+    pointer = captured.data_ptr()
     # Existing storages take post_load_weights' idempotent return; no kernels need rebuilding.
     monkeypatch.setattr(core, "post_load_weights", lambda: None)
-    core.w["l0_router"].fill_(2.0)
+    before = captured.clone()
+    core.w["l0_router"].fill_(2.0 + 2**-8 + 2**-17)
     core.cache_derived_state()
-    assert core.router_w_tf32[0] is captured
-    torch.testing.assert_close(captured, torch.full((8, 64), 2.0), rtol=0, atol=0)
+    assert core.router_w_split[0] is captured
+    assert captured.data_ptr() == pointer
+    expected = split_router_weight_bf16(core.w["l0_router"])
+    for term in (1, 2):
+        old_term = before[:, term * 64 : (term + 1) * 64]
+        new_term = captured[:, term * 64 : (term + 1) * 64]
+        assert torch.count_nonzero(old_term) == old_term.numel()
+        assert torch.count_nonzero(new_term) == new_term.numel()
+        assert not torch.equal(old_term, new_term)
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)

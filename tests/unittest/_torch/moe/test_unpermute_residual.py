@@ -28,7 +28,8 @@ def _case(t, hidden, top_k, seed):
 
 
 @pytest.mark.parametrize("t,hidden", [(97, 6144), (2048, 6144)])
-def test_bitwise_vs_moe_unpermute_plus_add(t, hidden) -> None:
+@pytest.mark.parametrize("strided_indices", [False, True])
+def test_bitwise_vs_moe_unpermute_plus_add(t, hidden, strided_indices) -> None:
     top_k = 4
     rows, e2p, scales, res = _case(t, hidden, top_k, 7 + t)
     ref = torch.empty(t, hidden, dtype=torch.bfloat16, device="cuda")
@@ -36,6 +37,13 @@ def test_bitwise_vs_moe_unpermute_plus_add(t, hidden) -> None:
         permuted_input=rows, output=ref, expanded_idx_to_permuted_idx=e2p, topk_scales=scales
     )
     ref_add = res.clone().add_(ref)
+    if strided_indices:
+        # Interleaved non-local slots are valid values, but must never be read as logical indices.
+        backing = torch.full((t, 2 * top_k), -1, dtype=e2p.dtype, device=e2p.device)
+        strided = backing[:, ::2]
+        strided.copy_(e2p)
+        assert not strided.is_contiguous()
+        e2p = strided
     match = {}
     for contract in (True, False):
         o = torch.empty_like(ref)

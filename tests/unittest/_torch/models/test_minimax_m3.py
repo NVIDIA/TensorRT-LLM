@@ -88,6 +88,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+from tensorrt_llm._torch.modules import linear as linear_module
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 import (
@@ -3374,25 +3375,29 @@ def test_ctx_fp4_input_scale_rejects_cutedsl_awq_prescale(has_prescale: bool) ->
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("direct_reload", [False, True], ids=["explicit_refresh", "direct_reload"])
-def test_minimax_m3_gate_tf32_refit_preserves_allocation(
+def test_minimax_m3_gate_fixed_router_refit_preserves_allocation(
     monkeypatch: pytest.MonkeyPatch, direct_reload: bool
 ) -> None:
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
     monkeypatch.setattr(modeling_minimaxm3, "_ROUTER_TC_GEN", False)
-    # CPU check uses the real bitwise TF32 conversion; captured replay is tested on Rubin.
-    gate = modeling_minimaxm3.MiniMaxM3Gate(64, 8, 2, 1.0)
-    gate.load_weights([{"weight": torch.ones(8, 64)}])
-    assert gate._weight_tf32 is None
-    gate.cache_tf32_weight()
-    captured_weight = gate._weight_tf32
+    # CPU checks the registered split-weight allocation; captured replay is tested on Rubin.
+    gate = modeling_minimaxm3.MiniMaxM3Gate(64, 16, 2, 1.0)
+    gate.load_weights([{"weight": torch.ones(16, 64)}])
+    assert not gate._use_fixed_router
+    gate.cache_fixed_router_weight()
+    assert gate._use_fixed_router
+    captured_weight = gate.split_weight
     ptr = captured_weight.data_ptr()
-    gate.load_weights([{"weight": torch.full((8, 64), 2.0)}])
-    if not direct_reload:
-        gate.cache_tf32_weight()
-    assert gate._weight_tf32 is captured_weight
-    assert gate._weight_tf32.data_ptr() == ptr
-    torch.testing.assert_close(captured_weight, torch.full((8, 64), 2.0), rtol=0, atol=0)
+    if direct_reload:
+        gate.load_weights([{"weight": torch.full((16, 64), 2.0)}])
+    else:
+        gate.weight.fill_(2.0)
+        gate.cache_fixed_router_weight()
+    assert gate.split_weight is captured_weight
+    assert gate.split_weight.data_ptr() == ptr
+    expected = torch.cat((torch.full((16, 64), 2.0), torch.zeros(16, 128)), dim=1).bfloat16()
+    torch.testing.assert_close(captured_weight, expected, rtol=0, atol=0)
 
 
 @pytest.mark.cpu_only
@@ -3405,3 +3410,82 @@ def test_cutedsl_shared_fold_backend_is_rubin_only(
     backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     nn.Module.__init__(backend)
     assert modeling_minimaxm3._fold_shared_backend(backend) is (sm == 107)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("hidden_size,num_experts", [(64, 8), (65, 16), (64, 24), (64, 512)])
+def test_minimax_m3_gate_unsupported_fixed_geometry_uses_stock(
+    monkeypatch: pytest.MonkeyPatch, hidden_size: int, num_experts: int
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_ROUTER_TC_GEN", False)
+    gate = modeling_minimaxm3.MiniMaxM3Gate(hidden_size, num_experts, 2, 1.0)
+    gate.load_weights([{"weight": torch.ones(num_experts, hidden_size)}])
+    gate.cache_fixed_router_weight()
+    assert not gate._use_fixed_router
+
+    def stock_mm(a, b, bias, out_dtype):
+        assert bias is None and out_dtype == torch.float32
+        return a.float() @ b.float()
+
+    stock = create_autospec(stock_mm, spec_set=True, side_effect=stock_mm)
+    monkeypatch.setattr(torch.ops.trtllm, "cublas_mm", stock)
+    hidden = torch.ones((2, hidden_size), dtype=torch.bfloat16)
+    actual = gate(hidden)
+    stock.assert_called_once()
+    assert actual.shape == (2, num_experts)
+    torch.testing.assert_close(actual, torch.full_like(actual, hidden_size), rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("error_type", [ValueError, AssertionError])
+def test_ctx_qkv_invalid_arguments_keep_stock_fallback(monkeypatch, error_type) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_autotuner_tuning", lambda: False)
+    monkeypatch.setattr(linear_module, "take_prequantized_mxfp8", lambda hidden: None)
+    runner = Mock(spec_set=["make_args", "run_args"])
+    runner.make_args.side_effect = error_type("unsupported cache layout")
+    monkeypatch.setattr(modeling_minimaxm3, "_ctx_qkv_fused_runner", lambda *heads: runner)
+    attention = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    nn.Module.__init__(attention)
+    attention.num_heads = 8
+    attention.num_key_value_heads = attention.sparse_num_index_heads = 1
+    attention.head_dim = 128
+    attention.qkv_proj = nn.Linear(64, 1536, bias=False, dtype=torch.bfloat16)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    attention.qkv_proj.quant_method = method
+    attention.qkv_proj.weight_scale = torch.empty(1, dtype=torch.uint8)
+    attention.qkv_proj._mxfp8_alpha = torch.ones(1)
+    hidden = torch.zeros((1025, 64), dtype=torch.bfloat16)
+    quantize = Mock(
+        return_value=(
+            torch.empty_like(hidden, dtype=torch.float8_e4m3fn),
+            torch.empty(1, dtype=torch.uint8),
+        )
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "mxfp8_quantize", quantize)
+    unused_cache = torch.empty(0, dtype=torch.uint8)
+    common_args = (
+        torch.zeros(1025, dtype=torch.int32),
+        torch.empty((1, 2, 32)),
+        torch.zeros(1025, dtype=torch.int32),
+    )
+    assert (
+        attention._ctx_fused_qkv_gemm_producer(
+            hidden,
+            unused_cache,
+            unused_cache,
+            unused_cache,
+            torch.ones(3),
+            common_args,
+            [torch.ones(128, dtype=torch.bfloat16)] * 4,
+            1e-6,
+        )
+        is None
+    )
+    runner.make_args.assert_called_once()
+    runner.run_args.assert_not_called()

@@ -143,7 +143,12 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_fp4_input_scale_rejects_cutedsl_awq_prescale
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_tf32_refit_preserves_allocation
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_fixed_router_refit_preserves_allocation
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_unsupported_fixed_geometry_uses_stock
+  - unittest/_torch/modules/test_m3_ctx_clc_dispatch.py
+  - unittest/_torch/models/test_minimax_m3_drafter_rows.py
+  - unittest/_torch/kernels/serial/test_m3_qkv_contract.py
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_invalid_arguments_keep_stock_fallback
   - unittest/_torch/models/test_minimax_m3.py::test_cutedsl_shared_fold_backend_is_rubin_only
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_keeps_native_mxfp8_without_rubin_dsl
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_memoizes_initialization_failure

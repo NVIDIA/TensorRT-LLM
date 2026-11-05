@@ -342,11 +342,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._inforward_snapshot_rows_left = 0
         # Append reserve for chunked context (opt-in: TLLM_CTX_APPEND_RESERVE=R tokens; unset or 0 disables).
         # The first context request of each iteration is chunked against
-        # max_num_tokens - R, so R tokens stay free for short context requests
-        # (agentic appends) in the same iteration instead of waiting for the
-        # whole long prefill. The cold chunk boundaries depend only on the
-        # request and the config, so scheduling stays deterministic. Applies
-        # only when max_num_tokens > 2 * R.
+        # the remaining token budget minus R, so R tokens stay free for short
+        # context requests (agentic appends) in the same iteration instead of
+        # waiting for the whole long prefill. Generation, encoder and held
+        # starvation tokens remain charged. Applies only when max_num_tokens > 2 * R.
         self._ctx_append_reserve = int(os.environ.get("TLLM_CTX_APPEND_RESERVE", "0") or 0)
         if (
             self._ctx_append_reserve > 0
@@ -920,7 +919,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                     budget.commit(req, tokens, peft_pages)
                 else:
                     action, tokens, chunking_flag = self._try_schedule_context(
-                        req, budget, preempt_for_pages, token_cap
+                        req,
+                        budget,
+                        preempt_for_pages,
+                        token_cap,
+                        first_context_in_batch=not scheduled_ctx,
                     )
                     if action is ScheduleAction.STOP:
                         ctx_stopped = True
@@ -1304,6 +1307,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         budget: BudgetTracker,
         preempt_for_pages: Callable[[LlmRequest], bool],
         token_cap: Optional[int] = None,
+        *,
+        first_context_in_batch: bool = True,
     ) -> tuple[ScheduleAction, int, bool]:
         """Try to schedule a context request (chunked or non-chunked).
 
@@ -1325,7 +1330,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 # Nothing is claimed yet, so there is nothing to release.
                 return ScheduleAction.SKIP, 0, False
-            result = self._try_schedule_context_chunked(req, budget, preempt_for_pages, token_cap)
+            result = self._try_schedule_context_chunked(
+                req,
+                budget,
+                preempt_for_pages,
+                token_cap,
+                first_context_in_batch=first_context_in_batch,
+            )
         else:
             result = self._try_schedule_context_full(req, budget, preempt_for_pages)
 
@@ -1558,13 +1569,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         budget: BudgetTracker,
         preempt_for_pages: Callable[[LlmRequest], bool],
         token_cap: Optional[int] = None,
+        *,
+        first_context_in_batch: bool = True,
     ) -> tuple[ScheduleAction, int, bool]:
         """Chunk a context request, holding back the append reserve for the first one.
 
+        Generation, encoder and starvation-hold tokens can precede the first context.
         See ``_ctx_append_reserve`` in ``__init__``.
         """
         reserve = self._ctx_append_reserve if self._ctx_append_reserve_active else 0
-        if not reserve or budget.num_tokens != 0 or budget.max_num_tokens is None:
+        if not reserve or not first_context_in_batch or budget.max_num_tokens is None:
             return self._try_schedule_context_chunked_impl(
                 req, budget, preempt_for_pages, token_cap
             )

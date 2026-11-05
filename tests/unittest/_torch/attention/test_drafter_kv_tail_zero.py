@@ -10,6 +10,11 @@ import torch
 from tensorrt_llm._torch.attention.backends.fmha import drafter_last_row
 from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
 
 PAGE, HEADS, D = 128, 4, 128
 
@@ -167,3 +172,32 @@ def test_a_private_cache_zeroes_through_the_gate(monkeypatch):
             )
             == 0
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("copy_partial", [False, True])
+def test_v1_manager_config_controls_tail_zero_safety(copy_partial: bool) -> None:
+    config = KvCacheConfig(
+        max_tokens=64,
+        enable_block_reuse=True,
+        enable_partial_reuse=True,
+        copy_on_partial_reuse=copy_partial,
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        kv_cache_type=CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=64,
+        max_batch_size=1,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+    )
+    try:
+        assert manager.enable_block_reuse and manager.enable_partial_reuse
+        assert manager.copy_on_partial_reuse is copy_partial
+        assert drafter_last_row._v_tail_zero_safe(manager) is copy_partial
+    finally:
+        manager.shutdown()

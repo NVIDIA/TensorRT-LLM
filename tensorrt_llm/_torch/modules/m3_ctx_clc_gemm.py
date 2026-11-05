@@ -182,16 +182,28 @@ def try_ctx_clc_mxfp8_gemm(
         _failed[key] = f"{type(exc).__name__}: {exc}"
         _skip(n, k, hpt, f"compile failed ({_failed[key]})")
         return None
-    reason = gemm.check(act, act_sf, weight, weight_sf, alpha)
+    try:
+        reason = gemm.check(act, act_sf, weight, weight_sf, alpha)
+    except (torch.OutOfMemoryError, torch.AcceleratorError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - optional host validation must preserve the stock path
+        _failed[key] = f"{type(exc).__name__}: {exc}"
+        _skip(n, k, hpt, f"host validation failed ({_failed[key]})")
+        return None
     if reason:
         _skip(n, k, hpt, reason)
         return None
+    # Allocation and kernel execution errors must propagate, rather than disabling an optional host path.
+    out = torch.empty((act.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=act.device)
     try:
-        # Direct call: in eager the custom-op dispatch would only add host time per GEMM.
-        out = _clc_gemm_impl(act, act_sf, weight, weight_sf, alpha, hpt)
-    except AssertionError as exc:
-        _skip(n, k, hpt, f"assertion {exc}")
+        args = gemm.make_args(act, act_sf, weight, weight_sf, alpha, out)
+    except (torch.OutOfMemoryError, torch.AcceleratorError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - argument conversion can fail before any kernel is launched
+        _failed[key] = f"{type(exc).__name__}: {exc}"
+        _skip(n, k, hpt, f"host argument preparation failed ({_failed[key]})")
         return None
+    gemm.run_args(args)
     logger.info_once(
         f"MiniMax-M3 CTX CLC MXFP8 GEMM taken (N={n}, K={k}, hpt={hpt})",
         key=f"m3_ctx_clc_gemm_taken_{n}_{k}_{hpt}",

@@ -23,7 +23,7 @@ from typing import Dict, Tuple
 
 import torch
 
-from .kernel import HEAD_DIM, M3QkvFusedRunner
+from .kernel import HEAD_DIM, M3QkvFusedRunner, _DeviceArgs
 
 NUM_HEADS_KV = 2
 NUM_HEADS_INDEX = 2
@@ -192,15 +192,18 @@ class M3ClcMxfp8Gemm:
         assert gemm_out.shape == (act.shape[0], self.n) and gemm_out.dtype == torch.bfloat16
         assert gemm_out.is_contiguous() and gemm_out.data_ptr() % 16 == 0
         w_dl, wsf_dl, alpha_dl = self._weight_dl(weight, weight_sf, alpha)
-        return (
-            _dl(act),
-            _dl(act_sf.view(torch.float8_e8m0fnu).reshape(-1)),
-            w_dl,
-            wsf_dl,
-            alpha_dl,
-            *_dummy_producer_args(act.device),
-            _dl(gemm_out.view(-1)),
-            *_TAIL_ARGS,
+        return _DeviceArgs(
+            (
+                _dl(act),
+                _dl(act_sf.view(torch.float8_e8m0fnu).reshape(-1)),
+                w_dl,
+                wsf_dl,
+                alpha_dl,
+                *_dummy_producer_args(act.device),
+                _dl(gemm_out.view(-1)),
+                *_TAIL_ARGS,
+            ),
+            act.device,
         )
 
     def run_args(self, args, stream=None) -> None:

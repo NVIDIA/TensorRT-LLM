@@ -70,7 +70,7 @@ def unpermute_residual(
         )
     block, warps = _CFG
     _unpermute_residual_kernel[(t, triton.cdiv(hidden, block))](
-        permuted_rows, output, expanded_idx_to_permuted_idx, topk_scales.contiguous(),
+        permuted_rows, output, expanded_idx_to_permuted_idx.contiguous(), topk_scales.contiguous(),
         residual if residual is not None else output, hidden, TOP_K=top_k, BLOCK=block,
         HAS_RES=residual is not None, CONTRACT=contract, num_warps=warps,
     )  # fmt: skip

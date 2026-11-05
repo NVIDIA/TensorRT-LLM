@@ -91,7 +91,7 @@ registers and runs slower.
 from __future__ import annotations
 
 import os
-from typing import NamedTuple, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Tuple
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -114,6 +114,10 @@ from .clc_tile_scheduler import (
     ClcDynamicPersistentTileScheduler,
     ClcDynamicPersistentTileSchedulerParams,
 )
+
+if TYPE_CHECKING:
+    import torch
+
 
 HEAD_DIM = 128
 ROTARY_DIM = 64
@@ -1871,6 +1875,17 @@ def _cache_strides(kv_data_cache, kv_scale_cache, index_k_cache):
     )
 
 
+class _DeviceArgs(tuple):
+    """Tuple-compatible FFI arguments retaining the operand device for stream lookup at launch."""
+
+    device: torch.device
+
+    def __new__(cls, values: tuple, device: torch.device) -> "_DeviceArgs":
+        args = super().__new__(cls, values)
+        args.device = device
+        return args
+
+
 class M3QkvFusedRunner:
     """Torch-callable wrapper: builds the TVM-FFI dlpack arguments once per call.
 
@@ -1913,43 +1928,76 @@ class M3QkvFusedRunner:
         gemm_out=None,
     ):
         import torch
-        from cutlass.cute.runtime import from_dlpack
 
         op = self.op
-        assert act.dim() == 2 and weight.shape == (op.n_total, act.shape[1])
-        assert act.shape[1] % 128 == 0
+        if not (act.dim() == 2 and weight.shape == (op.n_total, act.shape[1])):
+            raise ValueError(
+                "Unsupported fused QKV operands: expected activation [M,K] and projection weight [N,K]"
+            )
+        if act.shape[1] % 128:
+            raise ValueError("Unsupported fused QKV operands: K must be divisible by 128")
         m = act.shape[0]
-        assert q_out.shape == (m, op.num_heads_q, HEAD_DIM)
-        assert index_q_out.shape == (m, op.num_heads_index, HEAD_DIM)
-        assert kv_data_cache.dim() == 5 and kv_data_cache.shape[1:] == (
-            2,
-            op.num_heads_kv,
-            PAGE_SIZE,
-            HEAD_DIM // 2,
-        )
-        assert kv_scale_cache.dim() == 5 and kv_scale_cache.shape[1:] == (
-            2,
-            op.num_heads_kv,
-            PAGE_SIZE,
-            HEAD_DIM // 16,
-        )
-        assert index_k_cache.dim() == 4 and index_k_cache.shape[1:] == (1, PAGE_SIZE, HEAD_DIM)
-        assert kv_data_cache.stride(4) == 1 and kv_data_cache.stride(3) == HEAD_DIM // 2
-        assert kv_scale_cache.stride(4) == 1 and kv_scale_cache.stride(3) == HEAD_DIM // 16
-        assert index_k_cache.stride(3) == 1 and index_k_cache.stride(2) == HEAD_DIM
+        if not (q_out.shape == (m, op.num_heads_q, HEAD_DIM)):
+            raise ValueError("Unsupported fused QKV operands: q_out must have shape [M,Hq,128]")
+        if not (index_q_out.shape == (m, op.num_heads_index, HEAD_DIM)):
+            raise ValueError(
+                "Unsupported fused QKV operands: index_q_out must have shape [M,Hi,128]"
+            )
+        if not (
+            kv_data_cache.dim() == 5
+            and kv_data_cache.shape[1:] == (2, op.num_heads_kv, PAGE_SIZE, HEAD_DIM // 2)
+        ):
+            raise ValueError("Unsupported fused QKV operands: invalid NVFP4 data-cache shape")
+        if not (
+            kv_scale_cache.dim() == 5
+            and kv_scale_cache.shape[1:] == (2, op.num_heads_kv, PAGE_SIZE, HEAD_DIM // 16)
+        ):
+            raise ValueError("Unsupported fused QKV operands: invalid NVFP4 scale-cache shape")
+        if not (index_k_cache.dim() == 4 and index_k_cache.shape[1:] == (1, PAGE_SIZE, HEAD_DIM)):
+            raise ValueError("Unsupported fused QKV operands: invalid index-K cache shape")
+        if not (kv_data_cache.stride(4) == 1 and kv_data_cache.stride(3) == HEAD_DIM // 2):
+            raise ValueError(
+                "Unsupported fused QKV operands: NVFP4 data-cache rows must be contiguous"
+            )
+        if not (kv_scale_cache.stride(4) == 1 and kv_scale_cache.stride(3) == HEAD_DIM // 16):
+            raise ValueError(
+                "Unsupported fused QKV operands: NVFP4 scale-cache rows must be contiguous"
+            )
+        if not (index_k_cache.stride(3) == 1 and index_k_cache.stride(2) == HEAD_DIM):
+            raise ValueError(
+                "Unsupported fused QKV operands: index-K cache rows must be contiguous"
+            )
         strides = _cache_strides(kv_data_cache, kv_scale_cache, index_k_cache)
-        assert all(s % 16 == 0 for s in strides[0:4] + strides[7:9]), strides
-        assert all(s % 8 == 0 for s in strides[4:7]), strides
+        if any(s % 16 for s in strides[0:4] + strides[7:9]):
+            raise ValueError(
+                "Unsupported fused QKV operands: data/index cache strides must be 16-byte aligned"
+            )
+        if any(s % 8 for s in strides[4:7]):
+            raise ValueError(
+                "Unsupported fused QKV operands: scale-cache strides must be 8-byte aligned"
+            )
         for t, al in ((kv_data_cache, 16), (kv_scale_cache, 8), (index_k_cache, 16)):
-            assert t.data_ptr() % al == 0
+            if t.data_ptr() % al:
+                raise ValueError(
+                    "Unsupported fused QKV operands: cache storage pointer is misaligned"
+                )
         if isinstance(norm_weights, (list, tuple)):
             norm_weights = torch.cat([w.reshape(-1) for w in norm_weights])
-        assert norm_weights.dtype == torch.bfloat16 and norm_weights.numel() == 4 * HEAD_DIM
+        if not (norm_weights.dtype == torch.bfloat16 and norm_weights.numel() == 4 * HEAD_DIM):
+            raise ValueError(
+                "Unsupported fused QKV operands: norm weights must contain 512 BF16 elements"
+            )
         if gemm_out is None:
-            assert not self.debug
+            if self.debug:
+                raise ValueError(
+                    "Unsupported fused QKV operands: debug mode requires an explicit GEMM output"
+                )
             gemm_out = torch.empty(8, dtype=torch.bfloat16, device=act.device)
         else:
-            assert gemm_out.shape == (m, op.n_total) and gemm_out.dtype == torch.bfloat16
+            if not (gemm_out.shape == (m, op.n_total) and gemm_out.dtype == torch.bfloat16):
+                raise ValueError("Unsupported fused QKV operands: GEMM output must be BF16 [M,N]")
+
+        from cutlass.cute.runtime import from_dlpack
 
         def dl(t, al=16):
             return from_dlpack(t, assumed_align=al, enable_tvm_ffi=True)
@@ -1963,33 +2011,36 @@ class M3QkvFusedRunner:
             extent = 1 + sum((s - 1) * st for s, st in zip(base.shape, base.stride()))
             return torch.as_strided(base, (extent,), (1,))
 
-        return (
-            dl(act),
-            dl(act_sf.view(torch.float8_e8m0fnu).reshape(-1)),
-            dl(weight),
-            dl(weight_sf.view(torch.float8_e8m0fnu).reshape(-1)),
-            dl(alpha, 4),
-            dl(flat_u8(q_out).reshape(-1)),
-            dl(flat_u8(index_q_out).reshape(-1)),
-            dl(span_u8(kv_data_cache)),
-            dl(span_u8(kv_scale_cache), 8),
-            dl(span_u8(index_k_cache)),
-            dl(out_cache_loc, 4),
-            dl(kv_quant_scale, 4),
-            dl(rotary_cos_sin.reshape(-1)),
-            dl(position_ids, 4),
-            dl(norm_weights.reshape(-1)),
-            dl(gemm_out.reshape(-1)),
-            *strides,
-            int(kv_data_cache.shape[0]),
-            float(eps),
+        return _DeviceArgs(
+            (
+                dl(act),
+                dl(act_sf.view(torch.float8_e8m0fnu).reshape(-1)),
+                dl(weight),
+                dl(weight_sf.view(torch.float8_e8m0fnu).reshape(-1)),
+                dl(alpha, 4),
+                dl(flat_u8(q_out).reshape(-1)),
+                dl(flat_u8(index_q_out).reshape(-1)),
+                dl(span_u8(kv_data_cache)),
+                dl(span_u8(kv_scale_cache), 8),
+                dl(span_u8(index_k_cache)),
+                dl(out_cache_loc, 4),
+                dl(kv_quant_scale, 4),
+                dl(rotary_cos_sin.reshape(-1)),
+                dl(position_ids, 4),
+                dl(norm_weights.reshape(-1)),
+                dl(gemm_out.reshape(-1)),
+                *strides,
+                int(kv_data_cache.shape[0]),
+                float(eps),
+            ),
+            act.device,
         )
 
     def run_args(self, args, stream=None):
         import torch
 
         if stream is None:
-            stream = torch.cuda.current_stream().cuda_stream
+            stream = torch.cuda.current_stream(args.device).cuda_stream
         self.compiled(*args, cuda_driver.CUstream(stream))
 
     def __call__(self, *tensors, **kw):

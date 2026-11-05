@@ -5295,6 +5295,75 @@ class TestAppendReserveShortestFirst:
         assert short.context_chunk_size == 1000
         assert long_second.context_chunk_size == 1024
 
+    def test_reserve_with_generation_rows_applies_only_to_first_context(self):
+        generation = make_gen_request(100, num_draft_tokens=31)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = self._schedule(
+            make_kv_cache_manager(tokens_per_block=64), [generation, head, long_second, short]
+        )
+        assert ids(out.generation_requests) == [100]
+        assert sorted(ids(out.context_requests)) == [0, 1, 2]
+        assert head.context_chunk_size == 6080  # floor((8192 - 32 - 2048) / 64) * 64
+        assert short.context_chunk_size == 1000
+        assert long_second.context_chunk_size == 1024
+
+    @pytest.mark.parametrize("adaptive,expected", [(True, 8128), (False, 6080)])
+    def test_single_context_adaptive_reserve_with_generation(self, monkeypatch, adaptive, expected):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_ADAPTIVE", "1" if adaptive else "0")
+        generation = make_gen_request(100, num_draft_tokens=31)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [generation, head])
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == expected
+
+    @pytest.mark.parametrize(
+        "first_context,cap,expected",
+        [(True, None, 4032), (False, None, 6080), (True, 512, 512), (False, 512, 512)],
+    )
+    def test_first_context_flag_preserves_held_tokens_and_cap(self, first_context, cap, expected):
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        request = make_ctx_request(0, context_remaining_length=20000)
+        budget = BudgetTracker(8192, 8)
+        budget.hold(2080, 2)  # 32 committed generation tokens plus a 2048-token starvation share.
+        action, tokens, chunked = scheduler._try_schedule_context(
+            request,
+            budget,
+            lambda req: False,
+            token_cap=cap,
+            first_context_in_batch=first_context,
+        )
+        assert action is ScheduleAction.SCHEDULED and chunked
+        assert tokens == expected
+        assert budget.num_tokens == 2080 and budget.max_num_tokens == 8192
+
+    def test_skipped_candidate_does_not_consume_first_context_reserve(self, monkeypatch):
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        original = scheduler._try_schedule_context
+
+        def skip_candidate(request, *args, **kwargs):
+            if request.py_request_id == 0:
+                return ScheduleAction.SKIP, 0, False
+            return original(request, *args, **kwargs)
+
+        monkeypatch.setattr(scheduler, "_try_schedule_context", skip_candidate)
+        generation = make_gen_request(100, num_draft_tokens=31)
+        skipped = make_ctx_request(0, context_remaining_length=20000)
+        head = make_ctx_request(1, context_remaining_length=20000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = scheduler.schedule_request([generation, skipped, head, short], set())
+        assert sorted(ids(out.context_requests)) == [1, 2]
+        assert head.context_chunk_size == 6080 and short.context_chunk_size == 1000
+
     def test_kill_switch_keeps_arrival_order(self, monkeypatch):
         monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF", "0")
         head = make_ctx_request(0, context_remaining_length=20000)

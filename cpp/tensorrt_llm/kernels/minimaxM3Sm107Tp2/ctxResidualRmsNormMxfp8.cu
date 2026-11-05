@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/minimaxM3Sm107Tp2/ctxResidualRmsNormMxfp8.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
@@ -213,8 +214,8 @@ void invokeCtxResidualRmsNormMxfp8(__nv_bfloat16* inter, __nv_bfloat16 const* re
     config.numAttrs = 1;
     auto launch = [&](auto kernel)
     {
-        cudaLaunchKernelEx(&config, kernel, inter, residual, weight, normOut, qOut, sfOut, fp4Out, fp4SfOut,
-            fp4GlobalScale, rows, hidden, eps);
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, inter, residual, weight, normOut, qOut, sfOut, fp4Out,
+            fp4SfOut, fp4GlobalScale, rows, hidden, eps));
     };
     bool const fp4 = fp4Out != nullptr;
     if (normOut != nullptr)

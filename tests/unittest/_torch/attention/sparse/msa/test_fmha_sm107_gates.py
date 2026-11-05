@@ -29,6 +29,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -221,3 +222,56 @@ def test_combine_rejects_invalid_mxfp8_destinations(case: str, error: str) -> No
             o_fp8=values,
             sf_out=scales,
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failure", ["capture", "synchronize", "allocate"])
+def test_deferred_plan_retries_after_resolution_failure(monkeypatch, failure: str) -> None:
+    # Match the installed-source validation tests above, without importing CUDA kernels.
+    source = Path(_fmha_sm100_dir()) / "api.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_DeferredSplitPlanInfo"
+    )
+    event = Mock(spec_set=["synchronize"])
+    allocator = Mock(return_value=torch.empty(1))
+    namespace = {
+        "torch": torch,
+        "PlanInfo": dict,
+        "_SPLIT_KEYS": frozenset(("num_kv_splits", "predicted_speedup")),
+        "_log_plan_decision": Mock(),
+        "_alloc_workspace_buf": allocator,
+        "_BuffTag": types.SimpleNamespace(workspace_o=0),
+    }
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
+    plan = namespace["_DeferredSplitPlanInfo"](num_kv_splits=7, predicted_speedup=-1)
+    pending = dict(
+        event=event,
+        host=torch.tensor([1.0, 1.5]),
+        max_kv_splits=3,
+        total_qo_len=2,
+        num_qo_heads=1,
+        device="cuda",
+    )
+    plan.__dict__["_lazy"] = pending
+    capturing = {"active": failure == "capture"}
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing["active"])
+    if failure == "synchronize":
+        event.synchronize.side_effect = RuntimeError("controlled synchronize failure")
+    if failure == "allocate":
+        allocator.side_effect = RuntimeError("controlled allocation failure")
+    with pytest.raises(RuntimeError, match="capture|controlled"):
+        plan.get("num_kv_splits")
+    assert plan.__dict__["_lazy"] is pending
+    assert dict.__getitem__(plan, "num_kv_splits") == 7
+    if failure == "capture":
+        event.synchronize.assert_not_called()
+    capturing["active"] = False
+    event.synchronize.side_effect = None
+    allocator.side_effect = None
+    assert plan["num_kv_splits"] == 3
+    assert plan["predicted_speedup"] == 1.5
+    assert "_lazy" not in plan.__dict__
+    calls = event.synchronize.call_count
+    assert plan.get("num_kv_splits") == 3
+    assert event.synchronize.call_count == calls
