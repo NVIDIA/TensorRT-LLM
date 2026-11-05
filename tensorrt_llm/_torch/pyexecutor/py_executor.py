@@ -9104,6 +9104,7 @@ class PyExecutor:
     #    reserved and projected once per cycle.
     #
     # A failed encoder step fails its requests that have not finished.
+    # Terminating a request drops an output it has not consumed.
     # ---------------------------------------------------------------
     def _warmup_encoder_cuda_graphs_enc_dec(self) -> None:
         """Capture encoder graphs on the worker used for runtime replay."""
@@ -10835,6 +10836,9 @@ class PyExecutor:
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         self._release_multimodal_resources(request)
+        if getattr(request, "py_encoder_output", None) is not None:
+            request.py_encoder_output = None
+            request.py_encoder_output_ready_event = None
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
