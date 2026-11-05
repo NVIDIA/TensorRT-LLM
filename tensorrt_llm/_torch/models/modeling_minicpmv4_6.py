@@ -31,7 +31,7 @@ import transformers
 from packaging.version import Version
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range
@@ -58,6 +58,7 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
     find_input_mm_embeds,
@@ -612,65 +613,30 @@ class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
         hidden_states = self.post_layernorm(hidden_states)
         return self.merger(hidden_states, target_sizes)
 
+    def encode_batched(
+        self, pixel_values: torch.Tensor, target_sizes: torch.Tensor
+    ) -> torch.Tensor:
+        pixel_values = pixel_values.permute(1, 2, 0).unsqueeze(0)
+        features = self._get_image_features(pixel_values, target_sizes.to("cpu"))
+        return torch.cat(features, dim=0)
+
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self.encode_batched,
+                input_fields={
+                    "pixel_values": {"image": "pixel_values", "video": "pixel_values"},
+                    "target_sizes": {"image": "target_sizes", "video": "target_sizes"},
+                },
+            ),
+        )
+
     @torch.inference_mode()
     @nvtx_range("MiniCPMV4_6 vision encoder")
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        pixel_values_list = []
-        target_sizes_list = []
-        for param in multimodal_params:
-            # Image and video share the NaViT-packed vision path. A request
-            # carries at most one modality (the input processor rejects mixed
-            # image+video requests), so the fixed image-then-video iteration
-            # order here is unambiguous and matches the placeholder order in
-            # `input_ids`.
-            for modality in ("image", "video"):
-                modality_data = param.multimodal_data.get(modality)
-                if modality_data is None:
-                    continue
-                pixel_values_list.append(modality_data["pixel_values"])
-                target_sizes_list.append(modality_data["target_sizes"])
-
-        if not pixel_values_list:
-            return []
-
-        # NaViT packing: concat along the packed patch axis; target grids stack.
-        pixel_values = (
-            torch.cat(pixel_values_list, dim=-1)
-            if len(pixel_values_list) > 1
-            else pixel_values_list[0]
-        )
-        target_sizes = (
-            torch.cat(target_sizes_list, dim=0)
-            if len(target_sizes_list) > 1
-            else target_sizes_list[0]
-        )
-        target_sizes = target_sizes.to("cpu")
-
-        features = self._get_image_features(pixel_values, target_sizes)
-        fused = torch.cat(features, dim=0)
-
-        # Contract-4 invariants (this forward returns ONE pre-concatenated
-        # tensor that find_input_mm_embeds / _cache_multimodal_embeddings slice
-        # back per request):
-        #   I.  Order -- `features` are concatenated in `multimodal_params`
-        #       order; the loop above and the per-grid merger both preserve it,
-        #       which is exactly the order the downstream slicers assume. (Not
-        #       assertable cheaply -- covered by the multi-request E2E test.)
-        #   II. Count -- the produced row count must equal the sum of each
-        #       request's placeholder count (`total_embeds_in_request`). A
-        #       mismatch means the vision output and the fused `input_ids` will
-        #       misalign, so fail loudly here instead of silently scattering
-        #       wrong rows downstream. Only checked when every request carries
-        #       runtime counts (absent on some warmup / JIT paths).
-        runtimes = [p.multimodal_runtime for p in multimodal_params]
-        if all(r is not None and r.total_embeds_in_request is not None for r in runtimes):
-            expected = sum(r.total_embeds_in_request for r in runtimes)
-            assert fused.shape[0] == expected, (
-                f"MiniCPMV4_6 vision produced {fused.shape[0]} embedding rows "
-                f"but the batch's per-request placeholder counts sum to "
-                f"{expected}; vision output would misalign with input_ids."
-            )
-        return [fused]
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
     def load_weights(self, weights: Dict[str, torch.Tensor]):
         converted_weights = {}
@@ -693,6 +659,43 @@ class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
 # ---------------------------------------------------------------------------
 # Input processor
 # ---------------------------------------------------------------------------
+class _MiniCPMItemLengthsProcessor:
+    """Retain item row counts before the HF processor discards crop/frame counts."""
+
+    def __init__(self, processor, modality: str):
+        self.processor = processor
+        self.modality = modality
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "processor"), name)
+
+    def __call__(self, *args, **kwargs):
+        inputs = self.processor(*args, **kwargs)
+        if self.modality == "image":
+            target_sizes = inputs["target_sizes"]
+            counts = inputs["num_patches_per_image"]
+        else:
+            target_sizes = inputs["target_sizes_videos"]
+            counts = []
+            frame_offset = 0
+            for num_frames in inputs["num_frames_per_video"]:
+                end = frame_offset + int(num_frames)
+                counts.append(sum(inputs["num_patches_per_frame"][frame_offset:end]))
+                frame_offset = end
+        downsample = kwargs.get("downsample_mode", self.processor.downsample_mode)
+        rows = target_sizes.prod(dim=-1) // (4 if downsample == "4x" else 16)
+        offset = 0
+        lengths = []
+        for count in counts:
+            end = offset + int(count)
+            lengths.append(int(rows[offset:end].sum()))
+            offset = end
+        inputs[f"{self.modality}_output_embedding_lengths"] = torch.tensor(
+            lengths, dtype=torch.int64
+        )
+        return inputs
+
+
 class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Runs the HF MiniCPM-V processor and rewrites image tokens to the OOV
     sentinel expected by ``fuse_input_embeds``."""
@@ -723,6 +726,12 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         self._processor = AutoProcessor.from_pretrained(
             model_path, use_fast=self.use_fast, trust_remote_code=trust_remote_code
         )
+        self._processor.image_processor = _MiniCPMItemLengthsProcessor(
+            self._processor.image_processor, "image"
+        )
+        self._processor.video_processor = _MiniCPMItemLengthsProcessor(
+            self._processor.video_processor, "video"
+        )
         self._dtype = config.torch_dtype or config.text_config.torch_dtype or torch.bfloat16
         self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         self.image_token_str = getattr(self._processor, "image_token", "<|image_pad|>")
@@ -750,6 +759,35 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict,
+        mm_item_order: Optional[List[Dict]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        if metadata is not None:
+            return metadata
+        lengths = {
+            modality: data["output_embedding_lengths"].tolist()
+            for modality in ("image", "video")
+            if isinstance(data := multimodal_data.get(modality), dict)
+        }
+        if not lengths:
+            return None
+        refs = (
+            [(entry["modality"], entry["index"]) for entry in mm_item_order]
+            if mm_item_order
+            else [
+                (modality, index)
+                for modality, rows in lengths.items()
+                for index in range(len(rows))
+            ]
+        )
+        return MultimodalItemMetadata(
+            refs, output_embedding_lengths=[lengths[modality][index] for modality, index in refs]
+        )
 
     def _mm_token_ids(self) -> List[int]:
         return [
@@ -864,7 +902,7 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
                 # target_sizes stays on CPU: the vision encoder uses it for
                 # integer window/grid arithmetic (not listed in
                 # multimodal_data_device_paths).
-                "pixel_values": pixel_values.to(self.dtype),
+                "pixel_values": pixel_values.to(self.dtype).squeeze(0).permute(2, 0, 1),
                 "target_sizes": processed_inputs.get("target_sizes"),
             }
         # Video is packed identically to image (pixel_values_videos is a NaViT
@@ -873,9 +911,15 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         pixel_values_videos = processed_inputs.get("pixel_values_videos")
         if pixel_values_videos is not None:
             multimodal_data["video"] = {
-                "pixel_values": pixel_values_videos.to(self.dtype),
+                "pixel_values": pixel_values_videos.to(self.dtype).squeeze(0).permute(2, 0, 1),
                 "target_sizes": processed_inputs.get("target_sizes_videos"),
             }
+
+        for modality in ("image", "video"):
+            if modality in multimodal_data:
+                multimodal_data[modality]["output_embedding_lengths"] = processed_inputs[
+                    f"{modality}_output_embedding_lengths"
+                ]
 
         fused_input_ids = self._postprocess(processed_inputs["input_ids"][0])
         return fused_input_ids.to(torch.int32).tolist(), {
