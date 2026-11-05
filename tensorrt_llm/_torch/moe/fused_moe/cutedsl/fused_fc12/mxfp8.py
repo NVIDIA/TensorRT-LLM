@@ -14,13 +14,14 @@
 # limitations under the License.
 """TrtllmCutedslFusedFc12Mxfp8Impl: ``trtllm.cutedsl.fused_fc12.mxfp8``.
 
-FC1+FC2-fused CuteDSL MXFP8 MoE backend for Rubin (SM107). One persistent kernel
-(``trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin``) does gather + FC1
-GEMM + SwiGLU + MXFP8 requant + FC2 GEMM + top-k finalize (scatter-add into
-``moe_output``): W8A8 e4m3 x e4m3 with UE8M0 1x32 block scales. With locality
-domains, the planner instead splits every expert's inner channels across the
-two domains for every shape of the layer; the shards are then the only copy of
-the expert weights.
+FC1+FC2-fused CuteDSL MXFP8 MoE backend for Rubin (SM107) and Blackwell
+(SM100/SM103). One persistent kernel
+(``trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin``, or its SM100 port
+``..._blackwell``) does gather + FC1 GEMM + SwiGLU + MXFP8 requant + FC2 GEMM +
+top-k finalize (scatter-add into ``moe_output``): W8A8 e4m3 x e4m3 with UE8M0
+1x32 block scales. With locality domains (Rubin), the planner instead splits
+every expert's inner channels across the two domains for every shape of the
+layer; the shards are then the only copy of the expert weights.
 
 Its weights are the Cutlass MXFP8 layout plus a gate/up interleave of FC1
 (``MXFP8CuteDslFusedMoEMethod``). The kernel is a separate copy of the fused
@@ -29,6 +30,7 @@ FC12 kernel the NVFP4 leaf runs, so the two share no code here.
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
 from .....autotuner import AutoTuner
@@ -95,11 +97,11 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             routing_scales_dtype=torch.float32,
             run_moe_requires_coresident_grid=True,
         ),
-        doc="Rubin (SM107) MXFP8 fused FC1 + SwiGLU + FC2 + finalize persistent "
-        "CuTe DSL grouped GEMM.",
+        doc="Rubin (SM107) / Blackwell (SM100/SM103) MXFP8 fused FC1 + SwiGLU + FC2 + "
+        "finalize persistent CuTe DSL grouped GEMM.",
     )
 
-    sm_support = SmSupport(allowed=frozenset({107}))
+    sm_support = SmSupport(allowed=frozenset({100, 103, 107}))
     # The kernel writes a bfloat16 output.
     supported_dtypes = BF16_ONLY
 
@@ -136,7 +138,8 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # ------------------------------------------------------------------
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """MXFP8 on Rubin (SM107) with a CuTe DSL build that has the fused FC12 kernel."""
+        """MXFP8 on Rubin (SM107) or Blackwell (SM100/SM103), with a CuTe DSL build
+        that has the fused FC12 kernel for that architecture."""
         for verdict in (
             check_quant_matches_identity(cls, p),
             check_sm(cls, d),
@@ -195,14 +198,20 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
                 f"{cls.__name__} only has a fused-finalize FC2",
             )
 
-        # Older Rubin CuTe DSL builds miscompile the kernel's MXFP8 path.
-        for dep in (MoEDep.CUTEDSL_RUBIN, MoEDep.CUTEDSL_MXFP8_FUSED_FC12):
+        # Older Rubin CuTe DSL builds miscompile the kernel's MXFP8 path; the
+        # SM100 port needs the same submodules plus the Blackwell helpers.
+        if d.env.sm == 107:
+            deps = (MoEDep.CUTEDSL_RUBIN, MoEDep.CUTEDSL_MXFP8_FUSED_FC12)
+            build = "internal 0.3.0+20260803"
+        else:
+            deps = (MoEDep.CUTEDSL_MXFP8_FUSED_FC12_BLACKWELL,)
+            build = "4.8.0a0+20260821"
+        for dep in deps:
             if not d.env.has_dep(dep):
                 return _reject(
                     MoERejectReason.DEP_MISSING,
-                    f"{cls.__name__} requires a CuTe DSL build with the "
-                    "cutlass.memory / cutlass.tensor_utils submodules (e.g. internal "
-                    "0.3.0+20260803 or newer)",
+                    f"{cls.__name__} on SM{d.env.sm} requires a CuTe DSL build with the "
+                    f"fused FC12 kernel's submodules (e.g. {build} or newer)",
                 )
 
         return MoEEligibility.ok()
@@ -256,6 +265,9 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         self.tune_max_num_tokens = moe_tune_max_num_tokens(
             model_config, self.num_slots, routing_method.get_experts_per_token()
         )
+        # SM107 runs the Rubin kernel, SM100/SM103 its Blackwell port; both ops
+        # share the input contract.
+        self._sm_version = get_sm_version()
         self._init_output_memset_and_locality_domain(model_config)
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -333,9 +345,14 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         one E8M0 scale per 32 elements in linear order. ``can_implement``
         already requires ``hidden % 512 == 0``, so the hidden size needs no
         check here.
+
+        Only the Rubin kernel fuses the quantization into its reset launch;
+        the Blackwell op quantizes raw input in a separate launch, so on
+        SM100/SM103 the native quantizer is used directly.
         """
         return (
-            x.dtype in (torch.bfloat16, torch.float16)
+            self._sm_version == 107
+            and x.dtype in (torch.bfloat16, torch.float16)
             and x.dim() == 2
             and x.is_contiguous()
             and x.data_ptr() % 16 == 0
@@ -671,9 +688,14 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             )
 
         fc_alpha, fc1_norm_const = self._fused_fc12_constants(x.device)
+        fused_fc12_op = (
+            torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin
+            if self._sm_version == 107
+            else torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_blackwell
+        )
         # The block scales are stored int32-packed (4 UE8M0 per int32 along
         # K); the kernel reads them as a [E, N, K/32] byte matrix.
-        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+        fused_fc12_op(
             input=x,
             fc1_weight=self.w3_w1_weight,
             input_scale=x_sf,

@@ -48,6 +48,9 @@ class MoEDep(str, Enum):
     #: ``cutlass.tensor_utils`` submodules the Rubin MXFP8 fused FC12 kernel
     #: needs; older Rubin builds miscompile its MXFP8 path.
     CUTEDSL_MXFP8_FUSED_FC12 = "cutedsl_mxfp8_fused_fc12"
+    #: The installed CuTe DSL ships those submodules and the Blackwell helpers
+    #: the SM100/SM103 port of that kernel needs.
+    CUTEDSL_MXFP8_FUSED_FC12_BLACKWELL = "cutedsl_mxfp8_fused_fc12_blackwell"
     #: Locality-domain execution is usable here: SM107, driver support, and
     #: ``DISABLE_LOCALITY_DOMAINS`` unset.
     LOCALITY_DOMAIN = "locality_domain"
@@ -126,6 +129,17 @@ def _probe_cutedsl_mxfp8_fused_fc12() -> Tuple[bool, str]:
     return False, "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils"
 
 
+def _probe_cutedsl_mxfp8_fused_fc12_blackwell() -> Tuple[bool, str]:
+    from ...cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE
+
+    if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE:
+        return True, ""
+    return (
+        False,
+        "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils / Blackwell helpers",
+    )
+
+
 def _probe_locality_domain() -> Tuple[bool, str]:
     from ...locality_domain_utils import is_locality_domain_enabled
 
@@ -151,6 +165,7 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
     MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
     MoEDep.CUTEDSL_MXFP8_FUSED_FC12: _probe_cutedsl_mxfp8_fused_fc12,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12_BLACKWELL: _probe_cutedsl_mxfp8_fused_fc12_blackwell,
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 

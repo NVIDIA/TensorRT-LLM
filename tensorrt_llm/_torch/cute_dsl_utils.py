@@ -52,6 +52,12 @@ IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 # block-scaled path even when the attribute access is shimmed. Treat the
 # presence of both submodules as the capability marker for that kernel.
 IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE = False
+# The SM100/SM103 (data-center Blackwell) port of the MXFP8 fused FC1+FC2 MoE
+# kernel (moe/kernels/blackwell/
+# blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8.py) only needs
+# the public Blackwell helpers plus the same ``cutlass.memory`` /
+# ``cutlass.tensor_utils`` submodules; it does not need ``rubin_helpers``.
+IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE = False
 
 # The MXFP8 fused FC12 workspace reset indexes the output it zeroes and the raw
 # input it quantizes with Int32, so each holds at most this many elements.
@@ -99,6 +105,20 @@ if platform.system() != "Windows":
                     "cutlass dsl build is too old for the Rubin MXFP8 fused "
                     "FC12 MoE kernel (no cutlass.memory / cutlass.tensor_utils); "
                     "MXFP8 CuTe DSL MoE is disabled")
+        try:
+            import cutlass.memory  # noqa
+            import cutlass.tensor_utils  # noqa
+            import cutlass.utils.blackwell_helpers  # noqa
+            import cutlass.utils.blockscaled_layout  # noqa
+            logger.info("cutlass dsl supports the Blackwell (SM100/SM103) "
+                        "MXFP8 fused FC12 MoE kernel")
+            IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE = True
+        except ImportError:
+            logger.info(
+                "cutlass dsl build is too old for the Blackwell MXFP8 fused FC12 MoE "
+                "kernel (needs cutlass.memory / cutlass.tensor_utils / "
+                "cutlass.utils.blackwell_helpers); MXFP8 CuTe DSL MoE on "
+                "SM100/SM103 is disabled")
     except ImportError:
         pass
 
