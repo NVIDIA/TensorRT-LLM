@@ -30,7 +30,7 @@
 
 """GLM-5.2 MTP layers, head, and target-local draft construction."""
 
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 import torch
 from torch import nn
@@ -65,6 +65,7 @@ from tensorrt_llm._torch.utils import (
 )
 
 from ._model import Glm52DecoderLayer
+from .ops.spec.draft_sample_glue import DraftGlueWindow
 
 
 class Glm52MTPHead(nn.Module):
@@ -97,6 +98,7 @@ class Glm52MTPHead(nn.Module):
         lm_head: Linear,
         attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
+        gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if not return_context_logits:
             if attn_metadata is not None:
@@ -115,7 +117,11 @@ class Glm52MTPHead(nn.Module):
             self.mapping_lm_head_tp = create_lm_head_tp_mapping(
                 self.model_config.mapping, hidden_states.shape[0]
             )
-            hidden_states = allgather(hidden_states, self.mapping_lm_head_tp, dim=0)
+            hidden_states = (
+                gather(hidden_states)
+                if gather is not None
+                else allgather(hidden_states, self.mapping_lm_head_tp, dim=0)
+            )
 
         # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
         if not enable_attention_dp or enable_lm_head_tp_in_adp:
@@ -296,6 +302,36 @@ class Glm52MTP(Glm52DecoderLayer):
             enable_pdl=self._draft_glue_pdl,
         )
 
+    def draft_sample_glue_window(
+        self, embed_tokens: Embedding, device: torch.device
+    ) -> DraftGlueWindow | None:
+        """Return the operands the fused ADP step can normalize bit for bit."""
+        if not self._draft_glue_resolved:
+            self._resolve_draft_glue(device)
+        table = embed_tokens.weight
+        if (
+            self._draft_glue_window is None
+            or self.hidden_dim != 6144
+            or is_nvfp4_marlin_enabled()
+            or not isinstance(embed_tokens, Embedding)
+            or (embed_tokens.tp_size != 1 and embed_tokens.tp_mode is not None)
+            or table.dtype != torch.bfloat16
+            or table.dim() != 2
+            or table.shape[1] != self.hidden_dim
+            or not table.is_contiguous()
+            or table.data_ptr() % 16 != 0
+        ):
+            return None
+        col_lo, col_hi = self._draft_glue_window
+        return DraftGlueWindow(
+            table.detach(),
+            self.enorm.weight.detach(),
+            self.hnorm.weight.detach(),
+            self.enorm.variance_epsilon,
+            col_lo,
+            col_hi,
+        )
+
     def forward(
         self,
         input_ids: torch.IntTensor,
@@ -307,10 +343,11 @@ class Glm52MTP(Glm52DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         tail_row_ids: torch.Tensor | None = None,
         tail_all_rank_num_tokens: list[int] | None = None,
+        eh_proj_input: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        glue = None
-        if attn_metadata.num_contexts == 0 and not torch.compiler.is_compiling():
+        glue = eh_proj_input
+        if glue is None and attn_metadata.num_contexts == 0 and not torch.compiler.is_compiling():
             glue = self._fused_draft_glue(input_ids, hidden_states, embed_tokens)
         if glue is not None:
             hidden_states = glue

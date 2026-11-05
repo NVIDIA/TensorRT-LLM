@@ -53,6 +53,7 @@ class RubinTopK(TopK):
             and self.gvr_sorting is None
             and self.top_k == 2048
             and self.compress_ratio == 1
+            and gvr_row_order is None
             and gvr_topk.supports(scores, sequence_lengths, output_indices, next_n, max_seq_len)
         ):
             gvr_topk_decode(

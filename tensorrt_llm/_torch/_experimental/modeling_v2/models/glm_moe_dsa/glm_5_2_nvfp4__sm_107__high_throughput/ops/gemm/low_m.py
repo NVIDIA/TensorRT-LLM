@@ -7,6 +7,7 @@ from functools import lru_cache
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 
 
@@ -20,10 +21,16 @@ def _device_limits(device: torch.device) -> tuple[int, int]:
     "trtllm::glm_rubin_high_throughput_low_m", mutates_args=(), device_types="cuda"
 )
 def low_m_gemm(
-    inputs: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, narrow: bool = False
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    narrow: bool = False,
+    one_wave: bool = False,
+    release_early: bool = False,
 ) -> torch.Tensor:
     from ...kernels.gemm.splitk import (
         narrow_tactic,
+        one_wave_tactic,
         run_splitk_dense,
         splitk_default_tactic,
         wide_tuned_launch,
@@ -36,6 +43,8 @@ def low_m_gemm(
     options = {}
     if m <= 32:
         tactic = splitk_default_tactic(m, n, k, sm_count=sm_count, smem_capacity=smem_capacity)
+        if one_wave:
+            tactic = one_wave_tactic(tactic, m, n, k, sm_count=sm_count)
     elif narrow:
         tactic = narrow_tactic(m, n, k, smem_capacity=smem_capacity)
         options["reserve_full_smem"] = False
@@ -43,6 +52,8 @@ def low_m_gemm(
         launch = wide_tuned_launch(m, n, k, sm_count=sm_count, smem_capacity=smem_capacity)
         tactic = launch.tactic
         options = launch.run_kwargs()
+        if release_early:
+            options["launch_dependents_early"] = True
     output = torch.empty((m, n), dtype=inputs.dtype, device=inputs.device)
     run_splitk_dense(matrix, weight.t(), bias, output, get_env_enable_pdl(), tactic, **options)
     return output.view(*inputs.shape[:-1], n)
@@ -50,15 +61,21 @@ def low_m_gemm(
 
 @low_m_gemm.register_fake
 def _fake_low_m_gemm(
-    inputs: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, narrow: bool = False
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    narrow: bool = False,
+    one_wave: bool = False,
+    release_early: bool = False,
 ) -> torch.Tensor:
     return inputs.new_empty((*inputs.shape[:-1], weight.shape[0]))
 
 
 class RubinUnquantizedLinearMethod(UnquantizedLinearMethod):
-    def __init__(self, max_rows: int = 32, narrow: bool = False) -> None:
+    def __init__(self, max_rows: int = 32, narrow: bool = False, one_wave: bool = False) -> None:
         self.max_rows = max_rows
         self.narrow = narrow
+        self.one_wave = one_wave
 
     def apply(
         self,
@@ -85,7 +102,7 @@ class RubinUnquantizedLinearMethod(UnquantizedLinearMethod):
                 or not module.all_reduce.uses_nccl_symmetric_memory_window()
             )
         ):
-            return low_m_gemm(input, weight, bias, self.narrow)
+            return low_m_gemm(input, weight, bias, self.narrow, self.one_wave)
         return super().apply(module, input, bias, weight)
 
 
@@ -100,4 +117,6 @@ def install_low_m_methods(model: torch.nn.Module) -> None:
             ".mlp." in name and ".experts." not in name and ".shared_experts." not in name
         )
         narrow = name.endswith("shared_experts.down_proj")
-        module.quant_method = RubinUnquantizedLinearMethod(64 if wide or narrow else 32, narrow)
+        module.quant_method = RubinUnquantizedLinearMethod(
+            64 if wide or narrow else 32, narrow, isinstance(module, LMHead)
+        )

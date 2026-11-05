@@ -907,7 +907,7 @@ def _assert_high_throughput_paths(llm: LLM, batch_size: int, trace_dir: Path) ->
         for kernel in (
             "publishOwnerMembersKernel",
             "glmRubinNoAuxTcFp4QuantKernel",
-            "_glm_rubin_mtp_tail_scatter_kernel",
+            "draftSampleGlueAdpKernel",
         ):
             assert any(kernel in name for name in names), f"Rank {rank} did not execute {kernel}"
     return outputs

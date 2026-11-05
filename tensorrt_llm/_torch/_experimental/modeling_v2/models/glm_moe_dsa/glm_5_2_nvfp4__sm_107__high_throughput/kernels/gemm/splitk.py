@@ -633,6 +633,34 @@ def row_rms_launch(
     return WideLaunch(tuned, b_stages=b_stages, launch_dependents_early=launch_dependents_early)
 
 
+def one_wave_tactic(tactic: SplitKTactic, m: int, n: int, k: int, *, sm_count: int) -> SplitKTactic:
+    """``tactic`` with 128-row instead of 64-row tiles when its CTAs (one per SM) need more than one wave and the
+    128-row tiles fit in one, else ``tactic`` unchanged.
+
+    Each output keeps its split-K slice and its K order, so the results are the same; the grid is half as large and
+    has no partial second wave (the c1 LM head: 152 instead of 303 CTAs). Only long-K tactics (more than four K
+    tiles, the full-depth pipelines) are refined.
+    """
+
+    def cta_count(t: SplitKTactic) -> int:
+        return ((n + t.mma_m - 1) // t.mma_m) * ((m + t.mma_n - 1) // t.mma_n) * t.split_k
+
+    if tactic.mma_m != 64 or k <= 4 * _CTA_K or cta_count(tactic) <= sm_count:
+        return tactic
+    candidate = dataclasses.replace(tactic, mma_m=128)
+    if cta_count(candidate) > sm_count:
+        return tactic
+    stages = min(tactic.ab_stages, _max_ab_stages_for(candidate, _SMEM_CAPACITY_BYTES))
+    if stages < _DEFAULT_MIN_AB_STAGES:
+        return tactic
+    candidate = dataclasses.replace(candidate, ab_stages=stages)
+    try:
+        validate_tactic(candidate, m, n, k)
+    except ValueError:
+        return tactic
+    return candidate
+
+
 @dsl_user_op
 def _map_shared_rank(
     smem_ptr: "cute.Pointer",

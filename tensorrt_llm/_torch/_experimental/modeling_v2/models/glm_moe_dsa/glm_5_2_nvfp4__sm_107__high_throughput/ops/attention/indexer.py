@@ -25,9 +25,12 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.modules.top_k import TopKImplementation
+from tensorrt_llm._torch.utils import is_piecewise_running
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...kernels.attention import indexer_prologue
 from .full_query_policy import fp8_full_query_weight_cache_limit
 from .topk import RubinTopK
 
@@ -69,6 +72,11 @@ class RubinIndexer(Indexer):
             aux_stream,
             projection_free=projection_free,
         )
+        self._k_cache_prewritten_for: (
+            tuple[torch.Tensor, torch.Tensor, DSAtrtllmAttentionMetadata, int] | None
+        ) = None
+        self._projection_outputs: tuple[torch.Tensor, ...] | None = None
+        self._projection_metadata: DSAtrtllmAttentionMetadata | None = None
         if use_rubin_gvr:
             self._enable_heuristic_topk = True
             self._use_self_sampling_topk = True
@@ -82,6 +90,68 @@ class RubinIndexer(Indexer):
                 gvr_self_sampling=True,
                 gvr_deterministic=sparse_params.gvr_deterministic_topk,
             )
+
+    def can_skip_projection(
+        self, metadata: DSAtrtllmAttentionMetadata, rows: int | None = None
+    ) -> bool:
+        """Reuse draft-step-zero intermediates only while its TopK rows remain live."""
+        if rows is None:
+            rows = metadata.num_tokens
+        return (
+            self.mtp_index_share
+            and metadata.in_mtp_draft_loop
+            and metadata.indexer_skip_topk
+            and metadata.shared_topk_indices is not None
+            and metadata.num_contexts == 0
+            and self._projection_metadata is metadata
+            and self._projection_outputs is not None
+            and all(output.shape[0] >= rows for output in self._projection_outputs)
+        )
+
+    def reused_projection_outputs(
+        self, metadata: DSAtrtllmAttentionMetadata, rows: int
+    ) -> list[torch.Tensor]:
+        """Keep the five-tensor projection interface for a TopK-only draft step."""
+        if not self.can_skip_projection(metadata, rows):
+            raise RuntimeError("Indexer projection reuse requires initialized draft TopK")
+        return [output[:rows] for output in self._projection_outputs]
+
+    @staticmethod
+    def _is_prefix_view(full: torch.Tensor, view: torch.Tensor, rows: int) -> bool:
+        return (
+            view.device == full.device
+            and view.dtype == full.dtype
+            and view.shape == (rows, *full.shape[1:])
+            and view.stride() == full.stride()
+            and view.data_ptr() == full.data_ptr()
+        )
+
+    def _update_k_cache(
+        self, k_fp8: torch.Tensor, k_scale: torch.Tensor, metadata: DSAtrtllmAttentionMetadata
+    ) -> None:
+        prewritten = self._k_cache_prewritten_for
+        self._k_cache_prewritten_for = None
+        outputs = self._projection_outputs
+        if (
+            self.can_skip_projection(metadata)
+            and self._is_prefix_view(outputs[1], k_fp8, metadata.num_tokens)
+            and self._is_prefix_view(outputs[2], k_scale, metadata.num_tokens)
+        ):
+            return
+        # The outputs stay alive until consumed, so an allocator cannot recycle
+        # their addresses into an unrelated cache update.
+        if outputs is not None and self._is_prefix_view(outputs[1], k_fp8, metadata.num_tokens):
+            self._projection_metadata = metadata
+        if prewritten is not None:
+            full_k, full_scale, written_metadata, rows = prewritten
+            if (
+                written_metadata is metadata
+                and rows == metadata.num_tokens
+                and self._is_prefix_view(full_k, k_fp8, rows)
+                and self._is_prefix_view(full_scale, k_scale, rows)
+            ):
+                return
+        super()._update_k_cache(k_fp8, k_scale, metadata)
 
     def sparse_attn_indexer(
         self,
@@ -628,18 +698,22 @@ class RubinIndexer(Indexer):
         position_ids: torch.Tensor,
         q_in: torch.Tensor | None = None,
         wk_wp_out: torch.Tensor | None = None,
+        k_cache_metadata: DSAtrtllmAttentionMetadata | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pure token-wise projections (CUDA-graph-capturable).
+        """Token-wise projections with an optional eager/whole-graph cache write.
 
         Runs cublas_mm, qk_projection_and_rope, FP8/FP4 quantize, and weight
-        scaling.  Does NOT touch the k cache or any batch-specific metadata,
-        so this can safely run inside a captured CUDA graph partition.
+        scaling. Piecewise callers leave ``k_cache_metadata`` unset, keeping
+        the projection partition free of cache mutations and batch metadata.
 
         Returns (q_fp_bytes, k_fp_bytes, k_scale, weights, q_scale). The last
         tensor is only consumed by the FP4 kernel dispatch; the FP8 path
         ignores it. It is returned unconditionally so the two-op CUDA graph
         split in dsa.module.forward_dsa_proj sees a stable signature.
         """
+        self._k_cache_prewritten_for = None
+        self._projection_outputs = None
+        self._projection_metadata = None
         if self.projection_free:
             raise RuntimeError("Projection-free Indexer requires forward_prepared()")
         assert self._fused_wk_wp_weight is not None, (
@@ -672,6 +746,12 @@ class RubinIndexer(Indexer):
                 # which uses its own handle and always falls back to CUDA-core SGEMM.
                 fused_out = F.linear(_to_float(hidden_states_bf), self._fused_wk_wp_weight)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads], dim=-1)
+        if q_in is None and type(self)._qk_projection_and_rope is Indexer._qk_projection_and_rope:
+            q_in = self.wq_b(qr)
+        if self._fused_prologue_eligible(q_in, indexer_k, weights, hidden_states_bf.dtype):
+            outputs = self._prologue_fused(indexer_k, weights, q_in, position_ids, k_cache_metadata)
+            self._projection_outputs = outputs
+            return outputs
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE,
         # FP8 quantize); a no-op when the projection already ran in the model dtype.
         indexer_k = indexer_k.to(hidden_states_bf.dtype)
@@ -716,4 +796,88 @@ class RubinIndexer(Indexer):
             q_scale = q_scale.view(-1, self.n_heads, 1)
             weights = self._weight_scale(weights, q_scale)
 
-        return q_fp8, k_fp8, k_scale, weights, q_scale
+        outputs = (q_fp8, k_fp8, k_scale, weights, q_scale)
+        self._projection_outputs = outputs
+        return outputs
+
+    def _fused_prologue_eligible(
+        self,
+        q_in: torch.Tensor | None,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+        model_dtype: torch.dtype,
+    ) -> bool:
+        if (
+            not indexer_prologue.FUSED_PROLOGUE_ENABLED
+            or self.use_fp4
+            or self.head_dim != 128
+            or q_in is None
+            or type(self)._qk_projection_and_rope is not Indexer._qk_projection_and_rope
+            or type(self)._prep_q_or_k is not Indexer._prep_q_or_k
+        ):
+            return False
+        cos_sin = getattr(self.rotary_emb, "rotary_cos_sin", None)
+        return (
+            IS_FLASHINFER_AVAILABLE
+            and not getattr(self.rotary_emb, "inverse", False)
+            and isinstance(cos_sin, torch.Tensor)
+            and cos_sin.is_cuda
+            and cos_sin.dtype == torch.float32
+            and 0 < self.rope_dim <= self.head_dim
+            and self.rope_dim % 2 == 0
+            and model_dtype == torch.bfloat16
+            and q_in.dtype == torch.bfloat16
+            and q_in.ndim == 2
+            and q_in.shape == (indexer_k.shape[0], self.n_heads * self.head_dim)
+            and q_in.stride(-1) == 1
+            and indexer_k.dtype in (torch.bfloat16, torch.float32)
+            and indexer_k.stride(-1) == 1
+            and weights.stride(-1) == 1
+        )
+
+    def _prologue_fused(
+        self,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+        q_in: torch.Tensor,
+        position_ids: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        n_rows = indexer_k.shape[0]
+        k_cache = slot_fp8 = slot_scale = None
+        n_write = 0
+        if (
+            metadata is not None
+            and not is_piecewise_running()
+            and not torch.compiler.is_compiling()
+            and metadata.kv_cache_manager is not None
+            and metadata.slot_mapping_fp8 is not None
+            and metadata.slot_mapping_scale is not None
+            and 0 < metadata.num_tokens <= n_rows
+        ):
+            k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
+            slot_fp8 = metadata.slot_mapping_fp8
+            slot_scale = metadata.slot_mapping_scale
+            n_write = metadata.num_tokens
+        cos_sin = self.rotary_emb.rotary_cos_sin
+        outputs = indexer_prologue.dsa_indexer_prologue_fused(
+            indexer_k,
+            weights,
+            q_in.view(n_rows, self.n_heads, self.head_dim),
+            position_ids.view(-1),
+            cos_sin.view(cos_sin.shape[0], -1),
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+            self.weight_scale_factor,
+            self.rope_dim,
+            interleave=not self.rotary_emb.is_neox,
+            use_ue8m0=self.scale_fmt == "ue8m0",
+            k_cache=k_cache,
+            slot_mapping_fp8=slot_fp8,
+            slot_mapping_scale=slot_scale,
+            num_cache_tokens=n_write,
+        )
+        if n_write:
+            self._k_cache_prewritten_for = (outputs[1], outputs[2], metadata, n_write)
+        return outputs
