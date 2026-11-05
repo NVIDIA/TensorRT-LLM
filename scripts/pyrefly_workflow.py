@@ -226,6 +226,7 @@ def annotate_rebased_report(
     report_path: Path,
     source_branch: str,
     upstream_source: str,
+    target_ref: str,
     base: str,
     head: str,
     worktree: str,
@@ -242,7 +243,8 @@ def annotate_rebased_report(
     report.update(
         source_branch=source_branch,
         upstream_source=upstream_source,
-        upstream_main_sha=base,
+        rebase_target=target_ref,
+        rebase_target_sha=base,
         rebased_head=head,
         worktree=worktree,
         diff_report=diff_report,
@@ -250,6 +252,8 @@ def annotate_rebased_report(
         path_module_filter=path_module_filter,
         checked_files=checked_files,
     )
+    if target_ref == "main":
+        report["upstream_main_sha"] = base
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
 
@@ -301,6 +305,7 @@ def main() -> int:
     annotate_parser.add_argument("report", type=Path)
     annotate_parser.add_argument("source_branch")
     annotate_parser.add_argument("upstream_source")
+    annotate_parser.add_argument("target_ref")
     annotate_parser.add_argument("base")
     annotate_parser.add_argument("head")
     annotate_parser.add_argument("worktree")
@@ -334,6 +339,7 @@ def main() -> int:
             args.report,
             args.source_branch,
             args.upstream_source,
+            args.target_ref,
             args.base,
             args.head,
             args.worktree,

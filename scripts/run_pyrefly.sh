@@ -5,6 +5,7 @@
 # Run Pyrefly on changed product Python files, or the whole project with
 # --full-project. Add --rebase-upstream to check the current branch (or HEAD
 # when detached) in a new worktree rebased on upstream main and emit its diff.
+# Pass --rebase-target REF to choose another branch or local Git ref.
 # Rebased checks include non-ignored untracked product Python files.
 # Paths from tool.pyrefly.project-excludes and symbols from
 # tool.pyrefly-exclusions in pyproject.toml are removed from the JSON report by
@@ -13,7 +14,7 @@
 # up to eight diagnostics are printed to stdout when the check finishes.
 # Changed-file checks default to HEAD. Pass --full-project to scan all product
 # Python files. Diagnostics are filtered to added lines against HEAD by default;
-# --rebase-upstream uses its fetched main commit. Pass --no-diff-filter for
+# --rebase-upstream uses its rebase target commit. Pass --no-diff-filter for
 # file-level output.
 # Path and symbol exclusions are enabled by default; use --no-path-module-filter
 # to also disable Pyrefly's configured project and import exclusions.
@@ -22,6 +23,7 @@ set -euo pipefail
 
 FULL_PROJECT=0
 REBASE_UPSTREAM=0
+REBASE_TARGET="main"
 DIFF_BASE="${PYREFLY_INTERNAL_DIFF_BASE:-}"
 DIFF_FILTER=1
 PATH_MODULE_FILTER=1
@@ -40,6 +42,15 @@ while (( $# > 0 )); do
             REBASE_UPSTREAM=1
             shift
             ;;
+        --rebase-target)
+            if (( $# < 2 )) || [[ -z "$2" || "$2" == -* ]]; then
+                echo "ERROR: --rebase-target requires a branch or Git ref" >&2
+                exit 2
+            fi
+            REBASE_TARGET="$2"
+            REBASE_UPSTREAM=1
+            shift 2
+            ;;
         --help|-h)
             cat <<'EOF'
 Run Pyrefly on changed product Python files, or the whole project.
@@ -49,13 +60,17 @@ Options:
   --strict                 Fail on remaining diagnostics or check failures.
   --rebase-upstream        Rebase a new worktree from the current branch or HEAD
                            on upstream main, report its diff, and check changed files.
+  --rebase-target REF      Rebase onto REF instead of main. Local Git refs are
+                           used directly; other branch names are fetched from
+                           NVIDIA upstream. Also enables --rebase-upstream.
   --no-diff-filter         Keep diagnostics from all lines in changed files.
   --no-path-module-filter  Include diagnostics from excluded paths and modules.
 
 Path and module exclusions and diff-line filtering are enabled by default.
 
 Rebase workflow environment:
-  Fetches main from git@github.com:NVIDIA/TensorRT-LLM.git, falling back to
+  Fetches main (or another named branch) from
+  git@github.com:NVIDIA/TensorRT-LLM.git, falling back to
   https://github.com/NVIDIA/TensorRT-LLM.git if SSH fetch fails.
   PYREFLY_DIFF_REPORT_PATH      Git diff report directory (default: /tmp)
   PYREFLY_REPORT_PATH           Pyrefly report path (default: project root)
@@ -154,7 +169,8 @@ run_rebased_check() {
     fi
     local upstream_url fallback_url timestamp source_branch worktree_path temp_branch
     local worktree_parent random_suffix requested_path
-    local diff_report_dir diff_report check_report upstream_source main_ref main_sha rebased_head
+    local diff_report_dir diff_report check_report upstream_source target_sha rebased_head
+    local committer_name committer_email
     local requested_paths=("$@")
     upstream_url="git@github.com:NVIDIA/TensorRT-LLM.git"
     fallback_url="https://github.com/NVIDIA/TensorRT-LLM.git"
@@ -188,18 +204,30 @@ run_rebased_check() {
     export GIT_LFS_SKIP_SMUDGE="${GIT_LFS_SKIP_SMUDGE:-1}"
     PATCH_FILE="$(mktemp)"
     git -C "$PROJECT_DIR" diff --binary HEAD > "$PATCH_FILE"
-    if git -C "$PROJECT_DIR" fetch "$upstream_url" main; then
-        upstream_source="$upstream_url"
+    if [[ "$REBASE_TARGET" != "main" ]] &&
+        target_sha="$(git -C "$PROJECT_DIR" rev-parse --verify \
+            "$REBASE_TARGET^{commit}" 2>/dev/null)"; then
+        upstream_source="$REBASE_TARGET"
     else
-        echo "Could not fetch through SSH; falling back to $fallback_url." >&2
-        git -C "$PROJECT_DIR" fetch "$fallback_url" main
-        upstream_source="$fallback_url"
+        if ! git check-ref-format --branch "$REBASE_TARGET" >/dev/null 2>&1; then
+            echo "ERROR: invalid rebase target branch: $REBASE_TARGET" >&2
+            return 2
+        fi
+        if git -C "$PROJECT_DIR" fetch "$upstream_url" "refs/heads/$REBASE_TARGET"; then
+            upstream_source="$upstream_url"
+        else
+            echo "Could not fetch through SSH; falling back to $fallback_url." >&2
+            git -C "$PROJECT_DIR" fetch "$fallback_url" "refs/heads/$REBASE_TARGET"
+            upstream_source="$fallback_url"
+        fi
+        target_sha="$(git -C "$PROJECT_DIR" rev-parse "FETCH_HEAD^{commit}")"
     fi
-    main_ref="FETCH_HEAD"
-    main_sha="$(git -C "$PROJECT_DIR" rev-parse "$main_ref^{commit}")"
 
     git -C "$PROJECT_DIR" worktree add --quiet -b "$temp_branch" "$worktree_path" "$source_branch"
-    if ! git -C "$worktree_path" rebase "$main_sha"; then
+    committer_name="$(git -C "$PROJECT_DIR" log -1 --format=%cn HEAD)"
+    committer_email="$(git -C "$PROJECT_DIR" log -1 --format=%ce HEAD)"
+    if ! GIT_COMMITTER_NAME="$committer_name" GIT_COMMITTER_EMAIL="$committer_email" \
+        git -C "$worktree_path" rebase "$target_sha"; then
         echo "Rebase failed; the temporary worktree and branch will be cleaned up." >&2
         return 1
     fi
@@ -230,7 +258,7 @@ run_rebased_check() {
     local changed_files=() check_files=() path
     while IFS= read -r -d '' path; do
         changed_files+=("$path")
-    done < <(git -C "$worktree_path" diff --name-only -z "$main_sha" --)
+    done < <(git -C "$worktree_path" diff --name-only -z "$target_sha" --)
     for path in "${changed_files[@]}"; do
         if [[ "$path" == tensorrt_llm/* && ( "$path" == *.py || "$path" == *.pyi ) ]]; then
             if (( ${#requested_paths[@]} == 0 )); then
@@ -248,7 +276,8 @@ run_rebased_check() {
 
     {
         printf '# Source branch: %s\n' "$source_branch"
-        printf '# Upstream base: %s (%s)\n' "$upstream_source" "$main_sha"
+        printf '# Rebase target: %s from %s (%s)\n' \
+            "$REBASE_TARGET" "$upstream_source" "$target_sha"
         printf '# Rebased HEAD: %s\n\n' "$rebased_head"
         printf 'Changed files (%s):\n' "${#changed_files[@]}"
         if (( ${#changed_files[@]} == 0 )); then
@@ -257,10 +286,11 @@ run_rebased_check() {
             printf '  %s\n' "${changed_files[@]}"
         fi
         printf '\nZero-context code diff (hunks include changed line numbers):\n'
-        git -C "$worktree_path" diff --no-ext-diff --no-renames --unified=0 "$main_sha" --
+        git -C "$worktree_path" diff --no-ext-diff --no-renames --unified=0 "$target_sha" --
     } > "$diff_report"
 
-    printf 'Rebased %s onto %s at %s\n' "$source_branch" "$upstream_source" "$main_sha"
+    printf 'Rebased %s onto %s from %s at %s\n' \
+        "$source_branch" "$REBASE_TARGET" "$upstream_source" "$target_sha"
     printf 'Worktree: %s (branch %s)\n' "$worktree_path" "$temp_branch"
     printf 'Changed files (%s):\n' "${#changed_files[@]}"
     if (( ${#changed_files[@]} == 0 )); then
@@ -276,7 +306,7 @@ run_rebased_check() {
         if (( ! DIFF_FILTER )); then
             runner_args+=(--no-diff-filter)
         else
-            internal_diff_base="$main_sha"
+            internal_diff_base="$target_sha"
         fi
         if (( ! PATH_MODULE_FILTER )); then
             runner_args+=(--no-path-module-filter)
@@ -284,7 +314,8 @@ run_rebased_check() {
         (
             cd "$worktree_path"
             PYREFLY_INTERNAL_DIFF_BASE="$internal_diff_base" PYREFLY_REPORT_PATH="$check_report" \
-                bash scripts/run_pyrefly.sh "${runner_args[@]}" "${check_files[@]}"
+                bash scripts/run_pyrefly.sh "${runner_args[@]+"${runner_args[@]}"}" \
+                    "${check_files[@]}"
         )
     else
         printf '%s\n' \
@@ -292,7 +323,7 @@ run_rebased_check() {
             > "$check_report"
     fi
     python3 "$WORKFLOW_SCRIPT" annotate-rebased-report \
-        "$check_report" "$source_branch" "$upstream_source" "$main_sha" \
+        "$check_report" "$source_branch" "$upstream_source" "$REBASE_TARGET" "$target_sha" \
         "$rebased_head" "$worktree_path" "$diff_report" "$DIFF_FILTER" \
         "$PATH_MODULE_FILTER" "${check_files[@]+"${check_files[@]}"}"
     local check_status=0
