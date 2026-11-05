@@ -61,7 +61,7 @@ endif()
 
 target_compile_definitions(
   ${TRTLLM_NB_MODULE}
-  PRIVATE ENABLE_NANOBIND_PROFILING=$<BOOL:${ENABLE_NANOBIND_PROFILING}>)
+  PRIVATE TRTLLM_ENABLE_NANOBIND_PROFILING=$<BOOL:${ENABLE_NANOBIND_PROFILING}>)
 if(ENABLE_NANOBIND_PROFILING)
   if(NOT EXISTS "${nanobind_SOURCE_DIR}/src/trtllm_pytorch_tensor_adapter.h")
     message(
@@ -75,15 +75,21 @@ if(ENABLE_NANOBIND_PROFILING)
   # transfer agent.
   get_target_property(TRTLLM_NB_LINK_LIBRARIES ${TRTLLM_NB_MODULE}
                       LINK_LIBRARIES)
+  list(FIND TRTLLM_NB_LINK_LIBRARIES "nanobind-static"
+       TRTLLM_NB_DEFAULT_RUNTIME_INDEX)
+  if(TRTLLM_NB_DEFAULT_RUNTIME_INDEX EQUAL -1)
+    message(
+      FATAL_ERROR
+        "ENABLE_NANOBIND_PROFILING requires the bindings module to link nanobind-static; unsupported nanobind runtime"
+    )
+  endif()
   list(TRANSFORM TRTLLM_NB_LINK_LIBRARIES
        REPLACE "^nanobind-static$" "${TRTLLM_NB_PROFILING_RUNTIME}")
   set_property(TARGET ${TRTLLM_NB_MODULE}
                PROPERTY LINK_LIBRARIES "${TRTLLM_NB_LINK_LIBRARIES}")
   target_compile_features(${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE cxx_std_20)
   target_compile_definitions(${TRTLLM_NB_PROFILING_RUNTIME}
-                             PRIVATE TLLM_NANOBIND_PROFILING)
-  target_compile_definitions(${TRTLLM_NB_MODULE}
-                             PRIVATE TLLM_NANOBIND_PROFILING)
+                             PRIVATE TRTLLM_ENABLE_NANOBIND_PROFILING=1)
   target_include_directories(
     ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${PROJECT_SOURCE_DIR}/include
                                            ${TORCH_INCLUDE_DIRS})
