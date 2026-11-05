@@ -58,8 +58,13 @@ The configurable bucket fields are `e2e_request_latency_buckets`,
 
 ```yaml
 prometheus_metrics_config:
-  time_to_first_token_buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+  time_to_first_token_buckets: [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0]
 ```
+
+This example covers TTFT from 0.5 seconds through 20 seconds. Choose finite
+buckets that cover your latency objectives and workload tail. Prometheus appends a `+Inf` bucket, but samples
+above the largest finite boundary cannot be resolved into useful tail
+percentiles; the boundary is not a request timeout.
 
 `print_iter_log` is independent of Prometheus collection and need not be
 enabled. The HTTP `/metrics` endpoint returns structured iteration statistics;
