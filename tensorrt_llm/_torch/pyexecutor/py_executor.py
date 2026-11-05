@@ -1229,6 +1229,9 @@ class PyExecutor:
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
         self.pp_multi_stream_sample = get_env_flag(
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", True)
+        # Gather every attention-DP rank's iteration stats; see
+        # _flush_iter_stats_synced.
+        self._metrics_all_ranks = get_env_flag("TLLM_METRICS_ALL_RANKS", False)
         # Debug: compare each aggregated helix CP rank's schedule every
         # iteration; see _check_helix_schedule_consistency.
         check_requested = get_env_flag("TLLM_HELIX_AGG_CHECK_SCHEDULE", False)
@@ -1863,9 +1866,8 @@ class PyExecutor:
         buffer.
         """
         tp_size = self.dist.tp_size
-        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
-        if not (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
-                and self.enable_attention_dp):
+        if not (self._metrics_all_ranks and self.enable_iter_perf_stats
+                and tp_size > 1 and self.enable_attention_dp):
             return
         local_dict = self._pending_iter_stats_dict
         self._pending_iter_stats_dict = None
@@ -3501,9 +3503,9 @@ class PyExecutor:
         scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
 
         tp_size = getattr(self.dist, "tp_size", 1)
-        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
-        if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
-                and self.enable_attention_dp and attention_dp_rank is None):
+        if (self._metrics_all_ranks and self.enable_iter_perf_stats
+                and tp_size > 1 and self.enable_attention_dp
+                and attention_dp_rank is None):
             import json as _json
             local_dict = _json.loads(stats.to_json_str())
             if req_stats:

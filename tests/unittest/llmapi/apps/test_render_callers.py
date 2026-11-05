@@ -22,6 +22,7 @@ from unittest import mock
 
 import pytest
 
+from tensorrt_llm.serve.extensions import kimi_k3
 from tensorrt_llm.serve.render import RenderResources, render_chat
 from tensorrt_llm.serve.router_utils import KV_CACHE_HASH_ALGO_DEFAULT
 
@@ -357,7 +358,7 @@ class TestRouterWriteBack:
     ) -> None:
         # kimi_k3 refuses out-of-policy sampling parameters. The router has to leave that to
         # the worker (which answers the request) rather than fail it itself.
-        monkeypatch.setenv("TRTLLM_KIMI_PARAM_POLICY", "1")
+        monkeypatch.setattr(kimi_k3, "_KIMI_PARAM_POLICY_ENABLED", True)
         k3 = make_tokenizer(name=KIMI_K3)
         built = _Router.build(k3, ["server1"])
         try:
