@@ -10,6 +10,8 @@ import torch
 from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkDraftModel, dspark_propose
 from tensorrt_llm._torch.models.modeling_speculative import DSparkConfidenceHead, build_markov_head
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("physical_k", range(1, 9))
 @pytest.mark.parametrize(

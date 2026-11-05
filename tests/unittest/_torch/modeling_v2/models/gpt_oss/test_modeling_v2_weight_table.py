@@ -29,10 +29,14 @@ import torch
 
 __extra_import_path__ = ["../../.."]  # noqa: F841 -- repo's file-scoped import hook
 
+import pytest
+
 from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
     weights as W,
 )
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
 
 # gpt-oss-120b's own numbers, so the comparison is against the shapes this
 # target actually ships rather than a toy configuration.

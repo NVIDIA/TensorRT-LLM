@@ -33,6 +33,8 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformTransferScope,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Model(nn.Module):
     pass

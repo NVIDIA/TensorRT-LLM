@@ -18,6 +18,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce 
 )
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
+pytestmark = pytest.mark.cpu_only
+
 # (hidden, world): the two default targets at their MNNVL sizes.
 _SHAPES = [(2880, 8), (2880, 16), (7168, 8), (7168, 16)]
 

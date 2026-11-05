@@ -37,6 +37,8 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     precompute_dspark_freqs_cis,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 # The captured-context attention primitives were folded into
 # modeling_dspark; keep the historical alias so monkeypatch targets
 # below read unchanged.

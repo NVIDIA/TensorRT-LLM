@@ -40,6 +40,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _composite_config():
     """Minimal shape of the released K3 VL checkpoint config."""
