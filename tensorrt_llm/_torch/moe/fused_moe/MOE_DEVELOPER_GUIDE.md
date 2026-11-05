@@ -547,11 +547,14 @@ finalize (scatter-add) into one persistent kernel, driven through
 
 - Activations: e4m3 `[tokens, hidden]` plus **linear** UE8M0 scales
   `[tokens, hidden/32]` (`mxfp8_quantize(..., swizzled=False)`); the gather
-  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`. Without
-  communication, raw BF16/FP16 inputs up to 16M elements are passed through
-  unquantized and quantized inside the op's workspace-reset launch
+  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`. When
+  `quantize_input` is called with `post_quant_comm=False` (no communication,
+  or after a pre-quant dispatch), raw BF16/FP16 inputs up to
+  `FUSED_INPUT_QUANT_MAX_ELEMENTS` are passed through unquantized and
+  quantized inside the op's workspace-reset launch
   (`fused_fc12_mxfp8_workspace.py` / `mxfp8_input_quant.py`, bit-compatible
-  with `mxfp8_quantize`), saving the separate quantize launch.
+  with `mxfp8_quantize` for finite inputs), saving the separate quantize
+  launch.
 - Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
   swizzled layout produced by `block_scale_interleave` (int32-packed storage,
   viewed as bytes). FC1 weight and scales are gate/up interleaved at
@@ -577,9 +580,10 @@ finalize (scatter-add) into one persistent kernel, driven through
   (`stream_weights`); `fc2_stream_weights` sets the FC2 loads alone and the
   tactic space ties it to `stream_weights`. Shorter tactics from older
   caches normalize.
-  The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile, anchored to
-  the module's saturation token count so decode buckets are always profiled,
-  and the comb checker pins the inner `mma_tiler_m` to it.
+  The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile with its
+  power-of-two buckets anchored to `moe_tune_max_num_tokens` (so a small
+  warmup still profiles the larger buckets, up to that cap), and the comb
+  checker pins the inner `mma_tiler_m` to it.
 - **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
   than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
   `IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE` (true when `cutlass.memory` and

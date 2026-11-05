@@ -16,9 +16,8 @@
 
 The fused FC12 kernel gates FC2 A-loads on per-M-tile readiness flags and
 draws work IDs from two L2-atomic counters. All of them must be zero on
-entry. Zeroing them with three ``torch.zeros`` calls costs three allocations
-and three fill launches per forward; this kernel clears the cached buffers
-with a single launch on the GEMM stream.
+entry. The op allocates them per call, uninitialized, and this kernel clears
+them with a single launch on the GEMM stream.
 
 Optional PDL (``use_pdl``) lets this launch overlap the tail of the preceding
 kernel and lets the following fused GEMM's prologue overlap this kernel. The
@@ -52,6 +51,12 @@ try:
 except ImportError:
     from cuda import cuda
 
+#: Values each lane quantizes; four lanes share one MXFP8 scale group.
+_QUANT_VALUES_PER_LANE = 8
+#: Threads per block when the launch also quantizes input, and when it only resets.
+_QUANT_BLOCK_THREADS = 128
+_RESET_BLOCK_THREADS = 256
+
 
 @dsl_user_op
 def _store_zero_128(ptr: cute.Pointer, *, loc=None, ip=None) -> None:
@@ -78,10 +83,9 @@ def _reset_fc12_sync_workspace_kernel(
     input_raw: Optional[cute.Tensor],
     input_quant: Optional[cute.Tensor],
     input_scale: Optional[cute.Tensor],
-    values_per_lane: cutlass.Constexpr,
     block_threads: cutlass.Constexpr,
-    skip_idle_warps: cutlass.Constexpr,
-):
+) -> None:
+    values_per_lane = _QUANT_VALUES_PER_LANE
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     idx = bidx * block_threads + tidx
@@ -93,24 +97,20 @@ def _reset_fc12_sync_workspace_kernel(
         # must finish before this invocation clears the same memory.
         cute.arch.griddepcontrol_wait()
     if cutlass.const_expr(input_raw is not None):
-        # Use a warp-uniform guard: partial warps still call every shuffle
-        # with all lanes, while output-clear-only warps may skip quantization.
-        active = cutlass.Boolean(True)
-        if cutlass.const_expr(skip_idle_warps):
-            warp_begin = (idx // cute.arch.WARP_SIZE) * cute.arch.WARP_SIZE
-            active = warp_begin * values_per_lane < cute.size(input_raw)
-        if active:
-            chunk = idx * values_per_lane
-            valid = chunk < cute.size(input_raw)
-            chunk = cutlass.min(chunk, cutlass.max(cute.size(input_raw) - values_per_lane, 0))
-            layout = cute.make_layout((values_per_lane,))
-            src = cute.make_tensor(input_raw.iterator + chunk, layout)
-            dst = cute.make_tensor(input_quant.iterator + chunk, layout)
-            sf = quantize_mxfp8_chunk(src, dst, valid, values_per_lane)
-            lanes_per_scale = MXFP8_SCALE_GROUP_SIZE // values_per_lane
-            if valid:
-                if idx % lanes_per_scale == 0:
-                    input_scale[idx // lanes_per_scale] = sf
+        # Every lane of every warp runs the quantizer, so partial warps still
+        # call each scale-group shuffle with all lanes; lanes past the input
+        # clamp their load address and store nothing.
+        chunk = idx * values_per_lane
+        valid = chunk < cute.size(input_raw)
+        chunk = cutlass.min(chunk, cutlass.max(cute.size(input_raw) - values_per_lane, 0))
+        layout = cute.make_layout((values_per_lane,))
+        src = cute.make_tensor(input_raw.iterator + chunk, layout)
+        dst = cute.make_tensor(input_quant.iterator + chunk, layout)
+        sf = quantize_mxfp8_chunk(src, dst, valid, values_per_lane)
+        lanes_per_scale = MXFP8_SCALE_GROUP_SIZE // values_per_lane
+        if valid:
+            if idx % lanes_per_scale == 0:
+                input_scale[idx // lanes_per_scale] = sf
     if idx < cute.size(ready):
         ready[idx] = cutlass.Int32(0)
     if idx == 0:
@@ -138,14 +138,12 @@ def reset_fc12_sync_workspace(
     input_quant_ptr: Optional[cute.Pointer] = None,
     input_scale_ptr: Optional[cute.Pointer] = None,
     input_numel: cutlass.Int32 = 0,
-    values_per_lane: cutlass.Constexpr = 8,
-    block_threads: cutlass.Constexpr = None,
-    skip_idle_warps: cutlass.Constexpr = False,
-):
-    """Clear readiness flags, scheduler counters and optional BF16 output.
+) -> None:
+    """Clear the sync workspace and optional BF16 output, and quantize raw input.
 
     Clear ``num_ready`` Int32 ready flags, two one-element Int32 counters
-    and, with ``zero_output``, ``output_numel`` BF16 output elements.
+    and, with ``zero_output``, ``output_numel`` BF16 output elements. With
+    ``input_raw_ptr``, the same launch also quantizes the input to MXFP8.
 
     Raw pointers plus dynamic lengths let one compile serve every padded
     route count and token count; the fused GEMM wrapper follows the same
@@ -156,23 +154,15 @@ def reset_fc12_sync_workspace(
     pointers must be 16-byte aligned, and output buffers must not alias input.
     A zero element count performs only the reset.
 
-    ``values_per_lane`` is a power-of-two divisor of the MXFP8 scale group;
-    ``block_threads`` contains whole warps. When unspecified, quantization uses
-    128 threads and reset-only calls retain their original 256-thread launch.
-    These compile-time tuning parameters are independent of tensor shape. Eight values per lane shortens
-    the serial conversion/reduction work; four lanes share each scale.
-    The 128-thread default improved the measured decode quantize/reset path.
-    ``skip_idle_warps`` optionally skips fully inactive quantization warps;
-    it is disabled by default because the measured guard overhead lost time.
+    Each quantizing lane handles ``_QUANT_VALUES_PER_LANE`` values, so four
+    lanes share one scale; a quantizing launch uses ``_QUANT_BLOCK_THREADS``
+    threads per block and a reset-only launch ``_RESET_BLOCK_THREADS``.
     """
-    if cutlass.const_expr(block_threads is None):
-        block_threads = 128 if cutlass.const_expr(input_raw_ptr is not None) else 256
-    if cutlass.const_expr(values_per_lane < 1 or values_per_lane & (values_per_lane - 1)):
-        raise ValueError("values_per_lane must be a positive power of two")
-    if cutlass.const_expr(MXFP8_SCALE_GROUP_SIZE % values_per_lane):
-        raise ValueError("values_per_lane must divide the MXFP8 scale group")
-    if cutlass.const_expr(block_threads <= 0 or block_threads % cute.arch.WARP_SIZE):
-        raise ValueError("block_threads must contain whole warps")
+    block_threads = (
+        _QUANT_BLOCK_THREADS
+        if cutlass.const_expr(input_raw_ptr is not None)
+        else _RESET_BLOCK_THREADS
+    )
     ready = cute.make_tensor(ready_ptr, layout=cute.make_layout((num_ready,)))
     fc1_counter = cute.make_tensor(fc1_counter_ptr, layout=cute.make_layout((1,)))
     fc2_counter = cute.make_tensor(fc2_counter_ptr, layout=cute.make_layout((1,)))
@@ -192,7 +182,7 @@ def reset_fc12_sync_workspace(
         input_scale = cute.make_tensor(
             input_scale_ptr, cute.make_layout((input_numel // MXFP8_SCALE_GROUP_SIZE,))
         )
-        grid = cutlass.max(grid, cute.ceil_div(input_numel, block_threads * values_per_lane))
+        grid = cutlass.max(grid, cute.ceil_div(input_numel, block_threads * _QUANT_VALUES_PER_LANE))
     _reset_fc12_sync_workspace_kernel(
         ready,
         fc1_counter,
@@ -203,9 +193,7 @@ def reset_fc12_sync_workspace(
         input_raw,
         input_quant,
         input_scale,
-        values_per_lane,
         block_threads,
-        skip_idle_warps,
     ).launch(
         grid=(grid, 1, 1),
         block=(block_threads, 1, 1),

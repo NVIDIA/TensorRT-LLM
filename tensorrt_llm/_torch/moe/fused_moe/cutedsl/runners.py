@@ -575,10 +575,10 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             # MXFP8 inputs: [x, token_selected_experts, token_final_scales,
             #                x_sf, moe_output]
             # ``tune_max_num_tokens`` anchors the power-of-two token buckets to
-            # the module's saturation token count instead of the warmup
-            # forward's token count, so the decode buckets (a few tokens per
-            # DP rank) are always profiled; the nested fused-kernel tuning runs
-            # for each of them.
+            # the module's tuning cap instead of the warmup forward's token
+            # count, so a small warmup still profiles the larger buckets and
+            # profiling stops at the cap; the nested fused-kernel tuning runs
+            # for each bucket.
             self.__class__.tuning_config_cache[key] = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(

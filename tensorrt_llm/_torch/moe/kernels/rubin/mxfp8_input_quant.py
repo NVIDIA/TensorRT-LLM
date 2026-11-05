@@ -15,7 +15,10 @@
 """TRTLLM-compatible MXFP8 quantization with configurable work per lane.
 
 The format fixes the scale group; lane width controls its thread mapping.
-The exponent-zero reciprocal follows quantization.cuh::exp2f_rcp exactly.
+The exponent-zero reciprocal follows quantization.cuh::exp2f_rcp exactly, so
+for finite inputs the bytes match ``torch.ops.trtllm.mxfp8_quantize``. The
+block maximum here propagates NaN, while the native kernel ignores it, so a
+32-element block containing a NaN gets scale 0xFF and zero values here.
 """
 
 import math
@@ -30,7 +33,7 @@ MXFP8_SCALE_GROUP_SIZE = 32
 
 
 @dsl_user_op
-def _quant_scale(amax, *, loc=None, ip=None):
+def _quant_scale(amax: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Int32:
     """Return the packed E8M0 byte using the native quantizer's PTX rounding."""
     bits = llvm.inline_asm(
         cutlass.Int32.mlir_type,
@@ -49,7 +52,7 @@ def _quant_scale(amax, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _scale_reciprocal(exponent, *, loc=None, ip=None):
+def _scale_reciprocal(exponent: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Float32:
     """Decode reciprocal powers of two, preserving subnormal reciprocals."""
     value = llvm.inline_asm(
         cutlass.Float32.mlir_type,
@@ -74,11 +77,15 @@ def quantize_mxfp8_chunk(
     dst: cute.Tensor,
     valid: cutlass.Boolean,
     values_per_lane: cutlass.Constexpr,
-):
+) -> cutlass.Float8E8M0FNU:
     """Quantize a configurable lane chunk; every warp lane must participate.
 
-    Lane groups are derived from the MXFP8 format. Invalid lanes contribute zero
-    and store nothing. A balanced tree reduces the local dependency depth.
+    ``src`` is this lane's ``(values_per_lane,)`` BF16/FP16 slice of the input
+    and ``dst`` the matching E4M3 slice of the output. ``values_per_lane`` is a
+    power of two dividing the 32-value scale group, so ``32 / values_per_lane``
+    adjacent lanes share a scale and reduce their maxima with shuffles. Invalid
+    lanes contribute zero and store nothing. Returns the group's UE8M0 scale,
+    the same value on every lane of the group.
     """
     values = cute.make_rmem_tensor((values_per_lane,), cutlass.Float32)
     raw = cute.make_rmem_tensor((values_per_lane,), src.element_type)
@@ -107,9 +114,3 @@ def quantize_mxfp8_chunk(
     scale = cute.make_rmem_tensor((1,), cutlass.Uint8)
     scale[0] = exponent.to(cutlass.Uint8)
     return cute.recast_tensor(scale, cutlass.Float8E8M0FNU)[0]
-
-
-@cute.jit
-def quantize_mxfp8_16(src: cute.Tensor, dst: cute.Tensor, valid: cutlass.Boolean):
-    """Preserve the paired-lane interface for callers with 16-value slices."""
-    return quantize_mxfp8_chunk(src, dst, valid, 16)
