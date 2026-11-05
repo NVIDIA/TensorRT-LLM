@@ -27,6 +27,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 
 from ...conftest import check_device_contain, llm_models_root
 from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ._env import scoped_env_overrides
 
 _MODEL_NAME = "moonshotai/Kimi-K3"
 _MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
@@ -38,32 +39,35 @@ _GB200_ONLY = pytest.mark.skipif(
 
 
 def _run_gsm8k(model_path: str, moe_tp_size: int, moe_ep_size: int) -> None:
-    with LLM(
-        model_path,
-        dtype="bfloat16",
-        tensor_parallel_size=16,
-        pipeline_parallel_size=1,
-        moe_tensor_parallel_size=moe_tp_size,
-        moe_expert_parallel_size=moe_ep_size,
-        enable_attention_dp=False,
-        modeling_v2="require",
-        trust_remote_code=True,
-        max_batch_size=1,
-        max_num_tokens=GSM8K.MAX_INPUT_LEN,
-        max_seq_len=8192,
-        enable_chunked_prefill=True,
-        kv_cache_config=KvCacheConfig(
-            dtype="auto",
-            tokens_per_block=64,
-            enable_block_reuse=False,
-            use_kv_cache_manager_v2=True,
-            mamba_ssm_cache_dtype="float32",
-            max_tokens=8192,
-        ),
-        cuda_graph_config=CudaGraphConfig(batch_sizes=[1], enable_padding=True),
-        moe_config=MoeConfig(backend="TRTLLM", use_low_precision_moe_combine=True),
-        env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-    ) as llm:
+    with (
+        scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+        LLM(
+            model_path,
+            dtype="bfloat16",
+            tensor_parallel_size=16,
+            pipeline_parallel_size=1,
+            moe_tensor_parallel_size=moe_tp_size,
+            moe_expert_parallel_size=moe_ep_size,
+            enable_attention_dp=False,
+            modeling_v2="require",
+            trust_remote_code=True,
+            max_batch_size=1,
+            max_num_tokens=GSM8K.MAX_INPUT_LEN,
+            max_seq_len=8192,
+            enable_chunked_prefill=True,
+            kv_cache_config=KvCacheConfig(
+                dtype="auto",
+                tokens_per_block=64,
+                enable_block_reuse=False,
+                use_kv_cache_manager_v2=True,
+                mamba_ssm_cache_dtype="float32",
+                max_tokens=8192,
+            ),
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1], enable_padding=True),
+            moe_config=MoeConfig(backend="TRTLLM", use_low_precision_moe_combine=True),
+            env_overrides=rank_env,
+        ) as llm,
+    ):
         GSM8K(_MODEL_NAME).evaluate(llm)
 
 
@@ -76,8 +80,7 @@ class TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(LlmapiAccuracyTestHarness):
     MODEL_NAME = _MODEL_NAME
     MODEL_PATH = _MODEL_PATH
 
-    def test_gsm8k(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, "1")
+    def test_gsm8k(self) -> None:
         _run_gsm8k(self.MODEL_PATH, moe_tp_size=4, moe_ep_size=4)
 
 
@@ -90,6 +93,5 @@ class TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(LlmapiAccuracyTestHarness):
     MODEL_NAME = _MODEL_NAME
     MODEL_PATH = _MODEL_PATH
 
-    def test_gsm8k(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, "1")
+    def test_gsm8k(self) -> None:
         _run_gsm8k(self.MODEL_PATH, moe_tp_size=16, moe_ep_size=1)

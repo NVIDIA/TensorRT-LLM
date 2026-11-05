@@ -84,7 +84,7 @@ class GrpcRequestManager:
             sampling_params: Sampling parameters (with detokenize=False!)
             streaming: Whether to stream results
             lora_request: Optional LoRA adapter request
-            prompt_adapter_request: Optional prompt adapter request
+            prompt_adapter_request: Deprecated; prompt adapters are unsupported. Omit or pass None.
             kv_cache_retention_config: KV cache retention config
             disaggregated_params: Disaggregated inference params
             multi_modal_data: Multimodal data dict (e.g. {"image": [PIL images]})
