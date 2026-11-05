@@ -4613,6 +4613,8 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
         skip_warmup=True,
         model_path=model_dir,
         cwd=llm_venv.get_working_directory(),
+        # Cold FlashInfer JIT on all 8 ranks pushes startup to ~480-505 s on
+        # B300; 900 s leaves headroom.
         server_start_timeout=900)
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
