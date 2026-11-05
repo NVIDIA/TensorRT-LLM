@@ -346,6 +346,15 @@ artifacts stay warm across launches. Set
 `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
 creating the LLM instance to disable this behavior.
 
+Downloaded TRTLLM-Gen FMHA kernel cubins are the exception: FlashInfer only
+loads them and never compiles them, so ranks with persistent slots share them
+through a `cubins` directory next to the slots. A rank looks a kernel cubin up
+in its own slot, then in the shared directory, and downloads it only when
+neither has it, publishing the download to the shared directory with an atomic
+rename. Every cubin read from the shared directory is checked against its
+SHA-256. Headers and other compiler inputs are never shared. Set
+`TRTLLM_FLASHINFER_SHARED_CUBINS=0` to keep these cubins per-rank as well.
+
 Persistent slots are not pruned automatically, so their count can grow with
 peak job concurrency. When no TensorRT-LLM processes are using the cache, the
 slots may be deleted safely; subsequent launches rebuild the removed JIT
