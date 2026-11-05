@@ -14,6 +14,8 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     is_sparse_layer,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("params", [DeepSeekV4Params, DeepSeekV4MetadataParams])
 @pytest.mark.parametrize("variant", ["v41", "V41", "deepseek_v41", "v4.1", ""])

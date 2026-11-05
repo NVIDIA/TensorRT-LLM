@@ -81,6 +81,8 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
 from tensorrt_llm.mapping import Mapping
 
+pytestmark = pytest.mark.cpu_only
+
 # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
 SIZING_CASES = [
     # No PP: aggregated baseline, then the extra micro-batch.

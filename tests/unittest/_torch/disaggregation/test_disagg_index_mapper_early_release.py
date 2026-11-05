@@ -85,6 +85,7 @@ class _FakeExecutor(PyExecutor):
         self._disagg_coordinator.reap_context_sends = lambda at_least=0: None
 
 
+@pytest.mark.cpu_only
 class TestSendKvAsyncReleasesIndexSlot:
     """Test that `_send_kv_async` releases the IndexMapper slot before the
     transfer is started, which is where the production code actually lives
@@ -341,6 +342,7 @@ class TestFreeResourcesDoubleReleaseSafety:
         assert not _has_sequence(index_mapper, 1)
 
 
+@pytest.mark.cpu_only
 class TestAuxBufferHigherCapacity:
     """Test that increased AuxBuffer capacity works correctly."""
 

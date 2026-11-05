@@ -18,6 +18,8 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     _load_weights_strips_compile_wrapper,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _wrapped_instance(cls):
     # Skip the heavy constructors: only the module tree and the class matter.
