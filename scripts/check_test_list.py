@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Verify test lists for L0, QA, and waives file; AST-based validation via --validate.
 
 This script is used to verify test lists for L0, QA, and waives file.
@@ -81,6 +83,10 @@ def parse_test_entry(line: str):
         return None
     if line.startswith("- "):
         line = line[2:].strip()
+    if line.startswith("case:"):
+        line = line[len("case:"):].strip()
+        if not line:
+            return None
     token = line.split()[0]
     if "::" not in token:
         return None

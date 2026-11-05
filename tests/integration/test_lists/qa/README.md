@@ -48,9 +48,28 @@ This directory contains various test configuration files:
 
 ### Functional Test Lists
 - `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
-- `llm_function_multinode.txt` - Multi-node functional test cases
+- `llm_function_multinode.yml` - Multi-node functional test cases with per-case launch parameters
 - `llm_function_rtx6k.txt` - RTX 6000 series specific tests
 - `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
+
+### Multi-node Launch Parameters
+
+`llm_function_multinode.yml` contains a `tests` sequence. Each entry has an exact
+pytest node ID in `case` and a `launch` mapping:
+
+- `mode: mpi` uses `world_size` for the total MPI rank count. The pipeline derives
+  node count and tasks per node from the selected platform's GPU capacity.
+- `mode: per_node` uses explicit `nodes`, `tasks_per_node`, and `gpus_per_node`.
+  Pytest runs on each node and the test starts its local server workers.
+
+GPU architecture, memory, and NVLink-domain requirements still apply; select a
+platform supported by the test. Account, partition, container, and node placement
+remain pipeline settings.
+
+The Jenkins consumer must parse this YAML, resolve each entry's launch parameters,
+and generate a temporary single-case text list for the existing test runner.
+The previous text-list reader cannot consume this YAML directly; Jenkins job
+configuration and parser support must be migrated together before enabling it.
 
 ### Performance Test Files
 - `llm_perf_full.yml` - Main performance test configuration
