@@ -353,14 +353,22 @@ def _run_paired_adapter_engine(
             runner = _local_worker(llm).engine.model_engine.cuda_graph_runner
             original_replay = runner.replay
 
-            def counted_replay(key, current_inputs, *, position_id_offsets=None):
+            def counted_replay(
+                key, current_inputs, *, position_id_offsets=None, static_inputs_staged=0
+            ):
                 replay_count[0] += 1
-                return original_replay(key, current_inputs, position_id_offsets=position_id_offsets)
+                return original_replay(
+                    key,
+                    current_inputs,
+                    position_id_offsets=position_id_offsets,
+                    static_inputs_staged=static_inputs_staged,
+                )
 
             runner.replay = counted_replay
 
         sampling_params = SamplingParams(
             max_tokens=4,
+            end_id=2,
             temperature=0.0,
             ignore_eos=True,
             return_generation_logits=True,
@@ -472,13 +480,13 @@ def test_qwen_moe_native_fp8_lora_matches_bf16_reference(
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     config = Qwen3MoeConfig(
         vocab_size=128,
-        hidden_size=128,
+        hidden_size=256,
         intermediate_size=256,
         moe_intermediate_size=128,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=32,
+        head_dim=64,
         num_experts=4,
         num_experts_per_tok=2,
         max_position_embeddings=128,
