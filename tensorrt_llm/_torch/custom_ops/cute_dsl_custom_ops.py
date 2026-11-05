@@ -18697,8 +18697,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 @staticmethod
                 def new_input_quant_scratch(
-                        input_raw: torch.Tensor,
-                        scale_shape) -> Tuple[torch.Tensor, torch.Tensor]:
+                    input_raw: torch.Tensor, scale_shape: torch.Size
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
                     """One call's E4M3 values and linear UE8M0 scales, written by
                     the fused input quantization in the reset launch and read by
                     the GEMM; allocated per call like the workspace."""
@@ -18787,7 +18787,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 "the call instead")
                         reset_output_numel = output.numel()
 
-                    def _i32_ptr(t):
+                    def _i32_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Int32, t.data_ptr(),
                                         cute.AddressSpace.gmem)
 
@@ -19799,7 +19799,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 call_buffers = {}
 
                 def parent_reset(partition_inputs: List[torch.Tensor],
-                                 tactic) -> None:
+                                 tactic: Optional[tuple]) -> None:
                     # Derived from the call's own inputs so autotuner profiles at
                     # other row counts reset (and quantize into) matching buffers.
                     (
@@ -19810,7 +19810,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 def launch_partition(
                     partition_id: int,
                     partition_inputs: List[torch.Tensor],
-                    tactic,
+                    tactic: Optional[tuple],
                 ) -> None:
                     (fc1_weight, fc1_weight_scale, fc2_weight,
                      fc2_weight_scale) = shard_weights[partition_id]

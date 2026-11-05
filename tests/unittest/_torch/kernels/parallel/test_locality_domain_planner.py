@@ -23,6 +23,7 @@ Tests cover:
 - Singleton DISABLED_PLAN
 """
 
+import os
 from typing import Optional
 from unittest.mock import patch
 
@@ -109,8 +110,13 @@ class TestLocalityDomainPolicy:
         assert "bf16_linear" in policy.allowed_ops
         assert "bf16_bmm" in policy.allowed_ops
         assert "nvfp4_moe" in policy.allowed_ops
-        assert "mxfp8_moe" in policy.allowed_ops
         assert "bf16_moe" in policy.allowed_ops
+
+    @patch.dict(os.environ, {"TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE": "0"})
+    def test_mxfp8_moe_is_opt_in(self):
+        assert "mxfp8_moe" not in LocalityDomainPolicy().allowed_ops
+        with patch.dict(os.environ, {"TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE": "1"}):
+            assert "mxfp8_moe" in LocalityDomainPolicy().allowed_ops
 
     def test_enabled(self):
         policy = LocalityDomainPolicy(enabled=True)
@@ -691,12 +697,49 @@ class TestLocalityDomainMoePlanner:
     )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE", True)
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    @patch.dict(
+        os.environ,
+        {
+            "TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE": "1",
+            "TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD": "strict",
+        },
+    )
     def test_moe_enabled_when_mxfp8(self, mock_locality_domain):
         planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
         plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=False, mxfp8=True))
         assert plan.enabled
         assert plan.backend == "cutedsl"
         assert plan.merge_kind == "none"
+
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE", True)
+    @patch.dict(os.environ, {"TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE": "0"})
+    def test_moe_disabled_when_mxfp8_not_opted_in(self, mock_locality_domain):
+        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=False, mxfp8=True))
+        assert not plan.enabled
+        assert "allowed_ops" in plan.reason_if_disabled
+
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE", True)
+    @patch.dict(
+        os.environ,
+        {
+            "TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE": "1",
+            "TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD": "balanced",
+        },
+    )
+    def test_moe_disabled_when_mxfp8_on_balanced_split(self, mock_locality_domain):
+        """The fused kernel needs its whole persistent grid resident, which the
+        backfilled balanced partitions do not guarantee."""
+        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=False, mxfp8=True))
+        assert not plan.enabled
+        assert "balanced" in plan.reason_if_disabled
 
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True

@@ -5355,6 +5355,9 @@ def test_moe_backend(
     locality_domain_runtime_skip = should_skip_locality_domain_runtime(enable_locality_domains)
     if locality_domain_runtime_skip:
         pytest.skip(locality_domain_runtime_skip)
+    if enable_locality_domains and quant_algo == QuantAlgo.MXFP8:
+        # The MXFP8 split is opt-in; the default policy keeps the full-GPU op.
+        monkeypatch.setenv("TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE", "1")
     locality_domain_policy = LocalityDomainPolicy(enabled=enable_locality_domains)
 
     ci_skip = should_skip_to_accelerate_ci(

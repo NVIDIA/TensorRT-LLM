@@ -7198,6 +7198,20 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         module._cute_dsl_mxfp8_w3_w1_weight_interleaved = set()
         module._cute_dsl_mxfp8_w3_w1_scale_interleaved = set()
 
+    @staticmethod
+    def mark_all_slots_in_kernel_layout(module: torch.nn.Module) -> None:
+        """Record every local slot's FC1 weight and scales as interleaved.
+
+        For a module that has just written its full FC1 weight and block
+        scales in the kernel layout itself (gate/up interleaved, scales
+        swizzled), as a finalize leaves them, so that a later partial refit
+        deinterleaves a slot before overwriting part of it.
+        """
+        slots = set(range(module.expert_size_per_partition))
+        module._cute_dsl_mxfp8_w3_w1_interleave_pending = set()
+        module._cute_dsl_mxfp8_w3_w1_weight_interleaved = set(slots)
+        module._cute_dsl_mxfp8_w3_w1_scale_interleaved = set(slots)
+
     def load_expert_w3_w1_weight(self,
                                  module: torch.nn.Module,
                                  w1_weight: torch.Tensor,

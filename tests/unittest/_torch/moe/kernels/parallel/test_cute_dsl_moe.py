@@ -5269,16 +5269,20 @@ def test_moe_module_locality_domain_lifecycle_and_forward_rubin(quant_algo, rtol
     reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
 )
 @pytest.mark.parametrize("num_tokens", [16, 4096])
-def test_moe_module_mxfp8_locality_domain_static_split_rubin(num_tokens: int):
-    """Locality domains for an MXFP8 layer are a static planner decision, as for NVFP4/BF16.
+def test_moe_module_mxfp8_locality_domain_static_split_rubin(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the opt-in, locality domains for an MXFP8 layer are a static planner decision.
 
     ``transform_weights`` shards the weights onto the two partitions and
     releases the full parameters and block scales (the shards are the only
     copy), and every shape runs the split, prefill-sized rows included. A
-    refit reload after the release re-creates the full parameters, and the
-    next transform re-shards and releases them again.
+    refit rebuilds the full parameters from the shards, so a refit that
+    rewrites only one projection keeps the rest, and the next transform
+    refreshes the same shard tensors in place.
     """
     _skip_if_no_locality_domain()
+    monkeypatch.setenv("TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE", "1")
 
     from _torch.moe.quantize_utils import get_test_quant_params
     from transformers.configuration_utils import PretrainedConfig
@@ -5303,20 +5307,21 @@ def test_moe_module_mxfp8_locality_domain_static_split_rubin(num_tokens: int):
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
             QuantAlgo.MXFP8, x, "CUTEDSL"
         )
-        weights = quantize_util_cls(
+        quantize_util = quantize_util_cls(
             num_experts=num_experts,
             dtype=dtype,
             intermediate_size=intermediate_size,
             hidden_size=hidden_size,
             quant_config=quant_config,
-        ).create_weights(**quant_kwargs)
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
         pretrained_config = PretrainedConfig()
         pretrained_config.num_experts = num_experts
         pretrained_config.hidden_size = hidden_size
         pretrained_config.intermediate_size = intermediate_size
         pretrained_config.torch_dtype = dtype
 
-        def create_module(enable_locality_domains: bool):
+        def create_module(enable_locality_domains: bool, module_weights=None):
             model_config = ModelConfig(
                 pretrained_config=pretrained_config,
                 quant_config=quant_config,
@@ -5336,7 +5341,7 @@ def test_moe_module_mxfp8_locality_domain_static_split_rubin(num_tokens: int):
             )
             assert isinstance(moe.backend, TrtllmCutedslFusedFc12Mxfp8Impl)
             moe.create_weights()
-            moe.load_weights([weights])
+            moe.load_weights([weights if module_weights is None else module_weights])
             moe.transform_weights()
             moe.cache_derived_state()
             moe.cuda()
@@ -5397,6 +5402,54 @@ def test_moe_module_mxfp8_locality_domain_static_split_rubin(num_tokens: int):
             out_refit = split_module(x, router_logits)
         torch.cuda.synchronize()
         assert_matches(out_refit, out_base, "static split after refit vs full GPU")
+
+        # Refits refresh the shard tensors in place, so captured CUDA graphs
+        # keep valid addresses.
+        def shard_ptrs():
+            return [
+                {name: t.data_ptr() for name, t in shard.items()}
+                for shard in split_backend._locality_domain_weight_shards
+            ]
+
+        ptrs = shard_ptrs()
+
+        # A refit with different weights must reach the shards.
+        torch.manual_seed(1)
+        weights2 = quantize_util.create_weights(**quant_kwargs)
+        split_module.load_weights([weights2])
+        split_module.transform_weights()
+        split_module.cache_derived_state()
+        assert_released(split_backend)
+        assert shard_ptrs() == ptrs
+        with torch.inference_mode():
+            out_new = split_module(x, router_logits)
+            out_new_ref = create_module(False, weights2)(x, router_logits)
+        torch.cuda.synchronize()
+        assert_matches(out_new, out_new_ref, "static split after refit with new weights")
+
+        # A refit that rewrites only one projection (w1 of every expert, with
+        # its scales) keeps w3, w2 and their scales from the shards.
+        torch.manual_seed(2)
+        weights3 = quantize_util.create_weights(**quant_kwargs)
+        w1_only = {k: v for k, v in weights3.items() if ".w1." in k}
+        assert w1_only
+        # As the RLHF finalize walk does: a partial load defers
+        # process_weights_after_loading, and the transform then re-splits.
+        split_module.load_weights([w1_only], allow_partial_loading=True)
+        for mod in split_module.modules():
+            if hasattr(mod, "process_weights_after_loading"):
+                mod.process_weights_after_loading()
+        split_module.transform_weights()
+        split_module.cache_derived_state()
+        assert_released(split_backend)
+        assert shard_ptrs() == ptrs
+        merged = dict(weights2)
+        merged.update(w1_only)
+        with torch.inference_mode():
+            out_partial = split_module(x, router_logits)
+            out_partial_ref = create_module(False, merged)(x, router_logits)
+        torch.cuda.synchronize()
+        assert_matches(out_partial, out_partial_ref, "static split after a w1-only refit")
 
 
 @pytest.mark.skipif(
@@ -6234,12 +6287,16 @@ def _split_mxfp8_fused_fc12_shards(w31_kernel, w31_sf_kernel, w2_q, w2_sf_kernel
     get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
 )
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize(
     "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts",
     [
         (128, 2, 1, 1024, 512, 16),
         # Qwen3.5-397B expert geometry, TEP8-shaped decode.
         (32, 10, 8, 4096, 1024, 512),
+        # Far more FC1/FC2 tiles than a partition holds persistent clusters,
+        # so every cluster claims later tiles while FC2 waits on FC1.
+        (1024, 8, 1, 4096, 1024, 64),
     ],
 )
 def test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu(
@@ -6249,7 +6306,8 @@ def test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu(
     hidden_size: int,
     interm_size: int,
     num_experts: int,
-):
+    tile_size: int,
+) -> None:
     """The inner-channel split across two locality domains reproduces the full-GPU op.
 
     The shards slice the kernel-layout FC1 weights and scales along N (whole
@@ -6263,7 +6321,6 @@ def test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu(
     """
     _skip_if_no_locality_domain()
     torch.manual_seed(0)
-    tile_size = 128
     sf_vec_size = 32
     num_local_experts = num_experts // ep_size
 
@@ -6481,13 +6538,11 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> 
     from the hidden size rather than being tied to one model.
     """
     impl = TrtllmCutedslFusedFc12Mxfp8Impl
-    # Only the Rubin op fuses the quantization, so the fake runs as SM107.
     backend = SimpleNamespace(
         hidden_size=hidden,
         quant_method=SimpleNamespace(
             BLOCK_SIZE=32, weight_alignment=MXFP8CutlassFusedMoEMethod.weight_alignment
         ),
-        _sm_version=107,
         _locality_domain_runtime=None,
         FUSED_INPUT_QUANT_MAX_ELEMENTS=impl.FUSED_INPUT_QUANT_MAX_ELEMENTS,
     )
@@ -6517,13 +6572,6 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> 
         MXFP8CutlassFusedMoEMethod.weight_alignment,
     )
     assert sf.shape == (max_rows, scale_cols)
-    # Locality domains: the split's parent reset quantizes raw input for both
-    # shards, so the fusion applies to the split exactly as to the full op.
-    backend._locality_domain_runtime = object()
-    small = torch.empty((8, hidden), dtype=dtype)
-    raw, _ = impl.quantize_input(backend, small, post_quant_comm=False)
-    assert raw is small and len(calls) == 1
-    backend._locality_domain_runtime = None
     larger = torch.empty((max_rows + 1, hidden), dtype=dtype)
     quantized, _ = impl.quantize_input(backend, larger, post_quant_comm=False)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 2
@@ -6549,7 +6597,6 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(
     leaf.slot_start = 0
     leaf.num_slots = 4
     leaf.mapping = SimpleNamespace(moe_ep_size=1)
-    leaf._sm_version = 107
     leaf.act_clamp = float("inf")
     leaf._locality_domain_weight_shards = [
         {
@@ -6692,12 +6739,12 @@ def test_mxfp8_fused_fc12_op_rejects_inputs_the_kernel_misreads(case: str, messa
 @pytest.mark.cpu_only
 def test_mxfp8_input_quantization_tuning_cache_isolation() -> None:
     """Changing activation dtype must not reuse prequantized timing decisions."""
-    for locality in (False, True):
-        keys = {
-            TrtllmCutedslFusedFc12Mxfp8Impl._tuner_key(dtype, locality)
-            for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
-        }
-        assert len(keys) == 3
+    keys = {
+        TrtllmCutedslFusedFc12Mxfp8Impl._tuner_key(dtype, locality)
+        for locality in (False, True)
+        for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
+    }
+    assert len(keys) == 6
 
 
 def test_locality_domain_reload_drops_stale_shards():
