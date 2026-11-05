@@ -203,6 +203,8 @@ whether or not the record is sound.
 
 The per-process files ride back inside `results-<stage>.tar.gz`. Post-merge architecture
 checkpoints first upload single-GPU `cbts_pystart_report_x86_64.tar.gz` and
-`cbts_pystart_report_SBSA.tar.gz`, which the selector requires and hierarchically merges. The
-later `Test Coverage` stage merges all files and uploads
+`cbts_pystart_report_SBSA.tar.gz`, which the selector requires and hierarchically merges. After each
+multi-GPU job, separate `cbts_pystart_report_x86_64_multi_gpu.tar.gz` and
+`cbts_pystart_report_SBSA_multi_gpu.tar.gz` artifacts are uploaded when data exists. These can be
+partial after test failures and are not consumed by the selector. The later `Test Coverage` stage merges all files and uploads
 `${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz` for the full report.
