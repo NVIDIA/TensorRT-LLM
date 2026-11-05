@@ -4,7 +4,9 @@
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
+from types import SimpleNamespace
 
+import pytest
 import torch
 import transformers
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -21,11 +23,14 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.llama4_weight_mapper import \
     Llama4HfWeightMapper
-from tensorrt_llm._torch.models.modeling_llama import \
-    Llama4ForConditionalGeneration
+from tensorrt_llm._torch.models.modeling_llama import (
+    Llama4ForConditionalGeneration, Llama4InputProcessor, Llama4VisionEncoder)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalParams)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -464,3 +469,124 @@ class TestLlama4MinLatency(unittest.TestCase):
             f"Mismatch ratio {mismatch_ratio} exceeds threshold {mismatch_threshold}"
 
         kv_cache_manager.shutdown()
+
+
+def _main_llama4_vision_forward(self, multimodal_params):
+    """Llama4VisionEncoder.forward before grouped encoding, copied verbatim."""
+    pixel_values = [
+        multimodal_param.multimodal_data["image"]["pixel_values"]
+        for multimodal_param in multimodal_params
+    ]
+    pixel_values = torch.cat(pixel_values,
+                             dim=0).to(self.device).to(torch.float32)
+    image_features = self.vision_model(pixel_values).last_hidden_state.flatten(
+        0, 1)
+    image_features = self.mm_projector(image_features)
+    return [image_features]
+
+
+_LLAMA4_PATCHES_PER_TILE = 4
+
+
+class _CpuLlama4VisionModel(torch.nn.Module):
+    """Stand-in tower: each tile of [3, 2, 2] pixels gives 4 patch rows."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, pixel_values):
+        self.calls.append(pixel_values.clone())
+        return SimpleNamespace(last_hidden_state=pixel_values.reshape(
+            pixel_values.shape[0], _LLAMA4_PATCHES_PER_TILE, -1))
+
+
+def _cpu_llama4_encoder():
+    encoder = Llama4VisionEncoder.__new__(Llama4VisionEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.device = "cpu"
+    encoder.vision_model = _CpuLlama4VisionModel()
+    encoder.mm_projector = torch.nn.Linear(3, 5)
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for parameter in encoder.mm_projector.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator))
+    return encoder
+
+
+def _llama4_request(tiles_per_image, seed):
+    generator = torch.Generator().manual_seed(seed)
+    pixels = torch.randn(sum(tiles_per_image), 3, 2, 2, generator=generator)
+    return MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": pixels.to(torch.bfloat16)
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+            MultimodalItemMetadata(
+                [("image", index) for index in range(len(tiles_per_image))],
+                output_embedding_lengths=[
+                    tiles * _LLAMA4_PATCHES_PER_TILE
+                    for tiles in tiles_per_image
+                ],
+            ),
+        })
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tiles_by_request", [
+    [[1]],
+    [[1], [5]],
+    [[5, 1], [3], [1, 1]],
+],
+                         ids=["one", "several", "ragged"])
+def test_llama4_encoder_group_matches_main(tiles_by_request):
+    encoder = _cpu_llama4_encoder()
+    params = [
+        _llama4_request(tiles, seed)
+        for seed, tiles in enumerate(tiles_by_request)
+    ]
+    expected = _main_llama4_vision_forward(encoder, params)[0]
+    oracle_pixels = encoder.vision_model.calls.pop()
+
+    output = encoder.forward(params)
+
+    assert len(output) == 1
+    assert torch.equal(output[0], expected)
+    assert len(encoder.vision_model.calls) == 1
+    pixels = encoder.vision_model.calls[0]
+    assert torch.equal(pixels, oracle_pixels)
+    assert pixels.dtype == oracle_pixels.dtype == torch.float32
+
+
+@pytest.mark.cpu_only
+def test_llama4_metadata_without_hashing_counts_patch_tokens():
+    config = LLAMA_4_MAVERICK_TWO_LAYER_CONFIG
+    processor = Llama4InputProcessor.__new__(Llama4InputProcessor)
+    processor.image_token_start_index = config["boi_token_index"]
+    processor.image_token_end_index = config["eoi_token_index"]
+    processor.image_token_index = config["image_token_index"]
+    start, end, patch = (config["boi_token_index"], config["eoi_token_index"],
+                         config["image_token_index"])
+    # Separator and global-tile tokens: anything that is not a patch token.
+    x_separator, y_separator, global_tile = 200084, 200085, 200090
+    patches = [patch] * _LLAMA4_PATCHES_PER_TILE
+    two_tiles = ([start] + patches + [x_separator] + patches + [y_separator] +
+                 [global_tile] + patches + [end])
+    one_tile = [start, global_tile] + patches + [end]
+    prompt = [1, 2] + two_tiles + [3] + one_tile + [4]
+    data = {"image": {"pixel_values": torch.zeros(4, 3, 2, 2)}}
+
+    metadata = processor.get_mm_item_metadata(prompt, data)
+
+    assert metadata.item_refs == (("image", 0), ("image", 1))
+    assert metadata.output_embedding_lengths == (12, 4)
+    order = [{"modality": "image", "index": index} for index in range(2)]
+    assert processor.get_mm_item_metadata(prompt, data, order) == metadata
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    assert processor.get_mm_item_metadata(prompt, data) is metadata
+    assert processor.get_mm_item_metadata(prompt, {}) is None
+    # The rows match what the encoder returns for the 3 + 1 tiles.
+    output = _cpu_llama4_encoder().forward(
+        [MultimodalParams(multimodal_data=data)])
+    assert output[0].shape[0] == 16

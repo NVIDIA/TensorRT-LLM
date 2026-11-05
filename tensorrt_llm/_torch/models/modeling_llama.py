@@ -33,7 +33,8 @@ from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
+                                            MultimodalParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -58,6 +59,7 @@ from ..moe.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
                              MoEWeightLoadingMode, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -1273,18 +1275,28 @@ class Llama4VisionEncoder(nn.Module):
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)
 
-    @torch.inference_mode()
-    def forward(self, multimodal_params: List[MultimodalParams]):
-        pixel_values = [
-            multimodal_param.multimodal_data["image"]["pixel_values"]
-            for multimodal_param in multimodal_params
-        ]
-        pixel_values = torch.cat(pixel_values,
-                                 dim=0).to(self.device).to(torch.float32)
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (EncoderGroup(
+            modalities=("image", ),
+            encoder_fn=self.encode_batched,
+            input_fields={"pixel_values": {
+                "image": "pixel_values"
+            }},
+        ), )
+
+    def encode_batched(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        pixel_values = pixel_values.to(self.device).to(torch.float32)
         image_features = self.vision_model(
             pixel_values).last_hidden_state.flatten(0, 1)
-        image_features = self.mm_projector(image_features)
-        return [image_features]
+        return self.mm_projector(image_features)
+
+    @torch.inference_mode()
+    def forward(self, multimodal_params: List[MultimodalParams]):
+        return [
+            encode_multimodal_by_groups(self.mm_encoder_groups,
+                                        multimodal_params)
+        ]
 
 
 class Llama4InputProcessor(BaseMultimodalInputProcessor,
@@ -1346,6 +1358,32 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids,
+                                                multimodal_data, mm_item_order)
+        if metadata is not None or not multimodal_data.get("image"):
+            return metadata
+        # Each image is one image start ... image end span of the prompt, and
+        # its encoder rows are the patch tokens inside that span.
+        token_ids = torch.as_tensor(prompt_token_ids)
+        starts = token_ids == self.image_token_start_index
+        image_of_token = starts.cumsum(0) - 1
+        rows = torch.bincount(
+            image_of_token[token_ids == self.image_token_index],
+            minlength=int(starts.sum())).tolist()
+        item_refs = ([(entry["modality"], entry["index"])
+                      for entry in mm_item_order] if mm_item_order else
+                     [("image", index) for index in range(len(rows))])
+        return MultimodalItemMetadata(
+            item_refs,
+            output_embedding_lengths=[rows[index] for _, index in item_refs],
+        )
 
     def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt, multimodal_embedding: Dict[str,
