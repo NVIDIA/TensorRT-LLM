@@ -193,11 +193,18 @@ def read_back(golden, profile):
 
 
 def check(goldens, shipped_path=SHIPPED, profile_dir=PROFILES):
-    """Print, per model, how many renders read back and equal the shipped ones; 1 on any failure."""
+    """Print, per model, how many renders read back and equal the shipped ones.
+
+    Returns 1 when a render does not read back, or when there is no render at all: a check that
+    checked nothing has not passed.
+    """
     import profiles
 
     with open(shipped_path) as fh:
         shipped = {(g["model"], g["case"]): g["text"] for g in json.load(fh)["goldens"]}
+    if not goldens:
+        print("no renders: nothing was checked")
+        return 1
     failures = 0
     for model in sorted({g["model"] for g in goldens}):
         profile = profiles.load_profile(os.path.join(profile_dir, model + ".yaml"))
@@ -227,6 +234,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if bool(args.out) == args.check:
         ap.error("give exactly one of --out and --check")
+    if not (args.kimi_k3 or args.glm or args.deepseek_v41):
+        ap.error("name at least one checkpoint: --kimi-k3, --glm or --deepseek-v41")
     goldens = []
     sources = {}
     for flag, fn in (("kimi_k3", kimi_k3), ("glm", glm), ("deepseek_v41", deepseek_v41)):

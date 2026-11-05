@@ -393,6 +393,15 @@ def test_native_goldens_check_names_a_render_other_than_the_shipped_one(tmp_path
     assert f"DIFFERS {renders[0]['case']}: reads back exactly" in out and "FAIL" not in out
 
 
+def test_native_goldens_check_fails_when_it_checks_nothing(capsys):
+    """--check without a checkpoint, or with no render, checks nothing: that is not a pass."""
+    with pytest.raises(SystemExit) as no_checkpoint:
+        native_goldens.main(["--check"])
+    assert no_checkpoint.value.code == 2
+    assert native_goldens.check([]) == 1
+    assert "nothing was checked" in capsys.readouterr().out
+
+
 def test_native_reader_flags_the_models_slips():
     card = {"kind": "glm_xml", "prompt_opens": "think", "stop_markers": ["<|observation|>"]}
     turn = native.read(card, "Plan.</think>Reading.<tool_call>Read<arg_key>p</arg_key><arg_value>a")
