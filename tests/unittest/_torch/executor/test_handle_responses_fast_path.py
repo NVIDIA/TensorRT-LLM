@@ -35,6 +35,7 @@ def _executor(requests, *, stream_interval=1, pending_preemption=False):
     executor.perf_manager.get_timestamp.return_value = None
     executor.iter_counter = 1
     executor.stream_interval = stream_interval
+    executor.first_content_emit_iters = 1
     executor.dist = SimpleNamespace(rank=0, world_size=1)
     executor.kv_cache_transceiver = None
     executor.enable_attention_dp = False
