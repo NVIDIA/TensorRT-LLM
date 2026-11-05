@@ -63,6 +63,14 @@ class GlmLowmBf16Moe(OpWrapper):
             for tokens in (1, 2)
             for routing in ("random", "ties", "tiny")
         ),
+        *(
+            Cell(
+                why=f"FC2 boundary: {tokens} tokens, intermediate{inter}, random routing",
+                spec=dict(tokens=tokens, hidden=6144, inter=inter, routing="random"),
+            )
+            for tokens in (4, 5, 6)
+            for inter in (256, 512)
+        ),
     )
 
     note = """
