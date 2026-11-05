@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Pinned provenance of this reproduction entry. Field reference: examples/perf_reproductions/README.md.
 entry_id: inferencex/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/GB300/agentx-disagg
-status: branch  # branch | partial | mainline | superseded
+status: mainline  # branch | partial | mainline | superseded
 benchmark:
   name: InferenceX
   config_key: qwen3.5-fp4-gb300-dynamo-trt-agentic-disagg
@@ -11,48 +11,54 @@ model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
 hardware: GB300 NVL72
 code:
   repo: https://github.com/NVIDIA/TensorRT-LLM
-  commit: '4d09932ca7240f6fbb4d0dea811691446cc8cf92'
-  branch: feat/1.3.0rc24-iter-perf-stats-interval
+  commit: '0fd58c90ede974e01ecc53627ad5a9bc76846703'
+  branch: main
   tag: null
 image:
-  name: nvcr.io/nvidia/tensorrt-llm/release:1.3.0a0.dev202610210406
-  tensorrt_llm_version: 1.3.0a0.dev202610210406
-  digest: sha256:16b3237826b7969a3a736ceae930f7d63fe44f3c44c8e6c59a9d4b01dd66c199
+  name: nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3.dev202611020007
+  tensorrt_llm_version: 1.4.0rc3.dev202611020007
+  digest: sha256:f656ce79a88bfdbcd591fe0a5919fcb20c714b59fd73c8b9adb4101659762c7c
   platform_digests:
-    linux/amd64: sha256:c4f931e9e1ce244f17eb9c618d5af6592ead64cfb86225f59407f3df944b9d01
-    linux/arm64: sha256:b3d679d67e7c51145f2a8a084bbb8ec976fb9e22f3b9d83358b1a99edf85234c
+    linux/amd64: sha256:1ba509aa315e9983a98ffb3f5d8e5f4b36739dd197789915eb840fc170eb8695
+    linux/arm64: sha256:f96790104197379dba0e13471b4a38e7adec564022415b78da0650be6af49106
 dependencies:
   ai-dynamo: 1.6.0.dev20261010
   ai-dynamo-runtime: 1.6.0.dev20261010
 external:
-  submission: https://github.com/SemiAnalysisAI/InferenceX/pull/4356
-  recipe_repo: https://github.com/longlee0622/InferenceX
-  recipe_commit: bb54127914f6c7c039a5a89c5fd8590441e4fc90
+  submission: https://github.com/SemiAnalysisAI/InferenceX/pull/4747
+  recipe_repo: https://github.com/SemiAnalysisAI/InferenceX
+  recipe_commit: a9fc88e5b0a7ce82990c672d8e3bfd18cbf8e0a6
   recipe: inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/qwen3.5/trtllm/gb300-fp4/agentx/disagg-variants.yaml
 verify:
-  # One log line per worker rank from tensorrt_llm/_torch/q35_env.py; {count} is the number of switches applied.
+  # One log line per worker rank of tensorrt_llm at the pinned commit.
   log_patterns:
-    decode: 'TRTLLM_Q35_PROFILE=gen \(attention DP: (True|False)\): 89 TRTLLM_Q35_\* switches set'
-    prefill_tep: 'TRTLLM_Q35_PROFILE=ctx \(attention DP: False\): 10 TRTLLM_Q35_\* switches set'
-    prefill_dep: 'TRTLLM_Q35_PROFILE=ctx \(attention DP: True\): 0 TRTLLM_Q35_\* switches set'
+    all_roles: 'KV cache manager v2 host cache quota set to 128\.00GiB'
+    decode: 'Running CUDA graph capture for \d+ batch sizes\.'
+    prefill_tep: 'Captured \d+ breakable prefill graph break graphs, \d+ MiB'
+    prefill_dep: "TorchCompileConfig\\.enable_piecewise_cuda_graph is deprecated; use prefill_cuda_graph_backend='piecewise' instead\\."
 upstream:
-  - feature: TRTLLM_Q35_PROFILE role profiles and @register re-read of TRTLLM_Q35_* switches (q35_env)
-    status: branch-only
+  # The branch of the first submission was merged by #20815; on main the runs are plain configs.
   - feature: Fused MoE front (router GEMM, top-k, routing tables, NVFP4 quant), dynamic expert assignment, low-M FP8 GEMMs
-    status: branch-only
+    status: mainline
+    note: '#20815'
   - feature: Fused split-KV FP8 decode attention, context-parallel partial decode attention, segmented split-KV decode
-    status: branch-only
+    status: mainline
+    note: '#20815'
   - feature: Fused GEMM + all-reduce + RMSNorm and low-latency all-reduce / exchange kernels (MNNVL)
-    status: branch-only
+    status: mainline
+    note: '#20815'
   - feature: Fused GDN core and conv-replay kernels; in-forward and branch-point Mamba state snapshots
-    status: branch-only
+    status: mainline
+    note: '#20815'
   - feature: MTP context draft CUDA graphs, steady-state decode preparation, fused accept, vocabulary-sharded sampling
-    status: branch-only
+    status: mainline
+    note: '#20815'
   - feature: Breakable prefill CUDA graphs
-    status: equivalent-on-main
-    note: main selects it with prefill_cuda_graph_backend (#16609); this entry uses the branch's TRTLLM_PREFILL_BCG
+    status: mainline
+    note: '#16609 + #20815'
   - feature: Sampled iteration perf stats (iter_perf_stats_interval)
     status: mainline
     note: '#19717'
   - feature: Shortest-first context scheduling and disaggregated generation first-step streaming
-    status: branch-only
+    status: mainline
+    note: '#20815'

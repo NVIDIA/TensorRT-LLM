@@ -22,7 +22,7 @@ configurations in [`examples/configs`](../configs/).
 
 | Benchmark | Model | Hardware | Scenario | Code | Entry |
 |---|---|---|---|---|---|
-| InferenceX | `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` | GB300 NVL72 | AgentX agentic coding, disaggregated | branch | [agentx-disagg](inferencex/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/GB300/agentx-disagg/README.md) |
+| InferenceX | `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` | GB300 NVL72 | AgentX agentic coding, disaggregated | main | [agentx-disagg](inferencex/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/GB300/agentx-disagg/README.md) |
 
 The machine-readable registry is [`index.yaml`](index.yaml).
 

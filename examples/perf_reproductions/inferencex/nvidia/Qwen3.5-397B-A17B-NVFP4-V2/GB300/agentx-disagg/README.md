@@ -8,31 +8,32 @@ SPDX-License-Identifier: Apache-2.0
 This entry reproduces the TensorRT-LLM result for the InferenceX config
 `qwen3.5-fp4-gb300-dynamo-trt-agentic-disagg` (AgentX agentic-coding traces,
 disaggregated prefill/decode with Dynamo), submitted in
-[SemiAnalysisAI/InferenceX#4356](https://github.com/SemiAnalysisAI/InferenceX/pull/4356).
+[SemiAnalysisAI/InferenceX#4747](https://github.com/SemiAnalysisAI/InferenceX/pull/4747).
 
-**Code status: feature branch.** The result was produced from a TensorRT-LLM
-feature branch, not from `main`. The pinned NVIDIA container below already
-contains that code, so you do not need to build TensorRT-LLM. The
-[upstream status](#upstream-status) section lists which features have reached
-`main`.
+**Code status: on `main`.** The result was produced from a TensorRT-LLM `main`
+commit, not from a feature branch: the optimizations of the earlier submission
+([SemiAnalysisAI/InferenceX#4356](https://github.com/SemiAnalysisAI/InferenceX/pull/4356))
+landed via [#20815](https://github.com/NVIDIA/TensorRT-LLM/pull/20815), and the
+runs are configured with regular engine arguments. The pinned NVIDIA container
+below already contains that code, so you do not need to build TensorRT-LLM.
 
 ## What Was Used
 
 | Component | Version |
 |---|---|
-| TensorRT-LLM commit | [`4d09932ca7240f6fbb4d0dea811691446cc8cf92`](https://github.com/NVIDIA/TensorRT-LLM/commit/4d09932ca7240f6fbb4d0dea811691446cc8cf92) on [`feat/1.3.0rc24-iter-perf-stats-interval`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/1.3.0rc24-iter-perf-stats-interval) |
-| Container | `nvcr.io/nvidia/tensorrt-llm/release:1.3.0a0.dev202610210406` |
-| Container digest | `sha256:16b3237826b7969a3a736ceae930f7d63fe44f3c44c8e6c59a9d4b01dd66c199` (amd64 and arm64 digests in [`source.yaml`](source.yaml)) |
+| TensorRT-LLM commit | [`0fd58c90ede974e01ecc53627ad5a9bc76846703`](https://github.com/NVIDIA/TensorRT-LLM/commit/0fd58c90ede974e01ecc53627ad5a9bc76846703) on [`main`](https://github.com/NVIDIA/TensorRT-LLM/tree/main) |
+| Container | `nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3.dev202611020007` |
+| Container digest | `sha256:f656ce79a88bfdbcd591fe0a5919fcb20c714b59fd73c8b9adb4101659762c7c` (amd64 and arm64 digests in [`source.yaml`](source.yaml)) |
 | `ai-dynamo`, `ai-dynamo-runtime` | `1.6.0.dev20261010` |
 | Checkpoint | [`nvidia/Qwen3.5-397B-A17B-NVFP4-V2`](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2) |
-| InferenceX recipe | `disagg-variants.yaml` at commit `bb54127914f6c7c039a5a89c5fd8590441e4fc90` (see [`source.yaml`](source.yaml)) |
+| InferenceX recipe | `disagg-variants.yaml` at commit `a9fc88e5b0a7ce82990c672d8e3bfd18cbf8e0a6` (see [`source.yaml`](source.yaml)) |
 
 To see the code, check out the commit:
 
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
-git checkout 4d09932ca7240f6fbb4d0dea811691446cc8cf92
+git checkout 0fd58c90ede974e01ecc53627ad5a9bc76846703
 ```
 
 ## Points
@@ -47,18 +48,34 @@ four-GPU GB300 nodes.
 
 | Point (configs/ directory) | Prefill | Decode | Decode batch | Concurrency | Nodes |
 |---|---|---|---:|---|---:|
-| `disagg-gb300-1p2d-tep4-tep8-c128-b16-mtp-kvoffload` | 1× TEP4 | 2× TEP8 (MoE TP2/EP4) | 16 | 128 | 5 |
-| `disagg-gb300-2p1d-tep2-tep8-c192-b64-mtp-kvoffload` | 2× TEP2 | 1× TEP8 (MoE TP2/EP4) | 64 | 192 | 3 |
-| `disagg-gb300-2p2d-tep2-tep8-c176-b32-mtp-kvoffload` | 2× TEP2 | 2× TEP8 (MoE TP2/EP4) | 32 | 176 | 5 |
-| `disagg-gb300-2p2d-tep4-tep8-c264-b32-mtp-kvoffload` | 2× TEP4 | 2× TEP8 (MoE TP2/EP4) | 32 | 264 | 6 |
-| `disagg-gb300-3p1d-dep4-dep16-b12-mtp-kvoffload` | 3× DEP4 | 1× DEP16 | 12 | 600, 700 | 7 |
-| `disagg-gb300-3p2d-dep4-dep4-c704-b32-mtp-kvoffload` | 3× DEP4 | 2× DEP4 | 32 | 704 | 5 |
+| `disagg-gb300-1p1d-tep4-tep16-c8-b1-mnt7-mtp6-kvoffload` | 1× TEP4 | 1× TEP16 (MoE TP2/EP8) | 1 | 8 | 5 |
+| `disagg-gb300-1p1d-tep4-tep16-c16-b4-mnt28-mtp6-kvoffload` | 1× TEP4 | 1× TEP16 (MoE TP2/EP8) | 4 | 16 | 5 |
+| `disagg-gb300-1p1d-tep4-tep8-c28-b6-mnt42-mtp6-kvoffload` | 1× TEP4 | 1× TEP8 (MoE TP2/EP4) | 6 | 28 | 3 |
+| `disagg-gb300-1p2d-tep4-tep8-c128-b16-mnt112-mtp6-kvoffload` | 1× TEP4 | 2× TEP8 (MoE TP2/EP4) | 16 | 128 | 5 |
+| `disagg-gb300-2p1d-tep2-tep8-c224-b64-mnt448-mtp6-kvoffload` | 2× TEP2 | 1× TEP8 (MoE TP2/EP4) | 64 | 224 | 3 |
+| `disagg-gb300-2p2d-tep2-tep8-c176-b32-mnt224-mtp6-kvoffload` | 2× TEP2 | 2× TEP8 (MoE TP2/EP4) | 32 | 176 | 5 |
+| `disagg-gb300-2p2d-tep4-tep8-c264-b32-mnt224-mtp6-kvoffload` | 2× TEP4 | 2× TEP8 (MoE TP2/EP4) | 32 | 264 | 6 |
+| `disagg-gb300-3p1d-tep2-tep8-b128-mnt896-mtp6-kvoffload` | 3× TEP2 | 1× TEP8 (MoE TP2/EP4) | 128 | 352, 392 | 4 |
+| `disagg-gb300-3p2d-dep4-dep4-c720-b36-mnt252-mtp6-kvoffload` | 3× DEP4 | 2× DEP4 | 36 | 720 | 5 |
 
-The Qwen3.5 optimizations of this branch are selected with one variable per
-role: `TRTLLM_Q35_PROFILE=gen` on decode workers and `TRTLLM_Q35_PROFILE=ctx` on
-prefill workers (already in the `.env` files). The profile applies only to
-Qwen3.5 on SM103 (GB300); a `TRTLLM_Q35_*` variable set explicitly in the
-environment keeps its value.
+The point names encode the topology and the tuned decode budget: `<n>p<m>d` is
+the number of prefill and decode workers, `tep4`/`tep16`/`dep4` the prefill and
+decode parallel sizes, `c` the benchmark concurrency, `b` the decode
+`max_batch_size`, and `mnt` the decode `max_num_tokens` — the draft budget
+`max_batch_size` batches × (`max_draft_len` 6 + 1) tokens, e.g. `mnt896` for
+`b128`. `mtp6` marks decode MTP with draft length 6, and `kvoffload` the native
+KV-cache host offload of `use_kv_cache_manager_v2`: each rank on both roles
+pins 128 GiB of host memory as the offload tier (`kv_cache_config.host_cache_size`).
+
+All role tuning is regular engine arguments; no environment switch selects it:
+TEP prefill workers run breakable prefill CUDA graphs (`prefill_cuda_graph_backend:
+breakable`, captured up to 16384 tokens), decode workers run MTP draft length 6
+with the per-point CUDA-graph batch lists, and the largest point runs attention
+data parallelism (`enable_attention_dp: true`) on both roles, with the DEP
+prefill on piecewise prefill CUDA graphs captured up to 8192 tokens. Settings
+the recipe clears from its shared base are simply absent from the exported
+files, so every `configs/<point>/<role>.yaml` is a standalone engine argument
+file.
 
 ## Run It
 
@@ -98,18 +115,21 @@ python3 examples/perf_reproductions/_common/check_image.py \
     examples/perf_reproductions/inferencex/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/GB300/agentx-disagg/source.yaml
 ```
 
-After the workers start, confirm that every worker applied its profile. Each
-rank logs one line; decode applies 89 switches, TEP prefill 10, and DEP prefill
-(attention DP) none:
+After the workers start, every role rank logs its native KV-offload host tier;
+decode ranks log the CUDA-graph capture of the batch list from the exported
+`decode.yaml`, TEP prefill ranks log the breakable prefill-graph capture, and
+the DEP4 prefill ranks log the piecewise path (the deprecation warning
+confirms `enable_piecewise_cuda_graph` engaged):
 
 ```bash
 python3 examples/perf_reproductions/_common/check_worker_logs.py \
     examples/perf_reproductions/inferencex/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/GB300/agentx-disagg/source.yaml \
-    decode='/path/to/logs/decode*.log' prefill_tep='/path/to/logs/prefill*.log'
+    all_roles='/path/to/logs/*.log' decode='/path/to/logs/decode*.log' prefill_tep='/path/to/logs/prefill*.log'
 ```
 
-Use `prefill_dep` instead of `prefill_tep` for the DEP4 prefill points. Then
-run the readiness and metrics checks from the deployment guide.
+Use `prefill_dep` instead of `prefill_tep` for the DEP4 prefill point. Each
+rank logs each line once. Then run the readiness and metrics checks from the
+deployment guide.
 
 ## Results
 
@@ -122,25 +142,29 @@ used by the harness.
 
 ## Upstream Status
 
+Everything this entry runs is on `main`; the [features](https://github.com/NVIDIA/TensorRT-LLM/pull/20815)
+of the earlier feature-branch submission merged in #20815.
+
 | Feature | Status on `main` |
 |---|---|
-| `TRTLLM_Q35_PROFILE` role profiles | Branch only |
-| Fused MoE front, dynamic expert assignment, low-M FP8 GEMMs | Branch only |
-| Fused FP8 decode attention, context-parallel and segmented decode attention | Branch only |
-| Fused GEMM + all-reduce + RMSNorm, low-latency all-reduce and exchange kernels | Branch only |
-| Fused GDN kernels, in-forward and branch-point Mamba snapshots | Branch only |
-| MTP context draft CUDA graphs, steady-state decode preparation, fused accept, sharded sampling | Branch only |
-| Breakable prefill CUDA graphs | Equivalent on `main` (`prefill_cuda_graph_backend`, #16609) |
+| Fused MoE front, dynamic expert assignment, low-M FP8 GEMMs | On `main` (#20815) |
+| Fused FP8 decode attention, context-parallel and segmented decode attention | On `main` (#20815) |
+| Fused GEMM + all-reduce + RMSNorm, low-latency all-reduce and exchange kernels | On `main` (#20815) |
+| Fused GDN kernels, in-forward and branch-point Mamba snapshots | On `main` (#20815) |
+| MTP context draft CUDA graphs, steady-state decode preparation, fused accept, sharded sampling | On `main` (#20815) |
+| Breakable prefill CUDA graphs (`prefill_cuda_graph_backend`) | On `main` (#16609, #20815) |
 | Sampled iteration perf stats (`iter_perf_stats_interval`) | On `main` (#19717) |
-| Shortest-first context scheduling, disaggregated first-step streaming | Branch only |
+| Shortest-first context scheduling, disaggregated first-step streaming | On `main` (#20815) |
 
 [`source.yaml`](source.yaml) holds the authoritative list.
 
 ## Known Differences
 
-- The branch selects breakable prefill CUDA graphs with `TRTLLM_PREFILL_BCG=1`
-  (in the TEP prefill `.env` files); `main` uses the
-  `prefill_cuda_graph_backend` configuration field instead.
-- The worker environments also set branch-specific variables outside the
-  Qwen3.5 profile, such as `TRTLLM_CTX_SCHED_SRPT` and
-  `TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP`; they have no effect on `main`.
+- Unlike the earlier submission, no environment variable selects the Qwen3.5
+  optimizations: the `.env` files carry only the transport, allocator, garbage
+  collection, and logging settings of the recipe, which apply to any model.
+- The largest point clears a few settings relative to the recipe's shared
+  base — DEP4 prefill drops `allreduce_strategy` and MTP drafting; DEP4 decode
+  drops the GEN transfer-window budget (`max_tokens_in_buffer`) and falls back
+  to the default MoE-TP. The exported files omit cleared settings, as noted in
+  [Points](#points).

@@ -3,7 +3,9 @@
 """Export an InferenceX multi-node srt-slurm recipe into per-point TensorRT-LLM configs.
 
 For every search-space point of one config key in ``inferencex-e2e/configs/nvidia-master.yaml``, this writes the
-resolved engine arguments and worker environment of each role (base settings merged with the point's override):
+resolved engine arguments and worker environment of each role (base settings merged with the point's override).
+Recipe schema 2 overrides use a YAML ``null`` to clear a base setting; cleared settings are omitted from the
+exported files so that they load as standalone engine arguments.
 
     <out>/points.yaml                       # one summary entry per point
     <out>/<point>/{prefill,decode}.yaml     # engine arguments (``--extra-engine-args`` / ``trtllm-serve --config``)
@@ -40,6 +42,14 @@ def _merge(base: dict, override: dict) -> dict:
         else:
             out[key] = value
     return out
+
+
+def _prune(value):
+    """Drop ``None`` values (recipe schema 2: a null clears the base setting) and empty dicts."""
+    if isinstance(value, dict):
+        out = {k: _prune(v) for k, v in value.items()}
+        return {k: v for k, v in out.items() if v is not None and v != {}}
+    return value
 
 
 def _git_head(path: Path) -> str:
@@ -81,12 +91,14 @@ def export(inferencex: Path, config_key: str, out: Path, repo: str) -> None:
                 for role in ROLES:
                     base_role = base["roles"][role]
                     over_role = (override.get("roles") or {}).get(role) or {}
-                    args = _merge(base_role.get("args") or {}, over_role.get("args") or {})
-                    env = {
-                        **(base.get("environment") or {}),
-                        **(base_role.get("env") or {}),
-                        **(over_role.get("env") or {}),
-                    }
+                    args = _prune(_merge(base_role.get("args") or {}, over_role.get("args") or {}))
+                    env = _prune(
+                        {
+                            **(base.get("environment") or {}),
+                            **(base_role.get("env") or {}),
+                            **(over_role.get("env") or {}),
+                        }
+                    )
                     (point_dir / f"{role}.yaml").write_text(
                         header + yaml.safe_dump(args, sort_keys=True)
                     )
@@ -97,9 +109,9 @@ def export(inferencex: Path, config_key: str, out: Path, repo: str) -> None:
                         )
                     )
                     summary[role] = {
-                        "workers": over_role.get("workers"),
-                        "nodes": over_role.get("nodes"),
-                        "gpus_per_worker": over_role.get("gpus"),
+                        "workers": over_role.get("workers", base_role.get("workers")),
+                        "nodes": over_role.get("nodes", base_role.get("nodes")),
+                        "gpus_per_worker": over_role.get("gpus", base_role.get("gpus")),
                         "tensor_parallel_size": args.get("tensor_parallel_size"),
                         "moe_expert_parallel_size": args.get("moe_expert_parallel_size"),
                         "moe_tensor_parallel_size": args.get("moe_tensor_parallel_size"),
