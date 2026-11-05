@@ -1056,7 +1056,10 @@ def run_parallel_test(model_name: str,
                       trust_remote_code: bool = False,
                       quant_algo: str = None,
                       kv_cache_quant_algo: str = None,
-                      max_batch_size: int = None):
+                      max_batch_size: int = None,
+                      extra_evaluator_kwargs: Optional[Dict[Union[str, type],
+                                                            Dict[str,
+                                                                 Any]]] = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -1114,7 +1117,10 @@ def run_parallel_test(model_name: str,
             llm.args.quant_config.quant_algo = quant_algo
         if kv_cache_quant_algo is not None:
             llm.args.quant_config.kv_cache_quant_algo = kv_cache_quant_algo
-        run_accuracy_test(llm, model_name, test_sets)
+        run_accuracy_test(llm,
+                          model_name,
+                          test_sets,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
@@ -2140,6 +2146,16 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     # fallback (_util.py's _validate_or_fallback_kv_cache_manager_v2).
     MODEL_NAME = "Qwen/Qwen3.5-4B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+    # Match the aggregate accuracy run that the gsm8k.yaml reference comes
+    # from (test_llm_api_pytorch.py::TestQwen3_5_4B). With raw completion
+    # prompts the model often opens its answer with an empty think block and
+    # long markdown that runs past the output budget, scoring well below the
+    # reference.
+    GSM8K_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
 
     @pytest.mark.skip_less_device(2)
     def test_mismatched_block_reuse(self, mocker):
@@ -2183,7 +2199,10 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # reference for this quant_algo differs from the unquantized one.
             llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
             llm.args.quant_config.kv_cache_quant_algo = "FP8"
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME, [GSM8K],
+                extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
 
     @pytest.mark.skip_less_device(4)
     def test_ctx_pp_gen_tp_asymmetric(self, mocker):
@@ -2211,7 +2230,8 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # ctx_pp=2 overflows the KV cache quota.
             # Other Qwen3.5-4B tests cap this at 32
             # (see test_llm_api_pytorch.py).
-            max_batch_size=32)
+            max_batch_size=32,
+            extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)

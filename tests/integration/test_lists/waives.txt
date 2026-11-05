@@ -81,7 +81,6 @@ full:DGX_B200/unittest/tools/test_layer_wise_benchmarks.py::test_performance_ali
 full:DGX_H100/disaggregated/test_disaggregated.py::test_disaggregated_context_first_bf16_ownership SKIP (https://nvbugs/7051902)
 full:DGX_H100/unittest/disaggregated/test_kv_transfer_mp.py::test_context_first_bf16_owned_transfer SKIP (https://nvbugs/7051902)
 full:DGX_H100/unittest/disaggregated/test_transfer_lifecycle_gpu.py::test_context_first_bf16_lifecycle_gpu SKIP (https://nvbugs/7051902)
-full:GB200/accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_mismatched_block_reuse SKIP (https://nvbugs/7023115)
 full:GB200/accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache] SKIP (https://nvbugs/7023116)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2-moe_backend=TRTLLM] SKIP (https://nvbugs/7023117)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm[cuda_graph=True] SKIP (https://nvbugs/6525897)
