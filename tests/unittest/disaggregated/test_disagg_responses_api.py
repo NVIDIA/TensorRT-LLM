@@ -82,6 +82,7 @@ def _responses_response(finish_reason="length", status="incomplete"):
 
 def _service(**attrs):
     service = OpenAIDisaggregatedService.__new__(OpenAIDisaggregatedService)
+    service._request_deadline_config = None
 
     async def ready():
         return True

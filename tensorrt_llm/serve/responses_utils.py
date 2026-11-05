@@ -75,6 +75,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (VALID_MESSAGE_CONTENT_MM_PART_TYPES,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
+from tensorrt_llm.serve.disagg_request_deadline import DisaggRequestTimeoutError
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
@@ -3207,6 +3208,8 @@ def _sse_delimiter_and_markers(sample: Any) -> Tuple[Any, tuple]:
 
 def classify_stream_termination(exc: Exception) -> str:
     """Attribute a stream-ending exception to a cause."""
+    if isinstance(exc, DisaggRequestTimeoutError):
+        return "request_timeout"
     if isinstance(exc, (RequestError, EngineDeadError)):
         return STREAM_TERMINATION_ENGINE_ERROR
     # By module, to keep the HTTP client library out of this layer.
@@ -3218,9 +3221,11 @@ def classify_stream_termination(exc: Exception) -> str:
 def describe_stream_termination(exc: Exception, cause: str) -> str:
     """The client-facing detail of a stream-ending exception.
 
-    Only engine errors carry their message; transport and internal errors can
-    name internal hosts.
+    Only engine and request-deadline errors carry their message; transport and
+    internal errors can name internal hosts.
     """
+    if isinstance(exc, DisaggRequestTimeoutError):
+        return str(exc)
     if cause == STREAM_TERMINATION_ENGINE_ERROR and str(exc):
         return f"{type(exc).__name__}: {exc}"
     return type(exc).__name__

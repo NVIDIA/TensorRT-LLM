@@ -11,21 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import json
+from collections.abc import AsyncGenerator
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 from starlette.datastructures import Headers
+from starlette.requests import ClientDisconnect
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+from tensorrt_llm.serve.disagg_request_deadline import DisaggRequestTimeoutError
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    ChatCompletionStreamResponse,
     CompletionRequest,
     ConversationParams,
     DisaggregatedParams,
+    ResponsesRequest,
 )
+from tensorrt_llm.serve.responses_utils import ClosingStreamingResponse
 
 pytestmark = pytest.mark.cpu_only
 
@@ -324,3 +336,236 @@ def test_disagg_config_rejects_non_bool_request_chat_template_opt_in(value):
             generation_servers={"num_instances": 0},
             allow_request_chat_template=value,
         )
+
+
+_Protocol = Literal["completion", "chat", "responses", "anthropic"]
+_PROTOCOLS = ["completion", "chat", "responses", "anthropic"]
+
+
+def _deadline_server(entry_point: AsyncMock, enabled: bool = True) -> OpenAIDisaggServer:
+    """Build the real route wrapper without starting workers."""
+    server = object.__new__(OpenAIDisaggServer)
+    server._config = extract_disagg_cfg(
+        context_servers={"num_instances": 0},
+        generation_servers={"num_instances": 0},
+        request_deadline={"total_seconds": 5.0} if enabled else None,
+    )
+    server._allow_request_chat_template = False
+    server._collect_perf_metrics = False
+    server._perf_metrics_collector = Mock()
+    server._service = SimpleNamespace(openai_chat_completion=entry_point)
+    return server
+
+
+async def _call_deadline_route(
+    server: OpenAIDisaggServer, protocol: _Protocol, *, stream: bool
+) -> Response:
+    """Exercise the protocol entry point with an accepted HTTP request."""
+    raw = Request({"type": "http", "headers": [], "state": {"server_arrival_time": 0}})
+    messages = [{"role": "user", "content": "hello"}]
+    if protocol == "anthropic":
+        return await server.anthropic_messages(
+            AnthropicMessagesRequest(
+                model="test-model", messages=messages, max_tokens=8, stream=stream
+            ),
+            raw,
+        )
+    if protocol == "completion":
+        request = CompletionRequest(model="test-model", prompt="hello", stream=stream)
+    elif protocol == "chat":
+        request = ChatCompletionRequest(model="test-model", messages=messages, stream=stream)
+    else:
+        request = ResponsesRequest(model="test-model", input="hello", stream=stream)
+    return await server._wrap_entry_point(server._service.openai_chat_completion, type(request))(
+        request, raw
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+@pytest.mark.parametrize("stream", [False, True])
+async def test_request_deadline_before_headers_is_http_504(
+    protocol: _Protocol, stream: bool
+) -> None:
+    error = DisaggRequestTimeoutError(5.0)
+    server = _deadline_server(AsyncMock(side_effect=error))
+
+    if protocol == "anthropic":
+        response = await _call_deadline_route(server, protocol, stream=stream)
+        assert response.status_code == 504
+        assert json.loads(response.body)["error"]["message"] == str(error)
+    else:
+        with pytest.raises(HTTPException) as caught:
+            await _call_deadline_route(server, protocol, stream=stream)
+        assert caught.value.status_code == 504
+        assert caught.value.detail == str(error)
+        assert caught.value.__cause__ is error
+    server._perf_metrics_collector.http_exceptions.inc.assert_called_once()
+    server._perf_metrics_collector.internal_errors.inc.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+async def test_request_deadline_after_headers_is_terminal_error(protocol: _Protocol) -> None:
+    closed = []
+    error = DisaggRequestTimeoutError(5.0)
+
+    async def source() -> AsyncGenerator[str, None]:
+        try:
+            yield ": ready\n\n"
+            raise error
+        finally:
+            closed.append(True)
+
+    server = _deadline_server(AsyncMock(return_value=source()))
+    response = await _call_deadline_route(server, protocol, stream=True)
+    assert isinstance(response, ClosingStreamingResponse)
+    frames = [frame async for frame in response.body_iterator]
+    body = "".join(frame.decode() if isinstance(frame, bytes) else frame for frame in frames)
+
+    assert str(error) in body
+    if protocol in ("completion", "chat"):
+        payload = json.loads(body.split("data: ", 1)[1])
+        assert payload["error"]["code"] == "request_timeout"
+    else:
+        assert "event: error\n" in body
+        if protocol == "responses":
+            assert '"code":"request_timeout"' in body
+    assert "[DONE]" not in body
+    assert "event: response.completed" not in body
+    assert "event: message_stop" not in body
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+async def test_deadline_stream_closes_source_when_sending_headers_fails(
+    protocol: _Protocol,
+) -> None:
+    closed = []
+    consumed = []
+
+    async def source() -> AsyncGenerator[str, None]:
+        try:
+            # The service primes its cleanup scope before returning the stream.
+            yield ""
+            consumed.append(True)
+            yield ": ready\n\n"
+        finally:
+            closed.append(True)
+
+    upstream = source()
+    await upstream.__anext__()
+    response = await _call_deadline_route(
+        _deadline_server(AsyncMock(return_value=upstream)), protocol, stream=True
+    )
+
+    async def send(message: dict[str, object]) -> None:
+        assert message["type"] == "http.response.start"
+        raise OSError("connection reset")
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+    with pytest.raises(ClientDisconnect):
+        await response(scope, AsyncMock(), send)
+
+    assert consumed == []
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+@pytest.mark.parametrize("during_stream", [False, True])
+async def test_caller_cancellation_is_not_request_timeout(
+    protocol: _Protocol, during_stream: bool
+) -> None:
+    closed = []
+
+    async def source() -> AsyncGenerator[str, None]:
+        try:
+            yield ": ready\n\n"
+            raise asyncio.CancelledError
+        finally:
+            closed.append(True)
+
+    entry_point = (
+        AsyncMock(return_value=source())
+        if during_stream
+        else AsyncMock(side_effect=asyncio.CancelledError)
+    )
+    server = _deadline_server(entry_point)
+    with pytest.raises(asyncio.CancelledError):
+        response = await _call_deadline_route(server, protocol, stream=True)
+        async for _ in response.body_iterator:
+            pass
+    assert closed == ([True] if during_stream else [])
+    server._perf_metrics_collector.http_exceptions.inc.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["completion", "chat", "responses"])
+async def test_deadline_wrapper_preserves_other_stream_errors(protocol: _Protocol) -> None:
+    error = TimeoutError("worker timeout")
+
+    async def source() -> AsyncGenerator[str, None]:
+        yield ": ready\n\n"
+        raise error
+
+    response = await _call_deadline_route(
+        _deadline_server(AsyncMock(return_value=source())), protocol, stream=True
+    )
+    with pytest.raises(TimeoutError) as caught:
+        async for _ in response.body_iterator:
+            pass
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["responses", "anthropic"])
+async def test_late_deadline_does_not_publish_withheld_terminal_event(protocol: _Protocol) -> None:
+    if protocol == "responses":
+        worker_frames = [
+            ": ready\n\n",
+            'event: response.completed\ndata: {"type":"response.completed"}\n\n',
+        ]
+    else:
+        chunk = ChatCompletionStreamResponse(
+            model="test-model",
+            choices=[{"index": 0, "delta": {"content": "hello"}, "finish_reason": "stop"}],
+        )
+        worker_frames = [f"data: {chunk.model_dump_json()}\n\n", "data: [DONE]\n\n"]
+
+    async def source() -> AsyncGenerator[str, None]:
+        for frame in worker_frames:
+            yield frame
+        raise DisaggRequestTimeoutError(5.0)
+
+    response = await _call_deadline_route(
+        _deadline_server(AsyncMock(return_value=source())), protocol, stream=True
+    )
+    frames = [frame async for frame in response.body_iterator]
+    body = "".join(frame.decode() if isinstance(frame, bytes) else frame for frame in frames)
+
+    if protocol == "responses":
+        # This terminal event was already relayed before worker EOF.
+        assert "event: error" not in body
+        assert "event: response.completed" in body
+    else:
+        # Anthropic holds message_stop until EOF; expiry must not create success.
+        assert "event: error" in body
+        assert "E2E budget" in body
+        assert "event: message_stop" not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+async def test_disabled_request_deadline_keeps_existing_stream_response(
+    protocol: _Protocol,
+) -> None:
+    async def source() -> AsyncGenerator[str, None]:
+        yield "data: [DONE]\n\n"
+
+    response = await _call_deadline_route(
+        _deadline_server(AsyncMock(return_value=source()), enabled=False), protocol, stream=True
+    )
+    assert type(response) is StreamingResponse
+    await response.body_iterator.aclose()
