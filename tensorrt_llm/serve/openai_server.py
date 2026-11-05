@@ -648,6 +648,11 @@ class OpenAIServer(_VideoRoutesMixin):
         # A broken built-in extension module must fail the server start, not
         # the first request that consults it.
         load_builtin_extensions()
+        # Read the switch once here instead of at import, so a value set any time
+        # before the server starts applies. A bad value fails the launch: reading
+        # it as "1" would break a working deployment, and reading it as "0" would
+        # leave server-side paths open on a deployment that expects them refused.
+        self._local_media_path_disallowed = local_media_path_is_disallowed()
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
         self._embedding_max_queue_delay = embedding_max_queue_delay
@@ -3915,7 +3920,11 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, self.generator)
+                params = parse_visual_gen_params(
+                    request,
+                    self.generator,
+                    local_media_path_disallowed=self.
+                    _local_media_path_disallowed)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -4077,7 +4086,7 @@ class OpenAIServer(_VideoRoutesMixin):
         """
         if response_format != "path":
             return None
-        if local_media_path_is_disallowed():
+        if self._local_media_path_disallowed:
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
                 "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
@@ -4173,7 +4182,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = parse_visual_gen_params(
+                    request,
+                    self.generator,
+                    local_media_path_disallowed=self.
+                    _local_media_path_disallowed)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )

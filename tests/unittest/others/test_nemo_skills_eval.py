@@ -210,7 +210,8 @@ def test_scicode_grader_shim_leading_newline():
 
 
 # --- The sandbox runs model-generated code: remote hosts need an opt-in -----
-@pytest.mark.parametrize("allow_remote, starts", [(None, False), ("true", True)])
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("allow_remote, starts", [(None, False), ("false", False), ("true", True)])
 def test_sandbox_auto_start_on_remote_host_needs_opt_in(monkeypatch, allow_remote, starts):
     import socket
     import subprocess

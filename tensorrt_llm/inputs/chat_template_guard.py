@@ -164,7 +164,8 @@ def validate_chat_template_kwargs(
         raise UnusedChatTemplateKwargsError(
             f"chat_template_kwargs {unknown} are not referenced by the active chat template. "
             "Remove them, or set "
-            f"{ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR}=1 to allow them with a warning."
+            f"{ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR}=1 before starting the process "
+            "to allow them with a warning."
         )
     template_hash = hashlib.sha256(template_source.encode("utf-8")).hexdigest()
     for key in unknown:

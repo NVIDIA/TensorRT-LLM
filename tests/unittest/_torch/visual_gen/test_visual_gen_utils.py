@@ -23,7 +23,6 @@ import pytest
 from fastapi import UploadFile
 from PIL import Image
 
-from tensorrt_llm.serve import visual_gen_utils
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.serve.visual_gen_utils import (
     _merge_extra_params,
@@ -980,14 +979,13 @@ class TestLocalMediaPathCanBeDisallowed:
             prompt="x", image_reference={"content": content, "format": fmt}
         )
 
-    def test_path_is_accepted_by_default(self, monkeypatch):
-        monkeypatch.setattr(visual_gen_utils, "_LOCAL_MEDIA_PATH_DISALLOWED", False)
+    def test_path_is_accepted_by_default(self):
         params = parse_visual_gen_params(self._request(), _StubVisualGen())
 
         assert params.image_reference[0].format == "path"
 
-    def test_path_is_refused_when_disallowed(self, monkeypatch):
-        monkeypatch.setattr(visual_gen_utils, "_LOCAL_MEDIA_PATH_DISALLOWED", True)
-
+    def test_path_is_refused_when_disallowed(self):
         with pytest.raises(ValueError, match="is disallowed on this server"):
-            parse_visual_gen_params(self._request(), _StubVisualGen())
+            parse_visual_gen_params(
+                self._request(), _StubVisualGen(), local_media_path_disallowed=True
+            )
