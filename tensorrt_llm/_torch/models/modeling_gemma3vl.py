@@ -181,6 +181,9 @@ class Gemma3MultiModalProjector(torch.nn.Module):
     ))
 class Gemma3VLM(PreTrainedModel):
 
+    # The native vision path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
     @classmethod

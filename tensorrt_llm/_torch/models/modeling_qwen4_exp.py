@@ -1251,6 +1251,8 @@ _QWEN4_EXP_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
     """Composite model using the production Qwen3-VL vision stack."""
 
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
+
     supports_encoder_cache = True
 
     @classmethod
