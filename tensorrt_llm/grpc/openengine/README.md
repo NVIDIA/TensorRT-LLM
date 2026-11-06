@@ -74,6 +74,9 @@ For models that do not accept token-ID input, including Whisper, the optional
 applicable. It does not submit inference and does not establish inference liveness;
 the ordinary lifecycle and executor health checks still apply.
 
+`Control.Shutdown` currently returns `UNIMPLEMENTED`. Stop the serving process
+through its supervisor or with SIGTERM to run the normal engine shutdown path.
+
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
@@ -370,3 +373,17 @@ The helpers use the encoder-handoff contract proposed in
 immutable source revision in the vendor lock. It is not in a published BSR
 release. Serving role discovery, request dispatch and lifecycle integration are
 provided by the stacked serving change.
+
+### Encoder transport tests
+
+The CPU CI list collects `test_encoder_nixl.py`, but its two native NIXL/UCX
+transfer tests are opt-in local/QA tests. They require a compatible native runtime
+and are not enabled by the default CPU job. Run them explicitly with:
+
+```bash
+TRTLLM_TEST_NIXL_ENCODER=1 python3 -m pytest tests/unittest/grpc/openengine/test_encoder_nixl.py
+```
+
+These native tests use CPU buffers and exercise registration, WRITE, and
+release, including separate producer/consumer processes. Cross-host CUDA E+PD
+and E/P/D require separate GPU validation.

@@ -3,6 +3,7 @@
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,33 @@ from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("removed_before", ["stat", "unlink"])
+def test_collection_tolerates_a_concurrently_removed_file(tmp_path, monkeypatch, removed_before):
+    cache = oe.EncoderCache(str(tmp_path))
+    claimed = tmp_path / "claimed.tmp"
+    claimed.write_bytes(b"expired")
+    os.utime(claimed, (1, 1))
+    retained = tmp_path / "retained.safetensors"
+    retained.write_bytes(b"retained")
+    expected_bytes = retained.stat().st_size
+    original = getattr(Path, removed_before)
+    unlink = Path.unlink
+    removed = False
+
+    def remove_first(path, *args, **kwargs):
+        nonlocal removed
+        if path == claimed and not removed:
+            removed = True
+            unlink(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, removed_before, remove_first)
+    assert cache._collect() == expected_bytes
+    assert removed
+    assert retained.is_file()
+    assert not claimed.exists()
 
 
 def request():
