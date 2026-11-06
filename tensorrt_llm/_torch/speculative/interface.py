@@ -2875,6 +2875,13 @@ class SpecWorkerBase(nn.Module, ABC):
         num_gens = batch_size - num_contexts
         runtime_draft_len = draft_tokens.shape[1]
         gen_end = num_contexts + num_gens * (runtime_draft_len + 1)
+        # The acceptance slot's stream, as the reference passes to
+        # rejection_sampling_one_model.
+        seed, offset = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            slot=spec_metadata.rng_accept_slot)
         gen_accepted, gen_num_accepted = fast_rs_verify(
             logits[num_contexts:gen_end],
             spec_metadata.temperatures[num_contexts:gen_end],
@@ -2882,8 +2889,8 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.batch_slot_ids[num_contexts:batch_size],
             self._fast_rs_dummy_row(spec_metadata),
             spec_metadata.draft_probs,
-            spec_metadata.request_seeds[num_contexts:batch_size],
-            spec_metadata.request_offsets[num_contexts:batch_size],
+            seed,
+            offset,
         )
         if num_contexts == 0:
             return gen_accepted, gen_num_accepted
