@@ -792,7 +792,9 @@ class DecoderCudaGraphs:
         regime ceiling, the step's longest live KV rounded up, instead of the
         page-table capacity. Resolved at capture, once the KV cache exists; the
         regimes of a shape are those its 2x | 4x | two-stream decision can tell
-        apart (``kv_regimes_for_batch``), one for most shapes.
+        apart (``kv_regimes_for_batch``), one for most shapes. The graph runner
+        resolves every decode step, so each shape is computed once: replay keeps
+        the ceilings its graphs were captured for.
         """
         # Only an FP4 MLA KV cache gets regimes (the predicate under which the
         # attention metadata carries an fp4_mla_state); every other model returns
@@ -827,6 +829,7 @@ class DecoderCudaGraphs:
         capacity = int(kv_cache_manager.max_blocks_per_seq) * FP4_MLA_TOKENS_PER_BLOCK
         sm_count = self._decode_sm_count()
 
+        @functools.cache
         def resolver(batch_size: int, draft_len: int) -> tuple[int, ...]:
             query_len = int(draft_len) + 1
             return fp4_mla_dispatch.kv_regimes_for_batch(
