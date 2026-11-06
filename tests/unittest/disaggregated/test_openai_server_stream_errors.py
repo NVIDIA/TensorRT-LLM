@@ -23,7 +23,7 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.responses import StreamingResponse
@@ -34,7 +34,8 @@ from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError, ErrorResponse
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve import openai_server
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
@@ -172,3 +173,122 @@ async def test_llm_shutdown_admission_returns_service_unavailable(executor):
     )
     assert response.status_code == 503
     assert json.loads(response.body)["message"] == "LLM is shutting down"
+
+
+class _HarmonyPromise:
+    """A postprocessed partial response followed by an executor exception."""
+
+    def __init__(self, error: BaseException | None, partial: bool = False) -> None:
+        self.error = error
+        self.partial = partial
+
+    async def aresult(self) -> None:
+        assert self.error is not None
+        raise self.error
+
+    def __aiter__(self) -> "_HarmonyPromise":
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        if self.partial:
+            self.partial = False
+            return SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        _postprocess_result=[
+                            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n\n'
+                        ]
+                    )
+                ]
+            )
+        if self.error is not None:
+            raise self.error
+        raise StopAsyncIteration
+
+
+@pytest.fixture
+def harmony_server(monkeypatch) -> OpenAIServer:
+    engine = _FailingEngine("")
+    engine.args.num_postprocess_workers = 1
+    server = _bare_server(engine)
+    server.allow_request_chat_template = False
+    server.harmony_adapter = SimpleNamespace(get_stop_tokens=lambda: [])
+    server._extract_metrics = AsyncMock()
+    monkeypatch.setattr(openai_server, "tokenize_harmony_chat_request", lambda *_a, **_kw: [1])
+    return server
+
+
+@pytest.mark.parametrize(
+    "stage,error",
+    [
+        ("admission", EngineDeadError(RuntimeError("worker exited"))),
+        ("admission", EngineUnavailableError("command queue is full")),
+        ("nonstream", EngineDeadError(RuntimeError("worker exited"))),
+        ("first_chunk", EngineDeadError(RuntimeError("worker exited"))),
+        ("partial", EngineDeadError(RuntimeError("worker exited"))),
+    ],
+)
+@pytest.mark.asyncio
+async def test_harmony_engine_failure_returns_503_or_an_explicit_stream_error(
+    harmony_server, stage, error
+):
+    # Regression: Harmony must not turn worker loss into a bad request or a
+    # broken streaming connection, including after partial output.
+    def generate(**_kwargs):
+        if stage == "admission":
+            raise error
+        return _HarmonyPromise(error, partial=stage == "partial")
+
+    harmony_server.generator.generate_async = generate
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=4,
+        stream=stage != "nonstream",
+    )
+    response = await harmony_server.chat_harmony(request, raw)
+    if stage in ("admission", "nonstream"):
+        assert response.status_code == 503
+        assert json.loads(response.body)["type"] == "ServiceUnavailableError"
+    else:
+        assert isinstance(response, StreamingResponse)
+        assert response.status_code == 200
+        chunks = [chunk async for chunk in response.body_iterator]
+        frames = [json.loads(chunk[len("data: ") :]) for chunk in chunks[:-1]]
+        assert frames[-1]["error"]["message"] == str(error)
+        assert frames[-1]["error"]["type"] == "server_error"
+        assert chunks[-1] == "data: [DONE]\n\n"
+        assert len(frames) == (2 if stage == "partial" else 1)
+        for frame in frames[:-1]:
+            assert frame["choices"][0]["delta"]["content"] == "Hello"
+            assert frame["choices"][0]["finish_reason"] is None
+    await asyncio.sleep(0)  # finish the disconnect watcher
+
+
+@pytest.mark.parametrize(
+    "error", [asyncio.CancelledError(), ValueError("postprocessor failed"), None]
+)
+@pytest.mark.asyncio
+async def test_harmony_stream_preserves_cancellation_unexpected_errors_and_success(
+    harmony_server, error
+):
+    harmony_server.generator.generate_async = lambda **_kwargs: _HarmonyPromise(error, partial=True)
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    response = await harmony_server.chat_harmony(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=True,
+        ),
+        raw,
+    )
+    stream = response.body_iterator
+    assert "Hello" in await stream.__anext__()
+    if error is not None:
+        with pytest.raises(type(error)):
+            await stream.__anext__()
+    else:
+        assert [chunk async for chunk in stream] == ["data: [DONE]\n\n"]
+        harmony_server._extract_metrics.assert_awaited_once()
+    await asyncio.sleep(0)

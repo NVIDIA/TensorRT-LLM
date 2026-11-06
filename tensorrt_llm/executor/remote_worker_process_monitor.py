@@ -192,8 +192,8 @@ class RemoteWorkerProcessMonitor:
                     else:
                         self._accept_report(report)
                     readable = self._queue.poll(0)
-                if readable:
-                    continue
+                # Check leases after each bounded drain, even if traffic keeps
+                # arriving. A busy peer must not hide a silent rank forever.
                 now = time.monotonic()
                 with self._lock:
                     expired = [
