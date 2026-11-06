@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4:
+- condition:
+    ranges:
+      # 1 ctx worker with 1 node and 2 GPUs
+      # 1 gen worker with 1 node and 4 GPUs
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb300*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # minimax-m3-fp4 eagle3 150k1k con1 and con64: TP2 ctx worker, TP4 gen worker
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (45)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_minimax-m3-fp4_150k1k_con64_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (65)

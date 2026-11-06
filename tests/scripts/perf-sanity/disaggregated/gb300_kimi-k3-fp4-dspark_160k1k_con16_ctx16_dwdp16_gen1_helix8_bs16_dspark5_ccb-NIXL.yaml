@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Kimi-K3 NVFP4 + DSpark decode at a fixed long context, for the gen_only_no_context
-# lane: one helix (CP8) gen worker on 2 GB300 nodes decodes 16 requests of exactly
+# Kimi-K3 NVFP4 + DSpark decode at a fixed long context. In the gen_only_no_context
+# lane, one helix (CP8) gen worker on 2 GB300 nodes decodes 16 requests of exactly
 # 163840 input / 1024 output random tokens. This is the gen-only method of the K3
 # GB300 optimization work (balanced ISL 163840, steady-state step time), on the
 # helix8 bs16 dspark5 gen worker of
@@ -12,7 +12,8 @@
 # copied from that file unchanged; the AgentX trace replay, its client env, the
 # conversation router and the chat-history proxy options are left out. The ctx
 # section (the recipe's 16-GPU DWDP prefill fleet) is not started by
-# gen_only_no_context.
+# gen_only_no_context. The ctx_only lane runs it alone as one 16-GPU attention-DP
+# server, and the e2e lane runs the fleet in front of the gen worker.
 metadata:
   model_name: kimi_k3_nvfp4
   precision: fp4
