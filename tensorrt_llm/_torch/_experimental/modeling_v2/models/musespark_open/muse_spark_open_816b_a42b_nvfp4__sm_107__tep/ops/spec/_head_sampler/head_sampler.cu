@@ -52,6 +52,7 @@
 // the word to the sentinel. No -0 canonicalization: the gathered row is the GEMM's
 // bits.
 
+#include "draft_path_sample.cuh"
 #include "fusedSamplingKernelsCommon.cuh"
 
 #include <ATen/ATen.h>
@@ -63,6 +64,7 @@
 #include <climits>
 #include <cstdint>
 #include <optional>
+#include <tuple>
 
 namespace tensorrt_llm
 {
@@ -1791,6 +1793,89 @@ at::Tensor vpArgmax(at::Tensor const& status, int64_t rows, int64_t copy, int64_
     return tokens;
 }
 
+//! The DFlash 2 sampled path walk (draft_path_sample.cuh): the [B, K] int32 draft tokens and the [K, B, top_k]
+//! distributions the positions were drawn from. With draft_probs, also writes each position's distribution into
+//! its request's slot row at the candidates' vocabulary ids (the caller zeroes those rows first).
+std::tuple<at::Tensor, at::Tensor> draftPathSample(at::Tensor const& edges, at::Tensor const& unary,
+    at::Tensor const& ids, at::Tensor const& temperatures, at::Tensor const& topKs, at::Tensor const& topPs,
+    at::Tensor const& minPs, at::Tensor const& seed, at::Tensor const& offset, int64_t slotBase, int64_t slotSpan,
+    std::optional<at::Tensor> const& draftProbs, std::optional<at::Tensor> const& slots)
+{
+    TORCH_CHECK(unary.is_cuda() && unary.dim() == 3 && unary.scalar_type() == at::kFloat && unary.is_contiguous(),
+        "unary must be a contiguous FP32 [B, K, top_k] CUDA tensor");
+    int64_t const rows = unary.size(0);
+    int64_t const steps = unary.size(1);
+    int64_t const topK = unary.size(2);
+    TORCH_CHECK(rows >= 1 && rows <= INT32_MAX && steps >= 1 && topK >= 1 && topK <= fs::kNarrowBlock,
+        "unary shape out of range");
+    TORCH_CHECK(edges.scalar_type() == at::kFloat && edges.is_contiguous()
+            && edges.sizes() == at::IntArrayRef({rows, steps, topK, topK}),
+        "edges must be a contiguous FP32 [B, K, top_k, top_k] tensor");
+    TORCH_CHECK(ids.scalar_type() == at::kLong && ids.is_contiguous() && ids.sizes() == unary.sizes(),
+        "candidate ids must be a contiguous int64 [B, K, top_k] tensor");
+    checkRowVector(temperatures, "temperatures", at::kFloat, rows);
+    checkRowVector(topKs, "top_ks", at::kInt, rows);
+    checkRowVector(topPs, "top_ps", at::kFloat, rows);
+    checkRowVector(minPs, "min_ps", at::kFloat, rows);
+    checkRowVector(seed, "seed", at::kLong, rows);
+    checkRowVector(offset, "offset", at::kLong, rows);
+    TORCH_CHECK(draftProbs.has_value() == slots.has_value(), "draft_probs and slots go together");
+    at::cuda::CUDAGuard guard(unary.device());
+
+    auto const options = unary.options();
+    auto rowScratch = at::empty({steps, rows, topK}, options);
+    auto probs = at::empty({steps, rows, topK}, options);
+    auto offsets = at::empty({steps, rows}, options.dtype(at::kLong));
+    auto picks = at::empty({steps, rows}, options.dtype(at::kInt));
+    auto tokens = at::empty({rows, steps}, options.dtype(at::kInt));
+
+    fs::DraftPathSampleParams p;
+    p.edges = edges.data_ptr<float>();
+    p.unary = unary.data_ptr<float>();
+    p.ids = ids.data_ptr<int64_t>();
+    p.temperatures = temperatures.data_ptr<float>();
+    p.topKs = topKs.data_ptr<int32_t>();
+    p.topPs = topPs.data_ptr<float>();
+    p.minPs = minPs.data_ptr<float>();
+    p.seed = seed.data_ptr<int64_t>();
+    p.offset = offset.data_ptr<int64_t>();
+    p.slotBase = slotBase;
+    p.slotSpan = slotSpan;
+    p.rows = rowScratch.data_ptr<float>();
+    p.probs = probs.data_ptr<float>();
+    p.offsets = offsets.data_ptr<int64_t>();
+    p.picks = picks.data_ptr<int32_t>();
+    p.tokens = tokens.data_ptr<int32_t>();
+    if (draftProbs.has_value())
+    {
+        auto const& dp = draftProbs.value();
+        auto const& sl = slots.value();
+        TORCH_CHECK(
+            dp.is_cuda() && dp.scalar_type() == at::kFloat && dp.dim() == 3 && dp.stride(2) == 1 && dp.size(1) >= steps,
+            "draft_probs must be an FP32 [slots, >= K, vocab] tensor with unit vocabulary stride");
+        checkRowVector(sl, "slots", at::kLong, rows);
+        p.draftProbs = dp.data_ptr<float>();
+        p.slots = sl.data_ptr<int64_t>();
+        p.draftProbsSlotStride = dp.stride(0);
+        p.draftProbsStepStride = dp.stride(1);
+    }
+    p.numRows = static_cast<int32_t>(rows);
+    p.numSteps = static_cast<int32_t>(steps);
+    p.topK = static_cast<int32_t>(topK);
+    // The shipped launcher's block: 1024 threads up to kWideBlockMaxRows rows, else 512.
+    if (rows <= fs::kWideBlockMaxRows)
+    {
+        launch(fs::draftPathSampleKernel<fs::kWideBlock>, dim3(static_cast<unsigned>(rows)), dim3(fs::kWideBlock),
+            false, p);
+    }
+    else
+    {
+        launch(fs::draftPathSampleKernel<fs::kNarrowBlock>, dim3(static_cast<unsigned>(rows)), dim3(fs::kNarrowBlock),
+            false, p);
+    }
+    return {tokens, probs};
+}
+
 } // namespace
 
 TORCH_LIBRARY(musespark_open_sm107_head_sampler, m)
@@ -1829,6 +1914,10 @@ TORCH_LIBRARY(musespark_open_sm107_head_sampler, m)
     m.def(
         "vp_argmax(Tensor(a!) status, int rows, int copy, int rank, int ranks, int shard_vecs, int state_stride, "
         "int greedy_offset, int greedy_stride, int cand_stride, int timeout_s, bool pdl) -> Tensor");
+    m.def(
+        "draft_path_sample(Tensor edges, Tensor unary, Tensor ids, Tensor temperatures, Tensor top_ks, "
+        "Tensor top_ps, Tensor min_ps, Tensor seed, Tensor offset, int slot_base, int slot_span, "
+        "Tensor(a!)? draft_probs, Tensor? slots) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(musespark_open_sm107_head_sampler, CUDA, m)
@@ -1844,4 +1933,5 @@ TORCH_LIBRARY_IMPL(musespark_open_sm107_head_sampler, CUDA, m)
     m.impl("vp_draw", &vpDraw);
     m.impl("vp_decide", &vpDecide);
     m.impl("vp_argmax", &vpArgmax);
+    m.impl("draft_path_sample", &draftPathSample);
 }
