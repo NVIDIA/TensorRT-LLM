@@ -830,7 +830,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     #
-                    # Async arrive accumulator buffer empty ealier when overlapping_accum is enabled
+                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
