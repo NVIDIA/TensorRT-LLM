@@ -215,6 +215,42 @@ def test_qwen35_dense_vl_normalizes_native_nvfp4_mlp_paths(sm_version: int) -> N
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("qkv_algo", "z_algo", "fused_algo"),
+    [
+        (QuantAlgo.FP8, QuantAlgo.FP8, QuantAlgo.FP8),
+        (
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+        ),
+        # Mixed FP8 schemes cannot share one fused Linear: no fused entry.
+        (QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None),
+    ],
+)
+def test_qwen35_fuses_fp8_linear_attn_in_proj_entries(
+    qkv_algo: QuantAlgo, z_algo: QuantAlgo, fused_algo: QuantAlgo | None
+) -> None:
+    prefix = "model.language_model.layers.0.linear_attn"
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            f"{prefix}.in_proj_qkv": QuantConfig(quant_algo=qkv_algo),
+            f"{prefix}.in_proj_z": QuantConfig(quant_algo=z_algo),
+            f"{prefix}.out_proj": QuantConfig(quant_algo=z_algo),
+        },
+    )
+
+    _normalize_qwen35_quant_config_dict(model_config)
+
+    qcd = model_config.quant_config_dict
+    fused = qcd.get("model.layers.0.linear_attn.in_proj_qkvz")
+    assert (fused.quant_algo if fused is not None else None) == fused_algo
+    assert qcd["model.layers.0.linear_attn.out_proj"].quant_algo == z_algo
+    assert "model.layers.0.linear_attn.in_proj_qkv" not in qcd
+
+
 @pytest.mark.parametrize(
     ("sm_version", "expected_algo"),
     [
@@ -372,17 +408,22 @@ def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int)
         )
 
 
-def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
-    name = "model.language_model.layers.0.mlp.gate_proj"
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN])
+def test_qwen35_dense_vl_normalizes_fp8_mlp_paths(quant_algo: QuantAlgo) -> None:
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(num_hidden_layers=64),
-        quant_config_dict={name: QuantConfig(quant_algo=QuantAlgo.FP8)},
+        quant_config_dict={
+            f"model.language_model.layers.0.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        },
     )
 
     _normalize_qwen35_quant_config_dict(model_config)
 
     assert model_config.quant_config_dict == {
-        "model.layers.0.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
+        f"model.layers.0.mlp.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+        for proj in ("gate_proj", "up_proj", "down_proj")
     }
 
 
