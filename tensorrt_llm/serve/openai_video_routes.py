@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
+from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings,
@@ -176,7 +177,7 @@ class _VideoRoutesMixin:
                 )
                 output = await handle.aresult()
             except ValidationError as exc:
-                return self._render_pydantic_validation_error(exc)
+                return render_visual_gen_validation_error(exc, self.create_error_response)
             except ValueError as exc:
                 logger.error(f"Video request error: {exc}")
                 return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
@@ -270,7 +271,7 @@ class _VideoRoutesMixin:
             )
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(exc, self.create_error_response)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(
@@ -357,35 +358,6 @@ class _VideoRoutesMixin:
             f"Unsupported content-type: {content_type}. Use 'application/json' or 'multipart/form-data'"
         )
 
-    def _render_pydantic_validation_error(self, exc: ValidationError) -> Response:
-        """Render a multipart Pydantic ``ValidationError`` as the LLM envelope.
-
-        The visual-gen-scoped 422 envelope is the same shape JSON requests
-        get from the FastAPI ``RequestValidationError`` handler, so JSON
-        and multipart clients see indistinguishable bodies on bad
-        payloads.
-        """
-        parts: list[str] = []
-        for err in exc.errors():
-            loc = ".".join(str(seg) for seg in err.get("loc", ()) if seg != "body")
-            etype = err.get("type", "")
-            msg = err.get("msg", "")
-            if etype == "extra_forbidden":
-                parts.append(
-                    f"Unknown request field {loc!r}. Pass model-specific "
-                    "parameters via 'extra_params' instead."
-                )
-            elif loc:
-                parts.append(f"{loc}: {msg}")
-            else:
-                parts.append(msg)
-        message = "; ".join(parts) if parts else str(exc)
-        return self.create_error_response(
-            message=message,
-            err_type="BadRequestError",
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
-        )
-
     async def openai_video_generation_async(
         self,
         raw_request: Request,
@@ -468,7 +440,7 @@ class _VideoRoutesMixin:
             return JSONResponse(content=video_job.model_dump(), status_code=202)
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(exc, self.create_error_response)
         except ValueError as e:
             logger.error(f"Async video request error: {e}")
             return self.create_error_response(str(e), status_code=HTTPStatus.BAD_REQUEST)

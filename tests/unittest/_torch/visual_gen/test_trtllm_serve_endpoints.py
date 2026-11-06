@@ -2636,6 +2636,176 @@ class TestRouteEngineValidationError:
 
 
 # =========================================================================
+# The visual-gen validation-error envelope (both entry points)
+# =========================================================================
+
+
+class TestVisualGenValidationErrorRendering:
+    """Characterize the visual-gen 422 envelope at both entry points.
+
+    Routes with a declared request model fail with FastAPI's
+    ``RequestValidationError``; handlers that build their own request
+    model (video sync/async, image edit, multipart) fail with pydantic's
+    ``ValidationError``. Every path must render byte-identical bodies.
+    These tests pin the full body, so they must pass unchanged before
+    and after any refactor of the rendering code.
+    """
+
+    # The exact envelope every unknown-field request below must produce.
+    _UNKNOWN_FIELD_BODY = {
+        "object": "error",
+        "message": "Unknown request field 'not_a_field'. Pass model-specific "
+        "parameters via 'extra_params' instead.",
+        "type": "BadRequestError",
+        "param": None,
+        "code": 422,
+    }
+
+    def test_route_level_unknown_field_body_is_exact(self, image_client):
+        """``POST /v1/images/generations`` declares its request model, so an
+        unknown field arrives as a ``RequestValidationError``; the body is
+        pinned in full."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={"prompt": "a cat", "not_a_field": 1},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    def test_route_level_type_error_names_the_field(self, image_client):
+        """A type error reads ``<field>: <pydantic msg>``. The expected
+        message is computed from the model in the test, so the assertion
+        does not hard-code pydantic's wording."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest
+
+        payload = {"prompt": "a cat", "seed": "abc"}
+        with pytest.raises(ValidationError) as exc_info:
+            ImageGenerationRequest.model_validate(payload)
+        expected_msg = exc_info.value.errors()[0]["msg"]
+
+        resp = image_client.post("/v1/images/generations", json=payload)
+        assert resp.status_code == 422
+        body = resp.json()
+        _assert_llm_envelope(body, code=422)
+        assert body["message"] == f"seed: {expected_msg}"
+
+    def test_handler_level_bodies_match_route_level(self, tmp_path, monkeypatch):
+        """Handlers that build their own request model (video sync JSON,
+        video async JSON, image edit JSON) return the same 422 body as the
+        route-level path."""
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+
+        video_client = _create_server(MockVisualGen(video_output=_make_dummy_video_tensor()))
+        for url in ("/v1/videos/sync", "/v1/videos"):
+            resp = video_client.post(url, json={"prompt": "a cat", "not_a_field": 1})
+            assert resp.status_code == 422, (url, resp.text)
+            assert resp.json() == self._UNKNOWN_FIELD_BODY, url
+
+        edit_client = _create_server(
+            MockVisualGen(
+                image_output=_make_dummy_image_tensor(),
+                supports_image_edit=True,
+            )
+        )
+        resp = edit_client.post(
+            "/v1/images/edits",
+            json={"prompt": "a cat", "image": _b64_white_png_1x1(), "not_a_field": 1},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    def test_multipart_handler_level_body_is_exact(self, video_client):
+        """The multipart path funnels through the same pydantic model and
+        renders the same envelope. The unknown field is sent as a plain
+        multipart text part (no filename) so it is the only validation
+        error and the body matches the route-level one byte for byte."""
+        resp = video_client.post(
+            "/v1/videos/sync",
+            data={"prompt": "a cat"},
+            files={"not_a_field": (None, "1")},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    @staticmethod
+    def _pydantic_unknown_field_error():
+        """Return the pydantic ValidationError for an unknown field."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest
+
+        with pytest.raises(ValidationError) as exc_info:
+            ImageGenerationRequest.model_validate({"prompt": "x", "not_a_field": 1})
+        return exc_info.value
+
+    def test_renderer_accepts_both_exception_types(self):
+        """The shared renderer produces the same status and bytes for a
+        pydantic ``ValidationError`` and for a ``RequestValidationError``
+        whose ``loc`` entries carry FastAPI's leading ``body`` segment."""
+        from fastapi.exceptions import RequestValidationError
+
+        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        pydantic_exc = self._pydantic_unknown_field_error()
+        fastapi_exc = RequestValidationError(
+            errors=[{**err, "loc": ("body", *err["loc"])} for err in pydantic_exc.errors()]
+        )
+
+        responses = [
+            render_visual_gen_validation_error(exc, OpenAIServer.create_error_response)
+            for exc in (pydantic_exc, fastapi_exc)
+        ]
+        assert [r.status_code for r in responses] == [422, 422]
+        assert responses[0].body == responses[1].body
+        assert json.loads(responses[0].body) == self._UNKNOWN_FIELD_BODY
+
+    def test_renderer_falls_back_to_str_without_errors(self):
+        """With no error entries the message falls back to ``str(exc)``."""
+        from fastapi.exceptions import RequestValidationError
+
+        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        exc = RequestValidationError([])
+        resp = render_visual_gen_validation_error(exc, OpenAIServer.create_error_response)
+        assert resp.status_code == 422
+        assert json.loads(resp.body)["message"] == str(exc)
+
+    def test_renderer_delegates_to_the_factory(self):
+        """The renderer builds no response itself: it calls the factory it
+        is given exactly once, with the rendered message and the fixed
+        error type and status, and returns the factory's result. The
+        factory owns the envelope and the context-length code rule."""
+        from http import HTTPStatus
+
+        from fastapi.responses import Response
+
+        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
+
+        calls = []
+        sentinel = Response(status_code=422)
+
+        def spy_factory(*, message, err_type, status_code):
+            calls.append((message, err_type, status_code))
+            return sentinel
+
+        result = render_visual_gen_validation_error(
+            self._pydantic_unknown_field_error(), spy_factory
+        )
+        assert result is sentinel
+        assert calls == [
+            (
+                self._UNKNOWN_FIELD_BODY["message"],
+                "BadRequestError",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+        ]
+
+
+# =========================================================================
 # Non-visual-gen routes keep FastAPI's default validation response
 # =========================================================================
 
@@ -2676,7 +2846,7 @@ class TestNonVisualGenValidationResponse:
                 return _llm_envelope_branch(exc)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
-        # Mirror :meth:`OpenAIServer._create_visual_gen_validation_error_response`
+        # Mirror :func:`tensorrt_llm.serve._visual_gen_errors.render_visual_gen_validation_error`
         # inline so the test does not depend on instance state.
         def _llm_envelope_branch(exc):
             from http import HTTPStatus
