@@ -76,6 +76,7 @@ __all__ = [
     "NemotronNASForCausalLM",
     "Phi3ForCausalLM",
     "Phi4MMForCausalLM",
+    "PplxDeciderForDecision",
     "Qwen2ForCausalLM",
     "Qwen2ForProcessRewardModel",
     "Qwen2ForRewardModel",
