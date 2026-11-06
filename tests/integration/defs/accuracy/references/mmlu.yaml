@@ -128,6 +128,9 @@ Qwen3/Qwen3-Next-80B-A3B-Instruct:
   - accuracy: 86.03
 Qwen/Qwen3.8-Flash-Next:
   - accuracy: 87.82
+  # MTP is lossless, so the run without it shares the reference.
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.91
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 87.91
@@ -256,6 +259,11 @@ nvidia/Nemotron-3-Nano:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 73.684
+nvidia/Nemotron-3-Nano-4B:
+  - accuracy: 65.35
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 65.45
 nvidia/Nemotron-3.5-Lightning:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
