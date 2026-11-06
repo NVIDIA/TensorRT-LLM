@@ -5394,6 +5394,158 @@ def test_moe_module_mxfp8_locality_domain_static_split_rubin(
 
 
 @pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_moe_module_mxfp8_locality_domain_refit_under_cuda_graph_rubin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CUDA graph captured before a refit must compute with the refit weights.
+
+    The refit flow keeps captured graphs (it never recaptures), so decode
+    replays after ``update_weights`` go through the addresses captured at
+    warmup. Capture the split MXFP8 layer's forward once, then refit with new
+    weights and with ``w1`` only, and replay the original graph each time
+    against a full-GPU module built from the same weights.
+    """
+    _skip_if_no_locality_domain()
+    monkeypatch.setenv("TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE", "1")
+
+    from _torch.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.mapping import Mapping
+
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k = 16, 2048, 1536, 64, 4
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, x, "CUTEDSL"
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        def create_module(enable_locality_domains: bool, module_weights):
+            model_config = ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                mapping=mapping,
+                moe_backend="CUTEDSL",
+                locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
+            )
+            moe = create_moe(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=model_config,
+                allow_backend_degradation=False,
+            )
+            moe.create_weights()
+            moe.load_weights([module_weights])
+            moe.transform_weights()
+            moe.cache_derived_state()
+            moe.cuda()
+            return moe
+
+        def reference(module_weights):
+            with torch.inference_mode():
+                out = create_module(False, module_weights)(x, router_logits)
+            torch.cuda.synchronize()
+            return out
+
+        # Same tolerance rationale as the static-split test: outputs are ~1e5
+        # and the two shards round and accumulate in a different order.
+        def rms_rel(out, ref):
+            out, ref = out.float(), ref.float()
+            return ((out - ref).norm() / ref.norm()).item()
+
+        def assert_matches(out, ref, label):
+            cos = torch.nn.functional.cosine_similarity(
+                out.float().flatten(), ref.float().flatten(), dim=0
+            ).item()
+            err = rms_rel(out, ref)
+            assert err <= 1e-2 and cos >= 0.9999, f"{label}: rms_rel={err:.5f} cos={cos:.6f}"
+
+        split_module = create_module(True, weights)
+        assert split_module.backend._locality_domain_weight_shards is not None
+
+        # Warm up on a side stream (initializes the partition streams, the
+        # tactics and the allocator pools), then capture.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), torch.inference_mode():
+            for _ in range(2):
+                split_module(x, router_logits)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode(), torch.cuda.graph(graph):
+            graph_out = split_module(x, router_logits)
+
+        graph.replay()
+        torch.cuda.synchronize()
+        out_before = graph_out.clone()
+        assert_matches(out_before, reference(weights), "graph replay before refit")
+
+        # A full refit with different weights, without recapturing.
+        torch.manual_seed(1)
+        weights2 = quantize_util.create_weights(**quant_kwargs)
+        split_module.load_weights([weights2])
+        split_module.transform_weights()
+        split_module.cache_derived_state()
+        graph.replay()
+        torch.cuda.synchronize()
+        out_after = graph_out.clone()
+        # A stale graph would still match the old weights.
+        assert rms_rel(out_after, out_before) > 0.1, "replay after refit still sees the old weights"
+        assert_matches(out_after, reference(weights2), "graph replay after a full refit")
+
+        # A partial refit (w1 of every expert, with its scales), finalized as
+        # the RLHF walk does, again without recapturing.
+        torch.manual_seed(2)
+        weights3 = quantize_util.create_weights(**quant_kwargs)
+        w1_only = {k: v for k, v in weights3.items() if ".w1." in k}
+        assert w1_only
+        split_module.load_weights([w1_only], allow_partial_loading=True)
+        for mod in split_module.modules():
+            if hasattr(mod, "process_weights_after_loading"):
+                mod.process_weights_after_loading()
+        split_module.transform_weights()
+        split_module.cache_derived_state()
+        graph.replay()
+        torch.cuda.synchronize()
+        merged = dict(weights2)
+        merged.update(w1_only)
+        assert_matches(graph_out, reference(merged), "graph replay after a w1-only refit")
+
+
+@pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
