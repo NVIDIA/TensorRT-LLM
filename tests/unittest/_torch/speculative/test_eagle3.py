@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
+from test_common.moe_tactics import sm100f_moe_tactic_or_cutlass
 from utils.llm_data import llm_models_root
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
@@ -1263,7 +1264,7 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
         tensor_parallel_size=8,
         moe_expert_parallel_size=8,
         pipeline_parallel_size=1,
-        moe_config=MoeConfig(backend="TRTLLM"),
+        moe_config=MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("trtllm_gen")),
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,

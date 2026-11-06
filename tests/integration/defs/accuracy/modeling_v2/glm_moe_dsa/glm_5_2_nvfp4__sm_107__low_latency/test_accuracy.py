@@ -165,7 +165,7 @@ def _engine_kwargs(case: AccuracyCase = POINT01, *, modeling_v2: str = "require"
         cuda_graph_config=CudaGraphConfig(
             batch_sizes=list(range(1, case.batch_size + 1)), enable_padding=True
         ),
-        moe_config=MoeConfig(backend="TRTLLM", use_low_precision_moe_combine=True),
+        moe_config=MoeConfig(tactic="trtllm_gen", use_low_precision_moe_combine=True),
         sparse_attention_config=DeepSeekSparseAttentionConfig(
             enable_heuristic_topk=True,
             use_cute_dsl_paged_mqa_logits=False,

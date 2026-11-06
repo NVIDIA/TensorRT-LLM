@@ -214,7 +214,7 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "moe_config": {
             # DeepSeek-V4 routed experts use NVFP4 in this test. Use the
             # MegaMoE CuTe DSL path for the NVFP4 checkpoint.
-            "backend": "MEGAMOE_CUTEDSL",
+            "tactic": "cutedsl.mega_moe",
         },
         # Keep the DEP4 worker envelope aligned with the aggregate guard. A
         # batch-128 DSpark graph leaves too little headroom for the post-capture
@@ -243,6 +243,8 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
             "decoding_type": "DSpark",
             "max_draft_len": 5,
             "speculative_model": MODEL_PATH,
+            # Unset, the drafter resolves AUTO instead of the target's tactic.
+            "moe_tactic": "cutedsl.mega_moe",
         }
     return config
 

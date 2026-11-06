@@ -17,6 +17,7 @@ import json
 
 import jsonschema
 import pytest
+from test_common.moe_tactics import fp8_block_scales_moe_config, sm100f_moe_tactic_or_cutlass
 
 from tensorrt_llm import LLM
 from tensorrt_llm.evaluate import JsonModeEval as JsonModeEvaluator
@@ -32,7 +33,13 @@ from tensorrt_llm.llmapi import (
 )
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_blackwell, skip_ray
+from ..conftest import (
+    get_sm_version,
+    llm_models_root,
+    parametrize_with_ids,
+    skip_pre_blackwell,
+    skip_ray,
+)
 from .accuracy_core import (
     GSM8K,
     ForceTokenLogitsProcessor,
@@ -72,7 +79,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
-            moe_config=MoeConfig(backend="DEEPGEMM"),
+            moe_config=fp8_block_scales_moe_config(),
             speculative_config=MTPDecodingConfig(),
             enable_chunked_prefill=True,
         )
@@ -108,7 +115,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("cutedsl.grouped_gemm")),
             speculative_config=MTPDecodingConfig(max_draft_len=1),
             enable_chunked_prefill=True,
         )
@@ -140,7 +147,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("cutedsl.grouped_gemm")),
             speculative_config=MTPDecodingConfig(max_draft_len=1),
             enable_chunked_prefill=True,
         )
@@ -180,7 +187,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("cutedsl.grouped_gemm")),
             enable_chunked_prefill=True,
         )
 
@@ -240,7 +247,13 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 skip_indexer_for_short_seqs=False,
             ),
             moe_config=MoeConfig(
-                backend="CUTEDSL",
+                # The CuteDSL grouped GEMM has only a fused-finalize FC2 on
+                # SM107, so CUTLASS runs there with finalize fusion off.
+                tactic=(
+                    "cutlass"
+                    if get_sm_version() == 107
+                    else sm100f_moe_tactic_or_cutlass("cutedsl.grouped_gemm")
+                ),
                 disable_finalize_fusion=True,
             ),
             guided_decoding_backend="xgrammar",
@@ -402,7 +415,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("cutedsl.grouped_gemm")),
             speculative_config=MTPDecodingConfig(max_draft_len=3),
             enable_chunked_prefill=True,
         )
