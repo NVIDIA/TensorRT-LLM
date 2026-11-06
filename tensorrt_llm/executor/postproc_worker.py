@@ -1,6 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import traceback
-from collections import deque
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Union)
@@ -138,8 +139,6 @@ class PostprocWorker:
         ]
         self._to_stop = asyncio.Event()
 
-        self._q = deque()
-
         # Load the tokenizer and share in all records.
         # Guard against a None tokenizer_dir: transformers'
         # PreTrainedConfig._get_config_dict coerces it via str(None) → "None",
@@ -170,8 +169,10 @@ class PostprocWorker:
         self, input: Union["PostprocWorker.Input", "ResponseWrapper"]
     ) -> [Any, Optional[dict[str, float]]]:
         ''' Handle a single response from await_response worker. '''
-        if input.rsp.result.context_logits is not None or \
-              input.rsp.result.generation_logits is not None:
+        result = input.rsp.result
+        if not isinstance(result, tllm.Result) and (
+                result.context_logits is not None
+                or result.generation_logits is not None):
             raise ValueError(
                 "Context logits or generation logits are not supposed to be "
                 "sent to postprocessing workers.")

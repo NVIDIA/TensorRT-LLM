@@ -40,7 +40,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LogprobMode, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import SlotSamplingParams
@@ -62,13 +62,12 @@ class _Request:
     is_dummy: bool = False
     py_beam_width: int = 1
     is_context_init_state: bool = False
-    return_log_probs: bool = False
     py_return_log_probs: bool = False
+    py_logprobs_mode: LogprobMode = LogprobMode.RAW
     py_min_length: int = 0
     py_stop_words_list: Any = None
     py_bad_words: Any = None
     py_no_repeat_ngram_size: Any = None
-    py_is_draft: bool = False
     py_logits_post_processors: Any = None
     py_guided_decoding_params: Any = None
     py_embedding_bias: Any = None
@@ -147,8 +146,6 @@ class TestTierSelection:
             # Consume the logits after the forward returns.
             pytest.param(dict(py_guided_decoding_params=object()), id="guided_decoding"),
             pytest.param(dict(py_logits_post_processors=[object()]), id="logits_processor"),
-            # Shares this sampler but registers no hooks.
-            pytest.param(dict(py_is_draft=True), id="draft"),
             # Needs outputs the in-graph path does not produce.
             pytest.param(dict(py_return_log_probs=True), id="logprobs"),
         ],

@@ -34,10 +34,8 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-    gvr_topk_decode_dispatch as tier_dispatch,
-)
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (  # noqa: E501
+from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_dispatch as tier_dispatch
+from tensorrt_llm._torch.kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (  # noqa: E501
     _query_max_cluster_size,
 )
 from tensorrt_llm._utils import get_sm_version

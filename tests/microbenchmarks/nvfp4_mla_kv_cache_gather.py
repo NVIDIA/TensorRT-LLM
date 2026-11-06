@@ -32,8 +32,8 @@ from pathlib import Path
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
-from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.quantization import QuantMode
 
@@ -294,13 +294,13 @@ class GatherBenchmark:
 
         def run() -> None:
             self.fmha_scheduler_counter.zero_()
-            thop.attention(
+            FallbackFmha.attention(
                 q=self.query[:batch_size],
                 k=None,
                 v=None,
                 output=self.attention_output[:batch_size],
                 output_sf=None,
-                workspace_=self.attention_workspace,
+                workspace=self.attention_workspace,
                 sequence_length=self.kv_lens_cuda[:batch_size],
                 host_past_key_value_lengths=self.kv_lens_host[:batch_size],
                 host_total_kv_lens=host_total_kv_lens,
@@ -366,7 +366,7 @@ class GatherBenchmark:
                 use_spec_decoding=False,
                 is_spec_dec_tree=False,
                 spec_decoding_generation_lengths=None,
-                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
                 spec_decoding_bl_tree_mask_offset=None,
                 spec_decoding_bl_tree_mask=None,

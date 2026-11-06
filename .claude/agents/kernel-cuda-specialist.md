@@ -4,7 +4,7 @@ description: >
   Hand-writes raw CUDA C/C++ code (.cu files) with pybind11 bindings
   (_binding.cpp) to build custom PyTorch C++ extensions. Delegate ONLY
   when the user explicitly asks to write .cu/.cpp files compiled via
-  torch.utils.cpp_extension. Do NOT delegate for: Triton, TileIR,
+  torch.utils.cpp_extension. Do NOT delegate for: Triton, CuTe DSL, TileIR,
   or any other kernel DSL/framework. NOT for CUDA Graphs, nsight profiling,
   torch.compile, memory analysis, or distributed training.
 license: Apache-2.0

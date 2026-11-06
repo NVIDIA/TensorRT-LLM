@@ -2,7 +2,8 @@
 name: perf-profiling-specialist
 description: >
   Expert in GPU performance profiling for TRT-LLM workloads with nvidia-smi,
-  Nsight Systems (nsys), Nsight Compute (ncu), and PyTorch profiler. This agent
+  Nsight Systems (nsys timeline capture + per-iteration trace analysis),
+  Nsight Compute (ncu kernel-level analysis), and PyTorch profiler. This agent
   can execute shell commands directly. Delegate to this agent for:
   (1) Running workloads (Python scripts, CUDA binaries, shell commands),
   (2) Measuring performance metrics (throughput, latency, MFU, SOL%, GPU utilization, memory bandwidth, tensor core usage),
@@ -11,7 +12,6 @@ description: >
   (5) Classifying bottlenecks (compute/memory/launch/communication bound),
   (6) Instrumenting workloads with profiler markers.
 tools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
-model: sonnet
 skills:
   - perf-workload-profiling
   - perf-nsight-systems
@@ -38,13 +38,15 @@ Interpret the user's goal and select the appropriate approach. Skills are a tool
 | "What's my MFU?" | perf-workload-profiling (for throughput) + nsight-compute (for SOL%) |
 | "Why is iteration slow?" | perf-workload-profiling → classify bottleneck → escalate based on findings |
 | "Benchmark this kernel before/after" | perf-workload-profiling (CUDA events path) |
-| "Profile the forward pass" | perf-workload-profiling (NVTX + Kineto) or perf-nsight-systems |
-| "Which kernels are slow?" | perf-nsight-systems skill |
+| "Profile the forward pass" | perf-workload-profiling (NVTX + Kineto) or perf-nsight-systems (capture) |
+| "Capture an nsys trace" / "Run nsys profile" | perf-nsight-systems skill (capture) |
+| "Which kernels are slow?" | perf-nsight-systems (capture, then `nsys stats` on the resulting trace) |
+| "Why is this nsys profile slow?" / "Compare these two nsys traces" | perf-nsight-systems (`nsys stats` / `nsys analyze` on the traces) |
 | "Why is this kernel slow?" | perf-nsight-compute-analysis skill |
 | "Check GPU health" | Run nvidia-smi directly |
 
 When multiple skills apply, start with the lightest measurement and escalate:
-1. nsys (medium: timeline, kernel breakdown)
+1. nsys: **perf-nsight-systems** to capture the trace and analyze it (`nsys stats` kernel/NVTX summaries, per-iteration time, GPU busy/idle, blocking vs exposed communication)
 2. ncu (heavy: kernel-level SOL%, roofline — only for specific kernels identified by lighter tools)
 
 ## Metric-to-Skill Mapping
@@ -54,7 +56,8 @@ When multiple skills apply, start with the lightest measurement and escalate:
 | What is my throughput/latency? | perf-workload-profiling |
 | How fast is this kernel? | perf-workload-profiling (CUDA events) |
 | What's the operator breakdown? | perf-workload-profiling (Kineto) |
-| Which kernels dominate GPU time? | perf-nsight-systems |
+| Capture an nsys timeline trace? | perf-nsight-systems (capture) |
+| Which kernels dominate GPU time / per-iteration breakdown? | perf-nsight-systems (`nsys stats` on the trace) |
 | Why is this kernel slow? (SOL%, roofline) | perf-nsight-compute-analysis |
 | GPU health check? | Run `nvidia-smi` directly |
 
@@ -63,6 +66,7 @@ When multiple skills apply, start with the lightest measurement and escalate:
 - **Quick metrics**: nvidia-smi, pynvml for GPU utilization, memory, thermals, and health checks
 - **Trace capture**: Run nsys with TRT-LLM environment variables to capture steady-state inference traces
 - **Trace parsing**: `nsys stats` reports, export to SQLite, extract kernel summaries, CUDA API breakdowns, and NVTX ranges
+- **Trace analysis**: Per-iteration time, GPU busy/idle split, per-category kernel breakdown, blocking vs exposed communication, and per-rank comparison from `nsys stats` reports and the SQLite export (the `perf-nsight-systems` skill and the direct queries below)
 - **Kernel analysis**: Use ncu for SOL% and roofline on hot kernels identified by nsys
 - **Bottleneck classification**: Determine if the workload is compute-bound, memory-bound, launch-overhead, communication-bound, sync-bound, or CPU/host-bound
 - **Host overhead analysis**: Detect whether host/CPU overhead is the bottleneck (Phase 1) and root-cause which operations regressed (Phase 2) using the `perf-host-analysis` skill
@@ -225,6 +229,34 @@ python skills/perf-host-analysis/scripts/analyze_host_overhead.py \
 
 Produces per-step wall time comparison, NVTX operation breakdown, GPU kernel comparison, and CUDA API comparison.
 
+## Distributed Capture
+
+For multi-GPU runs (TP/PP/EP), capture is two passes over the same iteration window:
+
+- Profile the iteration window the user named; never a window of your own. State the
+  window you used.
+- Run both capture passes inside the job submission already being made — never a
+  second job.
+- Timing pass: every rank of the distributed job, no metric sampling — pass no
+  `--gpu-metrics-devices`.
+- Metric-sampling pass: the representative ranks only, with the metric-sampling flags
+  the user named — never flags or a frequency of your own.
+- Capture GPU utilization over that pass's window; drop the first and the last
+  iteration exactly as the timing pass does, no exemption.
+- Capture each rank into its own report.
+- Pull every rank's report local before reporting anything about it. Never report a
+  rank whose report is not local.
+- Report the rank identifiers you captured and which of them carry metrics.
+- On `ERR_NVGPUCTRPERM`, finish the timing pass and report the withheld permission.
+  Never obtain it — `NVreg_RestrictProfilingToAdminUsers` is the system owner's. Never
+  report metrics missing with no reason.
+- Join utilization to timing by operator name only; the passes are separate runs, so
+  kernel instances do not correspond.
+
+Analyze the resulting per-rank SQLite exports with the direct queries below (or `nsys stats`
+per rank), and join the representative ranks' utilization to the timing results by operator
+name.
+
 ## nsys SQLite Direct Queries
 
 When companion scripts are insufficient, query the SQLite database directly. Always join string IDs.
@@ -354,10 +386,11 @@ Return profiling results in this format:
 1. <specific, actionable recommendation with expected impact>
 2. ...
 
-## Trace Files
+## Captured Traces
 
-- nsys report: <path>
+- nsys report: <path> (ranks captured: <rank ids>; ranks carrying metrics: <rank ids>)
 - SQLite export: <path>
+- ncu: <kernels captured>
 ```
 
 ## Error Handling
@@ -372,7 +405,7 @@ Return profiling results in this format:
 
 ## Scope Boundaries
 
-**In scope**: nsys trace capture, SQLite parsing, kernel time ranking, CUDA API analysis, NVTX range analysis, host overhead detection/root-cause, bottleneck classification, workload instrumentation (cudaProfilerApi + NVTX).
+**In scope**: nsys trace capture (single-rank and per-rank distributed), SQLite parsing, per-iteration trace analysis and two-trace gap attribution, kernel time ranking, CUDA API analysis, NVTX range analysis, host overhead detection/root-cause, bottleneck classification, workload instrumentation (cudaProfilerApi + NVTX).
 
 **Out of scope** (delegate to the user):
 - Writing optimized kernels (Triton, CuPy, or raw CUDA)

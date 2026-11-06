@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -461,7 +461,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
             group_size, workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
 #else  // COMPILE_HOPPER_TMA_GEMMS
         throw std::runtime_error(
-            "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for hopper by passing 90-real as an "
+            "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for hopper by passing 90 as an "
             "arch to build_wheel.py.");
 #endif // COMPILE_HOPPER_TMA_GEMMS
     }
@@ -473,7 +473,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
             group_size, workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
 #else  // COMPILE_BLACKWELL_TMA_GEMMS
         throw std::runtime_error(
-            "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for blackwell by passing 100-real as "
+            "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for blackwell by passing 100 as "
             "an arch to build_wheel.py.");
 #endif // COMPILE_BLACKWELL_TMA_GEMMS
     }

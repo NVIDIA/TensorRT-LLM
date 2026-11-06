@@ -4,7 +4,6 @@
 ## Issue Tracking
 
 * All enhancement, bugfix, or change requests must begin with the creation of a [TensorRT-LLM Issue Request](https://github.com/nvidia/TensorRT-LLM/issues).
-  * The issue request must be reviewed by TensorRT-LLM engineers and approved prior to code review.
 
 ## Coding Guidelines
 
