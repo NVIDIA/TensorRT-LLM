@@ -554,6 +554,32 @@ def test_plan_is_issued_once_per_chunk_and_reissued_when_the_chunk_changes(monke
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_wrapper_rejects_inputs_that_alias_its_staging_buffers(qkv):
+    """The staging copies must refuse a source overlapping a staging buffer, except the
+    buffer itself (no copy needed). Guards the cached owner-range alias check."""
+    runner = _runner("ds_v32", 16384, qkv=qkv)
+    num_q, kv_prefix = 64, 4096
+    _check("ds_v32", num_q, kv_prefix, qkv=qkv, seed=30, runner=runner)  # plans num_q rows
+    state = runner._wrapper._capacity_plan._state
+    inputs = _make_inputs("ds_v32", num_q, kv_prefix, 30, qkv)
+    q_scale = None if qkv == "fp8" else inputs.q_scale.contiguous()
+
+    def run(q):
+        runner._wrapper.run(
+            q,
+            inputs.weights,
+            runner._k_stage,
+            k_scale=runner._k_scale_stage,
+            q_scale=q_scale,
+        )
+
+    run(state.q[:num_q])  # the staging buffer itself: allowed
+    with pytest.raises(ValueError, match="cross-alias"):
+        run(state.q[1 : num_q + 1])  # overlaps the staging buffer at an offset
+
+
+@skip_not_sm100
 def test_mxfp4_key_storage_is_padded_to_256_rows():
     runner = ThrowawayPrefillTopK(
         n_heads=64,
