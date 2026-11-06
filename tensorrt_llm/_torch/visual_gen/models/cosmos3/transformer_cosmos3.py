@@ -32,6 +32,9 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.cosmos3.checkpoint_keys import (
+    remap_cosmos3_checkpoint_key,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
     install_step_precision,
@@ -1988,148 +1991,30 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         )
 
     def load_weights(self, weights: dict) -> None:
-        """Load weights with key remapping from Cosmos3-Nano / Diffusers checkpoints.
+        """Load a Cosmos3 diffusion-transformer checkpoint, including Edge-FP8.
 
         Expects tensor names as in ``diffusion_pytorch_model.safetensors.index.json``
-        (e.g. ``layers.{i}.self_attn.to_q.weight``, ``proj_in.weight``).
-        Maps UND vs GEN blocks into this module's layout (causal self-attn vs cross-attn + MLPs).
+        (e.g. ``layers.{i}.self_attn.to_q.weight``, ``proj_in.weight``). A missing
+        required weight raises ``ValueError``. An unrecognized key is logged and
+        left unloaded.
         """
         remapped = {}
-        skip_prefixes = (
-            "lm_head.",
-            "action_pos_embed.",
-        )
         skipped_keys = []
 
         for key, value in weights.items():
-            k = key
-
-            # Normalize a leading "model." prefix up front so every skip and
-            # remap below matches whether or not the checkpoint namespaces
-            # top-level tensors (e.g. "model.audio_proj_in.weight") under
-            # "model.".
-            if k.startswith("model."):
-                k = k[len("model.") :]
-
-            if k.startswith(skip_prefixes):
-                skipped_keys.append(k)
+            action, mapped = remap_cosmos3_checkpoint_key(key)
+            if action == "quantizer":
                 continue
-
-            if k.startswith("proj_in."):
-                remapped[k.replace("proj_in.", "vae2llm.", 1)] = value
+            if action == "skip":
+                skipped_keys.append(mapped)
                 continue
-
-            if k.startswith("proj_out."):
-                remapped[k.replace("proj_out.", "llm2vae.", 1)] = value
+            if action == "unmatched":
+                if mapped.startswith("layers."):
+                    logger.warning(f"Unmatched layer key: {key}")
+                else:
+                    logger.warning(f"Skipping unknown checkpoint key: {key}")
                 continue
-
-            if k.startswith("audio_proj_in."):
-                remapped[k.replace("audio_proj_in.", "audio2llm.", 1)] = value
-                continue
-
-            if k.startswith("audio_proj_out."):
-                remapped[k.replace("audio_proj_out.", "llm2audio.", 1)] = value
-                continue
-
-            if k.startswith("audio_modality_embed"):
-                remapped[k] = value
-                continue
-
-            if k.startswith("action_modality_embed"):
-                remapped[k] = value
-                continue
-
-            if k.startswith("action_proj_in.") or k.startswith("action_proj_out."):
-                remapped[k] = value
-                continue
-
-            if k.startswith("time_embedder.linear"):
-                k = k.replace("time_embedder.linear_1.", "time_embedder.mlp.linear_1.")
-                k = k.replace("time_embedder.linear_2.", "time_embedder.mlp.linear_2.")
-                remapped[k] = value
-                continue
-
-            # embed_tokens → language_model.*
-            if k.startswith("embed_tokens."):
-                remapped[f"language_model.{k}"] = value
-                continue
-
-            # Und final norm: normalizes the und hidden state consumed only by
-            # lm_head; the generation path uses per-layer und K/V exclusively.
-            if k.startswith("norm."):
-                skipped_keys.append(k)
-                continue
-
-            # norm_moe_gen stays at top level
-            if k.startswith("norm_moe_gen."):
-                remapped[k] = value
-                continue
-
-            if not k.startswith("layers."):
-                logger.warning(f"Skipping unknown checkpoint key: {key}")
-                continue
-
-            parts = k.split(".", 2)  # ['layers', '{i}', '{rest}']
-            layer_idx = parts[1]
-            rest = parts[2]
-
-            # UND (language_model) prefix
-            und_lp = f"language_model.layers.{layer_idx}"
-            # GEN prefix
-            gen_lp = f"gen_layers.{layer_idx}"
-
-            # --- UND attention → language_model.layers.{i}.self_attn.* ---
-            attn_und_map = {
-                "self_attn.to_q.": f"{und_lp}.self_attn.to_q.",
-                "self_attn.to_k.": f"{und_lp}.self_attn.to_k.",
-                "self_attn.to_v.": f"{und_lp}.self_attn.to_v.",
-                "self_attn.to_out.": f"{und_lp}.self_attn.to_out.0.",
-                "self_attn.norm_q.": f"{und_lp}.self_attn.norm_q.",
-                "self_attn.norm_k.": f"{und_lp}.self_attn.norm_k.",
-                "self_attn.k_norm_und_for_gen.": f"{und_lp}.self_attn.k_norm_und_for_gen.",
-            }
-
-            # --- GEN attention → gen_layers.{i}.cross_attention.* ---
-            attn_gen_map = {
-                "self_attn.add_q_proj.": f"{gen_lp}.cross_attention.to_q.",
-                "self_attn.add_k_proj.": f"{gen_lp}.cross_attention.to_k.",
-                "self_attn.add_v_proj.": f"{gen_lp}.cross_attention.to_v.",
-                "self_attn.to_add_out.": f"{gen_lp}.cross_attention.to_out.0.",
-                "self_attn.norm_added_q.": f"{gen_lp}.cross_attention.norm_q.",
-                "self_attn.norm_added_k.": f"{gen_lp}.cross_attention.norm_k.",
-            }
-
-            # --- Norms ---
-            norm_map = {
-                "input_layernorm.": f"{und_lp}.input_layernorm.",
-                "post_attention_layernorm.": f"{und_lp}.post_attention_layernorm.",
-                "input_layernorm_moe_gen.": f"{gen_lp}.input_layernorm.",
-                "post_attention_layernorm_moe_gen.": f"{gen_lp}.post_attention_layernorm.",
-            }
-
-            # --- MLPs ---
-            mlp_map = {
-                "mlp.gate_proj.": f"{und_lp}.mlp.gate_proj.",
-                "mlp.up_proj.": f"{und_lp}.mlp.up_proj.",
-                "mlp.down_proj.": f"{und_lp}.mlp.down_proj.",
-                "mlp_moe_gen.gate_proj.": f"{gen_lp}.mlp.gate_proj.",
-                "mlp_moe_gen.up_proj.": f"{gen_lp}.mlp.up_proj.",
-                "mlp_moe_gen.down_proj.": f"{gen_lp}.mlp.down_proj.",
-            }
-
-            matched = False
-            for mapping in [attn_gen_map, attn_und_map, norm_map, mlp_map]:
-                for pattern, replacement in mapping.items():
-                    if rest.startswith(pattern):
-                        suffix = rest[len(pattern) :]
-                        remapped[replacement + suffix] = value
-                        matched = True
-                        break
-                if matched:
-                    break
-
-            if not matched:
-                logger.warning(f"Unmatched layer key: {key}")
+            remapped[mapped] = value
 
         # --- Load using DynamicLinearWeightLoader (handles QKV/gate_up fusion + quantization) ---
         params_map = {
