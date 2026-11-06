@@ -166,3 +166,11 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
 ModelingV2MuseSparkOpenNvfp4Tep4::dflash2:
   ref_al: 4.892
   min_al: 4.647
+# Read by TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_speed_bench_coding_golden_acceptance.
+# Not a measurement of this suite: ref_al is the SemiAnalysis golden for this
+# drafter at seven drafts (InferenceX golden_al_distribution/musespark_dflash.yaml,
+# SPEED-Bench qualitative coding, T=1.0, top_p 0.95, rejection sampling), and
+# min_al is that golden less 2%, the bar every submitted deployment must clear.
+ModelingV2MuseSparkOpenNvfp4Tep4::dflash2_speed_bench_coding_golden:
+  ref_al: 4.05
+  min_al: 3.969

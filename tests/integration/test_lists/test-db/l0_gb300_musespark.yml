@@ -21,6 +21,9 @@ l0_gb300_musespark:
   tests:
   # Disabled: needs the DFlash2 draft model, which the CI model cache does not have.
   # - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_gsm8k_and_acceptance
+  # - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_acceptance_under_prefix_reuse
+  # Also needs the SPEED-Bench coding prompts staged under llm-models/datasets/nvidia/SPEED-Bench.
+  # - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_speed_bench_coding_golden_acceptance
   # MuseSparkOpen GSM8K on the llm-models NVFP4 checkpoint; listed nowhere else.
   - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus[eager]
   - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus[cuda_graph]

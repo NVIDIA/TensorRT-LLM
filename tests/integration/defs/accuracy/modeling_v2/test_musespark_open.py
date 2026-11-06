@@ -21,6 +21,7 @@ whose preconditions are not met raises under any mode, so a pass is the
 target's fast paths end to end.
 """
 
+import json
 import os
 
 import pytest
@@ -28,10 +29,24 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, DFlashDecodingConfig, KvCacheConfig, MoeConfig
+from tensorrt_llm.llmapi import (
+    CudaGraphConfig,
+    DFlashDecodingConfig,
+    KvCacheConfig,
+    MoeConfig,
+    SamplingParams,
+)
 
 from ...conftest import llm_models_root
-from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness, assert_acceptance_length_for_llm
+from ..accuracy_core import (
+    GSM8K,
+    LlmapiAccuracyTestHarness,
+    assert_acceptance_length,
+    assert_acceptance_length_for_llm,
+    assert_acceptance_length_survives_prefix_reuse,
+    compute_acceptance_length,
+    gsm8k_fewshot_prompts,
+)
 
 # The TEP4 compositions are written for sm103 (GB300) and sm107 (Vera Rubin).
 skip_not_served_sm = pytest.mark.skipif(
@@ -42,13 +57,16 @@ skip_not_served_sm = pytest.mark.skipif(
 # The public opt-ins the compositions are written against: PDL launches, the
 # MNNVL one-shot attention all-reduce, the fused MoE finalize all-reduce, the
 # sharded projections, the low-M GEMM dispatcher and the windowed drafter context
-# arena. The target refuses to build without them. The KV-cache estimation pass is skipped because its
+# arena. The target refuses to build without them. On sm107 the sharded
+# projections and the fused finalize also need the SM107 fused-kernel opt-in,
+# which sm103 ignores. The KV-cache estimation pass is skipped because its
 # temporary cache does not fit next to this checkpoint's weights.
 _SERVED_ENV = {
     "TRTLLM_ENABLE_PDL": "1",
     "MUSESPARK_OPEN_ALLREDUCE": "MNNVL",
     "MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL": "1",
     "MUSESPARK_OPEN_SHARDED_PROJECTIONS": "1",
+    "MUSESPARK_OPEN_SM107_FUSED_KERNELS": "1",
     "TRTLLM_LOW_M_GEMM_BACKEND": "auto",
     "TRTLLM_DFLASH_WINDOWED_CTX_ARENA": "1",
     "TRTLLM_SKIP_KV_CACHE_ESTIMATION": "1",
@@ -134,3 +152,90 @@ class TestModelingV2MuseSparkOpenNvfp4Tep4(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             assert_acceptance_length_for_llm(self.ACCEPTANCE_KEY, llm)
+
+    # The SemiAnalysis golden protocol for this drafter (InferenceX
+    # golden_al_distribution/musespark_dflash.yaml): the first user turn of the
+    # 80 SPEED-Bench qualitative coding prompts, the served chat template,
+    # T=1.0, top_p=0.95, up to 4096 tokens, EOS honored, rejection sampling.
+    SPEED_BENCH_CODING = os.environ.get("MUSESPARK_SPEED_BENCH_CODING") or (
+        f"{llm_models_root()}/datasets/nvidia/SPEED-Bench/qualitative_coding_turn0.jsonl"
+    )
+    GOLDEN_ACCEPTANCE_KEY = "ModelingV2MuseSparkOpenNvfp4Tep4::dflash2_speed_bench_coding_golden"
+
+    def _speed_bench_coding_prompts(self, llm) -> list:
+        if not os.path.exists(self.SPEED_BENCH_CODING):
+            pytest.skip(
+                f"SPEED-Bench coding prompts not staged at {self.SPEED_BENCH_CODING} "
+                "(set MUSESPARK_SPEED_BENCH_CODING)"
+            )
+        with open(self.SPEED_BENCH_CODING, encoding="utf-8") as f:
+            texts = [json.loads(line)["text"] for line in f if line.strip()]
+        assert len(texts) == 80, f"expected the 80 coding prompts, found {len(texts)}"
+        return [
+            llm.tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True
+            )
+            for text in texts
+        ]
+
+    @skip_not_served_sm
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(180000)
+    def test_dflash2_speed_bench_coding_golden_acceptance(self, monkeypatch):
+        """Natural acceptance length on the golden protocol, against the golden.
+
+        Runs the default drafter backend (AUTO, TRTLLM here) with rejection
+        sampling, two passes with different seeds pooled, and checks the
+        reference's floor: the SemiAnalysis K=7 golden 4.05 less 2%.
+        """
+        with LLM(
+            self.MODEL_PATH,
+            speculative_config=DFlashDecodingConfig(
+                max_draft_len=7,
+                speculative_model=self.DFLASH2_MODEL_PATH,
+                use_rejection_sampling=True,
+            ),
+            **self.ENGINE,
+            **_require_target(monkeypatch, **_SERVED_ENV),
+        ) as llm:
+            prompts = self._speed_bench_coding_prompts(llm)
+            llm.get_stats(timeout=2)
+            for seed in (0, 1):
+                # The chat template already emits BOS; like the served chat
+                # endpoint, the tokenizer must not add a second one.
+                llm.generate(
+                    prompts,
+                    SamplingParams(
+                        max_tokens=4096,
+                        temperature=1.0,
+                        top_p=0.95,
+                        seed=seed,
+                        add_special_tokens=False,
+                    ),
+                    cache_salt=[f"golden-{seed}-{i}" for i in range(len(prompts))],
+                    use_tqdm=False,
+                )
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] {self.GOLDEN_ACCEPTANCE_KEY} acceptance_length = {acceptance_length:.4f}")
+            assert_acceptance_length(self.GOLDEN_ACCEPTANCE_KEY, acceptance_length)
+
+    @skip_not_served_sm
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(180000)
+    def test_dflash2_acceptance_under_prefix_reuse(self, monkeypatch):
+        """A prefix-cache hit keeps the drafter's context on the default backend.
+
+        See ``assert_acceptance_length_survives_prefix_reuse``: GSM8K few-shot
+        prompts run cold and then over their cached prefix, greedy.
+        """
+        with LLM(
+            self.MODEL_PATH,
+            speculative_config=DFlashDecodingConfig(
+                max_draft_len=7, speculative_model=self.DFLASH2_MODEL_PATH
+            ),
+            **self.ENGINE,
+            **_require_target(monkeypatch, **_SERVED_ENV),
+        ) as llm:
+            assert_acceptance_length_survives_prefix_reuse(
+                llm, gsm8k_fewshot_prompts(64), SamplingParams(max_tokens=256, temperature=0.0)
+            )
