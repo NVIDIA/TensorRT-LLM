@@ -16,10 +16,10 @@
 
 ``NcclEpContext`` seeds its NCCL communicator from the torch EP process group
 under the Ray orchestrator (``mpi_disabled()``) and from a split of the session
-MPI comm (``mpi_comm()``) keyed by pipeline stage otherwise. These tests stub the ``nccl`` namespace
-package, ``mpi4py`` and the CUDA allocations, so they run in the CPU-only stage
-and catch a regression that selects the wrong bootstrap, passes the wrong EP
-group, or tears the resources down in the wrong order.
+MPI comm (``mpi_comm()``) keyed by pipeline stage otherwise. These tests stub
+the ``nccl`` namespace package and the CUDA allocations, so they run in the
+CPU-only stage and catch a regression that selects the wrong bootstrap, passes
+the wrong EP group, or tears the resources down in the wrong order.
 """
 
 from __future__ import annotations
@@ -88,10 +88,7 @@ class _Tensor:
 class _CpuTorch:
     """Forward to ``torch`` but keep the context's receive buffers on the CPU."""
 
-    cuda = SimpleNamespace(
-        current_device=lambda: 0,
-        current_stream=lambda: SimpleNamespace(cuda_stream=0),
-    )
+    cuda = SimpleNamespace(current_device=lambda: 0)
 
     @staticmethod
     def device(*args: object, **kwargs: object) -> torch.device:
@@ -135,7 +132,6 @@ def _install_fake_nccl(
     ep.Tensor = _Tensor
     ep.DispatchConfig = Mock(name="DispatchConfig")
     ep.DispatchOutputs = Mock(name="DispatchOutputs")
-    ep.get_lib_version = Mock(return_value="0.2.0")
     interop = ModuleType("nccl.ep.interop")
     interop.__path__ = []
     interop_torch = ModuleType("nccl.ep.interop.torch")
@@ -152,10 +148,6 @@ def _install_fake_nccl(
         ("nccl.ep.interop.torch", interop_torch),
     ):
         monkeypatch.setitem(sys.modules, name, module)
-    # destroy() imports mpi4py only on the MPI branch; keep the test independent of it.
-    monkeypatch.setitem(
-        sys.modules, "mpi4py", SimpleNamespace(MPI=SimpleNamespace(Exception=Exception))
-    )
     return SimpleNamespace(core=core, ep=ep, interop_torch=interop_torch)
 
 
@@ -283,7 +275,6 @@ def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
 
     ctx.destroy()
 
-    nccl_ep_fakes.unregister.assert_called_once_with(proxy)
     # The timeout proxy must be unregistered before the group it points at is destroyed.
     expected = [
         call.unregister(proxy),
