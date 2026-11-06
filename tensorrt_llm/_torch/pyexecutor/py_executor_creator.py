@@ -355,6 +355,22 @@ def _enforce_overlap_spec_kv_correction(attn_backend: str,
     raise ValueError(message)
 
 
+def _rank_dspark_on_host_without_overlap(
+        spec_config, disable_overlap_scheduler: bool) -> None:
+    """Turn off DSpark device re-ranking when the overlap scheduler is off.
+
+    Device re-ranking reads the previous step's device tensors, which only the
+    overlap scheduler keeps. Without them it would skip every step while the
+    planner ranks from an older confidence copy than host ranking uses.
+    """
+    if (disable_overlap_scheduler and spec_config is not None
+            and getattr(spec_config, "enable_confidence_scheduling", False) and
+            getattr(spec_config, "enable_fused_confidence_scheduler", False)):
+        logger.info("DSpark device re-ranking needs the overlap scheduler; "
+                    "ranking draft positions on the host.")
+        spec_config.enable_fused_confidence_scheduler = False
+
+
 def _branch_snapshot_ctx_chunk_config(
     ctx_chunk_config: Optional[tuple],
     kv_cache_manager: Optional[BaseResourceManager],
@@ -709,6 +725,9 @@ def _create_py_executor(
             "Disabling overlap scheduler for multimodal encoder-only mode. "
             "The overlap scheduler is designed for generation models and is not needed "
             "when only processing vision encoder inputs.")
+
+    _rank_dspark_on_host_without_overlap(spec_config,
+                                         llm_args.disable_overlap_scheduler)
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
 
