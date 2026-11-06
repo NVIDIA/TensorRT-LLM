@@ -50,9 +50,7 @@ except ModuleNotFoundError as exc:
         raise
     builtin_beam = None  # The standard-serving implementation is a separate PR.
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
-    dispatch_combine,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam import dispatch_combine  # noqa: E501
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_bf16__sm_103__tp1 import (
     moe as moe_module,
 )

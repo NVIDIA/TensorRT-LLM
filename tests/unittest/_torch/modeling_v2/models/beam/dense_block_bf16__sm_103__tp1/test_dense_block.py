@@ -62,14 +62,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1 import (  # noqa: E501
     block as block_module,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1.block import (  # noqa: E501
     BeamDenseBlockBf16Sm103Tp1,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-    _attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
     beam_neox_rope,

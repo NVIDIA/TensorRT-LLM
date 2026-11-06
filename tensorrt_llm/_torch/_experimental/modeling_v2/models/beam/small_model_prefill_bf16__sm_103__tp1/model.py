@@ -80,8 +80,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, LayerId, PageIndexMode
 
+from .. import _attention
 from ..dense_block_bf16__sm_103__tp1 import block as dense_block
-from ..full_model_nvfp4__sm_103__tp4 import _attention
 from ..moe_bf16__sm_103__tp1.moe import check_weights
 from ..moe_bf16__sm_103__tp1.moe import weight_shapes as moe_weight_shapes
 from ..sparse_block_bf16__sm_103__tp1 import block as sparse_block
