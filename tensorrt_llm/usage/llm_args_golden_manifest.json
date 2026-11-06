@@ -182,7 +182,7 @@
         "native",
         "rank_striped_read_ahead"
       ],
-      "capture_policy": "literal",
+      "capture_policy": "enum[CheckpointIOPolicy]",
       "kind": "categorical",
       "path": "checkpoint_io_policy"
     },
@@ -1153,6 +1153,11 @@
       "capture_policy": "float|none",
       "kind": "value",
       "path": "multimodal_config.video_pruning_rate"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "multimodal_config.vision_gpu_normalize"
     },
     {
       "allowed_values": [

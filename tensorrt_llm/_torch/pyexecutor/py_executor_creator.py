@@ -390,6 +390,26 @@ def _branch_snapshot_ctx_chunk_config(
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
+def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
+                           is_generation: bool) -> None:
+    """Reject the settings a non-generation model cannot run with; warn on those it ignores."""
+    if is_generation:
+        return
+    if mapping.has_pp():
+        raise ValueError(
+            "Pipeline parallelism is not supported for non-generation models "
+            "(pooling and mm_encoder_only); set pipeline_parallel_size=1.")
+    if mapping.enable_attention_dp:
+        raise ValueError(
+            "Non-generation models do not support attention DP; set "
+            "enable_attention_dp=False.")
+    if llm_args.enable_chunked_prefill:
+        logger.warning(
+            "enable_chunked_prefill is ignored for non-generation models: each "
+            "request runs whole in one forward, and requests longer than "
+            "max_num_tokens are rejected.")
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -468,9 +488,10 @@ def create_encoder_executor(
 ):
     """Create an EncoderExecutor for models using the encode-only path.
 
-    Handles model loading and model_engine creation, then wraps in a
-    lightweight EncoderExecutor. Skips all decoder infrastructure
-    (KV cache, scheduler, sampler, drafter, speculative decoding).
+    Resolves the config, checkpoint loader and mapping, then lets
+    EncoderExecutor load the model and build its runner without ModelEngine.
+    Skips all decoder infrastructure (KV cache, scheduler, sampler, drafter,
+    speculative decoding).
 
     Args:
         llm_args: Configuration arguments.
@@ -487,17 +508,11 @@ def create_encoder_executor(
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     dist = Distributed.get(mapping)
 
-    model_engine = ModelEngine(
+    return EncoderExecutor.create(
+        llm_args,
         model_path=checkpoint_dir,
-        llm_args=llm_args,
-        mapping=mapping,
-        dist=dist,
-        spec_config=None,
         checkpoint_loader=checkpoint_loader,
-    )
-
-    return EncoderExecutor(
-        model_engine=model_engine,
+        mapping=mapping,
         dist=dist,
     )
 
@@ -874,6 +889,12 @@ def _create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
+
+    is_generation = model_engine.model.model_config.is_generation
+    _check_no_kv_execution(llm_args, mapping, is_generation)
+    if not is_generation:
+        enable_chunked_context = False
+        model_engine.attn_runtime_features.chunked_prefill = False
 
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (

@@ -814,6 +814,17 @@ class MultimodalEncoderSchedulingPolicy(StrEnum):
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
+    vision_gpu_normalize: bool = Field(
+        default=False,
+        description=
+        ("Normalize supported uint8 vision inputs on the GPU instead of the CPU. "
+         "Applies only to models that opt in and whose processors preserve "
+         "the required normalization settings and pixel layout. Unsupported "
+         "inputs keep the existing CPU preprocessing path. False (default) "
+         "disables GPU normalization."),
+        status="prototype",
+    )
+
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,
         description=
@@ -2335,8 +2346,11 @@ class _ParallelConfig(StrictBaseModel):
             pp_partition=self.pp_partition,
             cp_size=self.cp_size,
             # TODO: Mapping still uses cp_config as a dict; migrate to CpConfig
-            cp_config=self.cp_config.model_dump(
-                exclude_none=True) if self.cp_config else {},
+            # A cp_config takes effect only with context parallelism on: with
+            # one CP rank the Mapping carries no cp_type, so the executor
+            # (request merging, KV cache sizing, warmup) runs as without CP.
+            cp_config=self.cp_config.model_dump(exclude_none=True)
+            if self.cp_config and self.cp_size > 1 else {},
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
             moe_cluster_size=self.moe_cluster_size,
@@ -5341,7 +5355,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Whether to use the KV cache manager v2 (experimental). Defaults to "
         "True. Set False to select V1 for models that support it. 'auto' uses "
         "the model-specific preference and falls back to False when the model "
-        "does not declare one.")
+        "does not declare one. V1 is deprecated as of TensorRT-LLM 1.4 "
+        "(2026-11) and will be removed after the 3-month migration period.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     enable_swa_scratch_reuse: bool = Field(
@@ -5745,7 +5760,9 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "each server and is only logged, not surfaced, so keep context and "
         "generation server configurations consistent. None is equivalent "
         "to 'CPP'. 'auto' is resolved on the PyTorch backend's standard "
-        "model-loading path.")
+        "model-loading path. The C++ transceiver ('CPP' and None) is "
+        "deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed "
+        "after the 3-month migration period.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -6535,6 +6552,14 @@ class BaseLlmArgs(StrictBaseModel):
         )
 
 
+class CheckpointIOPolicy(StrEnum):
+    """Strategy for reading checkpoint weights and transferring them to GPU."""
+
+    AUTO = "auto"
+    NATIVE = "native"
+    RANK_STRIPED_READ_AHEAD = "rank_striped_read_ahead"
+
+
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -7205,24 +7230,20 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_io_policy: Literal[
-        "auto", "native", "rank_striped_read_ahead"] = Field(
-            default="auto",
-            description=
-            "Controls checkpoint storage I/O independently of checkpoint format. "
-            "'auto' selects rank-striped read-ahead for compatible built-in "
-            "PyTorch/HF loads and selects native I/O otherwise. "
-            "'native' preserves the existing loader. "
-            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
-            "SafeTensors extents while native mapping, materialization, and H2D "
-            "continue. Incompatible configurations select native I/O before "
-            "optimized reader or collective setup. Runtime-ineligible loads fall "
-            "back to native before model mutation.",
-            status="prototype",
-            json_schema_extra={
-                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
-            },
-        )
+    checkpoint_io_policy: CheckpointIOPolicy = Field(
+        default=CheckpointIOPolicy.AUTO,
+        description=
+        "Controls checkpoint storage I/O independently of checkpoint format. "
+        "'auto' selects rank-striped read-ahead for compatible built-in "
+        "PyTorch/HF loads and selects native I/O otherwise. "
+        "'native' preserves the existing loader. "
+        "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+        "SafeTensors extents while native mapping, materialization, and H2D "
+        "continue. Incompatible configurations select native I/O before "
+        "optimized reader or collective setup. Runtime-ineligible loads fall "
+        "back to native before model mutation.",
+        status="prototype",
+    )
 
     @property
     def is_partial_model_loading(self) -> bool:
@@ -7724,7 +7745,7 @@ class TorchLlmArgs(BaseLlmArgs):
             return False
         if self.attn_backend == "VANILLA":
             return False
-        if self.cp_config is not None:
+        if self.context_parallel_size > 1 and self.cp_config is not None:
             return False
         return True
 
@@ -8362,6 +8383,27 @@ class TorchLlmArgs(BaseLlmArgs):
                 )
 
         return self
+
+    @model_validator(mode='after')
+    def validate_cp_type_with_context_parallelism(self) -> 'TorchLlmArgs':
+        """Require a HELIX cp_config when context parallelism is on.
+
+        The PyTorch executor implements context parallelism only with HELIX:
+        with context_parallel_size > 1, the attention modules and the request
+        path reject any other cp_type, and a missing cp_config.
+        """
+        if self.context_parallel_size <= 1:
+            return self
+        if self.cp_config is None:
+            got = "no cp_config"
+        elif self.cp_config.cp_type != CpType.HELIX:
+            got = f"cp_config.cp_type {self.cp_config.cp_type.name}"
+        else:
+            return self
+        raise ValueError(
+            f"context_parallel_size {self.context_parallel_size} requires "
+            f"cp_config.cp_type HELIX, got {got}: the PyTorch backend "
+            "supports context parallelism only with cp_type HELIX.")
 
     def warn_on_unstable_feature_usage(self) -> 'TorchLlmArgs':
         """Warn on unstable feature usage."""

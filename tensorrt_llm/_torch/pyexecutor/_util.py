@@ -4951,9 +4951,16 @@ def instantiate_sampler(
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         sampler = get_spec_decoder(sampler_args, engine.spec_config)
-        spec_step_fold = runtime_hooks_of(engine.model).spec_step_fold
-        if spec_step_fold is not None and isinstance(sampler, SpecSampler):
-            sampler.bind_spec_step_fold(spec_step_fold)
+        runtime_hooks = runtime_hooks_of(engine.model)
+        if isinstance(sampler, SpecSampler):
+            if runtime_hooks.spec_step_fold is not None:
+                sampler.bind_spec_step_fold(runtime_hooks.spec_step_fold)
+            sampler.d2h_side_stream_copies = runtime_hooks.sampler_d2h_side_stream
+            sampler.static_slot_ids = runtime_hooks.spec_small_h2d
+            if runtime_hooks.sampler_d2h_side_stream:
+                logger.info(
+                    "[M3 host] spec sampler store copies on the D2H side stream"
+                )
         return sampler
 
     if mm_encoder_only:
@@ -4964,10 +4971,11 @@ def instantiate_sampler(
         # is never opened, so PyTorch would never release its allocation.
         returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
                                                   and 0 in mapping.tp_group)
-        return EarlyStopWithMMResult(return_mm_results=returns_responses)
+        return EarlyStopWithMMResult(return_mm_results=returns_responses,
+                                     max_num_tokens=engine.max_num_tokens)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
-        return EarlyStopSampler()
+        return EarlyStopSampler(max_num_tokens=engine.max_num_tokens)
     return TorchSampler(sampler_args)
 
 

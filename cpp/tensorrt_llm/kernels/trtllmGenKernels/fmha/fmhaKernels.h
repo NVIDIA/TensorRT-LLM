@@ -255,7 +255,7 @@ public:
         }
     }
 
-    static bool shouldUseNvrtc(FmhaOptions const& options)
+    bool shouldUseNvrtc(FmhaOptions const& options) const
     {
 #ifdef TLLM_RUBIN_FEATURES
         // Spcompress kernels must use precompiled cubins.
@@ -264,7 +264,20 @@ public:
             return false;
         }
 #endif // TLLM_RUBIN_FEATURES
-       // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
+       // The cubin table has no dense paged-KV kernels for 128-token pages, and the page size is
+       // part of the kernel hash. On SM107, generate those BF16/E4M3 context and KeepsMmaAb
+       // generation kernels for the actual cache layout instead.
+        constexpr int kPageSize128 = 128;
+        if (mSM == kSM_107
+            && (isContextKernel(options.mFmhaKernelType) || isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType))
+            && !options.mIsMlaGen && !isTokenSparse(options.mSparseType) && isPagedKv(options.mQkvLayout)
+            && options.mNumTokensPerPage == kPageSize128 && options.mDtypeQ == options.mDtypeKv
+            && (options.mDtypeQ == tg::Dtype::Bfloat16 || options.mDtypeQ == tg::Dtype::E4m3)
+            && options.mDtypeOut == tg::Dtype::Bfloat16)
+        {
+            return true;
+        }
+        // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
         if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
         {
             return true;
@@ -376,6 +389,20 @@ private:
         1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048, 2176, 2304, 2432, 2560, 2688, 2816, 2944, 3072, 3328, 3584,
         3840, 4096, 4352, 4608, 4864, 5120, 5376, 5632, 5888, 6144, 6656, 7168, 7680, 8192, 8704, 9216, 9728, 10240,
         10752, 11264, 11776, 12288, 13312, 14336, 16384, 20480, 24576, 32768, 40960, 49152, 65536, 98304, 131072};
+    // The same grid continued past 131072 in 32768-token steps to 1M tokens: kernel selection still changes there
+    // (e.g. MultiCtasKv vs MultiCtasKvCga), so a long-context step whose
+    // KV length falls between two grid points otherwise compiles its kernel inside a served request (~4-5 s).
+    // Selection is a cheap heuristic and compiled kernels are cached by config, so the finer grid only adds the
+    // compiles of configs the coarser grid missed. Kill: TRTLLM_FMHA_LONG_WARMUP=0.
+    inline static std::vector<int> const kLongWarmupSeqLenKvCandidates = []
+    {
+        std::vector<int> sizes = kDefaultWarmupSeqLenKvCandidates;
+        for (int size = 131072 + 32768; size <= 1048576; size += 32768)
+        {
+            sizes.push_back(size);
+        }
+        return sizes;
+    }();
     // Selection of seqLenQ: typically our prefill kernels would not use JIT and seqLenQ is fixed during decode.
     // However seqLenQ can change when we use generation kernel to do prefill. SeqLenQ is sensitive in the range 1-16.
     // Below sequence are chosen to cover most sparse attention cases.
@@ -412,6 +439,11 @@ private:
 
         std::tie(options, optionsFromArgs, ctaDim)
             = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
+        // Same override as run(), so the warmed config matches the dispatched one.
+        if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
+        {
+            options.mTileScheduler = TileScheduler::Static;
+        }
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
@@ -422,10 +454,12 @@ private:
 
         if (shouldUseNvrtc(options))
         {
+            // Compile exactly what run() compiles (same target arch), so the warmed kernel is the one run() hits.
+            FmhaOptions const nvrtcOptions = nvrtcCompileOptions(options);
             FmhaConfig fmhaConfig;
-            fmhaConfig.mOptions = options;
+            fmhaConfig.mOptions = nvrtcOptions;
             std::ostringstream sstream;
-            populateJsonConfig(options, sstream);
+            populateJsonConfig(nvrtcOptions, sstream);
             fmhaConfig.mGenCfgJsonStr = sstream.str();
 
             fmhaConfig.mExecPath = getExecPath().c_str();
@@ -443,9 +477,73 @@ private:
         }
     }
 
+    // Context-phase grid: the kernel variant (e.g. static vs persistent tile scheduler, tile shape) follows the CTA
+    // count, i.e. batch x ceil(seqLenQ / tileQ), so cover each power of two and the tile boundary just past it
+    // (chunked prefill runs chunk + 1 query tokens), with every KV length >= seqLenQ (cached prefix) from the KV grid.
+    inline static std::vector<int> const kContextWarmupBatchSizeCandidates = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+    inline static std::vector<int> const kContextWarmupSeqLenQCandidates = {1, 128, 129, 256, 257, 512, 513, 1024, 1025,
+        2048, 2049, 4096, 4097, 8192, 8193, 16384, 16385, 32768, 32769, 65536, 65537, 131072};
+
+    void runContextJITWarmupGrid(RunnerParams const& runnerParams)
+    {
+        static bool const contextWarmup
+            = tensorrt_llm::common::getIntEnv("TRTLLM_FMHA_CONTEXT_WARMUP").value_or(1) != 0;
+        int const maxBatchSize = runnerParams.mJITWarmupMaxNumRequests;
+        int const maxSeqLenQ = runnerParams.mJITWarmupMaxSeqLenQ;
+        int const maxSeqLenKv = runnerParams.mJITWarmupMaxSeqLenKv;
+        if (!contextWarmup || maxBatchSize <= 0 || maxSeqLenQ <= 0 || maxSeqLenKv <= 0)
+        {
+            return;
+        }
+        static bool const longWarmup = tensorrt_llm::common::getIntEnv("TRTLLM_FMHA_LONG_WARMUP").value_or(1) != 0;
+        std::vector<int> const seqLenKvCandidates = makeWarmupCandidateSizes(
+            longWarmup ? kLongWarmupSeqLenKvCandidates : kDefaultWarmupSeqLenKvCandidates, maxSeqLenKv);
+        auto warmupParams = runnerParams;
+        for (int batchSize : makeWarmupCandidateSizes(kContextWarmupBatchSizeCandidates, maxBatchSize))
+        {
+            warmupParams.mBatchSize = batchSize;
+            for (int seqLenQ : makeWarmupCandidateSizes(kContextWarmupSeqLenQCandidates, maxSeqLenQ))
+            {
+                warmupParams.mMaxSeqLenQ = seqLenQ;
+                for (int seqLenKv : seqLenKvCandidates)
+                {
+                    if (seqLenKv < seqLenQ)
+                    {
+                        continue;
+                    }
+                    warmupParams.mMaxSeqLenKv = seqLenKv;
+                    warmupParams.mSumOfSeqLensQ = static_cast<int>(
+                        std::min<int64_t>(static_cast<int64_t>(batchSize) * seqLenQ, std::numeric_limits<int>::max()));
+                    warmupParams.mSumOfSeqLensKv = static_cast<int>(
+                        std::min<int64_t>(static_cast<int64_t>(batchSize) * seqLenKv, std::numeric_limits<int>::max()));
+                    warmupOneKernel(warmupParams);
+                }
+            }
+        }
+    }
+
     void runJITWarmupGridIfRequested(RunnerParams const& runnerParams)
     {
-        if (!runnerParams.mJITWarmup || runnerParams.mKernelType != FmhaKernelType::Generation)
+        if (!runnerParams.mJITWarmup)
+        {
+            return;
+        }
+        if (isContextKernel(runnerParams.mKernelType))
+        {
+            // Only SM107 needs the dense paged-context NVRTC warmup grid.
+            // Other architectures retain their precompiled context path.
+            if (mSM != kSM_107)
+            {
+                return;
+            }
+            cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+            TLLM_CUDA_CHECK(cudaStreamIsCapturing(runnerParams.stream, &captureStatus));
+            TLLM_CHECK_WITH_INFO(captureStatus == cudaStreamCaptureStatusNone,
+                "TRTLLM-Gen FMHA JIT warmup must not run during CUDA graph capture.");
+            runContextJITWarmupGrid(runnerParams);
+            return;
+        }
+        if (runnerParams.mKernelType != FmhaKernelType::Generation)
         {
             return;
         }
@@ -472,7 +570,9 @@ private:
         std::vector<int> seqLenQCandidates = useGenKernelForPrefill
             ? makeWarmupCandidateSizes(kDefaultWarmupSeqLenQCandidates, maxSeqLenQ)
             : std::vector<int>{runnerParams.mMaxSeqLenQ};
-        std::vector<int> seqLenKvCandidates = makeWarmupCandidateSizes(kDefaultWarmupSeqLenKvCandidates, maxSeqLenKv);
+        static bool const longWarmup = tensorrt_llm::common::getIntEnv("TRTLLM_FMHA_LONG_WARMUP").value_or(1) != 0;
+        std::vector<int> seqLenKvCandidates = makeWarmupCandidateSizes(
+            longWarmup ? kLongWarmupSeqLenKvCandidates : kDefaultWarmupSeqLenKvCandidates, maxSeqLenKv);
 
         auto warmupParams = runnerParams;
 
@@ -582,14 +682,7 @@ public:
         if (shouldUseNvrtc(options))
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
-            FmhaOptions nvrtcOptions = options;
-#ifdef TLLM_RUBIN_FEATURES
-            // On Rubin, compile non-spcompress NVRTC kernels with Sm100f target for compatibility.
-            if (tg::isArchRubin(options.mCudaArch) && !options.mUsesSpcompress)
-            {
-                nvrtcOptions.mCudaArch = tg::CudaArch::Sm100f;
-            }
-#endif // TLLM_RUBIN_FEATURES
+            FmhaOptions const nvrtcOptions = nvrtcCompileOptions(options);
 
             FmhaConfig fmhaConfig;
             fmhaConfig.mOptions = nvrtcOptions;
@@ -682,6 +775,20 @@ public:
     }
 
 private:
+    // The options NVRTC compiles with; shared by run() and warmupOneKernel() so both produce the same kernel.
+    FmhaOptions nvrtcCompileOptions(FmhaOptions const& options) const
+    {
+        FmhaOptions nvrtcOptions = options;
+#ifdef TLLM_RUBIN_FEATURES
+        // On Rubin, compile non-spcompress NVRTC kernels with Sm100f target for compatibility.
+        if (tg::isArchRubin(options.mCudaArch) && !options.mUsesSpcompress)
+        {
+            nvrtcOptions.mCudaArch = tg::CudaArch::Sm100f;
+        }
+#endif // TLLM_RUBIN_FEATURES
+        return nvrtcOptions;
+    }
+
     // Autotuner entry for checkIfKernelExist, warmupOneKernel, and run. SM107 may select
     // CgaSmemReduction configs where clusterDimX * mMaxNumCtasPerSeqKv must stay <= 16;
     // the pre/post clamps below enforce that. Other architectures keep the legacy path.
