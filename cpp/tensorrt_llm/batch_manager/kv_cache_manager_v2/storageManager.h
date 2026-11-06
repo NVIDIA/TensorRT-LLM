@@ -28,7 +28,9 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <cstdint>
 #include <deque>
+#include <list>
 #include <functional>
 #include <map>
 #include <memory>
@@ -347,6 +349,21 @@ public:
         return mSlotUtilFracMax.at(lcId);
     }
 
+    // ---- Keep-disk-copy ----------------------------------------------------
+    //
+    // With TLLM_KVCM2_DISK_KEEP_COPY=1, a committed page restored from a disk level keeps its disk slot as a
+    // "retained copy" instead of releasing it: committed pages are immutable, so the disk data stays valid. When
+    // the page later falls back to that level, it takes the retained slot back and the write is skipped.
+    // Retained copies are duplicates, so a level reclaims them (oldest first) before it evicts any real page.
+
+    [[nodiscard]] bool keepDiskCopyEnabled() const noexcept;
+
+    // Called from Page::~Page: releases the page's retained copy, if any.
+    void onPageDestroyed(Page const& page) noexcept;
+
+    // Number of retained copies at a level (all pool groups when pgIdx is omitted).
+    [[nodiscard]] SlotCount numRetainedCopies(CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
+
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
@@ -541,6 +558,45 @@ private:
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
     std::unique_ptr<StagingBufferManager> mIndexStagingManager;
+
+    // ---- Keep-disk-copy state (see keepDiskCopyEnabled). Appended last so existing member offsets are unchanged.
+    struct RetainedCopy
+    {
+        Page const* page;
+        CacheLevel level;
+        PoolGroupIndex pgIdx;
+        Slot slot;
+        // Set while a fallen page is about to take this slot back, so reclaiming skips it.
+        bool pinned;
+    };
+
+    using RetainedCopyList = std::list<RetainedCopy>;
+
+    struct KeepCopyStats
+    {
+        uint64_t created{0};
+        uint64_t reused{0};
+        uint64_t reusedBytes{0};
+        uint64_t reclaimed{0};
+        uint64_t dropped{0};
+        int64_t lastPrintNs{0};
+        int statsSec{30};
+    };
+
+    void addRetainedCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
+    [[nodiscard]] std::optional<Slot> takeRetainedCopy(Page const& page, CacheLevel level);
+    bool pinRetainedCopy(Page const& page, CacheLevel level, bool pin) noexcept;
+    void releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
+    void releaseAllRetainedCopies(std::optional<CacheLevel> level);
+    void eraseRetainedCopy(RetainedCopyList::iterator iter);
+    void maybePrintKeepCopyStats();
+
+    bool mKeepDiskCopy{false};
+    // Oldest first.
+    RetainedCopyList mRetainedCopies;
+    std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
+    KeepCopyStats mKeepCopyStats;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
