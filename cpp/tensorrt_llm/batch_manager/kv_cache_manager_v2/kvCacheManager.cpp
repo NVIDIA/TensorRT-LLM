@@ -1643,6 +1643,12 @@ bool KvCacheManager::needAdjustment() const
     return _needAdjustment(kHotLevel) || _needAdjustment(lastLevel);
 }
 
+TypedVec<PoolGroupIndex, SlotCount> KvCacheManager::raiseHotMinSlots(BatchDesc const& batch)
+{
+    auto const apiLock = lockExclusive();
+    return mStorage->raiseHotMinSlots(batch, tokensPerBlock());
+}
+
 void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();

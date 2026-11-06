@@ -393,6 +393,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // utilization. Other levels need only the structural one-slot floor.
     mHotMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
+    mMaxUtilForResume = maxUtilForResume;
 
     // A fixed-capacity group's floor is its fixed size, so every quota check reserves it. Like the
     // elastic floors, it raises a GPU quota that is too small to hold all floors.
@@ -3430,6 +3431,18 @@ HostMemBackingOptions StorageManager::tierBackingOptions(
 // ---------------------------------------------------------------------------
 // minQuotaForLevel
 // ---------------------------------------------------------------------------
+
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::raiseHotMinSlots(BatchDesc const& batch, int tokensPerBlock)
+{
+    auto const needed
+        = computePoolGroupMinSlotsFromConstraints({batch}, tokensPerBlock, mSwaScratchReuse, mMaxUtilForResume);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < mHotMinSlots.size() && pgIdx < needed.size(); ++pgIdx)
+    {
+        SlotCount const capped = std::min(needed[pgIdx], numSlots(pgIdx, kHotLevel));
+        mHotMinSlots[pgIdx] = std::max(mHotMinSlots[pgIdx], capped);
+    }
+    return mHotMinSlots;
+}
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::_minSlotsFor(CacheLevel level) const
 {
