@@ -29,7 +29,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     Region,
     RegionLayer,
     RegionLifeCycle,
-    RegionTransfer,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import prefer_pinned
@@ -84,7 +83,6 @@ class KDAReplayRegion:
                     )
                     for layer, layout in self.layouts.items()
                 ),
-                transfer=RegionTransfer(rebuilt_roles=self.roles),
                 # One replay slot per living cache: KDA runs at beam width 1. Beam search
                 # would multiply the owners by the beam width in ``replay_slot_count``.
                 fixed_slot_count=state.replay_slot_count(max_living_caches, max_util_for_resume),

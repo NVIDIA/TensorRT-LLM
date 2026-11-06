@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Dict,
-    FrozenSet,
     Iterable,
     List,
     Mapping,
@@ -166,18 +165,6 @@ class RegionLayer:
 
 
 @dataclass(frozen=True)
-class RegionTransfer:
-    """How a region's planes move between disaggregated workers.
-
-    Attributes:
-        rebuilt_roles: Roles never transferred; the receiving worker rebuilds
-            them from the transferred planes or starts them afresh.
-    """
-
-    rebuilt_roles: FrozenSet[DataRole] = frozenset()
-
-
-@dataclass(frozen=True)
 class Region:
     """A unit of persistent state with one life cycle.
 
@@ -185,7 +172,6 @@ class Region:
         name: Identifies the region; unique per manager.
         life_cycle: How the region's memory is allocated and handed off.
         layers: The model layers the region covers, each with its planes.
-        transfer: How the region's planes move between disaggregated workers.
         fixed_slot_count: GPU slots of the region's pool group, which the
             manager then keeps at exactly this size. The declaring code computes
             it for every owner it supports, including the headroom
@@ -196,7 +182,6 @@ class Region:
     name: str
     life_cycle: RegionLifeCycle
     layers: Tuple[RegionLayer, ...]
-    transfer: RegionTransfer = field(default_factory=RegionTransfer)
     fixed_slot_count: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -310,7 +295,6 @@ class RegionLayout:
                     RegionLayer(renumber[layer.model_layer], layer.planes)
                     for layer in region.layers
                 ),
-                transfer=region.transfer,
                 fixed_slot_count=region.fixed_slot_count,
             )
             for region in self.regions
@@ -401,6 +385,5 @@ __all__ = [
     "RegionLayout",
     "RegionLifeCycle",
     "RegionProvider",
-    "RegionTransfer",
     "lay_out_regions",
 ]

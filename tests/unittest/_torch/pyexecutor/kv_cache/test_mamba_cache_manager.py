@@ -100,7 +100,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     Region,
     RegionLayer,
     RegionLifeCycle,
-    RegionTransfer,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -5264,12 +5263,15 @@ def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
 def test_v2_hybrid_private_ssm_buffer_uses_buffer_group_lookups():
     """A request-private region on the Mamba layers splits each of them across two layer groups. The manager resolves
     the recurrent-state group through the SSM_STATE buffer, describes the private group by its own role, and leaves
-    the private group, whose role the region declares rebuilt, out of the disaggregated transfer."""
+    the private group, whose role the manager excludes, out of the disaggregated transfer."""
     from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 
     private_role = DataRole("private_scratch")
 
     class PrivateBufferManager(NemotronHybridCacheManager):
+        def get_disagg_ignored_roles(self):
+            return super().get_disagg_ignored_roles() | {private_role}
+
         def _region_providers(self):
             return (*super()._region_providers(), self)
 
@@ -5282,7 +5284,6 @@ def test_v2_hybrid_private_ssm_buffer_uses_buffer_group_lookups():
                         RegionLayer(self.layer_offsets[layer_id], (Plane(private_role, 256),))
                         for layer_id in self.mamba_pp_layers
                     ),
-                    transfer=RegionTransfer(rebuilt_roles=frozenset({private_role})),
                 ),
             ]
 

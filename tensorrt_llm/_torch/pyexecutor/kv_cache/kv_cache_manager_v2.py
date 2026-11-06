@@ -4492,12 +4492,9 @@ class KVCacheManagerV2(BaseResourceManager):
         Specialized managers may register storage-only buffers to satisfy
         physical pool layout constraints. Such buffers remain part of local
         slot copies, but contain no model state that needs to be transferred
-        between disaggregated workers. Declared regions add the roles their
-        receiving worker rebuilds.
+        between disaggregated workers.
         """
-        return frozenset(
-            role for region in self.region_layout.regions for role in region.transfer.rebuilt_roles
-        )
+        return frozenset()
 
     def get_disagg_pool_view_partition(
         self, layer_id: LayerId, role: DataRole

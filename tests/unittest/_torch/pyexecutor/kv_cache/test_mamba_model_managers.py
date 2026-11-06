@@ -612,10 +612,42 @@ def test_kda_region_declares_storage_without_a_hybrid_manager():
         if buffer.buffer.role == DataRole("prev_num_accepted_tokens")
     ]
     assert len(count_buffers) == 1 and int(count_buffers[0].layer_id) == 0
-    assert layout.region(REPLAY_STATE_REGION).transfer.rebuilt_roles == provider.roles
+    assert (
+        frozenset(
+            plane.role
+            for layer in layout.region(REPLAY_STATE_REGION).layers
+            for plane in layer.planes
+        )
+        == provider.roles
+    )
     assert provider.region.fixed_bytes() == 7 * provider.bytes_per_slot
     assert MambaHybridCacheManagerV2._region_providers is KVCacheManagerV2._region_providers
     assert not hasattr(MambaHybridCacheManagerV2, "declare_regions")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "manager_cls, draft_records",
+    [
+        (KimiK3HybridCacheManager, False),
+        (KimiK3HybridCacheManager, True),
+        (Glm5NextCacheManager, False),
+    ],
+)
+def test_kda_manager_excludes_replay_from_transfer(manager_cls, draft_records):
+    """KDA's transfer hook excludes every replay role in either storage layout."""
+    state = KDAReplayState(2, draft_records=draft_records)
+    provider = KDAReplayRegion(state, _layout(), {0: 0, 1: 1}, 5, 0.8)
+    manager = object.__new__(manager_cls)
+    manager._kda_replay_region = provider
+
+    ignored = manager.get_disagg_ignored_roles()
+
+    assert ignored == provider.roles
+    assert DataRole("prev_num_accepted_tokens") in ignored
+    assert DataRole("kda_conv_q") in ignored
+    assert (DataRole("kda_state_tok") in ignored) == draft_records
+    assert ignored.isdisjoint({MambaRole.SSM_STATE, MambaRole.CONV_STATE})
 
 
 @pytest.mark.cpu_only

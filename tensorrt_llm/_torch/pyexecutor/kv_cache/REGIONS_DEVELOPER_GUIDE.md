@@ -19,7 +19,6 @@ registry and pool grouping; see that directory's `AGENTS.md`).
 | Plane | One kind of data a region stores per model layer, under one buffer role | `Plane` |
 | Region layer | The planes a region stores for one rank-local model layer | `RegionLayer` |
 | Life cycle | How the region's memory is allocated and when it is handed off to the prefix index | `RegionLifeCycle` |
-| Transfer | Which planes the receiving disaggregated worker rebuilds instead of receiving | `RegionTransfer` |
 | Region | Planes over a set of model layers with one life cycle, and optionally a fixed slot count | `Region` |
 | Provider | Code that declares regions | `RegionProvider` |
 | Layout | The declared regions and which region owns each buffer | `RegionLayout` |
@@ -50,14 +49,14 @@ The pool group belongs to the region alone, so this arithmetic is exact.
 | `_lay_out_regions(config)` | Config build, after `_build_cache_config`, zero-size removal and mixed-precision layers | Adds one native `RegionConfig` per region to `config.regions` |
 | `region_layout` | After declaration | The regions and, once laid out, the owner of each buffer |
 | `get_region_group_ids(name)` | After construction | The region's layer group, through `KVCacheManager.get_region_group_id`; empty for an undeclared region |
-| `get_disagg_ignored_roles()` | Disaggregated transfer | Includes every region's `transfer.rebuilt_roles` |
+| `get_disagg_ignored_roles()` | Disaggregated transfer | Model and backend managers identify locally rebuilt buffers to exclude |
 
 ## The KDA replay region
 
 `KDAReplayRegion` declares `replay_state` from the geometry supplied by `KDAReplayState`.
 Kimi K3 and GLM5Next compose this provider in their model-specific cache managers and register it
 through `_region_providers()`. The provider owns the region's identity, lifecycle, planes,
-capacity and transfer policy. The shared managers consume its declaration through the generic
+capacity. The shared managers consume its declaration through the generic
 region interfaces.
 
 The KDA managers bind the provider after the native pools and final layer mapping exist, before
@@ -75,8 +74,11 @@ slots.
 | Life cycle | `REQUEST`, `NEVER` |
 | Layers | The local KDA layers |
 | Planes | `replay_layout()`: the convolution replay windows and k/g/v/beta caches per layer, plus the accepted-draft count on the first local KDA layer |
-| Transfer | Every plane rebuilt: the generation worker seeds the replay state from the transferred recurrent state |
 | Fixed slot count | `KDAReplayState.replay_slot_count()`: `ceil(IndexMapper capacity / max_util_for_resume)`. The IndexMapper capacity bounds the living caches, active and suspended, reserved dummies included. KDA models run at beam width 1. |
+
+Kimi K3 and GLM5Next exclude replay buffers through `get_disagg_ignored_roles()`. The
+disaggregation extractor uses that hook to select transferable views. The generation worker
+seeds replay from the transferred recurrent state after the transfer completes.
 
 Replay state follows its request through suspend and resume; the physical slot can move. The
 provider uploads each request's replay slot; the KDA manager exposes it through
@@ -104,4 +106,5 @@ KDA keeps `enable_kv_pool_rebalance` off: its views are bound once to the recurr
    override `_estimate_fixed_region_bytes()` so the cost estimate reserves the same bytes.
 4. Resolve the region's layer group with `get_region_group_ids(name)` and its buffers with the
    per-buffer APIs (`get_buffer_group_id`, page strides, base addresses).
-5. List the roles a receiving disaggregated worker rebuilds in `transfer.rebuilt_roles`.
+5. Describe transfer views through the manager's disaggregation hooks. List buffers the
+   receiving worker rebuilds in `get_disagg_ignored_roles()`.

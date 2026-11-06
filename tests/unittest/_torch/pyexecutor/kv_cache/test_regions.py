@@ -24,7 +24,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     RegionLayer,
     RegionLayout,
     RegionLifeCycle,
-    RegionTransfer,
     lay_out_regions,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -76,7 +75,6 @@ def _replay(name="replay", fixed_slot_count=5, layers=(1, 2)):
             )
             for layer in layers
         ),
-        transfer=RegionTransfer(rebuilt_roles=frozenset({HISTORY, COUNT})),
         fixed_slot_count=fixed_slot_count,
     )
 
