@@ -60,6 +60,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     RegionLifeCycle,
     RegionProvider,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Sectioned
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -152,6 +153,11 @@ def _uses_fp4_mla_cache_layout(
         and getattr(pretrained_config, "kv_lora_rank", None) is not None
         and getattr(pretrained_config, "qk_rope_head_dim", None) is not None
     )
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    """A torch element type by name, such as ``"bfloat16"``, as a page layout states it."""
+    return str(dtype).removeprefix("torch.")
 
 
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
@@ -607,6 +613,42 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     ) -> int:
         """Estimate the per-slot bytes of the replay-state region this class declares."""
         return 0
+
+    def page_table_spec(self) -> PageTableSpec:
+        """Lay out the recurrent roles as well.
+
+        Convolution state is sectioned: its flat per-layer buffer is a
+        concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
+        each split by byte over the ranks recurrent state splits over. SSM
+        state is split by head. Both name their element types, which their
+        dtypes configure apart from the KV cache's. With the FP4 MLA cache
+        layout, the policy lays its attention roles and layer names over them
+        (``_fp4_mla_page_table_spec``), recurrent layers named ``2 * L``.
+        """
+        spec = super().page_table_spec()
+        if self.local_num_mamba_layers > 0:
+            d_conv_m1 = int(self.conv_state_shape[1])
+            _, head_dim, d_state = self.ssm_state_shape
+            spec = replace(
+                spec,
+                role_layouts={
+                    **spec.role_layouts,
+                    MambaRole.CONV_STATE: Sectioned(
+                        tuple(
+                            int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
+                            for dim in self.conv_section_dims
+                        ),
+                        dtype=_dtype_name(self.conv_state_dtype),
+                    ),
+                    MambaRole.SSM_STATE: ByHead(
+                        head_bytes=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize,
+                        dtype=_dtype_name(self.ssm_state_dtype),
+                    ),
+                },
+            )
+        if self._attention_cache_layout_policy is not None:
+            spec = self._fp4_mla_page_table_spec(spec, recurrent=self._is_local_mamba_layer)
+        return spec
 
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:

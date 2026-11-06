@@ -139,6 +139,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .page_table import ByHead, PageTableSpec, kv_dtype_name
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
     HostHistoryReservations,
@@ -349,6 +350,12 @@ class Role:
     MLA_V_PACKED = DataRole("mla_v_packed")
     MLA_HP_TAIL = DataRole("mla_hp_tail")
     ALL = DataRole("all")
+
+
+# The roles the base manager splits by KV head (page_table_spec).
+_HEAD_SPLIT_ROLES = frozenset(
+    str(role) for role in (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
+)
 
 
 class BlockReusePolicy(StrEnum):
@@ -5180,6 +5187,22 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    def page_table_spec(self) -> PageTableSpec:
+        """What this manager says of its pages that its runtime config and storage do not: how
+        each role's bytes spread over ranks, which roles never move, are derived or are rebuilt
+        per request, how its layers are named and how its KV data is quantized.
+
+        The base manager lays out the roles it registers itself: K/V and their block scales
+        split by KV head, head-major (HND), as the TRTLLM attention kernels write them. A manager
+        registering other roles (``Role.INDEX_KEY`` included) or laying these out otherwise
+        returns its own, usually this one with some fields replaced (``dataclasses.replace``).
+        A role that moves and that its spec does not lay out has no layout
+        (``PageTableSpec.layout_of``)."""
+        return PageTableSpec(
+            role_layouts={role: ByHead() for role in _HEAD_SPLIT_ROLES},
+            quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
+        )
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.

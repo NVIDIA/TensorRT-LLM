@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _fill_kv_pages,
     get_scratch_entry,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -1096,6 +1097,20 @@ class CSA2CacheManager(KVCacheManagerV2):
                 else min(pages, (window + self.tokens_per_block - 1) // self.tokens_per_block + 1)
             )
             for size, window in zip(sizes, windows)
+        )
+
+    def page_table_spec(self) -> PageTableSpec:
+        """Every CSA2 cache holds the same bytes on every rank. Under bounded replay on generation
+        the generation worker rebuilds the sliding-window caches past a request's split, which a
+        context-only worker keeps none of (``remote_tail_excluded_pool_views``)."""
+        spec = super().page_table_spec()
+        replay = getattr(self, "bounded_replay_on_generation", False)
+        rebuilt = {CSA2CacheRole.SWA.role} if replay else set()
+        return replace(
+            spec,
+            role_layouts={},
+            default_layout=Replicated(),
+            request_rebuilt_roles=spec.request_rebuilt_roles | rebuilt,
         )
 
     def get_disagg_role_mapper_kinds(self):

@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
     get_scratch_entry,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
 from tensorrt_llm._utils import (
@@ -73,6 +74,7 @@ from .params import (
 )
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
+_ATTENTION_TYPE_ROLES = frozenset(str(t.role) for t in DeepseekV4AttentionType)
 KV_CACHE_COPY_ALIGNMENT = 16
 NVFP4_VECTOR_SIZE = 16
 
@@ -1615,6 +1617,20 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         # The generic layers in the base config are replaced by
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
+
+    def page_table_spec(self) -> PageTableSpec:
+        """The cache of each attention type and the compressed cache's block scales hold MLA
+        latents of one KV head, which every tensor rank holds: split by head as the base manager
+        splits K/V. Storage-only NVFP4 alignment pages hold no state a peer needs and never move.
+        FP8 pages carrying their own scales are quantized as ``"fp8_ds_mla"``."""
+        spec = super().page_table_spec()
+        head_split = (COMPRESS_BLOCK_SCALE_ROLE, *_ATTENTION_TYPE_ROLES)
+        return replace(
+            spec,
+            role_layouts={**spec.role_layouts, **{role: ByHead() for role in head_split}},
+            untransferred_roles=spec.untransferred_roles | self._disagg_ignored_roles,
+            quant_mode="fp8_ds_mla" if self.use_fp8_ds_mla else spec.quant_mode,
+        )
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Exclude storage-only NVFP4 alignment pages from KV transfer."""
